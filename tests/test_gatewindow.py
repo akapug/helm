@@ -390,6 +390,41 @@ class JobIdentity(WindowBase):
         self.assertEqual(len(self.spawns), 1, self.spawns)
 
 
+class LaunchLabel(WindowBase):
+    """THE LAUNCH LABEL RIDES THE JOB (task/3066). MEASURED: `--label
+    train200` reached the window record and never receipt a8385c943e5d7a54,
+    because nothing carried it past the request. It rides `gate submit
+    --label` when the Fab that answered `gate measure` lists that option, and
+    the dispatch says which of the two happened."""
+
+    def measure_with(self, options):
+        event = json.loads(measured("snoozy"))
+        event["submit_options"] = options
+        return 0, json.dumps(event) + "\n", ""
+
+    def test_a_fab_that_takes_the_label_carries_it_on_the_submit(self):
+        room = self.room("train01", self.c)
+        rc, text, _req = self.door(room, label="train01", fab=self.fab(
+            measure=self.measure_with(["--label"])))
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.spawns[0][-2:], ["--label", "train01"])
+        self.assertIn("label:      train01 (carried to the node", text)
+        row = gatewindow.read_runs(self.path)[0]
+        self.assertEqual((row["label"], row["label_forwarded"]),
+                         ("train01", True))
+
+    def test_a_fab_that_does_not_take_it_is_told_nothing_and_says_so(self):  # noqa: VACUOUS_ASSERTION — rc 0 and the 'recorded here only' text are asserted positively; the sibling arm sees --label on the same submit argv
+        """CONTROL on the same observable: no option advertised, so the
+        submit Fab would refuse whole is sent unchanged, and the dispatch
+        names the label that stays on the record only."""
+        room = self.room("train01", self.c)
+        rc, text, _req = self.door(room, label="train01")
+        self.assertEqual(rc, 0, text)
+        self.assertNotIn("--label", self.spawns[0])
+        self.assertIn("recorded here only", text)
+        self.assertFalse(gatewindow.read_runs(self.path)[0]["label_forwarded"])
+
+
 class DetachedClient(WindowBase):
     """THE CLIENT OUTLIVES ITS CALLER, OR THE RECEIPT IS LOST.
 

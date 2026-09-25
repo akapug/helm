@@ -476,6 +476,35 @@ class RequestIdentityTest(FabGateBase):
             dict(self.runner, cgroup="systemd-whatever-v9"))
         self.assertIsNotNone(err)
 
+    def test_the_sliced_scope_is_requested_only_under_the_sliced_runner(self):
+        """The slice scope as a v10 receipt binds it (task/3039): kind whole,
+        argv the runner's path, run under `helm gate run --sliced`. Each
+        whole scope pairs with its own flags and no other."""
+        sliced = dict(self.runner, argv=self.runner["argv"] + ["--sliced"])
+        job, err = fabgate.request(self.repo, self.tree, "slice",
+                                   self.interpreter, sliced)
+        self.assertIsNone(err, err)
+        self.assertEqual(job["identity"]["scope"],
+                         {"kind": "whole", "argv": ["helm/gateslice.py"]})
+        self.assertIsNone(gateimport._fab_identity_contract(
+            job["identity"])[1])
+        for scope, argv in (
+                (fabgate.slice_scope(), self.runner["argv"]),
+                (fabgate.whole_scope(), self.runner["argv"] + ["--sliced"]),
+                (fabgate.slice_scope(),
+                 self.runner["argv"] + ["--sliced", "--focus"])):
+            job, err = fabgate.request(self.repo, self.tree, scope,
+                                       self.interpreter,
+                                       dict(self.runner, argv=argv))
+            self.assertIsNone(job, (scope, argv))
+            self.assertIn("runner identity is malformed", err)
+        for argv in (["helm/other.py"], ["helm/gateslice.py", "-v"]):
+            job, err = fabgate.request(
+                self.repo, self.tree, {"kind": "whole", "argv": argv},
+                self.interpreter, sliced)
+            self.assertIsNone(job, argv)
+            self.assertIn("whole scope differs", err)
+
     def test_tree_scope_interpreter_and_runner_changes_are_must_misses(self):
         base = self.request()
         with open(os.path.join(self.repo, "other.txt"), "w") as fh:

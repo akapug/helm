@@ -80,6 +80,11 @@ a.rbadge:hover{border-color:var(--accent)}
 .bkhead{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--sub);margin-bottom:4px}
 .bkcard{font-size:var(--f1);padding:2px 0;overflow-wrap:anywhere}
 .bkcard b{font-weight:var(--w-med)}
+/* a count line stands for many requests, so it is set apart from the cards;
+   the collapsed lines under the columns are quiet, one per class */
+.bkcard.bksum{border-top:1px dashed var(--line);margin-top:2px;padding-top:4px}
+.bkfold{font-size:var(--f1);margin:-4px 0 6px;overflow-wrap:anywhere}
+.bkfold code,.dline.bfold code{font-size:var(--f0)}
 /* the fleet kanban: one group per project, its four columns under its name */
 #fleetkb{margin:0}
 #fleetkb .fkline{font-size:var(--f1);margin:0 0 8px}

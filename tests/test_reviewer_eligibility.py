@@ -202,11 +202,42 @@ class ChainConjunct(unittest.TestCase):
 
 
 class AwakeConjunct(unittest.TestCase):
-    def test_a_deaf_seat_is_excluded_and_labelled_DEAF(self):
-        """DEAF is the state no other axis can see: pane live, turn ok, vendor
-        healthy, and no live beacon, so helm cannot wake it. It takes the
-        obligation and never works it."""
+    def test_a_DEAF_only_seat_is_eligible_with_a_nudge_pending_note(self):
+        """task/3055 A3, mirroring the dispatch door. DEAF with a live pane, a
+        turning loop and a healthy vendor is a seat helm cannot wake RIGHT
+        NOW; the door files the row, the ledger holds it until the beacon
+        re-arms, and the owed row is what the census's re-arm nudge fires on.
+        The bench must agree with the door, so the seat is eligible, noted,
+        and ranked below a clean one."""
+        # THE DEAF SEAT IS seat-a, which sorts FIRST by name: only the caveat
+        # can put it below its clean sibling, so the order is a measurement.
         deaf = {"can_take_work": False, "reachable": False,
+                "refusals": ("reachable",), "refusal": "reachable",
+                "reachable_why": "no live beacon: helm cannot wake it",
+                "reason": "no live beacon: helm cannot wake it (a re-arm "
+                          "fixes it)"}
+        report, err = re_.eligibility("row-1", seams=_seams(
+            join=_join(**{"seat-a": deaf})))
+        self.assertIsNone(err)
+        self.assertIn("seat-b", report["eligible"])        # must-hit control
+        self.assertIn("seat-a", report["eligible"])
+        row = _by_seat(report, "seat-a")
+        notes = dict(row["notes"])
+        self.assertIn(re_.AWAKE, notes)
+        self.assertTrue(notes[re_.AWAKE].startswith("DEAF (nudge pending)"),
+                        notes[re_.AWAKE])
+        self.assertLess(report["eligible"].index("seat-b"),
+                        report["eligible"].index("seat-a"),
+                        "a noted DEAF seat ranks below a clean one")
+
+    def test_a_deaf_seat_with_a_second_refusal_is_excluded_and_labelled_DEAF(self):
+        """DEAF is the state no other axis can see: pane live, turn ok, vendor
+        healthy, and no live beacon, so helm cannot wake it. Stacked on a dead
+        turn loop it is a seat that would take the obligation and never work
+        it, and the bench excludes it exactly as the door refuses it."""
+        deaf = {"can_take_work": False, "reachable": False,
+                "turn_state": "starved", "refusals": ("reachable", "turn"),
+                "refusal": "reachable",
                 "reason": "no live beacon: helm cannot wake it "
                           "(`helm chat wait --seat seat-b --follow` re-arms it)"}
         report, err = re_.eligibility("row-1", seams=_seams(

@@ -33,6 +33,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import chat, pk, seats, web  # noqa: E402
+from helm import session as helm_session  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -85,6 +86,20 @@ class Base(unittest.TestCase):
         # never run against the HOST's /tmp/claude-* from inside a test
         os.environ["HELM_SCRATCH_GC"] = "0"
         chat._ensure_dir()
+
+    def census(self, *rows, **patch):
+        """Plant the claude process census the claim-jump asks (session.
+        _proc_claude_census) for the rest of this test: `rows` are its live
+        claude rows, every completeness flag clear. `patch` replaces the
+        planted census whole (return_value=...) or makes it raise
+        (side_effect=...). A test may not read the host's process table,
+        and a synthetic session id is held by no real process."""
+        planted = {"rows": list(rows), "listing_failed": False,
+                   "who_failed": False, "census_partial": False}
+        p = mock.patch.object(helm_session, "_proc_claude_census",
+                              **(patch or {"return_value": planted}))
+        p.start()
+        self.addCleanup(p.stop)
 
     def _restore_env(self):
         for k, v in self.env_prior.items():
@@ -1352,7 +1367,9 @@ class IdentityDisagreementTest(Base):
         and every refusal rung opened. The arm exists to fail if anyone
         narrows the predicate back to my-session-only."""
         # The impostor declares the name that IS occupied — that is the whole
-        # shape, and the one r1's fixtures never staged.
+        # shape, and the one r1's fixtures never staged. OCCUPIED means a
+        # live process holds the session, so the census plants that holder.
+        self.census({"pid": 4242, "session": LIVE})
         self.plant({"console-design": {"session": LIVE, "sessions": [LIVE]}})
         os.environ["HELM_CHAT_NAME"] = "console-design"
         seats._FOREIGN_WARNED.clear()
@@ -1379,6 +1396,7 @@ class IdentityDisagreementTest(Base):
         predicate; existing is not."""
         os.environ["HELM_CHAT_NAME"] = "opus-integrator"
         seats._FOREIGN_WARNED.clear()
+        self.census({"pid": 4242, "session": LIVE})    # LIVE has a process
 
         # POSITIVE CONTROL FIRST, on the SAME observable: occupy the row and
         # the predicate must SPEAK. Without this the two assertIsNones below
@@ -1406,6 +1424,7 @@ class IdentityDisagreementTest(Base):
         differs from the pane's declared env sid), so the exemption is not a
         heuristic. Without it, every subagent join of a live seat refuses and
         two nonpane tests fail — which is exactly how this was found."""
+        self.census({"pid": 4242, "session": LIVE})    # the seat's live pane
         self.plant({"console-design": {"session": LIVE, "sessions": [LIVE]}})
         os.environ["HELM_CHAT_NAME"] = "console-design"
         os.environ["CLAUDE_CODE_SESSION_ID"] = LIVE      # the PANE's own sid
@@ -1551,6 +1570,130 @@ class IdentityDisagreementTest(Base):
 
 
 # ---------------------------------------------------------------------------
+# F2. A RELAUNCH ONTO A FRESH SESSION IS NOT A CLAIM-JUMP (task/2594)
+# ---------------------------------------------------------------------------
+
+PRED = "44444444-aaaa-4bbb-8ccc-444444444444"   # the seat's gone predecessor
+PANE = "55555555-aaaa-4bbb-8ccc-555555555555"   # its relaunched pane's session
+
+
+class RelaunchIsNotAClaimJumpTest(Base):
+    """A seat relaunched onto a FRESH session still names its predecessor on
+    its roster row, because nothing retires a binding when its pane dies. The
+    claim-jump must ask the process census whether that session is still
+    HELD. Reading the record as a live occupant refused the new pane's own
+    join AND every beacon it armed: `helm chat wait --follow` printed its
+    refusal and exited before `beacons.arm` ran, so the beacon census read a
+    live pane DEAF, `helm seat list` said UNUSABLE "no live beacon", and
+    dispatch would not book work to it.
+
+    Every arm plants the census it reads. The identical fixture with the
+    predecessor HELD is the positive control, so the absent refusal in the
+    first arm is a measurement and not an inert predicate."""
+
+    SEAT = "relaunched-seat"
+
+    def setUp(self):
+        super().setUp()
+        self.plant({self.SEAT: {"session": PRED, "sessions": [PRED]}})
+        os.environ["HELM_CHAT_NAME"] = self.SEAT
+        os.environ["CLAUDE_CODE_SESSION_ID"] = PANE    # the pane's own sid
+        seats._FOREIGN_WARNED.clear()
+
+    def arm_beacon(self):
+        """The Monitor's command, through the CLI door, with the registry
+        write stubbed: -> (rc, beacons.arm mock, stdout, stderr)."""
+        report = {"seat": self.SEAT, "pid": 5252, "stopped": [], "kept": [],
+                  "pruned": [], "registered": False, "already_live": None,
+                  "conflict": None}
+        with mock.patch("helm.beacons.arm", return_value=report) as arm, \
+                mock.patch("helm.seats_cli.wait", return_value=None):
+            rc, out, err = self.cmd("wait", ["--seat", self.SEAT, "--follow",
+                                             "--timeout", "0.01"])
+        return rc, arm, out, err
+
+    def test_a_predecessor_no_process_holds_does_not_lock_out_the_pane(self):
+        self.census({"pid": 5151, "session": PANE})    # only the new pane runs
+        self.assertIsNone(seats.identity_disagreement(PANE),
+                          "a session no process holds is a seat between "
+                          "panes, not a live occupant")
+        rc, arm, out, err = self.arm_beacon()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("REFUSING", out)
+        arm.assert_called_once()
+        self.assertEqual(arm.call_args[0][0], self.SEAT)
+        self.assertEqual(arm.call_args[1]["session"], PANE,
+                         "the beacon registers under the pane's own session")
+        _seat, line = seats.join(session=PANE, cwd="/tmp/x")
+        self.assertNotIn("JOIN REFUSED", line)
+        row = seats.roster()[self.SEAT]
+        self.assertEqual(row["session"], PANE,
+                         "SessionStart binds the relaunched pane's session")
+        self.assertIn(PRED, row["sessions"], "history stays addressable")
+
+    def test_a_predecessor_a_process_still_holds_is_refused(self):  # noqa: VACUOUS_ASSERTION — each absence has an unconditional positive on the same observable in this arm: `REFUSING to arm` is asserted present on the stdout the arm never ran past, `rostered NOWHERE` on the line whose takeover wording is absent, and the sibling arm calls the identical stub once
+        """POSITIVE CONTROL: the same fixture with the predecessor held."""
+        self.census({"pid": 4242, "session": PRED},
+                    {"pid": 5151, "session": PANE})
+        self.assertEqual(seats.identity_disagreement(PANE),
+                         (self.SEAT, self.SEAT))
+        _rc, arm, out, _err = self.arm_beacon()
+        self.assertIn("REFUSING to arm", out)
+        arm.assert_not_called()
+        _seat, line = seats.join(session=PANE, cwd="/tmp/x")
+        self.assertIn("JOIN REFUSED", line)
+        # THE JOIN SAYS THE SHAPE IT REFUSED: this pane's session is rostered
+        # nowhere, and the takeover wording would say it was rostered to a
+        # seat.
+        self.assertIn("rostered NOWHERE", line)
+        self.assertNotIn("is rostered to", line)
+        self.assertIn(PRED[:8], line)
+        self.assertEqual(seats.roster()[self.SEAT]["session"], PRED,
+                         "a refused join must not touch the standing binding")
+
+    def test_a_census_that_cannot_prove_the_predecessor_gone_refuses(self):  # noqa: VACUOUS_ASSERTION — the one None is the control, and the unconditional assertEqual over all eight refusing censuses is the positive on the same identity_disagreement call
+        """FAILS CLOSED: only a census read whole, with no holder and no
+        candidate, opens the seat. The None is the control on the same
+        observable, so the refusals below cannot come from a predicate that
+        refuses everything, and they cannot pass on one that refuses
+        nothing."""
+        free = {"rows": [{"pid": 5151, "session": PANE}],
+                "listing_failed": False, "who_failed": False,
+                "census_partial": False}
+        with mock.patch.object(helm_session, "_proc_claude_census",
+                               return_value=free):
+            self.assertIsNone(seats.identity_disagreement(PANE),
+                              "control: read whole, nothing holds it")
+        refusing = (
+            ("the census raised", {"side_effect": OSError("proc")}),
+            ("the table could not be listed",
+             {"return_value": dict(free, listing_failed=True)}),
+            ("a pid stopped before comm proved it",
+             {"return_value": dict(free, census_partial=True)}),
+            ("the who rung was lost",
+             {"return_value": dict(free, who_failed=True)}),
+            ("a contract key is missing",
+             {"return_value": {"rows": free["rows"]}}),
+            ("rows is not a list", {"return_value": dict(free, rows=None)}),
+            ("a row could not be probed",
+             {"return_value": dict(free, rows=[
+                 {"pid": 5151, "session": PANE},
+                 {"pid": 6161, "probe_failed": True}])}),
+            ("an unattributed row could hold it",
+             {"return_value": dict(free, rows=[
+                 {"pid": 5151, "session": PANE},
+                 {"pid": 6161, "possible_sessions": [PRED]}])}),
+        )
+        verdicts = {}
+        for label, patch in refusing:
+            with mock.patch.object(helm_session, "_proc_claude_census",
+                                   **patch):
+                verdicts[label] = seats.identity_disagreement(PANE)
+        self.assertEqual(verdicts, {label: (self.SEAT, self.SEAT)
+                                    for label, _patch in refusing})
+
+
+# ---------------------------------------------------------------------------
 # G. HELM-OWNED LAUNCH PATHS SET THE NAME, NEVER INHERIT (fix set D)
 # ---------------------------------------------------------------------------
 
@@ -1559,7 +1702,9 @@ class LaunchIdentityEnvTest(Base):
         from helm import sessions
         self.plant({"console-design": {"session": LIVE, "sessions": [LIVE]}})
         self.assertEqual(sessions.resume_identity_env(LIVE),
-                         {"HELM_CHAT_NAME": "console-design"})
+                         {"HELM_CHAT_NAME": "console-design",
+                          "HELM_CELL_PROFILE": "console-design",
+                          "DREGG_PROFILE": "console-design"})
 
     def test_an_unknown_or_ambiguous_sid_stays_nameless(self):  # noqa: VACUOUS_ASSERTION — the positive control IS inline (the single-owner plant asserts the helper exports before the Nones), and mutation M13 (`if hits` for `len(hits) == 1`) reddens exactly this test
         """Nameless is honest; a guessed name is incident 1."""
@@ -1568,7 +1713,9 @@ class LaunchIdentityEnvTest(Base):
         # positive control on the SAME observable: the single-owner sid DOES
         # export — the Nones below are the refusals, not a dead helper
         self.assertEqual(sessions.resume_identity_env(LIVE),
-                         {"HELM_CHAT_NAME": "console-design"})
+                         {"HELM_CHAT_NAME": "console-design",
+                          "HELM_CELL_PROFILE": "console-design",
+                          "DREGG_PROFILE": "console-design"})
         self.assertIsNone(sessions.resume_identity_env(DEAD))
         self.plant({"a-seat": {"session": LIVE, "sessions": [LIVE]},
                     "b-seat": {"sessions": [LIVE]}})

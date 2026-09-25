@@ -172,14 +172,12 @@ def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
         # line it rides the SessionStart emit and becomes the agent's first
         # context. Pre-join DMs keep: the eventual real join baselines its DM
         # lane at 0, so nothing sent meanwhile is lost.
+        # THE SENTENCE IS THE SHAPE'S OWN (`_dispute_sentence`): a claim-jump
+        # session is rostered NOWHERE, so the takeover wording ("is rostered
+        # to") would tell the joining pane something false about itself.
         own, bound = dis
-        return own, (
-            "[helm chat] JOIN REFUSED: this process declares %r but session "
-            "%.8s is rostered to %r. An inherited HELM_CHAT_NAME is free; "
-            "the roster can be corrupt; only agreement is clean. Fix: unset/"
-            "re-export HELM_CHAT_NAME to the seat you really are, or repair "
-            "a stale binding explicitly: `helm chat seat disown %s %.8s`"
-            % (own, str(session), bound, bound, str(session)))
+        return own, ("[helm chat] JOIN REFUSED: "
+                     + _dispute_sentence(own, bound, session))
     # AN EXPLICIT --seat IS A THIRD IDENTITY SOURCE and must obey the same
     # law as the other two: `identity_disagreement` above compares the
     # DECLARED name against the SESSION's roster binding, but never sees an

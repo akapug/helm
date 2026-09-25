@@ -109,6 +109,16 @@ _ROSTER_REP_LOCK = threading.Lock()
 # another home's fleet is a number nobody measured here.
 _ROSTER_REP_HOME = None         # the roster file every cached rep was built from
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_ROSTER_REP_CACHE": "per room, emptied whenever the roster home changes",
+    "_ROSTER_REP_FILL": (
+        "each room's last rebuild cost, emptied with the cache"),
+    "_ROSTER_REP_HOME": (
+        "the roster file the cache describes; a change empties the cache"),
+}
+
 
 def _rep_home():
     """The roster file this process would read right now, or None when that

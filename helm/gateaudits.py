@@ -36,9 +36,14 @@ ENUMERATORS = (
 #: reads the PRODUCT tree for material that must never enter history: a lane
 #: adding one fixture with an address-shaped string reddens it, and nothing
 #: the lane imports would ever select it.
+#: `test_env_hygiene` and `test_scratch` joined for task/3039: outside the
+#: import closure and this list, they were the failing module in 5 and 4 of
+#: the week's reds, and a focused plan for a change with no import graph (a
+#: doc, a script) runs this whole list, so it must carry them.
 RUNG_ARMS = ("test_wiring", "test_registry", "test_verb_sweep",
              "test_verbs_doc_parity", "test_hook_budgets",
-             "test_seat_split_contract", "test_never_track")
+             "test_seat_split_contract", "test_never_track",
+             "test_env_hygiene", "test_scratch")
 AUDITS = ENUMERATORS + RUNG_ARMS
 
 USAGE = ("usage: helm gate audits [--repo PATH] [--json] [-- <test module> ...]\n"

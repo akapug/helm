@@ -180,7 +180,22 @@ def _lr_project(now, newest, all_projects=False):
     # a dict exactly when the board rendered, and None on every unavailable
     # body — never a confident zero (law 1). Every term is knowable here
     # because project_raw refuses wholesale on a partial read.
-    out["filed"] = landreq.filed_split(lrs, raw)
+    #
+    # THE CENSUS IS WALKED ONCE AND READ THREE TIMES. `census_verdicts` is
+    # the walk `filed_split` takes for the header's split; the same answer is
+    # stamped onto each card as `frontier` / `frontier_rung`, where the
+    # scheduler's collapsed lines and the kanban's read it (task/2381: the
+    # owner's board lists live obligations and folds the rest into one line
+    # per class). The cards are the objects `loops` and `_scheduler_rows`
+    # share, so the list, the graph and the strip describe one walk of one
+    # instant, and a card the census never classified carries None — no
+    # frontier claim at all, never a guess.
+    verdicts = landreq.census_verdicts(lrs, raw)
+    for rid, card in cards.items():
+        verdict = verdicts.get(rid) or {}
+        card["frontier"] = verdict.get("reason")
+        card["frontier_rung"] = verdict.get("rung")
+    out["filed"] = landreq.filed_split(lrs, raw, verdicts=verdicts)
     # THE LANDED CARD, FROM THIS SAME SNAPSHOT (task/2355). One walk feeds the
     # in-flight lists, the closed footer and the lands card, so the three
     # cannot describe three different instants of one ledger.

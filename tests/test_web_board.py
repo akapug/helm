@@ -38,7 +38,7 @@ from tests.test_work import LandedWorld  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import (burnflags, home, pk, registry, repofacts,  # noqa: E402
-                  tasks, web, web_board, web_cache, web_ui_loader)
+                  scheduler, tasks, web, web_board, web_cache, web_ui_loader)
 from helm import seat as seat_mod  # noqa: E402
 
 
@@ -562,13 +562,16 @@ class BoardJoinTest(unittest.TestCase):
              "honored": True}]
         alpha = self.board()["projects"]["alpha"]
         # `trunk_contains_tip` rides every card, None where the pipeline
-        # never answered it — "not asked", which the page draws as before
+        # never answered it — "not asked", which the page draws as before —
+        # and beside it the one predicate's answer, False over a None
         self.assertEqual(alpha["lanes"]["loops"],
                          [{"id": "r1", "lane": "lane-a",
                            "state": "AWAITING_REVIEW",
-                           "trunk_contains_tip": None},
+                           "trunk_contains_tip": None,
+                           "on_main_unverdicted": False},
                           {"id": "r3", "lane": "lane-g", "state": "READY",
-                           "trunk_contains_tip": None}])
+                           "trunk_contains_tip": None,
+                           "on_main_unverdicted": False}])
         self.assertEqual(alpha["lanes"]["building_lanes"], ["lane-c"])
         self.assertEqual(alpha["landed"],
                          [{"lane": "lane-z", "task": "task/9", "age_s": 3600}])
@@ -608,9 +611,11 @@ class BoardJoinTest(unittest.TestCase):
                          [("b-review", "AWAITING_REVIEW"),
                           ("b-ready", "READY")])      # the honored row left
         self.assertEqual([r["lane"] for r in beta["landed"]], ["b-landed"])
-        # a project the read reached and found nothing for is EMPTY, not absent
+        # a project the read reached and found nothing for is EMPTY, not
+        # absent — and has no count line to draw, which is None, not a zero
         self.assertEqual(got["projects"]["gamma"]["pipeline"],
-                         {"loops": [], "landed": []})
+                         {"loops": [], "landed": [], "on_main": None,
+                          "collapsed": []})
         # the scope project keeps its own scoped read
         self.assertNotIn("pipeline", got["projects"]["alpha"])
         # rows no registered project owns are counted, never placed
@@ -1315,7 +1320,8 @@ class BoardRendererRuntimeTest(unittest.TestCase):
            "boardCapacity", "boardChip", "boardChips", "boardCount",
            "boardLanes", "boardLaneWord", "boardProgress", "boardRepoBadge",
            "boardRepos",
-           "boardKanban", "boardKanbanHTML", "fleetKanbanHTML", "boardWide",
+           "boardKanban", "boardKanbanHTML", "boardKanbanCount",
+           "boardFoldLine", "fleetKanbanHTML", "boardWide", "boardWaits",
            "boardDetail", "boardRowHTML", "onYouRead")
     CONSTS = ("LIGHTS", "FLAGCOL", "LIGHT_RANK", "KANBAN_OF")
     DECLS = ("DETAIL_HAVE", "DETAIL_ROUTE", "BOARD_DIRTY")
@@ -2249,7 +2255,8 @@ class LandedOnTheKanbanTest(unittest.TestCase):
     `work.lanes_landed`, `web_board._kanban_card`)."""
 
     FNS = ("pkey", "lrDur", "lrAgo", "boardSec", "boardSecState",
-           "boardKanban", "boardLaneWord")
+           "boardKanban", "boardKanbanHTML", "boardKanbanCount",
+           "boardFoldLine", "boardLaneWord")
 
     @classmethod
     def kanban(cls, cases):
@@ -2263,18 +2270,20 @@ class LandedOnTheKanbanTest(unittest.TestCase):
         fns = "\n\n".join(_extract_fn(src, n) for n in cls.FNS)
         board = {"sections": {"seats": _sec(), "lands": _sec(scope="proj"),
                               "fleet": _sec(scope="proj")}}
-        worlds = {name: {"running": run, "lanes": {"loops": loops,
-                                                   "building_lanes": []},
+        worlds = {name: {"running": run,
+                         "lanes": dict({"loops": loops, "building_lanes": []},
+                                       **(extra[0] if extra else {})),
                          "landed": landed}
-                  for name, (run, loops, landed) in cases.items()}
+                  for name, (run, loops, landed, *extra) in cases.items()}
         dirty = re.search(_DECL % "BOARD_DIRTY", src, re.M).group(0)
         script = ("const esc = s => String(s);\n"
                   + _extract_const(src, "KANBAN_OF") + "\n" + dirty + "\n"
                   + fns + "\n"
                   + "const BOARD = %s;\nconst W = %s;\nconst out = {};\n"
                   % (json.dumps(board), json.dumps(worlds))
-                  + "for (const k in W) out[k] = boardKanban({name: 'proj'}, "
-                    "W[k], BOARD);\n"
+                  + "for (const k in W) { out[k] = boardKanban({name: "
+                    "'proj'}, W[k], BOARD); out[k].html = "
+                    "boardKanbanHTML(out[k]); }\n"
                   + "out.words = (W.parity || W[Object.keys(W)[0]]).running"
                     ".map(boardLaneWord);\n"
                   + "console.log(JSON.stringify(out));\n")
@@ -2293,6 +2302,14 @@ class LandedOnTheKanbanTest(unittest.TestCase):
     @staticmethod
     def lanes(col):
         return [r["lane"] for r in col] if isinstance(col, list) else col
+
+    @staticmethod
+    def served(cards):
+        """(loops, lanes extras) as the SERVER sends them for these cards:
+        `web_board._kanban_split`, the call `_lands_join` makes, so the page
+        is fed exactly the live cards and count lines it would receive."""
+        live, on_main, folded = web_board._kanban_split(cards, 0)
+        return live, {"on_main": on_main, "collapsed": folded}
 
     @staticmethod
     def claim(lane, state, proof="LANDED by ancestry (the tip itself is on "
@@ -2358,11 +2375,16 @@ class LandedOnTheKanbanTest(unittest.TestCase):
                self.claim("building-lane", "unlanded"),
                self.claim("just-claimed", "unstarted"),
                self.claim("reviewed-in-chat", "gone")]
-        got = self.kanban({"parity": (run, [on_main, waiting], [])})["parity"]
-        self.assertEqual(self.lanes(got["landed"]),
-                         ["reviewed-in-chat", "landed-lane"])
+        loops, extra = self.served([on_main, waiting])
+        got = self.kanban({"parity": (run, loops, [], extra)})["parity"]
+        # THE ON-MAIN REQUEST IS COUNTED ON ONE LINE, not drawn as a card: it
+        # is ledger debris nobody moves, and the line names the listing
+        self.assertEqual(self.lanes(got["landed"]), ["landed-lane", None])
+        summary = got["landed"][1]
+        self.assertEqual(summary["summary"], 1)
+        self.assertIn("no verdict recorded", summary["note"])
+        self.assertIn("helm lr list", summary["note"])
         notes = {r["lane"]: r["note"] for r in got["landed"]}
-        self.assertIn("no verdict recorded", notes["reviewed-in-chat"])
         self.assertIn("lease still held", notes["landed-lane"])
         self.assertIn("LANDED by ancestry", notes["landed-lane"])
         # the CONTROLS on the same columns: unlanded and never-started work is
@@ -2375,13 +2397,17 @@ class LandedOnTheKanbanTest(unittest.TestCase):
         on_main = web_board._kanban_card({"id": "r1", "lane": "on-main",
                                           "state": "AWAITING_REVIEW",
                                           "trunk_contains_tip": True})
+        loops, extra = self.served([on_main])
         got = self.kanban({"unread": ([self.claim("landed-lane", "landed")],
-                                      [on_main], None)})["unread"]
+                                      loops, None, extra)})["unread"]
         self.assertEqual(got["landed"], "unknown")
         building = {r["lane"]: r["note"] for r in got["building"]}
         self.assertIn("LANDED", building["landed-lane"])
-        review = {r["lane"]: r["note"] for r in got["review"]}
-        self.assertIn("ON MAIN", review["on-main"])
+        # the count line stays where its cards came from, and says so
+        summary = [r for r in got["review"] if r.get("summary")]
+        self.assertEqual([r["summary"] for r in summary], [1])
+        self.assertIn("ON MAIN", summary[0]["note"])
+        self.assertNotIn("on-main", self.lanes(got["building"]))
 
     def test_a_lane_already_landed_is_not_ALSO_building_unless_it_moved_on(self):
         landed = [{"lane": "lane/done", "task": None, "age_s": 60},
@@ -2398,12 +2424,369 @@ class LandedOnTheKanbanTest(unittest.TestCase):
         self.assertIn("lease only — no room or branch", notes["never-landed"])
         self.assertNotIn("lease only", notes["next-round"])
 
+    def test_a_BUILD_row_sent_against_trunk_is_building_not_landed(self):
+        """fold-checkpoint-key-3048 and seat-signs-as-itself-3049 read as
+        LANDED the moment they were sent. The projection now answers a build
+        row's containment off its LANE, so a build with nothing authored is
+        not contained, and the kanban draws AWAITING_BUILD where it is: in
+        building."""
+        build = web_board._kanban_card({"id": "b", "state": "AWAITING_BUILD",
+                                        "lane": "seat-signs-as-itself-3049",
+                                        "kind": "build",
+                                        "trunk_contains_tip": False})
+        review = web_board._kanban_card({"id": "r", "lane": "under-review",
+                                         "state": "AWAITING_REVIEW",
+                                         "trunk_contains_tip": False})
+        got = self.kanban({"sent": ([], [build, review], [])})["sent"]
+        self.assertEqual(self.lanes(got["building"]),
+                         ["seat-signs-as-itself-3049"])
+        self.assertEqual(got["building"][0]["note"], "AWAITING_BUILD")
+        self.assertEqual(self.lanes(got["review"]), ["under-review"])
+        self.assertEqual(got["landed"], [])
+
+    def test_on_main_rows_are_ONE_count_line_naming_the_listing(self):
+        """The server counts them (`lanes.on_main`); the page draws one line
+        with the count, the oldest age and the command — and the lanes it
+        counts are placed, so a claim on one of them is not drawn building."""
+        on_main = {"label": "on main with no verdict recorded", "count": 7,
+                   "oldest_age_s": 3 * 86400,
+                   "lanes": ["m%d" % i for i in range(7)],
+                   "command": "helm lr list"}
+        verdicted = [{"lane": "lane/verdicted", "task": "task/9",
+                      "age_s": 60}]
+        got = self.kanban({"line": (
+            [self.claim("m3", "unlanded"), self.claim("fresh", "unlanded"),
+             # a landed lease on a lane the line already counts is not a
+             # second entry beside it — one entry per lane
+             self.claim("m4", "landed")],
+            [], verdicted, {"on_main": on_main})})["line"]
+        self.assertEqual(self.lanes(got["landed"]), ["lane/verdicted", None])
+        line = got["landed"][1]
+        self.assertEqual(line["summary"], 7)
+        for part in ("on main with no verdict recorded", "oldest 3d",
+                     "helm lr list"):
+            self.assertIn(part, line["note"])
+        # the review WITH a verdict that landed is still its own card
+        self.assertIn("task/9", got["landed"][0]["note"])
+        self.assertEqual(self.lanes(got["building"]), ["fresh"])
+        # the column head counts what the line counts, not one card
+        self.assertIn('landed <span class="bmut">8</span>', got["html"])
+
+    def test_the_page_never_refolds_a_card_the_server_sent(self):  # noqa: VACUOUS_ASSERTION — the two cards are asserted PRESENT in their columns by exact lane lists and the server's line by its exact count, on the same render
+        """THE SERVER DECIDES, ONCE. A page that folds a card marked
+        `trunk_contains_tip` into the on-main line itself is a second copy of
+        the rule, reading containment alone — and it counts a FIX-verdicted
+        row whose tip is on main (which the server keeps LISTED) as "no
+        verdict recorded". Every card the server sends is drawn as a card;
+        the count is the server's line and nothing else."""
+        fix = web_board._kanban_card({"id": "f", "lane": "fix-on-main",
+                                      "state": "CHANGES_REQUESTED",
+                                      "polarity": "fix",
+                                      "trunk_contains_tip": True})
+        gated = web_board._kanban_card({"id": "g", "lane": "owner-gated",
+                                        "state": "AWAITING_REVIEW",
+                                        "trunk_contains_tip": True})
+        on_main = web_board._kanban_card({"id": "m", "lane": "in-history",
+                                          "state": "AWAITING_REVIEW",
+                                          "trunk_contains_tip": True})
+        self.assertIs(fix["on_main_unverdicted"], False)
+        self.assertIs(on_main["on_main_unverdicted"], True)
+        # the owner-gated hold the server kept listed is sent as a card
+        # although its work is on main with no verdict
+        self.assertIs(gated["on_main_unverdicted"], True)
+        got = self.kanban({"sent": ([], [fix, gated], [],
+                                    {"on_main": {"count": 1, "lanes":
+                                                 ["in-history"],
+                                                 "label": "on main with no "
+                                                 "verdict recorded",
+                                                 "command": "helm lr list",
+                                                 "oldest_age_s": None}})})
+        got = got["sent"]
+        self.assertEqual(self.lanes(got["building"]), ["fix-on-main"])
+        self.assertEqual(self.lanes(got["review"]), ["owner-gated"])
+        self.assertEqual([r.get("summary") for r in got["landed"]], [1],
+                         "the page counted a card the server kept listed")
+
+    def test_collapsed_lines_are_drawn_under_the_columns_with_their_command(self):  # noqa: VACUOUS_ASSERTION — the drawn line and its command are asserted PRESENT in the same kanban HTML first; the plain run's missing fold is the paired absence
+        lines = [{"class": "off_frontier", "count": 4, "command":
+                  "helm lr retire --off-frontier", "oldest_age_s": 50 * 86400,
+                  "label": "left over after landing or abandonment (off the "
+                  "live frontier)", "by_reason": {}}]
+        got = self.kanban({"fold": ([], [], [], {"collapsed": lines})})["fold"]
+        self.assertEqual(got["collapsed"], lines)
+        self.assertIn("<b>4</b> left over after landing", got["html"])
+        self.assertIn("oldest 50d", got["html"])
+        self.assertIn("helm lr retire --off-frontier", got["html"])
+        plain = self.kanban({"none": ([], [], [])})["none"]
+        self.assertNotIn("bkfold", plain["html"])
+
     def test_the_lanes_hover_says_a_landed_lane_is_landed(self):
         got = self.kanban({"parity": ([self.claim("landed-lane", "landed"),
                                        self.claim("open", "unlanded")],
                                       [], [])})
         self.assertIn("landed on main, lease still held", got["words"][0])
         self.assertNotIn("landed", got["words"][1])
+
+
+def _loop(rid, lane, state="AWAITING_REVIEW", dwell_s=3600, **kw):
+    """One in-flight land-request card, in the fields `landreq_cli.card`
+    carries and `web_land._lr_project` stamps the census onto."""
+    row = {"id": rid, "lane": lane, "state": state, "kind": "review",
+           "terminal": False, "honored": False, "chain_root": rid,
+           "supersedes": None, "owed_by": "reviewer",
+           "holder_role": "reviewer", "holder_seat": "codex",
+           "dwell_s": dwell_s, "dwell_known": True, "hold_ts": None,
+           "contrary": False, "stalled": False,
+           "trunk_contains_tip": None, "frontier": None,
+           "frontier_rung": None}
+    row.update(kw)
+    return row
+
+
+class BoardWaitsRuntimeTest(unittest.TestCase):
+    """THE WAITS SECTION, drawn by the SHIPPED `boardWaits`: the live groups
+    as before, then one line per collapsed class with its count, its oldest
+    age and the command that lists it."""
+
+    FNS = ("pkey", "lrDur", "lrAgo", "boardSec", "boardSecState",
+           "boardSecWord", "boardFoldLine", "boardWaits")
+
+    def render(self, j, scope="proj"):
+        node = shutil.which("node")
+        if not node:
+            raise unittest.SkipTest("node not available")
+        src = web_ui_loader.read_text()
+        fns = "\n\n".join(_extract_fn(src, n) for n in self.FNS)
+        board = {"sections": {"lands": _sec(scope=scope)}}
+        script = ('const esc = s => String(s ?? "").replace(/[&<>"\']/g, '
+                  'c => ({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;",'
+                  '"\'":"&#39;"}[c]));\n' + fns + "\n"
+                  + "console.log(JSON.stringify(boardWaits({name: 'proj'}, "
+                  "%s, %s)));\n" % (json.dumps(j), json.dumps(board)))
+        tmp = tempfile.mkdtemp(prefix="helm-web-board-waits-")
+        try:
+            path = os.path.join(tmp, "run.js")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(script)
+            proc = subprocess.run([node, path], capture_output=True,
+                                  text=True, timeout=60)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        assert proc.returncode == 0, proc.stderr[:2000]
+        return json.loads(proc.stdout)
+
+    def test_live_groups_then_one_line_per_collapsed_class(self):
+        html = self.render({
+            "waits": [{"label": "lander", "count": 1, "oldest_age_s": 600,
+                       "rows": [{"plain_title": "a live ready", "age_s": 600,
+                                 "stage_class": "ready"}]}],
+            "waits_collapsed": [
+                {"class": "off_frontier", "count": 249,
+                 "oldest_age_s": 60 * 86400, "command":
+                 "helm lr retire --off-frontier",
+                 "label": "left over after landing or abandonment (off the "
+                 "live frontier)"},
+                {"class": "superseded", "count": 290, "oldest_age_s": None,
+                 "command": "helm lr list --all",
+                 "label": "absorbed or settled by a later round (nobody owes "
+                 "a move)"}]})
+        self.assertIn("<b>lander</b> · 1 waiting", html)
+        self.assertIn("a live ready", html)
+        self.assertIn("<b>249</b> left over after landing", html)
+        self.assertIn("oldest 60d", html)
+        self.assertIn("<code>helm lr retire --off-frontier</code>", html)
+        self.assertIn("<b>290</b> absorbed or settled", html)
+        self.assertIn("<code>helm lr list --all</code>", html)
+        self.assertNotIn("nothing is waiting", html)
+
+    def test_only_collapsed_rows_says_no_live_obligation_and_keeps_the_lines(self):
+        html = self.render({"waits": [], "waits_collapsed": [
+            {"class": "unclassified", "count": 2, "oldest_age_s": 86400,
+             "command": "helm lr retire --off-frontier",
+             "label": "unclassified (the lane is gone and helm cannot place "
+             "the work)"}]})
+        self.assertIn("no live obligation is waiting", html)
+        self.assertIn("<b>2</b> unclassified", html)
+        self.assertNotIn("nothing is waiting", html)
+
+    def test_an_older_body_without_lines_draws_as_before(self):
+        self.assertIn("nothing is waiting", self.render({"waits": []}))
+        self.assertIn("not read here", self.render({"waits": []},
+                                                   scope="other"))
+
+
+class LiveObligationsJoinTest(unittest.TestCase):
+    """THE BOARD'S JSON LISTS LIVE OBLIGATIONS; THE REST IS ONE LINE EACH.
+
+    The owner read "unknown (declared verdict held) 51 waiting, oldest 52d",
+    "author @integrator 40 waiting, oldest 60d", and a kanban LANDED
+    column of lanes "on main, no verdict recorded" — two of them BUILD rows
+    that read as landed the moment they were sent. `/api/board` is what the
+    page and any seat reading it consume, so the rule is asserted here, on the
+    wire, before anything is drawn."""
+
+    DAY = 86400
+
+    def join(self, cards, active, loops=None, lands=()):
+        model = scheduler.project(cards, active_ids=active, now=time.time(),
+                                  projection_age_s=5)
+        by_id = {c["id"]: c for c in cards}
+        body = {"withheld": {"scope": "proj"}, "read_age_s": 5,
+                "unavailable": None,
+                "loops": [by_id[i] for i in (loops if loops is not None
+                                             else active)],
+                "building": {"rows": [], "total": 0, "unavailable": None},
+                "scheduler": model,
+                "recent_lands": {"rows": list(lands), "total": len(lands),
+                                 "unavailable": None}}
+        _sec, rec = web_board._lands_join(lambda _qs: (body, 200))
+        return rec["proj"]
+
+    def test_waits_list_live_rows_and_one_line_per_collapsed_class(self):
+        cards = [
+            _loop("live", "live-lane", holder_role="author",
+                  holder_seat="opus", frontier="on-frontier",
+                  frontier_rung="lane-family"),
+            _loop("anc", "anc-lane", holder_role="author", holder_seat="opus",
+                  frontier="landed-by-ancestry", frontier_rung="landing",
+                  dwell_s=60 * self.DAY),
+            _loop("pid", "pid-lane", frontier="landed-by-patch-id",
+                  frontier_rung="landing", dwell_s=9 * self.DAY),
+            _loop("pruned", "pruned-lane", frontier="unclassified",
+                  frontier_rung="object", dwell_s=20 * self.DAY),
+            # a FRESH review whose label matches no branch: `tip`, work owed
+            _loop("fresh", "fresh-review", frontier="unclassified",
+                  frontier_rung="tip", dwell_s=600),
+            _loop("held", "held-lane", state="REVIEWED",
+                  holder_role="unknown (declared verdict held)",
+                  holder_seat=None, dwell_s=52 * self.DAY),
+            _loop("ready", "ready-lane", state="READY", holder_role="lander",
+                  holder_seat=None, frontier="on-frontier",
+                  frontier_rung="lane-family", dwell_s=13 * self.DAY)]
+        rec = self.join(cards, active=["live", "anc", "pid", "pruned",
+                                       "fresh", "ready"])
+        listed = {w["label"]: w["count"] for w in rec["waits"]}
+        self.assertEqual(listed, {"author @opus": 1, "lander": 1,
+                                  "reviewer @codex": 1},
+                         "a row off the live frontier, an unplaced row or an "
+                         "absorbed row was listed as a wait")
+        lines = {c["class"]: c for c in rec["waits_collapsed"]}
+        self.assertEqual({k: v["count"] for k, v in lines.items()},
+                         {"off_frontier": 2, "unclassified": 1,
+                          "superseded": 1})
+        self.assertEqual(lines["off_frontier"]["oldest_age_s"],
+                         60 * self.DAY + 5)
+        self.assertEqual(lines["off_frontier"]["command"],
+                         "helm lr retire --off-frontier")
+        self.assertEqual(lines["superseded"]["command"], "helm lr list --all")
+        for line in rec["waits_collapsed"]:
+            self.assertTrue(line["label"] and line["command"], line)
+
+    def test_the_kanban_draws_live_cards_and_one_on_main_line(self):
+        cards = [
+            # a BUILD sent against trunk: the projection answered its lane
+            # (nothing authored), so its tip is NOT contained — it builds
+            _loop("build", "seat-signs-as-itself", state="AWAITING_BUILD",
+                  kind="build", trunk_contains_tip=False,
+                  frontier="on-frontier", frontier_rung="lane-family"),
+            _loop("onmain1", "reviewed-in-chat", trunk_contains_tip=True,
+                  frontier="on-frontier", frontier_rung="lane-family",
+                  dwell_s=3 * self.DAY),
+            _loop("onmain2", "also-in-history", trunk_contains_tip=True,
+                  dwell_s=self.DAY),
+            _loop("left", "left-over", frontier="landed-by-ancestry",
+                  frontier_rung="landing", trunk_contains_tip=True),
+            _loop("review", "under-review", frontier="on-frontier",
+                  frontier_rung="lane-family", trunk_contains_tip=False)]
+        rec = self.join(cards, active=[c["id"] for c in cards])
+        lanes = rec["lanes"]
+        self.assertEqual(sorted(c["lane"] for c in lanes["loops"]),
+                         ["seat-signs-as-itself", "under-review"])
+        self.assertEqual(lanes["in_flight"], 2)
+        on_main = lanes["on_main"]
+        self.assertEqual(on_main["count"], 2)
+        self.assertEqual(sorted(on_main["lanes"]),
+                         ["also-in-history", "reviewed-in-chat"])
+        self.assertEqual(on_main["oldest_age_s"], 3 * self.DAY + 5)
+        self.assertEqual(on_main["command"], "helm lr list")
+        self.assertIn("no verdict recorded", on_main["label"])
+        self.assertEqual([(c["class"], c["count"]) for c in lanes["collapsed"]],
+                         [("off_frontier", 1)])
+
+    def test_the_waits_and_the_kanban_fold_the_same_rows_on_main(self):
+        """FINDING 3, RULED: ONE RULE ON BOTH SURFACES. The kanban folded on
+        the containment mark and the waits never read it, so the integrator's
+        listed waits held 8 rows the kanban beside them counted "on main with
+        no verdict recorded". Both now ask `scheduler.collapse_class`, over
+        `landreq.on_main_unverdicted`: the same rows are counted on the same
+        line with the same count and command on both, none of them is a listed
+        wait, and a row on main under a recorded FIX is listed on both."""
+        cards = [
+            _loop("clean1", "source-clean-1", holder_role="integrator",
+                  holder_seat=None, owed_by="integrator",
+                  trunk_contains_tip=True, frontier="unclassified",
+                  frontier_rung="tip", dwell_s=5 * self.DAY),
+            _loop("clean2", "source-clean-2", holder_role="integrator",
+                  holder_seat=None, owed_by="integrator",
+                  trunk_contains_tip=True, frontier="on-frontier",
+                  frontier_rung="lane-family", dwell_s=self.DAY),
+            _loop("fix", "fix-on-main", state="CHANGES_REQUESTED",
+                  polarity="fix", holder_role="author", holder_seat="opus",
+                  owed_by="author", trunk_contains_tip=True,
+                  frontier="on-frontier", frontier_rung="lane-family"),
+            _loop("live", "live-review", trunk_contains_tip=False,
+                  frontier="on-frontier", frontier_rung="lane-family")]
+        rec = self.join(cards, active=[c["id"] for c in cards])
+        listed = sorted(r["plain_title"] for g in rec["waits"]
+                        for r in g["rows"])
+        self.assertEqual(listed, ["fix-on-main", "live-review"])
+        waits_line = {c["class"]: c for c in rec["waits_collapsed"]}["on_main"]
+        kanban_line = rec["lanes"]["on_main"]
+        self.assertEqual(waits_line["count"], 2)
+        for key in ("count", "label", "command", "oldest_age_s"):
+            self.assertEqual(waits_line[key], kanban_line[key], key)
+        self.assertEqual(waits_line["oldest_age_s"], 5 * self.DAY + 5)
+        self.assertEqual(sorted(kanban_line["lanes"]),
+                         ["source-clean-1", "source-clean-2"])
+        self.assertEqual(sorted(c["lane"] for c in rec["lanes"]["loops"]),
+                         ["fix-on-main", "live-review"])
+        # THE ACCOUNTING HOLDS ON BOTH SURFACES
+        model_lines = sum(c["count"] for c in rec["waits_collapsed"])
+        self.assertEqual(len(listed) + model_lines, len(cards))
+        self.assertEqual(len(rec["lanes"]["loops"]) + kanban_line["count"]
+                         + sum(c["count"] for c in rec["lanes"]["collapsed"]),
+                         len(cards))
+
+    def test_nothing_on_main_is_no_line_not_a_zero_claim(self):
+        rec = self.join([_loop("r", "lane-r")], active=["r"])
+        # THE POSITIVE CONTROL on the same join: the live row IS drawn
+        self.assertEqual([c["lane"] for c in rec["lanes"]["loops"]],
+                         ["lane-r"])
+        self.assertEqual([w["count"] for w in rec["waits"]], [1])
+        self.assertIsNone(rec["lanes"]["on_main"])
+        self.assertEqual(rec["lanes"]["collapsed"], [])
+        self.assertEqual(rec["waits_collapsed"], [])
+
+    def test_every_other_projects_kanban_takes_the_same_split(self):
+        body = {"withheld": {"scope": "alpha"}, "read_age_s": 5,
+                "unavailable": None,
+                "loops": [
+                    _loop("b1", "b-live", foreign_project="beta"),
+                    _loop("b2", "b-on-main", foreign_project="beta",
+                          trunk_contains_tip=True),
+                    _loop("b3", "b-build", foreign_project="beta",
+                          state="AWAITING_BUILD", kind="build",
+                          trunk_contains_tip=False)],
+                "recent_lands": {"rows": [], "total": 0, "unavailable": None}}
+        with mock.patch.object(web_board, "_fleet_kick", lambda: None), \
+                mock.patch.dict(web_board._FLEET,
+                                {"done": (time.time(), body, None)}):
+            _sec, out = web_board._fleet_now(["alpha", "beta"], time.time())
+        beta = out["beta"]
+        self.assertEqual(sorted(c["lane"] for c in beta["loops"]),
+                         ["b-build", "b-live"])
+        self.assertEqual(beta["on_main"]["count"], 1)
+        self.assertEqual(beta["on_main"]["lanes"], ["b-on-main"])
 
 
 class LandedLaneParityTest(LandedWorld):

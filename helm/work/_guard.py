@@ -797,16 +797,48 @@ def _stale_scanner_check(quoted_source, profile):
     ))
 
 
-def hook_path(root, name="post-checkout"):
-    """The hook Git will actually execute, including a repo-local hooksPath."""
+def hooks_dir(root):
+    """The hooks DIRECTORY Git will actually execute from, including a
+    repo-local hooksPath."""
     rc, out, _err = _git(root, "rev-parse", "--path-format=absolute",
                          "--git-path", "hooks")
     if rc == 0 and out:
-        return os.path.join(out, name)
+        return out
     rc, out, _err = _git(root, "rev-parse", "--path-format=absolute",
                          "--git-common-dir")
     gitdir = out if rc == 0 and out else os.path.join(root, ".git")
-    return os.path.join(gitdir, "hooks", name)
+    return os.path.join(gitdir, "hooks")
+
+
+class Hooks(object):
+    """The hooks directory of ONE guard evaluation, asked of git at most once
+    and only when the evaluation first needs it (task/3039).
+
+    MEASURED BEFORE: `hook_path` asked git once per hook NAME, about 41 times
+    per `helm work claim`, 7,995 times in tests.test_stop_seam. An evaluation
+    (`stale_guard_hooks`, one remedy, `installed_profile`, `install_guard`)
+    makes one of these at its top and hands it down.
+
+    NEVER KEPT ACROSS EVALUATIONS. `core.hooksPath` can change between two of
+    them, and a directory remembered by repository path would then name hooks
+    git no longer runs; the next evaluation asks again."""
+
+    __slots__ = ("root", "_dir")
+
+    def __init__(self, root):
+        self.root = root
+        self._dir = None
+
+    def path(self, name):
+        if self._dir is None:
+            self._dir = hooks_dir(self.root)
+        return os.path.join(self._dir, name)
+
+
+def hook_path(root, name="post-checkout", hooks=None):
+    """The hook Git will actually execute, including a repo-local hooksPath.
+    `hooks` is the caller's evaluation (`Hooks`), when it has one."""
+    return (hooks or Hooks(root)).path(name)
 
 
 HOSTPATH_PUSH_HOOK = _counted("""#!/bin/sh
@@ -1113,14 +1145,15 @@ RAIL_ONLY_HOOKS = tuple(name for name, _t in GUARD_PROFILES["rail"]
                         if name not in {n for n, _t in GUARD_PROFILES["leak"]})
 
 
-def _rail_only_assets(root):
+def _rail_only_assets(root, hooks=None):
     """The scanner snapshots the rail runs and the leak profile does not —
     derived from the profile tables, never a list to keep in step with them."""
-    return sorted(set(_scanner_assets(root, "rail"))
-                  - set(_scanner_assets(root, "leak")))
+    hooks = hooks or Hooks(root)
+    return sorted(set(_scanner_assets(root, "rail", hooks))
+                  - set(_scanner_assets(root, "leak", hooks)))
 
 
-def rail_only_artifacts(root):
+def rail_only_artifacts(root, hooks=None):
     """Every artifact ON DISK that only a rail install puts there.
 
     Three kinds, and the shared pre-commit slot is the one that is easy to
@@ -1145,6 +1178,7 @@ def rail_only_artifacts(root):
     only if the walk ends with no rail artifact found — the one case where
     reading it could have changed the answer.
     """
+    hooks = hooks or Hooks(root)
     found = []
     unreadable = []
 
@@ -1156,14 +1190,14 @@ def rail_only_artifacts(root):
             return ("absent", None, None)
 
     for name in RAIL_ONLY_HOOKS:
-        path = hook_path(root, name)
+        path = hooks.path(name)
         if _owned_hook(snap(path)):
             found.append(path)
-    rail_assets = _rail_only_assets(root)
+    rail_assets = _rail_only_assets(root, hooks)
     for path in rail_assets:
         if snap(path)[0] != "absent":
             found.append(path)
-    shared = hook_path(root, "pre-commit")
+    shared = hooks.path("pre-commit")
     shared_snap = snap(shared)
     if _owned_hook(shared_snap) and shared_snap[0] == "file":
         body = shared_snap[1] or b""
@@ -1175,7 +1209,7 @@ def rail_only_artifacts(root):
     return found
 
 
-def installed_profile(root):
+def installed_profile(root, hooks=None):
     """The profile whose hooks are ACTUALLY ON DISK, or None when this repo
     carries no helm-owned hook at all.
 
@@ -1208,13 +1242,14 @@ def installed_profile(root):
     hook set nobody could open lets the leak profile speak for the rail. The
     shared slots are walked the way the rail-only ones are: an owned slot
     settles it, an unreadable one is raised only when nothing settled it."""
-    if rail_only_artifacts(root):
+    hooks = hooks or Hooks(root)
+    if rail_only_artifacts(root, hooks):
         return "rail"
     unreadable = []
     shared = []
     for name, _template in GUARD_PROFILES["leak"]:
         try:
-            snap = _path_snapshot(hook_path(root, name))
+            snap = _path_snapshot(hooks.path(name))
         except OSError as exc:
             unreadable.append(exc)
             continue
@@ -1260,7 +1295,7 @@ def checked_declaration(root):
     return value
 
 
-def guard_profile(root):
+def guard_profile(root, hooks=None):
     """THE PROFILE A FLAGLESS OPERATION IS ABOUT, resolved in three steps and
     in this order: what this repo DECLARED (git config PROFILE_KEY), else what
     it is RUNNING (`installed_profile`, which reads the hook set on disk), else
@@ -1298,13 +1333,13 @@ def guard_profile(root):
     declared = checked_declaration(root)
     if declared is not None:
         return declared
-    running = installed_profile(root)
+    running = installed_profile(root, hooks)
     if running is not None:
         return running
     return default_profile(root)
 
 
-def _remedy_resolution(root):
+def _remedy_resolution(root, hooks=None):
     """(profile, declared, running) behind a printed remedy: the profile the
     remedy names, what the repo declares (None when nothing), and what its
     hooks on disk are running (None when nothing owned, or unreadable under a
@@ -1334,24 +1369,26 @@ def _remedy_resolution(root):
     declaration, while an undeclared repo whose hook set cannot be read RAISES
     — the leak profile may never speak for a rail nobody could look at, and
     the caller renders the choose-it-yourself form."""
+    hooks = hooks or Hooks(root)
     declared = checked_declaration(root)
     if declared is None:
-        running = installed_profile(root)
+        running = installed_profile(root, hooks)
         return (running or default_profile(root)), None, running
     try:
-        running = installed_profile(root)
+        running = installed_profile(root, hooks)
     except OSError:
         return declared, declared, None
     if running is None or running == declared:
         return declared, declared, running
     planned = [{"name": name} for name, _template in GUARD_PROFILES[declared]]
-    if _narrowing_losses(root, planned, _scanner_assets(root, declared),
-                         running):
+    if _narrowing_losses(root, planned,
+                         _scanner_assets(root, declared, hooks), running,
+                         hooks):
         return running, declared, running
     return declared, declared, running
 
 
-def _remedy_parts(root):
+def _remedy_parts(root, hooks=None):
     """(command, note) — the install command to PRINT at a repo whose guard
     is stale or missing, and the sentence that follows it when the profile it
     names is not the one the repo declares (empty otherwise).
@@ -1361,7 +1398,7 @@ def _remedy_parts(root):
     could not be resolved would hide the finding to protect its footnote. When
     the profile is unresolvable the operator is asked for it."""
     try:
-        profile, declared, running = _remedy_resolution(root)
+        profile, declared, running = _remedy_resolution(root, hooks)
     except Exception:
         return "helm work install-guard --apply --profile rail|leak", ""
     command = "helm work install-guard --apply --profile %s" % profile
@@ -1403,6 +1440,13 @@ def guard_remedy_note(root):
     the command does, and which command narrows on purpose. Kept outside the
     command so the command stays a paste."""
     return _remedy_parts(root)[1]
+
+
+def guard_remedy_and_note(root, hooks=None):
+    """(`guard_remedy`, `guard_remedy_note`) from ONE resolution. A consumer
+    that prints both asked the profile question twice; `hooks` is the
+    evaluation the consumer's own staleness check already made."""
+    return _remedy_parts(root, hooks)
 
 
 def declare_profile(root, profile):
@@ -1710,7 +1754,7 @@ def _hook_scope(root, targets):
     return True, parent
 
 
-def _scanner_assets(root, profile=None):
+def _scanner_assets(root, profile=None, hooks=None):
     """Stable installed snapshot -> source module for each hook scanner.
 
     The hook may be installed FROM a lane, but it must never execute FROM that
@@ -1719,9 +1763,10 @@ def _scanner_assets(root, profile=None):
     The leak profile snapshots only the three scanners its hooks run, so drift
     detection judges what is armed, not the rail's whole shelf.
     """
-    d = os.path.join(os.path.dirname(hook_path(root, "pre-commit")),
+    hooks = hooks or Hooks(root)
+    d = os.path.join(os.path.dirname(hooks.path("pre-commit")),
                      ".helm-scanners")
-    profile = profile or guard_profile(root)
+    profile = profile or guard_profile(root, hooks)
     if profile == "leak":
         return {os.path.join(d, "nevertrack.py"): _scanner_path(),
                 os.path.join(d, "conflict_marker.py"):
@@ -1747,12 +1792,13 @@ def _scanner_assets(root, profile=None):
             os.path.join(d, "hostpath_guard.py"): _hostpath_scanner_path()}
 
 
-def _guard_plan(root, profile=None):
-    profile = profile or guard_profile(root)
+def _guard_plan(root, profile=None, hooks=None):
+    hooks = hooks or Hooks(root)
+    profile = profile or guard_profile(root, hooks)
     base = _base(root)
     if profile == "leak":
-        return base, _leak_plan(root)
-    assets = _scanner_assets(root, profile)
+        return base, _leak_plan(root, hooks)
+    assets = _scanner_assets(root, profile, hooks)
     scanner = next(p for p in assets if p.endswith("/nevertrack.py"))
     vacuous = next(p for p in assets if p.endswith("/vacuous_assertion.py"))
     orphaned = next(p for p in assets if p.endswith("/orphaned_mock.py"))
@@ -1772,7 +1818,7 @@ def _guard_plan(root, profile=None):
     trailer = next(p for p in assets if p.endswith("/trailer_rung.py"))
     plan = []
     for name, template in GUARD_HOOKS:
-        target = hook_path(root, name)
+        target = hooks.path(name)
         user = target + ".helm-user"
         sc = hostpath if name == "pre-push" else scanner
         subs = {"base": shlex.quote(base), "user_hook": shlex.quote(user),
@@ -1802,16 +1848,17 @@ def _guard_plan(root, profile=None):
     return base, plan
 
 
-def _leak_plan(root):
+def _leak_plan(root, hooks=None):
     """The leak profile's hooks, rendered from the same templates and
     snapshot paths the rail uses, so drift detection is one predicate."""
-    assets = _scanner_assets(root, "leak")
+    hooks = hooks or Hooks(root)
+    assets = _scanner_assets(root, "leak", hooks)
     scanner = next(p for p in assets if p.endswith("/nevertrack.py"))
     conflict = next(p for p in assets if p.endswith("/conflict_marker.py"))
     hostpath = next(p for p in assets if p.endswith("/hostpath_guard.py"))
     plan = []
     for name, template in GUARD_PROFILES["leak"]:
-        target = hook_path(root, name)
+        target = hooks.path(name)
         user = target + ".helm-user"
         sc = hostpath if name == "pre-push" else scanner
         subs = {"user_hook": shlex.quote(user),
@@ -1826,7 +1873,7 @@ def _leak_plan(root):
     return plan
 
 
-def stale_guard_hooks(root):
+def stale_guard_hooks(root, hooks=None):
     """[(state, name, why)] for every non-FRESH generated guard hook.
 
     A GUARD THAT IS LANDED BUT NOT INSTALLED IS INERT, and nothing was
@@ -1850,8 +1897,13 @@ def stale_guard_hooks(root):
     both halves (doctor.py:613); this one read only the hooks, which made it
     strictly weaker than the check it was meant to move to a louder surface.
     ONE predicate for both, so the two cannot drift apart again."""
+    hooks = hooks or Hooks(root)
+    # ONE PROFILE FOR THE WHOLE CHECK (task/3039): the plan and the scanner
+    # snapshots below are judged under one resolution, so the two halves of
+    # the check cannot disagree about the profile, and git is asked once.
     try:
-        _base_, plan = _guard_plan(root)
+        profile = guard_profile(root, hooks)
+        _base_, plan = _guard_plan(root, profile, hooks)
     except Exception as exc:
         return [("UNKNOWN", "guard-plan",
                  "cannot render the expected hooks: %s: %s" % (
@@ -1883,7 +1935,7 @@ def stale_guard_hooks(root):
             out.append(("STALE", p["name"],
                         "installed hook is not executable (mode is not 0755) — "
                         "git will not run it"))
-    for snap, source in sorted(_scanner_assets(root).items()):
+    for snap, source in sorted(_scanner_assets(root, profile, hooks).items()):
         name = "scanner:" + os.path.basename(snap)
         try:
             with open(source, "rb") as f:
@@ -2029,7 +2081,7 @@ def _unreadable_running_refusal(root, exc, profile):
             % (PROFILE_KEY, type(exc).__name__, exc, target, slot, PROFILE_KEY))
 
 
-def _narrowing_losses(root, plan, assets, running):
+def _narrowing_losses(root, plan, assets, running, hooks=None):
     """What a target would retire that the RUNNING profile is still using:
     hook slots the running profile plans and this plan does not, plus scanner
     snapshots it runs and this one does not.
@@ -2042,15 +2094,16 @@ def _narrowing_losses(root, plan, assets, running):
     losses = [name for name, _t in GUARD_PROFILES[running]
               if name not in planned]
     losses += sorted(os.path.basename(a) for a in
-                     set(_scanner_assets(root, running)) - set(assets))
+                     set(_scanner_assets(root, running, hooks)) - set(assets))
     return losses
 
 
-def _narrowing_refusal(root, plan, assets, declared, running, profile):
+def _narrowing_refusal(root, plan, assets, declared, running, profile,
+                       hooks=None):
     """The refusal text for a flagless install that would narrow, or None when
     the target retires nothing the running profile uses (leak → rail widens,
     and a widening never needs the operator's permission)."""
-    losses = _narrowing_losses(root, plan, assets, running)
+    losses = _narrowing_losses(root, plan, assets, running, hooks)
     if not losses:
         return None
     said = ("declares %s=%s" % (PROFILE_KEY, declared) if declared
@@ -2102,8 +2155,9 @@ def install_guard(root, apply=False, profile=None):
     # target arrived at by a flagless refresh is the accident this verb must
     # never commit.
     explicit = profile is not None
+    hooks = Hooks(root)
     try:
-        profile = profile or guard_profile(root)
+        profile = profile or guard_profile(root, hooks)
     except ValueError as exc:
         return 1, ["helm work: REFUSED guard install — %s" % exc]
     except OSError as exc:
@@ -2112,8 +2166,8 @@ def install_guard(root, apply=False, profile=None):
         # declaration, and an unreadable hook set surfaced as a traceback out
         # of a verb that had written nothing. One text for both doors.
         return 1, [_unreadable_running_refusal(root, exc, None)]
-    base, plan = _guard_plan(root, profile)
-    assets = _scanner_assets(root, profile)
+    base, plan = _guard_plan(root, profile, hooks)
+    assets = _scanner_assets(root, profile, hooks)
     targets = [p["target"] for p in plan]
     safe, scope = _hook_scope(root, targets)
     if not safe:
@@ -2230,7 +2284,7 @@ def install_guard(root, apply=False, profile=None):
         installed = None
         if declared is None:
             try:
-                installed = installed_profile(root)
+                installed = installed_profile(root, hooks)
             except OSError as exc:
                 return 1, [_unreadable_running_refusal(root, exc, profile)]
         # A FLAGLESS INSTALL MAY NOT NARROW THIS REPO. The resolver above keeps
@@ -2253,12 +2307,12 @@ def install_guard(root, apply=False, profile=None):
         running = installed
         if running is None and declared is not None:
             try:
-                running = installed_profile(root)
+                running = installed_profile(root, hooks)
             except OSError:
                 running = None
         if not explicit and running is not None and running != profile:
             refusal = _narrowing_refusal(root, plan, assets, declared,
-                                         running, profile)
+                                         running, profile, hooks)
             if refusal:
                 return 1, [refusal]
         previous = declared or installed or profile
@@ -2293,7 +2347,7 @@ def install_guard(root, apply=False, profile=None):
         for was in sorted(outgoing - {profile}):
             for name, _template in GUARD_PROFILES[was]:
                 if name not in planned:
-                    path = hook_path(root, name)
+                    path = hooks.path(name)
                     if path not in leaving:
                         leaving.append(path)
         # ARCHIVES BEFORE THE SLOTS THEY EMPTY — the same rule as the retired
@@ -2305,7 +2359,8 @@ def install_guard(root, apply=False, profile=None):
         leaving_users = [path + ".helm-user" for path in leaving]
         leaving_companions = leaving_archives + leaving_users
         orphan_assets = sorted(set().union(
-            *(set(_scanner_assets(root, was)) for was in outgoing)) - set(assets))
+            *(set(_scanner_assets(root, was, hooks))
+              for was in outgoing)) - set(assets))
         asset_paths = sorted(assets)
         retired_paths = [p["retired"] for p in plan]
         paths = (asset_paths + targets + [p["user"] for p in plan]

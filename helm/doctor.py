@@ -1240,7 +1240,62 @@ def _startup_probe(exe=None, repeats=3, run=None):
     return row
 
 
-def check_startup_doors(probe=None):
+# A CHILD LAUNCHED THE WAY A HOOK IS. `bin/helm-hook` skips the site stage
+# only for the helm beside it whose first line is exactly the env shebang, so
+# the probe stands a COPY of the shipped wrapper beside a `helm` that is that
+# shebang plus a report of its own start. The copy walks the same PATH and
+# reads the same interpreter record the hooks do, which is the whole point:
+# the rung measures what the next hook will pay, not what a file says.
+_HOOK_START_CHILD = """#!/usr/bin/env python3
+import json, os, sys
+sys.stdout.write(json.dumps({"no_site": bool(sys.flags.no_site),
+                             "executable": sys.executable,
+                             "pid": os.getpid()}))
+"""
+
+
+def _hook_start_probe(run=None, wrapper=None):
+    """-> whether a hook started now would run the site stage.
+
+    `{"ok": True, "no_site": bool, "executable": str, "pid": int}`, or
+    `{"ok": False, "why": ...}` for every unreadable world. It never writes
+    the interpreter record: the probe child is not helm and ignores the
+    wrapper's request to record, so a miss is REPORTED, never repaired."""
+    import json
+    import shutil
+    import subprocess as sp
+    import tempfile
+    from . import hooks
+    runner = run or sp.run
+    try:
+        src = wrapper or hooks.wrapper_bin()
+        with tempfile.TemporaryDirectory(prefix="helm-doctor-hookstart-") as tmp:
+            door = os.path.join(tmp, hooks.HOOK_WRAPPER)
+            shutil.copy2(src, door)
+            child = os.path.join(tmp, "helm")
+            with open(child, "w", encoding="utf-8") as fh:
+                fh.write(_HOOK_START_CHILD)
+            os.chmod(child, 0o755)
+            env = dict(os.environ,
+                       HELM_HOOK_ALARM_DIR=os.path.join(tmp, "alarm"))
+            got = runner(["sh", door, "lane", "doctor-hook-start",
+                          "SessionStart", "30", "-", child],
+                         capture_output=True, text=True, timeout=60, env=env,
+                         stdin=sp.DEVNULL)
+    except Exception as e:                                     # noqa: BLE001
+        return {"ok": False, "why": "the hook-start child did not run (%s: %s)"
+                % (e.__class__.__name__, e)}
+    try:
+        said = json.loads((got.stdout or "").strip().splitlines()[-1])
+        return {"ok": True, "no_site": bool(said["no_site"]),
+                "executable": str(said["executable"]),
+                "pid": int(said["pid"])}
+    except Exception as e:                                     # noqa: BLE001
+        return {"ok": False, "why": "the hook-start child answered unreadably "
+                                    "(%s: %s)" % (e.__class__.__name__, e)}
+
+
+def check_startup_doors(probe=None, hook_probe=None):
     """The half of the hook budget that lives OUTSIDE this repository.
 
     A per-tool-call hook is a fresh interpreter, so its floor is whatever the
@@ -1263,6 +1318,12 @@ def check_startup_doors(probe=None):
     row is spent only when the child was refused. What that proves is bounded,
     and the row says so: the suite door in a child of THIS interpreter, not the
     guard's pytest or doctest doors and not its loader arms.
+
+    AN EAGER SITE STAGE IS A HOOK COST ONLY IF HOOKS RUN IT. `bin/helm-hook`
+    starts helm with -S once it has an interpreter recorded, so `hook_probe`
+    (production: `_hook_start_probe`) launches a child through a copy of the
+    wrapper and reads whether it ran the site stage. Eager, skipped by hooks
+    and still refusing a suite is OK; eager and paid by hooks stays a WARN.
     """
     try:
         row = (probe or _startup_probe)()
@@ -1278,9 +1339,43 @@ def check_startup_doors(probe=None):
     where = row.get("user_site") or ("this interpreter's own per-version user "
                                      "site directory")
     if row["eager"]:
+        # WHO PAYS IT IS MEASURED TOO (task/3040). bin/helm-hook starts helm
+        # with the site stage skipped once it has an interpreter recorded, and
+        # then an eager site stage is every OTHER python start's cost, not the
+        # hook budget's. Only a child launched the way a hook is can say which.
+        try:
+            hook = (hook_probe or _hook_start_probe)()
+        except Exception as e:                                 # noqa: BLE001
+            hook = {"ok": False, "why": "%s: %s" % (e.__class__.__name__, e)}
+        skips = bool(hook.get("ok") and hook.get("no_site"))
+        if skips and row["refused"]:
+            return [(OK, "interpreter startup: the site stage imports %s at "
+                         "every interpreter start and costs %.0f ms, and NO "
+                         "HOOK PAYS IT: a child launched through bin/helm-hook "
+                         "the way a hook is ran %s with the site stage skipped "
+                         "(-S). Every other python start on this box still "
+                         "pays it, because the machine-local local-suite guard "
+                         "(a usercustomize.py in %s) imports the engines at "
+                         "module scope instead of from a sys.meta_path finder; "
+                         "its teeth are intact: a one-case suite was REFUSED "
+                         "in that child."
+                     % (", ".join(row["eager"]), row["site_ms"],
+                        hook.get("executable") or "its interpreter", where))]
+        if skips:
+            paid = (". Hooks skip it (a child launched through bin/helm-hook "
+                    "ran %s -S), so it is not in the hook budget"
+                    % (hook.get("executable") or "its interpreter"))
+        elif hook.get("ok"):
+            paid = (", which every hook process on this box pays on every "
+                    "tool call: a child launched through bin/helm-hook ran the "
+                    "site stage, because no interpreter is recorded yet for "
+                    "the python3 this PATH finds (the first helm hook through "
+                    "the wrapper records one)")
+        else:
+            paid = (", and whether hook processes pay it is UNKNOWN (%s)"
+                    % hook.get("why", "no reason recorded"))
         return [(WARN, "interpreter startup: the site stage imports %s at EVERY "
-                       "interpreter start and costs %.0f ms, which every hook "
-                       "process on this box pays on every tool call. The "
+                       "interpreter start and costs %.0f ms%s. The "
                        "file that decides this here is the machine-local "
                        "local-suite guard, a usercustomize.py in %s: it must "
                        "install its refusal doors from a sys.meta_path finder "
@@ -1290,7 +1385,7 @@ def check_startup_doors(probe=None):
                        "measured while its author is not, so any other site "
                        "file on the path can produce this reading too. Its "
                        "teeth are %s."
-                 % (", ".join(row["eager"]), row["site_ms"], where,
+                 % (", ".join(row["eager"]), row["site_ms"], paid, where,
                     "intact: a one-case suite was REFUSED in that child"
                     if row["refused"] else
                     "GONE TOO: nothing refused a one-case suite in that child"))]
@@ -2057,6 +2152,13 @@ def check_chat_node():
     if not url:
         return degraded + [(OK, "chat: signed transport disabled "
                                 "(HELM_CHAT_NODE_URL empty) — v1 RAM room only")]
+    # WHICH BINARY THE UNIT RUNS, AND WHERE IT CAME FROM — the line `helm chat
+    # node status` prints. A recorded binary that is gone or changed FAILS:
+    # the `helm chat node up` every row here recommends would refuse.
+    report = _node.binary_report()
+    if report:
+        degraded.append(({"ok": OK, "warn": WARN, "fail": FAIL}[report[0]],
+                         "chat " + chat._safe_reason(report[1])))
     head = chat.node_head(url)
     if head is None:
         # WHY IT IS NOT ANSWERING, WHEN THE UNIT CAN SAY: a node still in its
@@ -2530,11 +2632,11 @@ def check_work_guard(root=None):
     if not current and not owned and not os.path.isdir(root + "-wt"):
         return []
     if stale:
+        remedy, note = _guard.guard_remedy_and_note(root)
         return [(WARN, "git guard rail incomplete in %s — missing/stale: %s; "
                        "`%s` closes it (pre-commit runs the vacuity advisory "
                        "then never-track enforcement)%s"
-                 % (root, ", ".join(stale), _guard.guard_remedy(root),
-                    _guard.guard_remedy_note(root)))]
+                 % (root, ", ".join(stale), remedy, note))]
     return [(OK, "git guard rail current in %s (%s)"
              % (root, ", ".join(current)))]
 
@@ -3702,6 +3804,17 @@ def check_stop_timings(read=None):
             when = ("; no run carries a ladder-start age — a record omits it "
                     "when the field predates it AND when /proc could not be "
                     "read, and this rung cannot tell which")
+        # AND HOW BUSY THE BOX WAS (task/2460): a wall time is CPU times load,
+        # so a ladder that went quiet at load 30 and one that went quiet at
+        # load 2 are different findings. The highest 1-minute load any record
+        # of those runs saw; said only when at least one carries it.
+        loads = [r["load"] for r in unfinished if r.get("load") is not None]
+        if loads:
+            when += ("; the box's 1-minute load while they ran peaked at "
+                     "%.1f-%.1f" % (min(loads), max(loads))
+                     if len(loads) > 1 else
+                     "; the box's 1-minute load while it ran peaked at %.1f"
+                     % loads[0])
         out.append((WARN, "stop timings: %d slow ladder(s) recorded no end — "
                           "last rung observed %s. An END is absent when a run "
                           "was KILLED, is STILL RUNNING, or failed to append "
@@ -4038,6 +4151,118 @@ def check_web_servers():
     return out
 
 
+def check_stop_facts(read=None):
+    """The stop guard's facts, read off the snapshot's own header.
+
+    EVERY STOP READS THIS FILE AND NOTHING ELSE FOR ITS LEDGER AND GIT FACTS.
+    The `helm web` resident writes it (helm/stopfacts_resident.py); when it is
+    absent, too old or written by other code, every claims exemption is
+    refused and every seat holding a lane in gate is held at its stop. That is
+    the safe direction and it is still a fault, so it is a FAIL with the cure,
+    not a note."""
+    from . import stopfacts
+    try:
+        view = (read or stopfacts.read)()
+    except Exception as exc:              # noqa: BLE001 — a rung that cannot
+        return [(WARN, "stop facts: cannot tell (%s)"      # look says so
+                       % type(exc).__name__)]
+    cure = ("the `helm web` resident writes them — restart it with "
+            "`systemctl --user restart helm-web`, or run `helm web`")
+    if view.snap is None:
+        # A HOME THAT NO CONSOLE SERVES is told, not failed — the board rungs'
+        # law: a host serving nothing has nothing to break. A console that
+        # serves THIS home and writes no facts is the resident broken, and
+        # FAILs. Only a server registered in this home's own registry is known
+        # to serve it: the process table also shows consoles of OTHER homes
+        # (a test's, a second install's), and theirs write their own facts.
+        from . import webserve
+        try:
+            serving = sum(1 for x in webserve.live()["servers"]
+                          if x.get("registered"))
+        except Exception:                 # noqa: BLE001 — cannot tell: FAIL
+            serving = None
+        if serving == 0:
+            return [(WARN, "stop facts ABSENT and no `helm web` serves this "
+                           "home: "
+                           "every claims exemption (a lane in gate, a lane "
+                           "approved) is refused at every stop until one "
+                           "does; run `helm web`")]
+        return [(FAIL, "stop facts ABSENT: %s. Every claims exemption is "
+                       "refused until they exist; %s" % (view.absent, cure))]
+    if view.absent and ("refolding" not in view.absent
+                        or not view.resident_alive()):
+        return [(FAIL, "stop facts ABSENT: %s. Every claims exemption is "
+                       "refused; %s" % (view.absent, cure))]
+    if view.absent:
+        # A RESIDENT THAT JUST STARTED OR RE-EXEC'D keeps the facts it found
+        # on disk marked as being refolded, and they carry the policy of the
+        # code before it: that is the re-exec working, not other code.
+        return [(WARN, "stop facts: %s — exemptions wait for its first "
+                       "refresh" % view.absent)]
+    if not view.code_matches():
+        return [_stop_facts_other_code(view, cure)]
+    if not view.resident_alive():
+        return [(WARN, "stop facts as of %ds, but the process that wrote them "
+                       "is gone; they age out at %ds. %s"
+                 % (view.age, stopfacts.HARD_AGE_S, cure))]
+    state, why, _tail = view.ledger()
+    if state != "exact" and (view.age or 0) > 60:
+        return [(WARN, "stop facts: the resident is %ds behind the dispatch "
+                       "ledger (%s) — %s" % (view.age, why, view.headline()))]
+    snap = view.snap
+    return [(OK, "stop facts: %s; %d lease(s), %d seat(s)"
+             % (view.headline(), _rows_in(snap.get("leases")),
+                _rows_in(snap.get("seats"))))]
+
+
+def _rows_in(value):
+    """How many rows a snapshot table holds; a table of the wrong shape (the
+    file is another process's) holds none, and is never raised on."""
+    return len(value) if isinstance(value, dict) else 0
+
+
+def _stop_facts_other_code(view, cure):
+    """The row for facts a resident running OTHER code wrote, naming that
+    resident — and, when it loaded THIS tree and the tree has changed since,
+    saying so: that is the state after a land, and the resident re-execs
+    itself onto the tree (`stopfacts_resident.Leg.reexec`) within seconds.
+    A resident running another checkout is a different fault and says so."""
+    import time as _time
+    from . import stopfacts, stopfacts_resident
+    got = view.snap.get("resident")
+    r = got if isinstance(got, dict) else {}
+    pid, loaded = r.get("pid"), r.get("started_at")
+    if not view.resident_alive():
+        return (FAIL, "stop facts were computed by other code, and the "
+                      "resident that wrote them (pid %s) is gone: every "
+                      "claims exemption is refused; %s" % (pid, cure))
+    here = stopfacts.code_root()
+    if r.get("code_root") != here:
+        return (FAIL, "stop facts were computed by other code: resident pid "
+                      "%s runs %s, not this tree (%s), so every claims "
+                      "exemption is refused until a resident runs this tree; "
+                      "%s" % (pid, r.get("code_root") or "a tree it does not "
+                              "name", here, cure))
+    clock = (lambda s: _time.strftime("%H:%M:%SZ", _time.gmtime(s))
+             if isinstance(s, (int, float)) else "an unrecorded time")
+    newest = stopfacts.source_newest()
+    changed = newest if newest is not None and not (
+        isinstance(loaded, (int, float)) and newest <= loaded) else None
+    since = max(0, int(_time.time() - changed)) if changed else None
+    said = ("resident pid %s loaded its code at %s, older than this tree "
+            "(%s)" % (pid, clock(loaded),
+                      "changed %s, %ds ago" % (clock(changed), since)
+                      if changed else "a source was removed or renamed"))
+    if since is not None and since <= stopfacts_resident.REEXEC_WITHIN_S:
+        return (WARN, "stop facts: %s; it re-execs onto the tree within "
+                      "seconds of a change, and every claims exemption is "
+                      "refused until it has" % said)
+    return (FAIL, "stop facts: %s, and it has not re-exec'd onto it: every "
+                  "claims exemption is refused. Its log says why "
+                  "(`journalctl --user -u helm-web`) — a tree that does not "
+                  "import is never exec'd onto; %s" % (said, cure))
+
+
 def check_seat_physics_currency():
     """Seats running BEHIND their own configuration — the config-vs-RUNNING axis.
 
@@ -4349,7 +4574,7 @@ CHECKS = ("check_home", "check_actuator_wiring", "check_harness_mirror",
           "check_timers", "check_stop_timings", "check_injection_budget",
           "check_fixed_text",
           "check_gitfacts_table", "check_chat_dir_debris", "check_burn_flags",
-          "check_board_reads", "check_web_servers",
+          "check_board_reads", "check_web_servers", "check_stop_facts",
           "check_seat_physics_currency",
           "check_trunk_authority", "check_dispatch_seq_collisions",
           "check_intent_actual",

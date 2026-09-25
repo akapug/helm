@@ -14,7 +14,8 @@ what keep it short.
 ```console
 $ git clone <your-fork-or-origin> helm && cd helm
 $ ./bin/helm --help                          # runs from the checkout, nothing to install
-$ python3 -m unittest discover -s tests      # the full suite; a few minutes
+$ ./bin/helm gate run --focus --plan         # the tests your change can reach; runs nothing
+$ ./bin/helm gate audits                     # the tree-wide audits, as one command
 ```
 
 Optional PATH install (the entry script resolves the package through any
@@ -24,20 +25,95 @@ symlink):
 $ ln -s "$PWD/bin/helm" ~/.local/bin/helm
 ```
 
-The authoritative `helm gate run` uses literal same-process serial unittest
-discovery; only that serial receipt can bind landing authority. `helm gate equiv`
-and `helm/gateshard.py` are diagnostic/observational fresh-worker tools: their
-results cannot mint or bind landing authority.
-
-**Python floor: 3.9+.** The floor is declared in `scripts/install.sh` and the
-README. Run the suite with `python3 -m unittest discover -s tests`, as above.
-Maintainers test on newer interpreters; 3.9 is declared, not CI-tested. The
-one version-gated import — `tomllib`, 3.11+ — is guarded: TOML validation
-degrades to a warning without it.
-
 Tests are `unittest`, not pytest, and never touch your real `~/.helm` or
 harness stores — they point `HELM_HOME` / `HELM_ADOPTED_DIR` at temp dirs.
-New tests must do the same.
+New tests must do the same. The whole suite is
+`python3 -m unittest discover -s tests`. It is long, and in this tree it runs
+once for each landing, as the land gate (below), not once for each change.
+
+**Python floor: 3.9+.** The floor is declared in `scripts/install.sh` and the
+README. Maintainers test on newer interpreters; 3.9 is declared, not
+CI-tested. The one version-gated import — `tomllib`, 3.11+ — is guarded: TOML
+validation degrades to a warning without it.
+
+### How a change is tested
+
+A change is tested by FOCUSED rounds while it is built and reviewed, and by ONE
+whole suite when it lands. In helm's own tree, `helm gate run` enforces that
+split; an adopter project's gate is unchanged.
+
+- **A focused round.** `helm gate run --focus --plan` prints the selection
+  and runs nothing: the test modules whose imports reach a changed module.
+  For a change outside the import graph (a doc, a script), the selection is
+  every tree-wide audit plus each test module that names the file.
+  `helm gate run --focus` runs that selection and mints a focused receipt.
+- **The tree-wide audits, in every round.**
+  `helm gate audits -- <your test modules>` prints one command that runs
+  every audit plus the modules you name. An audit reads the whole tree
+  instead of importing what it judges, so the focused selection for a Python
+  change does not reliably include it. If you skip this step, a new module,
+  verb or docstring reference meets the audits for the first time at the land
+  gate.
+- **A red round.** Cure it and run the focused round again. A whole suite
+  does not run twice on the same tree without a reason: a tree whose last
+  whole-suite receipt is red runs again only with `--again` (a suspected
+  flake), and a tree that already has a green one is refused, with that
+  receipt's evidence line printed for you to cite.
+- **The whole suite belongs to the land gate.** The land gate is one serial
+  whole suite, on the exact tree that lands: the integrator's train. In a lane
+  room, `helm gate run` refuses a whole suite and prints the focused route
+  instead. The escape is `--lane-suite --why TEXT`: the reason goes on the
+  receipt label, and every escape is counted.
+
+What each run can authorize:
+
+| run | receipt | binds | never binds |
+|---|---|---|---|
+| `helm gate run --focus` | focused (v6) | a cure-round verdict (FIX, SUPERSEDE, CONCUR) at the exact tip | an APPROVE, a land |
+| a whole suite with no mode flag in a lane-level room: a peek, a seat's home, a harness worktree, or a lane room admitted by `--lane-suite` | sliced (v10) | a lane tip, a review's APPROVE | a land |
+| a whole suite anywhere else: the shared checkout, a compose or train room, a `train...` label, a Fab job, or `--serial` | serial | a lane tip, an APPROVE, a land | — |
+
+**Sliced is the fast whole suite, and it never lands.** It runs the suite as
+parallel slices of one serial discovery. Every worker must agree on one
+ordered test inventory, and a leak audit fails any module that leaves process
+state behind. What it cannot see is data that one module leaves in a shared
+module object for a module on a different worker. A serial run sees that
+failure and a sliced run can miss it, so every land door refuses the sliced
+kind by name. A lane-level room that cannot run slices (fewer than four CPUs,
+or a tree whose own `helm/gate.py` predates the kind) runs serial and says
+why. `helm gate equiv` and a standalone `helm/gateshard.py` run are diagnostic
+fresh-worker tools: their results cannot mint or bind landing authority.
+
+**Review and landing.**
+
+- A reviewer whose source read is clean, with no whole-suite receipt to cite,
+  HOLDS the row: `helm dispatch hold <row> --source-clean <tip> <reason>`. An
+  APPROVE is refused without a verified `gate:<token>` from a whole suite; it
+  is recorded against the token the land gate mints on the tree that lands. A
+  CONCUR is not a way around that: it endorses the work and authorizes nothing.
+- The integrator's land gate is one serial whole suite for each landing
+  window (one trunk head). The durable road is `helm gate window launch`,
+  which `helm train --apply` and `helm gate run` in a compose room both use.
+  It records the window before it dispatches a keyed job, refuses a second
+  whole suite on the same window, and leaves a detached client that fetches
+  and imports the receipt. The classic road is `fab gate` on a train room
+  that stands outside the compose container. It also runs serial, and its
+  receipt comes home only through the client that launched it, which imports
+  it with `helm gate import`. In a compose room the classic road is refused,
+  and the refusal names the durable one. `--sliced` is a usage error in a
+  compose room and beside a `train...` label.
+
+**Where tests run.** A host can refuse local suites. The fleet's hub is
+agents-only: suites run on the build fabric, and a machine-local guard refuses
+`python3 -m unittest` in any shape. `helm doctor`'s interpreter-startup row
+says whether this interpreter refuses one. On such a host, a focused round
+runs on the remote runner:
+`fab test --repo <room> -- python3 -m unittest <modules>`.
+Its Ran/OK line is testimony and not a receipt: a focused receipt
+routed through `fab gate` cannot come home, because `helm gate import` refuses
+a focused artifact. Whole suites go through `fab gate`, which asks
+`helm gate run --plan` first and so meets every door above. On a machine with
+no such guard, run the same module list with `python3 -m unittest`.
 
 ### Mutation matrix
 
@@ -96,6 +172,10 @@ and exit 2 means the matrix itself was invalid. An unexpected survivor is a
 finding: delete genuinely inert code or add a direct primitive-contract witness
 that kills it; never dismiss it.
 
+The matrix runs its `unittest` children on the machine that starts it, so on a
+host that refuses local suites (see "Where tests run" above), start it where
+suites may run.
+
 ## The laws new code obeys
 
 1. **Zero dependencies.** Stdlib only — no pip, no vendored packages, no
@@ -153,9 +233,10 @@ demands and the exact edit that satisfies it — is
 it (or defend it in `helm/wiring.py`'s `ALLOWED` with a reason), give it a test
 that imports it, keep it stdlib-only, and register whatever your module *does* —
 roster reads, bare seat-name resolution, direct `git` spawns, stores under the
-helm home, new `HELM_*` variables. The Stop hook catches the first of those; the
-rest wait for the whole suite, which is the slowest place in the tree to learn
-anything.
+helm home, new `HELM_*` variables. The Stop hook catches the first of those.
+Tree-wide audits enforce the rest. Run the command `helm gate audits` prints
+in each focused round: a lane that skips it learns them at the land gate's
+whole suite, which is the slowest place in the tree to learn anything.
 
 ## Adding a verb
 
@@ -169,7 +250,9 @@ that by audit).
 
 `compiles` is not done. Before a change lands:
 
-- the full suite passes: `python3 -m unittest discover -s tests`;
+- the focused round and the tree-wide audits pass on your tip, and the whole
+  suite passes at the land gate on the tree that lands (see
+  [How a change is tested](#how-a-change-is-tested));
 - the touched verb was actually run against real (or realistic temp) stores;
 - for web changes, the affected view was exercised in a browser;
 - docs that state the changed behavior were updated in the same change.

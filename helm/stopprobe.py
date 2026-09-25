@@ -13,9 +13,10 @@ told apart in a total. A log the guard writes has none of those properties:
 one writer, one grammar, and a line means an event happened.
 
 WHAT IT RECORDS, AND WHEN IT SAYS NOTHING. A healthy ladder writes nothing at
-all. Recording starts only once a run's total passes SLOW, so the ordinary
-stop -- the median is a few seconds -- pays no write, and the file contains
-only the runs anybody would want to read about.
+all. Recording starts only once a run's total passes SLOW (1 s), so a stop at
+the design target pays no write and the file contains only the runs anybody
+would want to read about. When the threshold was set that was most stops
+(median 7.7 s), which is the population the read-path cure has to move.
 
 WHY PER-BOUNDARY AND NOT ONE SUMMARY AT THE END. The interesting run is the
 one that never reaches its end: the outer timeout kills the guard mid-rung,
@@ -68,7 +69,10 @@ def log_path():
     return os.path.join(home.helm_home(), "helm", "pause-ops",
                         "stopprobe.log")
 
-_DEFAULT_SLOW = 3.0
+# ONE SECOND, NOT THREE (task/3040). At 3.0 s the file kept only the stops
+# that were already an incident, so the shape of a merely slow ladder -- the
+# population a cure has to move from 7 s to under 1 s -- was never recorded.
+_DEFAULT_SLOW = 1.0
 
 
 def threshold_from_env(raw, default):
@@ -99,6 +103,44 @@ def threshold_from_env(raw, default):
 # the median and pay a write on turns that are working correctly.
 SLOW = threshold_from_env(os.environ.get("HELM_STOPPROBE_SLOW"),
                           _DEFAULT_SLOW)
+
+def load1():
+    """The box's one-minute load average, or None when it cannot be read.
+
+    WHY IT RIDES EVERY RECORD (task/2460). A rung's wall time is its CPU times
+    how oversubscribed the box was, and this log recorded only the first
+    factor, so "was that the code or the box" could not be asked of the one
+    file that exists to answer questions about this ladder. One cheap read per
+    record; absent when unreadable, never a zero that claims an idle box."""
+    try:
+        value = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return None
+    if value != value or value < 0 or value == float("inf"):
+        return None
+    return value
+
+
+def snapshot_path():
+    """Where the resident writes the stop-facts projection the guard reads
+    (the resident's write-behind projection): `web_cache._persist_path("stop-facts")`,
+    spelled here without importing the web cache onto the Stop path. A test
+    holds the two spellings equal."""
+    from . import home
+    return os.path.join(home.global_dir(), "web-cache", "stop-facts.json")
+
+
+def snapshot_age(path=None, now=None):
+    """Seconds since the stop-facts projection was last written, or None when
+    there is none. ONE stat, no parse. A modification time in the future is a
+    clock this reading cannot trust, so it is None rather than zero."""
+    try:
+        written = os.stat(path or snapshot_path()).st_mtime
+    except (OSError, ValueError):
+        return None
+    age = (time.time() if now is None else now) - written
+    return age if age >= 0 else None
+
 
 RUNG = "STOP-RUNG"     # a boundary crossed by a run that is already slow
 END = "STOP-END"       # a slow run that reached its own end
@@ -168,6 +210,15 @@ def _write(event, fields, log=None, seat=None, began=None):
     stamped = list(fields)
     if began is not None:
         stamped.append(("began", "%.3f" % began))
+    # THE BOX AND THE SNAPSHOT, read at the instant of the record rather than
+    # once per ladder: the load that matters is the load during the rung that
+    # just ended, and a projection can be rewritten mid-ladder.
+    load = load1()
+    if load is not None:
+        stamped.append(("load", "%.2f" % load))
+    age = snapshot_age()
+    if age is not None:
+        stamped.append(("snap_age", "%.1f" % age))
     return probelog.write(path, event, stamped,
                           required=_REQUIRED[event], known_seat=seat)
 
@@ -211,7 +262,9 @@ _REQUIRED = {RUNG: ("run", "rung", "elapsed", "total"),
              END: ("run", "rung", "total")}
 
 
-_NUMERIC = ("elapsed", "total", "began")
+# `load` is not a duration, but it is held to the same rule: finite and
+# non-negative, or it is uncertainty and never a silent zero.
+_NUMERIC = ("elapsed", "total", "began", "load", "snap_age")
 
 
 def _parse(line):
@@ -270,7 +323,7 @@ def runs(rows):
             seen[key] = {"run": row.get("run", ""), "pid": row.get("pid"),
                          "seat": row.get("seat"), "rungs": [],
                          "ended": False, "total": 0.0, "last": "",
-                         "began_at_age": None}
+                         "began_at_age": None, "load": None}
             order.append(seen[key])
         run = seen[key]
         try:
@@ -291,6 +344,16 @@ def runs(rows):
                 run["began_at_age"] = float(row["began"])
             except (TypeError, ValueError):
                 pass
+        # THE HIGHEST LOAD ANY OF ITS RECORDS SAW, None when none carried it:
+        # the question is whether the box was busy while this ladder ran.
+        if row.get("load") is not None:
+            try:
+                seen_load = float(row["load"])
+            except (TypeError, ValueError):
+                seen_load = None
+            if seen_load is not None:
+                run["load"] = (seen_load if run["load"] is None
+                               else max(run["load"], seen_load))
         if row["event"] == END:
             run["ended"] = True
         else:

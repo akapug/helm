@@ -2,10 +2,15 @@
 """helm seats — stop_guard: the single decision about whether a seat may idle.
 
 ONE FUNCTION, AND ITS SIZE IS THE POINT. Every rung feeds here: inbox, claims,
-leases, beacon, review spiral, seam, NDP, punt, whisper, wiring, claim
-evidence, and the mechanical tail. They resolve in ONE place because a seat
-either stops or it does not, and a posture resolved twice can disagree with
-itself.
+leases, beacon, review spiral, seam, NDP, punt, whisper, wiring and claim
+evidence. They resolve in ONE place because a seat either stops or it does
+not, and a posture resolved twice can disagree with itself.
+
+NO RUNG HERE FOLDS THE DISPATCH LEDGER OR ASKS GIT PER LEASE. Those facts are
+the `helm web` resident's (helm/stopfacts_resident.py), computed with the
+guard's own functions when an input moves, and read here through O(1)
+witnesses (helm/stopfacts.py): an exemption needs EXACT facts, and STALE or
+ABSENT facts keep every block and say why.
 
 THAT LIST IS IN EXECUTION ORDER AND THE ORDER IS LOAD-BEARING. Every rung up
 to `whisper` reads state THIS TURN produced and has one moment to fire;
@@ -30,7 +35,7 @@ import os
 import time
 
 from . import (chat, home, pk, projscope, seats_advice, seats_stop_budget,
-               vcs)
+               stopfacts, vcs)
 from .seats_common import STATUS_BYTES, _clip, _scrub
 from .seats_identity import _delivery_pause, derive_seat, identity_disagreement
 from .seats_roster import seat_for_session
@@ -49,9 +54,8 @@ from .seats_stop_seam import _seam_gate
 from .seats_stop_claims import (LEASE_LATCH,  # noqa: F401
                                 LEASE_TTL_ALARM_S, claims_rung)
 from .seats_work_offer import _stop_whisper
-from .seats_room_advice import (_ROOM_READS, _ROOM_ROWS_SHOWN,
-                                _ledger_snapshot, _missed,
-                                _room_unfinished)
+from .seats_room_advice import (_ROOM_READS, _ROOM_ROWS_SHOWN,  # noqa: F401
+                                _missed, _room_unfinished)
 
 # The four reads `_room_advice` makes, named so a PARTIAL read can say
 # which one is missing rather than shrinking the denominator (task/112).
@@ -164,15 +168,6 @@ def _inbox_clean_line(room, seat, session):
     except Exception:
         pass
     return full
-
-
-#: THE PRODUCER'S TWO REASONS, NAMED ONCE. The room-advice wrapper renders
-#: them inside its own sentence and the guard's arm pins THE CONSTANT, so a
-#: rewording moves both sides together and can never leave the test
-#: asserting a string nothing emits (the seam train16 caught red).
-LEDGER_RESERVE_SPENT = ("the dispatch ledger exceeded its successor "
-                        "reserve; coverage is UNKNOWN")
-LEDGER_RAISED = "the dispatch ledger raised"
 
 
 def _wiring_rung(session, room, seat, blocks=None):
@@ -326,23 +321,25 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
       (b4) BLOCK — an UNTESTED COMPOSITION (_seam_gate): the worktree this seat
           stands in (plus any lane rooms it leases) and another LIVE worktree
           of the same repo under a DIFFERENT holder have both authored the same
-          code file, both halves are VERIFIED by the strongest evidence that
-          repo produces, and nothing has ever run against the two together.
+          code file, both halves' current trees carry an admissible gate
+          receipt, and nothing has ever run against the two together.
           Owner canon 2026-08-23: "two green halves with an untested
           composition ... the biggest failure mode across projects." The signal
           is GIT + /proc — the worktree registry, cwd occupancy, branch diffs —
           with helm bookkeeping added where it exists rather than required,
           because keying on lane rooms was measured BLIND to the very project
-          that asked for the rung. Discharged by an arm run against the
+          that asked for the rung. Discharged only by an arm run against the
           composed tree (the receipt binds the TREE, so it is a set membership,
-          not a story) or by a `Seam: <peer branch>` commit trailer naming who
-          owns the seam. An UNKNOWN peer holder never buys the same-seat
-          exemption. Latched per seam SET, not per tip; an unwritable latch
-          degrades to the WARN; HELM_STOP_GUARD_SEAM=0 disables. It also emits
+          not a story); a commit trailer discharges nothing. An UNKNOWN peer
+          holder never buys the same-seat exemption. Latched per seam SET,
+          not per tip; an unwritable latch degrades to the WARN;
+          HELM_STOP_GUARD_SEAM=0 disables. It also emits
           a WARN-only SEAM RUNG BLIND SPOT line: this rung is keyed on the
           WORKTREE, so seats sharing ONE room are invisible to it, and a seat
           stopping in such a room is told once per arrangement rather than
-          being left to read silence as a clean bill.
+          being left to read silence as a clean bill. The census and the rows
+          are the `helm web` resident's (stop facts); a reading that is not
+          EXACT is one UNKNOWN warn and never a block.
       (c) WHISPER — the contextual continuation lane (_stop_whisper): ONE
           budgeted nudge from the live signals (stuck/dirty counters, the
           verify-grounding rungs — red gate, unverified edits, unbanked
@@ -360,9 +357,10 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
       (d) WARN — clean stop: one line reminding to arm the idle-wake beacon.
           A scan that could not read a room or list the estate is not clean
           and does not get this line.
-      (e) silent mechanical — `helm index cap --apply` best-effort in-process
-          (the documented Stop line, docs/VERBS.md): never blocks, never
-          prints; HELM_STOP_GUARD_INDEX=0 disables.
+      (e) the silent mechanical leg (`helm index cap --apply`, the scratch
+          reaper) is no longer run here: the `helm web` resident runs it every
+          minute (`stopfacts_resident.mechanical`); HELM_STOP_GUARD_INDEX=0
+          still disables it.
     stop_active (the hook JSON's stop_hook_active) suppresses every BLOCK and
     mechanical leg but still surfaces the inbox and claim-evidence WARNs: the
     harness is already continuing, and a WARN cannot re-enter the stop path."""
@@ -456,59 +454,15 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
         timing.done("continuing-inbox")
         return [], surfaced
     pending = []
-    # One append-only dispatch observation is shared by every stop rung.
-    _dispatch_cache = []
-    def _dispatch_snapshot():
-        # THE FAILURE PAIR OBEYS THE PRODUCER'S OWN CONTRACT: AN EMPTY MAPPING
-        # PLUS A REASON, NEVER None. `dispatches.snapshot()` returns `({},
-        # reason)` for a ledger it could not read (`_snapshot`'s unavailable
-        # arm), and two consumers state that shape in their own comments —
-        # `_dispatch_advice`: "AN UNREADABLE LEDGER IS AN EMPTY DICT PLUS A
-        # REASON — never None"; the claims rung's gate exemption: "An
-        # UNAVAILABLE ledger already folds to {} in `snapshot()` ... so the
-        # threaded value never changes an answer, it only stops the second
-        # read." THIS FALLBACK WAS THE ONE PLACE None ENTERED, and it made
-        # that second sentence false about the only stop it describes.
-        #
-        # WHAT IT COST, at seats_stop_claims' gate-exemption call site:
-        # `snap=_snap if isinstance(_snap, dict) else None`, and
-        # `_gate_pending` reads `snap is None` as NO OBSERVATION SUPPLIED and
-        # opens its own `dispatches.rows()` — a SECOND whole ledger fold, once
-        # per held lane lease, on the exact stop where the first fold had just
-        # spent its entire reserve. The rung then has the claims reserve and
-        # nothing else to spend it on: measured from the guard's own probe log
-        # (`helm/stopprobe.py`), the claims rung ends at its 9.5s wall on every
-        # ladder that records it — 131 of 131 in the sample that opened this
-        # lane — behind a dispatch-ledger rung ending at its 7.5s wall on 238
-        # of 238.
-        #
-        # AND IT COULD HAVE WIDENED AN AUTHORISATION, which is the half that
-        # does not depend on any timing. A second read that SUCCEEDS where the
-        # shared one failed lets `_gate_pending` return a triple, and the rung
-        # exempts the lease — "stop allowed, lease retained" — on evidence the
-        # one shared observation could not supply. Whether the guard allows a
-        # stop would then turn on which of two reads of one ledger happened to
-        # finish, which is the non-determinism a single read exists to remove.
-        # With `{}` the exemption falls to `_gate_pending`'s own stated law:
-        # "an unreadable ledger ... returns None and the claims block stands".
-        #
-        # EVERY OTHER CONSUMER IS UNMOVED, because every one of them reads the
-        # REASON before it reads the state: `_dispatch_advice` and
-        # `_room_unfinished` (`if note or not isinstance(snap, dict)`),
-        # `_beacon_obligation`, `review_spiral` and `stop_candidate` (`if
-        # unavailable:`), `_offer_rows` (`elif dispatch_snapshot[1]`). The
-        # gate exemption was the only one keyed on the state's TYPE.
-        if not _dispatch_cache:
-            try:
-                snap = timing.measure(
-                    "dispatch-ledger", _ledger_snapshot, budget=budget,
-                    fallback=({}, LEDGER_RESERVE_SPENT))
-            except projscope.Expired:
-                raise
-            except Exception:
-                snap = ({}, LEDGER_RAISED)
-            _dispatch_cache.append(snap)
-        return _dispatch_cache[0]
+    # ONE READING OF THE STOP FACTS, SHARED BY EVERY RUNG THAT NEEDS A
+    # DISPATCH-LEDGER OR GIT-DERIVED FACT. The ladder no longer folds the
+    # ledger or asks git per lease: the `helm web` resident computes those
+    # facts with the guard's own functions and writes them behind itself
+    # (helm/stopfacts_resident.py); this stop reads them with O(1) witnesses
+    # (helm/stopfacts.py). Read lazily — a stop that asks nothing reads
+    # nothing — once, and never waited for: a reading that is not EXACT keeps
+    # every block and says how old it is.
+    facts = stopfacts.Lazy()
 
     if dispute_warn:
         warns.append(dispute_warn)
@@ -590,12 +544,13 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
 
     budget.run("claims", lambda: claims_rung(
         session, room, seat, blocks=blocks, warns=warns,
-        dispatch_snapshot=_dispatch_snapshot, detail=detail))
+        facts=facts, detail=detail))
     timing.done("claims", "beacon", complete="claims" not in budget.yielded)
     beacon = None
     try:  # the ARMED-BEACON gate — fail-open TOTAL (never wedge a stop)
         beacon = _beacon_block(
-            session, room, seat, dispatch_snapshot=_dispatch_snapshot)
+            session, room, seat,
+            dispatch_snapshot=lambda: facts.view().owed_pair(seat))
     except projscope.Expired:
         raise
     except Exception:
@@ -624,8 +579,8 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
     try:
         spiral, spiral_warn = _spiral_gate(
             session, room, seat,
-            dispatch_snapshot=None if _off("STOP_GUARD_SPIRAL")
-            else _dispatch_snapshot())
+            spiral=None if _off("STOP_GUARD_SPIRAL") or not seat
+            else facts.view().spiral(seat))
     except projscope.Expired:
         raise
     except Exception:
@@ -640,7 +595,7 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
     # the owner's named biggest failure mode across projects (2026-08-23).
     # Latched per seam set; fail-open total.
     budget.run("seam", lambda: _seam_gate(
-        session, room, seat, cwd, blocks=blocks, warns=warns))
+        session, room, seat, cwd, blocks=blocks, warns=warns, facts=facts))
     timing.done("seam", "ndp", complete="seam" not in budget.yielded)
     # THE NON-DISTRACTION-PROTOCOL RUNG. A wide load held with zero
     # delegation all session becomes a conditional block (owner canon
@@ -695,7 +650,8 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
         try:  # fail-closed to NOTHING: whisper trouble = silence, never louder
             w = _stop_whisper(
                 session, room, seat, pending, inbox_blocked, cwd,
-                actor=stop_actor, dispatch_snapshot=_dispatch_snapshot())
+                actor=stop_actor,
+                dispatch_snapshot=facts.view().owed_pair(seat))
         except projscope.Expired:
             raise
         except Exception:
@@ -733,23 +689,11 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
     # Same-state latch, the mechanism every other rung here already uses.
     if not blocks and not pending and not unread:
         warns.append(_inbox_clean_line(room, seat, session))
-    timing.done("claim-evidence", "mechanical")
-    if not _off("STOP_GUARD_INDEX"):
-        try:  # the documented Stop line — silent, best-effort, never a gate
-            from . import store
-            store.index_cap(apply=True)
-        except projscope.Expired:
-            raise
-        except Exception:
-            pass
-        try:  # the scratch reaper's automatic leg — throttled, bounded, silent
-            from . import scratch
-            scratch.auto_gc()
-        except projscope.Expired:
-            raise
-        except Exception:
-            pass
-    timing.done("mechanical")
+    # THE MECHANICAL TAIL (the memory-index cap and the scratch reaper) LEFT
+    # THIS LADDER for the resident's periodic job
+    # (`stopfacts_resident.mechanical`): nothing in it was about the turn that
+    # is ending, and it cost seats seconds at every stop.
+    timing.done("claim-evidence")
     return blocks, warns
 
 

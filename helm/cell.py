@@ -461,11 +461,19 @@ def seat_reading():
     export. `seats.roster_checked()` is the strict reader: a MISSING file is
     still a proven empty roster (a fresh box has no seats), everything else it
     cannot read is a failure, and a failure is reported, never filed as "no
-    seat"."""
+    seat".
+
+    THE NAME MAY BE A ROSTER KEY, AND IT IS VALIDATED BEFORE IT LEAVES.
+    `_self_seat` resolves a live rename alias to the row it names (task/3049),
+    so the name is no longer always the process's own validated
+    HELM_CHAT_NAME. It goes back through the same identifier rule
+    (`home.validate_seat_arg`) before it can become a signer or a refusal's
+    text; a key that fails it is a name this process could not resolve."""
     try:
         from . import seats
         from .meld import _self_seat
         name = (_self_seat() or "").strip()
+        home.validate_seat_arg(name)
     except Exception as exc:
         return "", "this process could not resolve its own seat (%s: %s)" % (
             exc.__class__.__name__, exc)
@@ -484,10 +492,134 @@ def seat_reading():
     return name, ""
 
 
-def signing_identity(explicit=None, *, reading=None):
+def _owner_set():
+    """The owner's names, casefolded, or an empty set when they cannot be
+    read (see `is_owner_cell`). One `owner_names()` call — it can spawn `git
+    config` (~17 ms measured), so a decision reads it once, never per name."""
+    try:
+        from .seats_identity import owner_names
+        return {str(n).strip().casefold() for n in owner_names() or ()}
+    except Exception:                    # noqa: BLE001 — unread is not-owner
+        return set()
+
+
+def is_owner_cell(name, owners=None):
+    """True when `name` is one of the OWNER's names (`seats.owner_names`,
+    casefolded) — the recognition set the owner rails and the web card
+    already use. Never raises: an owner set that cannot be read answers False,
+    which makes the signing gate REFUSE (the safe direction), never swap.
+
+    NOT A BOX CONSTANT. With no authored `owner_name`, `owner_name()` derives
+    from the CWD's git user.name, then the unix login, so on such a box the
+    same process can be recognised in one repo and not in another. Every
+    wrong answer here is a refusal, never an owner signature: a name wrongly
+    NOT recognised keeps today's loud refusal, and a seat wrongly recognised
+    as the owner is exactly what the swap refuses to land on."""
+    cf = str(name or "").strip().casefold()
+    if not cf:
+        return False
+    return cf in (_owner_set() if owners is None else owners)
+
+
+def _admitted_as(seat, admitted=None, admit=True):
+    """(True, None) when the identity layer admits THIS process as `seat`,
+    else (False, why). Never raises.
+
+    `admitted` is an `actors.AdmittedActor` the caller's own door already
+    minted for this process (the CLI post door does, through `_seat_actor`),
+    so the common path runs no second admission. A raw string is not one and
+    is ignored: a name cannot stand in for the capability. Without it, the
+    law is asked through `actors.admitted_name`, which runs every refusal the
+    admission pass runs and WRITES NOTHING. `admit=False` is a reader that
+    discards the refusal anyway (a fleet status panel); it consults nothing."""
+    name = None
+    try:
+        from . import actors
+        if isinstance(admitted, actors.AdmittedActor):
+            name = admitted.canonical_name
+        elif not admit:
+            return False, "this reader does not consult the identity layer"
+        else:
+            name, err, _reason = actors.admitted_name(
+                home.session_id(), act="sign as seat %s" % seat)
+            if not name:
+                return False, err or "the identity layer admitted no seat"
+    except Exception as exc:             # noqa: BLE001 — never-raise gate
+        return False, "the identity layer raised %s: %s" % (
+            exc.__class__.__name__, exc)
+    if str(name).casefold() != str(seat).casefold():
+        return False, ("the identity layer admits this process as %r, not %r"
+                       % (name, seat))
+    return True, None
+
+
+_AMBIENT = object()
+
+
+def _session_dispute(named):
+    """(bound, None) when this process's session is bound to a FLEET ACTOR
+    other than the name it gives itself; (None, why) when the roster cannot
+    say; (None, None) otherwise. Never raises.
+
+    ASKED ONLY WHERE THE OWNER'S PROFILE WOULD OTHERWISE STAND (rule 6 with
+    an owner-name ambient and a session to look up). `seat_reading` names a
+    seat by the name this process gives itself; a HELM_CHAT_NAME that no row
+    holds — a rename alias past its window, a name inherited from another
+    pane — therefore read as "no seat", and the owner's inherited profile
+    signed the row while the SESSION sat bound to a fleet seat (task/3049,
+    the expired-alias arm). The session is the stronger fact: an owner
+    profile never stands for a process the roster binds to a fleet seat."""
+    try:
+        from . import seats, seats_roster
+        sid = home.session_id()
+        rows, failed = seats.roster_checked()
+    except Exception as exc:             # noqa: BLE001 — never-raise gate
+        return None, "the roster read raised %s: %s" % (
+            exc.__class__.__name__, exc)
+    if failed or not isinstance(rows, dict):
+        return None, ("the roster could not be read to rule out that this "
+                      "process's session belongs to a fleet seat")
+    index, _holders = seats_roster.roster_indexes(rows)
+    for bound in seats_roster.seats_for_session_in(index, sid):
+        row = rows.get(bound)
+        if isinstance(row, dict) and row.get("home_room") \
+                and str(bound).casefold() != str(named or "").casefold():
+            from .seats_common import _seat_label
+            return _seat_label(bound), None
+    return None, None
+
+
+def _own_alias(profile, seat):
+    """True when `profile` is `seat`'s OWN old name inside a live rename
+    window — the same actor under its previous label, whose key it already
+    holds. Never raises; an unreadable roster answers False (refuse).
+
+    WHY THIS IS AGREEMENT, NOT A CONFLICT. `seat_reading` resolves a live
+    alias to the renamed row (task/3049), so a seat launched as `old` (profile
+    `old`) and renamed to `new` reads as seat `new` under profile `old`. Before
+    that resolution it read as "no seat" and signed as `old`; calling the same
+    process a CONFLICT now would turn a working seat DEGRADED for the whole
+    window. Past the window the old name is a stranger again and the conflict
+    returns, which is the rename law everywhere else (`seats_common.own_name`).
+    The caller asks this only for a profile that is NOT an owner name, so a
+    seat once renamed away from an owner name can never sign as the owner."""
+    try:
+        from .seats_common import live_alias
+        key, _until = live_alias(profile)
+    except Exception:                    # noqa: BLE001 — never-raise gate
+        return False
+    return bool(key) and str(key).casefold() == str(seat).casefold()
+
+
+def signing_identity(explicit=None, *, reading=None, admitted=None,
+                     admit=True, ambient=_AMBIENT):
     """(profile, refusal) — who this process may sign as, or why it may not.
     Exactly one is non-None. `reading` is a `seat_reading()` result the caller
     already took, so one decision costs one roster read; never build one.
+    `admitted` and `admit` only matter in the owner-export branch below (see
+    `_admitted_as`); that branch alone reads more. `ambient` is the profile
+    the environment names, `signer_profile()` unless a caller holds the exact
+    value its subprocess will read (`cmd_cell`'s mapped DREGG_PROFILE).
 
     THE LAW ALREADY EXISTED AND WAS ENFORCED IN THE WRONG PLACE. `launch.py`
     sets HELM_CELL_PROFILE and DREGG_PROFILE to the seat and says why: "a child
@@ -499,13 +631,18 @@ def signing_identity(explicit=None, *, reading=None):
     signing as the OWNER. Owner-observed. This moves the same law to SIGNING time, which is
     the boundary that actually matters: never trust that the caller checked.
 
-    WHY REFUSE RATHER THAN SIGN AS THE DERIVED SEAT — the integrator's
-    argument, and it is the one that settles the design: signing is
-    CRYPTOGRAPHIC. A seat cannot sign as itself without ITS OWN key material,
-    so "just use the derived identity" is not an available move. The only two
-    outcomes are BORROWING someone else's key or REFUSING, and a row signed
-    with a name its author does not hold the key for is a false claim about a
-    specific person on an append-only ledger. Refusing is the honest one.
+    A SEAT UNDER THE OWNER'S INHERITED PROFILE SIGNS AS ITSELF (task/3049).
+    Refusing is not the only honest move, because "a seat cannot sign as
+    itself without ITS OWN key material" is a false binary: the signing leg's
+    `join --profile <seat>` CREATES the seat's own key when it is missing and
+    reuses it after (dregg-client-sign `resolve_clerk(create=true)`),
+    fee-free. So the choice is never "borrow or refuse" — the seat can sign
+    with its own key. And the owner's profile on a seat is INHERITED BY
+    CONSTRUCTION: every helm launch door sets the profile to the seat itself,
+    none ever sets an owner name, so a seat carrying one got it from the shell
+    (the owner's rc exports it on purpose, for premises he states). Refusing
+    that shape left 29 of 300 measured room rows UNSIGNED, every one under the
+    owner's profile.
 
     PRECEDENCE:
       1. `explicit` — a caller deliberately speaking for someone (`--seat kimi`
@@ -513,20 +650,29 @@ def signing_identity(explicit=None, *, reading=None):
          wins outright and is not a conflict.
       2. a proven seat identity that AGREES with the ambient profile — the
          normal, correctly-launched case.
-      3. DISAGREEMENT between a proven seat identity and the ambient profile —
-         REFUSED, naming both values so the reader can see what was rejected.
-      4. no proven seat identity — the ambient profile stands. This is the
+      3. a proven seat under the OWNER's profile, that the identity layer
+         ADMITS as that same seat — signs as the SEAT. The swap never lands on
+         an owner name (`is_owner_cell(seat)` refuses), so it cannot create an
+         owner signature; it only turns a refusal into the seat's own.
+      4. a proven seat whose profile is its OWN old name inside a live rename
+         window (`_own_alias`) — the same actor's key, so it agrees.
+      5. any other DISAGREEMENT between a proven seat identity and the ambient
+         profile — REFUSED, naming both values. A profile naming ANOTHER SEAT
+         stays loud on purpose: that is the pane-contagion shape, a pane that
+         inherited another seat's exports.
+      6. no proven seat identity — the ambient profile stands. This is the
          population with no seat context, and collapsing it into a refusal
          would strand it unsigned for no benefit.
 
     AN UNREADABLE IDENTITY IS NOT PERMISSION. When the process names a seat
-    and the roster cannot say whether that seat is a fleet actor, rule 4 would
+    and the roster cannot say whether that seat is a fleet actor, rule 6 would
     let the ambient profile stand, and on this box that profile is the owner's.
     So an ambient profile that is not the named seat is REFUSED for that
     window. An ambient profile that IS the named seat needs no roster to be
     safe, and still signs. With no ambient profile the unproven name is never
     used as a signer, so the no-profile answer stands."""
-    ambient, _src = signer_profile()
+    if ambient is _AMBIENT:
+        ambient, _src = signer_profile()
     if explicit:
         return explicit, None
     named, unreadable = reading if reading is not None else seat_reading()
@@ -542,14 +688,45 @@ def signing_identity(explicit=None, *, reading=None):
                       % (why, ambient, ambient, ambient))
     seat = "" if unreadable else named
     if seat and ambient and ambient != seat:
+        # THE REASON THE OWNER'S PROFILE WAS NOT SET ASIDE LEADS: a row's
+        # stamped reason is capped with its MIDDLE elided (chat._safe_reason),
+        # so a clause placed between the diagnosis and the remedy never
+        # reaches the reader who needs it.
+        head = "the environment names profile %r" % ambient
+        owners = _owner_set()
+        if is_owner_cell(ambient, owners):
+            if not is_owner_cell(seat, owners):
+                ok, why = _admitted_as(seat, admitted, admit)
+                if ok:
+                    return seat, None
+                head = ("the environment names the owner's profile %r, which "
+                        "is set aside for a seat only when the identity "
+                        "layer admits this process as that seat — it did "
+                        "not (%s)" % (ambient, why))
+        elif _own_alias(ambient, seat):
+            return ambient, None
         return None, ("identity conflict: this process resolves to seat %r but "
-                      "the environment names profile %r. Signing as %r would "
-                      "attribute this row to someone who did not write it, and "
-                      "signing as %r is impossible without that seat's own key "
-                      "— so it is left UNSIGNED. Relaunch through `helm launch` "
-                      "(which sets both vars to the seat) or pass an explicit "
-                      "profile if you mean to speak for %r."
-                      % (seat, ambient, ambient, seat, ambient))
+                      "%s. Signing as %r would attribute this row to someone "
+                      "who did not write it, so it is left UNSIGNED. Relaunch "
+                      "through `helm launch` (which sets both vars to the "
+                      "seat) or pass an explicit profile if you mean to speak "
+                      "for %r." % (seat, head, ambient, ambient))
+    if not seat and not unreadable and ambient and home.session_id() \
+            and is_owner_cell(ambient):
+        bound, why = _session_dispute(named)
+        if bound or why:
+            return None, ("identity conflict: the environment names the "
+                          "owner's profile %r, but %s. Signing as %r would "
+                          "attribute this row to someone who did not write "
+                          "it, so it is left UNSIGNED. Re-export "
+                          "HELM_CHAT_NAME to the seat this is, relaunch "
+                          "through `helm launch`, or pass an explicit profile "
+                          "if you mean to speak for %r."
+                          % (ambient, why or (
+                              "this process's session is bound to fleet seat "
+                              "%r while it names itself %r — a stale or "
+                              "expired HELM_CHAT_NAME" % (bound, named)),
+                             ambient, ambient))
     return (ambient or seat or None,
             None if (ambient or seat) else "no profile and no derivable seat")
 
@@ -855,14 +1032,17 @@ def node_staleness(repo=None):
     The same check as signer_staleness, for the other binary on the seam. It
     did not exist, and the node sat thousands of commits behind its source
     with no helm surface saying so. The binary is the one `helm chat node up`
-    would run (chatnode.bin_path: HELM_CHAT_NODE_BIN, else dregg-cave-node on
-    PATH, else ~/.local/bin/dregg-cave-node)."""
+    would run (chatnode.bin_resolution: HELM_CHAT_NODE_BIN, else the binary
+    the last `up` recorded, else — only with nothing recorded —
+    dregg-cave-node on PATH, else ~/.local/bin/dregg-cave-node). A record
+    that cannot be honoured is unknown with its own reason, never a staleness
+    reading of whichever binary the PATH offers."""
     from . import chatnode
-    b = chatnode.bin_path()
+    res = chatnode.bin_resolution()
+    b = res["path"] and chatnode.install_path(res["path"])
     if not b or not os.path.isfile(b):
-        return {"state": "unknown", "reason": "no chat node binary found "
-                "(HELM_CHAT_NODE_BIN, dregg-cave-node on PATH, "
-                "~/.local/bin/dregg-cave-node)"}
+        return {"state": "unknown", "reason": res["reason"] or
+                "no chat node binary at %s" % b}
     return _staleness("node", b, repo,
                       "Rebuild and reinstall the node binary (never on the "
                       "agent hub).")
@@ -1365,8 +1545,29 @@ def cmd_cell(args):
         print("helm cell: a2a transport unavailable — %s" % signer["reason"],
               file=sys.stderr)
         return 1
+    env = build_env()
+    # THE PASSTHROUGH ASKS THE SAME GATE AS A POST, when the signer would sign
+    # as the OWNER on the environment's say-so alone. `build_env` maps
+    # HELM_CELL_PROFILE onto DREGG_PROFILE, and dregg-client-sign reads that
+    # var whenever argv carries no `--profile` — so a bare `helm cell send`
+    # from a seat that inherited the owner's export signed as the OWNER, with
+    # no refusal anywhere (task/3049). Now a seat signs as itself, a process
+    # the gate refuses is refused here too, and a process that is not a seat
+    # (the owner's own terminal) is unchanged. `--profile <name>` in argv is
+    # stated intent and the escape hatch; the signer reads it over the env.
+    if "--profile" not in rest:
+        mapped = (env.get("DREGG_PROFILE") or "").strip()
+        if is_owner_cell(mapped):
+            profile, refusal = signing_identity(ambient=mapped)
+            if refusal:
+                print("helm cell: refusing to %s as the owner's profile %r "
+                      "on the environment's say-so — %s (pass --profile "
+                      "<name> to speak for someone deliberately)"
+                      % (verb, mapped, refusal), file=sys.stderr)
+                return 1
+            env["DREGG_PROFILE"] = env["MELD_AGENT_PROFILE"] = profile
     try:
-        return subprocess.call([b, verb] + rest, env=build_env())
+        return subprocess.call([b, verb] + rest, env=env)
     except OSError as exc:
         print("helm cell: a2a transport unavailable — %s" % exc, file=sys.stderr)
         return 1

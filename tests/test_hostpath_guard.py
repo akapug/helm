@@ -31,6 +31,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _PAT = hostpath_guard._HOSTPATH_RE
 _ZERO = "0000000000000000000000000000000000000000"
+# `_visibility` answers for a mocked door: (state, why), why only on UNKNOWN.
+_PRIVATE = (hostpath_guard.PRIVATE, None)
+_PUBLIC = (hostpath_guard.PUBLIC, None)
 
 
 class PatternTest(unittest.TestCase):
@@ -57,7 +60,9 @@ class TestGitRepo(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-hp-")
-        os.environ["HELM_HOSTPATH_SKIP"] = "0"
+        skip = mock.patch.dict(os.environ, {"HELM_HOSTPATH_SKIP": "0"})
+        skip.start()
+        self.addCleanup(skip.stop)
         subprocess.run(["git", "-C", self.tmp, "init", "-q"], check=True)
         subprocess.run(["git", "-C", self.tmp, "config", "user.email",
                         "test@example.com"], check=True)
@@ -126,38 +131,247 @@ class TestGitRepo(unittest.TestCase):
 
 
 class RemoteVisibilityTest(unittest.TestCase):
-    """Public/private detection — UNKNOWN = public (fail safe)."""
+    """The visibility answer is PRIVATE, PUBLIC or UNKNOWN with its cause.
+    Only PRIVATE skips; the caller scans UNKNOWN as if public (fail safe)."""
 
-    def test_unknown_remote_is_public(self):
-        self.assertTrue(hostpath_guard._is_public(None))
-        self.assertTrue(hostpath_guard._is_public(""))
-        self.assertTrue(hostpath_guard._is_public(
-            "git@unknown-host:owner/repo"))
+    def setUp(self):
+        # The retry pause is observed, never slept.
+        self.pause = mock.patch.object(hostpath_guard, "time").start()
+        self.addCleanup(mock.patch.stopall)
 
-    def test_non_github_remote_is_public(self):
-        """gitlab, self-hosted — cannot determine = public."""
-        self.assertTrue(hostpath_guard._is_public(
-            "git@gitlab.com:owner/repo.git"))
+    def test_a_remote_gh_cannot_be_asked_about_is_unknown_without_asking(self):  # noqa: VACUOUS_ASSERTION — the absent pause is read beside five equalities to non-empty UNKNOWN answers, and test_gh_unavailable_is_unknown_after_one_retry is the pause's positive control
+        """No URL, a URL not on GitHub, or no owner/repo: asking again cannot
+        change the answer, so gh never runs and nothing is retried."""
+        cases = {None: "no remote URL", "": "no remote URL",
+                 "git@unknown-host:owner/repo": "not a GitHub URL",
+                 "git@gitlab.com:owner/repo.git": "not a GitHub URL",
+                 "https://github.com/owner": "no owner/repo in the GitHub URL"}
+        with mock.patch.object(hostpath_guard.subprocess, "run",
+                               side_effect=AssertionError("gh ran")):
+            for url, why in cases.items():
+                with self.subTest(url=url):
+                    self.assertEqual(hostpath_guard._visibility(url),
+                                     (hostpath_guard.UNKNOWN, why))
+        self.pause.sleep.assert_not_called()
 
-    def test_github_private_is_not_public(self):
+    def test_github_private_is_private(self):
         with mock.patch.object(hostpath_guard.subprocess, "run") as mr:
             mr.return_value.returncode = 0
             mr.return_value.stdout = json.dumps({"isPrivate": True})
-            self.assertFalse(hostpath_guard._is_public(
-                "git@github.com:owner/private-repo.git"))
+            self.assertEqual(hostpath_guard._visibility(
+                "git@github.com:owner/private-repo.git"), _PRIVATE)
+        self.assertEqual(mr.call_args[0][0], ("gh", "repo", "view",
+                                              "owner/private-repo", "--json",
+                                              "isPrivate"))
 
-    def test_github_public_is_public(self):
+    def test_github_public_is_public(self):  # noqa: VACUOUS_ASSERTION — the absent pause is read beside an equality to the PUBLIC answer and a call count of 1; test_gh_unavailable_is_unknown_after_one_retry is the pause's positive control
         with mock.patch.object(hostpath_guard.subprocess, "run") as mr:
             mr.return_value.returncode = 0
             mr.return_value.stdout = json.dumps({"isPrivate": False})
-            self.assertTrue(hostpath_guard._is_public(
-                "https://github.com/owner/public-repo"))
+            self.assertEqual(hostpath_guard._visibility(
+                "https://github.com/owner/public-repo"), _PUBLIC)
+        self.assertEqual(mr.call_count, 1)
+        self.pause.sleep.assert_not_called()
 
-    def test_gh_unavailable_treats_as_public(self):
+    def test_gh_unavailable_is_unknown_after_one_retry(self):
         with mock.patch.object(hostpath_guard.subprocess, "run") as mr:
             mr.side_effect = OSError("gh not found")
-            self.assertTrue(hostpath_guard._is_public(
-                "git@github.com:owner/repo.git"))
+            self.assertEqual(hostpath_guard._visibility(
+                "git@github.com:owner/repo.git"),
+                (hostpath_guard.UNKNOWN, "cannot run gh (OSError), twice"))
+        self.assertEqual(mr.call_count, 2)
+        self.pause.sleep.assert_called_once_with(
+            hostpath_guard._GH_RETRY_PAUSE)
+
+    def test_an_answer_that_is_not_a_boolean_is_unknown_never_private(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a literal tuple of four answers, each an equality to a non-empty UNKNOWN answer
+        """The old read took a missing isPrivate, and a string "false", as
+        PRIVATE and skipped the scan on an answer gh never gave."""
+        for out in ("{}", '{"isPrivate": "false"}', '{"isPrivate": null}',
+                    "[true]"):
+            with self.subTest(out=out), \
+                    mock.patch.object(hostpath_guard.subprocess, "run") as mr:
+                mr.return_value.returncode = 0
+                mr.return_value.stdout = out
+                self.assertEqual(
+                    hostpath_guard._visibility("git@github.com:o/r.git"),
+                    (hostpath_guard.UNKNOWN,
+                     "gh repo view gave no isPrivate true/false, twice"))
+
+
+# A stand-in `gh`: each call appends its argv to <plan>.calls and plays the
+# next step of the JSON plan (the last step repeats). A step may sleep, print
+# to stdout or stderr, and exit with an rc.
+_GH_STUB = r"""
+import json, os, sys, time
+plan = os.environ["HP_GH_PLAN"]
+with open(plan) as f:
+    steps = json.load(f)
+with open(plan + ".calls", "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+with open(plan + ".calls") as f:
+    n = len(f.readlines())
+step = steps[min(n, len(steps)) - 1]
+time.sleep(step.get("sleep", 0))
+sys.stdout.write(step.get("stdout", ""))
+sys.stderr.write(step.get("stderr", ""))
+sys.exit(step.get("rc", 0))
+"""
+
+
+class StubbedGhRefusalLineTest(unittest.TestCase):
+    """task/3073, MEASURED: a push of main to a PRIVATE repository was
+    refused with "must not be pushed to a PUBLIC remote", and `gh repo view`
+    read isPrivate:true 409 ms later. The guard could not say which gh
+    failure it had turned into PUBLIC.
+
+    Every arm runs the real pre-push entry against a stub `gh` that is the
+    only program on PATH, so the real gh is never reached. The push carries
+    one host path (the scan's git reads are stubbed; the pattern match is
+    real), so each arm ends on the line that decides it: the private skip, or
+    the refusal's last line, which names the visibility answer."""
+
+    URL = "git@github.com:example/leaky.git"
+    ARGV = ["repo", "view", "example/leaky", "--json", "isPrivate"]
+    SKIP = "[helm hostpath] remote 'origin' is private — host-path scan skipped"
+    HEAD = "[helm hostpath] REFUSED: 1 host-path match in outgoing push"
+    LAST = ("[helm hostpath] these match a host filesystem-path pattern and "
+            "must not be pushed to %s")
+    PUBLIC_LINE = LAST % "a PUBLIC remote"
+    UNKNOWN_LINE = LAST % "'origin': visibility UNKNOWN (%s), treated as public"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-hp-gh-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.bindir = os.path.join(self.tmp, "bin")
+        os.mkdir(self.bindir)
+        self.plan = os.path.join(self.tmp, "plan.json")
+
+    def install_gh(self):
+        gh = os.path.join(self.bindir, "gh")
+        with open(gh, "w") as f:
+            f.write("#!%s\n%s" % (sys.executable, _GH_STUB))
+        os.chmod(gh, 0o755)
+
+    def push(self, *steps, timeout=None):
+        """-> (rc, stderr lines, gh argvs, the pause mock)."""
+        with open(self.plan, "w") as f:
+            json.dump(list(steps), f)
+        blob = ("b" * 40, "leak.py", 64)
+        err = io.StringIO()
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.dict(os.environ, {
+                "PATH": self.bindir, "HP_GH_PLAN": self.plan}))
+            st.enter_context(mock.patch(
+                "sys.stdin", io.StringIO("refs/heads/main %s refs/heads/main "
+                                         "%s\n" % ("a" * 40, _ZERO))))
+            st.enter_context(mock.patch.object(
+                hostpath_guard, "_remote_config",
+                return_value=[("remote.origin.url", self.URL)]))
+            st.enter_context(mock.patch.object(
+                hostpath_guard, "_advertised_base", return_value=([], None)))
+            st.enter_context(mock.patch.object(
+                hostpath_guard, "_outgoing_blobs",
+                return_value=([blob], None)))
+            st.enter_context(mock.patch.object(
+                hostpath_guard, "_read_blobs", return_value=iter(
+                    [(blob[0], b'H = "/home/test-user/secret"\n')])))
+            pause = st.enter_context(mock.patch.object(hostpath_guard,
+                                                       "time"))
+            if timeout is not None:
+                st.enter_context(mock.patch.object(
+                    hostpath_guard, "_GH_TIMEOUT", timeout))
+            st.enter_context(contextlib.redirect_stderr(err))
+            rc = hostpath_guard.main(["--pre-push", "origin", self.URL])
+        calls = self.plan + ".calls"
+        argvs = []
+        if os.path.exists(calls):
+            with open(calls) as f:
+                argvs = [json.loads(line) for line in f]
+        return rc, err.getvalue().splitlines(), argvs, pause.sleep
+
+    def assert_refused_unknown(self, rc, lines, why):
+        self.assertEqual(rc, 1, lines)
+        self.assertIn(self.HEAD, lines)
+        self.assertEqual(lines[-2], self.UNKNOWN_LINE % why)
+        self.assertNotIn(self.PUBLIC_LINE, lines)
+
+    def test_private_skips_the_scan(self):
+        self.install_gh()
+        rc, lines, argvs, pause = self.push({"stdout": '{"isPrivate":true}'})
+        self.assertEqual((rc, lines), (0, [self.SKIP]))
+        self.assertEqual(argvs, [self.ARGV])
+        pause.assert_not_called()
+
+    def test_public_refuses_and_says_public(self):
+        self.install_gh()
+        rc, lines, argvs, pause = self.push({"stdout": '{"isPrivate":false}'})
+        self.assertEqual(rc, 1, lines)
+        self.assertIn(self.HEAD, lines)
+        self.assertEqual(lines[-2], self.PUBLIC_LINE)
+        self.assertEqual(argvs, [self.ARGV])
+        pause.assert_not_called()
+
+    def test_a_nonzero_gh_exit_refuses_as_unknown_and_never_prints_gh(self):
+        self.install_gh()
+        rc, lines, argvs, pause = self.push(
+            {"rc": 1, "stderr": "HTTP 502: Bad Gateway (example/leaky)\n"})
+        self.assert_refused_unknown(rc, lines, "gh repo view exited 1, twice")
+        self.assertEqual(argvs, [self.ARGV, self.ARGV])
+        pause.assert_called_once_with(hostpath_guard._GH_RETRY_PAUSE)
+        self.assertFalse([ln for ln in lines if "502" in ln or
+                          "example/leaky" in ln], lines)
+
+    def test_a_gh_timeout_refuses_as_unknown(self):
+        self.install_gh()
+        rc, lines, argvs, pause = self.push({"sleep": 30}, timeout=0.5)
+        self.assert_refused_unknown(
+            rc, lines, "gh repo view timed out after 0.5s, twice")
+        self.assertEqual(argvs, [self.ARGV, self.ARGV])
+        pause.assert_called_once_with(hostpath_guard._GH_RETRY_PAUSE)
+
+    def test_no_gh_on_path_refuses_as_unknown(self):
+        """No stub installed: PATH holds nothing, so running gh is an
+        OSError."""
+        rc, lines, argvs, pause = self.push({"rc": 0})
+        self.assert_refused_unknown(
+            rc, lines, "cannot run gh (FileNotFoundError), twice")
+        self.assertEqual(argvs, [])
+        pause.assert_called_once_with(hostpath_guard._GH_RETRY_PAUSE)
+
+    def test_output_that_is_not_json_refuses_as_unknown(self):
+        self.install_gh()
+        rc, lines, argvs, pause = self.push({"stdout": "isPrivate: true\n"})
+        self.assert_refused_unknown(rc, lines, "gh repo view printed no JSON, "
+                                               "twice")
+        self.assertEqual(argvs, [self.ARGV, self.ARGV])
+
+    def test_two_different_failures_are_both_named(self):
+        self.install_gh()
+        rc, lines, argvs, _pause = self.push({"rc": 4}, {"sleep": 30},
+                                             timeout=0.5)
+        self.assert_refused_unknown(
+            rc, lines, "gh repo view exited 4, then gh repo view timed out "
+                       "after 0.5s")
+        self.assertEqual(len(argvs), 2)
+
+    def test_the_measured_push_a_failed_first_probe_whose_retry_answers(self):
+        """The measured push replayed: the first probe fails, the retry reads
+        isPrivate:true, and the push goes through as PRIVATE."""
+        self.install_gh()
+        rc, lines, argvs, pause = self.push(
+            {"rc": 1}, {"stdout": '{"isPrivate":true}'})
+        self.assertEqual((rc, lines), (0, [self.SKIP]))
+        self.assertEqual(argvs, [self.ARGV, self.ARGV])
+        pause.assert_called_once_with(hostpath_guard._GH_RETRY_PAUSE)
+
+    def test_a_failed_first_probe_whose_retry_says_public_refuses_as_public(
+            self):
+        self.install_gh()
+        rc, lines, argvs, _pause = self.push(
+            {"rc": 1}, {"stdout": '{"isPrivate":false}'})
+        self.assertEqual(rc, 1, lines)
+        self.assertEqual(lines[-2], self.PUBLIC_LINE)
+        self.assertEqual(len(argvs), 2)
 
 
 class CliTest(unittest.TestCase):
@@ -446,8 +660,8 @@ class PushIdentityFromGitArgvTest(unittest.TestCase):
                                side_effect=AssertionError(
                                    "name resolution must not run when git "
                                    "supplied the URL")):
-            with mock.patch.object(hostpath_guard, "_is_public",
-                                   return_value=False) as vis:
+            with mock.patch.object(hostpath_guard, "_visibility",
+                                   return_value=_PRIVATE) as vis:
                 rc, err = self._run(
                     ["--pre-push", "aspublic",
                      "git@github.com:example/staging.git"])
@@ -462,8 +676,8 @@ class PushIdentityFromGitArgvTest(unittest.TestCase):
         not outrank what git measured about THIS push."""
         with mock.patch.object(hostpath_guard, "_remote_url",
                                side_effect=AssertionError("no resolution")):
-            with mock.patch.object(hostpath_guard, "_is_public",
-                                   return_value=False):
+            with mock.patch.object(hostpath_guard, "_visibility",
+                                   return_value=_PRIVATE):
                 rc, err = self._run(
                     ["--pre-push", "aspublic", "git@github.com:e/s.git"],
                     env={"HELM_HOSTPATH_REMOTE": "somewhere-else"})
@@ -476,8 +690,8 @@ class PushIdentityFromGitArgvTest(unittest.TestCase):
         (and the env override) must keep working — with name resolution."""
         with mock.patch.object(hostpath_guard, "_remote_url",
                                return_value="git@github.com:e/priv.git") as res:
-            with mock.patch.object(hostpath_guard, "_is_public",
-                                   return_value=False):
+            with mock.patch.object(hostpath_guard, "_visibility",
+                                   return_value=_PRIVATE):
                 rc, err = self._run(["--pre-push"])
         self.assertEqual(rc, 0)
         res.assert_called_once()
@@ -489,8 +703,8 @@ class PushIdentityFromGitArgvTest(unittest.TestCase):
         private URL SCANS on a public one — proving the visibility answer
         drives the scan rather than decorating it. The object walk is stubbed
         empty so no fixture repo is needed; the note says scanned-0-files."""
-        with mock.patch.object(hostpath_guard, "_is_public",
-                               return_value=True):
+        with mock.patch.object(hostpath_guard, "_visibility",
+                               return_value=_PUBLIC):
             with mock.patch.object(hostpath_guard, "_outgoing_blobs",
                                    return_value=([], None)), \
                     mock.patch.object(hostpath_guard, "_advertised_base",
@@ -1233,8 +1447,8 @@ class PushUrlCredentialsNeverPrintTest(_PushSandbox):
         for url in CRED_URLS:
             for name, label in ((url, "a URL remote"), ("origin", "'origin'")):
                 with self.subTest(url=url, name=label), \
-                        mock.patch.object(hostpath_guard, "_is_public",
-                                          return_value=False):
+                        mock.patch.object(hostpath_guard, "_visibility",
+                                          return_value=_PRIVATE):
                     rc, err = self.main(name, url)
                     _hits, notes = hostpath_guard.scan_push(
                         self.root, _ZERO, self.head, name, remote_url=url)

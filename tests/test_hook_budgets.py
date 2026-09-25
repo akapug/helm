@@ -62,9 +62,20 @@ BUDGETS = {
     # the ceiling covers the constant prose plus a wide act.
     "PreToolUse/refusal-ci-runner": 470,
     "PreToolUse/refusal-sidechain-beacon": 460,
+    # The delegate authority refusal (task/3060): the verb, why a delegate's
+    # write is the seat's, the parent, the advisory route and the grant.
+    "PreToolUse/refusal-sidechain-authority": 480,
     # The agent-model refusal: the fact, three doors and the premise pointer,
     # with the flag's value echoed at most AGENT_MODEL_ECHO characters wide.
     "PreToolUse/refusal-agent-model": 460,
+    # The env-dump refusal (task/3037): what the command prints, its spelling
+    # capped at chat._ENV_SPELL, and the cure for that kind.
+    "PreToolUse/refusal-env-dump": 420,
+    # The shared-checkout refusal (task/3057): the verb capped at
+    # chat._TREE_SPELL, the checkout it would run in, the same verb spelled
+    # with the lane under that checkout, and the integrator's declaration.
+    # The path is said twice, so the ceiling holds an 80-character top.
+    "PreToolUse/refusal-shared-checkout": 580,
     # PreToolUse pass-path steers, once per (session, steer).
     "PreToolUse/steer": 450,
     # PreToolUse pass path, EVERYTHING one call is handed at once. The lines
@@ -220,6 +231,21 @@ class StaticMessageBudgetTest(BudgetAssertion):
             "[helm argv-guard] BLOCKED: "
             + actors.sidechain_beacon_refusal("a-long-seat-name") + ".")
 
+    def test_pretooluse_sidechain_authority_refusal_for_every_verb(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), and the table is asserted non-empty first
+        """Every refused verb, rendered through the shipped refusal, grantable
+        and not: the verb is interpolated twice, so the longest one bounds
+        the line."""
+        from helm import delegate_grant
+        self.assertTrue(delegate_grant.REFUSED)
+        for group, verb in delegate_grant.REFUSED:
+            with self.subTest(verb=verb):
+                self.assert_within(
+                    "PreToolUse/refusal-sidechain-authority",
+                    "[helm argv-guard] BLOCKED: "
+                    + actors.sidechain_authority_refusal(
+                        "%s %s" % (group, verb),
+                        (group, verb) in delegate_grant.GRANTABLE))
+
     def test_pretooluse_agent_model_refusal_at_its_widest_value(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), and the widest witness is first asserted to echo exactly the cut
         """Every model name the Agent tool offers, and a value far past the
         cut. The cut is what bounds the line, so the widest render is drawn
@@ -237,6 +263,27 @@ class StaticMessageBudgetTest(BudgetAssertion):
         # one character in is one character out, whatever the character
         self.assertEqual(len(chat.agent_model_message("\x00" * 500)),
                          len(text))
+
+    def test_pretooluse_env_dump_refusal_for_every_kind(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
+        """Every kind the rung names, at the widest spelling it can carry.
+        The kinds are read from the shipped table, so a kind added tomorrow
+        is inside this arm the moment it lands."""
+        self.assertEqual(set(chat._ENV_WHAT), set(chat._ENV_CURE))
+        self.assertGreaterEqual(len(chat._ENV_WHAT), 6)
+        for kind in chat._ENV_WHAT:
+            with self.subTest(kind=kind):
+                self.assert_within("PreToolUse/refusal-env-dump",
+                                   chat.env_dump_message(
+                                       (kind, "x" * chat._ENV_SPELL)))
+
+    def test_pretooluse_shared_checkout_refusal_at_its_widest(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
+        """An 80-character checkout and a spelling at the cap. The cap is
+        read from the shipped constant, so the widest render is drawn
+        through the renderer rather than typed."""
+        top = "/home/" + "d" * 74
+        text = chat.shared_checkout_message((top, "x" * chat._TREE_SPELL))
+        self.assertEqual(text.count(top), 2)
+        self.assert_within("PreToolUse/refusal-shared-checkout", text)
 
     def test_every_shipped_argv_steer(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
         """The SHIPPED table, not a sample of it: a new steer added tomorrow

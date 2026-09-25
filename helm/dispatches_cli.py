@@ -496,6 +496,98 @@ def _collisions(rest):
     return 0
 
 
+_RETRACT_USAGE = ("usage: helm dispatch retract <id-or-unique-prefix> --reason R "
+                  "--reads source-clean|fix|supersede|unknown "
+                  "--measured|--inferred [--reissue|--successor ID] [--json]  "
+                  "(withdraw a wrong verdict's authority without rewriting "
+                  "it; the verdict's author seat, the integrator or the owner "
+                  "only)")
+
+
+def _cmd_retract(rest):
+    """`helm dispatch retract` (task/3060): parse, call `dispatches.retract`,
+    and say what now carries the review."""
+    valued = {"--reason": None, "--reads": None, "--successor": None}
+    bare = {"--measured", "--inferred", "--reissue", "--json"}
+    pos, seen = [], set()
+    i = 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg in ("-h", "--help"):
+            print(_RETRACT_USAGE)
+            return 0
+        if arg in valued:
+            if i + 1 >= len(rest) or rest[i + 1].startswith("--"):
+                print("helm dispatch retract: %s wants a value" % arg,
+                      file=sys.stderr)
+                return 2
+            valued[arg] = rest[i + 1]
+            i += 2
+            continue
+        if arg in bare:
+            seen.add(arg)
+        elif arg.startswith("--"):
+            print("helm dispatch retract: unknown option %s (%s)"
+                  % (arg, _RETRACT_USAGE), file=sys.stderr)
+            return 2
+        else:
+            pos.append(arg)
+        i += 1
+    if len(pos) != 1:
+        print(_RETRACT_USAGE, file=sys.stderr)
+        return 2
+    for flag, what in (("--reason", "why the verdict was wrong"),
+                       ("--reads", "what the review now reads")):
+        if not valued[flag]:
+            print("helm dispatch retract: %s is required (%s)" % (flag, what),
+                  file=sys.stderr)
+            return 2
+    bases = sorted(seen & {"--measured", "--inferred"})
+    if len(bases) != 1:
+        print("helm dispatch retract: declare exactly one basis, --measured or "
+              "--inferred (how you know the verdict was wrong)",
+              file=sys.stderr)
+        return 2
+    if "--reissue" in seen and valued["--successor"]:
+        print("helm dispatch retract: --reissue mints the successor and "
+              "--successor names an existing one: pass one", file=sys.stderr)
+        return 2
+    row, why = dispatches.retract(
+        pos[0], valued["--reason"], valued["--reads"], bases[0][2:],
+        reissue="--reissue" in seen, successor=valued["--successor"])
+    if why:
+        print("helm dispatch: " + why, file=sys.stderr)
+        return 1
+    if "--json" in seen:
+        print(json.dumps(row, sort_keys=True, default=str))
+        return 0
+    successor = str(row.get("retract_successor") or "")
+    print("helm dispatch: %s — VERDICT %s RETRACTED by @%s (%s); reads %s (%s)"
+          % (row["id"], str(row.get("retracted_polarity") or "?").upper(),
+             row.get("retract_seat") or "?", row.get("retract_role") or "?",
+             str(row.get("retract_reads") or "?").upper(),
+             row.get("retract_basis") or "?"))
+    if successor:
+        print("helm dispatch: successor %s carries the review (@%s)"
+              % (successor, row.get("recipient") or "?"))
+        if row.get("retract_reads") == "source-clean":
+            # THE CLAIM HAS A HOME. A source-clean reading waits on the
+            # integrator's land gate, and the hold is where the integrator's
+            # own listing finds it.
+            print("helm dispatch: to record the clean read where the "
+                  "integrator finds it: helm dispatch hold %s --source-clean "
+                  "%s <reason>" % (successor[:12], row.get("reviewed_tip")
+                                   or "<tip>"))
+    else:
+        print("helm dispatch: no successor carries the review; re-request it "
+              "with `helm dispatch send %s %s --ref %s --kind %s --supersedes "
+              "%s` (body on stdin)"
+              % (row.get("recipient") or "<reviewer>",
+                 row.get("lane") or "<lane>", row.get("tip") or "<tip>",
+                 row.get("kind") or "review", row["id"][:12]))
+    return 0
+
+
 def _cmd_dispatch(args):
     args = list(args or [])
     if not args or args[0] in ("-h", "--help"):
@@ -725,12 +817,15 @@ def _cmd_dispatch(args):
             # invocation typed would describe a brief that was never stored.
             nbytes = row.get("brief_bytes")
             if isinstance(nbytes, int):
+                kept = dispatches._cut_kept_bytes(row.get("body"))
+                kept_str = "%d" % kept if isinstance(kept, int) else "fewer than %d" % dispatches.MESSAGE_BODY_CAP
                 print("helm dispatch: brief %d bytes, stored whole by "
                       "reference%s" % (
                           nbytes,
-                          " (%d over the %d-byte row cap, so the row's own "
-                          "copy is bounded)"
-                          % (nbytes - dispatches.MESSAGE_BODY_CAP, dispatches.MESSAGE_BODY_CAP)
+                          " (%d over the %d-byte row cap; the recipient sees "
+                          "the first %s bytes unless it follows the reference)"
+                          % (nbytes - dispatches.MESSAGE_BODY_CAP,
+                             dispatches.MESSAGE_BODY_CAP, kept_str)
                           if nbytes > dispatches.MESSAGE_BODY_CAP else ""))
             else:
                 # NO REFERENCE MEANS A ROW FROM BEFORE THIS STORE — a
@@ -858,6 +953,8 @@ def _cmd_dispatch(args):
                          if cap["evidence"] == "read-failed"
                          else "no seat has joined this box yet"))
         return 0
+    if verb == "retract":
+        return _cmd_retract(rest)
     if verb == "verdict":
         # Polarity is a FLAG, not a positional, so it can never be swallowed by
         # the free-text evidence tail. Omitting it is REFUSED for a new write —
@@ -1626,10 +1723,27 @@ def _cmd_dispatch(args):
             if problem:
                 print("  " + problem)
             if brief:
-                print("  BRIEF (as sent, %s):"
-                      % ("stored whole, read by reference" if not problem
-                         and row.get("brief_ref") is not None
-                         else "stored on the row"))
+                is_ref_read = not problem and row.get("brief_ref") is not None
+                is_cut = dispatches.brief_was_cut(row) or dispatches.BODY_TRUNCATED_MARK in brief
+                if is_ref_read:
+                    label = "as sent, stored whole, read by reference"
+                elif is_cut:
+                    kept = dispatches._cut_kept_bytes(brief) or len(brief.encode("utf-8"))
+                    sent = dispatches._cut_sent_bytes(brief) or row.get("brief_bytes")
+                    if sent and kept:
+                        label = "TRUNCATED bounded copy, %d of %d bytes stored on the row" % (kept, sent)
+                    else:
+                        label = "TRUNCATED bounded copy stored on the row"
+                else:
+                    label = "as sent, stored on the row"
+                print("  BRIEF (%s):" % label)
+                # Only the NOTICE carries the `<id>` placeholder helm wrote; the
+                # brief above it is the sender's own words, and briefs quote
+                # `<id>` as an instruction, so the substitution never reaches it.
+                head, mark, notice = brief.rpartition(dispatches.BODY_TRUNCATED_MARK)
+                if mark:
+                    brief = head + mark + notice.replace(
+                        "<id>", str(row.get("id") or "")[:12])
                 for line in brief.splitlines():
                     print("    " + line)
             elif absent == dispatches.BODY_UNRECORDED:

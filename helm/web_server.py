@@ -517,6 +517,11 @@ def cmd_web(args):
     _prewarm_configs()
     _prewarm_board()
     bound = srv.server_address[1]
+    # THE STOP GUARD'S FACTS ARE COMPUTED HERE AND READ BY EVERY SEAT'S STOP
+    # HOOK (helm/stopfacts_resident.py). Off the serve path like the prewarms:
+    # a daemon thread, and a failure costs stale stop facts, never a server.
+    from . import stopfacts_resident
+    stopfacts_resident.start(port=bound)
     url = "http://%s:%d/" % (BIND, bound)
     print("helm web ⎈ %s  (Ctrl-C to stop)" % url)
     # SAY THAT THIS SERVER EXISTS. Without this, nothing in helm knows one is

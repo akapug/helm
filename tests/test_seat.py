@@ -3350,27 +3350,52 @@ sys.exit(int(os.environ.get("HELM_TEST_RC", "0")))
         self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, ()), mask)
 
     def test_launch_owner_keeps_forward_signals_blocked_through_disarm(self):
-        """A pending TERM cannot pre-empt the reset after the child is reaped."""
+        """A pending TERM cannot pre-empt the reset after the child is reaped.
+
+        IN ITS OWN INTERPRETER, because the TERM goes to the process that runs
+        the owner, and in the suite that process is the suite runner. A signal
+        mask is per THREAD: while any other thread is alive, the kernel gives a
+        process-directed TERM to that thread, the owner's forwarding handler
+        runs during disarm, and the owner re-raises TERM on itself with the
+        default action. MEASURED (task/3070): train198's whole-suite gate died
+        that way part-way through the suite, receipt rc 241 (-15 through the
+        gate supervisor), its stderr ending on the fork warning this test's
+        run() prints, and the gate refused it as UNKNOWN. Reproduced on the
+        same steps: with one sleeping thread alive, 2 of 5 runs died of TERM;
+        with none, 0 of 5. Here only the helper can die, and it is
+        single-threaded, so the mask the owner sets is the mask that holds."""
         from helm import seat_launch_owner
-        events = []
-        prior_handler = signal.signal(
-            signal.SIGTERM, lambda _sig, _frame: events.append("term"))
-        prior_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK,
-                                            (signal.SIGTERM,))
-        self.addCleanup(signal.signal, signal.SIGTERM, prior_handler)
-        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, prior_mask)
+        helper = """
+import importlib.util
+import os
+import signal
+import sys
 
-        def disarm(_done):
-            mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
-            self.assertIn(signal.SIGTERM, mask,
-                          "TERM was unblocked before terminal cleanup")
-            events.append("disarm-start")
-            os.kill(os.getpid(), signal.SIGTERM)
-            events.append("disarm-end")
+spec = importlib.util.spec_from_file_location('_helm_seat_launch_owner_test',
+                                              sys.argv[1])
+owner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(owner)
+events = []
+signal.signal(signal.SIGTERM, lambda _sig, _frame: events.append('term'))
+signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGTERM,))
 
-        with mock.patch.object(seat_launch_owner, "_disarm", disarm):
-            self.assertEqual(seat_launch_owner.run(["/bin/true"]), 0)
-        self.assertEqual(events, ["disarm-start", "disarm-end", "term"])
+def disarm(_done):
+    if signal.SIGTERM not in signal.pthread_sigmask(signal.SIG_BLOCK, ()):
+        events.append('TERM-UNBLOCKED-BEFORE-CLEANUP')
+    events.append('disarm-start')
+    os.kill(os.getpid(), signal.SIGTERM)
+    events.append('disarm-end')
+
+owner._disarm = disarm
+rc = owner.run(['/bin/true'])
+print('RESULT', rc, ','.join(events), flush=True)
+"""
+        proc = subprocess.run(
+            [sys.executable, "-I", "-c", helper, seat_launch_owner.__file__],
+            cwd=self.tmp, capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(),
+                         "RESULT 0 disarm-start,disarm-end,term", proc.stderr)
 
     def test_launch_sh_disarms_once_after_zero_and_nonzero_harness_exit(self):
         """Normal and crashed/nonzero exits keep their status and sanitize once."""

@@ -163,6 +163,13 @@ _ID_SPAN = 512         # CLIENT_ID to OAUTH_FILE_SUFFIX measured ~100 bytes
 
 _identity_cache = {}
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_identity_cache": (
+        "keyed by CLI path, size and mtime; a changed binary misses"),
+}
+
 
 def _version_key(name):
     return tuple(int(p) if p.isdigit() else -1 for p in name.split("."))

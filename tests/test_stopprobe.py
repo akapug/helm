@@ -232,7 +232,7 @@ class StopProbeReadTest(unittest.TestCase):
 
     def test_a_malformed_env_threshold_never_raises_at_IMPORT(self):
         for raw in ("x", "", "nan", "inf", "-1", None):
-            self.assertEqual(stopprobe.threshold_from_env(raw, stopprobe._DEFAULT_SLOW), 3.0, repr(raw))
+            self.assertEqual(stopprobe.threshold_from_env(raw, stopprobe._DEFAULT_SLOW), 1.0, repr(raw))
         # POSITIVE CONTROL: a legitimate value IS honoured, so the default
         # above is a rejection and not a function that ignores its argument.
         self.assertEqual(stopprobe.threshold_from_env("7.5", stopprobe._DEFAULT_SLOW), 7.5)
@@ -372,9 +372,13 @@ class StopProbeAgeRungTest(unittest.TestCase):
     def rung(self, rows, err=None):
         return doctor.check_stop_timings(read=lambda: (rows, err))
 
+    # A SEAM THAT FITS ITS PIN. These arms are about the ladder-start age,
+    # not the pin read-back beside it, so each rung stays under the seam's
+    # fitted cost (0.1s since it reads the resident's facts, task/3042) and
+    # the pin line cannot join the rung's output.
     def _row(self, run, total, began):
         row = {"event": stopprobe.RUNG, "pid": "7", "seat": "s", "run": run,
-               "rung": "seam", "elapsed": "5.0", "total": total}
+               "rung": "seam", "elapsed": "0.05", "total": total}
         if began is not None:
             row["began"] = began
         return row
@@ -417,12 +421,16 @@ class StopProbeRungTest(unittest.TestCase):
         self.assertEqual([lvl for lvl, _l in out], [doctor.WARN])
         self.assertIn("UNMEASURED", out[0][1])
 
+    # EVERY seam ROW BELOW FITS THE SEAM'S PIN (0.1s since task/3042): these
+    # arms are about truncation and counts, and a row over the pin adds the
+    # pin read-back line to the rung's output, which is another arm's
+    # question.
     def test_a_truncated_ladder_names_its_rung_and_the_count(self):
         rows = [
             {"event": stopprobe.RUNG, "pid": "7", "seat": "s", "run": "a",
-             "rung": "seam", "elapsed": "5.4", "total": "10.1"},
+             "rung": "seam", "elapsed": "0.05", "total": "10.1"},
             {"event": stopprobe.RUNG, "pid": "8", "seat": "s", "run": "b",
-             "rung": "seam", "elapsed": "6.0", "total": "11.0"},
+             "rung": "seam", "elapsed": "0.06", "total": "11.0"},
         ]
         out = self.rung(rows, None)
         self.assertEqual([lvl for lvl, _l in out], [doctor.WARN])
@@ -435,13 +443,27 @@ class StopProbeRungTest(unittest.TestCase):
         been read as empty, so the OK line carries how many it read."""
         rows = [
             {"event": stopprobe.RUNG, "pid": "7", "seat": "s", "run": "a",
-             "rung": "seam", "elapsed": "3.1", "total": "4.0"},
+             "rung": "seam", "elapsed": "0.03", "total": "4.0"},
             {"event": stopprobe.END, "pid": "7", "seat": "s", "run": "a",
              "rung": "response", "total": "4.2"},
         ]
         out = self.rung(rows, None)
         self.assertEqual([lvl for lvl, _l in out], [doctor.OK])
         self.assertIn("1", out[0][1])
+
+    def test_a_seam_over_its_new_pin_is_read_back_as_FALSIFIED(self):
+        """THE RE-PIN IS LIVE IN THE READ-BACK (task/3042): the seam is
+        fitted at 0.1s now that it reads the resident's facts, so a seam
+        that spent half a second is reported against that pin — the same
+        complete ladder the arm above reads OK at 0.03s."""
+        rows = [
+            {"event": stopprobe.RUNG, "pid": "7", "seat": "s", "run": "a",
+             "rung": "seam", "elapsed": "0.5", "total": "4.0"},
+            {"event": stopprobe.END, "pid": "7", "seat": "s", "run": "a",
+             "rung": "response", "total": "4.2"},
+        ]
+        text = " ".join(line for _lvl, line in self.rung(rows, None))
+        self.assertIn("seam spent 0.500s against a 0.1s fit (x1)", text)
 
     def test_a_REUSED_PID_cannot_hide_an_unfinished_new_run(self):
         """A pid is not a run. Grouping a lifetime log by pid folds a
@@ -479,7 +501,7 @@ class StopProbeRungTest(unittest.TestCase):
         end is also what a still-running ladder and a failed end-append look
         like, and the rung cannot tell those apart."""
         rows = [{"event": stopprobe.RUNG, "pid": "7", "seat": "s", "run": "a",
-                 "rung": "seam", "elapsed": "5.4", "total": "10.1"}]
+                 "rung": "seam", "elapsed": "0.05", "total": "10.1"}]
         line = self.rung(rows, None)[0][1]
         self.assertIn("recorded no end", line)
         self.assertIn("STILL RUNNING", line)
@@ -821,3 +843,95 @@ class TheDogfoodFoundThreeThingsTheArmsCouldNotTest(unittest.TestCase):
         self.assertNotIn(stopprobe.END, [r["event"] for r in rows])
         unfinished, _by = stopprobe.findings(rows)
         self.assertEqual(len(unfinished), 1)
+
+
+_REAL_SNAPSHOT_PATH = getattr(stopprobe, "snapshot_path", None)
+
+
+class StopProbeBoxAndSnapshotTest(unittest.TestCase):
+    """task/3040 + task/2460: a record says how busy the box was and how old
+    the stop-facts projection was, and the threshold is one second.
+
+    A wall time is CPU times load, and until now this log carried only the
+    first factor, so "was that the code or the box" could not be asked of it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="stopprobe-box-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.log = os.path.join(self.tmp, "stopprobe.log")
+        self.snap = os.path.join(self.tmp, "stop-facts.json")
+        patcher = mock.patch.object(stopprobe, "snapshot_path",
+                                    lambda: self.snap, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def line(self):
+        with open(self.log) as fh:
+            return fh.read().splitlines()[-1]
+
+    def test_a_one_second_ladder_is_recorded_by_default(self):
+        self.assertEqual(stopprobe._DEFAULT_SLOW, 1.0)
+        self.assertTrue(stopprobe.record("r", "claims", 0.8, 1.2, log=self.log,
+                                         slow=stopprobe._DEFAULT_SLOW),
+                        "a 1.2 s ladder is under the threshold")
+        self.assertFalse(stopprobe.record("r", "claims", 0.1, 0.9, log=self.log,
+                                          slow=stopprobe._DEFAULT_SLOW))  # control
+
+    def test_every_record_carries_the_box_load_and_absent_means_unread(self):
+        with mock.patch.object(stopprobe.os, "getloadavg",
+                               return_value=(12.345, 9.0, 8.0)):
+            self.assertTrue(stopprobe.record("r", "seam", 2.0, 3.1,
+                                             log=self.log, slow=1.0))
+        self.assertIn("load=12.35", self.line())
+        rows, err = stopprobe.read(log=self.log)
+        self.assertIsNone(err)
+        self.assertEqual(rows[-1]["load"], "12.35")
+        self.assertEqual(stopprobe.runs(rows)[0]["load"], 12.35)
+        with mock.patch.object(stopprobe.os, "getloadavg",
+                               side_effect=OSError("no /proc/loadavg")):
+            self.assertTrue(stopprobe.record("r2", "seam", 2.0, 3.1,
+                                             log=self.log, slow=1.0))
+        self.assertNotIn("load=", self.line(),
+                         "an unreadable load was written as a number")
+
+    def test_the_snapshot_age_rides_the_record_only_when_there_is_one(self):  # noqa: VACUOUS_ASSERTION — the absent field is read against the same log carrying snap_age two records later, asserted unconditionally
+        self.assertTrue(stopprobe.record("r", "seam", 2.0, 3.1, log=self.log,
+                                         slow=1.0))
+        self.assertNotIn("snap_age=", self.line(), "no snapshot, no age")
+        with open(self.snap, "w") as fh:
+            fh.write("{}")
+        then = time.time() - 30
+        os.utime(self.snap, (then, then))
+        self.assertTrue(stopprobe.record("r", "claims", 2.0, 5.1, log=self.log,
+                                         slow=1.0))
+        rows, _err = stopprobe.read(log=self.log)
+        self.assertAlmostEqual(float(rows[-1]["snap_age"]), 30.0, delta=5.0)
+
+    def test_the_snapshot_is_the_one_the_web_cache_persists(self):
+        """Two spellings of one path, held equal: the guard stats the file
+        the resident writes, or it reports the age of nothing."""
+        from helm import web_cache
+        self.assertIsNotNone(_REAL_SNAPSHOT_PATH, "no snapshot_path to ask")
+        with mock.patch.dict(os.environ, {"HELM_HOME": self.tmp}):
+            self.assertEqual(_REAL_SNAPSHOT_PATH(),
+                             web_cache._persist_path("stop-facts"))
+
+    def test_a_load_that_is_not_a_real_number_is_torn(self):
+        with open(self.log, "w") as fh:
+            fh.write("2026-09-24T12:00:01 STOP-RUNG pid=2 | seat=s | run=a "
+                     "| rung=seam | elapsed=1.0 | total=6.0 | load=nan\n")
+            fh.write("2026-09-24T12:00:02 STOP-RUNG pid=2 | seat=s | run=b "
+                     "| rung=seam | elapsed=1.0 | total=6.0 | load=3.5\n")
+        rows, _err = stopprobe.read(log=self.log)
+        self.assertEqual([r["event"] for r in rows],
+                         [stopprobe.MALFORMED, stopprobe.RUNG])
+
+    def test_the_doctor_rung_names_the_load_a_quiet_ladder_ran_under(self):
+        rows = [{"event": stopprobe.RUNG, "pid": "7", "seat": "s", "run": run,
+                 "rung": "seam", "elapsed": "5.0", "total": "9.0",
+                 "load": load} for run, load in (("a", "31.5"), ("b", "4.0"))]
+        out = doctor.check_stop_timings(read=lambda: (rows, None))
+        text = " ".join(msg for _lvl, msg in out)
+        self.assertIn("load", text)
+        self.assertIn("4.0-31.5", text)

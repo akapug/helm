@@ -870,7 +870,11 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
         # exit is added next. One door, because a cancel added per exit is a
         # list that a later exit is left off.
         budget = seats_stop_budget.State()
-        deadline = time.monotonic() + seats_stop_budget.BUDGET_S
+        # FROM THE HOOK'S START, NOT THIS LINE'S: the wrapper's `timeout` was
+        # armed before this interpreter existed, and startup spends it too.
+        from . import procage
+        deadline = time.monotonic() + seats_stop_budget.BUDGET_S \
+            - (procage.hook_elapsed() or 0.0)
         try:
             with projscope.scope(deadline=deadline):
                 try:

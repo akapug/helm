@@ -66,6 +66,14 @@ _NAME = re.compile(r"\A[a-z][a-z0-9]{0,31}\Z")
 
 _cache = {"stat": None, "table": None, "why": None, "path": None}
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_cache": (
+        "the local-names table keyed by the file's stat; a changed file "
+        "misses"),
+}
+
 
 def _stat(path):
     try:

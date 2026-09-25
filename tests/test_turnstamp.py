@@ -70,6 +70,11 @@ class _Base(unittest.TestCase):
                                   return_value=self.roster_path)
         patch.start()
         self.addCleanup(patch.stop)
+        # THE STOP GUARD READS A RESIDENT'S FACTS; the dispatch arms drive the
+        # real guard, so a resident that is exactly up to date stands in for
+        # the `helm web` one (tests/_stopfacts.py).
+        from tests._stopfacts import always_fresh
+        self.fresh_resident = always_fresh(self)
 
     def _restore(self):
         for k, v in self._env.items():

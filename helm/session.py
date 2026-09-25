@@ -1321,6 +1321,52 @@ def open_pids(sid, rows=None):
     return sorted({r["pid"] for r in exact + possible})
 
 
+def held_or_unproven(sid):
+    """False ONLY when the census PROVES no live claude process holds `sid`.
+
+    This is law 1's own answer read the other way round: `open_pids` empty on
+    a census read whole is what lets a resume open `sid` again, and the same
+    measurement is what says a seat's recorded session no longer has a pane.
+    The identity law's claim-jump asks it (seats_identity), because a roster
+    row keeps its last session after that session's pane is gone: a seat
+    relaunched onto a FRESH session still names its dead predecessor, and
+    reading that record as a live occupant refused the new pane's own join and
+    every `helm chat wait --follow` it armed. The waiter printed the refusal
+    and exited before `beacons.arm` registered anything, so the beacon census
+    read a live pane as DEAF and dispatch would not book work to it.
+
+    True for everything else, which keeps that refusal standing:
+      * a row whose session IS `sid`, or a candidate row that could be holding
+        it (an unattributed claude whose cwd holds its transcript),
+      * a census that raised, answered without its contract keys, could not
+        list the process table, stopped before a pid's comm proved or refuted
+        claude, or lost its `helm who` rung,
+      * any row carrying a documented uncertainty marker, since a row whose
+        facts could not be probed may be the holder.
+    An unreadable census is not an empty one, so it never answers False. The
+    contract keys and the markers are the claim ledger's pinned copies
+    (seats_claims), read rather than restated so one schema pin covers both."""
+    if not sid:
+        return False
+    try:
+        from .seats_claims import _CENSUS_KEYS, _ROW_UNCERTAIN
+        census = _proc_claude_census()
+        if not isinstance(census, dict) \
+                or any(k not in census for k in _CENSUS_KEYS):
+            return True
+        rows = census.get("rows")
+        if not isinstance(rows, (list, tuple)) \
+                or any(census.get(k) is not False for k in _CENSUS_KEYS
+                       if k != "rows"):
+            return True
+        if any(not isinstance(r, dict) or any(r.get(k) for k in _ROW_UNCERTAIN)
+               for r in rows):
+            return True
+        return bool(open_pids(sid, list(rows)))
+    except Exception:          # noqa: BLE001 — a census that cannot answer
+        return True            # proves nothing, and nothing never opens this
+
+
 def memory_only_panes(rows=None, persisting=None):
     """Proven live AGENT PANES with NO transcript on disk. Two exclusions, and
     they are different in kind:

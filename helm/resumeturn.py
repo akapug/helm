@@ -3132,11 +3132,21 @@ def rearm_text(seat_name, owes=""):
     """The one sentence a DEAF seat's pane is given: what it owes, then
     re-arm the beacon with the exact unfiltered Monitor recipe
     `seats_advice.beacon_monitor` renders everywhere else, so the nudge and
-    every other instruction agree."""
-    from .seats_advice import beacon_monitor
+    every other instruction agree.
+
+    AND IT SAYS WHY IT FIRED NOW (task/3055). A beacon that reaches its
+    30-minute lease is the seat's own check-in, and the census waits the
+    re-arm grace before it calls that seat DEAF, so this keystroke means the
+    grace passed with no re-arm, or the beacon died before its lease. A seat
+    reading the sentence knows it was not typed into mid-check-in."""
+    from .beacons import REARM_GRACE_S
+    from .seats_advice import BEACON_TIMEOUT_MS, beacon_monitor
     return ("[helm] %s, and your inbox beacon is not running, so helm cannot "
-            "wake you. Re-arm it now: %s"
-            % (owes or "you owe work", beacon_monitor(seat_name)))
+            "wake you. helm types this only after a beacon that reached its "
+            "%d-minute lease has had a %d-minute re-arm grace, or when the "
+            "beacon ended before its lease. Re-arm it now: %s"
+            % (owes or "you owe work", BEACON_TIMEOUT_MS // 60000,
+               REARM_GRACE_S // 60, beacon_monitor(seat_name)))
 
 
 def _rearm_owes(seat_name, session, row=None):
@@ -3219,45 +3229,51 @@ def _seat_project(row):
 def _auto_scope(seat_name, session, row):
     """("", ("", "")) when an AUTOMATIC keystroke may reach this seat,
     else (kind, (subject, verdict)): the report reads "<subject>: <what it
-    owes>; <verdict>". The ruling on task/2925:
+    owes>; <verdict>". The ruling on task/2925, re-scoped on task/3055:
 
     PROJECT SCOPE. The timer types only into seats of the project it runs
     for. Another project's seats and runtime belong to that project's lead.
     A seat whose checkout does not resolve to a project is not ours to type
     into; the report then names the roster's own project label.
 
-    FAMILY SCOPE. Only a VERIFIED native claude seat. A proxy or codex
-    family is billed per turn, so a wake is a paid turn the owner did not
-    order.
-
-    Every failing clause is reported, so a seat that is both foreign and
-    paid says both. The kind names the project first."""
-    from .seats_runtime import runtime_for_session
+    FAMILY SCOPE IS NOT A REFUSAL ANY MORE (the owner's ruling: "yes, I think
+    [that] is totally reasonable ... I don't think we utilize orca text
+    injections as fully as we could, especially because it is a primitive").
+    The refusal said "a wake is a paid turn the owner did not order", and that
+    is false exactly when the seat OWES: the row it owes is the order. Every
+    caller asks the owing question itself — `rearm_deaf` before this scope,
+    the child's `_prepare_rearm_once` after it — and neither types into a
+    seat that owes nothing, whatever its family. So a DEAF seat on a proxy or
+    codex family that owes work gets the same bounded re-arm as a native one:
+    one per DEAF spell, under `_decide`'s debounce, spiral and per-hour cap.
+    `paid_runtime` names the family so the report says the wake is paid."""
     row = row if isinstance(row, dict) else {}
     mine, theirs = _own_project(), _seat_project(row)
-    foreign = not mine or theirs != mine
+    if mine and theirs == mine:
+        return "", ("", "")
+    name = theirs or ("%s (roster label; its checkout does not resolve)"
+                      % row["project"] if row.get("project")
+                      else "UNKNOWN (no resolvable checkout)")
+    return "foreign-project", (
+        "%s belongs to project %s, not %s" % (seat_name, name,
+                                               mine or "UNKNOWN"),
+        "another project's seat; not auto-nudged")
+
+
+def paid_runtime(seat_name, session, row):
+    """"<family>/<backend>" when a wake of this seat is a PAID turn (any
+    runtime that is not a verified native claude one), else None. A report
+    note, never a refusal (see `_auto_scope`)."""
+    from .seats_runtime import runtime_for_session
+    row = row if isinstance(row, dict) else {}
     runtime, verified = runtime_for_session(row, session)
     runtime = runtime if isinstance(runtime, dict) else {}
-    paid = not (verified and runtime.get("family") == "claude"
-                and runtime.get("backend") == "native")
-    if not (foreign or paid):
-        return "", ("", "")
-    subject, verdict = [], []
-    if foreign:
-        name = theirs or ("%s (roster label; its checkout does not resolve)"
-                          % row["project"] if row.get("project")
-                          else "UNKNOWN (no resolvable checkout)")
-        subject.append("belongs to project %s, not %s"
-                       % (name, mine or "UNKNOWN"))
-        verdict.append("another project's seat")
-    if paid:
-        subject.append("runs %s/%s%s" % (runtime.get("family") or "?",
-                                         runtime.get("backend") or "?",
-                                         "" if verified else " (unverified)"))
-        verdict.append("wake is a paid turn")
-    return ("foreign-project" if foreign else "paid-family"), (
-        "%s %s" % (seat_name, " and ".join(subject)),
-        "%s; not auto-nudged" % "; ".join(verdict))
+    if verified and runtime.get("family") == "claude" \
+            and runtime.get("backend") == "native":
+        return None
+    return "%s/%s%s" % (runtime.get("family") or "?",
+                        runtime.get("backend") or "?",
+                        "" if verified else " (unverified)")
 
 
 def rearm_deaf(seat_name, session, dry=False, att=None):
@@ -3354,6 +3370,11 @@ def rearm_deaf(seat_name, session, dry=False, att=None):
     note = ("" if stamped is not None else
             " (the spawn stamp was skipped because the resume state was "
             "locked or could not be read; the child records the same key)")
+    # A PAID WAKE SAYS SO (task/3055). Typed now that the seat owes, and still
+    # a turn billed to its family, so the report the operator reads names it.
+    paid = paid_runtime(seat_name, session, srow)
+    if paid:
+        note += (" (a paid turn on %s, ordered by the work it owes)" % paid)
     return {"action": "wake", "detail": text + note, "attempt": attempt,
             "stamped": stamped is not None}
 
@@ -4035,6 +4056,12 @@ _OBSOLETE_HERE = {}
 #: nonce, so its own intent left behind by a failed write is not read back as
 #: an act of unknown outcome by the process that knows the outcome.
 _SETTLED_INTENTS = set()
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_SETTLED_INTENTS": "intents settled by nonce, and a nonce never recurs",
+}
 
 #: How many act intents and obsolete records one resume-state entry keeps.
 ACT_RECORDS_KEPT = 4

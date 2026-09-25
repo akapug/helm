@@ -704,7 +704,14 @@ def _whisper_candidates(session, seat, pending, inbox_blocked, cwd=None,
     ask = _ask_candidate()   # owner-ask rung: unsurfaced owner debt outranks all
     if ask:
         out.append(ask)
-    dsp = _dispatch_candidate(dispatch_snapshot)  # then: handed-out work
+    # THE STOP FACTS' OWN UNAVAILABILITY IS NOT A LEDGER FINDING. The Stop
+    # guard hands this ladder the resident's owed frontier; when those facts
+    # are absent or behind, the ledger itself is fine and the claims footer
+    # and `helm doctor` already name the resident, so this nudge falls silent
+    # (the whisper law) instead of telling the seat its ledger is unreadable.
+    facts_out = dispatch_snapshot is not None and str(
+        dispatch_snapshot[1] or "").startswith("stop-facts")
+    dsp = None if facts_out else _dispatch_candidate(dispatch_snapshot)
     if dsp:
         out.append(dsp)
     c = {}

@@ -153,8 +153,12 @@ def setUpModule():
 
 
 def tearDownModule():
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT: other modules import from this
+    # one, so a stopped patcher left here is data they can reach (task/3039).
+    _LIVE_SEATS_PATCH = None
 
 
 class TheLivenessStandInIsInEffectInWebLrTest(unittest.TestCase):
@@ -623,6 +627,69 @@ class FiledPopulationTest(LrApiBase):
             body = self.lr()
         self.assertIn("cycle", body["unavailable"])
         self.assertIsNone(body["filed"])
+
+
+class LiveObligationsWireTest(LrApiBase):
+    """ONE CENSUS, THREE CONSUMERS: the header's filed split, the scheduler
+    model and the kanban cards all read the SAME off-frontier walk of one
+    build, through the real route, over a real repository — so the number the
+    strip prints, the line the waits draw and each card's own mark cannot
+    disagree, and the walk the board already paid for is not paid twice."""
+
+    def left_over(self):
+        """LEFT OVER: a FIX-verdicted row whose lane is gone — no ref, no
+        room, no lease — and whose reviewed tip is on trunk by ancestry."""
+        tip = self.commit("left-over-on-trunk", path="left")
+        row = self.dispatch(ref=tip, lane="left-over-lane")
+        dispatches._mark_delivered(row["id"], "post-left-over")
+        _out, err = self.mark_verdict(row["id"], tip, "reviewed",
+                                      polarity="fix")
+        self.assertIsNone(err, err)
+        return row
+
+    def test_an_off_frontier_row_collapses_and_a_live_one_stays_listed(self):  # noqa: VACUOUS_ASSERTION — the live row is asserted LISTED by exact equality and the left-over row is asserted on the collapsed line by exact count and reason, on the same body
+        gone = self.left_over()
+        # LIVE: its lane branch still exists and holds work off trunk
+        self.git("branch", "lane/still-building", self.side)
+        live = self.dispatch(ref=self.side, lane="still-building")
+        calls = []
+        real = landreq.frontier_verdicts
+
+        def counted(*a, **kw):
+            calls.append(len(a[0]))
+            return real(*a, **kw)
+
+        with mock.patch.object(landreq, "frontier_verdicts", counted):
+            body = self.lr()
+        self.assertIsNone(body["unavailable"])
+        self.assertEqual(len(calls), 1, "the census walked twice in one "
+                         "build: %r" % calls)
+        cards = {c["id"]: c for c in body["loops"]}
+        self.assertEqual(cards[gone["id"]]["frontier"], "landed-by-ancestry")
+        self.assertEqual(cards[live["id"]]["frontier"], "on-frontier")
+        model = body["scheduler"]
+        listed = [r["id"] for g in model["groups"] for r in g["rows"]]
+        self.assertEqual(listed, [live["id"]])
+        self.assertEqual([(c["class"], c["count"]) for c in model["collapsed"]],
+                         [("off_frontier", 1)])
+        self.assertEqual(model["collapsed"][0]["by_reason"],
+                         {"landed-by-ancestry": 1})
+        # THE HEADER COUNTED THE SAME ROW FROM THE SAME WALK
+        self.assertEqual(body["filed"]["off_frontier"], 1)
+        self.assertEqual(model["listed_count"] + model["collapsed_count"],
+                         model["row_count"])
+
+    def test_a_body_whose_census_was_not_taken_claims_no_collapse(self):
+        """No frontier on the cards is no frontier claim: every live row is
+        listed, exactly as before the split."""
+        self.left_over()
+        with mock.patch.object(landreq, "frontier_verdicts",
+                               return_value={}):
+            body = self.lr()
+        self.assertIsNone(body["unavailable"])
+        self.assertEqual(body["scheduler"]["collapsed"], [])
+        self.assertEqual(body["scheduler"]["listed_count"], 1)
+        self.assertIsNone(body["loops"][0]["frontier"])
 
 
 class UnavailableIsLoudTest(LrApiBase):
@@ -7181,20 +7248,378 @@ class TheGateChipGoesQuietTest(CardRuntimeBase):
 
 class AlreadyOnTrunkOnThePipelineWallTest(CardRuntimeBase):
     """THE PIPELINE WALL SAYS WHAT `helm lr list` SAYS about a row whose
-    pinned tip main already holds with no verdict recorded. Without the field
-    on the wire the card draws it as a plain AWAITING_REVIEW row, and the
-    owner reads landed work as waiting."""
+    work main already holds with no verdict recorded. Without the field on
+    the wire the card draws it as a plain AWAITING_REVIEW row, and the owner
+    reads landed work as waiting. The field is the server's own answer
+    (`landreq.on_main_unverdicted`), so each fixture row carries what the
+    server would send for it."""
+
+    def wall(self, **fields):
+        row = self.row(observable=False, **fields)
+        row["on_main_unverdicted"] = landreq.on_main_unverdicted(row)
+        return {"__row": row}
 
     def test_a_row_already_on_trunk_carries_the_CLI_mark(self):
         got = self.render(
-            on={"__row": self.row(state="AWAITING_REVIEW", polarity=None,
-                                  observable=False, trunk_contains_tip=True)},
-            off={"__row": self.row(state="AWAITING_REVIEW", polarity=None,
-                                   observable=False, trunk_contains_tip=False)})
+            on=self.wall(state="AWAITING_REVIEW", polarity=None,
+                         trunk_contains_tip=True),
+            off=self.wall(state="AWAITING_REVIEW", polarity=None,
+                          trunk_contains_tip=False))
         self.assertIn("ALREADY ON TRUNK", got["on"]["html"])
         self.assertIn("NO VERDICT recorded", got["on"]["html"])
         # THE CONTROL: a PROVEN not-on-trunk row carries no such mark
         self.assertNotIn("ALREADY ON TRUNK", got["off"]["html"])
+
+    def test_a_verdicted_row_on_trunk_is_never_called_unverdicted(self):  # noqa: VACUOUS_ASSERTION — the unverdicted row on the SAME containment answer carries the mark in this same render, so the verdicted rows' absent mark is a measurement
+        """MEASURED on the live trunk board: seven rows whose work trunk holds
+        by patch identity carried a recorded APPROVE, CONCUR or FIX, and the
+        wall printed "NO VERDICT recorded" on every one of them — the same
+        words `lr list` printed. A FIX on main is a contradiction somebody
+        owes; the wall does not call it ledger debris."""
+        got = self.render(
+            fix=self.wall(state="CHANGES_REQUESTED", polarity="fix",
+                          trunk_contains_tip=True),
+            held=self.wall(state="REVIEWED", polarity="approve",
+                           trunk_contains_tip=True),
+            none=self.wall(state="AWAITING_REVIEW", polarity=None,
+                           trunk_contains_tip=True))
+        self.assertIn("NO VERDICT recorded", got["none"]["html"])
+        self.assertNotIn("ALREADY ON TRUNK", got["fix"]["html"])
+        self.assertNotIn("ALREADY ON TRUNK", got["held"]["html"])
+
+
+class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
+    """THE SURFACE-BY-STATE MATRIX (task/2381 round 2). Each state is built
+    for real — dispatch rows, lane branches, merges, cherry-picks, the kept
+    landing proof written through its one door — beside a CONTROL (a live
+    review whose lane holds work off trunk), read once through the real
+    `/api/lr` route, and then read off every surface the owner and the fleet
+    read it from:
+
+      waits groups     `/api/board` waits: the live obligations, by holder
+      waits lines      `/api/board` waits_collapsed: one counted line a class
+      kanban columns   the SHIPPED `boardKanban`, run, over `/api/board` lanes
+      kanban lines     `/api/board` lanes.on_main and lanes.collapsed
+      helm lr list     the CLI listing and its marks
+      the wall         the SHIPPED `lrRowHTML`, run, over each `/api/lr` card
+
+    One test per state, one subTest per surface cell. In every cell the
+    accounting holds on both counting surfaces — listed plus collapsed is
+    every row — and the two agree row for row: a row counted on a line on one
+    is on the same line on the other, never listed there."""
+
+    SURFACES = ("waits_groups", "waits_lines", "kanban_columns",
+                "kanban_lines", "lr_list", "wall")
+    ON_MAIN = {"waits_groups": None, "waits_lines": "on_main",
+               "kanban_columns": None, "kanban_lines": "on_main",
+               "lr_list": "ALREADY ON TRUNK", "wall": "ALREADY ON TRUNK"}
+
+    def listed(role, column, lr_mark=None):
+        return {"waits_groups": role, "waits_lines": None,
+                "kanban_columns": column, "kanban_lines": None,
+                "lr_list": lr_mark, "wall": None}
+
+    #: state -> (lane, the expected cell on each surface). `waits_groups` is
+    #: the holder ROLE of the group listing the row; `lr_list` the marks its
+    #: line must carry (None: no ALREADY ON TRUNK on it).
+    EXPECT = {
+        "live_review": ("fresh-review", listed("reviewer", "review")),
+        "clean_hold_on_trunk": ("clean-on-trunk", dict(
+            ON_MAIN, lr_list=("ALREADY ON TRUNK", "SOURCE-CLEAN"))),
+        "build_merged": ("built-merged", ON_MAIN),
+        "build_picked_proof": ("built-picked", ON_MAIN),
+        "build_picked_no_proof": ("picked-unproved",
+                                  listed("builder", "building")),
+        "build_unstarted": ("sent-unclaimed", listed("builder", "building")),
+        "fix_on_main": ("fix-on-main",
+                        listed("integrator", "building", lr_mark="CONTRARY")),
+    }
+    del listed
+    #: the builds whose work nobody measured on trunk: an UNKNOWN bills
+    #: nobody for a rebase (the live review's BEHIND is a PROVEN no, and true)
+    UNKNOWN_WORK = ("build_picked_no_proof", "build_unstarted")
+
+    # -- the states ------------------------------------------------------------
+
+    def delivered(self, ref, lane, kind="review"):
+        row = self.dispatch(ref=ref, lane=lane, kind=kind, deadline_s=60)
+        dispatches._mark_delivered(row["id"], "post-" + lane)
+        self.age(row["id"], 3600)
+        return row["id"]
+
+    def lane_commit(self, lane, base, merge=False, pick=False):
+        """A lane branch minted at `base` with one authored commit, the way a
+        seat does it, landed by merge or by cherry-pick when asked."""
+        branch = "lane/" + lane
+        self.git("branch", branch, base)
+        self.git("checkout", "-q", branch)
+        tip = self.commit("work " + lane, path=lane)
+        self.git("checkout", "-q", self.main)
+        if merge:
+            self.git("merge", "--no-edit", "-q", branch)
+        if pick:
+            # `-x` names the source commit, as a train's pick does: without a
+            # message of its own, a pick made in the same second as the commit
+            # it copies IS that commit, and trunk would hold it by ancestry
+            self.git("cherry-pick", "-x", tip)
+        return tip
+
+    def make_live_review(self):
+        # a fresh review whose label names no branch: the census `tip` rung
+        return self.delivered(self.side, "fresh-review")
+
+    def make_clean_hold_on_trunk(self):
+        rid = self.delivered(self.b, "clean-on-trunk")
+        _row, err = dispatches.mark_hold(
+            rid, "SOURCE-CLEAN: read clear, the gate is the integrator's",
+            source_clean_tip=self.b)
+        self.assertIsNone(err, err)
+        return rid
+
+    def make_build_merged(self):
+        rid = self.delivered(self.c, "built-merged", kind="build")
+        self.lane_commit("built-merged", self.c, merge=True)
+        return rid
+
+    def make_build_picked_proof(self):
+        rid = self.delivered(self.c, "built-picked", kind="build")
+        self.proofs.append(self.lane_commit("built-picked", self.c,
+                                            pick=True))
+        return rid
+
+    def make_build_picked_no_proof(self):
+        rid = self.delivered(self.c, "picked-unproved", kind="build")
+        self.lane_commit("picked-unproved", self.c, pick=True)
+        return rid
+
+    def make_build_unstarted(self):
+        # sent against the trunk sha itself; no builder has claimed a lane
+        return self.delivered(self.c, "sent-unclaimed", kind="build")
+
+    def make_fix_on_main(self):
+        # its lane still holds the next round off trunk, so the census keeps
+        # it on the frontier and only the on-main rule could fold it
+        self.git("branch", "lane/fix-on-main", self.side)
+        row = self.dispatch(ref=self.b, lane="fix-on-main", deadline_s=60)
+        dispatches._mark_delivered(row["id"], "post-fix-on-main")
+        _out, err = self.mark_verdict(row["id"], self.b, "reviewed",
+                                      polarity="fix")
+        self.assertIsNone(err, err)
+        self.age(row["id"], 3600)
+        return row["id"]
+
+    def world(self, *states):
+        """The control plus one row per state -> {state: (row id, lane)}. Every
+        kept proof is written after the last trunk move, against that trunk,
+        through the ledger's one door (MUST-HIT)."""
+        self.proofs = []
+        self.git("branch", "lane/control-review", self.side)
+        rows = {"control": (self.delivered(self.side, "control-review"),
+                            "control-review")}
+        for state in states:
+            rows[state] = (getattr(self, "make_" + state)(),
+                           self.EXPECT[state][0])
+        trunk = self.git("rev-parse", self.main)
+        for tip in self.proofs:
+            self.assertEqual(landreq._landing_proof(self.repo_git, tip, trunk),
+                             landreq.PROOF_PATCH_EQUIVALENT)
+        return rows
+
+    # -- the surfaces ------------------------------------------------------------
+
+    def surfaces(self, body, rows):
+        """{state: {surface: cell}} for every row of `rows`, read off `body`
+        exactly as each surface reads it, plus the two accountings."""
+        from helm import scheduler, web_board
+        from tests import test_web_board as board   # the module, never its TestCase
+        self.assertIsNone(body.get("unavailable"), body.get("unavailable"))
+        self.assertFalse(body.get("warming"))
+        # THE JOIN KEYS ITS RECORD BY THE SCOPE'S PROJECT NAME, which this
+        # fixture's registry does not resolve (`scope_why` says so); a label
+        # stands in for the name and nothing else in the body is touched
+        scope = body["withheld"]["scope"] or "fixture"
+        joined = dict(body, withheld=dict(body["withheld"], scope=scope))
+        _sec, rec = web_board._lands_join(lambda _qs: (joined, 200))
+        rec = rec[scope]
+        lanes = rec["lanes"]
+        page = board.LandedOnTheKanbanTest.kanban({"m": (
+            [], lanes["loops"], rec["landed"],
+            {"on_main": lanes["on_main"], "collapsed": lanes["collapsed"]})})
+        page = page["m"]
+        _rc, listing, _err = run(["list"])
+        cards = {c["id"]: c for c in body["loops"]}
+        wall = self.render(**{rid: {"__row": cards[rid]}
+                              for rid, _lane in rows.values() if rid in cards})
+        waits_lines = {c["class"]: c["count"] for c in rec["waits_collapsed"]}
+        kanban_lines = {c["class"]: c["count"] for c in lanes["collapsed"]}
+        on_main = lanes["on_main"] or {"count": 0, "lanes": []}
+        out = {}
+        for state, (rid, lane) in rows.items():
+            title = scheduler.plain_title(lane)
+            group = [g["label"] for g in rec["waits"]
+                     if title in [r["plain_title"] for r in g["rows"]]]
+            column = [name for name in ("building", "review", "gate", "landed")
+                      if isinstance(page[name], list)
+                      and lane in [r.get("lane") for r in page[name]]]
+            line = [ln for ln in listing.splitlines() if rid[:12] in ln]
+            out[state] = {
+                "waits_groups": group[0].split(" @")[0] if group else None,
+                "kanban_columns": column[0] if column else None,
+                "kanban_lines": "on_main" if lane in on_main["lanes"] else None,
+                "lr_list": line[0] if line else None,
+                "wall": wall[rid]["html"] if rid in wall else None}
+        model = body["scheduler"]
+        return out, {
+            "waits_lines": waits_lines, "kanban_lines": dict(
+                kanban_lines, **({"on_main": on_main["count"]}
+                                 if on_main["count"] else {})),
+            "model": (model["listed_count"], model["collapsed_count"],
+                      model["row_count"]),
+            "kanban": (len(lanes["loops"]), on_main["count"]
+                       + sum(kanban_lines.values()),
+                       len([c for c in body["loops"] if not c["honored"]])),
+            "page_summary": [r.get("summary") for name in ("review", "landed")
+                             if isinstance(page[name], list)
+                             for r in page[name] if r.get("summary")]}
+
+    def check(self, state):
+        rows = self.world(state)
+        got, whole = self.surfaces(self.lr(), rows)
+        lane, want = self.EXPECT[state]
+        cell, ctl = got[state], got["control"]
+        for surface in self.SURFACES:
+            with self.subTest(state=state, surface=surface):
+                expect = want[surface]
+                if surface == "waits_lines":
+                    self.assertEqual(whole["waits_lines"],
+                                     {expect: 1} if expect else {})
+                elif surface == "kanban_lines":
+                    self.assertEqual(cell["kanban_lines"], expect)
+                    self.assertEqual(whole["kanban_lines"],
+                                     {expect: 1} if expect else {})
+                    self.assertEqual(whole["page_summary"],
+                                     [1] if expect else [])
+                elif surface == "lr_list":
+                    self.assertIsNotNone(cell["lr_list"],
+                                         "the row is missing from lr list")
+                    marks = expect if isinstance(expect, tuple) \
+                        else (expect,) if expect else ()
+                    for mark in marks:
+                        self.assertIn(mark, cell["lr_list"])
+                    if "ALREADY ON TRUNK" not in marks:
+                        self.assertNotIn("ALREADY ON TRUNK", cell["lr_list"])
+                    if state in self.UNKNOWN_WORK:
+                        self.assertNotIn("BEHIND", cell["lr_list"])
+                elif surface == "wall":
+                    self.assertIsNotNone(cell["wall"], "not on the wall")
+                    if expect:
+                        self.assertIn(expect, cell["wall"])
+                    else:
+                        self.assertNotIn("ALREADY ON TRUNK", cell["wall"])
+                else:
+                    self.assertEqual(cell[surface], expect)
+        with self.subTest(state=state, surface="control"):
+            self.assertEqual((ctl["waits_groups"], ctl["kanban_columns"],
+                              ctl["kanban_lines"]),
+                             ("reviewer", "review", None))
+            self.assertNotIn("ALREADY ON TRUNK", ctl["wall"])
+        with self.subTest(state=state, surface="accounting"):
+            listed_n, collapsed_n, rows_n = whole["model"]
+            self.assertEqual(listed_n + collapsed_n, rows_n)
+            live_n, folded_n, filed_n = whole["kanban"]
+            self.assertEqual(live_n + folded_n, filed_n)
+            self.assertEqual(whole["waits_lines"], whole["kanban_lines"],
+                             "the waits and the kanban folded different rows")
+
+    def test_a_live_review_with_no_verdict_tip(self):  # noqa: VACUOUS_ASSERTION — `check` asserts every cell by exact equality or a present mark, the control row by exact tuple, and both accountings by equality
+        self.check("live_review")
+
+    def test_a_source_clean_hold_on_trunk(self):  # noqa: VACUOUS_ASSERTION — `check` asserts every cell by exact equality or a present mark, the control row by exact tuple, and both accountings by equality
+        self.check("clean_hold_on_trunk")
+
+    def test_a_build_landed_by_merge(self):  # noqa: VACUOUS_ASSERTION — `check` asserts every cell by exact equality or a present mark, the control row by exact tuple, and both accountings by equality
+        self.check("build_merged")
+
+    def test_a_build_landed_by_cherry_pick_with_its_proof_kept(self):  # noqa: VACUOUS_ASSERTION — `check` asserts every cell by exact equality or a present mark, the control row by exact tuple, and both accountings by equality
+        self.check("build_picked_proof")
+
+    def test_a_build_landed_by_cherry_pick_with_no_proof(self):  # noqa: VACUOUS_ASSERTION — `check` asserts every cell by exact equality or a present mark, the control row by exact tuple, and both accountings by equality
+        self.check("build_picked_no_proof")
+
+    def test_a_build_sent_at_trunk_and_not_started(self):  # noqa: VACUOUS_ASSERTION — `check` asserts every cell by exact equality or a present mark, the control row by exact tuple, and both accountings by equality
+        self.check("build_unstarted")
+
+    def test_a_FIX_verdict_on_a_tip_that_is_on_main(self):  # noqa: VACUOUS_ASSERTION — `check` asserts every cell by exact equality or a present mark, the control row by exact tuple, and both accountings by equality
+        self.check("fix_on_main")
+
+    def test_a_restored_schema_3_cache(self):  # noqa: VACUOUS_ASSERTION — the control asserts the restored record's on-main cell PRESENT by exact equality before any cell is compared
+        """THE BODY THE SERVER BEFORE THIS LANE SAVED — no census stamp, no
+        on-main word, a BUILD's containment its base's — restored on a
+        MATCHING witness. It is refused by its schema, so every surface reads
+        the rebuilt projection, cell for cell. THE CONTROL: the same record
+        under the current schema number IS restored, and the owner board then
+        counts a build nobody has started as on main — so the equality is the
+        refusal's doing."""
+        from helm import web_land_model as model
+        rows = self.world("build_unstarted", "clean_hold_on_trunk")
+        fresh, whole = self.surfaces(self.lr(), rows)
+        with mock.patch.object(web_land, "_lr_recent_lands",
+                               return_value={"rows": [], "total": 0,
+                                             "source": "helm lr list",
+                                             "unavailable": None}), \
+                mock.patch.object(web_land, "_lr_native_chain",
+                                  return_value={"count": 0,
+                                                "unavailable": None}), \
+                model._lr_snapshot() as reads:
+            body = web_land._lr_build()
+            witness = reads.witness()
+        self.assertIsInstance(witness, str)
+        for key in ("loops", "_scheduler_rows"):
+            for card in body[key]:
+                for field in ("frontier", "frontier_rung",
+                              "on_main_unverdicted"):
+                    card.pop(field, None)
+                if card.get("kind") == "build":
+                    card["trunk_contains_tip"] = True    # its base, on trunk
+        path = web_cache._persist_path("lr")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"schema": 3, "stored_ts": time.time(), "body": body,
+                       "input_witness": witness}, fh)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        self.addCleanup(web_cache._qrestored.discard, "lr")
+
+        def restored():
+            web_cache._qrestored.discard("lr")
+            return self.surfaces(self.lr(), rows)
+
+        # THE CONTROL FIRST, while the witness still matches: under a
+        # matching schema number the record IS restored, and serves the
+        # reading this lane exists to end
+        with mock.patch.object(web_cache, "_PERSIST_SCHEMA", 3):
+            poisoned, _whole = restored()
+        self.assertEqual(poisoned["build_unstarted"]["kanban_lines"],
+                         "on_main", "THE CONTROL: the record under a matching "
+                         "schema was not restored, so the equality below "
+                         "would prove nothing about the schema")
+        self.assertIsNone(fresh["build_unstarted"]["kanban_lines"])
+        got, got_whole = restored()
+        marks = ("ALREADY ON TRUNK", "SOURCE-CLEAN", "CONTRARY", "BEHIND")
+
+        def read(surface, cell):
+            # a line or a card is compared by the marks it carries: its dwell
+            # text is a clock, and two reads are seconds apart
+            return tuple(m for m in marks if m in cell) \
+                if surface in ("lr_list", "wall") and cell else cell
+        for state in rows:
+            for surface in self.SURFACES:
+                if surface in got[state]:
+                    with self.subTest(state="schema-3/" + state,
+                                      surface=surface):
+                        self.assertEqual(read(surface, got[state][surface]),
+                                         read(surface, fresh[state][surface]))
+        with self.subTest(state="schema-3", surface="lines and accounting"):
+            self.assertEqual(got_whole, whole)
 
 
 class TheOwnerCanReadTheCardTest(CardRuntimeBase):
@@ -7724,6 +8149,39 @@ class ProjectionSurvivesARestartTest(LrApiBase):
         self._saved(now, key="t757b", wit="W9")
         fresh = web_cache.persist_load("t757b", 30, self._snap("W9"))
         self.assertLess(time.time() - fresh[0], 30)
+
+    def test_a_body_saved_before_the_census_stamp_is_refused_by_its_schema(self):
+        """THE SAVED BODY'S SHAPE IS AN INPUT TOO, and this lane changed it: a
+        restored body's cards must carry the census (`frontier`,
+        `frontier_rung`) and a BUILD row's lane-based containment, because the
+        scheduler and the kanban split on those fields at serve time. The
+        server that ran before this lane saved neither, under schema 3, and a
+        restore admitted that record FRESH on a matching witness. MEASURED on
+        a spare-port server of this tree against the live home: every card
+        `frontier` None, so all 931 non-listed rows folded into "absorbed or
+        settled by a later round" (267 were off the frontier and 65
+        unplaceable) and a BUILD sent at trunk was counted on the on-main line
+        — the readings this lane exists to end, served for as long as the
+        restored body stayed FRESH. A saved body proves its shape by its
+        schema number, so the number moved and the old one is refused.
+        THE CONTROL: the same record under the current schema is admitted."""
+        now = time.time()
+        path = web_cache._persist_path("t757")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        body = {"read_ts": now, "loops": [], "_scheduler_active_ids": [],
+                "_scheduler_rows": [{"id": "b", "kind": "build",
+                                     "terminal": False, "honored": False,
+                                     "trunk_contains_tip": True}]}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"schema": 3, "stored_ts": now, "body": body,
+                       "input_witness": "W1"}, fh)
+        self.assertIsNone(web_cache.persist_load("t757", 30, self._snap("W1")),
+                          "a body saved before the census stamp was restored "
+                          "and would be split on fields it does not carry")
+        self._saved(now, wit="W1", body=body)
+        self.assertIsNotNone(
+            web_cache.persist_load("t757", 30, self._snap("W1")),
+            "the same record under the current schema was refused")
 
     def test_an_UNDATEABLE_body_is_UNKNOWN_and_never_served(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control is the final persist_load on t757_ok through the SAME loader, which must return a body; the None checks are the intentional absences under test
         """A cache that cannot establish freshness must leave the regime EMPTY

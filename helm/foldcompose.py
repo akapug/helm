@@ -1598,11 +1598,12 @@ def bounded_gate(where, tip, receipt, consuming=None):
     # wants the repository; the declared-command origin clause wants the location
     # whose declaration would RUN, and a common dir has no declaration of its own —
     # handing it that value skipped a worktree's exact-path precedence silently.
-    state, token, why = gate.bind(receipt, tip, repo_id=repo, need=gate.NEED_SUITE,
+    state, token, why = gate.bind(receipt, tip, repo_id=repo, need=gate.NEED_LAND,
                                  consuming_repo=consuming or where)
     if state != "VERIFIED":
         return False, "whole composed-tree suite gate pending/refused: " + str(why)
-    state, why = landgate.gate_binds_tree(token, tree, repo=repo, tip=tip)
+    state, why = landgate.gate_binds_tree(token, tree, repo=repo, tip=tip,
+                                          where=consuming or where)
     return state == landgate.OK, why
 
 

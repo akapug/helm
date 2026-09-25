@@ -1225,6 +1225,29 @@ def sidechain_beacon_refusal(seat=None):
             "shell." % (who, SIDECHAIN_RULE))
 
 
+def sidechain_authority_refusal(verb, grantable=True):
+    """Why a delegate's verdict-class write is refused, and the two doors
+    (task/3060). `verb` is "group verb" from helm.delegate_grant.REFUSED.
+
+    THE SAME FACT AS THE BEACON RUNG, ONE LEDGER OVER: a delegate (an Agent
+    tool subagent or a Workflow agent) shares its seat's session and name, so
+    every door downstream records its write as the seat's own. The escape is
+    stated whole because the refusal is the one place a delegate meets it:
+    report to the parent; a Workflow read is recorded BY the seat as an
+    advisory; a seat that means to delegate grants it first."""
+    head = ("`%s` is a verdict-class write and you are a delegate (a "
+            "subagent or Workflow agent sharing this seat's session), so it "
+            "would be recorded as the seat's own. Report your read to your "
+            "parent instead." % ("helm " + verb))
+    if not grantable:
+        return head + (" Minting or revoking a grant is the seat's own act, "
+                       "and no grant admits it.")
+    return head + (" A Workflow run is never a seat: the seat records its "
+                   "read as an advisory (--reviewer-model/--reviewer-run). "
+                   "Deliberate same-family delegation: the seat's main thread "
+                   "runs `helm delegate allow --verbs \"%s\"` first." % verb)
+
+
 def replacement_authority(claimed, on_behalf=None, session=None):
     """(name, err) — may THIS CALLER rotate `claimed`'s beacon? POSITIVE only.
 
@@ -1350,6 +1373,33 @@ def resolve_actor_reason(session=None, cwd=None, asserted=None, act="act"):
     return _resolve(session, cwd, asserted, act)
 
 
+def admitted_name(session=None, cwd=None, act="act"):
+    """(name, err, reason) — the NAME the admission pass would admit this
+    process as, decided by the whole law and WRITING NOTHING.
+
+    FOR A DOOR THAT NEEDS THE LAW'S ANSWER BUT MUST NOT MINT. The signing
+    gate (`cell.signing_identity`) asks "may this seat sign past an inherited
+    owner profile?", and the answer has to be this layer's: DISPUTED,
+    CLAIM-JUMP, MALFORMED, rename-alias admission and an unreadable store live
+    only here, and a second resolver would re-implement a subset of them. But
+    the gate runs under READ verbs too — `chat.transport_status` asks it for
+    `helm doctor`, the owner TUI's refresh and `helm chat transport status` —
+    and a read that mints an identity record is a log used as a bus. So this
+    runs every refusal `resolve_actor_reason` runs, in the same order, and
+    stops at the preflight: a first admission is proven admissible and NOT
+    committed (`_bind(commit=False)` returns `_UNCOMMITTED_ADMISSION`). The
+    record is still minted where it always was, by the process's first ACT.
+
+    A NAME, NEVER A CAPABILITY. What comes back is a string: an
+    `AdmittedActor` means an admission HAPPENED, and here none did. A caller
+    that acts still resolves its own capability."""
+    got, err, reason = _resolve(session, cwd, None, act, commit=False)
+    if got is None:
+        return None, err, reason
+    return (got.canonical_name if isinstance(got, AdmittedActor)
+            else str(got)), None, None
+
+
 def _uncorroborated_message(act, declared, session):
     return (
         "refusing to %s as %r: this identity is DECLARED and nothing "
@@ -1362,12 +1412,16 @@ def _uncorroborated_message(act, declared, session):
            else "its session is not on the roster"))
 
 
-def _resolve(session=None, cwd=None, asserted=None, act="act"):
+def _resolve(session=None, cwd=None, asserted=None, act="act", commit=True):
     """(actor, err, reason) — the pass both doors share.
 
     The REASON is returned, not just the message, because the speech door has
     to drop exactly one refusal and no other. Branching on message text would
-    be a guard that a reworded sentence silently opens."""
+    be a guard that a reworded sentence silently opens.
+
+    `commit=False` is `admitted_name`'s preflight: every refusal below runs,
+    and an admission that would be a FIRST sighting returns its name (a str)
+    instead of taking the locked commit. Only `admitted_name` passes it."""
     from . import seats_identity as _ident
     from . import seats_roster as _roster
 
@@ -1502,6 +1556,11 @@ def _resolve(session=None, cwd=None, asserted=None, act="act"):
     refused = corroboration_refusal()
     if refused is not None:
         return None, str(refused), refused.reason
+
+    # THE PREFLIGHT STOPS HERE: every refusal above has run, and a first
+    # sighting is admissible. Its NAME is the answer; nothing is committed.
+    if row is _UNCOMMITTED_ADMISSION and not commit:
+        return name, None, None
 
     # A FIRST ADMISSION HAS ONLY BEEN PREFLIGHTED. Repeat the locked pass with
     # the corroboration callback: it re-reads the roster at the commit seam,

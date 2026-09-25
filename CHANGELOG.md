@@ -1,5 +1,390 @@
 # Changelog
 
+## 0.3.1 — 2026-09-24
+
+Changes since 0.3.0.
+
+This release is about the cost of running a fleet every day. A stop no longer
+rebuilds fleet state, a dispatch send or verdict no longer waits behind a
+ledger rebuild, and a seat stays reachable after its 30-minute watch ends. In
+helm's own repository, a lane no longer runs its own whole test suite: the one
+serial whole suite runs at the land gate, and a lane that needs a whole suite
+gets a sliced run that is about six times faster. The argument guard gains
+refusals for commands that print secrets into a transcript, change the shared
+checkout, or write verdicts from a subagent. Some refusals and defaults
+changed: read "Breaking or behaviour changes" at the end before you upgrade.
+The one new requirement is to keep `helm web` running, because the Stop hook
+now reads the facts it writes.
+
+### Test gates
+
+The whole-suite rules below are helm's own landing rules. They apply when
+`helm gate run` runs helm's own test suite. A project that declares its own
+gate command keeps its own rules.
+
+- **A whole suite runs once, at the land gate.** The land gate is one serial
+  whole suite on the exact tree that lands: the integrator's train. In a lane
+  room (`<repo>-wt/<lane>`), `helm gate run` refuses a whole suite and prints
+  the focused route instead. The escape is `--lane-suite --why TEXT`: the
+  reason goes on the receipt label, and every escape is counted. In one
+  measured week, 142 whole suites (68.6 hours) had run on lane tips.
+- **A green tree is never gated twice, and a red tree reruns only with
+  `--again`.** When a tree's last whole-suite receipt is green and binds it,
+  `helm gate run` refuses and prints that receipt's evidence line for you to
+  cite. When the last receipt is red, a rerun measures only a flake, so it
+  needs `--again`, which is recorded on the label. In a compose room, the
+  whole suite launches through `helm gate window launch`.
+- **A lane-level whole suite runs as slices.** With no mode flag, a whole
+  suite in a lane room admitted by `--lane-suite`, a peek, a seat's home or a
+  harness worktree runs as parallel slices of one serial discovery and mints
+  a sliced receipt. On one build node, the same 22,533 tests measured 906.5 s
+  serial and 145.1 s as slices. Every worker must agree on one ordered test
+  inventory, and an audit fails any test module that leaves process state or
+  module data behind. Everywhere else (the shared checkout, a compose or train
+  room, a gate labelled `train...`, a Fab job) the suite runs serial. A room
+  that cannot run slices (fewer than four CPUs, or a tree whose own
+  `helm/gate.py` predates the sliced kind) runs serial and says why.
+  `--serial` forces serial, and `--sliced --box HOST` runs slices on that
+  host.
+- **A sliced receipt never authorizes a land.** It binds a lane tip and a
+  review's APPROVE. Slices do not see data that one test module leaves in a
+  shared module for a module on another worker, so every land door refuses the
+  sliced kind by name and a land needs a serial whole-suite receipt.
+- **New `helm gate canary`** keeps checking that slices agree with serial. It
+  holds one serial and one sliced receipt of trunk's tip and compares them
+  test by test. A divergence posts one alert and writes a marker that stays
+  until a person clears it (`helm gate canary clear --reason ...`). While
+  the marker stands, no sliced receipt may authorize a land; in this release
+  none does. `--install-timer` installs the nightly timer, which is not
+  installed for you.
+- **Refusals name the move that works in your room.** Every focus-planner
+  refusal, and every refusal that told a lane room to run the whole suite, now
+  names the tree-wide audits plus the lane's own test modules (`helm gate
+  audits`) or the `--lane-suite --why` escape. Outside a lane room they name
+  `helm gate run`, or `fab gate` on a host that refuses local suites.
+- `helm gate slice-timings` prints the newest sliced receipt's per-module
+  seconds as one JSON object. `helm gate run --sliced --timings FILE` reads
+  such a file to schedule the longest modules first. A file that does not
+  validate is named and ignored, never trusted.
+- `helm gate run --plan --json` names the resolved `mode` and `mode_reason`,
+  and for a sliced run the slice command and the most `workers` it starts, so
+  a runner outside helm can forward `--sliced` and size its grant.
+- A gated suite no longer inherits the gate's own `HELM_HOME` and
+  `MELD_HOME`. Before, a test could write rows into the ledger that the gate's
+  receipt goes to, and the receipt's import was then refused.
+- **A suite killed by a signal reports 128+N.** A suite that died of SIGTERM
+  reported exit 241 (256-15), which reads as an exit code. It now reports 143
+  (128+15). A worker of the diagnostic shard runner (`helm/gateshard.py`)
+  reports the same way, and its pool names the signal.
+- A whole-suite gate of helm's own tree could end UNKNOWN part-way: one test
+  sent SIGTERM to the suite runner itself. That test now runs its subject in a
+  separate interpreter. The receipt parser still refuses a run that died
+  part-way, instead of reading an earlier summary as the result.
+
+### Landing work
+
+- **New `helm train`** composes the landing window. By default it is a dry
+  run: it lists this project's approve-ready rows, their reviewed tips and the
+  merge order, oldest approve first, and names every READY row it leaves out
+  and why. Rows that read READY-SELF-REVIEW or READY-CONTESTED, and rows whose
+  independence reads UNKNOWN, are left out by name. `--apply` makes one room
+  under `<repo>-wt/compose/`, merges each reviewed tip by its exact commit,
+  with rerere off, and launches one whole suite through `helm gate window
+  launch`. A conflict is aborted, never resolved: the row and its lane are
+  named, and the other rows still compose. A car whose reviewed tip is more
+  than `--max-behind N` commits behind trunk (default 200) is skipped and
+  named. `--apply` refuses when the local trunk differs from the declared
+  remote trunk, or when that trunk is undeclared or cannot be read.
+- **A land takes only a receipt helm can prove it ran.** Every check `helm
+  gate import` makes (schema, content id, head, tree) is one the artifact's
+  submitter can make too, so an edited receipt could import and bind a land.
+  Every land door now asks, last, which authenticated door placed the receipt
+  in the repository being landed: a local `helm gate run`, a completion helm
+  observed for a job that `helm gate window launch` dispatched, or a routed
+  `helm gate run --box` session. A receipt that only `helm gate import` placed
+  still binds a lane tip and an APPROVE, and the land refusal names `helm gate
+  window launch` as the cure. This check is off until the integrator runs
+  `helm gate provenance --activate`, and it is forward-only: a land made
+  before the activation, and a receipt the ledger already held, are judged as
+  they were. A project that declares its own gate command has no
+  authenticated remote door yet, so its land binds as before and every door
+  says `provenance: unauthenticated-no-door`. `helm gate provenance` prints
+  the state.
+- The label given to `helm gate window launch --label` now travels with the
+  job to the receipt, where the remote runner accepts it, and the launch says
+  whether it did. `helm gate show` measures a receipt's standing in the
+  repository the receipt was placed in, and says so, instead of reading
+  UNKNOWN from any other directory. In a compose room, a green receipt that
+  no land door would take no longer stops a new whole suite: the run goes to
+  the window with a note that says why.
+- **New `helm dispatch retract`** takes back a wrong verdict without
+  rewriting it. It appends one event after the verdict, and the row then reads
+  RETRACTED wherever authority is read, so a wrong APPROVE authorizes nothing.
+  The verdict's author, the integrator or the owner may retract. `--reissue`
+  sends the successor review in the same call. A second verdict on a row now
+  names `retract` in its refusal.
+- **Sends and verdicts no longer wait behind a ledger rebuild.** A land makes
+  every ledger checkpoint cold, and the first writer after a land rebuilt it
+  while it held the dispatch ledger lock (102.2 s measured once). Every
+  dispatch-ledger writer now reads outside the lock and holds it only to
+  write. Of two sends of one cured operation, the one that finds the other's
+  successor reports not sent.
+- A dispatch brief longer than the row's cap now says, on the row's copy,
+  that the whole brief is stored by reference and how to read it (`helm
+  dispatch triage <id>`). `helm dispatch triage` labels a cut copy TRUNCATED,
+  with the bytes kept and sent, and the send says how many bytes the recipient
+  sees unless it follows the reference.
+- A build sent against trunk no longer shows as landed the moment it is sent.
+  helm asks a build's own lane whether its work reached trunk, never the base
+  it was sent against. A build lane landed by cherry-pick counts as landed
+  when a kept patch-identity proof says so.
+- `helm lr compose` refuses a closed row that still reads READY, by name.
+  `helm lr list`, `helm lr show`, `helm train` and the READY ladder use one
+  test for a live READY row.
+
+### Seats and chat
+
+- **A seat stays reachable after its 30-minute watch.** Claude Code stops
+  every Monitor at 30 minutes, which ends a seat's waiter without its cleanup,
+  and helm then read the seat as DEAF and refused dispatches to it. A seat
+  whose waiter ended at that deadline now reads WAKING for a grace period:
+  helm never types into it, and it shows as DEGRADED, not UNUSABLE. A dispatch
+  to a seat whose only refusal is DEAF is filed with an advisory, the router
+  ranks that seat last, and `helm reviewers` keeps it eligible with a
+  "DEAF (nudge pending)" note. With `--post`, `helm beacons` re-arms a DEAF
+  seat that owes work by typing into its pane, once per DEAF spell, for any
+  model family. A seat that owes nothing is never typed into.
+- A seat relaunched onto a fresh session was refused at its own chat join as
+  a claim-jump, so its waiter never armed and `helm seat list` read UNUSABLE
+  over a live pane. A session that no process holds now counts as a seat
+  between panes.
+- **A seat under your inherited profile signs as itself.** A seat started
+  outside `helm launch` inherits your `HELM_CELL_PROFILE` from your shell, and
+  its signed posts were refused. When the identity layer admits the process as
+  its seat, it now signs with the seat's own key, which the signer makes on
+  first use. Any other profile that names someone else still posts unsigned.
+- **`helm chat node up` remembers the binary it installed** (its path and
+  sha256), and a bare `up` uses it. Before, a bare `up` could bring back the
+  old node binary against a new chain's data. A record that cannot be honoured
+  refuses and prints `HELM_CHAT_NODE_BIN=<binary> helm chat node up`. `helm
+  chat node status` and `helm doctor` print the binary and where it came from.
+- The session catalog honours `HELM_CACHE_DIR`. Before, a scratch or test
+  home still wrote its catalog caches into `~/.cache/helm`.
+
+### Hooks and guards
+
+- **The Stop hook reads a snapshot instead of rebuilding fleet state.** The
+  `helm web` resident computes the facts every stop needs (gate and approval
+  exemptions, room advice, what each seat owes, review rounds and the
+  composition-seam rows) when their inputs move, and writes them to one file.
+  A stop checks that each fact is still exact, with no subprocess, and never
+  waits for one. On a live fleet, stops measured about 0.3-0.8 s (p50 326 ms,
+  p95 824 ms over 14 stops), where one seat's stops had taken 12-20 s. A fact
+  that is stale or absent never grants an exemption: the stop keeps its block
+  and prints the snapshot's age. After a land, the resident restarts itself
+  on the new code once that code imports. `helm doctor` reports a missing
+  snapshot and a resident that runs older code than the tree.
+- **Hooks start faster.** helm's hook child now starts Python without its
+  site stage, from the interpreter helm recorded the first time, and uses GNU
+  timeout (`gnutimeout`) when the host has it. Measured at load 12.5-16.8: the
+  argument guard went from p50/p90 207/310 ms to 110/144 ms. Every state helm
+  cannot prove keeps the old start. `helm doctor` says whether hooks still pay
+  for an eager site stage.
+- `helm hooks latency` now measures every hook event, not only PostToolUse. A
+  hook that timed out or was cancelled is also kept in an incidents file that
+  holds about a day, so a day's timeouts can be counted.
+- **The argument guard refuses a command that prints secrets into the
+  transcript**: the whole environment, a process's environment, a
+  credentials file, or a secret-looking variable, for Bash and Monitor calls.
+  It follows `bash -c`, `eval`, `ssh`, `su -c`, `docker exec`, `kubectl exec`
+  and `podman exec`, follows process substitutions, and tells a file a
+  command writes from a file it prints. `env` as a launcher, a presence
+  check, `grep -c`, `wc -l`, a names-only filter and a redirect to a file
+  pass. `export $(...)` is refused, because an empty substitution runs a bare
+  `export`. The refusal names the cure. Over about 400,000 recorded fleet
+  commands it refuses 0.10%.
+- **A working-tree git command cannot run in the shared checkout.** In a
+  repository that uses the full ("rail") guard profile and has lanes, the
+  argument guard refuses a git command that would change the shared
+  checkout's working tree: `stash pop`, `apply`, `drop` or `branch`;
+  `checkout` or `restore` with an operand; `reset --hard`, `--merge` or
+  `--keep`; `merge` or `pull` without `--ff-only`; `rebase`, `cherry-pick`,
+  `revert`, `am` and `switch`; and `clean` without `-n`. It follows `cd`,
+  `pushd` and `git -C`, and the refusal spells the command for the lane.
+  `HELM_WORK_INTEGRATOR=1` allows it.
+- **A subagent cannot write verdicts as its seat.** A subagent or Workflow
+  agent shares its seat's name and session, so its ledger writes looked like
+  the seat's own. The argument guard now refuses a delegate's verdict-class
+  writes unless the seat grants them with the new `helm delegate allow --verbs
+  "..."` (30 minutes by default, 24 hours at most): `helm dispatch` verdict,
+  retract, hold, release, cancel, rebind and retip; `helm lr` close, land,
+  abandon, retire and expired; `helm store` confirm, supersede, revise,
+  retire and reject; and `helm handoff write`. `helm delegate list` and
+  `revoke` manage grants, and no grant admits `allow` or `revoke`. Sends,
+  claims, chat posts, gate runs, usage calls, dry runs and a literal test
+  `HELM_HOME` stay open.
+- **Words that are data are not commands.** The GitHub Actions and delegate
+  rungs refuse a verb only where the shell runs it. A grep pattern, a `pgrep`
+  or `ps` argument, a quoted heredoc body read by `cat` or `tee`, an `echo`
+  argument, and a `git -c user.name=... commit` are data. Python text given
+  to `python -c` or in a heredoc is data only when every import comes from a
+  list of modules that cannot start a process and it names no dynamic
+  primitive such as `exec`, `eval`, `getattr` or `__import__`; a heredoc
+  body that does not parse as Python is prose, and data too. In Python text
+  that is not data, a list or call that spells a helm command is read as that
+  command. For a delegate, `xargs` or `parallel` feeding a helm command
+  is refused as UNKNOWN, and no grant admits it.
+- The substitution guard now covers `helm store revise`, as it covers `helm
+  store add`: a backtick or `$(...)` in a double-quoted statement runs before
+  helm starts.
+- **The pre-push host-path guard says UNKNOWN when it cannot read a
+  repository's visibility.** It reads PRIVATE, PUBLIC or UNKNOWN with the
+  cause, and asks `gh` once more after a failed probe. UNKNOWN still scans and
+  refuses, and the refusal now reads `<remote>: visibility UNKNOWN (<why>),
+  treated as public`. Before, it called a private repository public.
+- **The removed-name check refuses less.** The full guard no longer refuses a
+  commit that renames one of two duplicate top-level definitions while the
+  file still defines the name with a `def` or `class`. In another file that
+  defines its own top-level function of the same name, a bare use of that name
+  no longer counts as a use of the removed one.
+- The pre-commit vacuous-assertion advisory no longer warns about a mock's
+  `assert_not_called()` or `assert_not_awaited()` when a positive assertion
+  on the same double stands beside it. The same absence with no positive
+  assertion on that double still warns.
+
+### Web cockpit
+
+- **The owner board lists only live obligations.** The Board's waits list
+  had grown to 900 rows up to 60 days old, most of them already landed or
+  settled. The waits and the kanban now list live obligations only. Every
+  other open row is counted on one line per class, with its oldest age and
+  the command that lists it: work left over after landing
+  (`helm lr retire --off-frontier`), work on main with no verdict recorded
+  (`helm lr list`), and rounds that a later round absorbed (`helm lr list
+  --all`). A row on main under a live FIX stays listed, and an owner-gated
+  hold stays listed.
+
+### Performance
+
+All numbers below are measurements stated in the commits.
+
+- A ledger read no longer takes minutes when Orca-launched and plain seats
+  take turns. Orca launches seats with extra credential settings in git's
+  configuration, which gave the two kinds of seat different fingerprints for
+  one checkpoint file, so each replaced the other's checkpoint with a cold one
+  (one measured read: 92.8 s instead of 4.5 s). Credential settings are no
+  longer part of the fingerprint.
+- Checking whether each build lane landed reads ancestry and the lane's own
+  history, and no longer walks every trunk patch: 0.18 s cold over 92 build
+  lanes, where it had taken minutes.
+- In the Stop hook, the claims check costs at most 0.14 s and the
+  composition-seam check at most 0.05 s, measured over 40 stops. The seam
+  check had taken 1.4-4.8 s per stop.
+- `helm work claim` asks git for the hooks directory once per guard check
+  instead of once per hook name (about 41 times per claim before).
+
+### Breaking or behaviour changes
+
+#### Required on upgrade
+
+- **Keep `helm web` running.** The Stop hook now reads the stop facts that the
+  `helm web` server on the console port writes (docs/WEB.md shows a systemd
+  user unit for it). With no `helm web` running, every claims exemption (a
+  lane in gate, a lane approved) is refused at every stop, the
+  composition-seam check only warns, and `helm doctor` says so. The
+  memory-index cap and the scratch reaper also moved from the stop to that
+  server, which runs them every minute. `HELM_STOP_FACTS_LEG=1` turns the
+  facts on for a server on another port.
+
+#### Changed defaults
+
+- In helm's own repository, a whole suite with no mode flag in a lane-level
+  room runs as slices and mints a sliced receipt, which cannot authorize a
+  land. Pass `--serial` for a serial run.
+- A seat that inherited your signing profile from your shell signs as itself
+  when the identity layer admits it. In 0.3.0 it posted unsigned.
+- `helm beacons --post` re-arms a DEAF seat that owes work on any model
+  family. On a paid family this spends one paid turn per DEAF spell. Before,
+  it re-armed only native Claude seats.
+- A seat whose waiter ended at the 30-minute watch reads WAKING, not DEAF,
+  for a grace period. A dispatch to a seat whose only refusal is DEAF is filed
+  with an advisory instead of refused.
+- Hooks start Python with `-S`, from the interpreter recorded in
+  `<helm home>/_global/.state/hook-interp`, and use `gnutimeout` when it is on
+  `PATH`.
+- With `HELM_CHAT_NODE_BIN` unset, `helm chat node up` uses the binary it
+  recorded, not the default search.
+- The session catalog writes its caches under `HELM_CACHE_DIR` when it is
+  set.
+
+#### New refusals
+
+- **Whole suites, in helm's own repository.** `helm gate run` refuses a
+  whole suite in a lane room without `--lane-suite --why TEXT`, a whole suite
+  on a tree whose green receipt binds it, and a rerun of a red tree without
+  `--again`. `--lane-suite` without `--why`, `--sliced` in a compose room or
+  beside a `train...` label, `--sliced` with `--serial`, and `--timings` on a
+  run that is not sliced or with `--box` exit 2.
+- **Lands.** Every land door refuses a sliced receipt. After `helm gate
+  provenance --activate`, every land door also refuses a receipt that no
+  authenticated door placed, except in a project that declares its own gate
+  command.
+- **Gate declarations.** A project's declared gate command that names one of
+  helm's diagnostic runners (`helm/gateslice.py`, `helm/gateshard.py`) is
+  refused, so a diagnostic run can never mint a landing receipt.
+- **The argument guard** refuses, in every project where helm's hooks are
+  installed: a command that prints the environment, a process's environment,
+  a credentials file or a secret-looking variable; a delegate's verdict-class
+  write without a grant; and a `helm store revise` statement that holds a
+  command substitution. In a repository under the full ("rail") guard, it
+  refuses a working-tree git command in the shared checkout.
+- **`helm train --apply`** refuses when the local trunk differs from the
+  declared remote trunk or the remote cannot be read. `--max-behind` below 10,
+  or not a whole number, exits 2.
+- **`helm lr compose`** refuses a closed row that still reads READY.
+- **Retracted rows.** `helm dispatch verdict`, `helm dispatch cancel`, `helm
+  lr close`, `helm lr retire` and a second `helm dispatch retract` refuse a
+  retracted row and name the retraction.
+- **`helm chat node up`** refuses a recorded binary that is gone or whose
+  sha256 changed, a record it cannot read, and a binary it cannot hash.
+- **The pre-push host-path guard** treats a `gh` answer with no true or false
+  `isPrivate` as UNKNOWN, so it scans and refuses. Before, such an answer
+  skipped the scan as private.
+
+#### Changed output
+
+- A suite, or a worker of the diagnostic shard runner, killed by signal N
+  reports 128+N (143 for SIGTERM), not 256-N.
+- The host-path guard's refusal for a visibility it could not read ends with
+  `<remote>: visibility UNKNOWN (<why>), treated as public`.
+- `helm gate run --plan --json` adds `mode` and `mode_reason`, and for a
+  sliced run `slice` and `workers`.
+- `/api/board` carries `waits_collapsed` beside the live waits, and each
+  kanban's lanes carry an on-main count line and the collapsed lines. The
+  web server rebuilds its saved board once after the upgrade, because the
+  saved shape changed.
+- `helm dispatch list`, `helm dispatch triage`, `helm lr list` and `helm lr
+  show` print RETRACTED for a retracted verdict.
+- After the provenance activation, a land door's success text ends with the
+  door that placed the receipt, or `provenance: unauthenticated-no-door`.
+
+#### Project infrastructure
+
+- helm's repository now tracks `.claude/settings.json` with commit and PR
+  attribution turned off, so a cloud session that starts on a fresh clone adds
+  no AI trailer. Everything else under `.claude/` is ignored.
+- CONTRIBUTING.md has a new section, "How a change is tested": focused rounds
+  and the tree-wide audits while a change is built, and one serial whole
+  suite at the land gate.
+- The slice runner's audit found test modules that left process state or
+  module data for the modules after them. Each of those modules now restores
+  its own.
+
+### Thanks
+
+Thanks to ember arlynx ([@emberian](https://github.com/emberian)) for dregg,
+which signs helm's chat.
+
 ## 0.3.0 — 2026-09-23
 
 Changes since 0.2.0.

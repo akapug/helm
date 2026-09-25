@@ -126,12 +126,13 @@ class SubagentStartEnvelope(unittest.TestCase):
         # What IS still pinned is that the block names the PLAN form (cheap,
         # local, no run) and never a bare focused gate as the cure route.
         self.assertIn("--focus --plan", g)
-        # AND its refusal case, because the block ships the command: --plan
-        # exits 1 for a lane touching any non-Python file. Measured on this
-        # very lane, which carries two .md files. Promising a subagent that a
-        # command "prints the selection" when it refuses for their lane is the
-        # same defect as naming an unreachable verb.
+        # AND what it does for a lane that touches a non-Python file, because
+        # the block ships the command: since task/3039 it selects the
+        # tree-wide audits plus the modules naming the file, and the block
+        # must say THAT, never that it refuses. Promising one answer when the
+        # other is true is the same defect as naming an unreachable verb.
         self.assertIn("non-Python", g)
+        self.assertNotIn("REFUSES if your lane touches any", g)
         # THE DISCRIMINATION IS THE CUSTOM ARGV, NOT THE VERB. This arm used
         # to assert `assertNotIn("fab gate --repo", g)` on the reasoning that
         # the custom-argv path mints UNKNOWN, so the verb "must be named only

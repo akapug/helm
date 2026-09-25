@@ -51,6 +51,14 @@ REASON_CHARS = 200
 _WRITE_LOCK = threading.Lock()
 _LAST = {"ts": 0.0, "outcome": None}
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_LAST": (
+        "the heartbeat's last-write stamp; the tests that assert a write "
+        "(test_boardread, test_web_lr) reset it first"),
+}
+
 
 def path():
     return os.path.join(home.helm_home(), "_global", ".state", "board-read.json")

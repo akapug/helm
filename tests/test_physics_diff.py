@@ -26,7 +26,9 @@ class PhysicsBase(unittest.TestCase):
 
     def tearDown(self):
         physics.MANAGED_DIRS = self._orig_managed
-        configs.HOME_ROOTS = self._orig_home_roots
+        # IN PLACE: every configs submodule holds this one list object, and
+        # re-binding the name handed them a copy (task/3039).
+        configs.HOME_ROOTS[:] = self._orig_home_roots
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # -- planters ----------------------------------------------------------

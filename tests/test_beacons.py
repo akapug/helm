@@ -2928,8 +2928,8 @@ class VacantTest(Base):
         # line, which is precisely when somebody needs to check the tally
         # still accounts for every seat. MISROUTED broke it on arrival and
         # that is the arm working, not the arm being brittle.
-        self.assertIn("2 seats, 1 covered, 0 DEAF, 0 DEAF-IN-EFFECT, "
-                      "0 MISROUTED, 1 VACANT, 0 UNPROVEN",
+        self.assertIn("2 seats, 1 covered, 0 WAKING, 0 DEAF, "
+                      "0 DEAF-IN-EFFECT, 0 MISROUTED, 1 VACANT, 0 UNPROVEN",
                       CensusTest.render(self, rep))
 
     def test_the_census_still_signals_NOTHING_at_a_VACANT_seat(self):
@@ -3804,8 +3804,15 @@ class StaleBatchOppositeEdgeTest(Base):
                 mock.patch("helm.notify.owner_push", side_effect=push), \
                 mock.patch("helm.notify.configured", return_value=True):
             out = beacons.escalate(reg_a["transitions"], rep_a)
+            # JOINED INSIDE THE PATCH SCOPE. The recovery thread opens its own
+            # patch of `live_sessions` and HELM_PROC while this block's are
+            # open. Leaving this block first restored the real function, and
+            # the thread's later exit then restored THIS block's MagicMock,
+            # which stayed bound on helm.beacons for every later module in
+            # the process. Nested exits are the only order that unwinds.
+            for thread in threads:
+                thread.join(2)
         self.assertEqual(len(threads), 1, "the chat leg never ran")
-        threads[0].join(2)
         self.assertFalse(threads[0].is_alive(),
                          "attendance stayed blocked after escalation released")
         if failures:
@@ -4322,6 +4329,142 @@ class ResumeSidShapeTest(unittest.TestCase):
                 "oi", SID_A, procs=live, unreadable=[])
         self.assertIsNone(ident)
         self.assertIn("different session", why)
+
+
+class ALeaseExpiryIsWakingNotDeafTest(Base):
+    """task/3055 — a beacon that reached its 30-minute lease is a check-in.
+
+    MEASURED ON THE LIVE FLEET: gemini read `UNUSABLE — no live
+    beacon` and a review booking to grok was refused, each inside the gap
+    between a waiter the harness killed at its Monitor deadline and the one
+    its seat armed about 31 seconds later. The killed waiter never ran its
+    own `finally`, so its registry row survived it; the census pruned that
+    row and wrote DEAF, and the register held DEAF for a whole pass.
+
+    These arms plant exactly that row: a registry entry whose pid is gone and
+    whose arm time puts its death at the lease deadline. Only the arm time
+    and the declaring pane vary between them."""
+
+    LEASE_S = 1800        # seats_advice.BEACON_TIMEOUT_MS, the Monitor cap
+
+    def plant_row(self, pid, armed_ago, seat="alpha", phase=None):
+        """A committed registry row for a waiter that is NOT in /proc."""
+        os.makedirs(beacons.registry_dir(), exist_ok=True)
+        row = {"seat": seat, "pid": pid, "session": SID_A, "starttime": 100,
+               "armed": time.time() - armed_ago,
+               "home": os.environ["HELM_HOME"]}
+        if phase:
+            row["phase"] = phase
+        with open(beacons._entry_path(seat, pid), "w") as f:
+            json.dump(row, f)
+
+    def census(self):
+        with mock.patch.object(beacons, "live_sessions",
+                               return_value={SID_A: 90}):
+            return beacons.census(proc_dir=self.proc)
+
+    def test_a_beacon_killed_at_its_lease_deadline_reads_WAKING(self):  # noqa: VACUOUS_ASSERTION — the verdict WAKING and the waking bucket naming alpha are the positive observables of the same census; the empty deaf and unreachable buckets are their complement
+        """THE RED-FIRST ARM. The tip before task/3055 pruned this row and
+        answered DEAF."""
+        self.roster("alpha")
+        self.agent(90, "alpha")
+        self.plant_row(4242, self.LEASE_S + 10)
+        rep = self.census()
+        self.assertEqual([beacons.WAKING], [r["verdict"] for r in rep["seats"]],
+                         rep["seats"][0]["why"])
+        self.assertEqual(["alpha"], [r["seat"] for r in rep["waking"]])
+        self.assertEqual([], rep["deaf"])
+        self.assertEqual([], rep["unreachable"],
+                         "a seat inside its re-arm grace is not an outage")
+        self.assertEqual(1, len(beacons.entries("alpha")),
+                         "the expired row must be KEPT for the grace")
+        self.assertEqual([4242], [b["pid"] for b in rep["seats"][0]["expired"]])
+        out = CensusTest.render(self, rep)
+        self.assertIn("WAKING SEAT alpha", out)
+        self.assertIn("30-minute lease", out)
+        self.assertIn("1 WAKING, 0 DEAF", out)
+
+    def test_the_register_writes_WAKING_and_never_advances_covered(self):  # noqa: VACUOUS_ASSERTION — the register's state WAKING is the positive observable of the same attend; the absent covered stamp and empty transitions are what WAKING must not write
+        self.roster("alpha")
+        self.agent(90, "alpha")
+        self.plant_row(4242, self.LEASE_S + 10)
+        rep = self.census()
+        out = beacons.attend(rep)
+        self.assertIsNone(out["error"], out)
+        with open(os.path.join(os.environ["HELM_CHAT_DIR"],
+                               ".roster.json")) as f:
+            att = json.load(f)["alpha"]["attendance"]
+        self.assertEqual(beacons.WAKING, att["state"])
+        self.assertFalse(att["alarm"])
+        self.assertIsNone(att["covered"],
+                          "WAKING is not a proven answer, so it must not "
+                          "stamp the covered grace")
+        self.assertEqual([], out["transitions"],
+                         "no alarm edge for a seat that is re-arming")
+
+    def test_CONTROL_an_hour_past_the_deadline_is_DEAF_and_pruned(self):  # noqa: VACUOUS_ASSERTION — the verdict DEAF and the unreachable bucket naming alpha are the positive observables; the emptied registry is the prune they imply
+        """The grace ends. A seat that never re-armed is DEAF again, and its
+        row goes the way of every other dead row."""
+        self.roster("alpha")
+        self.agent(90, "alpha")
+        self.plant_row(4242, self.LEASE_S + 3600)
+        rep = self.census()
+        self.assertEqual([beacons.DEAF], [r["verdict"] for r in rep["seats"]])
+        self.assertEqual([], beacons.entries("alpha"))
+        self.assertEqual(["alpha"], [r["seat"] for r in rep["unreachable"]])
+
+    def test_CONTROL_a_death_mid_lease_is_DEAF_at_once(self):  # noqa: VACUOUS_ASSERTION — the verdict DEAF is the positive observable; the emptied registry is the prune it implies
+        """Ten minutes into a 30-minute lease is not the lease: a waiter that
+        died there crashed or was killed, and nothing will re-arm it on its
+        own schedule."""
+        self.roster("alpha")
+        self.agent(90, "alpha")
+        self.plant_row(4242, 600)
+        rep = self.census()
+        self.assertEqual([beacons.DEAF], [r["verdict"] for r in rep["seats"]])
+        self.assertEqual([], beacons.entries("alpha"))
+
+    def test_CONTROL_no_declaring_pane_is_never_WAKING(self):
+        """WAKING needs the independent evidence VACANT rests on: a pane that
+        declares the seat. Without it the agent that would re-arm may be gone
+        with its waiter, and that is DEAF."""
+        self.roster("alpha")
+        self.plant_row(4242, self.LEASE_S + 10)
+        rep = self.census()
+        self.assertEqual([beacons.DEAF], [r["verdict"] for r in rep["seats"]])
+
+    def test_CONTROL_an_arming_marker_never_reads_WAKING(self):  # noqa: VACUOUS_ASSERTION — the verdict DEAF is the positive observable; the emptied registry is the prune it implies
+        """An `arming` marker never entered wait, so it had no lease."""
+        self.roster("alpha")
+        self.agent(90, "alpha")
+        self.plant_row(4242, self.LEASE_S + 10, phase="arming")
+        rep = self.census()
+        self.assertEqual([beacons.DEAF], [r["verdict"] for r in rep["seats"]])
+        self.assertEqual([], beacons.entries("alpha"))
+
+    def test_CONTROL_a_live_beacon_beside_an_expired_row_is_COVERED(self):
+        """The re-arm landed: the new waiter answers, whatever the old row
+        says."""
+        self.roster("alpha")
+        self.agent(90, "alpha")
+        self.waiter(613, "alpha", sid=SID_A)
+        self.plant_row(4242, self.LEASE_S + 10)
+        rep = self.census()
+        self.assertEqual([beacons.COVERED], [r["verdict"] for r in rep["seats"]])
+        self.assertEqual(1, len(rep["seats"][0]["live"]))
+
+    def test_WAKING_is_outside_the_alarm_class(self):
+        self.assertFalse(beacons.unreachable(
+            {"verdict": beacons.WAKING, "live": []}))
+        # THE CONTROL on the same predicate: DEAF with no live beacon alarms.
+        self.assertTrue(beacons.unreachable(
+            {"verdict": beacons.DEAF, "live": []}))
+
+    def test_the_grace_is_derived_from_the_census_cadence(self):  # noqa: VACUOUS_ASSERTION — two equalities between named constants, each a positive value
+        self.assertEqual(2 * beacons.INTERVAL_S, beacons.REARM_GRACE_S)
+        from helm import seats_advice
+        self.assertEqual(self.LEASE_S * 1000, seats_advice.BEACON_TIMEOUT_MS,
+                         "the fixture's lease must be the harness cap")
 
 
 class ADeliveryThatBecameNoTurnTest(Base):

@@ -570,6 +570,10 @@ class ADirectScriptEntryPointStillRuns(unittest.TestCase):
             json.dump({session: entry}, f)
         return self.run_direct("helm/catalog.py", [],
                                env={"HOME": home, "HELM_CATALOG": "scanner",
+                                    # the suite isolates HELM_CACHE_DIR, and the
+                                    # catalog honours it: point it at the cache
+                                    # this fixture wrote
+                                    "HELM_CACHE_DIR": cache_dir,
                                     "HELM_CLAUDE_ROOTS": root,
                                     "HELM_CODEX_ROOTS": os.path.join(home, "none")})
 

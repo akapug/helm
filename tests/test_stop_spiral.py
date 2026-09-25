@@ -78,6 +78,11 @@ class SpiralBase(unittest.TestCase):
         os.environ["HELM_STOP_GUARD_WHISPER"] = "0"
         os.environ["HELM_STOP_GUARD_WIRING"] = "0"
         os.makedirs(os.path.dirname(D.ledger_path()), exist_ok=True)
+        # THE STOP GUARD READS A RESIDENT'S FACTS, the spiral count among
+        # them; this stands in one that is exactly up to date at every stop
+        # (tests/_stopfacts.py).
+        from tests._stopfacts import always_fresh
+        self.fresh_resident = always_fresh(self)
 
     def tearDown(self):
         for k, v in self.prior.items():

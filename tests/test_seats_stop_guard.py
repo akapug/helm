@@ -62,6 +62,10 @@ def setUpModule():
     _ENV_PRIOR["HELM_STOP_GUARD_LEASE_TTL"] = os.environ.get("HELM_STOP_GUARD_LEASE_TTL")
     _ENV_PRIOR["HELM_STOP_GUARD_WHISPER"] = os.environ.get("HELM_STOP_GUARD_WHISPER")
     os.environ["HELM_SCRATCH_GC"] = "0"
+    # No dispatch row this module writes walks the host's process table
+    # (task/3039; see tests._tmphome.pin_live_seats).
+    from tests._tmphome import pin_live_seats
+    pin_live_seats()
 
 
 def tearDownModule():
@@ -70,6 +74,12 @@ def tearDownModule():
             os.environ.pop(key, None)
         else:
             os.environ[key] = was
+    # A stop that armed a surviving disclosure and never emitted it leaves
+    # the text queued for whatever refuses next in this process, which is
+    # another module's stop; drain it the way an interrupted response does
+    # (task/3039: the slice runner's data audit named it).
+    from helm import seats_stop_seam
+    seats_stop_seam.fallback_lines(())
 
 
 class StopGuardTest(SeatsBase):
@@ -370,8 +380,11 @@ class StopGuardTest(SeatsBase):
         )
         self.assertAlmostEqual(max(float(row[4]) for row in rows),
                                10.319, places=6)
+        # THE dispatch-ledger COLUMN STAYS IN THE FIXTURE AS EVIDENCE, and its
+        # stage left this loop with its rung: the fold runs in the `helm web`
+        # resident, so no reserve or admission cost is pinned for it.
+        self.assertNotIn("dispatch-ledger", seats_stop_budget.RESERVE_S)
         for stage, column, latest in (
-                ("dispatch-ledger", 5, 0.482),
                 ("claims", 6, 0.404),
                 ("seam", 7, 5.508)):
             starts = [float(row[column]) for row in rows
@@ -388,12 +401,14 @@ class StopGuardTest(SeatsBase):
     def test_measured_6_395s_prefix_reaches_whisper_and_response(self):
         """The production specimen, without a 6.4-second sleeping test.
 
-        0.147s before the shared dispatch observation + 1.324s dispatch +
-        4.924s seam is the recorded 6.395s pre-whisper prefix. Each producer
-        advances one fake monotonic clock and the exact timing lines are the
-        positive control that the arm drove those inputs. The whisper returns a
-        marker block after another 4.000s, so the complete 10.395s path is red
-        under the old budget and green now rather than merely described as such.
+        The recorded 6.395s pre-whisper prefix was 0.147s before the shared
+        dispatch observation + 1.324s dispatch fold + 4.924s seam. The fold is
+        no longer on this ladder (the `helm web` resident computes the stop
+        facts), so the same stop is 0.147s + 4.924s before the whisper. Each
+        producer advances one fake monotonic clock and the exact timing lines
+        are the positive control that the arm drove those inputs. The whisper
+        returns a marker block after another 4.000s, so the complete path is
+        9.071s and still reaches response.
         """
         from helm import projscope
         from helm import seats_stop_guard as guard_impl
@@ -402,13 +417,6 @@ class StopGuardTest(SeatsBase):
         def advance(seconds, answer):
             clock[0] += seconds
             return answer
-
-        def ledger():
-            return advance(1.324, ({}, None))
-
-        def beacon(_session, _room, _seat, dispatch_snapshot=None):
-            dispatch_snapshot()
-            return None
 
         def whisper(*_args, **_kwargs):
             marker = advance(4.000, "[helm stop-whisper] reached")
@@ -419,10 +427,8 @@ class StopGuardTest(SeatsBase):
                 mock.patch.object(guard_impl, "_pending_all",
                                   side_effect=lambda *a, **k:
                                   advance(0.147, [])), \
-                mock.patch.object(guard_impl, "_ledger_snapshot",
-                                  side_effect=ledger), \
                 mock.patch.object(guard_impl, "_beacon_block",
-                                  side_effect=beacon), \
+                                  return_value=None), \
                 mock.patch.object(guard_impl, "_spiral_gate",
                                   return_value=(None, None)), \
                 mock.patch.object(guard_impl, "_seam_gate",
@@ -437,15 +443,14 @@ class StopGuardTest(SeatsBase):
                                        args=["--seat", "alice"])
         self.assertEqual(rc, 2, err)
         whisper_spy.assert_called_once()
-        self.assertIn("DONE dispatch-ledger elapsed=1.324s", err)
-        self.assertIn("DONE seam elapsed=4.924s total=6.395s", err)
-        self.assertIn("BEGIN whisper total=6.395s", err)
+        self.assertNotIn("dispatch-ledger", err,
+                         "the ladder folded the dispatch ledger again")
+        self.assertIn("DONE seam elapsed=4.924s total=5.071s", err)
+        self.assertIn("BEGIN whisper total=5.071s", err)
         self.assertIn("[helm stop-whisper] reached", err)
         self.assertIn("DONE response elapsed=", err)
         self.assertNotIn("COVERAGE UNKNOWN", err)
-        self.assertAlmostEqual(clock[0] - 100.0, 10.395, places=6)
-        self.assertGreater(clock[0] - 100.0, 10.0,
-                           "the arm would have stayed green on the old budget")
+        self.assertAlmostEqual(clock[0] - 100.0, 9.071, places=6)
         self.assertLess(clock[0] - 100.0, seats_stop_budget.BUDGET_S)
         self.assertIsNone(projscope.deadline())
 
@@ -502,49 +507,6 @@ class StopGuardTest(SeatsBase):
         self.assertIn("[helm stop-whisper] claims tail", err)
         self.assertIn("DONE response elapsed=", err)
 
-    def test_dispatch_reserve_yields_unknown_but_later_rungs_run(self):
-        from helm import projscope
-        from helm import seats_stop_guard as guard_impl
-        clock = [10.0]
-
-        def ledger():
-            clock[0] += (seats_stop_budget.BUDGET_S
-                         - seats_stop_budget.RESERVE_S["dispatch-ledger"]
-                         + 0.001)
-            projscope.spend_or_raise("dispatch result control")
-
-        def beacon(_session, _room, _seat, dispatch_snapshot=None):
-            dispatch_snapshot()
-            return None
-
-        with mock.patch("time.monotonic", side_effect=lambda: clock[0]), \
-                mock.patch.object(guard_impl, "_ledger_snapshot",
-                                  side_effect=ledger), \
-                mock.patch.object(guard_impl, "_beacon_block",
-                                  side_effect=beacon), \
-                mock.patch.object(guard_impl, "_spiral_gate",
-                                  return_value=(None, None)), \
-                mock.patch.object(guard_impl, "_seam_gate",
-                                  return_value=(None, None)), \
-                mock.patch.object(guard_impl, "_stop_whisper",
-                                  return_value="[helm stop-whisper] after yield"), \
-                mock.patch.dict(os.environ,
-                                {"HELM_STOP_GUARD_WIRING": "0",
-                                 "HELM_STOP_GUARD_INDEX": "0"}):
-            rc, _out, err = self.guard({"session_id": "s-dispatch-yield"},
-                                       args=["--seat", "alice"])
-        # SAME READING AS THE CLAIMS ARM ABOVE: the mocked whisper is the
-        # block, so the coverage line is suppressed and its absence is what
-        # proves it no longer refuses. The YIELD line is a TIMING record and
-        # prints on every exit, which is what still shows the rung yielded.
-        self.assertEqual(rc, 2, err)
-        self.assertNotIn("COVERAGE UNKNOWN", err,
-                         "an unexamined rung rode the block channel")
-        self.assertIn("YIELD dispatch-ledger", err)
-        self.assertIn("BEGIN whisper", err)
-        self.assertIn("[helm stop-whisper] after yield", err)
-        self.assertIn("DONE response elapsed=", err)
-
     def test_a_MEASURED_block_still_refuses_beside_an_unexamined_rung(self):
         """THE CONTROL ON THE WHOLE task/2300 CURE, and it is why the cure is
         "an absence does not refuse" rather than "nothing refuses". Both halves
@@ -552,7 +514,7 @@ class StopGuardTest(SeatsBase):
         single pending row and asserting either alone would be a claim about
         the fixture.
 
-        FIRST CALL, nothing pending: the ledger rung overruns its reserve, the
+        FIRST CALL, nothing pending: the seam rung overruns its reserve, the
         coverage line goes out on the WARN channel and the stop PASSES.
         SECOND CALL, one undelivered row: the SAME overrun happens and the stop
         is REFUSED — by the inbox rung's measured finding, which is evidence
@@ -564,27 +526,23 @@ class StopGuardTest(SeatsBase):
         from helm import seats_stop_guard as guard_impl
         clock = [10.0]
 
-        def ledger():
-            clock[0] += (seats_stop_budget.BUDGET_S
-                         - seats_stop_budget.RESERVE_S["dispatch-ledger"]
-                         + 0.001)
-            projscope.spend_or_raise("dispatch result control")
+        def seam(*_args, **_kwargs):
+            clock[0] = start[0] + (seats_stop_budget.BUDGET_S
+                                   - seats_stop_budget.RESERVE_S["seam"]
+                                   + 0.001)
+            projscope.spend_or_raise("seam result control")
 
-        def beacon(_session, _room, _seat, dispatch_snapshot=None):
-            dispatch_snapshot()
-            return None
+        start = [10.0]
 
         def run():
-            clock[0] = 10.0
+            clock[0] = start[0]
             with mock.patch("time.monotonic", side_effect=lambda: clock[0]), \
-                    mock.patch.object(guard_impl, "_ledger_snapshot",
-                                      side_effect=ledger), \
                     mock.patch.object(guard_impl, "_beacon_block",
-                                      side_effect=beacon), \
+                                      return_value=None), \
                     mock.patch.object(guard_impl, "_spiral_gate",
                                       return_value=(None, None)), \
                     mock.patch.object(guard_impl, "_seam_gate",
-                                      return_value=(None, None)), \
+                                      side_effect=seam), \
                     mock.patch.object(guard_impl, "_stop_whisper",
                                       return_value=None), \
                     mock.patch.dict(os.environ,
@@ -596,7 +554,7 @@ class StopGuardTest(SeatsBase):
         seats.join(session="s-block-beside-yield", seat="alice", cwd="/tmp/p")
         rc, _out, err = run()
         self.assertEqual(rc, 0, err)
-        self.assertIn("dispatch-ledger=UNFINISHED", err)
+        self.assertIn("seam=UNFINISHED", err)
         self.assertIn("This Stop PASSES", err)
 
         chat.post("@alice a measured obligation", who="bob")
@@ -702,25 +660,6 @@ class StopGuardTest(SeatsBase):
         self.assertEqual(state.yielded, set())
         self.assertAlmostEqual(clock[0] - started, 8.799, places=6)
         self.assertAlmostEqual(left, 8.701, places=6)
-
-    def test_nested_reserves_project_from_one_ambient_deadline(self):
-        """Dispatch inside claims must not subtract both successor reserves."""
-        from helm import projscope
-        clock = [20.0]
-        with mock.patch("time.monotonic", side_effect=lambda: clock[0]):
-            state = seats_stop_budget.State()
-            with projscope.scope(
-                    deadline=clock[0] + seats_stop_budget.BUDGET_S):
-                with state.rung("claims") as claims:
-                    with state.rung("dispatch-ledger") as dispatch:
-                        clock[0] += 7.501
-                        projscope.spend_or_raise("nested dispatch must-hit")
-                    left = projscope.spend_or_raise(
-                        "claims continuation positive control")
-        self.assertFalse(dispatch.complete)
-        self.assertTrue(claims.complete)
-        self.assertAlmostEqual(left, 1.999, places=6)
-        self.assertEqual(state.yielded, {"dispatch-ledger"})
 
     def test_each_fat_tail_reserve_is_local_fail_closed_and_leaves_tail(self):
         """Every configured reserve has a must-hit and a later-work pole."""
@@ -2005,16 +1944,16 @@ class OneSlowRungCannotDisableTheRestTest(unittest.TestCase):
                                places=6)
         self.assertGreater(left, 0.0)
 
-    def test_the_yield_names_three_successors_and_not_eight(self):
+    def test_the_yield_names_two_successors_and_not_eight(self):
         """What a `wiring` overrun now costs, spelled in the verdict itself.
 
         The rung moved behind every perishable rung on the ladder, so the
-        blast radius of its worst case is the three cheap ones after it."""
+        blast radius of its worst case is the cheap ones after it — two, since
+        the mechanical tail moved to the `helm web` resident."""
         text = seats_stop_budget.unknown("wiring")
         unreached = [r for r in seats_stop_budget.RUNGS
                      if r + "=UNREACHED" in text]
-        self.assertEqual(unreached,
-                         ["claim-evidence", "mechanical", "response"])
+        self.assertEqual(unreached, ["claim-evidence", "response"])
         # THE POSITIVE CONTROL ON THE SAME OBSERVABLE: for an EARLY rung this
         # same renderer DOES name the long tail, so a short tail above is a
         # fact about `wiring`'s position and not a renderer that emits
@@ -2037,4 +1976,6 @@ class OneSlowRungCannotDisableTheRestTest(unittest.TestCase):
                 self.assertLess(order.index(rung), order.index("wiring"),
                                 "a perishable rung runs after the durable one")
         self.assertEqual(list(order[order.index("wiring") + 1:]),
-                         ["claim-evidence", "mechanical", "response"])
+                         ["claim-evidence", "response"])
+        self.assertNotIn("mechanical", order,
+                         "the index/scratch tail runs in the resident now")

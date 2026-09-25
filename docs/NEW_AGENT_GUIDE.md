@@ -154,16 +154,30 @@ design and must never arm, replace or stop one.
   kimi / ds4pro / claude — gemini reviews are valuable input, not a closing
   leg), where family means the verified resolved runtime model, not the seat
   label, agent/subagent type, or harness. UNKNOWN runtime grants no authority.
-  The approval is bound to the exact tip WITH a verified `gate:<token>`: mint the
-  receipt with `helm gate run` (or `fab gate`) in your room and paste its
-  evidence line into the verdict, where the token is resolved against the
-  minted-receipt ledger. `helm lr land` only WITNESSES — the integrator
-  performs the merge.
-- **An integrator launches a whole suite through `helm gate window launch`,
-  never `fab gate` by hand.** One whole suite per project LANDING WINDOW — one
-  trunk head — because a green receipt on a stacked train's top car lands
-  every car beneath it. The door records the project, the trunk head and the
-  room before it dispatches, and REFUSES a second whole suite on the same
+  The approval is bound WITH a verified `gate:<token>` from a WHOLE suite on a
+  tree that carries the reviewed tip, and that suite is the integrator's train:
+  a lane runs no whole suite of its own, and `helm gate run` refuses one in a
+  lane room. A lane's rounds are focused, and each round is two runs:
+  `helm gate run --focus --plan` prints the selection (the tests the change's
+  imports reach; a change outside the import graph, a `.md` included, selects
+  every tree-wide audit and the tests that name the file instead), and
+  `helm gate audits` prints the tree-wide audits as one command, which a
+  Python change's selection does not reliably carry. A red round is cured and run
+  focused again; a whole suite re-runs a red tree only with `--again`, and
+  refuses a tree that already holds a green one. On a host that refuses local
+  suites (the fleet hub is agents-only), a focused receipt routed through
+  `fab gate` cannot come home, so the round is `fab test` over that selection:
+  testimony, not a receipt. A reviewer whose source read is clean HOLDS the
+  row: `helm dispatch hold <row> --source-clean <tip> <reason>`, and the approve
+  then binds the token the train's gate mints. An APPROVE without a verified
+  token is refused, and a CONCUR authorizes nothing, so neither stands in for
+  the hold. `helm lr land` only WITNESSES — the integrator performs the merge.
+- **The land gate is ONE SERIAL whole suite per project LANDING WINDOW — one
+  trunk head — on the tree that lands**, because a green receipt on a stacked
+  train's top car lands every car beneath it. Its durable road is
+  `helm gate window launch`, which `helm train --apply` and `helm gate run` in
+  a compose room both take. The door records the project, the trunk head and
+  the room before it dispatches, and REFUSES a second whole suite on the same
   window, or on a room a running run already contains, naming the running run
   and the only two doors that are open: WAIT, or `--supersede`, which kills
   the running run and gates your room in its place and is allowed only when
@@ -171,7 +185,20 @@ design and must never arm, replace or stop one.
   the node holds a record every import door can bind, and it leaves a DETACHED
   client behind to fetch that receipt — your terminal dying no longer strands a
   green suite. `helm gate window show` names anything the node finished that this
-  hub never bound, and `--recover` binds it.
+  hub never bound, and `--recover` binds it. The classic road, `fab gate` on a
+  train room standing outside the compose container, also runs serial; its
+  receipt comes home only through the client that launched it, and it keeps no
+  window record. In a compose room the classic road is refused and the refusal
+  names the door. A SLICED whole suite (the default with no mode flag in a
+  lane-level room) binds a lane tip and never a land: every land road runs
+  serial.
+- **The train composes itself: `helm train`.** A dry run lists this project's
+  approve-ready rows, their reviewed tips and the merge order. `--apply` merges
+  each reviewed tip by its exact sha into one detached room under
+  `<repo>-wt/compose/`, refuses a conflicting row by name without resolving it,
+  and launches the gate through the door above. It merges and does not
+  cherry-pick, so each reviewed sha is an ancestor of trunk once the train
+  lands.
 
 ## 4. Knowledge
 

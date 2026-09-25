@@ -187,6 +187,8 @@ def declared_name():
 
 
 _DECLARED_CACHE = {}
+_GATESLICE_MUTABLE = {"_DECLARED_CACHE": "one entry keyed by the roster's "
+                      "identity stamp; a changed roster misses"}
 
 
 def _roster_read_checked():

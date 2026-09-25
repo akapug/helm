@@ -423,6 +423,9 @@ def rank(rows, kind):
     ORANGE wording tells you to route AROUND sorts below one it does not
     [E11]; a family with no rating on this kind's axis sorts last and says so
     rather than being given a number [E7]; then the axis itself [E7]; then
+    reachability — a seat helm can wake now, then one inside its beacon's
+    re-arm grace, then a DEAF one the door still files for (task/3055) —
+    and like idleness it only orders, never excludes; then
     idleness, and load NEVER excludes [E14]; then a known expiry above an
     unknown one at equal colour, because an answer you can plan around beats
     one you cannot; then the name, so two equal seats order the same way
@@ -448,6 +451,7 @@ def rank(rows, kind):
                 == review_independence.SAME_FAMILY else 0,
                 0 if fam in order else 1,
                 order.get(fam, len(order)),
+                row.get("reach_rank", 0),
                 row.get("pane_rank", 2),
                 0 if row.get("until") else 1,
                 fam)
@@ -459,6 +463,23 @@ def rank(rows, kind):
 # ---------------------------------------------------------------------------
 
 _PANE_RANK = {"IDLE": 0, "LIVE": 1, "RUNNING": 2}
+
+
+def _reach_rank(jrow):
+    """0 reachable (or not measured), 1 WAKING, 2 DEAF-only (task/3055).
+
+    A seat inside its beacon's re-arm grace answers in seconds, and a DEAF
+    seat answers once it re-arms or is nudged; both can take the row, and a
+    seat helm can wake NOW is the better pick. A secondary preference like
+    idleness, never an exclusion."""
+    from . import seat_usability
+    jrow = jrow or {}
+    if seat_usability.deaf_only(jrow):
+        return 2
+    if jrow.get("reachable") is None \
+            and jrow.get("reachable_state") == seat_usability._WAKING:
+        return 1
+    return 0
 
 
 def _seat_family(name, row, entry=None, seatmod=None):
@@ -598,10 +619,19 @@ def answer(kind, frm=None, project=None, row=None, now=None, seams=None):
         # seat that is merely BUSY still is, ranked lower. Excluding on load
         # is how a fleet comes to route everything to the one seat nobody has
         # given work to yet.
+        # A DEAF SEAT IS A LAST-RANKED CANDIDATE, NOT A DROPPED ONE (task/3055).
+        # The dispatch door files a row for a seat whose only refusal is that
+        # helm cannot wake it (`seat_usability.deaf_only`), because the ledger
+        # holds the row until the beacon re-arms; the router must agree with
+        # that door or it names a family the door would accept as having no
+        # seat. It ranks after a WAKING seat, which ranks after a reachable
+        # one. Every other refusal still drops the seat.
+        from . import seat_usability
         seats = []
         for name in bench.get(family, ()):
             jrow = joined.get(name) or {}
-            if jrow.get("can_take_work") is False:
+            if jrow.get("can_take_work") is False \
+                    and not seat_usability.deaf_only(jrow):
                 continue
             seats.append((name, jrow))
         if not seats:
@@ -611,7 +641,8 @@ def answer(kind, frm=None, project=None, row=None, now=None, seams=None):
                             "seats": [re_mod.label_seat(s)
                                       for s in bench.get(family, ())]})
             continue
-        seats.sort(key=lambda p: (_PANE_RANK.get((p[1] or {}).get("pane"), 2),
+        seats.sort(key=lambda p: (_reach_rank(p[1]),
+                                  _PANE_RANK.get((p[1] or {}).get("pane"), 2),
                                   p[0]))
         name, jrow = seats[0]
         # THE RAW KEY DRIVES THE MATCH, THE LAUNDERED ONE IS EMITTED — the
@@ -641,6 +672,7 @@ def answer(kind, frm=None, project=None, row=None, now=None, seams=None):
             "pane": jrow.get("pane"), "verdict": jrow.get("verdict"),
             "holding": jrow.get("holding"),
             "pane_rank": _PANE_RANK.get(jrow.get("pane"), 2),
+            "reach_rank": _reach_rank(jrow),
             "colour": colour, "until": flag.get("expires_at"),
             "reading_age_s": reading_age, "stale_reading": stale,
             "critical_path_only": colour == burnflags.ORANGE,

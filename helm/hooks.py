@@ -920,6 +920,13 @@ class HookPathError(ValueError):
 
 _SHARED_ROOT = {}
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_SHARED_ROOT": (
+        "the shared checkout per start path, a pure function of the tree"),
+}
+
 
 def _shared_root(start):
     """The checkout whose bin/helm a generated hook must name, or None when
@@ -3788,7 +3795,8 @@ def running_panes(proc=None):
             row = {"pid": row["pid"], "seat": None, "config_dir": None,
                    "family": None, "environ_unreadable": True,
                    "incarnation_unknown": True,
-                   "signer_bin": None, "signer_profile": None}
+                   "signer_bin": None, "signer_profile": None,
+                   "session": None}
         elif now != token:
             return                       # a different process wore this pid
         if (row.get("environ_unreadable") or row.get("detect_unknown")
@@ -3846,7 +3854,8 @@ def running_panes(proc=None):
                  {"pid": int(pid), "seat": None, "config_dir": None,
                   "family": None, "environ_unreadable": True,
                   "detect_unknown": True,
-                  "signer_bin": None, "signer_profile": None})
+                  "signer_bin": None, "signer_profile": None,
+                  "session": None})
             continue
         # THE ENVIRON IS READ SEPARATELY, AND FAILING TO READ IT NO LONGER
         # DELETES THE PANE. Both reads used to sit in one try with a bare
@@ -3928,7 +3937,15 @@ def running_panes(proc=None):
                     # does in the gate.
                     "signer_profile": next(
                         (v for v in ((val(k) or "").strip()
-                                     for k in cell.PROFILE_ENV) if v), None)})
+                                     for k in cell.PROFILE_ENV) if v), None),
+                    # THE HARNESS SESSION ID, in home.session_id's order, when
+                    # the pane's own environ carries one (a proxy/codex pane
+                    # may; a claude pane's does NOT — Claude Code sets it only
+                    # for its children, measured across every live pane, so
+                    # `unsigned_panes` falls back to the pid-keyed session
+                    # record). Only the signing report reads it (task/3049).
+                    "session": next((val(k) for k in home._SESSION_ENV
+                                     if val(k)), None)})
     return out
 
 
@@ -4001,6 +4018,19 @@ def uncovered_panes(proc=None, quiet_s=900, panes=None):
         return []
 
 
+def _pane_sessions():
+    """{pid: session id} for the claude panes that hold one open, from the
+    pid-keyed session records (`sessions.live_sids`), or {} when that read
+    fails. A claude pane's own environ does not carry its session id — Claude
+    Code sets it only for the processes it starts (measured across every live
+    pane) — so the signing report reads it where it IS written."""
+    try:
+        from . import sessions
+        return {pid: sid for sid, pid in (sessions.live_sids() or {}).items()}
+    except Exception:                    # noqa: BLE001 — fail-open report
+        return {}
+
+
 def unsigned_panes(proc=None, panes=None):
     """Running NAMED panes that cannot sign their posts: HELM_CELL_BIN unset
     or pointing at a non-executable (cell.bin_ready's law), or the profile
@@ -4022,10 +4052,18 @@ def unsigned_panes(proc=None, panes=None):
     header. (Converged in a
     convergence meld; I constructed the case only after writing the wrong
     reasoning down.)
+
+    A PANE THAT SIGNS AS ITSELF DESPITE THE OWNER'S EXPORT IS INFO, NOT A
+    RELAUNCH (task/3049). A seat started outside `helm launch` inherits the
+    owner's profile from his shell; the gate now sets that profile aside and
+    signs as the seat when its session is bound to its row. Such a pane comes
+    back with `sign_info` set, and `surface_uncovered` prints it under a
+    no-action header: telling an operator to relaunch a pane that signs would
+    spend its context on nothing.
     """
     try:
         from . import cell
-        out, roster = [], None
+        out, roster, pane_sids = [], None, None
         for p in (running_panes(proc) if panes is None else panes):
             if p.get("environ_unreadable"):
                 p["sign_unknown"] = True
@@ -4056,29 +4094,68 @@ def unsigned_panes(proc=None, panes=None):
                 # The signing gate refuses a seat whose profile names someone
                 # else only when the roster proves the seat is an actor
                 # (home_room), or cannot say; a named pane that never joined
-                # still signs as the ambient profile (cell.signing_identity,
-                # rule 4), so flagging it would claim a refusal that does not
-                # happen. One strict roster read per scan, the gate's reader.
-                # Both names are laundered: they come from an unvalidated
-                # environ.
-                from . import seats
+                # still signs as the ambient profile (cell.signing_identity),
+                # so flagging it would claim a refusal that does not happen.
+                # One strict roster read per scan, the gate's reader. Both
+                # names are laundered: they come from an unvalidated environ.
+                #
+                # THE SAME THREE READINGS THE GATE MAKES (task/3049): a live
+                # rename alias names the renamed row; a profile that is that
+                # row's own old name agrees; and the OWNER's inherited profile
+                # is set aside for a seat whose session is bound to its row —
+                # that pane SIGNS, as itself, and is reported as INFO, never
+                # as a relaunch. The gate admits through the actor layer; this
+                # /proc scan must not call it, so it asks the binding it can
+                # see: the pane's session (environ, else the pid-keyed session
+                # record) against the row's current or remembered sessions.
+                from . import seats, seats_common
                 if roster is None:
                     try:
                         roster = seats.roster_checked()
                     except Exception:            # noqa: BLE001 — the gate
                         roster = ({}, True)      # reads a raise as unreadable
                 rows, failed = roster
-                row = None if failed else rows.get(p["seat"])
+                prof = p["signer_profile"]
+                key = None
+                if not failed:
+                    key = (p["seat"] if isinstance(rows.get(p["seat"]), dict)
+                           else seats_common.live_alias(p["seat"], rows)[0])
+                row = rows.get(key) if key else None
                 if failed:
                     why = ("the roster cannot be read, so the signing gate "
                            "refuses it (identity_unreadable)")
-                elif isinstance(row, dict) and row.get("home_room"):
-                    why = "the signing gate refuses it (identity_conflict)"
-                else:
+                elif not (isinstance(row, dict) and row.get("home_room")):
                     continue
+                elif str(prof).casefold() == str(key).casefold() or str(
+                        seats_common.live_alias(prof, rows)[0] or ""
+                ).casefold() == str(key).casefold():
+                    continue            # its own row's name or old name
+                elif cell.is_owner_cell(prof) and not cell.is_owner_cell(key):
+                    if pane_sids is None:
+                        pane_sids = _pane_sessions()
+                    sid = p.get("session") or pane_sids.get(p["pid"])
+                    held = [row.get("session")] + list(
+                        row.get("sessions") or [])
+                    if sid and sid in held:
+                        p["sign_info"] = True
+                        p["sign_reason"] = (
+                            "launched outside `helm launch`: profile '%s' is "
+                            "the owner's inherited export, set aside — it "
+                            "signs as its own seat '%s'" % (
+                                seats._seat_label(prof),
+                                seats._seat_label(key)))
+                        out.append(p)
+                        continue
+                    why = ("the signing gate refuses it (identity_conflict): "
+                           "the owner's profile is set aside only for a seat "
+                           "whose session is bound to its row, and %s" % (
+                               "this pane's session is not"
+                               if sid else "this pane's session is unknown"))
+                else:
+                    why = "the signing gate refuses it (identity_conflict)"
                 p["sign_reason"] = "profile '%s' is not this pane's seat '%s' — %s" % (
-                    seats._seat_label(p["signer_profile"]),
-                    seats._seat_label(p["seat"]), why)
+                    seats._seat_label(prof),
+                    seats._seat_label(key or p["seat"]), why)
             else:
                 continue
             out.append(p)
@@ -4148,8 +4225,10 @@ def surface_uncovered(out=None):
     # a destructive remedy; a pane whose environ we could not read has not
     # been proven anything, and a relaunch discards its context. Non-destructive
     # header, no relaunch instruction.
-    sign = [p for p in scanned_sign if not p.get("sign_unknown")]
+    sign = [p for p in scanned_sign
+            if not (p.get("sign_unknown") or p.get("sign_info"))]
     sign_unknown = [p for p in scanned_sign if p.get("sign_unknown")]
+    sign_info = [p for p in scanned_sign if p.get("sign_info")]
     if sign:
         print("helm hooks: %d running pane(s) posting UNSIGNED (no signing env, "
               "or a profile that is not their own) — relaunch from their "
@@ -4164,6 +4243,13 @@ def surface_uncovered(out=None):
               % len(sign_unknown), file=out)
         for p in sign_unknown:
             print("  pid %-7d %-14s %s" % (p["pid"], "UNKNOWN",
+                                           p["sign_reason"]), file=out)
+    if sign_info:
+        print("helm hooks: %d running pane(s) launched outside `helm launch` "
+              "that SIGN AS THEIR OWN SEAT (the owner's inherited profile is "
+              "set aside) — no action needed:" % len(sign_info), file=out)
+        for p in sign_info:
+            print("  pid %-7d %-14s %s" % (p["pid"], label(p),
                                            p["sign_reason"]), file=out)
 
 

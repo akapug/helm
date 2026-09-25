@@ -2240,6 +2240,22 @@ def projections():
             source="the land projection's last computed body per cache key",
             sources=(master,), rebuild="delete; the next read rebuilds it",
             fresh_days=1),
+        # THE STOP GUARD'S FACTS: what every seat's Stop hook reads instead of
+        # folding the dispatch ledger and asking git per lease, written behind
+        # itself by the `helm web` resident (helm/stopfacts_resident.py) under
+        # its single-writer lock. A pure PROJECTION: deleting it costs every
+        # stop its exemptions until the resident's next refresh, a second or
+        # so later. The tmp glob is `pk.atomic_write`'s per-writer temporary.
+        row("stop-facts", "projection", "home",
+            ("_global/web-cache/stop-facts.json",
+             "_global/web-cache/stop-facts.lock",
+             "_global/web-cache/stop-facts.json.*.tmp"),
+            source="the dispatch ledger, the claims file and each held "
+                   "lane's git state, computed with the stop guard's own "
+                   "functions (helm.stopfacts_resident)",
+            sources=(os.path.join(home.global_dir(), "dispatches.jsonl"),),
+            rebuild="delete; the resident writes it again within its poll",
+            fresh_days=1),
         # THE LEDGER FOLD CHECKPOINTS (task/2770): the whole fold of one
         # append-only ledger at a byte offset, one file per code version, keyed
         # on the ledger prefix, the code, the gate-epoch marker and every git

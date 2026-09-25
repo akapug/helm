@@ -9,6 +9,7 @@ import pickle
 import subprocess
 import sys
 import tempfile
+import textwrap
 from types import ModuleType
 import unittest
 from unittest import mock
@@ -462,38 +463,54 @@ assert not errors, errors
         finally:
             web._PROVIDER = original
 
-    def test_reload_recreates_the_monolith_runtime_state(self):  # noqa: VACUOUS_ASSERTION — populated cache, captured identities, and seeded stale bridge controls are contrasted with exact fresh post-reload state
-        import importlib
+    def test_reload_recreates_the_monolith_runtime_state(self):  # noqa: VACUOUS_ASSERTION — populated cache, captured identities, and seeded stale bridge controls are contrasted with exact fresh post-reload state; the child's returncode binds every assertion
+        """A reload rebuilds every runtime object the facade owns.
 
-        state = web._qstate
-        endpoint = web._api_registry
-        handler = web.Handler
-        token = web.MUTATION_TOKEN
-        modules = tuple(web._WEB_IMPL_MODULES)
-        stale_bridge = object()
-        for module in modules:
-            for name in _BRIDGE_SURFACE:
-                module.__dict__[name] = stale_bridge
-                self.addCleanup(module.__dict__.pop, name, None)
-        state["probe"] = "reload must discard this"
-        web.DEFAULT_PORT = 8123
-        importlib.reload(web)
-        self.assertIsNot(web._qstate, state)
-        self.assertEqual(web._qstate, {})
-        self.assertIsNot(web._api_registry, endpoint)
-        self.assertIsNot(web.Handler, handler)
-        for module in web._WEB_IMPL_MODULES:
-            for name in _BRIDGE_SURFACE:
-                self.assertNotIn(name, module.__dict__)
-        from helm import localnames
-        pinned = (os.environ.get("HELM_API_TOKEN")
-                  or localnames.legacy_env("API_TOKEN"))
-        if pinned:
-            self.assertEqual(web.MUTATION_TOKEN, pinned)
-        else:
-            self.assertNotEqual(web.MUTATION_TOKEN, token)
-        self.assertEqual(web.DEFAULT_PORT, 7433)
-        self.assertEqual(web.make_server.__defaults__, (7433,))
+        IN A FRESH INTERPRETER, because a reload rebinds `helm.web` and every
+        implementation module it fans out to for the REST OF THE PROCESS:
+        every later module that imported `web` or reads its classes by name
+        would hold objects from a different generation than the ones it
+        imported. That reach is the thing under test, so it cannot be undone
+        from inside and the only clean scope for it is a process of its own.
+        """
+        root, env = _fresh_process()
+        code = textwrap.dedent("""
+            import importlib, os
+            from helm import web, localnames
+            BRIDGE = %r
+            state = web._qstate
+            endpoint = web._api_registry
+            handler = web.Handler
+            token = web.MUTATION_TOKEN
+            stale_bridge = object()
+            for module in web._WEB_IMPL_MODULES:
+                for name in BRIDGE:
+                    module.__dict__[name] = stale_bridge
+            state["probe"] = "reload must discard this"
+            web.DEFAULT_PORT = 8123
+            importlib.reload(web)
+            assert web._qstate is not state
+            assert web._qstate == {}, web._qstate
+            assert web._api_registry is not endpoint
+            assert web.Handler is not handler
+            for module in web._WEB_IMPL_MODULES:
+                for name in BRIDGE:
+                    assert name not in module.__dict__, (module, name)
+            pinned = (os.environ.get("HELM_API_TOKEN")
+                      or localnames.legacy_env("API_TOKEN"))
+            if pinned:
+                assert web.MUTATION_TOKEN == pinned
+            else:
+                assert web.MUTATION_TOKEN != token
+            assert web.DEFAULT_PORT == 7433, web.DEFAULT_PORT
+            assert web.make_server.__defaults__ == (7433,)
+            print("RELOAD-CHECKED")
+        """) % (sorted(_BRIDGE_SURFACE),)
+        p = subprocess.run([sys.executable, *_SAFE_PATH, "-c", code],
+                           cwd=root, env=env, capture_output=True, text=True,
+                           timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("RELOAD-CHECKED", p.stdout)
 
     def test_reload_preserves_documented_environment_token_pins(self):  # noqa: VACUOUS_ASSERTION — both subprocesses positively assert the exact winning token before and after reload; returncode binds those assertions
         root, base_env = _fresh_process()

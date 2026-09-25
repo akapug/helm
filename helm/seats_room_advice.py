@@ -92,18 +92,7 @@ def _clock_spent():
     return left is not None and left <= 0
 
 
-def _ledger_snapshot():
-    """(state by id, unavailable) — the dispatch ledger, read ONCE per stop.
-
-    A named seam rather than an inline call because two rungs of one stop
-    (`_gate_pending`'s exemption test and `_room_unfinished`'s review read)
-    ask the same 190ms question, and the second one arriving later is exactly
-    how a stop path doubles its cost without anybody noticing."""
-    from . import dispatches
-    return dispatches.snapshot()
-
-
-def _room_unfinished(resource, snap=None, ledger_note=None):
+def _room_unfinished(resource, snap=None, ledger_note=None, cwd=None):
     """(findings, unknowns) — the UNFINISHED WORK BOUND TO THIS ROOM, named.
 
     THE QUESTION THIS REPLACES WAS DELEGATION, AND DELEGATION WAS BOTH THE
@@ -165,7 +154,13 @@ def _room_unfinished(resource, snap=None, ledger_note=None):
     EVERY READ DEGRADES TO UNKNOWN AND SAYS SO. A read that cannot be made
     lands in `unknowns` carrying its reason; none of them may collapse to a
     silent "nothing here", because the sentence this feeds sits directly
-    under a destructive command."""
+    under a destructive command.
+
+    WHO CALLS IT. The stop resident (`helm/stopfacts_resident.py`), once per
+    change of an input, anchoring each lease at `cwd` — the repository its
+    claim recorded. The Stop hook reads the result from the stop facts and
+    never calls this: four git-backed reads per lease per stop was the cost
+    the resident exists to take off the hook."""
     findings, unknowns = [], []
     # THE READS STILL OWED, so an expiry can name exactly what it did not
     # reach. Each read strikes its own name the moment it has ANY answer —
@@ -174,7 +169,7 @@ def _room_unfinished(resource, snap=None, ledger_note=None):
     # to strike itself over-reports blindness, which is the safe direction
     # and the one `_missed` already chose.
     reads_owed = list(_ROOM_READS)
-    room = _lease_worktree(resource)
+    room = _lease_worktree(resource, cwd=cwd)
     if not room:
         # NAME THE SCOPE LIMIT RATHER THAN THE ROOM'S ABSENCE. All four reads
         # are cwd-scoped, so a lease held in ANOTHER repository is unreadable
@@ -182,7 +177,7 @@ def _room_unfinished(resource, snap=None, ledger_note=None):
         # simply somewhere else. Rendering that as "no lane room" sends the
         # holder looking for a missing directory and repeats every stop for
         # the lease's whole TTL.
-        foreign = lease_foreign_project(resource)
+        foreign = lease_foreign_project(resource, cwd=cwd)
         # A LEASE IN ANOTHER REPOSITORY AND A CLOCK THAT RAN OUT ARE TWO
         # DIFFERENT SENTENCES WITH TWO DIFFERENT REPAIRS, and only one of them
         # is about the lease. The foreign read is a pure upward path walk, so
@@ -287,7 +282,8 @@ def _room_unfinished(resource, snap=None, ledger_note=None):
             reads_owed.remove("gate")
     if snap is None and not ledger_note:
         try:
-            snap, ledger_note = _ledger_snapshot()
+            from . import dispatches
+            snap, ledger_note = dispatches.snapshot()
         except projscope.Expired:
             return findings, unknowns + _clock_lost(reads_owed)
         except Exception:
@@ -556,8 +552,16 @@ def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
         "   — %s records no status this surface can classify (%s), "
         "so whether it is still owed is UNKNOWN"
         % (lane, status.upper() or "empty"))
-def _room_advice(resource, snap=None, ledger_note=None, brief=False):
+def _room_advice(resource, snap=None, ledger_note=None, brief=False,
+                 reads=None, foreign=None):
     """(may_print_the_release_command, sentence) for one lane lease.
+
+    `reads` is `(findings, unknowns)` ALREADY MADE — the Stop hook passes the
+    resident's stop facts here, so the ruling below is the same ruling over
+    the same four reads, made by the process that could afford them. With
+    `reads` given, `foreign` is the scope limit the caller already knows (the
+    resident anchors each lease in its own repository, so it is None there)
+    and nothing below reads git.
 
     `brief` PICKS THE SHORT SPELLING OF THE SAME RULING, never a different
     one. Every branch below returns both renderings from ONE expression, side
@@ -620,7 +624,8 @@ def _room_advice(resource, snap=None, ledger_note=None, brief=False):
     contention from this lane's own concurrent mutation run and did NOT
     reproduce on a quiet box — it is noise, not a measurement.)"""
     try:
-        findings, unknowns = _room_unfinished(resource, snap, ledger_note)
+        findings, unknowns = reads if reads is not None else \
+            _room_unfinished(resource, snap, ledger_note)
     except Exception:
         # measured NOTHING: the weakest possible standing, so the command
         # goes with it.
@@ -673,7 +678,8 @@ def _room_advice(resource, snap=None, ledger_note=None, brief=False):
         # is an upward path walk, the signature is shared with other readers,
         # and a second parameter on it would be paid by every caller to serve
         # one branch.
-        foreign = lease_foreign_project(resource)
+        if reads is None:
+            foreign = lease_foreign_project(resource)
         # ONE RETURN, TWO SPELLINGS. A second `return` for the brief form would
         # be a fifth branch in a function whose exhaustiveness arm counts them,
         # and that arm is what keeps the header's promise true. NEVER THE WORD

@@ -1194,6 +1194,14 @@ _PROXY_TRACE_ID = re.compile(r"[0-9]{14}-([0-9a-f]{16})-[0-9a-f]{8}\Z")
 # shape; every read still remeasures that shape, so a pid/listener/config/route
 # change misses immediately rather than surviving the memo window.
 _PROXY_AUTH_CANARIES = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_PROXY_AUTH_CANARIES": (
+        "keyed by the complete measured proxy shape, which every read "
+        "measures again"),
+}
 _PROXY_AUTH_CANARY_FRESH_S = INTERVAL_S
 
 

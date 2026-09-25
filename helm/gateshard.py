@@ -24,6 +24,11 @@ import unittest
 # new executed sibling cannot appear without changing the manifest population.
 STANDALONE_DEPENDENCIES = ("gatetestrecord.py", "gatechild.py", "pathenv.py")
 
+# THE OUTPUT SAYS WHAT IT IS. The parent's first stderr line, however it was
+# launched (a shell, runpy, a joined -m): the gate reads the output and never
+# mints a suite receipt from a diagnostic runner's result.
+DIAGNOSTIC_MARKER = "HELM-DIAGNOSTIC-RUNNER gateshard"
+
 
 _FOOTER = re.compile(
     r"^-{70}\nRan (?P<ran>\d+) tests? in \d+(?:\.\d+)?s\n\n"
@@ -552,8 +557,28 @@ def _protocol_body(text):
 
 
 def _wait_status(status):
-    return "died on signal %d" % -status if status < 0 else \
-        "exited %d" % status
+    """How a worker's exit reads. -> str
+
+    TWO SPELLINGS OF A SIGNAL DEATH reach this reader. A process the pool
+    itself waits on and that dies of signal N waits as -N (Popen's form),
+    and `_supervise` reports its inner worker's signal death as 128+N, the
+    shell's form (task/3075). Both read as the signal, so a TERM death never
+    reads as the exit code 143 or, before that cure, 241. Every exit code
+    the shard and slice runners choose is below 128; only a test that calls
+    `os._exit` with a larger number reads as a signal, as a shell reads it."""
+    if status < 0:
+        return "died on signal %s" % _signal_label(-status)
+    if 128 < status < 128 + signal.NSIG:
+        return "died on signal %s (reported as exit %d)" % (
+            _signal_label(status - 128), status)
+    return "exited %d" % status
+
+
+def _signal_label(number):
+    try:
+        return "%d (%s)" % (number, signal.Signals(number).name)
+    except ValueError:
+        return "%d" % number
 
 
 _COUNT_FIELDS = ("ran", "skipped", "failures", "errors",
@@ -566,6 +591,18 @@ _TEST_ENV_KEYS = ("HELM_CONFIG_ROOTS", "HELM_METAHARNESS",
 
 _ROLE_ENV_KEYS = ("HELM_GATESHARD_PLANNER", "HELM_GATESHARD_WORKER")
 _PATH_ENV_KEYS = None
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_GATECHILD": (
+        "a sibling module loaded by path once; loading it again yields the "
+        "same code"),
+    "_RECORD": (
+        "a sibling module loaded by path once; loading it again yields the "
+        "same code"),
+    "_PATH_ENV_KEYS": "a constant tuple read once from pathenv",
+}
 
 
 def _identity_path_env_keys():
@@ -591,8 +628,17 @@ def _identity_path_env_keys():
     return _PATH_ENV_KEYS
 
 
-def _fresh_env(marker):
-    env = dict(os.environ)
+def scrubbed_env(base):
+    """`base` without any store path, test root or runner role a launcher
+    chose. -> a new dict
+
+    THE ONE ENV CONTRACT for every process that runs helm's suite as a
+    verdict: each shard or slice worker (through `_fresh_env`) and the serial
+    child (through gate._suite_env). tests/__init__ then plants every one of
+    these itself, so the verdict never depends on what the launching shell
+    exported.
+    """
+    env = dict(base)
     keys = (_TEST_ENV_KEYS + _identity_path_env_keys()
             + _ROLE_ENV_KEYS + _MEASURE_ENV_KEYS)
     for key in keys:
@@ -603,6 +649,11 @@ def _fresh_env(marker):
     # any helm import, so it drops the whole family rather than read them.
     for key in [k for k in env if k.endswith("_CONFIG_ROOTS")]:
         env.pop(key)
+    return env
+
+
+def _fresh_env(marker):
+    env = scrubbed_env(os.environ)
     env[marker] = "1"
     return env
 
@@ -1135,6 +1186,14 @@ def _supervise(index, manifest_path, protocol_path, meta_path):
         time.sleep(0.02)
     if inner.poll() is None:
         inner.wait()
+    # THE EXIT THIS PROCESS REPORTS FOR THE INNER. A worker killed by signal
+    # N waits as -N, and `SystemExit(-N)` exits 256-N, so a TERM death reached
+    # the pool as "exited 241" (task/3075). 128+N is the encoding
+    # gatechild's supervisor and guard give a signal death, and the one
+    # `_wait_status` reads back as a signal. The witness below keeps the raw
+    # wait status: it records what the inner did, not what this exit says.
+    code = inner.returncode if inner.returncode >= 0 \
+        else 128 - inner.returncode
     # AFTER inner death, never before: only now is every atexit handler it
     # owned finished, so only now is a survivor certainly not this run's.
     swept = _sweep_own_descendants()
@@ -1202,7 +1261,7 @@ def _supervise(index, manifest_path, protocol_path, meta_path):
         if not swept:
             return 70
         if not overdue:
-            return inner.returncode
+            return code
         return 1
     # THE CERTIFYING CLAUSES ARE ENFORCED HERE, AT THE PROMOTION, and until
     # now they were only DEFINED. certifying_supervisor_artifact demands
@@ -1226,7 +1285,7 @@ def _supervise(index, manifest_path, protocol_path, meta_path):
                 pass
             return 70
     os.replace(staging, meta_path)
-    return inner.returncode
+    return code
 
 
 def main(argv=None):
@@ -1287,6 +1346,8 @@ def main(argv=None):
         return 0
     if argv:
         return 2
+    sys.stderr.write(DIAGNOSTIC_MARKER + "\n")
+    sys.stderr.flush()
 
     import tempfile
     record_context = _recorder().consume_context("sharded") \

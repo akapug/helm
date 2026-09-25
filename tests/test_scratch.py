@@ -1163,12 +1163,23 @@ class GcTest(unittest.TestCase):
         slept, called, read = run(False)
         self.assertEqual((slept, called, read), (None, False, False))
 
-    def test_the_stop_hook_runs_the_automatic_leg(self):
-        """Wired to an EXISTING hook — helm adds no service."""
-        from helm import seats
-        with mock.patch.object(scratch, "auto_gc") as a:
+    def test_the_resident_runs_the_automatic_leg_and_the_stop_does_not(self):
+        """Wired to an EXISTING process — the `helm web` resident's periodic
+        job (`stopfacts_resident.mechanical`), which took the leg off every
+        seat's Stop. Both halves in one arm: the resident's job calls it, and
+        a stop no longer does."""
+        from helm import seats, store, stopfacts_resident
+        # THE INDEX CAP IS STUBBED, NEVER RUN: it rewrites the adopted memory
+        # index, and this arm is about which process calls the reaper.
+        with mock.patch.object(scratch, "auto_gc",
+                               return_value=None) as a, \
+                mock.patch.object(store, "index_cap") as cap:
+            receipt = stopfacts_resident.mechanical()
+        self.assertTrue(cap.called, receipt)
+        self.assertTrue(a.called, receipt)
+        with mock.patch.object(scratch, "auto_gc") as b:
             seats.stop_guard(session=None, room="main", seat="nobody")
-        self.assertTrue(a.called)
+        self.assertFalse(b.called, "a stop ran the scratch reaper")
 
 
 class CliTest(unittest.TestCase):

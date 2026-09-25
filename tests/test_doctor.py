@@ -42,11 +42,15 @@ class DoctorBase(unittest.TestCase):
             "HELM_SCAN_ROOTS": scan,
         })
         self.envp.start()
+        # THE FIRST CLEANUP RUNS LAST. Restored in tearDown, the environment
+        # was put back BEFORE every addCleanup a test registered, and a
+        # cleanup that restores its own env snapshot then re-planted this
+        # fixture's paths into every module that ran after this one.
+        self.addCleanup(self.envp.stop)
         os.environ.pop("MELD_HOME", None)
         self.assertTrue(home.helm_home().startswith(self.tmp.name))
 
     def tearDown(self):
-        self.envp.stop()
         self.tmp.cleanup()
 
     def seed_home(self):
@@ -2182,9 +2186,16 @@ class StartupDoorsCheckTest(unittest.TestCase):
         self.assertIn("REFUSED", msg)
         self.assertIn("NOT probed", msg)
 
+    # WHAT A HOOK LAUNCHED NOW WOULD PAY, the second input (task/3040).
+    HOOK_PAYS = {"ok": True, "no_site": False, "pid": 4343,
+                 "executable": "/probe/bin/python3"}
+    HOOK_SKIPS = dict(HOOK_PAYS, no_site=True)
+    EAGER = {"eager": ["unittest", "doctest", "pdb"], "site_ms": 576.0}
+
     def test_eager_warns_with_the_measured_cost_the_artifact_and_the_cure(self):
         res = doctor.check_startup_doors(
-            probe=self.probe(eager=["unittest", "doctest", "pdb"], site_ms=576.0))
+            probe=self.probe(**self.EAGER),
+            hook_probe=lambda: dict(self.HOOK_PAYS))
         self.assertEqual([lvl for lvl, _ in res], [doctor.WARN])
         msg = res[0][1]
         self.assertIn("576 ms", msg)
@@ -2192,6 +2203,83 @@ class StartupDoorsCheckTest(unittest.TestCase):
         self.assertIn("usercustomize.py", msg)
         self.assertIn("/probe/user-site", msg)
         self.assertIn("sys.meta_path", msg)
+
+    def test_eager_but_skipped_by_every_hook_is_OK_and_says_who_still_pays(self):
+        """THE DESIGN'S ROW: the doctor startup door is OK on an idle box and
+        on a loaded one once hooks start with -S, because the eager site stage
+        is then every OTHER python start's cost and not the hook budget's."""
+        res = doctor.check_startup_doors(
+            probe=self.probe(**self.EAGER),
+            hook_probe=lambda: dict(self.HOOK_SKIPS))
+        self.assertEqual([lvl for lvl, _ in res], [doctor.OK])
+        msg = res[0][1]
+        self.assertIn("NO HOOK PAYS IT", msg)
+        self.assertIn("/probe/bin/python3", msg)
+        self.assertIn("-S", msg)
+        self.assertIn("576 ms", msg)
+        self.assertIn("REFUSED", msg)
+
+    def test_eager_and_skipped_but_toothless_still_warns(self):
+        res = doctor.check_startup_doors(
+            probe=self.probe(refused=False, **self.EAGER),
+            hook_probe=lambda: dict(self.HOOK_SKIPS))
+        self.assertEqual([lvl for lvl, _ in res], [doctor.WARN])
+        self.assertIn("GONE TOO", res[0][1])
+        self.assertIn("Hooks skip it", res[0][1])
+
+    def test_eager_and_paid_by_hooks_says_so_and_an_unread_hook_is_unknown(self):
+        paid = doctor.check_startup_doors(
+            probe=self.probe(**self.EAGER),
+            hook_probe=lambda: dict(self.HOOK_PAYS))
+        self.assertEqual([lvl for lvl, _ in paid], [doctor.WARN])
+        self.assertIn("every hook process on this box pays", paid[0][1])
+        self.assertIn("no interpreter is recorded yet", paid[0][1])
+
+        def boom():
+            raise OSError("no sh")
+        unread = doctor.check_startup_doors(probe=self.probe(**self.EAGER),
+                                            hook_probe=boom)
+        self.assertEqual([lvl for lvl, _ in unread], [doctor.WARN])
+        self.assertIn("UNKNOWN", unread[0][1])
+        self.assertIn("no sh", unread[0][1])
+
+    def test_the_hook_start_probe_launches_through_the_real_wrapper(self):  # noqa: VACUOUS_ASSERTION — the absent record after the COLD probe is read against the planted record the WARM probe then uses, on the same path, unconditionally
+        """MUST-HIT for the second input: a copy of the SHIPPED wrapper starts
+        a child the way a hook is started, cold (nothing recorded: the site
+        stage runs) and warm (recorded: it does not). Hermetic: its own
+        HELM_HOME and a PATH python3 of its own."""
+        import shlex
+        import shutil
+        from helm import hooks
+        with tempfile.TemporaryDirectory() as tmp:
+            pathbin = os.path.join(tmp, "pathbin")
+            os.makedirs(pathbin)
+            shim = os.path.join(pathbin, "python3")
+            with open(shim, "w") as fh:
+                fh.write("#!/bin/sh\nexec %s \"$@\"\n" % shlex.quote(sys.executable))
+            os.chmod(shim, 0o755)
+            env = {"HELM_HOME": os.path.join(tmp, "home"),
+                   "PATH": pathbin + os.pathsep + os.environ.get("PATH", "")}
+            wrapper = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(doctor.__file__))), "bin", hooks.HOOK_WRAPPER)
+            with mock.patch.dict(os.environ, env):
+                cold = doctor._hook_start_probe(wrapper=wrapper)
+                self.assertTrue(cold.get("ok"), cold)
+                self.assertIs(cold["no_site"], False)
+                self.assertNotEqual(cold["pid"], os.getpid())
+                record = os.path.join(tmp, "home", "_global", ".state",
+                                      "hook-interp")
+                self.assertFalse(os.path.exists(record),
+                                 "the probe repaired what it only reports")
+                os.makedirs(os.path.dirname(record))
+                with open(record, "w") as fh:
+                    fh.write("%s\t%s\n" % (shim, sys.executable))
+                warm = doctor._hook_start_probe(wrapper=wrapper)
+            self.assertTrue(warm.get("ok"), warm)
+            self.assertIs(warm["no_site"], True)
+            self.assertEqual(os.path.realpath(warm["executable"]),
+                             os.path.realpath(sys.executable))
+            shutil.rmtree(os.path.join(tmp, "home"))
 
     def test_lazy_but_disarmed_never_reads_as_good(self):
         # AN ABSENT GUARD MEASURES EXACTLY LIKE A LAZY ONE on the import axis,
@@ -2249,7 +2337,8 @@ class StartupDoorsCheckTest(unittest.TestCase):
         self.assertTrue(seeded.get("ok"), seeded)
         self.assertIn("unittest", seeded["eager"])
         self.assertIn("doctest", seeded["eager"])
-        res = doctor.check_startup_doors(probe=lambda: seeded)
+        res = doctor.check_startup_doors(
+            probe=lambda: seeded, hook_probe=lambda: dict(self.HOOK_PAYS))
         self.assertEqual([lvl for lvl, _ in res], [doctor.WARN])
         self.assertIn("usercustomize.py", res[0][1])
 

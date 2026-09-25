@@ -13,6 +13,8 @@ import io
 import inspect
 import json
 import os
+import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -1262,6 +1264,41 @@ def _helm_sources(root):
     return sorted(out)
 
 
+# THE ONE ROOT BOTH CENSUSES WALK. A module global rather than a literal in
+# each census so a non-vacuity arm can point the census at its OWN tree.
+_HELM_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "helm")
+
+
+def _census_mirror(case):
+    """A private copy of helm/ that a non-vacuity arm may plant a probe in.
+
+    A TEST MAY NOT WRITE INTO THE TREE IT IS TESTING. Every module that scans
+    helm/ reads that tree, so a probe planted in the checkout's helm/work/ is
+    visible to whichever of them runs while it exists. Run serially the probe
+    lives for milliseconds between two modules nobody else occupies; run with
+    modules in parallel, tests.test_seats' stop-guard reports it as an unwired
+    module (FAIL) and tests.test_display_launder_tripwire lists it and then
+    cannot open it (ERROR).
+
+    The mirror holds REAL directories, so `_helm_sources`'s os.walk descends
+    it exactly as it descends helm/, and a SYMLINK per .py file, so every
+    census key and every source line is the checkout's own. The probe is then
+    a real file in the mirror's work/ and nowhere else. The mirror lives under
+    this process's temp root and goes with the case.
+    """
+    mirror = tempfile.mkdtemp(prefix="helm-census-mirror-")
+    case.addCleanup(shutil.rmtree, mirror, ignore_errors=True)
+    for name, path in _helm_sources(_HELM_ROOT):
+        dest = os.path.join(mirror, name)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        os.symlink(path, dest)
+    patch = mock.patch.object(sys.modules[__name__], "_HELM_ROOT", mirror)
+    patch.start()
+    case.addCleanup(patch.stop)
+    return mirror
+
+
 def _send_sites():
     """[(module, outermost_function, lineno, source_of_that_function)] for every
     `<something>.send(...)` in helm/.
@@ -1279,10 +1316,8 @@ def _send_sites():
     same commit that creates it.
     """
     import ast
-    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "helm")
     out = []
-    for name, path in _helm_sources(root):
+    for name, path in _helm_sources(_HELM_ROOT):
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
         tree = ast.parse(src)
@@ -1442,12 +1477,10 @@ class SendSiteCensusTest(unittest.TestCase):
         PLANTED one can prove the guard now reaches there. Asserting the count
         is still 8 proves nothing; asserting that a fake site MAKES IT FAIL
         does."""
-        root = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "helm")
-        pkg = os.path.join(root, "work")
-        self.assertTrue(os.path.isdir(pkg),
+        self.assertTrue(os.path.isdir(os.path.join(_HELM_ROOT, "work")),
                         "helm/work/ is the nested package this pins — if it "
                         "moved, re-point the probe rather than deleting it")
+        pkg = os.path.join(_census_mirror(self), "work")
         probe = os.path.join(pkg, "_census_nonvacuity_probe.py")
 
         def clean():
@@ -2515,10 +2548,8 @@ def _census_consumers():
     the SOURCE instead, so a fifth consumer cannot be written silently.
     """
     import ast
-    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "helm")
     out = set()
-    for name, path in _helm_sources(root):
+    for name, path in _helm_sources(_HELM_ROOT):
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
         tree = ast.parse(src)
@@ -3074,10 +3105,8 @@ class CensusConsumerCensusTest(unittest.TestCase):
     def test_the_consumer_census_REACHES_A_NESTED_PACKAGE(self):
         """NON-VACUITY, the same probe `_send_sites` earns. A census that
         cannot see a new consumer reports zero and gets believed."""
-        root = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "helm")
-        pkg = os.path.join(root, "work")
-        self.assertTrue(os.path.isdir(pkg))
+        self.assertTrue(os.path.isdir(os.path.join(_HELM_ROOT, "work")))
+        pkg = os.path.join(_census_mirror(self), "work")
         probe = os.path.join(pkg, "_census_consumer_probe.py")
 
         def clean():

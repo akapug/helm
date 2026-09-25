@@ -237,6 +237,14 @@ _DISABLED = [False]
 _VERSION = []                   # one element once resolved: bytes, or None
 _SELECTION = []                 # one element once resolved: the scrub's names
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_VERSION": "git's version, resolved once per process",
+    "_SELECTION": (
+        "the scrub's environment names, resolved once from a constant"),
+}
+
 
 def _root():
     from . import registry

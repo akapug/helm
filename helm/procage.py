@@ -41,3 +41,41 @@ def process_age(pid=None):
     # A NEGATIVE AGE IS A CLOCK WE DO NOT UNDERSTAND, not a young process:
     # report nothing rather than a number that cannot be true.
     return age if age >= 0 else None
+
+
+#: The hook wrapper's start, in /proc/uptime's frame (`bin/helm-hook`).
+HOOK_T0_ENV = "HELM_HOOK_T0"
+#: A start further back than this is not this hook's: a stale value inherited
+#: by something that is not a hook child.
+HOOK_T0_MAX_S = 3600.0
+
+
+def hook_elapsed(environ=None):
+    """Seconds since the hook wrapper started this hook, or None.
+
+    THE BUDGET IS THE HOOK'S, NOT THE HANDLER'S. The wrapper arms the outer
+    `timeout` the moment it starts, and everything before a handler's first
+    line — the interpreter, its site hooks, `import helm.cli` — runs against
+    that same clock. A handler that starts its own budget from its first line
+    was measured spending 2.42s of an owner's stop before its ladder began,
+    which is how the outer `timeout 20` killed ladders that believed they had
+    time left. `bin/helm-hook` records /proc/uptime in HELM_HOOK_T0 before it
+    starts the child, with no fork; this reads the same clock now.
+
+    None when the variable is absent, unparseable, in the future or older
+    than HOOK_T0_MAX_S, or when /proc/uptime cannot be read: the caller then
+    budgets from its own start, as it always did."""
+    env = os.environ if environ is None else environ
+    raw = env.get(HOOK_T0_ENV)
+    if not raw:
+        return None
+    try:
+        t0 = float(raw)
+        with open("/proc/uptime", "rb") as fh:
+            now = float(fh.read().split()[0])
+    except Exception:                     # noqa: BLE001 — "cannot tell"
+        return None
+    elapsed = now - t0
+    if elapsed < 0 or elapsed > HOOK_T0_MAX_S:
+        return None
+    return elapsed

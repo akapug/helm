@@ -693,6 +693,12 @@ def _rerank(prompt, jit_all, route_ids, project, session):
 #: hook is one turn per process.
 CURRENT = {}
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "CURRENT": "the turn under construction, cleared when every turn opens",
+}
+
 
 def _stage(name, **kw):
     CURRENT["stage"] = name

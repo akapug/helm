@@ -42,7 +42,14 @@ _FUTURE_TS_GRACE_S = 60.0
 # FRESH on a matching witness, so the console would render a stale schema as
 # current with no rebuild to correct it. Bump this whenever the persisted body
 # changes shape; an unrecognised value is refused, never migrated in place.
-_PERSIST_SCHEMA = 3
+# 4: each card carries the census (`frontier`, `frontier_rung`) and a BUILD
+# row's containment is its lane's, not its base's (task/2381) — the scheduler
+# and the kanban split on those fields at serve time, so a body saved without
+# them restores as "every row absorbed" and a build counted on main.
+# 5: each card carries `on_main_unverdicted`, the one predicate's answer the
+# pipeline wall's ALREADY ON TRUNK mark reads (task/2381); a body saved
+# without it would draw no mark on a row the owner's count line counts.
+_PERSIST_SCHEMA = 5
 
 _qstate = {}
 
@@ -456,14 +463,26 @@ _qreads_lock = threading.Lock()
 _qfailed = {}                # key -> (when, "raised" | "refused", why) of its last failed read
 
 
-def _read_behind(key, ttl, hard_ttl, fn, refuse=None):
+def _read_behind(key, ttl, hard_ttl, fn, refuse=None, changed=None):
     """(thread, box) for `key`. A reading that may be served comes back at
     once, with no thread and its box filled; otherwise the thread is the read
     already running or a new one, for the caller to join under its own
     budget. A filled box holds `got` and `at` (when it was read); `failed` is
     (when, "raised" or "refused", the class name or the refusal) for a read
     that raised, and rides beside a served reading when a read after it
-    failed."""
+    failed.
+
+    `changed`, when given, is the caller's witness that the inputs moved: a
+    reading younger than `ttl` is read again behind itself as soon as it says
+    True, instead of waiting out the ttl. It is asked OUTSIDE the lock (it is
+    I/O), and a witness that raises counts as moved — a read is the direction
+    that can only cost work."""
+    moved = False
+    if changed is not None:
+        try:
+            moved = bool(changed())
+        except Exception:                    # noqa: BLE001 — see above
+            moved = True
     now = time.time()
     with _qreads_lock:
         held = _qreads.get(key)
@@ -472,7 +491,7 @@ def _read_behind(key, ttl, hard_ttl, fn, refuse=None):
             ent, fail = _qstate.get(key), _qfailed.get(key)
         if ent is None or now - ent[0] >= hard_ttl:
             return held if running else _read_start(key, fn, refuse)
-        if now - ent[0] >= ttl and not running:
+        if (now - ent[0] >= ttl or moved) and not running:
             _read_start(key, fn, refuse)
         box = {"got": ent[1], "at": ent[0]}
         if fail is not None and fail[0] > ent[0]:
@@ -941,4 +960,20 @@ def verified_at(key):
 # disk on every EMPTY poll, and a body refused as stale must not be re-offered
 # on the next one. Restoration is a once-per-life event by construction.
 _qrestored = set()
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_qstate": (
+        "the stale-while-revalidate cache per projection; the arms that "
+        "read one pop its key first"),
+    "_qfresh": (
+        "the input identity each key last declined a rebuild on, read only "
+        "with that key's own fingerprint"),
+    "_qrestored": (
+        "keys whose saved body was offered, once per process by design"),
+    "_PROVIDER": (
+        "the lazy provider singleton; the arms that depend on it inject a "
+        "stub"),
+}
 del _web

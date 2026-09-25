@@ -1296,7 +1296,12 @@ _NON_CARRYING_STATUS = ("cancelled",)
 # that lands, a retired successor is closed AND still counted as carrying,
 # and the parent silently loses its debt with nothing going red. Two correct
 # fixes compose into a regression unless both land together.
-_NON_CARRYING_FLAGS = ("withdrawn", "abandoned", "retired_admin")
+_NON_CARRYING_FLAGS = ("withdrawn", "abandoned", "retired_admin",
+                       # A RETRACTED verdict took nothing on: the review it
+                       # recorded is void, so a successor that retracted is a
+                       # pass-through and the obligation it seemed to carry is
+                       # visible again on the row above it (task/3060).
+                       "verdict_retracted")
 # ...AND IT IS NOT ALWAYS A FLAG EITHER (helm task/744, L3).
 # The comment above learned that a withdrawal is recorded as a FLAG and
 # stopped there — but a STRUCTURED close writes `close_reason="withdrawn"`
@@ -1334,6 +1339,10 @@ _RETIRED_BY = (
     ("withdrawn", "withdrawn", "withdraw"),
     ("closed_by_landing", "landed", "close-landed"),
     ("abandoned", "abandoned", "abandon"),
+    # A RETRACTION IS A TERMINAL LIKE THE FOUR ABOVE (task/3060): the verdict
+    # stays on the ledger and its authority is withdrawn, so every door that
+    # asks "what already ended this row" names it instead of closing it again.
+    ("verdict_retracted", "retracted", "retract"),
 )
 
 
@@ -2443,6 +2452,13 @@ def untriaged(row, snap):
     superseded row's obligation.
     """
     status = str(row.get("status") or "")
+    if row.get("verdict_retracted"):
+        return "RETRACTED", ("not triaged: verdict RETRACTED (was %s) — "
+                             "successor %s"
+                             % (str(row.get("retracted_polarity")
+                                    or "undeclared").upper(),
+                                str(row.get("retract_successor")
+                                    or "none")[:12]))
     if status == "verdict":
         return "VERDICT", ("not triaged: closed by %s verdict"
                            % (row.get("polarity") or "undeclared").upper())
@@ -2699,6 +2715,9 @@ LEDGER_EVENT_ACTORS = {
     "abandon": (),
     "close-landed": (),
     "close-correction": (),
+    # A VERDICT RETRACTION names its hand, the seat whose door admitted it
+    # (the verdict's author, the integrator, or the owner) (task/3060).
+    "verdict-retract": ("retract_seat",),
     "custody": (),
     "retip": (),
     # A MODEL RUN'S ADVISORY READ: the seat that recorded it is the hand.
@@ -3148,6 +3167,25 @@ def _apply(state, row, current=None, verdicts=None, position=None):
                        delivered_report_correction=True, seq=expected)
             for key in _CLOSE_STATE_FIELDS["delivered-report"]:
                 out[key] = row.get(key)
+            return out
+        # THE VERDICT RETRACTION (task/3060) — the second narrow exception to
+        # "terminal is immutable", and like the first it rewrites nothing. The
+        # verdict event stays exactly as appended; this LATER fact withdraws
+        # its authority. The projected polarity becomes RETRACTED and the
+        # original moves to `retracted_polarity`, which is the fail-safe
+        # encoding: every authority reader asks `== "approve"` or
+        # `in ("fix", "supersede")`, so a retracted row authorizes, contests
+        # and discharges nothing even at a reader nobody taught this word.
+        # THE REPLAY ADMITS EXACTLY WHAT THE WRITER ADMITS: both run
+        # `_retract_record` over the same event and the same state.
+        if event == RETRACT_EVENT and strict:
+            fields, err = _retract_record(row, state)
+            if err:
+                return state
+            out = dict(state)
+            out.update(fields)
+            out.update(polarity=RETRACTED, verdict_retracted=True,
+                       seq=expected)
             return out
         # CLOSED-BY-LANDING is a monotonic historical fact: once Git proved an
         # UNDECLARED reviewed change on one sampled trunk, no later event or ref
@@ -4052,9 +4090,11 @@ def _ledger_fold_scoped(strict=False, want_events=False, want_actors=False):
 
 def _advance_checkpoint():
     """THE WRITER'S HALF OF WRITE-MAINTAINED: fold what was just appended into
-    the checkpoint, under the lock the append held (task/2770). A failure here
-    changes nothing about the write that already succeeded, so it never
-    raises — not even a spent budget; the next reader folds the same tail."""
+    the checkpoint (task/2770), AFTER the writer has released the ledger lock
+    (`_ledger_write`): the fold is a read, and the checkpoint store takes its
+    own save lock. A failure here changes nothing about the write that
+    already succeeded, so it never raises — not even a spent budget; the next
+    reader folds the same tail."""
     try:
         _ledger_fold()
     except Exception as exc:                             # noqa: BLE001
@@ -4062,13 +4102,142 @@ def _advance_checkpoint():
         record.swallow("dispatches._advance_checkpoint", exc)
 
 
-def _append_unlocked(path, event):
-    """`eventledger.append_unlocked`, then the checkpoint advance when the
-    event landed on THIS ledger. Returns the append's own answer."""
-    ok = eventledger.append_unlocked(path, event)
-    if ok and path == ledger_path():
-        _advance_checkpoint()
-    return ok
+#: How many tries a dispatch-ledger writer makes (`_ledger_write`). Every try
+#: but the last reads without the lock; the last takes the lock for its read
+#: as well as its write.
+LEDGER_WRITE_TRIES = 4
+
+
+class _LedgerMoved(BaseException):
+    """The ledger changed between one try's read and its write. A
+    BaseException, so that no `except Exception` inside a writer's body can
+    swallow the retry and append on a read that is no longer current."""
+
+
+_THEN = object()
+_ABSENT = ("absent",)
+
+
+def _ledger_identity(path):
+    """`eventledger.ledger_identity`, with an ABSENT ledger named as such.
+
+    The probe answers None both for a ledger that does not exist and for one
+    it cannot read. The first is a known state, a fresh home's first write,
+    and a writer that read it and still finds it absent at the write has
+    seen nothing change; the second proves nothing, so it stays None and
+    never matches."""
+    identity = eventledger.ledger_identity(path)
+    if identity is None and not os.path.lexists(path):
+        return _ABSENT
+    return identity
+
+
+class _LedgerTxn(object):
+    """ONE TRY OF ONE DISPATCH-LEDGER WRITE. `_ledger_write` explains it.
+
+    `held` is what a writer's `if not held:` reads: True on an optimistic
+    try, which has not asked for the lock yet, and the lock's own answer on
+    the last try, which asked before the read."""
+
+    def __init__(self, path, stack, last, redo=False):
+        self.path, self.last, self.appended = path, last, 0
+        # AN EARLIER TRY OF THIS CALL DECIDED TO WRITE AND FOUND THE LEDGER
+        # MOVED. A body that now finds its own intended effect already on the
+        # ledger lost a race to another writer: its answer is "already done",
+        # never "I did it" (`_append_dispatch`, `_WRITTEN_ELSEWHERE`).
+        self.redo = redo
+        self._stack, self._then, self.seen = stack, None, None
+        self._locked = False
+        if last:
+            self._locked = bool(stack.enter_context(eventledger.locked(path)))
+            self.held = self._locked
+        else:
+            self.held = True
+            # TAKEN BEFORE THE WRITER READS, so an append that lands between
+            # this line and the read also sends the try round again.
+            self.seen = _ledger_identity(path)
+
+    def lock(self):
+        """Take the lock now: True, or False when the ledger is unwritable.
+
+        On an optimistic try this proves the ledger is still the file the try
+        read (`eventledger.ledger_identity`: device, inode, size, mtime and
+        ctime). If it is not, the try is over and `_ledger_write` runs the
+        writer again from a fresh read. A writer calls this itself before a
+        LIVE probe whose answer it records as measured at the write (a git
+        object, a lane's state, a mint's freshness): from here to the append
+        is one critical section, while the fold before it runs without the
+        lock."""
+        if self._locked:
+            return True
+        if self.last or not self._stack.enter_context(
+                eventledger.locked(self.path)):
+            return False
+        self._locked = True
+        # A ledger that cannot be identified proves nothing unchanged.
+        if self.seen is None or _ledger_identity(self.path) != self.seen:
+            raise _LedgerMoved()
+        return True
+
+    def append(self, event):
+        """Append one event: True, or False when the ledger is unwritable.
+        The first append of an optimistic try takes the lock (`lock`)."""
+        if not self.lock():
+            return False
+        if not eventledger.append_unlocked(self.path, event):
+            return False
+        self.appended += 1
+        return True
+
+    def then(self, finish):
+        """Return this from the writer's body to have `finish()` give the
+        writer's answer AFTER the lock is released and the checkpoint has
+        advanced: the projection a writer returns can itself re-validate
+        with git, which is never work for the lock."""
+        self._then = finish
+        return _THEN
+
+
+def _ledger_write(body, path=None, tries=None):
+    """Run ONE dispatch-ledger write: `body(txn)` reads, decides and appends
+    through `txn.append`, and whatever it returns is the writer's answer.
+
+    THE LOCK COVERS THE WRITE, NEVER THE FOLD. The fold a writer reads is a
+    whole-ledger replay whenever its checkpoint is cold, and a land changes
+    the code, which makes every checkpoint cold: measured one minute after a
+    land, the first `snapshot()` took 102.2 s and the next 0.23 s. A writer
+    that folded under the lock made every `dispatch send` and `dispatch
+    verdict` in the fleet wait that long. So every try but the last reads
+    and validates with no lock held, and under the lock proves only that the
+    ledger is the file it read before it appends (`_LedgerTxn.append`). A
+    try whose ledger moved is run again from a fresh read, and the redo is
+    cheap: the read before it left the fold checkpoint warm.
+
+    THE LAST TRY READS UNDER THE LOCK. A writer that re-takes the lock faster
+    than this one can read again would win every optimistic race, so after
+    `tries - 1` misses the read, the checks and the write are one critical
+    section, as every writer was before this. `tries=1` makes a door locked
+    from its first read, for a writer whose checks the ledger's identity
+    cannot cover.
+
+    A body is re-run from its start on a miss, so it must rebuild what it
+    decides from its own inputs: nothing it computes may leak from one try
+    to the next. The checkpoint advance runs after the lock is released."""
+    path = path or ledger_path()
+    total = LEDGER_WRITE_TRIES if tries is None else max(1, int(tries))
+    moved = 0
+    for number in range(total):
+        try:
+            with contextlib.ExitStack() as stack:
+                txn = _LedgerTxn(path, stack, number == total - 1,
+                                 redo=moved > 0)
+                answer = body(txn)
+        except _LedgerMoved:
+            moved += 1
+            continue
+        if txn.appended and path == ledger_path():
+            _advance_checkpoint()
+        return txn._then() if answer is _THEN else answer
 
 
 def snapshot():
@@ -5168,13 +5337,18 @@ def _body_fits(text):
             and _serialized_len(text) <= MESSAGE_BODY_SERIALIZED_CAP)
 
 
-def _body_with_notice(kept, total):
+def _body_with_notice(kept, total, has_ref=False):
     """The stored value for a truncated brief: the kept text AND the notice.
 
     The notice is part of the STORED VALUE and not a flag beside it, so every
     reader that can render a body at all renders the fact that it is short —
     including readers that never learn this field has a cap.
     """
+    if has_ref:
+        return kept + (
+            "\n\n%s — %d of %d UTF-8 bytes stored on the dispatch row. The whole "
+            "brief is stored by reference; read it with `helm dispatch triage <id>`.]"
+            % (BODY_TRUNCATED_MARK, len(kept.encode("utf-8")), total))
     return kept + (
         "\n\n%s — %d of %d UTF-8 bytes stored on the dispatch row. The rest "
         "went out in the original DM only and is NOT recoverable from this "
@@ -5182,7 +5356,7 @@ def _body_with_notice(kept, total):
         % (BODY_TRUNCATED_MARK, len(kept.encode("utf-8")), total))
 
 
-def _store_body(message):
+def _store_body(message, has_ref=False):
     """The durable form of one dispatch brief: the text, capped, SAYING SO.
 
     A SILENT TRUNCATION READS AS A COMPLETE BRIEF, which is worse than storing
@@ -5214,11 +5388,11 @@ def _store_body(message):
     lo, hi = 0, len(message)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if _body_fits(_body_with_notice(message[:mid], total)):
+        if _body_fits(_body_with_notice(message[:mid], total, has_ref=has_ref)):
             lo = mid
         else:
             hi = mid - 1
-    if not _body_fits(_body_with_notice("", total)):
+    if not _body_fits(_body_with_notice("", total, has_ref=has_ref)):
         # THE BOUND WINS, AND AN UNFITTABLE NOTICE IS A MISCONFIGURATION
         #. I had made the
         # NOTICE win and knowingly exceeded the cap, reasoning that a silently
@@ -5241,7 +5415,7 @@ def _store_body(message):
             "it was cut. Raise the cap; a cap that may be knowingly exceeded "
             "is not a cap."
             % (MESSAGE_BODY_CAP, MESSAGE_BODY_SERIALIZED_CAP,
-               len(_body_with_notice("", total).encode("utf-8"))))
+               len(_body_with_notice("", total, has_ref=has_ref).encode("utf-8"))))
     if lo >= len(message):
         # NOTHING WAS CUT, SO NOTHING MAY CLAIM IT WAS. The raw admission bound
         # is deliberately lower than the serialized one, so a body can fail the
@@ -5251,7 +5425,7 @@ def _store_body(message):
         # for a tail that does not exist. Caught by probing the function, not
         # by reading it.
         return message
-    return _body_with_notice(message[:lo], total)
+    return _body_with_notice(message[:lo], total, has_ref=has_ref)
 
 
 # ------------------------------------------------------------- the brief file
@@ -5498,6 +5672,19 @@ def _cut_sent_bytes(body):
         re.escape(BODY_TRUNCATED_MARK) + re.escape(marker)
         + r"(\d+) of (\d+) UTF-8 bytes", str(body or ""))
     return int(match.group(2)) if match else None
+
+
+def _cut_kept_bytes(body):
+    """The KEPT byte length a truncation notice reports, or None."""
+    probe = _body_with_notice("", 0)
+    head, _sep, tail = probe.partition("0 of 0 UTF-8 bytes")
+    if not _sep:
+        return None
+    marker = head.split(BODY_TRUNCATED_MARK)[-1]
+    match = re.search(
+        re.escape(BODY_TRUNCATED_MARK) + re.escape(marker)
+        + r"(\d+) of (\d+) UTF-8 bytes", str(body or ""))
+    return int(match.group(1)) if match else None
 
 
 def brief_census(current=None):
@@ -6297,6 +6484,20 @@ def _cured_operation_reconciliation(operation, current):
     return existing, None, True
 
 
+#: Carried by the row `_append_dispatch` answers with when THIS call decided
+#: to write, lost the race to another writer of the same operation, and found
+#: that writer's row on its redo. Never stored: `send` and `add` read it off
+#: and drop it.
+_WRITTEN_ELSEWHERE = "_written_elsewhere"
+
+
+def _written_elsewhere(existing, txn):
+    """`existing`, marked when this call only found it on a redo."""
+    if not txn.redo or not isinstance(existing, dict):
+        return existing
+    return dict(existing, **{_WRITTEN_ELSEWHERE: True})
+
+
 def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
                      cured_operation=None):
     """(row, err, existed) — existed=True means the operation was already on
@@ -6317,8 +6518,13 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
     drifts mints a chainless row.
     """
     path = ledger_path()
-    with eventledger.locked(path) as held:
-        if not held:
+    given_row, given_alt_ops = row, alt_ops
+
+    def attempt(txn):
+        # EACH TRY STARTS FROM THE CALLER'S ROW: a try that re-derived it
+        # (`prepare`) must not hand that derivation to the next one.
+        row, alt_ops = given_row, given_alt_ops
+        if not txn.held:
             return None, "ledger unwritable (%s) — dispatch NOT recorded" % path, False
         current, unavailable = snapshot()
         if unavailable:
@@ -6329,7 +6535,7 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
             existing, why, existed = _cured_operation_reconciliation(
                 cured_operation, current)
             if existed:
-                return existing, why, True
+                return _written_elsewhere(existing, txn), why, True
             try:
                 row, alt_ops, why = cured_operation["prepare"](current)
             except Exception as exc:              # noqa: BLE001
@@ -6414,7 +6620,7 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
                 if warning:
                     existing = dict(existing)
                     existing[_WRITE_WARNINGS] = [warning]
-                return existing, None, True
+                return _written_elsewhere(existing, txn), None, True
             return None, "operation key already names different work", True
         warning, needs_force = _duplicate_mint_warning(row, current)
         if warning and needs_force and not force:
@@ -6430,7 +6636,7 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
                 current.get(str(row["supersedes"])), "--supersedes dispatch")
             if refusal:
                 return None, refusal, False
-        if not _append_unlocked(path, row):
+        if not txn.append(row):
             return None, "ledger unwritable (%s) — dispatch NOT recorded" % path, False
         # ANNOTATE THE PARENT IN THE SAME WRITE SEQUENCE (441c4491). The
         # successor is already on the ledger, so a failure here leaves the
@@ -6447,18 +6653,23 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
         if row.get("supersedes") and not force:
             parent = current.get(str(row["supersedes"]))
             if isinstance(parent, dict) and not parent.get("superseded_by"):
-                _append_unlocked(path, {
+                txn.append({
                     "v": 3, "event": "superseded",
                     "seq": (parent.get("seq") or 0) + 1,
                     "id": parent["id"], "ts": pk.now_ts(),
                     "successor": row["id"]})
-    pk.event("dispatch-add", row["id"], "%s -> %s" % (row["recipient"], row["lane"]))
-    out = dict(row)
-    out.update(delivery="needs-confirmation", migration=None,
-               delivery_ref=None, verdict_ref=None, reviewed_tip=None)
-    if warning:
-        out[_WRITE_WARNINGS] = [warning]
-    return out, None, False
+
+        def added():
+            pk.event("dispatch-add", row["id"],
+                     "%s -> %s" % (row["recipient"], row["lane"]))
+            out = dict(row)
+            out.update(delivery="needs-confirmation", migration=None,
+                       delivery_ref=None, verdict_ref=None, reviewed_tip=None)
+            if warning:
+                out[_WRITE_WARNINGS] = [warning]
+            return out, None, False
+        return txn.then(added)
+    return _ledger_write(attempt, path)
 
 
 def acting_author(action="author this dispatch"):
@@ -6864,6 +7075,16 @@ def _recipient_join(recipient):
     return state, why, row, None
 
 
+def _census_interval_min():
+    """The beacons census cadence in minutes, read from its owner so the
+    advisory's bound moves with the timer."""
+    try:
+        from . import beacons
+        return max(1, int(beacons.INTERVAL_S) // 60)
+    except Exception:                       # noqa: BLE001 — prose only
+        return 5
+
+
 def _recipient_seat_rung(recipient, force, joined=None):
     """(ok, refusal, warning) — can this SEAT work right now?
 
@@ -6950,6 +7171,28 @@ def _recipient_seat_rung(recipient, force, joined=None):
                      "reason": (row or {}).get("upstream"),
                      "since": (row or {}).get("upstream_since")})))
         return True, None, None
+    if seat_usability.deaf_only(row):
+        # A DEAF PANE IS A DELAY TOO (task/3055), and the argument is the GONE
+        # pane's above, word for word: the ledger is DURABLE, and the row is
+        # delivered when the recipient's beacon re-arms. What made a live-pane
+        # refusal right — a seat that takes the obligation and never works it
+        # — is not this seat: it cannot take anything until it re-arms, and
+        # then it can work it. Refusing here only made the sender re-type the
+        # row later (measured: a review booking refused for a seat whose
+        # waiter was 31 seconds from re-arming after its 30-minute lease).
+        # And the filed row is what makes the seat OWE, which is the input the
+        # beacons census's re-arm nudge fires on. A second refusal rung — a
+        # wall, a dead turn loop — keeps the refusal below; `deaf_only` is
+        # False for it.
+        return True, None, (
+            "recipient %r is DEAF (%s): filed, because the ledger is durable "
+            "and the row is delivered when its beacon re-arms. This row makes "
+            "it owe work, so the beacons census asks its pane to re-arm on "
+            "its next pass (at most %d minutes) when that pane declares the "
+            "seat and the seat is of the project the census runs for; `helm "
+            "seat resume-turn --nudge --seat %s` types the same wake now." % (recipient, (row or {}).get("reachable_why")
+                           or "no live beacon", _census_interval_min(),
+                           (row or {}).get("seat") or recipient))
     if can is False:
         return False, (
             "recipient %r is UNUSABLE right now: %s. Its pane is LIVE, so it "
@@ -7199,7 +7442,7 @@ def add(recipient, lane, ref=None, note=None, deadline_s=None,
         # that already fits UNCHANGED, so this costs nothing in the ordinary
         # case and only bites the one it exists for.
         if message_body:
-            message_body = _store_body(message_body)
+            message_body = _store_body(message_body, has_ref=bool(inherited_brief_ref))
     recipient, err = _recipient_operand(recipient)
     if err:
         return (None, err) if _reason else None
@@ -7236,6 +7479,7 @@ def add(recipient, lane, ref=None, note=None, deadline_s=None,
     out, why, existed = _append_dispatch(row, force=force)
     if not out:
         return (None, why) if _reason else None
+    out = {k: v for k, v in out.items() if k != _WRITTEN_ELSEWHERE}
     if not existed:
         _queue_findings_pass(out)
     if notify:
@@ -7298,8 +7542,9 @@ def _mark_delivered(rid, delivery_ref):
     if err:
         return None, err
     path = ledger_path()
-    with eventledger.locked(path) as held:
-        if not held:
+
+    def attempt(txn):
+        if not txn.held:
             return None, "delivery observed but ledger update failed"
         current, unavailable = snapshot()
         if unavailable:
@@ -7326,13 +7571,14 @@ def _mark_delivered(rid, delivery_ref):
             event = {"v": 3, "event": "delivered", "seq": row["seq"] + 1,
                      "id": row["id"], "ts": pk.now_ts(), "delivery_ref": ref}
             warning = None
-        if not _append_unlocked(path, event):
+        if not txn.append(event):
             return None, "delivery observed but ledger update failed"
-    out = dict(row)
-    out.update(delivery="observed", delivery_ref=ref, seq=event["seq"])
-    if warning:
-        out[_WRITE_WARNINGS] = list(out.get(_WRITE_WARNINGS, ())) + [warning]
-    return out, None
+        out = dict(row)
+        out.update(delivery="observed", delivery_ref=ref, seq=event["seq"])
+        if warning:
+            out[_WRITE_WARNINGS] = list(out.get(_WRITE_WARNINGS, ())) + [warning]
+        return out, None
+    return _ledger_write(attempt, path)
 
 
 mark_delivered = _mark_delivered    # public alias -- the verb for updating
@@ -7619,7 +7865,6 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
     # storage decision; `message_hash` is an identity contract. Computed ONCE
     # here because every admission path below builds its row through `_base`,
     # and the brief must reach whichever row is the one appended.
-    message_body = _store_body(message)
     # THE FILE IS WRITTEN HERE, BEFORE ANY ROW EXISTS, and the ordering is the
     # whole safety argument. Every `_base` call below is downstream of this
     # line and every append is downstream of them, so there is no interleaving
@@ -7635,6 +7880,9 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
     brief_ref, brief_bytes, brief_err = write_brief_file(message)
     if brief_err:
         return None, brief_err, False
+    # The row copy is cut AFTER the file exists, so its notice can say where the
+    # whole brief is instead of telling the reader the tail is lost.
+    message_body = _store_body(message, has_ref=bool(brief_ref))
     info = _repo_info(repo)
     raw_parent = str(supersedes or "").strip() or None
     raw_tip = str(ref or "").strip().lower()
@@ -7789,6 +8037,11 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
         unique_key=unique_key, cured_operation=operation)
     if why:
         return None, why, False
+    # A RACE LOST IS NOT A SEND. Another send of this same operation wrote
+    # the row, and delivered it, while this call was reading; this call did
+    # neither, so it must not report `sent`, whatever the row now says.
+    raced = bool(row.get(_WRITTEN_ELSEWHERE))
+    row = {k: v for k, v in row.items() if k != _WRITTEN_ELSEWHERE}
     warnings = row.get(_WRITE_WARNINGS, ())
     notes = [n for n in (usability_note, _tier_note(recipient, kind),
                          _project_light_rung(row.get("repo_root") or repo, kind,
@@ -7819,7 +8072,7 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
                          % (str(row.get("id") or "")[:12], closed_state(row),
                             str(row.get("supersedes") or "") or "the parent")), \
                 False
-        if operation and row.get("delivery") == "observed":
+        if operation and row.get("delivery") == "observed" and not raced:
             return row, None, True
         return row, ("dispatch already recorded; delivery is %s — confirm at the "
                      "recipient, do not resend automatically" % row["delivery"]), False
@@ -8402,65 +8655,44 @@ def record_findings_note(rid, tip, fields):
     ever on the ledger that replay would drop.
 
     THE LEDGER LOCK COVERS THE WRITE, NEVER THE FOLD, on every try but the
-    last. The row is read and the event is built with no lock held; under
-    the lock the writer checks only that the ledger file is the one it read
-    (`eventledger.ledger_identity`: device, inode, size, mtime and ctime),
-    appends if it is, and reads again if it is not. A fold is the expensive
-    half: a worker whose code or trunk has no warm fold checkpoint pays a
-    full replay, minutes under load, and a fold held under this lock makes
-    every `dispatch send` and `dispatch verdict` in the fleet wait for it.
-    The checkpoint advance after the append also folds, so it runs after the
-    lock is released; the checkpoint store takes its own save lock.
-
-    THE LAST TRY READS UNDER THE LOCK (`FINDINGS_NOTE_TRIES` says why): a
-    writer that re-takes the lock faster than this one can read again wins
-    every optimistic race, and a note that gave up there was dropped."""
+    last: the discipline every dispatch-ledger writer shares
+    (`_ledger_write`). It takes `FINDINGS_NOTE_TRIES` tries rather than the
+    writers' default, and that constant says why: a writer that re-takes the
+    lock faster than this one can read again wins every optimistic race, and
+    a note that gave up there was dropped."""
     path = ledger_path()
-    for attempt in range(FINDINGS_NOTE_TRIES):
-        last = attempt == FINDINGS_NOTE_TRIES - 1
-        with (eventledger.locked(path) if last
-              else contextlib.nullcontext(True)) as held:
-            if not held:
-                return None, "ledger unwritable (%s) — findings note NOT " \
-                    "recorded" % path
-            seen = None if last else eventledger.ledger_identity(path)
-            current, unavailable = snapshot()
-            if unavailable:
-                return None, "dispatch ledger unavailable: %s" % unavailable
-            row, err = _resolve_row(current, rid)
-            if err:
-                return None, err
-            if row.get("status") not in FINDINGS_NOTE_STATES:
-                return None, ("dispatch %s is %s — a findings note lands only "
-                              "on a row still owed a review"
-                              % (row["id"][:12], row.get("status")))
-            event = {"v": 3, "event": "findings-note", "seq": row["seq"] + 1,
-                     "id": row["id"], "ts": pk.now_ts(),
-                     "reader": FINDINGS_READER,
-                     "reviewed_tip": str(tip or "").lower()}
-            event.update({k: v for k, v in (fields or {}).items()
-                          if k in _FINDINGS_FIELDS and v is not None})
-            if "reason" in event:
-                event["reason"] = _one_line(event["reason"],
-                                            FINDINGS_REASON_CAP)
-            out = _apply(row, event)
-            if out is row:
-                return None, ("the findings note was refused by the reducer "
-                              "before append — nothing was recorded")
-            with (contextlib.nullcontext(True) if last
-                  else eventledger.locked(path)) as held:
-                if not held:
-                    return None, "ledger unwritable (%s) — findings note " \
-                        "NOT recorded" % path
-                # A ledger that cannot be identified proves nothing unchanged.
-                if not last and (seen is None
-                                 or eventledger.ledger_identity(path) != seen):
-                    continue
-                if not eventledger.append_unlocked(path, event):
-                    return None, "ledger unwritable (%s) — findings note " \
-                        "NOT recorded" % path
-        _advance_checkpoint()
+
+    def attempt(txn):
+        if not txn.held:
+            return None, "ledger unwritable (%s) — findings note NOT " \
+                "recorded" % path
+        current, unavailable = snapshot()
+        if unavailable:
+            return None, "dispatch ledger unavailable: %s" % unavailable
+        row, err = _resolve_row(current, rid)
+        if err:
+            return None, err
+        if row.get("status") not in FINDINGS_NOTE_STATES:
+            return None, ("dispatch %s is %s — a findings note lands only "
+                          "on a row still owed a review"
+                          % (row["id"][:12], row.get("status")))
+        event = {"v": 3, "event": "findings-note", "seq": row["seq"] + 1,
+                 "id": row["id"], "ts": pk.now_ts(),
+                 "reader": FINDINGS_READER,
+                 "reviewed_tip": str(tip or "").lower()}
+        event.update({k: v for k, v in (fields or {}).items()
+                      if k in _FINDINGS_FIELDS and v is not None})
+        if "reason" in event:
+            event["reason"] = _one_line(event["reason"], FINDINGS_REASON_CAP)
+        out = _apply(row, event)
+        if out is row:
+            return None, ("the findings note was refused by the reducer "
+                          "before append — nothing was recorded")
+        if not txn.append(event):
+            return None, "ledger unwritable (%s) — findings note " \
+                "NOT recorded" % path
         return out, None
+    return _ledger_write(attempt, path, tries=FINDINGS_NOTE_TRIES)
 
 
 def _queue_findings_pass(row):
@@ -8675,12 +8907,16 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
         # (v3, and a tier reader answers PRE-TIER: it authorizes nothing).
         bind_author = False
     path = ledger_path()
-    # BOUND BEFORE THE LOCK, deliberately. The projection below tests this
-    # name, and a guard that can raise NameError instead of answering is the
-    # exact defect the stale `author_keys` rename shipped last round.
-    event = None
-    with eventledger.locked(path) as held:
-        if not held:
+    given_on_behalf = on_behalf
+
+    def attempt(txn):
+        # EACH TRY STARTS FROM THE CALLER'S BINDING: the row binds it below.
+        on_behalf = given_on_behalf
+        # BOUND BEFORE THE READ, deliberately. The projection below tests this
+        # name, and a guard that can raise NameError instead of answering is
+        # the exact defect the stale `author_keys` rename shipped last round.
+        event = None
+        if not txn.held:
             return None, "ledger unwritable (%s) — verdict NOT recorded" % path
         current, unavailable = snapshot()
         if unavailable:
@@ -8688,6 +8924,9 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
         row, err = _resolve_row(current, rid)
         if err:
             return None, err
+        if row.get("verdict_retracted"):
+            return None, retracted_refusal(
+                row, "a retracted row takes no new verdict")
         if row["status"] == "verdict":
             if row.get("reviewed_tip") == reviewed \
                     and row.get("verdict_ref") == evidence \
@@ -8710,8 +8949,16 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
                 return out, None
             # A DIFFERENT polarity or basis on the same tip+evidence is not a
             # retry, it is an attempt to flip a standing verdict's semantics.
-            # Terminal is immutable: it falls through to the refusal below.
-            return None, "dispatch %s already has a verdict (closed)" % rid
+            # Terminal is immutable: it falls through to the refusal below,
+            # which names the one door that corrects a wrong verdict without
+            # rewriting it (task/3060).
+            return None, ("dispatch %s already has a verdict (closed) — a "
+                          "standing verdict is immutable. If it is WRONG, its "
+                          "author or the integrator retracts it: `helm "
+                          "dispatch retract %s --reason R --reads "
+                          "source-clean|fix|supersede|unknown "
+                          "--measured|--inferred --reissue`"
+                          % (rid, row["id"][:12]))
         if row["status"] == "cancelled":
             return None, ("dispatch %s was cancelled (abandoned) — a verdict "
                           "asserts a review happened, so it is refused" % rid)
@@ -8766,7 +9013,7 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
             if out is row:
                 return None, ("the advisory read was refused by the reducer "
                               "before append — nothing was recorded")
-            if not _append_unlocked(path, event):
+            if not txn.append(event):
                 return None, ("ledger unwritable (%s) — advisory read NOT "
                               "recorded" % path)
             return out, None
@@ -8932,62 +9179,66 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
             tier, why = approval_tier_for_verdict(_apply(row, event))
             if tier == "unknown":
                 return None, "record-time approval tier is unavailable: " + str(why)
-        if not _append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) — verdict NOT recorded" % path
-    # THE CANONICAL REDUCER OWNS THE PROJECTION. Rebuilding the
-    # verdict row by hand here made the WRITE path and the REPLAY path two
-    # independent readers of one event, free to disagree — so a new field could
-    # report immediate success and then fail replay or leave the row open, which
-    # is precisely the class the stale-rename incident exposed. `_apply` is what
-    # replay runs; running it here means the caller's answer IS the projection.
-    out = _apply(row, event) if event is not None else dict(row)
-    # AND THE REDUCER'S REFUSAL IS AN ERROR, NOT A SHRUG. `_apply` returns the
-    # state OBJECT it was handed on every refusal path (pinned by
-    # ApplySignalsWhatItTook), so identity IS the signal. Reaching here with a
-    # refused event means the ledger has an appended verdict the projection
-    # will not take: the caller would be told SUCCESS and the row would replay
-    # OPEN. That divergence is the whole class this cure closes, so it fails
-    # loudly at the one place that can still see both halves.
-    if event is not None and out is row:
-        return None, ("verdict was appended but the canonical reducer refused "
-                      "it — the row would replay OPEN, so the ledger and the "
-                      "projection disagree; do not trust this write")
-    # `gate` is the ONLY field recorded, and everything a reader wants is
-    # derived from it (gate_state). The first draft also returned gate_state
-    # and gate_why on this path — and the idempotent-retry path, which
-    # early-returns the REPLAYED row, could not carry them, so a retry answered
-    # in a different shape than the original call. tests/test_dispatches caught
-    # it. A second stored spelling of one fact is the same defect as the
-    # duplicated STALE_ON_REMINT list: two places to update, one of them
-    # forgotten.
-    # EVERY FIELD ABOVE USED TO BE RE-SET BY HAND HERE — status, tip, ref,
-    # polarity, seq, gate, gate_caps, basis, the exit answer and the author
-    # bundle. That made the caller's answer a SECOND derivation of the event,
-    # able to agree with replay today and diverge silently tomorrow. `_apply`
-    # produced all of it one line above; re-asserting it would only mask the
-    # divergence the parity arm exists to catch.
-    # FREEZE THE CUTOVER on the first stamped write, so it is a recorded fact
-    # rather than a per-read derivation. No-op once a marker exists.
-    if GATE_CAPS:
-        try:
-            record_gate_epoch()
-        except Exception:               # noqa: BLE001 — never fail a verdict
-            pass
-    # WHAT THE ACTUATOR CLAIMS, THE VERDICT RELEASES. When a row is
-    # dispatched to an idle seat the offer layer claims `dispatch:<row id>`
-    # ON THAT SEAT'S BEHALF and tells it to start -- and it discards the
-    # lease id it minted, so the holder is never handed the token `release`
-    # demands. Binding a verdict finishes that work and closes the row, and
-    # nothing released the lease: three stood on one seat in one night, every
-    # one found by the stop-guard rather than by the seat, while every reader
-    # of `helm chat claims` saw a seat mid-work on lanes it had already
-    # verdicted -- on the night reviewer availability was the scarcest thing
-    # the fleet had. An entry and an exit belong to the same owner; a release
-    # only a guard remembers is not an exit.
-    _release_autoclaim(row["id"])
-    pk.event("dispatch-verdict", row["id"], evidence)
-    out["announce"] = _announce_verdict(out, reviewed, evidence)
-    return out, None
+
+        # AFTER THE LOCK IS RELEASED: the projection, the epoch marker, the
+        # lease release and the announcement are none of them the write.
+        def finish():
+            # THE CANONICAL REDUCER OWNS THE PROJECTION. Rebuilding the
+            # verdict row by hand here made the WRITE path and the REPLAY path two
+            # independent readers of one event, free to disagree — so a new field could
+            # report immediate success and then fail replay or leave the row open, which
+            # is precisely the class the stale-rename incident exposed. `_apply` is what
+            # replay runs; running it here means the caller's answer IS the projection.
+            out = _apply(row, event) if event is not None else dict(row)
+            # AND THE REDUCER'S REFUSAL IS AN ERROR, NOT A SHRUG. `_apply` returns the
+            # state OBJECT it was handed on every refusal path (pinned by
+            # ApplySignalsWhatItTook), so identity IS the signal. Reaching here with a
+            # refused event means the ledger has an appended verdict the projection
+            # will not take: the caller would be told SUCCESS and the row would replay
+            # OPEN. That divergence is the whole class this cure closes, so it fails
+            # loudly at the one place that can still see both halves.
+            if event is not None and out is row:
+                return None, ("verdict was appended but the canonical reducer refused "
+                              "it — the row would replay OPEN, so the ledger and the "
+                              "projection disagree; do not trust this write")
+            # `gate` is the ONLY field recorded, and everything a reader wants
+            # is derived from it (gate_state). The answer carries no second
+            # spelling of it: the idempotent-retry path early-returns the
+            # REPLAYED row and cannot carry one, so a retry would answer in a
+            # different shape than the original call (tests/test_dispatches),
+            # and two stored spellings of one fact are two places to update.
+            # NO FIELD IS RE-SET BY HAND HERE — status, tip, ref, polarity,
+            # seq, gate, gate_caps, basis, the exit answer and the author
+            # bundle all come from `_apply` one line above. A hand re-set would
+            # make the caller's answer a SECOND derivation of the event, able
+            # to agree with replay today and diverge silently tomorrow, and it
+            # would mask the divergence the parity arm exists to catch.
+            # FREEZE THE CUTOVER on the first stamped write, so it is a recorded fact
+            # rather than a per-read derivation. No-op once a marker exists.
+            if GATE_CAPS:
+                try:
+                    record_gate_epoch()
+                except Exception:               # noqa: BLE001 — never fail a verdict
+                    pass
+            # WHAT THE ACTUATOR CLAIMS, THE VERDICT RELEASES. When a row is
+            # dispatched to an idle seat the offer layer claims `dispatch:<row id>`
+            # ON THAT SEAT'S BEHALF and tells it to start -- and it discards the
+            # lease id it minted, so the holder is never handed the token `release`
+            # demands. Binding a verdict finishes that work and closes the row, and
+            # nothing released the lease: three stood on one seat in one night, every
+            # one found by the stop-guard rather than by the seat, while every reader
+            # of `helm chat claims` saw a seat mid-work on lanes it had already
+            # verdicted -- on the night reviewer availability was the scarcest thing
+            # the fleet had. An entry and an exit belong to the same owner; a release
+            # only a guard remembers is not an exit.
+            _release_autoclaim(row["id"])
+            pk.event("dispatch-verdict", row["id"], evidence)
+            out["announce"] = _announce_verdict(out, reviewed, evidence)
+            return out, None
+        return txn.then(finish)
+    return _ledger_write(attempt, path)
 
 
 #: THE ACTUATOR'S RESOURCE SPELLING, WRITTEN ONCE. Six sites spelled this by
@@ -9330,7 +9581,7 @@ def _announce_verdict(row, reviewed, evidence):
             # (the owner asked why they landed in #main while the fleet works
             # in #helm); HELM_VERDICT_ROOM stays the deliberate-centralization
             # override
-            if not _append_unlocked(path, {
+            if not eventledger.append_unlocked(path, {
                     "v": 1, "event": "intent", "id": row["id"],
                     "ts": pk.now_ts(), "room": room,
                     "binding": _binding_key(row, reviewed, evidence)}):
@@ -9802,16 +10053,15 @@ CARRIED_WITNESSES = (CARRIAGE_REPLAY, REACHED_TRUNK)
 # the same refusal `landreq._is_parentless` makes on the same measurement.
 #
 # AND THE COST THE CUT LEAVES BEHIND IS MEASURED ON THE FINAL TREE, NOT ASSUMED.
-# Timed through the shipped rung — `seats_room_advice._ledger_snapshot` ->
-# `dispatches.snapshot()`, the name `seats_stop_guard` hands to `timing.measure`
-# ("dispatch-ledger") — on THE TREE THIS COMMENT SHIPS IN, identified by the
+# Timed through `dispatches.snapshot()`, the read the Stop guard's
+# dispatch-ledger rung then made (that fold has since moved off every hook path
+# into the stop-facts resident) — on THE TREE THIS COMMENT SHIPS IN, identified by the
 # property that decides the cost: no witness store is present anywhere under
 # `helm/` and both witness families are re-derived. The exact tree of the run is
 # recorded on the lane's review row. Against the live
 # 14,567-event 8,349,380-byte ledger and the real helm home, read-only, five cold
 # processes of one call each: at load average 29.7-30.7 the rung is 3.351s
-# median, 52% of the 6.5s
-# `seats_stop_budget.ADMISSION_COST_S["dispatch-ledger"]`, min 1.578s and max
+# median, 52% of the 6.5s admission cost that rung then carried, min 1.578s and max
 # 4.452s — so EVERY sample fit the budget on a box near load 30. Two carriage
 # witnesses are derived per read, counted at this function's own call.
 #
@@ -11232,8 +11482,13 @@ def mark_cancel(rid, reason):
     evidence and polarity as independent axes.
     """
     path = ledger_path()
-    with eventledger.locked(path) as held:
-        if not held:
+    given_reason = reason
+
+    def attempt(txn):
+        # EACH TRY STARTS FROM THE CALLER'S VALUES: nothing one try
+        # derives may leak into the next.
+        reason = given_reason
+        if not txn.held:
             return None, "ledger unwritable (%s) — cancel NOT recorded" % path
         current, unavailable = snapshot()
         if unavailable:
@@ -11264,6 +11519,9 @@ def mark_cancel(rid, reason):
         # `pk.event` the ordinary cancel has always used, so a field added to
         # a cancel cannot reach one admission and miss the other.
         advisory_close = row["status"] == "verdict" and advisory
+        if row.get("verdict_retracted"):
+            return None, retracted_refusal(
+                row, "there is no standing verdict left to cancel")
         if row["status"] == "verdict" and not advisory_close:
             # THE REFUSAL NAMES THE DOOR IT IS NOT (task/2619). This sentence
             # is correct for the cancel invariant and, stopping there, it was
@@ -11312,15 +11570,19 @@ def mark_cancel(rid, reason):
                  "id": row["id"], "ts": pk.now_ts(), "reason": reason}
         if advisory_close:
             event["advisory"] = True
-        if not _append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) — cancel NOT recorded" % path
-    out = dict(row)
-    out.update(status="cancelled", cancel_reason=reason, seq=event["seq"])
-    if advisory_close:
-        out["cancel_advisory"] = True
-    pk.event("dispatch-advisory-close" if advisory_close else "dispatch-cancel",
-             row["id"], reason)
-    return out, None
+
+        def finish():
+            out = dict(row)
+            out.update(status="cancelled", cancel_reason=reason, seq=event["seq"])
+            if advisory_close:
+                out["cancel_advisory"] = True
+            pk.event("dispatch-advisory-close" if advisory_close else "dispatch-cancel",
+                     row["id"], reason)
+            return out, None
+        return txn.then(finish)
+    return _ledger_write(attempt, path)
 
 def mark_custody(rid, auth, outcome=None):
     """(row, err) — move a row's DELIVERY LEG to another seat.
@@ -11366,8 +11628,9 @@ def mark_custody(rid, auth, outcome=None):
     if not reason:
         return None, ("custody needs a reason — a delivery leg that changed "
                       "hands with no stated cause is unauditable")
-    with eventledger.locked(path) as locked:
-        if not locked:
+
+    def attempt(txn):
+        if not txn.held:
             return None, "ledger unwritable (%s) -- custody NOT recorded" % path
         current, unavailable = snapshot()
         if unavailable:
@@ -11378,7 +11641,8 @@ def mark_custody(rid, auth, outcome=None):
         if row["status"] in CLOSED_STATES:
             return None, ("dispatch %s is %s -- a closed row has no delivery "
                           "leg to transfer" % (row["id"], row["status"]))
-        # COMPARE AND SWAP, UNDER THE LEDGER LOCK. The caller
+        # COMPARE AND SWAP AT THE WRITE: the append below proves this read is
+        # the ledger it holds (`_ledger_write`). The caller
         # measured this row's holder in `holdings()`, and another transfer can
         # land in the window between that read and this write — at which point
         # a stale reassignment would silently overwrite a fresher one and the
@@ -11407,20 +11671,28 @@ def mark_custody(rid, auth, outcome=None):
                 outcome["already"] = True
             return row, None             # already there; idempotent
         # Admission can precede a long lock wait or census. Recheck at the
-        # append boundary; mint-time freshness cannot authorize a later write.
+        # append boundary, UNDER the lock; mint-time freshness cannot
+        # authorize a later write.
+        if not txn.lock():
+            return None, ("ledger unwritable (%s) -- custody NOT recorded"
+                          % path)
         err = takeover.reassign_custody_error(auth)
         if err:
             return None, err
         event = {"v": 3, "event": "custody", "seq": row["seq"] + 1,
                  "id": row["id"], "ts": pk.now_ts(), "custodian": who,
                  "reason": reason}
-        if not _append_unlocked(path, event):
+        if not txn.append(event):
             return None, ("ledger unwritable (%s) -- custody NOT recorded"
                           % path)
-    out = dict(row)
-    out.update(custodian=who, custody_ts=event["ts"], seq=event["seq"])
-    pk.event("dispatch-custody", row["id"], "%s: %s" % (who, reason))
-    return out, None
+
+        def finish():
+            out = dict(row)
+            out.update(custodian=who, custody_ts=event["ts"], seq=event["seq"])
+            pk.event("dispatch-custody", row["id"], "%s: %s" % (who, reason))
+            return out, None
+        return txn.then(finish)
+    return _ledger_write(attempt, path)
 
 
 # A FULL object id in either hash — 40 for sha1, 64 for sha256 — and nothing
@@ -11488,8 +11760,13 @@ def mark_hold(rid, reason, owner_gated=False, source_clean_tip=None):
     ordinary case, and the listing shows both so a divergence is visible rather
     than silently accepted or wrongly refused."""
     path = ledger_path()
-    with eventledger.locked(path) as locked:
-        if not locked:
+    given_reason = reason
+
+    def attempt(txn):
+        # EACH TRY STARTS FROM THE CALLER'S VALUES: nothing one try
+        # derives may leak into the next.
+        reason = given_reason
+        if not txn.held:
             return None, "ledger unwritable (%s) -- hold NOT recorded" % path
         current, unavailable = snapshot()
         if unavailable:
@@ -11557,24 +11834,29 @@ def mark_hold(rid, reason, owner_gated=False, source_clean_tip=None):
         # comparing equal across the door that added this field.
         if clean_tip:
             event["source_clean_tip"] = clean_tip
-        if not _append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) -- hold NOT recorded" % path
-    out = dict(row)
-    out.update(status="held", hold_reason=reason, hold_ts=event["ts"],
-               owner_gated=bool(owner_gated), seq=event["seq"])
-    if clean_tip:
-        out["source_clean_tip"] = clean_tip
-    pk.event("dispatch-hold", row["id"],
-             "%s%s" % (reason, " [source-clean %s]" % clean_tip[:12]
-                       if clean_tip else ""))
-    return out, None
+
+        def finish():
+            out = dict(row)
+            out.update(status="held", hold_reason=reason, hold_ts=event["ts"],
+                       owner_gated=bool(owner_gated), seq=event["seq"])
+            if clean_tip:
+                out["source_clean_tip"] = clean_tip
+            pk.event("dispatch-hold", row["id"],
+                     "%s%s" % (reason, " [source-clean %s]" % clean_tip[:12]
+                               if clean_tip else ""))
+            return out, None
+        return txn.then(finish)
+    return _ledger_write(attempt, path)
 
 
 def mark_release(rid):
     """Return a HELD dispatch to OPEN."""
     path = ledger_path()
-    with eventledger.locked(path) as locked:
-        if not locked:
+
+    def attempt(txn):
+        if not txn.held:
             return None, "ledger unwritable (%s) -- release NOT recorded" % path
         current, unavailable = snapshot()
         if unavailable:
@@ -11590,18 +11872,370 @@ def mark_release(rid):
         event = {"v": 3, "event": "release", "seq": row["seq"] + 1,
                  "id": row["id"], "ts": pk.now_ts(),
                  "reason": row.get("hold_reason")}
-        if not _append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) -- release NOT recorded" % path
-    out = dict(row)
-    out.update(status="open", release_reason=event["reason"],
-               release_ts=event["ts"], seq=event["seq"])
-    # THE SAME KEYS THE REPLAY DROPS. A return that kept the claim while the
-    # fold dropped it made the in-process answer and the stored one disagree
-    # about an OPEN row, which is the kind of split that survives until some
-    # future caller reads the wrong one.
-    for key in ("owner_gated", "hold_reason", "hold_ts", "source_clean_tip"):
-        out.pop(key, None)
-    pk.event("dispatch-release", row["id"], event["reason"])
+
+        def finish():
+            out = dict(row)
+            out.update(status="open", release_reason=event["reason"],
+                       release_ts=event["ts"], seq=event["seq"])
+            # THE SAME KEYS THE REPLAY DROPS. A return that kept the claim while the
+            # fold dropped it made the in-process answer and the stored one disagree
+            # about an OPEN row, which is the kind of split that survives until some
+            # future caller reads the wrong one.
+            for key in ("owner_gated", "hold_reason", "hold_ts", "source_clean_tip"):
+                out.pop(key, None)
+            pk.event("dispatch-release", row["id"], event["reason"])
+            return out, None
+        return txn.then(finish)
+    return _ledger_write(attempt, path)
+
+
+# ---------------------------------------------------------------------------
+# THE VERDICT RETRACTION (task/3060)
+# ---------------------------------------------------------------------------
+# A VERDICT IS IMMUTABLE, AND UNTIL THIS EXISTED A WRONG ONE HAD NO CORRECTIVE.
+# The door refuses a second verdict on a verdicted row ("terminal is
+# immutable"), `cancel` refuses a row whose verdict declared a polarity, and
+# the only moves left were to contest it with a successor review (whose FIX
+# became chain debt while the parent APPROVE still read READY for its tip), to
+# retire it, or to not land it. The measured case: a delegated reader running
+# inside a seat wrote an APPROVE with no findings that its brief never
+# authorized, and that immutable row kept authorizing a land nobody meant.
+#
+# A RETRACTION IS A LATER FACT, NEVER A REWRITE. It is one `verdict-retract`
+# event appended after the verdict. The verdict event, its evidence, its gate
+# binding and its attestation stay exactly as recorded; the projection reads
+# polarity RETRACTED and keeps the original in `retracted_polarity`. The
+# retraction carries the corrected READING as a labelled claim for the
+# integrator — it is not a polarity and re-enters no verdict semantics.
+#
+# WHO MAY RETRACT, and the list is short on purpose: the verdict's AUTHOR (the
+# row's recipient seat, from any session, because the session that erred is
+# usually gone), the INTEGRATOR role resolved from the roster, or the OWNER
+# through his own capability. The row's SENDER is refused: a sender who
+# disagrees with a review contests it with `dispatch send --supersedes`, the
+# path whose reviewer-shopping residual is already disclosed.
+RETRACT_EVENT = "verdict-retract"
+#: What the retracting hand now says the review found. A CLAIM for the
+#: integrator to read, never a polarity: source-clean (the delta reads clean
+#: and waits on the land gate), fix, supersede, or unknown (the verdict was
+#: wrong and nobody has re-read it yet).
+RETRACT_READS = ("source-clean", "fix", "supersede", "unknown")
+#: How the retracting hand knows. `unverified` is absent on purpose: a
+#: retraction removes authority, and one that cannot say how it knows is a
+#: guess about somebody else's review.
+RETRACT_BASES = ("measured", "inferred")
+#: The door that admitted the retraction, recorded on the event.
+RETRACT_ROLES = ("author", "integrator", "owner")
+#: The projected polarity of a retracted verdict. It is outside POLARITIES,
+#: so `clean_polarity` refuses it at every writer and `_replay_polarity`
+#: reads it as UNDECLARED: authority fails closed.
+RETRACTED = "retracted"
+_RETRACT_PROOF_V = 1
+_RETRACT_REASON_CAP = 256
+
+
+def _retract_admission_error(state):
+    """Why this row's verdict cannot be retracted, or None when it can.
+
+    ONE PREDICATE FOR THE WRITER AND THE REPLAY. `retract` asks it before it
+    mints anything, `_record_retract` asks it under the ledger lock, and
+    `_apply` asks it through `_retract_record` for every event it folds."""
+    if not isinstance(state, dict):
+        return "the row is unreadable"
+    if state.get("verdict_retracted"):
+        return "its verdict is already retracted"
+    if state.get("status") != "verdict":
+        return ("only a verdicted row has a verdict to retract (this one is "
+                "%s)" % (state.get("status") or "in an unknown state"))
+    if _replay_polarity(state.get("polarity")) is None:
+        return ("its verdict declared no polarity, so it authorized nothing "
+                "to retract: `helm dispatch cancel %s <reason>` closes it as "
+                "advisory" % str(state.get("id") or "")[:12])
+    terminal = _close_retired_by(state)
+    if terminal:
+        return "it is already retired by %s" % terminal
+    return None
+
+
+def _retract_record(event, state):
+    """(state fields, None) for a well-formed retraction of `state`, else
+    (None, why). The replay's validator and the writer's projection."""
+    err = _retract_admission_error(state)
+    if err:
+        return None, err
+    reason, err = _clean(event.get("retract_reason"), "retract reason",
+                         _RETRACT_REASON_CAP)
+    if err:
+        return None, err
+    if event.get("retract_reads") not in RETRACT_READS:
+        return None, "retract reads must be one of %s" % "|".join(RETRACT_READS)
+    if event.get("retract_basis") not in RETRACT_BASES:
+        return None, "retract basis must be one of %s" % "|".join(RETRACT_BASES)
+    if event.get("retract_role") not in RETRACT_ROLES:
+        return None, "retract role must be one of %s" % "|".join(RETRACT_ROLES)
+    seat = event.get("retract_seat")
+    if not isinstance(seat, str) or not _TOKEN.fullmatch(seat):
+        return None, "retract seat must be an exact seat token"
+    # THE EVENT NAMES WHAT IT RETRACTS, the way a retip names the tip it
+    # moves: a retraction spliced onto a different verdict is inert.
+    if event.get("retracted_polarity") != state.get("polarity") \
+            or str(event.get("retracted_tip") or "") \
+            != str(state.get("reviewed_tip") or ""):
+        return None, "the retraction names a verdict this row does not carry"
+    successor = event.get("retract_successor")
+    if successor is not None and (not isinstance(successor, str)
+                                  or not _ID.fullmatch(successor)
+                                  or successor == state.get("id")):
+        return None, "retract successor must be another row's id"
+    same = event.get("retract_same_session")
+    if same is not None and not isinstance(same, bool):
+        return None, "retract same-session must be true, false or absent"
+    if type(event.get("retract_proof_version")) is not int \
+            or event.get("retract_proof_version") != _RETRACT_PROOF_V:
+        return None, "unknown retract proof version"
+    if not _valid_ts(event.get("ts")):
+        return None, "retract timestamp is unreadable"
+    fields = {"retracted_polarity": state.get("polarity"),
+              "retract_ts": event.get("ts"), "retract_reason": reason,
+              "retract_reads": event["retract_reads"],
+              "retract_basis": event["retract_basis"],
+              "retract_role": event["retract_role"], "retract_seat": seat,
+              "retract_successor": successor}
+    # ABSENT STAYS ABSENT: a verdict that recorded no author session cannot
+    # be compared, and a default would claim a comparison nobody made.
+    if same is not None:
+        fields["retract_same_session"] = same
+    return fields, None
+
+
+def retracted_refusal(row, act):
+    """The sentence a door says over a retracted row: what was retracted,
+    when, by whom, and where the review now lives."""
+    rid = str(row.get("id") or "")
+    successor = str(row.get("retract_successor") or "")
+    where = ("the successor %s carries the review" % successor[:12]
+             if successor else
+             "re-request it: `helm dispatch send %s %s --ref %s --kind %s "
+             "--supersedes %s` (body on stdin)"
+             % (row.get("recipient") or "<reviewer>",
+                row.get("lane") or "<lane>",
+                row.get("tip") or "<tip>", row.get("kind") or "review",
+                rid[:12]))
+    return ("dispatch %s: its %s verdict was RETRACTED at %s by @%s (%s), so "
+            "%s; %s" % (rid[:12],
+                        str(row.get("retracted_polarity") or "?").upper(),
+                        row.get("retract_ts") or "an unrecorded time",
+                        row.get("retract_seat") or "?",
+                        row.get("retract_role") or "?", act, where))
+
+
+def _retract_role(row, seat, owner=None):
+    """(role, None) for the door that admits `seat` to retract `row`'s
+    verdict, else (None, why).
+
+    THE AUTHOR IS THE ROW'S RECIPIENT, because a land-authorizing verdict
+    binds its author to exactly that seat (`mark_verdict`). The identity is
+    the seat, never the session: the session that wrote a wrong verdict is
+    usually gone, and requiring it would leave the error with no author able
+    to take it back."""
+    if owner is not None:
+        return "owner", None
+    from . import seats
+    if seats.recipient_matches(row.get("recipient") or "", seat):
+        return "author", None
+    from . import seats_integrator
+    integrator, why = seats_integrator.integrator_seat()
+    if integrator and seats.recipient_matches(integrator, seat):
+        return "integrator", None
+    return None, (
+        "refusing to retract dispatch %s's verdict as @%s: a verdict is "
+        "retracted by its AUTHOR (@%s, from any session), the INTEGRATOR (%s) "
+        "or the OWNER. A seat that disagrees with a review contests it with "
+        "a successor: `helm dispatch send %s %s --ref %s --kind %s "
+        "--supersedes %s`"
+        % (str(row.get("id") or "")[:12], seat, row.get("recipient") or "?",
+           "@" + integrator if integrator else "unresolved: %s" % why,
+           row.get("recipient") or "<reviewer>", row.get("lane") or "<lane>",
+           row.get("tip") or "<tip>", row.get("kind") or "review",
+           str(row.get("id") or "")[:12]))
+
+
+def _retract_matches(row, seat, reason, reads, basis, successor):
+    """Is `row` already retracted exactly as asked? The idempotent retry
+    reconciles the standing retraction and never writes a second one."""
+    return bool(row.get("verdict_retracted")) \
+        and str(row.get("retract_seat") or "").casefold() == seat.casefold() \
+        and row.get("retract_reason") == reason \
+        and row.get("retract_reads") == reads \
+        and row.get("retract_basis") == basis \
+        and (successor is None or row.get("retract_successor") == successor)
+
+
+def _record_retract(rid, seat, role, reason, reads, basis, successor=None,
+                    session=None):
+    """(row, err) — append ONE `verdict-retract` event, under the lock.
+
+    Every admission is decided again here from the locked read: the caller's
+    pre-read may be seconds old, and a verdict retracted or retired in that
+    window must not be retracted twice."""
+    path = ledger_path()
+
+    def attempt(txn):
+        if not txn.held:
+            return None, "ledger unwritable (%s) -- retraction NOT recorded" % path
+        current, unavailable = snapshot()
+        if unavailable:
+            return None, "dispatch ledger unavailable: %s" % unavailable
+        row, err = _resolve_row(current, rid)
+        if err:
+            return None, err
+        if _retract_matches(row, seat, reason, reads, basis, successor):
+            return row, None
+        err = _retract_admission_error(row)
+        if err:
+            if row.get("verdict_retracted"):
+                return None, retracted_refusal(row, "it is not retracted again")
+            return None, "dispatch %s cannot be retracted: %s" % (row["id"], err)
+        event = {"v": 3, "event": RETRACT_EVENT, "seq": row["seq"] + 1,
+                 "id": row["id"], "ts": pk.now_ts(),
+                 "retract_reason": reason, "retract_reads": reads,
+                 "retract_basis": basis, "retract_role": role,
+                 "retract_seat": seat,
+                 "retracted_polarity": row.get("polarity"),
+                 "retracted_tip": row.get("reviewed_tip"),
+                 "retract_proof_version": _RETRACT_PROOF_V}
+        # OMITTED WHEN THERE IS NONE, never written as null.
+        if successor:
+            event["retract_successor"] = successor
+        author_session = row.get("verdict_author_session")
+        if session and isinstance(author_session, str) and author_session:
+            event["retract_same_session"] = session == author_session
+        # THE REDUCER IS THE WRITER'S PROJECTION, and its refusal is an error:
+        # an event it would not fold must never reach the ledger.
+        out = _apply(row, event)
+        if out is row:
+            fields, why = _retract_record(event, row)
+            return None, ("the retraction was refused by the reducer before "
+                          "append (%s) — nothing was recorded" % why)
+        if not txn.append(event):
+            return None, "ledger unwritable (%s) -- retraction NOT recorded" % path
+
+        def finish():
+            pk.event("dispatch-retract", row["id"],
+                     "%s retracted by %s (%s): reads %s" % (
+                         str(row.get("polarity") or "").upper(), seat, role,
+                         reads))
+            return out, None
+        return txn.then(finish)
+    return _ledger_write(attempt, path)
+
+
+def retract(rid, reason, reads, basis, reissue=False, successor=None,
+            owner=None, notify=True):
+    """(row, err) — RETRACT a standing verdict: `helm dispatch retract`.
+
+    The row keeps its verdict and gains a `verdict-retract` event after it;
+    the projection reads RETRACTED everywhere authority is read. `reads` is
+    the corrected reading (RETRACT_READS), `basis` how the retracting hand
+    knows (RETRACT_BASES).
+
+    `reissue` MINTS THE SUCCESSOR REVIEW in the same motion: same recipient,
+    lane, tip and kind, `--supersedes` this row, the lane author's name
+    inherited as sender (the move mint `rebind` uses, so the successor does
+    not read as a self-review by whoever retracted). The successor is written
+    FIRST, and a retraction that then fails disowns it, so a failed call never
+    leaves a successor claiming an obligation that did not move. `successor`
+    instead links an existing row that already supersedes this one.
+
+    `owner` is the owner's capability (`ownerasks.OwnerDoor`) and nothing
+    else: a caller-stated name is never the owner. Without it the acting seat
+    is resolved through `_acting_author` and must hold the author's or the
+    integrator's door (`_retract_role`)."""
+    reason, err = _clean(reason, "retract reason", _RETRACT_REASON_CAP)
+    if err:
+        return None, err
+    if reads not in RETRACT_READS:
+        return None, ("--reads must be one of %s (what the review now reads)"
+                      % "|".join(RETRACT_READS))
+    if basis not in RETRACT_BASES:
+        return None, ("a retraction declares its basis: --%s"
+                      % "|--".join(RETRACT_BASES))
+    if reissue and successor:
+        return None, ("--reissue mints the successor and --successor names an "
+                      "existing one: pass one")
+    # THE ROW FIRST: a row this helm cannot read is refused by the vocabulary
+    # rung before anything else is asked about it (`unknown_kinds_refusal`).
+    current, unavailable = snapshot()
+    if unavailable:
+        return None, "dispatch ledger unavailable: %s" % unavailable
+    row, err = _resolve_row(current, rid)
+    if err:
+        return None, err
+    if owner is not None:
+        from . import ownerasks
+        if not isinstance(owner, ownerasks.OwnerDoor):
+            return None, ("the owner's door is a capability, never a name: "
+                          "retract as your own seat")
+        seat = ownerasks.OWNER
+    else:
+        seat, err = _acting_author("retract this verdict")
+        if err:
+            return None, err
+    successor_id = None
+    if successor:
+        # NO allow_retired: a successor retired by the terminality rung
+        # carries nothing, so it cannot be named as the row that does.
+        kid, err = _resolve_row(current, successor)
+        if err:
+            return None, "--successor: " + err
+        if kid.get("supersedes") != row["id"]:
+            return None, ("--successor %s does not supersede %s, so it does "
+                          "not carry this review; name the row minted with "
+                          "--supersedes %s, or pass --reissue"
+                          % (kid["id"][:12], row["id"][:12], row["id"][:12]))
+        successor_id = kid["id"]
+    if _retract_matches(row, seat, reason, reads, basis, successor_id):
+        return dict(row), None
+    err = _retract_admission_error(row)
+    if err:
+        if row.get("verdict_retracted"):
+            return None, retracted_refusal(row, "it is not retracted again")
+        return None, "dispatch %s cannot be retracted: %s" % (row["id"], err)
+    role, err = _retract_role(row, seat, owner)
+    if err:
+        return None, err
+    new = None
+    if reissue:
+        # THE ROW'S OWN REPOSITORY, exactly as rebind resolves it: the
+        # successor re-requests the same obligation, never a new one.
+        repo_path = str(row.get("repo_id") or "")[:-5] or None
+        new, add_err = add(
+            row.get("recipient"), row.get("lane"),
+            ref=row.get("tip") or row.get("ref"), note=row.get("note"),
+            deadline_s=int(row["deadline_s"]) if row.get("deadline_s")
+            else None,
+            repo=repo_path, kind=row.get("kind"), notify=notify,
+            supersedes=row["id"], _reason=True,
+            _ref_branch=row.get("ref_branch"), _preserve_origin=_MOVE_MINT)
+        if new is None:
+            return None, ("retraction NOT recorded: the successor review was "
+                          "refused: %s" % (add_err or "dispatch NOT recorded"))
+        successor_id = new["id"]
+    out, err = _record_retract(row["id"], seat, role, reason, reads, basis,
+                               successor=successor_id,
+                               session=home.session_id())
+    if err:
+        if new is not None:
+            fate = _rebind_disown_child(
+                new["id"], "retract aborted: the verdict on %s was not "
+                "retracted" % row["id"][:12])
+            err = "%s; %s" % (err, fate)
+        return None, err
+    out = dict(out)
+    if new is not None:
+        out["reissued"] = new
     return out, None
 
 
@@ -11834,9 +12468,12 @@ def superseded_parent_sweep(apply=False):
     if not apply:
         return hits, None
     path = ledger_path()
-    done, refused = [], []
-    with eventledger.locked(path) as held:
-        if not held:
+
+    def attempt(txn):
+        # PER TRY: a refusal counted on a read the write then discarded must
+        # not be counted twice.
+        done, refused = [], []
+        if not txn.held:
             return done, "ledger unwritable (%s) — sweep NOT recorded" % path
         fresh, unavailable = snapshot()
         if unavailable:
@@ -11844,7 +12481,7 @@ def superseded_parent_sweep(apply=False):
         for pid, kid in hits:
             parent = fresh.get(pid)
             if not isinstance(parent, dict) or parent.get("superseded_by"):
-                continue            # re-checked under the lock, never assumed
+                continue            # re-checked on the read the write binds
             # A PARENT THIS HELM CANNOT READ IS NOT ANNOTATED, AND IS NAMED.
             # One such row refuses only itself: the sweep's other parents are
             # rows this helm reads in full.
@@ -11852,13 +12489,17 @@ def superseded_parent_sweep(apply=False):
             if refusal:
                 refused.append(refusal)
                 continue
-            if not _append_unlocked(path, {
+            if not txn.append({
                     "v": 3, "event": "superseded",
                     "seq": (parent.get("seq") or 0) + 1,
                     "id": pid, "ts": pk.now_ts(), "successor": kid}):
                 return done, "ledger unwritable (%s)" % path
             done.append((pid, kid))
-    return done, ("; ".join(refused) if refused else None)
+
+        def finish():
+            return done, ("; ".join(refused) if refused else None)
+        return txn.then(finish)
+    return _ledger_write(attempt, path)
 
 
 def rebind_room_fence(row, old_recipient):
@@ -13030,16 +13671,18 @@ def retip(rid, ref, reason=None, repo=None, notify=True):
     if why:
         return None, why
     path = ledger_path()
-    with eventledger.locked(path) as held:
-        if not held:
+
+    def attempt(txn):
+        if not txn.held:
             return None, "ledger unwritable (%s) — retip NOT recorded" % path
         current, unavailable = snapshot()
         if unavailable:
             return None, "dispatch ledger unavailable: %s" % unavailable
         live = current.get(row["id"])
-        # THE LOCKED RE-READ IS WHERE THIS WRITER'S SEQ COMES FROM, so the
-        # vocabulary is checked on IT; the resolve above read an earlier
-        # snapshot, and an event this helm cannot read may have landed since.
+        # THE RE-READ THE WRITE BINDS IS WHERE THIS WRITER'S SEQ COMES FROM,
+        # so the vocabulary is checked on IT; the resolve above read an
+        # earlier snapshot, and an event this helm cannot read may have
+        # landed since.
         refusal = unknown_kinds_refusal(live)
         if refusal:
             return None, refusal
@@ -13103,33 +13746,37 @@ def retip(rid, ref, reason=None, repo=None, notify=True):
         # was an unkeyed content hash a forger recomputes over their own
         # fields, and the fold now refuses to read one — the writer stamps
         # nothing the acceptance path is pinned to ignore.
-        if not _append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) — retip NOT recorded" % path
-    out = dict(live)
-    hops = list(live.get("retips") or ())
-    hops.append({"old_tip": live.get("tip"), "old_ref": live.get("ref"),
-                 "tip": new_tip, "ts": event["ts"], "reason": reason,
-                 "identity": identity,
-                 "base_replaced": bool(event.get("base_replaced"))})
-    out.update(_moving_binding(event))
-    out.update(tip=new_tip, ref=ref, retips=hops, seq=event["seq"],
-               identity=identity)
-    # THE SAME STALING THE FOLD APPLIES, so the returned row is the row a
-    # reader replays. The writer's in-memory answer diverging from replay is
-    # the two-spellings-of-one-fact defect this module keeps catching; a caller
-    # acting on `out` would see a delivery state the ledger disagrees with.
-    if live.get("delivery") == "observed":
-        out["delivery"] = "needs-confirmation"
-    pk.event("dispatch-retip", row["id"],
-             "%s -> %s [%s]" % (event["old_tip"][:12], new_tip[:12], identity))
-    # A NEW TIP IS NEW CODE TO READ: the note on the old tip no longer
-    # describes what the reviewer will adjudicate.
-    _queue_findings_pass(out)
-    if notify:
-        _notify_public(out, "RETIPPED %s -> %s [identity %s]: %s%s"
-                       % (event["old_tip"][:12], new_tip[:12], identity,
-                          reason, (" — " + how) if how else ""))
-    return out, None
+
+        def finish():
+            out = dict(live)
+            hops = list(live.get("retips") or ())
+            hops.append({"old_tip": live.get("tip"), "old_ref": live.get("ref"),
+                         "tip": new_tip, "ts": event["ts"], "reason": reason,
+                         "identity": identity,
+                         "base_replaced": bool(event.get("base_replaced"))})
+            out.update(_moving_binding(event))
+            out.update(tip=new_tip, ref=ref, retips=hops, seq=event["seq"],
+                       identity=identity)
+            # THE SAME STALING THE FOLD APPLIES, so the returned row is the row a
+            # reader replays. The writer's in-memory answer diverging from replay is
+            # the two-spellings-of-one-fact defect this module keeps catching; a caller
+            # acting on `out` would see a delivery state the ledger disagrees with.
+            if live.get("delivery") == "observed":
+                out["delivery"] = "needs-confirmation"
+            pk.event("dispatch-retip", row["id"],
+                     "%s -> %s [%s]" % (event["old_tip"][:12], new_tip[:12], identity))
+            # A NEW TIP IS NEW CODE TO READ: the note on the old tip no longer
+            # describes what the reviewer will adjudicate.
+            _queue_findings_pass(out)
+            if notify:
+                _notify_public(out, "RETIPPED %s -> %s [identity %s]: %s%s"
+                               % (event["old_tip"][:12], new_tip[:12], identity,
+                                  reason, (" — " + how) if how else ""))
+            return out, None
+        return txn.then(finish)
+    return _ledger_write(attempt, path)
 
 
 def _age_s(row, now=None):
@@ -13657,6 +14304,16 @@ USAGE = ("usage: helm dispatch send <recipient> <lane> <message...> --ref TIP "
          "binds a verified whole-suite token only the land gate produces. The "
          "two are refused together because one row cannot owe two holders) | "
          "release <id-or-unique-prefix> (return a HELD row to OPEN) | "
+         "retract <id-or-unique-prefix> --reason R "
+         "--reads source-clean|fix|supersede|unknown --measured|--inferred "
+         "[--reissue|--successor ID] [--json] (withdraw a WRONG verdict's "
+         "authority without rewriting it: one verdict-retract event appended "
+         "after the verdict, and the row reads RETRACTED wherever authority is "
+         "read. Only the verdict's author seat (any session), the integrator "
+         "or the owner may retract; --reads is the corrected reading for the "
+         "integrator, not a new polarity; --reissue mints the successor "
+         "review for the same recipient and tip, --successor links one that "
+         "already supersedes this row) | "
          "rebind <id-or-unique-prefix> --to <seat> [--force] "
          "[--reason R] [--repo PATH] [--json] "
          "(move an OPEN row to a new recipient, one operation; REFUSED unless "
@@ -13774,6 +14431,17 @@ def _base_label(row):
     verdicts — helm's own usage text says 36% of this ledger was filed with no
     polarity, a number nothing in the default view had ever shown, because a
     decision with no direction rendered identically to a decided one."""
+    if row.get("verdict_retracted"):
+        # THE ORIGINAL DECISION STAYS IN THE LABEL and the retraction follows
+        # it, the way every other terminal here reads: the ledger holds both
+        # facts, and a label that dropped the first would hide what was
+        # withdrawn (task/3060).
+        successor = str(row.get("retract_successor") or "")
+        return "VERDICT %s / RETRACTED (reads %s) by %s%s" % (
+            row.get("retracted_polarity") or "UNDECLARED",
+            row.get("retract_reads") or "unknown",
+            row.get("retract_seat") or "?",
+            " -> " + successor[:12] if successor else " (no successor)")
     if row.get("abandoned"):
         return "VERDICT %s / ABANDONED (LAND UNKNOWN)" % (
             row.get("polarity") or "UNDECLARED")

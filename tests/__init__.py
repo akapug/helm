@@ -227,6 +227,12 @@ SOCKET_ROOT_PREFIX = "helm-suite-sock-"
 SOCKET_OWNER_LINK = "owner"
 _SOCKROOT = None
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_SOCKROOT": "the suite's socket root, made once per process",
+}
+
 
 def _reap_orphan_socket_roots():
     """Remove this uid's socket roots whose owning suite root is gone."""

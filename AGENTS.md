@@ -13,19 +13,40 @@ guide: how to change helm's own code safely.
 
 ```console
 $ ./bin/helm --help                          # runs from the checkout — nothing to install
-$ python3 -m unittest discover -s tests      # the full suite, a few minutes
+$ ./bin/helm gate run --focus --plan         # the tests your change can reach; runs nothing
+$ ./bin/helm gate audits -- <test modules>   # the tree-wide audits plus yours, as one command
 ```
 
 - Tests are **`unittest`, not pytest**, and never touch a real `~/.helm`: they
   point `HELM_HOME` / `HELM_ADOPTED_DIR` at temp dirs. New tests do the same.
-  The authoritative `helm gate run` executes literal same-process serial
-  unittest discovery; only that serial receipt can bind landing authority.
-  `helm gate equiv` and `helm/gateshard.py` are diagnostic observations whose
-  fresh-worker results cannot mint or bind landing authority.
+- **Focused rounds while you build; ONE whole suite when it lands.** Each
+  round (a lane's, or a cure's) runs `helm gate run --focus` together with the
+  command `helm gate audits` prints. The focused selection is the test
+  modules the change's imports reach, and for a change outside the import
+  graph (a doc, a script) every tree-wide audit and the tests that name the
+  file. The audits import nothing they judge, so a Python change's selection
+  does not reliably include them. The whole suite
+  (`python3 -m unittest discover -s tests`) is the land gate: serial, on the
+  exact tree that lands. In helm's own tree `helm gate run` refuses a whole
+  suite in a lane room (`--lane-suite --why TEXT` is the counted escape),
+  refuses a second one on a tree that already has a green receipt, and runs a
+  red tree again only with `--again`. The full process, and what each receipt
+  authorizes: [How a change is tested](CONTRIBUTING.md#how-a-change-is-tested).
+- **Only a serial whole-suite receipt authorizes a land.** A whole suite with
+  no mode flag in a lane-level room (a peek, a seat's home, a harness
+  worktree, or a lane room admitted by `--lane-suite`) runs as parallel slices
+  (receipt v10). It binds a lane tip and a review's APPROVE and never a land;
+  every land road runs serial. A focused receipt (v6) binds a cure-round
+  verdict only. `helm gate equiv` and a standalone `helm/gateshard.py` run are
+  diagnostic: their results cannot mint or bind landing authority.
+- **Where tests run.** A host with a local-suite guard (the fleet's hub is
+  agents-only) refuses `python3 -m unittest` in any shape. There, run a
+  focused round on the remote runner:
+  `fab test --repo . -- python3 -m unittest <modules>`. Its Ran/OK line is
+  testimony, never a receipt.
 - **Python 3.9+.** The floor is declared in `scripts/install.sh` and the
-  README. Run the suite with `python3 -m unittest discover -s tests`.
-  Maintainers test on newer interpreters; 3.9 is declared, not CI-tested.
-  Use no syntax newer than 3.9.
+  README. Maintainers test on newer interpreters; 3.9 is declared, not
+  CI-tested. Use no syntax newer than 3.9.
 - Mutation runs use `python3 scripts/mutation_matrix.py SPEC.json` against a
   committed baseline and tracked, clean targets. Each observation gets an
   isolated clone and parent-owned anonymous `unittest` receipt pipe; only
@@ -74,10 +95,11 @@ Full text and rationale live in [CONTRIBUTING.md](CONTRIBUTING.md). In one breat
   [docs/VERBS.md](docs/VERBS.md), and a test. The dispatcher help and VERBS.md
   must never disagree — a verb without a doc entry is a bug this repo learned by
   audit.
-- **Verify before you call it done**: the full suite is green, the touched verb
-  was actually run against real (or realistic temp) stores, and the docs that
-  state the changed behaviour were updated in the *same* change. "Compiles" is
-  not "done."
+- **Verify before you call it done**: the focused round and the tree-wide
+  audits are green on your tip (the whole suite is the land gate's, on the tree
+  that lands), the touched verb was actually run against real (or realistic
+  temp) stores, and the docs that state the changed behaviour were updated in
+  the *same* change. "Compiles" is not "done."
 - **Maintained as-public**: no secrets, no machine-local absolute paths (use
   `~` or an env var), no personal data, and no data that is not source
   (exports, dumps, snapshots, archives, address lists). The repo is kept at
@@ -130,6 +152,12 @@ You additionally have the coordination physics, and they are not optional:
   seat comparison preserves recorded display names. Recorded contributors
   are submission provenance, not proven Git authorship. These readiness
   checks do not replace independent composed-tip review or the land gate.
+- **A clean read with no gate is a HOLD, not an approve** — an APPROVE is
+  refused without a verified `gate:<token>` from a whole suite, and a lane runs
+  none of its own. Record the read with
+  `helm dispatch hold <row> --source-clean <tip> <reason>`; the approve is then
+  recorded against the token the integrator's land gate mints on the tree that
+  lands. A CONCUR is not a way around it: it endorses and authorizes nothing.
 - **Agree on the exact composed tip before shipping** — both counterparts must
   agree that no further patch is needed. Record any remaining disagreement in
   the task meld. Consensus does not replace independent composed-tip review,

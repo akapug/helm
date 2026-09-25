@@ -564,20 +564,9 @@ class DottedPatchCarriesItsOwnModuleTest(RungBase):
         self.assertNotIn("tests/test_double.py", found)
 
 
-class AModuleTokenIsNotABindingTest(RungBase):
-    """ANOTHER FILE THAT NAMES THE MODULE IS NOT A CONSUMER OF EVERY NAME IT HOLDS.
-
-    The rung asked two token questions of another file: does it hold the
-    name, and does it hold the module. It never asked what the name is BOUND
-    to. Replaying 8d6fd2216a8, which retires `cell.roster_path`, refused over
-    helm/chat.py (`from .seats_common import roster_path`, and `from . import
-    cell` 800 lines away) and three `seats.roster_path()` test sites, and
-    the author had to commit with HELM_RETIRED_NAME_SKIP=1. Nothing in the
-    tree spelled `cell.roster_path`.
-
-    Every arm runs the installed rung end to end, and every clearance is
-    paired with a refusal on the same fixture, so a rung that clears
-    everything cannot pass."""
+class _PkgAFixture(RungBase):
+    """pkg/a.py defines f and g, pkg/c.py defines its own f, and each arm
+    commits a pkg/b.py and stages the retirement of `a.f`. No arms here."""
 
     A = "def f():\n    return 1\n\n\ndef g():\n    return 2\n"
     RETIRED = "def g():\n    return 2\n"
@@ -611,6 +600,22 @@ class AModuleTokenIsNotABindingTest(RungBase):
                 reset = self.git("reset", "-q", "--hard", "HEAD~1")
                 self.assertEqual(reset.returncode, 0, reset.stderr)
                 self.assertRefusesB(r)
+
+
+class AModuleTokenIsNotABindingTest(_PkgAFixture):
+    """ANOTHER FILE THAT NAMES THE MODULE IS NOT A CONSUMER OF EVERY NAME IT HOLDS.
+
+    The rung asked two token questions of another file: does it hold the
+    name, and does it hold the module. It never asked what the name is BOUND
+    to. Replaying 8d6fd2216a8, which retires `cell.roster_path`, refused over
+    helm/chat.py (`from .seats_common import roster_path`, and `from . import
+    cell` 800 lines away) and three `seats.roster_path()` test sites, and
+    the author had to commit with HELM_RETIRED_NAME_SKIP=1. Nothing in the
+    tree spelled `cell.roster_path`.
+
+    Every arm runs the installed rung end to end, and every clearance is
+    paired with a refusal on the same fixture, so a rung that clears
+    everything cannot pass."""
 
     def test_a_name_imported_from_ANOTHER_module_is_not_a_consumer(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same fixture, one real a.f added, must refuse through assertRefusesB (rc 1 plus the exact refusal line)
         """The shape of chat.py. Red on trunk: `a` is a token in b.py."""
@@ -738,6 +743,165 @@ class AModuleTokenIsNotABindingTest(RungBase):
                          r.stderr)
 
 
+class AFilesOwnTopLevelDefIsABindingTest(_PkgAFixture):
+    """ANOTHER FILE'S OWN DEF IS A BINDING, BY THE SHAPE-A TEST AND NO WIDER.
+
+    8b9ecd16e00 (task/3060) retires `chat._ledger_write`. helm/dispatches.py
+    imports `chat` inside many functions and has its own, unrelated
+    top-level `def _ledger_write`; every bare `_ledger_write` there calls
+    that def. The rung refused with 18 lines of dispatches.py, and the author
+    had to commit with HELM_RETIRED_NAME_SKIP=1.
+
+    A BARE spelling in another file is cleared when that file still defines
+    the name by `still_defines`: an unconditional top-level def, async def
+    or class, no module-scope `del` after it, no `global` or `nonlocal` of
+    it. An attribute or an import that can reach the module, an assignment,
+    and a def under a condition all still refuse. Every clearance is paired
+    with a refusal on the same fixture."""
+
+    OWN = ("from pkg import a\n\n\n"
+           "def f():\n    return 0\n\n\n"
+           "def run():\n    return a.g(), f()\n")
+
+    def judge(self, src):
+        """`retire_f(src)`, then undo the b commit so the next shape starts
+        from the clean fixture."""
+        r = self.retire_f(src)
+        reset = self.git("reset", "-q", "--hard", "HEAD~1")
+        self.assertEqual(reset.returncode, 0, reset.stderr)
+        return r
+
+    def test_a_file_that_DEFINES_the_name_itself_is_not_a_consumer(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same fixture, one real a.f beside the own def, must refuse through assertRefusesB (rc 1 plus the exact refusal line)
+        """The 8b9ecd16e00 shape. Red on trunk: `a` is a token in b.py and
+        no foreign import binds `f`."""
+        r = self.retire_f(self.OWN)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("a.f (retired", r.stderr)
+        # POSITIVE CONTROL, SAME FIXTURE AND OBSERVABLE: one `a.f` beside the
+        # own def refuses, so the def clears bare spellings only.
+        self.stage("pkg/b.py", self.OWN.replace("a.g(), f()", "a.f(), f()"))
+        self.assertRefusesB(self.rung())
+
+    def test_an_own_def_alone_or_an_async_def_or_class_clears(self):  # noqa: VACUOUS_ASSERTION — each shape is paired with the same source plus a module-scope del, which must refuse through assertRefusesB
+        """The def statement is itself a spelling of the name, so a file
+        whose only use is the def holds the token and is still cleared."""
+        for own in ("def f():\n    return a.g()\n",
+                    "async def f():\n    return a.g()\n",
+                    "class f:\n    pass\n"):
+            with self.subTest(own):
+                src = "from pkg import a\n\n\n" + own
+                r = self.judge(src)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertRefusesB(self.judge(src + "\n\ndel f\n"))
+
+    def test_a_spelling_that_can_reach_the_module_still_refuses(self):  # noqa: VACUOUS_ASSERTION — assertEachRefuses asserts rc 1 and the exact refusal and path per shape; nothing here asserts an absence
+        """CONTROL. Beside the own def: `a.f`, an alias of the module, a
+        receiver no import binds, and `from pkg.a import f` in a function,
+        where the import is the binding that wins."""
+        own = "\n\n\ndef f():\n    return 0\n\n\n"
+        self.assertEachRefuses((
+            self.OWN.replace("a.g(), f()", "a.f(), f()"),
+            "import pkg.a as z" + own + "def run():\n    return z.f(), f()\n",
+            "from pkg import a as z" + own
+            + "def run():\n    return z.f(), f()\n",
+            "from pkg import a" + own
+            + "def run(m):\n    return m.f(), f()\n\n\nrun(a)\n",
+            "from pkg import a  # noqa: F401" + own
+            + "def run():\n    from pkg.a import f\n    return f()\n"))
+
+    def test_a_binder_that_is_not_an_unconditional_def_still_refuses(self):  # noqa: VACUOUS_ASSERTION — assertEachRefuses asserts rc 1 and the exact refusal and path per shape; nothing here asserts an absence
+        """CONTROL. The own-def clearance is `still_defines` and no wider:
+        `from pkg.a import f` with no local def, an assignment, a def under
+        `if` or `try`, a method of the same name, a later module-scope
+        `del`, and a `global` of the name in a function."""
+        run = "\n\ndef run():\n    return f()\n"
+        self.assertEachRefuses((
+            "from pkg import a  # noqa: F401\nfrom pkg.a import f\n\n" + run,
+            "from pkg import a\n\nf = a.g\n\n" + run,
+            "from pkg import a\n\nif a:\n    def f():\n        return 0\n\n"
+            + run,
+            "from pkg import a  # noqa: F401\n\ntry:\n    def f():\n"
+            "        return 0\nexcept NameError:\n    pass\n\n" + run,
+            "from pkg import a  # noqa: F401\n\n\nclass C:\n"
+            "    def f(self):\n        return 0\n\n" + run,
+            self.OWN + "\n\ndel f\n",
+            self.OWN + "\n\ndef drop():\n    global f\n    del f\n"))
+
+    def test_the_8b9ecd16e00_replay_clears_dispatches_own_ledger_write(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same fixture, one real _chat._ledger_write added, must refuse naming chat._ledger_write and the exact line
+        """The incident, its spellings copied from 8b9ecd16e00 ("argv-guard:
+        one delegate rung; ..."). That commit is on an unlanded lane, so the
+        fixture carries the shape rather than depend on the object."""
+        self.stage("helm/__init__.py", "")
+        chat = ("import os\n\n\ndef _default_post_room():\n"
+                "    return os.environ.get('HELM_ROOM', 'main')\n\n\n"
+                "def _ledger_write(group, act, args):\n"
+                '    """Whether verb `act` of the helm verb group `group`, '
+                'given `args`,\n    writes the ledger."""\n'
+                "    return bool(args)\n")
+        self.stage("helm/chat.py", chat)
+        dispatches = (
+            "import os\n\n"
+            "#: How many tries a dispatch-ledger writer makes "
+            "(`_ledger_write`).\nLEDGER_TRIES = 3\n\n\n"
+            "def _ledger_write(body, path=None, tries=None):\n"
+            '    """Run ONE dispatch-ledger write."""\n'
+            "    return body(path)\n\n\n"
+            "def notify(row, context):\n"
+            "    from . import chat\n"
+            "    return chat._default_post_room(), '@%s %s' % (row, context)"
+            "\n\n\n"
+            "def add(attempt, path):\n"
+            "    return _ledger_write(attempt, path)\n\n\n"
+            "def verdict_room(intent):\n"
+            "    if not intent:\n"
+            "        from . import chat as _chat\n"
+            "        return (os.environ.get('HELM_VERDICT_ROOM')\n"
+            "                or _chat._default_post_room())\n"
+            "    return intent\n")
+        self.stage("helm/dispatches.py", dispatches)
+        self.assertEqual(self.git("commit", "-qm", "incident").returncode, 0)
+        self.stage("helm/chat.py", chat.split("\n\ndef _ledger_write")[0] + "\n")
+        r = self.rung()
+        self.assertNotIn("chat._ledger_write", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # POSITIVE CONTROL: a real `chat._ledger_write` through the alias the
+        # file already uses refuses, and names that line.
+        use = "    return _chat._ledger_write('work', 'land', args)"
+        self.stage("helm/dispatches.py",
+                   dispatches + "\n\ndef census(args):\n"
+                   "    from . import chat as _chat\n" + use + "\n")
+        line = (dispatches + "\n\ndef census(args):\n").count("\n") + 2
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("chat._ledger_write (retired from helm/chat.py)",
+                      r.stderr)
+        self.assertIn("helm/dispatches.py:%d: %s" % (line, use), r.stderr)
+
+    def test_a_string_reach_through_an_alias_beats_the_own_def(self):  # noqa: VACUOUS_ASSERTION — each reach is paired with the same source minus the string line, which must clear
+        """A review of this lane: beside an own def, `getattr(c, "f")`,
+        `c.__dict__["f"]` and `vars(c)["f"]` reach the retired module's f
+        through an alias the attribute walk never sees, and cleared anyway."""
+        own = "\n\n\ndef f():\n    return 0\n\n"
+        for reach in ("import pkg.a as z" + own + "X = getattr(z, 'f')\n",
+                      "from pkg import a as z" + own + "X = z.__dict__['f']\n",
+                      "import pkg.a as z" + own + "X = vars(z)['f']\n",
+                      "import pkg.a as z" + own + "ok = hasattr(z, 'f')\n",
+                      # the NON-aliased shapes: the bare name of a
+                      # from-import, and the dotted chain of a plain import
+                      "from pkg import a" + own + "X = getattr(a, 'f')\n",
+                      "from pkg import a" + own + "X = a.__dict__['f']\n",
+                      "import pkg.a" + own + "X = getattr(pkg.a, 'f')\n",
+                      "import pkg.a" + own + "X = pkg.a.__dict__['f']\n"):
+            with self.subTest(reach):
+                self.assertRefusesB(self.judge(reach))
+        # the same files without the reach clear on the same fixture
+        for plain in ("import pkg.a as z" + own,
+                      "from pkg import a" + own,
+                      "import pkg.a" + own):
+            with self.subTest(plain):
+                self.assertEqual(self.judge(plain).returncode, 0)
+
+
 class UnparseableSourceIsNotCleanTest(RungBase):
     """A FILE THIS RUNG CANNOT READ IS NOT A FILE IT CLEARED.
 
@@ -764,6 +928,507 @@ class UnparseableSourceIsNotCleanTest(RungBase):
         self.assertIn("pkg/broken.py", {h[0] for h in hits},
                       "an unreadable candidate must be reported, because "
                       "nothing here can rule it out")
+
+
+class _CellFixture(RungBase):
+    """The helm/cell.py repository the merge arms share: the base defines
+    MODE, profile_name and roster_path, tests/test_cell.py spells
+    `cell.roster_path()`, and branch `trunk` starts there. No arms here."""
+
+    CELL = ("MODE = 'base'\n\n\n"
+            "def profile_name():\n    return 'default'\n\n\n"
+            "def roster_path():\n    return 'roster.toml'\n")
+    USES = ("from helm import cell\n\n\n"
+            "def test_roster():\n    return cell.roster_path()\n")
+    #: What trunk left behind when it retired `roster_path`: a receiver no
+    #: import binds, beside a `cell` token. The rung reads it as a use (its
+    #: docstring names this cost), so trunk's author committed with the
+    #: override -- and every lane that merges trunk inherits the spelling.
+    TRUNK_DEBT = ("from helm import cell\n\n\n"
+                  "def test_roster(r):\n"
+                  "    return cell.profile_name(), r.roster_path()\n")
+
+    def setUp(self):
+        super().setUp()
+        self.stage("helm/cell.py", self.CELL)
+        self.stage("tests/test_cell.py", self.USES)
+        self.commit("cell")
+        self.assertEqual(self.git("branch", "trunk").returncode, 0)
+
+    def commit(self, msg, cwd=None):
+        r = self.run_git(cwd or self.root, "commit", "-qm", msg)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def run_git(self, cwd, *args, env=None):
+        return subprocess.run(("git",) + args, cwd=cwd, capture_output=True,
+                              text=True, timeout=90,
+                              env=dict(os.environ, **(env or {})))
+
+    def write(self, cwd, rel, text):
+        with open(os.path.join(cwd, rel), "w", encoding="utf-8") as f:
+            f.write(text)
+        r = self.run_git(cwd, "add", "--", rel)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def rung_in(self, cwd):
+        return subprocess.run((sys.executable, RUNG, "--staged"), cwd=cwd,
+                              capture_output=True, text=True, timeout=90)
+
+    def trunk_retires_roster_path(self):
+        """On trunk: MODE moves and `roster_path` goes, leaving the debt."""
+        self.assertEqual(self.git("checkout", "-q", "trunk").returncode, 0)
+        self.stage("helm/cell.py",
+                   self.CELL.replace("'base'", "'trunk'")
+                   .split("\n\n\ndef roster_path")[0] + "\n")
+        self.stage("tests/test_cell.py", self.TRUNK_DEBT)
+        self.commit("trunk retires cell.roster_path")
+        self.assertEqual(self.git("checkout", "-q", "main").returncode, 0)
+
+    def lane_moves_mode(self, cwd):
+        self.write(cwd, "helm/cell.py", self.CELL.replace("'base'", "'lane'"))
+        self.commit("lane moves MODE", cwd=cwd)
+
+    def conflicted_merge(self, cwd, resolution):
+        """`git merge trunk` stops on the MODE line; stage `resolution`."""
+        r = self.run_git(cwd, "merge", "trunk")
+        self.assertNotEqual(r.returncode, 0, "the fixture must conflict")
+        self.assertIn("CONFLICT", r.stdout + r.stderr)
+        self.write(cwd, "helm/cell.py", resolution)
+        merge_head = self.run_git(cwd, "rev-parse", "-q", "--verify",
+                                  "MERGE_HEAD")
+        self.assertEqual(merge_head.returncode, 0, "the merge is in progress")
+
+    def without_roster_path(self, mode):
+        return (self.CELL.replace("'base'", "'%s'" % mode)
+                .split("\n\n\ndef roster_path")[0] + "\n")
+
+
+class WhatTheCommitItselfRetiresTest(_CellFixture):
+    """THE TWO SHAPES THAT OPENED task/3025, and what the rung answers now.
+    Every fixture is a real repository with real commits and merges.
+
+    A. A NAME THE FILE STILL DEFINES IS NOT RETIRED. A module defined
+    `_own_commits` twice at column zero and a commit renamed one copy to
+    `_reflog_biography`. The diff carries `-def _own_commits` and no `+` line
+    adds it back, while the file still defines the name with a def, so the
+    rung clears it.
+
+    B. A MERGE IS JUDGED AGAINST ITS FIRST PARENT, as every commit is.
+    Merging trunk into a lane charges the lane with every retirement trunk
+    made since the lane base, and the rung refuses it. Lanes compose in the
+    train room with trunk as the first parent; HELM_RETIRED_NAME_SKIP=1 is
+    the override for a merge that must be made the other way."""
+
+    # 1 -----------------------------------------------------------------
+    def test_1_an_ordinary_def_deletion_with_a_consumer_still_refuses(self):
+        self.stage("helm/cell.py",
+                   self.CELL.split("\n\n\ndef roster_path")[0] + "\n")
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("cell.roster_path (retired from helm/cell.py)", r.stderr)
+        self.assertIn("tests/test_cell.py:5:", r.stderr)
+
+    # 2 -----------------------------------------------------------------
+    TWICE = ("def _own_commits():\n    return 1\n\n\n"
+             "def run():\n    return _own_commits()\n\n\n"
+             "def _own_commits():\n    return 2\n")
+
+    def test_2_renaming_ONE_of_two_duplicate_defs_retires_nothing(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same fixture, the surviving copy renamed too, must refuse naming walker._own_commits
+        """Shape A. Red on the base: the second copy still defines the name."""
+        self.stage("helm/walker.py", self.TWICE)
+        self.stage("tests/test_walker.py",
+                   "from helm import walker\n\n\n"
+                   "def test_it():\n    return walker._own_commits()\n")
+        self.commit("walker, with the name defined twice")
+        once = self.TWICE.replace("def _own_commits():\n    return 1",
+                                  "def _reflog_biography():\n    return 1")
+        self.stage("helm/walker.py", once)
+        r = self.rung()
+        self.assertEqual(r.returncode, 0,
+                         "the file still defines the name:\n%s" % r.stderr)
+        # MUST-HIT ON THE SAME FIXTURE: rename the surviving copy too and the
+        # name is gone from the file while both consumers still spell it.
+        self.stage("helm/walker.py",
+                   once.replace("\n\n\ndef _own_commits():\n    return 2\n",
+                                "\n\n\ndef _own_walk():\n    return 2\n"))
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("walker._own_commits (retired from helm/walker.py)",
+                      r.stderr)
+
+    # 3 -----------------------------------------------------------------
+    def test_3_renaming_the_ONLY_def_while_references_remain_refuses(self):
+        """Shape A's negative: one definition, renamed, consumers left."""
+        self.stage("helm/cell.py",
+                   self.CELL.replace("def roster_path", "def roster_file"))
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("cell.roster_path (retired from helm/cell.py)", r.stderr)
+        self.assertIn("tests/test_cell.py:5:", r.stderr)
+
+    # 4 -----------------------------------------------------------------
+    def test_4_merging_trunk_into_a_lane_is_charged_trunks_retirement(self):  # noqa: VACUOUS_ASSERTION — asserts rc 1, the exact refusal and trunk's own consumer line
+        """Shape B refuses. Trunk is the SECOND parent, the staged diff is
+        taken against the first, and trunk's `-def roster_path` is in it
+        beside trunk's own remaining spelling."""
+        self.trunk_retires_roster_path()
+        self.lane_moves_mode(self.root)
+        self.conflicted_merge(self.root, self.without_roster_path("merged"))
+        first = self.run_git(self.root, "diff", "--cached", "-U0", "HEAD",
+                             "--", "*.py")
+        self.assertIn(("helm/cell.py", "roster_path", "helm/cell.py"),
+                      retired_name_rung.parse(first.stdout))
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("cell.roster_path (retired from helm/cell.py)", r.stderr)
+        self.assertIn("tests/test_cell.py:5:", r.stderr)
+
+    def test_4c_shape_B_through_the_installed_hook_refuses_until_overridden(self):  # noqa: VACUOUS_ASSERTION — asserts the exact refusal lines, then a committed merge with three rev-list tokens
+        """Shape B at the door a conflicted merge is concluded by: refused,
+        and HELM_RETIRED_NAME_SKIP=1 commits it as a real two-parent merge."""
+        self.trunk_retires_roster_path()
+        self.lane_moves_mode(self.root)
+        rc, _lines = _guard.install_guard(self.root, apply=True)
+        self.assertEqual(rc, 0)
+        self.conflicted_merge(self.root, self.without_roster_path("merged"))
+        r = self.git("commit", "--no-edit", env=SKIPS)
+        self.assertNotEqual(r.returncode, 0, "trunk's retirement was admitted")
+        self.assertIn("[helm retired-name] REFUSED", r.stderr)
+        self.assertIn("cell.roster_path (retired from helm/cell.py)", r.stderr)
+        self.assertIn("tests/test_cell.py:5:", r.stderr)
+        r = self.git("commit", "--no-edit",
+                     env=dict(SKIPS, HELM_RETIRED_NAME_SKIP="1"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        parents = self.git("rev-list", "--parents", "-n", "1", "HEAD")
+        self.assertEqual(3, len(parents.stdout.split()), parents.stdout)
+
+    # 5 -----------------------------------------------------------------
+    def test_5_a_resolution_that_drops_a_name_both_parents_keep_refuses(self):  # noqa: VACUOUS_ASSERTION — asserts the exact refusal lines, then a committed merge with three rev-list tokens
+        """Both parents define `roster_path` and both still spell
+        `cell.roster_path()`; the conflict resolution drops the def. The
+        merge itself retires it, so it is judged. Through the installed
+        hook, at the door a conflicted merge is concluded by."""
+        self.assertEqual(self.git("checkout", "-q", "trunk").returncode, 0)
+        self.stage("helm/cell.py", self.CELL.replace("'base'", "'trunk'"))
+        self.commit("trunk moves MODE")
+        self.assertEqual(self.git("checkout", "-q", "main").returncode, 0)
+        self.lane_moves_mode(self.root)
+        rc, _lines = _guard.install_guard(self.root, apply=True)
+        self.assertEqual(rc, 0)
+        self.conflicted_merge(
+            self.root, self.CELL.replace("'base'", "'merged'")
+            .split("\n\n\ndef roster_path")[0] + "\n")
+        r = self.git("commit", "--no-edit", env=SKIPS)
+        self.assertNotEqual(r.returncode, 0, "the merge's own retirement "
+                            "was admitted")
+        self.assertIn("[helm retired-name] REFUSED", r.stderr)
+        self.assertIn("cell.roster_path (retired from helm/cell.py)", r.stderr)
+        self.assertIn("tests/test_cell.py:5:", r.stderr)
+        # 8: THE OVERRIDE STILL ADMITS IT, and the commit is a real merge.
+        r = self.git("commit", "--no-edit",
+                     env=dict(SKIPS, HELM_RETIRED_NAME_SKIP="1"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        parents = self.git("rev-list", "--parents", "-n", "1", "HEAD")
+        self.assertEqual(3, len(parents.stdout.split()), parents.stdout)
+
+    # 6 -----------------------------------------------------------------
+    def test_6_a_merge_that_retires_nothing_passes(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same in-progress merge, with the def dropped from the result, must refuse
+        self.assertEqual(self.git("checkout", "-q", "trunk").returncode, 0)
+        self.stage("helm/extra.py", "def extra():\n    return 1\n")
+        self.commit("trunk adds a module")
+        self.assertEqual(self.git("checkout", "-q", "main").returncode, 0)
+        self.stage("helm/lane.py", "def lane():\n    return 1\n")
+        self.commit("lane adds a module")
+        r = self.git("merge", "--no-commit", "--no-ff", "trunk")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = self.rung()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # POSITIVE CONTROL: the same merge, resolved without the def.
+        self.stage("helm/cell.py",
+                   self.CELL.split("\n\n\ndef roster_path")[0] + "\n")
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("cell.roster_path (retired from helm/cell.py)", r.stderr)
+
+    # 7 -----------------------------------------------------------------
+    def test_7_a_commit_with_no_parent_is_judged_as_it_was(self):  # noqa: VACUOUS_ASSERTION — pins today's answer on a parentless commit; the must-hit arms above run the same rung on parented commits
+        """Today an unborn HEAD diffs against the empty tree, so no `-` line
+        exists and nothing is retired. A root commit, and an orphan branch
+        whose index drops a def a staged consumer still spells."""
+        fresh = os.path.join(self.tmp, "fresh")
+        os.makedirs(os.path.join(fresh, "helm"))
+        for args in (("init", "-q", "-b", "main"),
+                     ("config", "user.email", "t@example.invalid"),
+                     ("config", "user.name", "t")):
+            self.assertEqual(self.run_git(fresh, *args).returncode, 0)
+        self.write(fresh, "helm/cell.py", self.CELL)
+        r = self.rung_in(fresh)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.git("checkout", "-q", "--orphan",
+                                  "fresh").returncode, 0)
+        self.stage("helm/cell.py",
+                   self.CELL.split("\n\n\ndef roster_path")[0] + "\n")
+        r = self.rung()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class OnlyADefOrClassKeepsTheNameTest(RungBase):
+    """SHAPE A, AND NOTHING WIDER. A retired name is cleared only when the
+    file still has an unconditional top-level def, async def or class of it,
+    with no module-scope `del` of it after that statement and no `global`
+    or `nonlocal` of it anywhere in the file. Every other binder -- an
+    assignment, an annotation, an import, a loop or with target -- is not
+    counted, so the rung refuses as it did before the clearance existed.
+    Each clearance here is paired with a refusal on the same fixture."""
+
+    CONSUMER = ("from helm import knob\n\n\n"
+                "def test_it():\n    return knob.LIMIT\n")
+
+    def judge(self, before, after):
+        """Commit `before` as helm/knob.py beside a consumer of knob.LIMIT,
+        stage `after`, run the rung, then put the work tree back."""
+        self.stage("helm/knob.py", before)
+        self.stage("tests/test_knob.py", self.CONSUMER)
+        r = self.git("commit", "-q", "--allow-empty", "-m", "knob")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.stage("helm/knob.py", after)
+        r = self.rung()
+        reset = self.git("reset", "-q", "--hard", "HEAD")
+        self.assertEqual(reset.returncode, 0, reset.stderr)
+        return r
+
+    def assertRefuses(self, r):
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("knob.LIMIT (retired from helm/knob.py)", r.stderr)
+        self.assertIn("tests/test_knob.py:5:", r.stderr)
+
+    def test_F2_a_kept_duplicate_followed_by_a_top_level_del_refuses(self):  # noqa: VACUOUS_ASSERTION — assertRefuses asserts rc 1, the exact refusal and the consumer line
+        """The review's reproduction: the copy that survives is deleted
+        further down, so the module ends with LIMIT unbound."""
+        self.assertRefuses(self.judge(
+            "def LIMIT():\n    return 1\n\n\ndel LIMIT\n\n\n"
+            "def LIMIT():\n    return 2\n",
+            "def LIMIT():\n    return 1\n\n\ndel LIMIT\n"))
+
+    def test_a_duplicate_kept_and_then_DELETED_refuses_where_shape_A_passes(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same fixture, a del after the kept copy, must refuse through assertRefuses
+        twice = "def LIMIT():\n    return 1\n\n\ndef LIMIT():\n    return 2\n"
+        r = self.judge(twice, "def LIMIT():\n    return 1\n")
+        self.assertEqual(r.returncode, 0,
+                         "shape A: the kept copy defines LIMIT:\n%s" % r.stderr)
+        self.assertRefuses(self.judge(
+            twice, "def LIMIT():\n    return 1\n\n\ndel LIMIT\n"))
+
+    def test_F2_a_bare_annotation_left_where_the_def_was_refuses(self):  # noqa: VACUOUS_ASSERTION — assertRefuses asserts rc 1, the exact refusal and the consumer line per shape
+        """The review's second reproduction. `LIMIT: object` declares a
+        type and binds nothing, whether the commit writes it in place of the
+        def or it was already there."""
+        for before in ("def LIMIT():\n    return 1\n",
+                       "LIMIT: object\n\n\ndef LIMIT():\n    return 1\n"):
+            with self.subTest(before):
+                self.assertRefuses(self.judge(before, "LIMIT: object\n"))
+
+    def test_a_surviving_ASYNC_def_or_CLASS_keeps_the_name(self):  # noqa: VACUOUS_ASSERTION — the second scan on each fixture, a trailing del added, must refuse through assertRefuses
+        for survivor in ("async def LIMIT():\n    return 1\n",
+                         "class LIMIT:\n    pass\n"):
+            with self.subTest(survivor):
+                before = survivor + "\n\ndef LIMIT():\n    return 2\n"
+                r = self.judge(before, survivor)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertRefuses(
+                    self.judge(before, survivor + "\n\ndel LIMIT\n"))
+
+    def test_a_remaining_binder_that_is_not_a_def_or_class_refuses(self):  # noqa: VACUOUS_ASSERTION — assertRefuses asserts rc 1, the exact refusal and the consumer line per shape
+        """The def goes and another binder of the name stays in the file,
+        unchanged by the commit. Some of these leave `knob.LIMIT` resolving
+        at runtime and some do not; the rung does not model which, and
+        refuses every one. The re-export by import is the correct commit
+        this costs, and the override exists for it."""
+        self.stage("helm/knob_impl.py", "def LIMIT():\n    return 1\n")
+        for binder in ("LIMIT = 1\n",
+                       "LIMIT, OTHER = 1, 2\n",
+                       "LIMIT: int = 1\n",
+                       "from helm.knob_impl import LIMIT\n",
+                       "from helm.knob_impl import *\n",
+                       "import os as LIMIT\n",
+                       "for LIMIT in (1,):\n    pass\n",
+                       "with open(__file__) as LIMIT:\n    pass\n"):
+            with self.subTest(binder):
+                self.assertRefuses(self.judge(
+                    binder + "\n\ndef LIMIT():\n    return 1\n", binder))
+
+    def test_a_zero_trip_loop_left_where_the_assignment_was_refuses(self):  # noqa: VACUOUS_ASSERTION — assertRefuses asserts rc 1, the exact refusal and the consumer line
+        """`for LIMIT in ():` never binds LIMIT. A loop target is not
+        counted at all, so whether the loop runs is never asked."""
+        self.assertRefuses(self.judge("LIMIT = 1\n",
+                                      "for LIMIT in ():\n    pass\n"))
+
+    def test_a_GLOBAL_of_the_name_anywhere_refuses(self):  # noqa: VACUOUS_ASSERTION — the first scan on the same fixture, with no global, must pass; each shape then refuses through assertRefuses
+        """A class body that declares `global LIMIT` and deletes it unbinds
+        the module's name while the module runs, and a function that does
+        the same unbinds it when called. The rung does not model which
+        runs, so a `global` of the name anywhere in the file refuses."""
+        twice = "def LIMIT():\n    return 1\n\n\ndef LIMIT():\n    return 2\n"
+        kept = "def LIMIT():\n    return 1\n"
+        r = self.judge(twice, kept)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for tail in ("class C:\n    global LIMIT\n    del LIMIT\n",
+                     "def drop():\n    global LIMIT\n    del LIMIT\n"):
+            with self.subTest(tail):
+                self.assertRefuses(self.judge(twice, kept + "\n\n" + tail))
+
+
+class StillDefinedIsAnUnconditionalDefOrClassTest(unittest.TestCase):
+    """The shape-A rule as a table over `still_defines`. True needs a def,
+    async def or class statement directly in the module body, no `del` of
+    the name in module scope after the last such statement (an
+    `except ... as NAME` counts as one), and no `global`/`nonlocal` of the
+    name anywhere. A `del` inside a def, or inside a class body without
+    `global`, touches that scope's own name and does not count."""
+
+    ROWS = (("def X():\n    pass\n", True),
+            ("async def X():\n    pass\n", True),
+            ("class X:\n    pass\n", True),
+            ("@dec\ndef X():\n    pass\n", True),
+            ("X = 1\n\n\ndef X():\n    pass\n", True),
+            ("def X():\n    pass\n\n\nX = 2\n", True),
+            ("def X():\n    pass\n\n\ndel X\n\n\ndef X():\n    pass\n", True),
+            ("def X():\n    pass\n\n\ndef f():\n    del X\n", True),
+            ("def X():\n    pass\n\n\nclass C:\n    X = 2\n    del X\n",
+             True),
+            ("def X():\n    pass\n\n\ndel X.attr, d[X]\n", True),
+            ("X = 1\n", False),
+            ("X, Y = 1, 2\n", False),
+            ("X: int = 1\n", False),
+            ("X: object\n", False),
+            ("import X\n", False),
+            ("import os as X\n", False),
+            ("from os import X\n", False),
+            ("from os import *\n", False),
+            ("for X in ():\n    pass\n", False),
+            ("for X in (1,):\n    pass\n", False),
+            ("with open('f') as X:\n    pass\n", False),
+            ("(X := 1)\n", False),
+            ("type X = int\n", False),
+            ("if c:\n    def X():\n        pass\n", False),
+            ("try:\n    class X:\n        pass\nexcept E:\n    pass\n", False),
+            ("def X():\n    pass\n\n\ndel X\n", False),
+            ("def X():\n    pass\n\n\ndel Y, X\n", False),
+            ("def X():\n    pass\n\n\nif c:\n    del X\n", False),
+            ("def X():\n    pass\n\n\ntry:\n    pass\nexcept E as X:\n"
+             "    pass\n", False),
+            ("def X():\n    pass\n\n\nclass C:\n    global X\n    del X\n",
+             False),
+            ("def X():\n    pass\n\n\ndef f():\n    global X\n", False),
+            ("global X\n\n\ndef X():\n    pass\n", False),
+            ("def X():\n    pass\n\n\ndef f():\n    X = 1\n\n"
+             "    def g():\n        nonlocal X\n", False),
+            ("def X():\n    pass\n\n\nX = [\n", False))
+
+    def test_each_statement_shape(self):  # noqa: VACUOUS_ASSERTION — assertIs against a table holding rows of both polarities; every True row is an unconditional positive control on the same predicate
+        for src, defined in self.ROWS:
+            with self.subTest(src):
+                self.assertIs(
+                    retired_name_rung.still_defines(src, "X"), defined)
+
+
+class AMergeIsJudgedAgainstItsFirstParentTest(_CellFixture):
+    """A MERGE IS JUDGED AS EVERY COMMIT IS: its staged diff against HEAD,
+    with no parent able to clear a name the result no longer defines. Each
+    refusal here is a merge that a parent-clearance rule admitted with the
+    staged tree broken (task/3025)."""
+
+    LANE_USES = ("from helm import cell\n\n\n"
+                 "def test_lane():\n    return cell.roster_path()\n")
+    MOVED = ("from helm import cell\n\n\n"
+             "def test_roster():\n    return cell.profile_name()\n")
+    #: The consumer line kept byte for byte, under a local `cell` that
+    #: shadows the module, so the same text is not the same reference.
+    SHADOWED = ("import types\n\nfrom helm import cell  # noqa: F401\n\n\n"
+                "def test_roster():\n"
+                "    cell = types.SimpleNamespace(roster_path=str)\n"
+                "    return cell.roster_path()\n")
+
+    def trunk_retires_and_moves_the_consumer(self):
+        """Trunk retires roster_path cleanly: its one consumer moves too."""
+        self.assertEqual(self.git("checkout", "-q", "trunk").returncode, 0)
+        self.stage("helm/cell.py", self.without_roster_path("trunk"))
+        self.stage("tests/test_cell.py", self.MOVED)
+        self.commit("trunk retires cell.roster_path and moves its consumer")
+        self.assertEqual(self.git("checkout", "-q", "main").returncode, 0)
+
+    def lane_adds_a_consumer(self):
+        self.stage("tests/test_lane.py", self.LANE_USES)
+        self.commit("lane adds a consumer of cell.roster_path")
+
+    def merge_trunk_into_a_lane_commit(self):
+        """Give the lane a commit of its own, then `git merge --no-commit
+        --no-ff trunk`, which must stop with the merge in progress."""
+        self.stage("helm/lane.py", "def lane():\n    return 1\n")
+        self.commit("lane adds a module")
+        r = self.git("merge", "--no-commit", "--no-ff", "trunk")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def assertRefusesRosterPath(self, r, where):
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("cell.roster_path (retired from helm/cell.py)", r.stderr)
+        self.assertIn(where, r.stderr)
+
+    def test_F1_a_parent_that_never_had_the_name_clears_nothing(self):  # noqa: VACUOUS_ASSERTION — asserts rc 1, the exact refusal and the consumer line
+        """The review's reproduction: HEAD defines roster_path and holds a
+        live consumer, the second parent has neither, and the resolution
+        drops the def while keeping the consumer."""
+        self.trunk_retires_and_moves_the_consumer()
+        self.lane_adds_a_consumer()
+        self.lane_moves_mode(self.root)
+        self.conflicted_merge(self.root, self.without_roster_path("merged"))
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("cell.roster_path (retired from helm/cell.py)", r.stderr)
+        self.assertIn("tests/test_lane.py:5:", r.stderr)
+
+    def test_a_parent_that_defines_it_only_CONDITIONALLY_clears_nothing(self):  # noqa: VACUOUS_ASSERTION — assertRefusesRosterPath asserts rc 1, the exact refusal and the consumer line
+        """Trunk moved `roster_path` under `if True:` and still spells
+        `cell.roster_path()`; the resolution drops the definition and keeps
+        the consumer. Trunk never lacked the name, so it clears nothing."""
+        self.assertEqual(self.git("checkout", "-q", "trunk").returncode, 0)
+        self.stage("helm/cell.py", self.without_roster_path("base")
+                   + "\n\nif True:\n    def roster_path():\n"
+                   "        return 'roster.toml'\n")
+        self.commit("trunk defines roster_path under a condition")
+        self.assertEqual(self.git("checkout", "-q", "main").returncode, 0)
+        self.merge_trunk_into_a_lane_commit()
+        self.write(self.root, "helm/cell.py", self.without_roster_path("base"))
+        self.assertRefusesRosterPath(self.rung(), "tests/test_cell.py:5:")
+
+    def test_a_parent_whose_identical_line_is_SHADOWED_clears_nothing(self):  # noqa: VACUOUS_ASSERTION — assertRefusesRosterPath asserts rc 1, the exact refusal and the consumer line
+        """Trunk retired `roster_path` and kept `return cell.roster_path()`
+        under a local `cell`; the resolution keeps that line and drops the
+        shadow, so the line now reaches into the module."""
+        self.assertEqual(self.git("checkout", "-q", "trunk").returncode, 0)
+        self.stage("helm/cell.py", self.without_roster_path("base"))
+        self.stage("tests/test_cell.py", self.SHADOWED)
+        self.commit("trunk retires roster_path behind a local shadow")
+        self.assertEqual(self.git("checkout", "-q", "main").returncode, 0)
+        self.merge_trunk_into_a_lane_commit()
+        self.write(self.root, "tests/test_cell.py", self.USES)
+        self.assertRefusesRosterPath(self.rung(), "tests/test_cell.py:5:")
+
+    def test_both_parents_lack_it_and_nothing_spells_it_passes(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same merge, profile_name dropped from the resolution, must refuse naming it
+        self.trunk_retires_and_moves_the_consumer()
+        self.stage("helm/cell.py", self.without_roster_path("lane"))
+        self.stage("tests/test_cell.py", self.MOVED)
+        self.commit("lane retires cell.roster_path too")
+        self.conflicted_merge(self.root, self.without_roster_path("merged"))
+        r = self.rung()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # MUST-HIT ON THE SAME MERGE: profile_name, which both parents define
+        # and MOVED spells, dropped by the resolution.
+        self.write(self.root, "helm/cell.py", "MODE = 'merged'\n")
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("cell.profile_name (retired from helm/cell.py)",
+                      r.stderr)
+        self.assertNotIn("cell.roster_path", r.stderr)
 
 
 if __name__ == "__main__":

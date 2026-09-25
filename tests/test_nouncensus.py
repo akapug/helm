@@ -13,6 +13,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import os as _os, sys as _sys  # noqa: E402
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
@@ -208,6 +209,97 @@ class CensusTest(unittest.TestCase):
         for noun in nc.NOUNS:
             self.assertGreater(s[noun]["sites"], 0,
                                "noun %r has no sites — its seed is dead" % noun)
+
+
+class RealTreeCensusOncePerOwnerTableTest(unittest.TestCase):
+    """The real tree is censused once per process for each `_OWNER` table
+    (task/3039).
+
+    MEASURED BEFORE THE MEMO: `census()` ran 22 times in this module, 13 of
+    them on the real tree at about 8.3 s profiled each, which was 90% of the
+    module. The key is the IDENTITY of `_OWNER`, because an arm above patches
+    it to the seven-noun table and must get that table's census, not the
+    remembered nine-noun one. Any other root is censused on every call.
+    """
+
+    def _counted(self):
+        real = nc._mark_ambiguous
+        calls = []
+
+        def spy(rows):
+            calls.append(1)
+            return real(rows)
+
+        patch = mock.patch.object(nc, "_mark_ambiguous", spy)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return calls
+
+    def test_a_second_real_census_parses_nothing(self):  # noqa: VACUOUS_ASSERTION — the counter is proven live in this arm: a planted census under the same spy must add one
+        censused = self._counted()
+        rows, unparsed = nc.census()
+        seen = len(censused)
+        self.assertGreater(len(rows), 1000, "control: the real tree was read")
+        self.assertEqual(nc.census(), (rows, unparsed))
+        self.assertEqual(len(censused), seen,
+                         "a second real-tree census parsed the package again")
+        d = tempfile.mkdtemp(prefix="helm-test-nouncensus-control-")
+        self.addCleanup(shutil.rmtree, d, True)
+        nc.census(d)
+        self.assertEqual(len(censused), seen + 1,
+                         "control: the counter sees a census that runs")
+
+    def test_a_patched_owner_table_gets_its_own_census(self):
+        """On a small stand-in for the real package, so the arm does not pay
+        two more whole-tree censuses: `wiring.modules()` names one planted
+        file, and the memo starts empty for this case."""
+        d = tempfile.mkdtemp(prefix="helm-test-nouncensus-owner-")
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "m.py")
+        with open(path, "w") as fh:
+            fh.write("seat = 1\nverb = 2\n")
+        for patch in (mock.patch.object(nc.wiring, "modules",
+                                        lambda root=None: {"m": path}),
+                      mock.patch.object(nc, "_REAL", [])):
+            patch.start()
+            self.addCleanup(patch.stop)
+        censused = self._counted()
+        real_rows, _ = nc.census()
+        seven = {tok: noun for tok, noun in nc._OWNER.items()
+                 if noun not in ("lease", "verb")}
+        with mock.patch.object(nc, "_OWNER", seven):
+            patched_rows, _ = nc.census()
+        self.assertEqual(len(censused), 2,
+                         "the patched table was served the remembered census")
+        self.assertEqual([r["noun"] for r in patched_rows], ["seat"])
+        self.assertEqual([r["noun"] for r in real_rows], ["seat", "verb"],
+                         "control: the real table does census verb sites")
+        self.assertEqual(nc.census()[0], real_rows,
+                         "the real table got the patched table's census")
+        self.assertEqual(len(censused), 2,
+                         "the real table's census was not remembered")
+
+    def test_a_planted_root_is_censused_every_time(self):
+        nc.census()                          # the real tree is remembered
+        d = tempfile.mkdtemp(prefix="helm-test-nouncensus-planted-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, "m.py"), "w") as fh:
+            fh.write("seat = 1\n")
+        censused = self._counted()
+        first, _ = nc.census(d)
+        with open(os.path.join(d, "m.py"), "a") as fh:
+            fh.write("lane = 2\n")
+        second, _ = nc.census(d)
+        self.assertEqual(len(censused), 2)
+        self.assertEqual([r["token"] for r in first], ["seat"])
+        self.assertEqual([r["token"] for r in second], ["seat", "lane"])
+
+    def test_a_caller_that_edits_a_row_cannot_change_the_next_census(self):
+        rows, _ = nc.census()
+        self.assertTrue(rows, "control: the real tree has sites")
+        rows[0]["noun"] = "planted-3039"
+        rows.append({"noun": "planted-3039"})
+        self.assertNotIn("planted-3039", {r["noun"] for r in nc.census()[0]})
 
 
 class CensusVerbTest(unittest.TestCase):

@@ -1519,8 +1519,21 @@ class ProductionWritersRefuseDerivedTest(LayerBase):
     def test_delivery_moves_NOTHING_under_a_disputed_identity(self):  # noqa: VACUOUS_ASSERTION — the second half is an unconditional positive control: the same call with the sources in agreement moves the store
         """The 2026-08-02 theft vector: an inherited HELM_CHAT_NAME pointing
         at somebody else's row, consuming that seat's inbox."""
+        from helm import session as helm_session
         self.roster(B, "sid-bound")
         self.declare(B, corroborate=False)
+        # SOMEBODY ELSE'S ROW IS A LIVE ONE: the claim-jump asks the claude
+        # census whether the rostered session is still held, so the arm plants
+        # its holder rather than reading the host's process table.
+        held = mock.patch.object(helm_session, "_proc_claude_census",
+                                 return_value={
+                                     "rows": [{"pid": 4242,
+                                               "session": "sid-bound"}],
+                                     "listing_failed": False,
+                                     "who_failed": False,
+                                     "census_partial": False})
+        held.start()
+        self.addCleanup(held.stop)
         before = self.snapshot()
         got = seats.deliver(session="sid-other", room="main", cwd=self.tmp)
         self.assertIsNone(got, "delivery ran under a contested identity")

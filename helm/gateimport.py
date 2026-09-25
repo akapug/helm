@@ -72,8 +72,53 @@ FAB_COMPLETIONS = "gate-fab-completions.jsonl"
 BINDING_EVENT = "gate-import-binding"
 FAB_COMPLETION_EVENT = "gate-fab-completion"
 FAB_COMPLETION_VERSION = 1
+# THE TWO OTHER AUTHENTICATED DOORS' OWN RECORDS (task/3066). A local mint and
+# a challenge-routed import each write one row the generic door never writes,
+# and `land_provenance` reads only rows like these: never a field inside the
+# artifact, whose every byte its submitter chose.
+MINTS = "gate-mints.jsonl"
+MINT_EVENT = "gate-mint"
+MINT_VERSION = 1
+MINT_REQUIRED = frozenset((
+    "v", "event", "id", "ts", "receipt", "repo", "head", "tree"))
+ROUTE_CUSTODIES = "gate-route-custodies.jsonl"
+ROUTE_CUSTODY_EVENT = "gate-route-custody"
+ROUTE_CUSTODY_VERSION = 1
+ROUTE_CUSTODY_REQUIRED = frozenset((
+    "v", "event", "id", "ts", "receipt", "importing_repo", "head", "tree",
+    "node", "challenge", "artifact"))
+ROUTED_CUSTODY_KEYS = frozenset(("receipt", "head", "tree", "node",
+                                 "challenge"))
+# gateroute's per-invocation challenge is uuid4().hex; the grammar admits any
+# plain atom so a custody row can never carry a separator or control byte.
+_CHALLENGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 FAB_KEY_FORMAT = "helm-fab-gate-job-v2"
 FAB_WHOLE_ARGV = ("-m", "unittest", "discover", "-s", "tests", "-t", ".")
+# The scope a Fab completion authority names for a sliced (v10) whole suite:
+# the runner's path relative to the checkout it ran in.
+FAB_SLICE_ARGV = (gate.SLICE_RUNNER,)
+# The helm command every Fab gate job runs on the node.
+FAB_RUNNER_ARGV = ("-m", "helm", "gate", "run", "--repo", ".")
+# EVERY WHOLE-SUITE SCOPE A FAB JOB MAY NAME, with the `helm gate run` flags
+# it runs under: the serial suite, the v9 shard script's suite, and the
+# sliced runner (task/3039), which runs under `--sliced`. The kind is "whole"
+# for all three, so the argv says which; Fab's own node authority holds the
+# same pairing (the Fab runtime's SCOPE_GATE_ARGS). Any other argv, or
+# a known argv with other flags, is refused.
+FAB_WHOLE_SCOPES = (
+    (FAB_WHOLE_ARGV, ()),
+    (gateauthority.SUITE_ARGV, ()),
+    (FAB_SLICE_ARGV, ("--sliced",)),
+)
+
+
+def fab_scope_gate_args(scope):
+    """The `helm gate run` flags a Fab whole-suite scope runs under, or None
+    when Fab runs no such scope."""
+    for argv, args in FAB_WHOLE_SCOPES:
+        if scope == {"kind": "whole", "argv": list(argv)}:
+            return list(args)
+    return None
 #: The cgroup regimes Fab's own node authority admits, in the order Fab ranks
 #: them: the immutable runtime's generation cgroup first, then the direct-scope
 #: regime it treats as historical. Fab's node reader holds exactly this set
@@ -209,6 +254,14 @@ def fab_completions_path():
     return os.path.join(home.global_dir(), FAB_COMPLETIONS)
 
 
+def mints_path():
+    return os.path.join(home.global_dir(), MINTS)
+
+
+def route_custodies_path():
+    return os.path.join(home.global_dir(), ROUTE_CUSTODIES)
+
+
 _REPO_IDENTITIES = {}
 
 
@@ -324,11 +377,11 @@ def _fab_identity_contract(identity):
     if type(identity.get("tree")) is not str \
             or not re.fullmatch(r"[0-9a-f]{40}", identity["tree"]):
         return None, "Fab completion tree identity is malformed"
-    # Reader-first: transport may describe either historical serial scope or
-    # the v9 script scope. _fab_receipt_err binds each to its own receipt era.
-    if identity.get("scope") not in (
-            {"kind": "whole", "argv": list(FAB_WHOLE_ARGV)},
-            {"kind": "whole", "argv": list(gateauthority.SUITE_ARGV)}):
+    # Reader-first: transport may describe the serial scope, the v9 script
+    # scope or the sliced scope. _fab_receipt_err binds each to its own
+    # receipt kind, and the runner below must carry that scope's own flags.
+    gate_args = fab_scope_gate_args(identity.get("scope"))
+    if gate_args is None:
         return None, "Fab completion scope identity is malformed"
     interpreter = identity.get("interpreter")
     if not isinstance(interpreter, dict) or set(interpreter) != {
@@ -341,8 +394,7 @@ def _fab_identity_contract(identity):
     if not isinstance(runner, dict) or set(runner) != {
             "format", "argv", "wrapper_version", "cgroup"} \
             or runner.get("format") != "fab-gate-runner-v1" \
-            or runner.get("argv") != [
-                "-m", "helm", "gate", "run", "--repo", "."] \
+            or runner.get("argv") != list(FAB_RUNNER_ARGV) + gate_args \
             or type(runner.get("wrapper_version")) is not str \
             or not re.fullmatch(r"[0-9a-f]{64}", runner["wrapper_version"]) \
             or runner.get("cgroup") not in FAB_RUNNER_CGROUPS:
@@ -434,8 +486,10 @@ def _fab_authority_err(authority):
 def _fab_receipt_err(receipt, authority):
     identity = authority["identity"]
     sha, tree = authority["sha"], identity["tree"]
+    sliced = receipt.get("v") == gate.SLICE_VERSION
     scope_argv = gateauthority.SUITE_ARGV \
-        if receipt.get("v") == gate.SHARDED_AUTHORITY_VERSION else FAB_WHOLE_ARGV
+        if receipt.get("v") == gate.SHARDED_AUTHORITY_VERSION \
+        else FAB_SLICE_ARGV if sliced else FAB_WHOLE_ARGV
     if identity["scope"] != {"kind": "whole", "argv": list(scope_argv)}:
         return "Fab scope differs from the receipt version's canonical suite"
     if receipt.get("v") == gate.SHARDED_AUTHORITY_VERSION:
@@ -446,7 +500,11 @@ def _fab_receipt_err(receipt, authority):
         "head": sha, "tree": tree, "dirty": False,
         "head_after": sha, "tree_after": tree, "dirty_after": False,
         "interpreter": identity["interpreter"], "suite": True,
-        "argv": [identity["interpreter"]["executable"]]
+        # The sliced runner is launched by its absolute path in the checkout
+        # the spoke ran in, which the receipt names as its repo_id.
+        "argv": gate._slice_argv(identity["interpreter"],
+                                 str(receipt.get("repo_id") or ""))
+                if sliced else [identity["interpreter"]["executable"]]
                 + identity["scope"]["argv"],
         "rc": authority["exit"],
         "status": "OK" if authority["exit"] == 0 else "FAILED",
@@ -641,6 +699,10 @@ def _schema_err(row, routed_focus=False):
         return "receipt carries keys no gate mints: %s" % ", ".join(foreign)
     if row.get("v") == gate.SHARDED_AUTHORITY_VERSION:
         refusal = gateauthority.receipt_refusal(row)
+        if refusal:
+            return refusal
+    if row.get("v") == gate.SLICE_VERSION:
+        refusal = gate.slice_refusal(row)
         if refusal:
             return refusal
     return _diagnostic_err(row)
@@ -1149,6 +1211,8 @@ def placement_err(row, repo):
                 % (head, local_tree, tree))
     if row.get("v") == gate.SHARDED_AUTHORITY_VERSION:
         return gateauthority.runner_tree_refusal(row, repo)
+    if row.get("v") == gate.SLICE_VERSION:
+        return gate.slice_tree_refusal(row, repo)
     return None
 
 
@@ -1243,7 +1307,8 @@ def _binding_rows(deadline=None):
     recomputing an answer that has not changed.
 
     A PROCESS-LIFETIME MEMO WOULD BE WRONG HERE, and the obvious precedent
-    (`_dispatch_snapshot`'s one-element cache) is exactly that shape. One of
+    (the Stop ladder's one-element dispatch cache, since retired) is exactly
+    that shape. One of
     this function's three callers appends a binding under the ledger lock and
     the next reader must see it, so the key has to move when the file does.
 
@@ -1334,6 +1399,20 @@ def _binding_rows(deadline=None):
 
 
 _BINDING_INDEX_MEMO = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_BINDING_INDEX_MEMO": "an index per rows object; a new read is a new key",
+    "_BINDING_ROWS_MEMO": (
+        "one entry keyed by the binding file's identity; a moved file "
+        "misses"),
+    "_REPO_IDENTITIES": (
+        "per repository path, used only while its generation stamp still "
+        "matches"),
+    "_STORED_IDS_CACHE": (
+        "keyed by the ledger path and its stat; a changed ledger misses"),
+}
 
 
 def _binding_index(rows):
@@ -1540,6 +1619,520 @@ def _record_fab_completion(receipt, repo, artifact, authority):
         if not eventledger.append_unlocked(fab_completions_path(), row):
             return None, None, "canonical Fab completion append failed"
         return row, "appended", None
+
+
+def _content_id(row):
+    """sha256 of a door row's canonical body without its id and ts."""
+    body = {k: v for k, v in row.items() if k not in ("id", "ts")}
+    return hashlib.sha256(
+        _canonical(body).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _canonical_repo(value):
+    return type(value) is str and bool(value) and os.path.isabs(value) \
+        and os.path.realpath(value) == value
+
+
+def _mint_err(row, receipt=None):
+    """Is this the exact v1 local mint record (for `receipt`, when given)?"""
+    if not isinstance(row, dict) or set(row) != set(MINT_REQUIRED) \
+            or row.get("v") != MINT_VERSION or row.get("event") != MINT_EVENT:
+        return "local mint record is not the canonical v1 shape"
+    for name in ("id", "ts", "receipt", "head", "tree"):
+        if type(row.get(name)) is not str or not row[name]:
+            return "local mint record %s is malformed" % name
+    if not _canonical_repo(row.get("repo")):
+        return "local mint record repository is not one canonical path"
+    if row["id"] != _content_id(row):
+        return "local mint record content id does not resolve"
+    if receipt is not None:
+        for name, value in (("receipt", receipt.get("id")),
+                            ("head", receipt.get("head")),
+                            ("tree", receipt.get("tree"))):
+            if row.get(name) != value:
+                return "local mint record %s disagrees with the receipt" % name
+    return None
+
+
+def record_mint(receipt, repo):
+    """Record that helm's OWN runner minted `receipt` in `repo` -> err or None.
+
+    ONE PRODUCTION CALLER, `gate._mint_result`, after the receipt row itself
+    is durable and under the receipt ledger's lock, handing the common-dir
+    identity `gate.run` measured (a path is resolved to one here). No import
+    door writes this ledger: the generic door validates an artifact and
+    places it, and a row it placed is exactly the thing a land cannot take on
+    the artifact's own word (task/3066). A failure here is loud and costs
+    only land authority; the receipt still binds every lane-level purpose.
+    """
+    identity = _repo_identity(repo)
+    if not identity:
+        return "the minting repository's identity is unreadable"
+    row = {"v": MINT_VERSION, "event": MINT_EVENT, "ts": pk.now_ts(),
+           "receipt": receipt.get("id"), "repo": identity,
+           "head": receipt.get("head"), "tree": receipt.get("tree")}
+    row["id"] = _content_id(row)
+    err = _mint_err(row, receipt)
+    if err:
+        return err
+    with eventledger.locked(mints_path()) as held:
+        if not held:
+            return "the local mint record lock is unavailable"
+        if not eventledger.append_unlocked(mints_path(), row):
+            return "the local mint record append failed"
+    return None
+
+
+def _door_rows(path, check, what):
+    """Every row of one door ledger, each validated; fail closed as a whole."""
+    rows, unavailable = eventledger.checked_events(path, strict=True)
+    if unavailable:
+        return None, "%s unavailable: %s" % (what, unavailable)
+    for row in rows:
+        err = check(row)
+        if err:
+            return None, "%s is malformed: %s" % (what, err)
+    return rows, None
+
+
+def _route_custody_err(row, receipt=None):
+    """Is this the exact v1 routed-custody row (for `receipt`, when given)?"""
+    if not isinstance(row, dict) \
+            or set(row) != set(ROUTE_CUSTODY_REQUIRED) \
+            or row.get("v") != ROUTE_CUSTODY_VERSION \
+            or row.get("event") != ROUTE_CUSTODY_EVENT:
+        return "routed custody row is not the canonical v1 shape"
+    for name in ("id", "ts", "receipt", "head", "tree", "node"):
+        if type(row.get(name)) is not str or not row[name]:
+            return "routed custody %s is malformed" % name
+    if type(row.get("challenge")) is not str \
+            or not _CHALLENGE.fullmatch(row["challenge"]):
+        return "routed custody challenge is malformed"
+    if not _canonical_repo(row.get("importing_repo")):
+        return "routed custody repository is not one canonical path"
+    artifact = row.get("artifact")
+    if not isinstance(artifact, dict) \
+            or set(artifact) != set(FAB_ARTIFACT_REQUIRED) \
+            or type(artifact.get("sha256")) is not str \
+            or not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]) \
+            or type(artifact.get("bytes")) is not int \
+            or artifact["bytes"] < 0:
+        return "routed custody artifact identity is malformed"
+    if row["id"] != _content_id(row):
+        return "routed custody content id does not resolve"
+    if receipt is not None:
+        host = receipt.get("host")
+        for name, value in (("receipt", receipt.get("id")),
+                            ("head", receipt.get("head")),
+                            ("tree", receipt.get("tree")),
+                            ("node", host.get("node")
+                             if isinstance(host, dict) else None)):
+            if row.get(name) != value:
+                return "routed custody %s disagrees with the receipt" % name
+    return None
+
+
+def _route_custody_row(receipt, importing_repo, artifact, custody):
+    row = {"v": ROUTE_CUSTODY_VERSION, "event": ROUTE_CUSTODY_EVENT,
+           "ts": pk.now_ts(), "receipt": receipt["id"],
+           "importing_repo": importing_repo, "head": custody["head"],
+           "tree": custody["tree"], "node": custody["node"],
+           "challenge": custody["challenge"],
+           "artifact": {name: artifact[name]
+                        for name in FAB_ARTIFACT_REQUIRED}}
+    row["id"] = _content_id(row)
+    return row
+
+
+def _record_route_custody(receipt, repo, artifact, custody):
+    """Append the routed custody row for (receipt, importing repository)."""
+    importing_repo = _repo_identity(repo)
+    if not importing_repo:
+        return None, "importing repository identity is unreadable"
+    row = _route_custody_row(receipt, importing_repo, artifact, custody)
+    err = _route_custody_err(row, receipt)
+    if err:
+        return None, err
+    with eventledger.locked(route_custodies_path()) as held:
+        if not held:
+            return None, "routed custody lock unavailable"
+        rows, err = _door_rows(route_custodies_path(), _route_custody_err,
+                               "routed custody ledger")
+        if err:
+            return None, err
+        hits = [stored for stored in rows
+                if stored.get("receipt") == receipt["id"]
+                and stored.get("importing_repo") == importing_repo]
+        if hits:
+            # A fresh routed run mints a fresh receipt, so one receipt has
+            # one custody per repository; anything else is a conflict.
+            same = [stored for stored in hits
+                    if {k: v for k, v in stored.items() if k != "ts"}
+                    == {k: v for k, v in row.items() if k != "ts"}]
+            return ("existing", None) if same and len(hits) == 1 else (
+                None, "stored routed custody conflicts with this transport")
+        if not eventledger.append_unlocked(route_custodies_path(), row):
+            return None, "routed custody append failed"
+        return "appended", None
+
+
+# THE LAND PROVENANCE LAW (task/3066). A land may be authorized only by a
+# whole-suite receipt whose PROVENANCE helm can prove, and helm proves it
+# from the rows its authenticated doors write, never from the artifact:
+#
+#   (a) LOCAL: helm's own runner minted it in this repository
+#       (`gate-mints.jsonl`, written by `gate._mint_result` alone);
+#   (b) FAB: it entered through `import_fab_receipt` with a completion
+#       authority helm built from its own observation of the Fab job, whose
+#       artifact_sha256 is the artifact the import binding recorded and whose
+#       sha/tree are the receipt's head/tree (`gate-fab-completions.jsonl`);
+#   (c) ROUTED: it entered through gateroute's challenge-framed session
+#       (`gate-route-custodies.jsonl`), bound to the same artifact.
+#
+# MEASURED on trunk before this existed: a v4 FAILED receipt with its status
+# flipped to OK and its id recomputed imported through the generic door and
+# bound every land door, and so did a v10 OK reminted as v4. Every check the
+# generic door runs (id, head, tree, schema) is a computation the submitter
+# can run too, so a generic import still binds every lane-level purpose and
+# never a land.
+LAND_LOCAL, LAND_FAB, LAND_ROUTED = "local mint", "Fab completion", \
+    "routed custody"
+
+
+def land_provenance(receipt, repo):
+    """(True|False|None, reason): which authenticated door placed `receipt`
+    for the repository `repo` is landing in.
+
+    True names the door; False says no authenticated door did (a generic
+    import, or nothing); None is UNKNOWN (a ledger or the repository cannot
+    be read), and UNKNOWN never authorizes. Every fact comes from a door
+    row; the receipt is used only to name which rows to read and to check
+    that each row is about exactly this receipt.
+    """
+    err = _receipt_shape_err(receipt)
+    if err:
+        return False, err
+    importing = _repo_identity(repo) if repo else None
+    if not importing:
+        return None, ("the repository this land spends it in (%s) has no "
+                      "readable identity, so its provenance is UNKNOWN"
+                      % (repo or "none named"))
+    with eventledger.locked(gate.receipts_path()) as held:
+        if not held:
+            return None, "receipt ledger lock unavailable — provenance UNKNOWN"
+        durable = _durable_receipt_err(receipt)
+    if durable:
+        return None, "%s — provenance UNKNOWN" % durable
+    rid = receipt["id"]
+    mints, err = _door_rows(mints_path(), _mint_err, "local mint ledger")
+    if err:
+        return None, err
+    for row in mints:
+        if row["receipt"] == rid and row["repo"] == importing \
+                and _mint_err(row, receipt) is None:
+            return True, ("%s: helm's own runner minted it in %s"
+                          % (LAND_LOCAL, importing))
+    rows, err = _binding_rows()
+    if err:
+        return None, err
+    binding, err = _matching_binding(rows, rid, importing)
+    if err:
+        return None, err
+    if binding is not None:
+        err = _binding_err(binding, receipt)
+        if err:
+            return None, err
+    imported = binding["artifact"]["sha256"] if binding else None
+    refusals = []
+    completions, err = _fab_completion_rows()
+    if err:
+        return None, err
+    for row in completions:
+        if row["receipt"] != rid or row["importing_repo"] != importing:
+            continue
+        err = _fab_completion_err(row, receipt)
+        authority = row["authority"]
+        if err is None and (authority["sha"] != receipt.get("head")
+                            or authority["identity"]["tree"]
+                            != receipt.get("tree")):
+            err = ("its Fab completion names %s/%s, not the receipt's "
+                   "head/tree" % (authority["sha"][:12],
+                                  authority["identity"]["tree"][:12]))
+        if err is None and imported is None:
+            err = ("its Fab completion has no import binding in %s, so no "
+                   "imported artifact exists to compare" % importing)
+        if err is None and authority["artifact_sha256"] != imported:
+            err = ("its Fab completion authority's artifact_sha256 %s is not "
+                   "the imported artifact %s"
+                   % (str(authority["artifact_sha256"])[:12], imported[:12]))
+        if err:
+            refusals.append(err)
+            continue
+        return True, ("%s: Fab job %s generation %s on %s, artifact sha256 %s"
+                      % (LAND_FAB, authority["job_id"][:17],
+                         authority["generation"], authority["host"],
+                         imported[:12]))
+    custodies, err = _door_rows(route_custodies_path(), _route_custody_err,
+                                "routed custody ledger")
+    if err:
+        return None, err
+    for row in custodies:
+        if row["receipt"] != rid or row["importing_repo"] != importing:
+            continue
+        err = _route_custody_err(row, receipt)
+        if err is None and imported is None:
+            err = ("its routed custody has no import binding in %s"
+                   % importing)
+        if err is None and row["artifact"]["sha256"] != imported:
+            err = ("its routed custody artifact %s is not the imported "
+                   "artifact %s" % (row["artifact"]["sha256"][:12],
+                                    imported[:12]))
+        if err:
+            refusals.append(err)
+            continue
+        return True, ("%s: challenge %s on node %s"
+                      % (LAND_ROUTED, row["challenge"][:12], row["node"]))
+    if refusals:
+        return False, refusals[0]
+    if binding is not None:
+        return False, ("it entered %s through the generic import door only "
+                       "(`helm gate import`, classic `fab gate`), which "
+                       "authenticates nothing" % importing)
+    return False, ("no authenticated door placed it in %s: no local mint, "
+                   "no Fab completion and no routed custody names it"
+                   % importing)
+
+
+# THE FLIP IS FORWARD-ONLY (task/3066, OI's ruling 02:21Z). It governs land
+# decisions made AFTER it took effect and never re-reads the proof of a land
+# that already happened: `helm lr foldcheck` on a tip that landed on a classic
+# receipt (LANDs 310 and 312, trains 199 and 201, both gated the classic way)
+# must answer exactly as it answered before. So the flip has a RECORDED instant, the
+# ACTIVATION, written once by the integrator (`helm gate provenance
+# --activate`), and every receipt is judged by the rule in force when it was
+# placed:
+#
+#   * the activation record names every gate receipt the ledger held at that
+#     instant (helm's own ledger, never a field of an artifact), and its time;
+#   * a receipt on that list, whose import binding in the repository being
+#     landed (when it has one) predates the activation, keeps the rule in force
+#     then, which asked no provenance question at all;
+#   * everything else — a receipt first placed after the activation, or an old
+#     receipt newly imported into this repository after it — answers the flip.
+#
+# The receipt's own `ts` is never the clock: it is inside the artifact, and a
+# forged row would simply backdate it. Before the activation the flip is
+# DORMANT and every land door answers as it did; a damaged activation (one
+# half torn or unreadable) is UNKNOWN and enforces for every receipt, so no
+# damage can turn it back off. Record and latch are written the way
+# `foldcompose` writes its own activation: latch first, each write-once.
+ACTIVATION = "land-provenance-activation.json"
+ACTIVATION_LATCH = os.path.join(".state", "land-provenance-activation-latch.json")
+FLIP_INACTIVE, FLIP_ACTIVE, FLIP_UNKNOWN = "inactive", "active", "unknown"
+ACTIVATION_FORMAT = "helm-land-provenance-activation-v1"
+_TS = re.compile(r"20[0-9]{2}-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:"
+                 r"[0-5][0-9]Z\Z")
+
+
+def activation_paths():
+    """(record, latch) — both under the helm home's _global."""
+    return (os.path.join(home.global_dir(), ACTIVATION),
+            os.path.join(home.global_dir(), ACTIVATION_LATCH))
+
+
+def _ids_digest(ids):
+    return hashlib.sha256("\n".join(ids).encode("ascii")).hexdigest()
+
+
+def _activation_file(path, latch):
+    """("absent" | "active" | "unknown", record-or-None). An I/O failure is
+    never absence (`foldcompose._presence`)."""
+    from .foldcompose import _presence
+    seen = _presence(path)
+    if seen != "present":
+        return ("absent" if seen == "absent" else "unknown"), None
+    try:
+        with pk.open_regular(path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return "unknown", None
+    keys = {"format", "ts", "receipts_sha256"} if latch \
+        else {"format", "ts", "receipts"}
+    if not isinstance(rec, dict) or set(rec) != keys \
+            or rec.get("format") != ACTIVATION_FORMAT \
+            or type(rec.get("ts")) is not str or not _TS.fullmatch(rec["ts"]):
+        return "unknown", None
+    if latch:
+        digest = rec.get("receipts_sha256")
+        if type(digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return "unknown", None
+        return "active", rec
+    ids = rec.get("receipts")
+    if not isinstance(ids, list) or ids != sorted(set(ids)) \
+            or not all(type(rid) is str and gate._ID.fullmatch(rid)
+                       for rid in ids):
+        return "unknown", None
+    return "active", rec
+
+
+def activation_state():
+    """(FLIP_INACTIVE | FLIP_ACTIVE | FLIP_UNKNOWN, record-or-None, why)."""
+    record_path, latch_path = activation_paths()
+    record_state, record = _activation_file(record_path, latch=False)
+    latch_state, latch = _activation_file(latch_path, latch=True)
+    if record_state == latch_state == "absent":
+        return FLIP_INACTIVE, None, "the land-provenance flip is not activated"
+    if record_state == latch_state == "active" \
+            and record["ts"] == latch["ts"] \
+            and _ids_digest(record["receipts"]) == latch["receipts_sha256"]:
+        return FLIP_ACTIVE, record, "activated %s" % record["ts"]
+    return FLIP_UNKNOWN, None, (
+        "the land-provenance activation is UNKNOWN (record %s, latch %s, or "
+        "the two disagree): %s and %s" % (record_state, latch_state,
+                                          record_path, latch_path))
+
+
+def activate(ts=None):
+    """Record the flip's activation -> (record, err). Write-once, latch first.
+
+    The receipt list is read under the receipt ledger's lock, so a mint or
+    import that is appending lands wholly before the instant or wholly after
+    it. `ts` exists for fixtures that must place the instant; the verb never
+    passes one."""
+    from .foldcompose import _write_once
+    state, record, why = activation_state()
+    if state == FLIP_ACTIVE:
+        return None, "the flip is already active since %s" % record["ts"]
+    record_path, latch_path = activation_paths()
+    with eventledger.locked(gate.receipts_path()) as held:
+        if not held:
+            return None, "receipt ledger lock unavailable; nothing was activated"
+        stored, _poisoned, err = _stored_ids()
+        if err:
+            return None, "receipt ledger is unreadable: %s" % err
+        ids = sorted(rid for rid, row in stored.items()
+                     if row.get("event") == "gate")
+        when = ts or pk.now_ts()
+        latch_state, latch = _activation_file(latch_path, latch=True)
+        record_state, _record = _activation_file(record_path, latch=False)
+        if FLIP_UNKNOWN in (latch_state, record_state) \
+                or record_state == "active":
+            return None, why + "; repair it before activating"
+        if latch_state == "active":
+            # A CRASH BETWEEN THE TWO WRITES: finish with the latch's own
+            # instant, never a new one, so the pair can settle.
+            when = latch["ts"]
+            if _ids_digest(ids) != latch["receipts_sha256"]:
+                return None, ("the activation latch names another receipt "
+                              "ledger than this one; repair it by hand")
+        try:
+            if latch_state == "absent" and not _write_once(latch_path, {
+                    "format": ACTIVATION_FORMAT, "ts": when,
+                    "receipts_sha256": _ids_digest(ids)}):
+                return None, "the activation latch changed concurrently"
+            if not _write_once(record_path, {"format": ACTIVATION_FORMAT,
+                                             "ts": when, "receipts": ids}):
+                return None, "the activation record changed concurrently"
+        except OSError as exc:
+            return None, "the activation could not be written: %s" % exc
+    state, record, why = activation_state()
+    if state != FLIP_ACTIVE:
+        return None, "the activation did not settle: %s" % why
+    return record, None
+
+
+def placed_before_flip(receipt, repo, record):
+    """(True|False|None, why): was this receipt placed for `repo` before the
+    flip's recorded activation, so the rule in force then judges it?
+
+    True only when the activation record lists it (it was on helm's own
+    ledger at that instant) AND its import binding in this repository, if it
+    has one, predates the activation: an old receipt imported here after the
+    flip is a new placement and answers the flip."""
+    rid = receipt.get("id")
+    if rid not in set(record["receipts"]):
+        return False, "it was placed after the flip's activation at %s" \
+            % record["ts"]
+    importing = _repo_identity(repo) if repo else None
+    if not importing:
+        return None, "the landing repository has no readable identity"
+    rows, err = _binding_rows()
+    if err:
+        return None, err
+    binding, err = _matching_binding(rows, rid, importing)
+    if err:
+        return None, err
+    if binding is not None and not binding["ts"] < record["ts"]:
+        return False, ("it was imported into %s at %s, after the flip's "
+                       "activation at %s" % (importing, binding["ts"],
+                                             record["ts"]))
+    return True, ("it was on the ledger when the flip was activated at %s"
+                  % record["ts"])
+
+
+PROVENANCE_USAGE = "gate provenance [--activate] [--json]"
+
+
+def cmd_provenance(rest):
+    """`helm gate provenance` — the flip's state; `--activate` records its
+    instant, once, under the integrator's sanction."""
+    from .cli import guard_tail
+    rest = list(rest or ())
+    rc = guard_tail("helm gate provenance", rest,
+                    flags=("--activate", "--json"), usage=PROVENANCE_USAGE)
+    if rc is not None:
+        return rc
+    if "--activate" in rest:
+        if os.environ.get("HELM_WORK_INTEGRATOR") != "1":
+            print("helm gate provenance: REFUSED — activating the land-"
+                  "provenance flip is the integrator's act; run it with "
+                  "HELM_WORK_INTEGRATOR=1", file=sys.stderr)
+            return 2
+        record, err = activate()
+        if err:
+            print("helm gate provenance: REFUSED — %s" % err, file=sys.stderr)
+            return 1
+    state, record, why = activation_state()
+    if "--json" in rest:
+        print(json.dumps({"state": state, "ts": (record or {}).get("ts"),
+                          "receipts_before": len((record or {}).get(
+                              "receipts") or ()), "reason": why},
+                         sort_keys=True))
+    elif state == FLIP_ACTIVE:
+        print("land provenance: ACTIVE since %s — a land takes only a receipt "
+              "an authenticated door placed; %d receipt(s) on the ledger then "
+              "keep the rule in force at their placement"
+              % (record["ts"], len(record["receipts"])))
+    elif state == FLIP_INACTIVE:
+        print("land provenance: INACTIVE — every land door answers as it did "
+              "before task/3066; activate with `HELM_WORK_INTEGRATOR=1 helm "
+              "gate provenance --activate`")
+    else:
+        print("land provenance: UNKNOWN — %s; every land door enforces the "
+              "flip for every receipt until it is repaired" % why)
+    return 1 if state == FLIP_UNKNOWN else 0
+
+
+def placed_repositories(receipt_id):
+    """The repositories authenticated or generic doors placed this receipt
+    in, durable door first -> (list, err). A read for DISPLAY: `gate show`
+    measures a receipt's standing against the repository it was imported
+    for instead of a node's worktree path that does not exist here."""
+    found = []
+    for path, check, key in (
+            (fab_completions_path(), _fab_completion_err, "importing_repo"),
+            (route_custodies_path(), _route_custody_err, "importing_repo"),
+            (mints_path(), _mint_err, "repo")):
+        rows, err = _door_rows(path, check, os.path.basename(path))
+        if err:
+            return None, err
+        found += [row[key] for row in rows if row["receipt"] == receipt_id]
+    rows, err = _binding_rows()
+    if err:
+        return None, err
+    found += [row["importing_repo"] for row in rows
+              if row.get("receipt") == receipt_id]
+    return list(dict.fromkeys(found)), None
 
 
 def _legacy_import_rows(deadline=None):
@@ -1920,8 +2513,14 @@ def repository_authorization(receipt, repo, migrate=True):
 
 
 def _import_receipt(artifact, repo, want_id=None, actor=None,
-                    routed_focus=None, fab_authority=None):
-    """Shared import ladder; optional transport authority is fail-closed."""
+                    routed_focus=None, fab_authority=None, routed_suite=None):
+    """Shared import ladder; optional transport authority is fail-closed.
+
+    `routed_focus` and `routed_suite` are the SAME challenge-framed custody
+    record gateroute read off its live session, for the two kinds it routes:
+    the focused receipt (v6) and a whole suite. Only the focused kind needs
+    custody to import at all; a whole suite needs it to be a receipt helm
+    can prove it ran, which is what a land asks (`land_provenance`)."""
     if fab_authority is not None:
         fab_authority, err = _normalized_fab_authority(fab_authority)
         if err:
@@ -1932,30 +2531,40 @@ def _import_receipt(artifact, repo, want_id=None, actor=None,
     row, err = _pick(rows, want_id)
     if err:
         return None, None, err
-    routed = routed_focus is not None
-    err = _schema_err(row, routed_focus=routed)
+    custody = routed_focus if routed_focus is not None else routed_suite
+    routed = custody is not None
+    focused = routed_focus is not None
+    err = _schema_err(row, routed_focus=focused)
     if err:
         return None, None, err
     if routed:
-        if not isinstance(routed_focus, dict) or set(routed_focus) != {
-                "receipt", "head", "tree", "node", "challenge"}:
-            return None, None, ("routed focused custody is malformed — only "
-                                "gateroute's complete live-session record admits v6")
-        if row.get("v") != FOCUSED_VERSION:
+        kind = "focused" if focused else "whole-suite"
+        if not isinstance(custody, dict) \
+                or set(custody) != ROUTED_CUSTODY_KEYS \
+                or type(custody.get("challenge")) is not str \
+                or not _CHALLENGE.fullmatch(custody["challenge"]):
+            return None, None, ("routed %s custody is malformed — only "
+                                "gateroute's complete live-session record "
+                                "admits it" % kind)
+        if focused and row.get("v") != FOCUSED_VERSION:
             return None, None, ("routed focused custody accompanies receipt v%r, "
                                 "not v6" % row.get("v"))
-        if _canonical(row) != _canonical(routed_focus["receipt"]):
-            return None, None, ("focused artifact differs from the receipt object "
-                                "read from the challenge-framed live session")
-        if row.get("head") != routed_focus["head"] \
-                or row.get("tree") != routed_focus["tree"]:
-            return None, None, ("focused receipt does not bind the exact head/tree "
-                                "the local router shipped")
+        if not focused and row.get("v") == FOCUSED_VERSION:
+            return None, None, ("routed whole-suite custody accompanies a "
+                                "focused (v6) receipt")
+        if _canonical(row) != _canonical(custody["receipt"]):
+            return None, None, ("%s artifact differs from the receipt object "
+                                "read from the challenge-framed live session"
+                                % kind)
+        if row.get("head") != custody["head"] \
+                or row.get("tree") != custody["tree"]:
+            return None, None, ("%s receipt does not bind the exact head/tree "
+                                "the local router shipped" % kind)
         host_block = row.get("host")
         if not isinstance(host_block, dict) \
-                or host_block.get("node") != routed_focus["node"]:
-            return None, None, ("focused receipt host does not match the node "
-                                "reported on the live transport channel")
+                or host_block.get("node") != custody["node"]:
+            return None, None, ("%s receipt host does not match the node "
+                                "reported on the live transport channel" % kind)
     try:
         recomputed = gate._receipt_id(row)
     except ValueError as exc:
@@ -1985,12 +2594,36 @@ def _import_receipt(artifact, repo, want_id=None, actor=None,
         err = _fab_completion_err(candidate, row)
         if err:
             return None, None, err
+    if routed:
+        err = _route_custody_err(_route_custody_row(
+            row, _repo_identity(repo), artifact_identity, custody), row)
+        if err:
+            return None, None, err
     completion_state = None
     if fab_authority is not None:
         _completion, completion_state, err = _record_fab_completion(
             row, repo, artifact_identity, fab_authority)
         if err:
             return row, "completion-pending", err
+    custody_state = None
+    if routed:
+        stored, _poisoned, err = _stored_ids()
+        if err:
+            return None, None, "receipt ledger is unreadable: %s" % err
+        if row["id"] in stored:
+            # NOT A FRESH RUN. A challenge-framed session mints a NEW receipt
+            # (ts is inside the content id), so one this ledger already holds
+            # was handed back, not run: it gets no custody, and the ladder
+            # below answers exactly as it did before custody existed.
+            custody_state = "existing"
+        else:
+            # BEFORE THE RECEIPT, as the Fab completion is: a crash between
+            # the two leaves an inert custody row naming a receipt the ledger
+            # does not hold, never a placed receipt whose custody was lost.
+            custody_state, err = _record_route_custody(
+                row, repo, artifact_identity, custody)
+            if err:
+                return None, None, err
     receipt_state, err = _ensure_receipt(row, chunks, timing=timing)
     if err:
         return None, None, err
@@ -2004,7 +2637,8 @@ def _import_receipt(artifact, repo, want_id=None, actor=None,
     # walks this leg: the prior attempt may have completed receipt+binding and
     # failed only its audit append, and retry is the repair path for that state.
     duplicate = binding_state == "existing" and receipt_state == "existing" \
-        and completion_state in (None, "existing")
+        and completion_state in (None, "existing") \
+        and custody_state in (None, "existing")
     # Origin is READ, never typed and never parsed-into-existence: origin_repo
     # comes from the receipt's own repo_id. Generic imports keep run/node absent;
     # a routed focus records them only because the live challenge-framed session
@@ -2015,8 +2649,8 @@ def _import_receipt(artifact, repo, want_id=None, actor=None,
                   "importing_repo": binding["importing_repo"]}
     if routed:
         provenance.update({"transport": "helm-gateroute-v1",
-                           "origin_run": routed_focus["challenge"],
-                           "origin_node": routed_focus["node"]})
+                           "origin_run": custody["challenge"],
+                           "origin_node": custody["node"]})
     if row.get("failure_chunks"):
         provenance["chunks"] = list(row["failure_chunks"])
     actor = actor or _self_actor()
@@ -2027,7 +2661,8 @@ def _import_receipt(artifact, repo, want_id=None, actor=None,
         verdict = "audit-repaired" if audit_state == "appended" else "duplicate"
     else:
         verdict = "repaired" if receipt_state == "repaired" \
-            or completion_state == "appended" and binding_state == "existing" \
+            or "appended" in (completion_state, custody_state) \
+            and binding_state == "existing" \
             else "imported"
     return row, verdict, warning
 
@@ -2048,6 +2683,14 @@ def import_routed_focus(artifact, repo, custody, want_id=None, actor=None):
     """Challenge-framed gateroute door for one focused v6 receipt."""
     return _import_receipt(artifact, repo, want_id=want_id, actor=actor,
                            routed_focus=custody)
+
+
+def import_routed_suite(artifact, repo, custody, want_id=None, actor=None):
+    """Challenge-framed gateroute door for one whole-suite receipt: the
+    generic ladder, plus the custody row that makes it a receipt helm can
+    prove it ran (`land_provenance` (c))."""
+    return _import_receipt(artifact, repo, want_id=want_id, actor=actor,
+                           routed_suite=custody)
 
 
 def _self_actor():

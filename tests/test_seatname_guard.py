@@ -67,6 +67,9 @@ class RungBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-seatname-")
         self.prior = {k: os.environ.get(k) for k in ENV_KEYS}
+        # The first cleanup runs last, after every cleanup a test registers,
+        # so no later snapshot restore can leave these keys popped.
+        self.addCleanup(self._restore_env)
         for k in ENV_KEYS:
             os.environ.pop(k, None)
         os.environ["HOME"] = os.path.join(self.tmp, "home")
@@ -94,12 +97,14 @@ class RungBase(unittest.TestCase):
                      "helm.guard.profile", "rail")):
             self.assertEqual(self.sh(*cmd).returncode, 0)
 
-    def tearDown(self):
+    def _restore_env(self):
         for k, v in self.prior.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def sh(self, *args, env=None):

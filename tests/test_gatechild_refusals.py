@@ -390,3 +390,51 @@ class TheSubreaperFixtureRestoresItsCallerTest(unittest.TestCase):
             "caller: stdout=%r stderr=%r" % (run.stdout, run.stderr))
         self.assertIn("True", run.stdout,
                       "the nested fixture case did not complete successfully")
+
+
+class TheSupervisorEncodesASignalDeathAsTheGuardDoesTest(unittest.TestCase):
+    """task/3070: a suite that died of TERM reached its receipt as rc 241.
+
+    The supervisor returned the suite's wait status (-15) to `sys.exit`, which
+    exits 256-15. `_guard` maps a negative wait status to 128+N for its own
+    child, so the one encoding a reader has to know is 128+N. Each arm runs
+    the real `--supervise` door as a script, with this process as its guard
+    and launcher, which is the ancestry its checks ask for; no cgroup is
+    involved."""
+
+    def supervise(self, code):
+        import os
+        import subprocess
+        import sys
+        me = os.getpid()
+        start = gatechild._proc_rows()[me][1]
+        ready_r, ready_w = os.pipe()
+        proc = subprocess.Popen(
+            [sys.executable, gatechild.__file__, "--supervise",
+             "--launcher", str(me), "--launcher-start", str(start),
+             "--guard", str(me), "--guard-start", str(start),
+             "--position", "exit-status-arm", "--ready-fd", str(ready_r),
+             "--", sys.executable, "-c", code],
+            pass_fds=(ready_r,), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        os.close(ready_r)
+        os.write(ready_w, b"\0")
+        os.close(ready_w)
+        _out, err = proc.communicate(timeout=60)
+        return proc.returncode, err
+
+    def test_a_suite_killed_by_TERM_reports_143_not_241(self):
+        rc, err = self.supervise(
+            "import os, signal; os.kill(os.getpid(), signal.SIGTERM)")
+        self.assertEqual(rc, 143, err)      # 128 + SIGTERM (15); trunk gave 241
+
+    def test_a_suite_killed_by_KILL_reports_137(self):
+        rc, err = self.supervise(
+            "import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+        self.assertEqual(rc, 137, err)      # 128 + SIGKILL (9)
+
+    def test_an_exit_code_passes_through_unchanged(self):
+        """The control: a suite that exits 3 or 0 is reported as 3 and 0, so
+        the arms above are about signals and not about every status."""
+        self.assertEqual(self.supervise("raise SystemExit(3)")[0], 3)
+        self.assertEqual(self.supervise("raise SystemExit(0)")[0], 0)

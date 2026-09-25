@@ -859,7 +859,12 @@ class ClaimsLockWaitIsBoundedTest(HolderRebindBase):
         # does not wait, and it never writes without the lock.
         self.assertIn(RES_A, out["claims-list"]["result"])
         self.assertNotIn(self.RES_OLD, out["claims-list"]["result"])
-        self.assertLess(out["claims-list"]["elapsed"], bound / 2)
+        # "Does not wait" means below the floor every waiting door is held to
+        # above: a door that waited returns no sooner than 0.99 * bound. A
+        # smaller fixed fraction of the bound would also bound how slow the
+        # call's own work may be, and on a loaded build host that work alone
+        # measured 0.65 of the bound.
+        self.assertLess(out["claims-list"]["elapsed"], bound * 0.99)
 
         # NOTHING PROCEEDED WITHOUT THE LOCK: once the holder is gone the
         # ledger is byte-identical, so the refused release left its lease.

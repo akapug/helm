@@ -8,11 +8,17 @@ own). Two commits went straight to local `main` in the shared checkout: no
 claimed lane, no whole-suite gate, no cross-family verdict, no fold. Over the
 preceding 40 commits on origin/main exactly ONE other commit had that shape,
 and it was the same author's. The fleet's process is: claim a lane -> build in
-its private worktree -> gate the whole suite -> a cross-family reviewer reads
-it and either APPROVEs carrying the gate token or, on a MECHANICAL finding,
-commits the cure in their OWN worktree on a branch off the exact reviewed tip
-and records that tip on a FIX verdict (`--patch-tip`) for the lane owner or
-integrator to rebase onto -> the integrator FOLDS it to main. A lane may
+its private worktree -> verify it with focused runs (`helm gate run --focus`,
+the tests the change reaches, beside the tree-wide audits that
+`helm gate audits` prints) -> a cross-family
+reviewer reads it and, on a clean read, HOLDS it source-clean (`helm dispatch
+hold --source-clean`), or, on a MECHANICAL finding, commits the cure in their
+OWN worktree on a branch off the exact reviewed tip and records that tip on a
+FIX verdict (`--patch-tip`) for the lane owner or integrator to rebase onto ->
+the integrator composes the train, runs its ONE serial whole suite (the
+land gate) on the tree that lands, the approve binds that suite's token, and
+the integrator FOLDS it to main. A lane runs no whole suite of its own:
+`helm gate run` refuses one in a lane room (task/3039). A lane may
 therefore carry SEVERAL AUTHORS of either family; what keeps the families
 independent is that the composed tip is re-read once by a reader who wrote
 none of it, not a rule that one family may only look. A DESIGN finding is

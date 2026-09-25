@@ -22,8 +22,9 @@ Provisioning contract (probed live against the binary, 2026-07-19):
     re-unlocks with the STORED passphrase (see chat._revive).
 
 State: <helm-home>/_global/.state/chat-node.json (0600) {url, passphrase,
-token} — provisioning config written at `node up` time, never in the
-send/read hot path (the RAM canon governs message data; the unit file and
+token, binary} — provisioning config written at `node up` time (binary is
+the node binary `up` installed, see BIN_RECORD), never in the send/read hot
+path (the RAM canon governs message data; the unit file and
 this credential live on disk exactly like every other service config).
 
 Import-safe, stdlib-only.
@@ -34,6 +35,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -121,17 +123,184 @@ def descriptor_files(data_dir):
         out.append(n)
     return out
 
-def bin_path():
-    """HELM_CHAT_NODE_BIN, else `dregg-cave-node` on PATH, else the known
-    install; None when nothing resolves."""
-    explicit = home.env("CHAT_NODE_BIN")
+# THE BINARY `up` INSTALLED IS RECORDED, because nothing else knew it. The
+# unit names a binary, but `up` re-renders the unit from the default
+# resolution every time it runs, and that resolution was HELM_CHAT_NODE_BIN,
+# else `dregg-cave-node` on PATH, else ~/.local/bin/dregg-cave-node. So a node
+# brought up on a new chain's binary with the variable set went back to the
+# old binary on the next bare `up`, against the new chain's data. A bare `up`
+# is not rare: status and doctor print it as the fix. `up` now records the
+# binary (absolute path and sha256) beside the node credential, and the
+# default resolution prefers that record. A record it cannot honour (the
+# file is gone, its bytes changed, the record will not read) is a refusal,
+# never a quiet fall back to whichever binary the PATH offers.
+BIN_ENV = "CHAT_NODE_BIN"             # HELM_ (or MELD_) prefixed
+BIN_RECORD = "binary"                 # chat-node.json: {"path", "sha256"}
+BIN_FIX = "Fix: HELM_CHAT_NODE_BIN=<binary> helm chat node up"
+BIN_SOURCES = {
+    "env": "from HELM_CHAT_NODE_BIN",
+    "recorded": "recorded by `helm chat node up`",
+    "fallback": "fallback (nothing recorded): dregg-cave-node on PATH, else "
+                "~/.local/bin",
+}
+_SHA_MEMO = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_SHA_MEMO": (
+        "sha256 keyed by path, inode, size, mtime and ctime; a changed file "
+        "misses"),
+}
+
+
+def file_sha256(path):
+    """The sha256 of a regular file, as hex. Raises OSError, including for a
+    path that is not a regular file (a FIFO would hang the read).
+
+    Memoised for this process on the file's whole stat identity (device,
+    inode, size, mtime and ctime in ns): status reads the binary twice, and
+    a rebased node is about 330 MB, 0.43 s to hash. A write moves ctime,
+    which no caller can set back, so a changed file misses the memo."""
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError("not a regular file: %s" % path)
+    key = (os.path.abspath(path), st.st_dev, st.st_ino, st.st_size,
+           st.st_mtime_ns, st.st_ctime_ns)
+    if key not in _SHA_MEMO:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        _SHA_MEMO[key] = h.hexdigest()
+    return _SHA_MEMO[key]
+
+
+def install_path(b):
+    """The absolute path `up` renders into the unit and records: a bare name
+    resolves on PATH (as the unit would not), anything else is made
+    absolute. Symlinks are kept, so the record names what the operator
+    named; the sha256 follows the link, so repointing it is a change."""
+    if os.sep not in b:
+        b = shutil.which(b) or b
+    return os.path.abspath(os.path.expanduser(b))
+
+
+def recorded_binary():
+    """(record, None) for the binary the last `up` installed, as {"path",
+    "sha256"}, when that file still holds those bytes; (None, None) when
+    nothing is recorded; (None, why) when a record exists and cannot be
+    honoured. UNREADABLE IS NOT ABSENT: a state file that will not parse
+    may hold a record, so it refuses rather than read as none."""
+    path = state_path()
+    try:
+        st = pk.read_json(path, {}, strict=True)
+    except Exception as e:            # noqa: BLE001 — any unreadable state is one refusal, named by its class
+        st = e
+    if not isinstance(st, dict):
+        return None, ("the chat node state %s does not read as a JSON object "
+                      "(%s), so the recorded binary is unknown — refusing to "
+                      "guess one. %s" % (path, st.__class__.__name__, BIN_FIX))
+    rec = st.get(BIN_RECORD)
+    if rec is None:
+        return None, None
+    rec = rec if isinstance(rec, dict) else {}
+    where, want = rec.get("path"), rec.get("sha256")
+    if not (isinstance(where, str) and os.path.isabs(where)
+            and isinstance(want, str)
+            and re.fullmatch(r"[0-9a-f]{64}", want)):
+        return None, ("the binary record in %s is malformed (it needs an "
+                      "absolute path and a sha256) — refusing to fall back "
+                      "to another binary. %s" % (path, BIN_FIX))
+    try:
+        have = file_sha256(where)
+    except OSError as e:
+        gone = isinstance(e, FileNotFoundError)
+        return None, ("the recorded chat node binary %s is %s — refusing to "
+                      "fall back to another binary, which may run another "
+                      "chain. %s" % (where, "MISSING" if gone else
+                                     "unreadable (%s)" % e.__class__.__name__,
+                                     BIN_FIX))
+    if have != want:
+        return None, ("the recorded chat node binary %s has CHANGED (sha256 "
+                      "%s recorded, %s now) — refusing to run bytes `up` never "
+                      "installed. %s" % (where, want[:12], have[:12], BIN_FIX))
+    return {"path": where, "sha256": want}, None
+
+
+def bin_resolution():
+    """Which node binary `up` installs, and where that came from:
+    {"path", "source", "reason"}. The order is HELM_CHAT_NODE_BIN ("env"),
+    else the binary the last `up` recorded ("recorded"), else — ONLY when
+    nothing is recorded — `dregg-cave-node` on PATH, else
+    ~/.local/bin/dregg-cave-node ("fallback"). A path of None always carries
+    a reason; a record that cannot be honoured is source "recorded" with no
+    path, and nothing below it is consulted."""
+    explicit = home.env(BIN_ENV)
     if explicit:
-        return explicit
-    on_path = shutil.which("dregg-cave-node")
-    if on_path:
-        return on_path
+        return {"path": explicit, "source": "env", "reason": None}
+    rec, why = recorded_binary()
+    if why:
+        return {"path": None, "source": "recorded", "reason": why}
+    if rec:
+        return {"path": rec["path"], "source": "recorded", "reason": None}
     known = os.path.join(os.path.expanduser("~"), ".local", "bin", "dregg-cave-node")
-    return known if os.path.exists(known) else None
+    found = shutil.which("dregg-cave-node") or (
+        known if os.path.exists(known) else None)
+    if found:
+        return {"path": found, "source": "fallback", "reason": None}
+    return {"path": None, "source": None,
+            "reason": "dregg-cave-node binary not found — set "
+                      "HELM_CHAT_NODE_BIN or install to ~/.local/bin"}
+
+
+def bin_path():
+    """The node binary bin_resolution names; None when it names none."""
+    return bin_resolution()["path"]
+
+
+def record_binary(b):
+    """Record `b` as the binary `up` installed, into the 0600 state beside
+    the node credential. Returns None, or why it could not be recorded."""
+    try:
+        rec = {"path": b, "sha256": file_sha256(b)}
+        st = state()
+        if st.get(BIN_RECORD) != rec:
+            st[BIN_RECORD] = rec
+            write_state(st)
+    except OSError as e:
+        return "%s: %s" % (e.__class__.__name__, e)
+    return None
+
+
+def unit_binary():
+    """The binary the installed unit's ExecStart names; None without a unit."""
+    try:
+        with open(unit_path(), encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = re.search(r"^ExecStart=(\S+)", text, re.M)
+    return m.group(1) if m else None
+
+
+def binary_report():
+    """(level, line) naming the binary the unit runs and where it came from,
+    the one line `status` and `doctor` both print; level is "ok", "warn" or
+    "fail". None when nothing resolves and nothing is recorded: a host that
+    reaches a node elsewhere has no local binary to name."""
+    res = bin_resolution()
+    if res["path"] is None:
+        if res["source"] == "recorded":
+            return "fail", "node binary REFUSED — " + res["reason"]
+        return None
+    want = install_path(res["path"])
+    ran = unit_binary()
+    if ran and ran != want:
+        return "warn", ("the unit runs %s, but the next `helm chat node up` "
+                        "installs %s (%s)"
+                        % (ran, want, BIN_SOURCES[res["source"]]))
+    return "ok", "node binary %s (%s)" % (want, BIN_SOURCES[res["source"]])
 
 
 def helm_bin():
@@ -786,7 +955,8 @@ def _prepare_locked(data_dir, binary):
                           "aside deliberately, then start again"
                           % (identity_dir(), archives[-1], archives[-1],
                              identity_dir()))
-    b = binary or bin_path()
+    res = {"path": binary} if binary else bin_resolution()
+    b = res["path"]
     if "node.key" in snap and GENESIS_FILE not in snap \
             and b and mints_genesis(b):
         msg, err = _successor_ceremony(data_dir, b)
@@ -798,8 +968,8 @@ def _prepare_locked(data_dir, binary):
         return said("restored node identity (%s) into %s — same node across "
                     "the reboot" % (", ".join(restored), data_dir)), None
     if not b:
-        return None, ("dregg-cave-node binary not found and no identity "
-                      "snapshot to restore — set HELM_CHAT_NODE_BIN")
+        return None, ("no node binary and no identity snapshot to restore: "
+                      + res["reason"])
     # Nothing to restore: `init` mints into a path that does not exist yet
     # (its silent no-op on an existing dir is unreachable), and the data dir
     # receives the result only once the snapshot holds it.
@@ -2466,10 +2636,22 @@ def wait_api(url, seconds=None):
 
 
 def _up(args):
-    b = bin_path()
-    if not b:
-        print("helm chat node: dregg-cave-node binary not found — set "
-              "HELM_CHAT_NODE_BIN or install to ~/.local/bin", file=sys.stderr)
+    from . import chat
+    res = bin_resolution()
+    if not res["path"]:
+        print("helm chat node: " + chat._safe_reason(res["reason"]),
+              file=sys.stderr)
+        return 1
+    b = install_path(res["path"])
+    # A BINARY THAT CANNOT BE RECORDED IS NOT INSTALLED. Without its record a
+    # later bare `up` resolves some other binary against this chain, so a
+    # path that will not hash stops here, before the unit names it.
+    try:
+        file_sha256(b)
+    except OSError as e:
+        print("helm chat node: " + chat._safe_reason(
+            "the node binary %s cannot be read (%s) — nothing installed"
+            % (b, e.__class__.__name__)), file=sys.stderr)
         return 1
     up_path = unit_path()
     want = unit_text(b)
@@ -2494,6 +2676,16 @@ def _up(args):
         os.replace(tmp, up_path)
         print("helm chat node: unit %s (0600): %s" % (
             "written" if have is None else "REFRESHED (it had drifted)", up_path))
+    err = record_binary(b)
+    if err:
+        print("helm chat node: " + chat._safe_reason(
+            "the unit runs %s, but recording it failed (%s) — a later bare "
+            "`helm chat node up` would not know it; fix the state file %s and "
+            "re-run" % (b, err, state_path())), file=sys.stderr)
+        return 1
+    print("helm chat node: " + chat._safe_reason(
+        "runs %s (%s); recorded, so a later bare `up` keeps this binary"
+        % (b, BIN_SOURCES[res["source"]])))
     posture = declared_posture()
     dropin = write_posture_dropin(posture)
     if dropin:
@@ -2618,6 +2810,13 @@ def _status(args):
     from . import chat
     rc, out = _systemctl("is-active", UNIT)
     print("helm chat node: unit %s (%s)" % (UNIT, out or "unknown"))
+    # WHICH BINARY, AND WHY THAT ONE. The same line doctor prints; a refused
+    # record fails status, since the `up` this surface recommends would refuse.
+    report = binary_report()
+    if report:
+        print("helm chat node: " + chat._safe_reason(report[1]),
+              file=sys.stderr if report[0] != "ok" else sys.stdout)
+    refused = bool(report) and report[0] == "fail"
     url = chat.node_url() or default_url()
     transport = chat.transport_status()
     if transport.get("mode") == "degraded":
@@ -2705,7 +2904,7 @@ def _status(args):
     else:
         print("helm chat node: identity snapshotted (%s) — survives a reboot"
               % ", ".join(ident["saved"]))
-    return 1 if transport.get("mode") == "degraded" else 0
+    return 1 if transport.get("mode") == "degraded" or refused else 0
 
 
 def _prepare(args):
@@ -2755,9 +2954,9 @@ PREPARE_FAILED = "helm chat node prepare: FAILED — "
 # written down here, and a description with no handler will not run.
 _VERBS = (
     ("up", lambda a: _up(a),
-     "write the unit if missing (0600), start, wait for health, unlock +\n"
-     "           bootstrap the chain, store the node credential (0600), "
-     "snapshot identity"),
+     "write the unit if missing (0600), record its binary, start, wait for\n"
+     "           health, unlock + bootstrap the chain, store the node "
+     "credential (0600), snapshot identity"),
     ("down", lambda a: _down(a),
      "stop the unit (the RAM room evaporates — flush first: "
      "helm chat log-flush)"),

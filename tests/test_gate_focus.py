@@ -198,6 +198,10 @@ class FocusBase(unittest.TestCase):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
+        # The plant stands in for a LOCAL MINT, so it writes the row the local
+        # runner writes beside its receipt: a land takes only a receipt an
+        # authenticated door placed (task/3066, tests/test_land_provenance).
+        self.assertIsNone(gateimport.record_mint(row, self.repo))
         return row
 
     def reresolve(self, row, **edits):
@@ -272,6 +276,7 @@ class FocusPlanArms(FocusBase):
         self.assertIsNone(plan)
         self.assertIn("notes.md", err)
         self.assertIn("whole suite", err)
+        self.assertIn(gate._SUITE_ROUTE, err)
 
     def test_an_unconsumed_change_refuses(self):
         """No test consumes it -> a focused run would prove itself by running
@@ -284,6 +289,7 @@ class FocusPlanArms(FocusBase):
         plan, err = gate.focus_plan(self.repo)
         self.assertIsNone(plan)
         self.assertIn("no test module consumes", err)
+        self.assertIn(gate._SUITE_ROUTE, err)
 
     def test_a_full_universe_closure_refuses(self):
         """A focused run that selects every test module is the whole suite by
@@ -295,12 +301,15 @@ class FocusPlanArms(FocusBase):
         plan, err = gate.focus_plan(self.repo)
         self.assertIsNone(plan)
         self.assertIn("whole suite by another name", err)
+        self.assertIn(gate._SUITE_ROUTE, err)
 
     def test_nothing_changed_refuses(self):
         self._git("checkout", "-q", "main")
         plan, err = gate.focus_plan(self.repo)
         self.assertIsNone(plan)
         self.assertIn("nothing changed", err)
+        self.assertIn("A lane room has nothing of its own to test", err)
+        self.assertNotIn("run `helm gate run`", err)
 
 
 class RanSetArms(FocusBase):
@@ -1307,7 +1316,8 @@ class FocusLandDoorArms(FocusBase):
         satisfy this arm."""
         row = self.mint_suite()
         state, why = landgate.gate_binds_tree(
-            row["id"], row["tree"], gates={row["id"]: row})
+            row["id"], row["tree"], gates={row["id"]: row},
+            repo=self.repo, tip=self.head)
         self.assertEqual(state, landgate.OK, why)
         self.assertIn(row["tree"][:12], why)
         self.assertIn(row["id"], why)
@@ -1499,6 +1509,11 @@ class CounterfeitArms(FocusBase):
             d["id"], self.head, gate.evidence_line(row), "approve")
         self.assertIsNone(got)
         self.assertIn("needs the whole suite", err)
+        # the route that works for a lane's reviewer: hold, and let the
+        # approve bind the land gate's receipt (task/3039)
+        self.assertIn("--source-clean", err)
+        self.assertIn("land gate", err)
+        self.assertNotIn("Run `helm gate run` on the reviewed tip", err)
         self.assertFalse(any(e.get("event") == "verdict"
                              for e in dispatches.history(d["id"])))
         # and neither land door will read it as authority either
@@ -2419,6 +2434,32 @@ class PlannerFailClosedArms(FocusBase):
         plan, err = gate.focus_plan(self.repo)
         self.assertIsNone(plan)
         self.assertIn("merge-bases", err)
+        self.assertIn("Rebase onto a single base", err)
+        self.assertIn(gate._SUITE_ROUTE, err)
+
+
+class PlannerRefusalRouteArms(unittest.TestCase):
+    """task/3039: a lane room of helm's own tree refuses a whole suite, so a
+    planner refusal may not end at "run the whole suite". The one sentence
+    every such refusal ends with names each room's move, and the gate verb's
+    help says the same."""
+
+    def test_the_route_names_the_lane_moves_and_the_land_gate(self):
+        route = gate._SUITE_ROUTE
+        self.assertIn("helm gate audits -- <your test modules>", route)
+        self.assertIn("helm gate run --lane-suite --why TEXT", route)
+        self.assertIn("land gate", route)
+        self.assertIn("integrator's train", route)
+        # the rooms where a whole suite does run keep their verb
+        self.assertIn("Anywhere else, `helm gate run`", route)
+
+    def test_the_gate_help_names_the_same_route(self):
+        from helm import cli
+        text = cli._VERB_HELP["gate"]
+        self.assertIn("names the move that works in the reader's room", text)
+        self.assertIn("(`helm gate audits`) or takes the `--lane-suite --why` "
+                      "escape", text)
+        self.assertNotIn("refuse toward the whole suite", text)
 
 
 class FrozenV4Control(unittest.TestCase):
@@ -2562,3 +2603,10 @@ class TheFocusFixtureRestoresTheEnvironmentItInherited(unittest.TestCase):
         exactly one behaviour, restoring what the process actually arrived
         with."""
         self.assertIsNone(self._after_one_real_focus_case(None))
+
+
+def setUpModule():
+    """No dispatch row this module writes walks the host's process table
+    (task/3039; see tests._tmphome.pin_live_seats)."""
+    from tests._tmphome import pin_live_seats
+    pin_live_seats()

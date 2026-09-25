@@ -85,8 +85,13 @@ def _panes(names=(), blind=None, per_seat=None):
     return lambda: (set(names), blind, dict(per_seat or {}))
 
 
+def _no_beacon(name):
+    """The live beacon probe's answer for a seat nothing is listening on."""
+    return [], None
+
+
 def _join(rows, upstream=None, ledger=None, reg=None, roster_boom=None,
-          seats=None, panes=()):
+          seats=None, panes=(), beacon_live=_no_beacon):
     # `upstream` takes a RECORDS DICT or an already-built reader. Wrapping a
     # reader in _upstream() again produced (<function>, None) — a real failure
     # this file caught on itself: the row then said "not a family map" instead
@@ -99,7 +104,8 @@ def _join(rows, upstream=None, ledger=None, reg=None, roster_boom=None,
         upstream=reader,
         open_recipients=_ledger({} if ledger is None else ledger),
         register=_roster(_REGISTERED if reg is None else reg, boom=roster_boom),
-        canonical=_IDENTITY, live_seats=_panes(panes))
+        canonical=_IDENTITY, live_seats=_panes(panes),
+        beacon_live=beacon_live)
 
 
 def _line(seat, rows, **kw):
@@ -1099,6 +1105,131 @@ class OneSeatsCensusRefusalStaysOnOneRow(unittest.TestCase):
         self.assertIn("could not be taken", got)
 
 
+class ARegisterDeafIsReprovenLiveBeforeItRefuses(unittest.TestCase):
+    """task/3055 A2. The attendance register is written by a five-minute
+    timer, and a seat's beacon is gone for about 30 seconds every half hour
+    while it re-arms after the harness's 30-minute Monitor cap. MEASURED: a
+    seat read UNUSABLE on a DEAF written inside that gap, 31 seconds after a
+    new waiter was running. So a DEAF refuses only while it is STILL TRUE."""
+
+    def test_a_DEAF_seat_that_re_armed_since_the_census_is_USABLE(self):
+        """THE RED-FIRST ARM: before the cure the register's DEAF refused
+        this seat without asking whether anything was listening now."""
+        asked = []
+
+        def live(name):
+            asked.append(name)
+            return [4242], None
+        rows = _join([_hrow("seat-a")], panes=("seat-a",),
+                     reg={"seat-a": _att(seat_usability_DEAF, age_s=60)},
+                     beacon_live=live)
+        row = rows["seat-a"]
+        self.assertEqual(["seat-a"], asked, "the probe must ask about this "
+                         "seat, by the name the join holds")
+        self.assertEqual(seat_usability.USABLE, row["verdict"], row["reason"])
+        self.assertIs(row["reachable"], True)
+        self.assertIs(row["can_take_work"], True)
+        self.assertIn("re-armed since the last census", row["reachable_why"])
+        self.assertIn("4242", row["reachable_why"])
+
+    def test_CONTROL_a_DEAF_seat_with_nothing_listening_stays_UNUSABLE(self):
+        rows = _join([_hrow("seat-a")], panes=("seat-a",),
+                     reg={"seat-a": _att(seat_usability_DEAF, age_s=60)})
+        self.assertEqual(seat_usability.UNUSABLE, rows["seat-a"]["verdict"])
+        self.assertIs(rows["seat-a"]["reachable"], False)
+
+    def test_a_probe_that_fails_keeps_the_measured_DEAF(self):  # noqa: VACUOUS_ASSERTION — positive control is test_a_DEAF_seat_that_re_armed_since_the_census_is_USABLE, the same join with a probe that proves a live beacon
+        """THE FAIL DIRECTION, pinned: the register's DEAF was measured, and
+        a probe that could not look has not overturned it."""
+        def boom(name):
+            raise OSError("proc table gone")
+
+        def unsure(name):
+            return [], "1 live beacon waiter could not be attributed"
+        for probe in (boom, unsure):
+            with self.subTest(probe=probe.__name__):
+                rows = _join([_hrow("seat-a")], panes=("seat-a",),
+                             reg={"seat-a": _att(seat_usability_DEAF,
+                                                 age_s=60)},
+                             beacon_live=probe)
+                self.assertEqual(seat_usability.UNUSABLE,
+                                 rows["seat-a"]["verdict"])
+                self.assertIs(rows["seat-a"]["reachable"], False)
+
+    def test_the_probe_is_paid_only_for_a_register_DEAF(self):  # noqa: VACUOUS_ASSERTION — the call record IS the observable (the join's cost law), and its last assertion is the positive control: a DEAF register does call the probe
+        """The join's cost law: a fleet of reachable seats pays no process
+        walk. The live probe runs for a seat the register calls DEAF."""
+        asked = []
+
+        def live(name):
+            asked.append(name)
+            return [], None
+        for state in ("covered", "UNPROVEN", "VACANT", "WAKING"):
+            _join([_hrow("seat-a")], panes=("seat-a",),
+                  reg={"seat-a": _att(state)}, beacon_live=live)
+        self.assertEqual([], asked)
+        _join([_hrow("seat-a")], panes=("seat-a",),
+              reg={"seat-a": _att(seat_usability_DEAF)}, beacon_live=live)
+        self.assertEqual(["seat-a"], asked, "control: DEAF does ask")
+
+    def test_a_WAKING_seat_can_take_work_with_the_caveat(self):
+        """A seat inside its beacon's re-arm grace answers in seconds, so it
+        takes work, and the reason says why its wake path is down now."""
+        why = ("beacon expired 20s ago (30-minute lease); pane pid 90 "
+               "declares seat seat-a; re-arm expected within 9m")
+        rows = _join([_hrow("seat-a")], panes=("seat-a",),
+                     reg={"seat-a": _att("WAKING", why=why)})
+        row = rows["seat-a"]
+        self.assertEqual(seat_usability.DEGRADED, row["verdict"])
+        self.assertIs(row["can_take_work"], True)
+        self.assertIsNone(row["reachable"])
+        self.assertEqual("WAKING", row["reachable_state"])
+        self.assertIn("WAKING", row["reason"])
+        self.assertIn("30-minute lease", row["reason"])
+        self.assertIn("delivered when it re-arms", row["reason"])
+
+    def test_the_register_word_is_the_census_word(self):
+        from helm import beacons
+        self.assertEqual(beacons.WAKING, seat_usability._WAKING)
+
+
+class TheRefusingRungIsAField(unittest.TestCase):
+    """task/3055 A3: a caller that routes a DEAF seat differently from a
+    walled one reads `refusals`, never the reason prose."""
+
+    def test_each_refusal_rung_is_named_in_ladder_order(self):  # noqa: VACUOUS_ASSERTION — three of the four cases assert a non-empty refusal tuple from the same join
+        cases = (
+            ({"reg": {"seat-a": _att(seat_usability_DEAF)}},
+             ("reachable",)),
+            ({"reg": {"seat-a": _att(seat_usability_DEAF)},
+              "rows_over": {"turn_state": "starved"}},
+             ("reachable", "turn")),
+            ({"rows_over": {"pane_live": False}}, ("pane",)),
+            ({}, ()),
+        )
+        for kw, want in cases:
+            with self.subTest(want=want):
+                over = kw.get("rows_over") or {}
+                rows = _join([_hrow("seat-a", **over)], panes=("seat-a",),
+                             reg=kw.get("reg"))
+                row = rows["seat-a"]
+                self.assertEqual(want, row["refusals"])
+                self.assertEqual(want[0] if want else None, row["refusal"])
+                self.assertEqual(bool(want), row["can_take_work"] is False)
+
+    def test_deaf_only_is_true_for_one_refusal_and_no_other(self):
+        deaf = _join([_hrow("seat-a")], panes=("seat-a",),
+                     reg={"seat-a": _att(seat_usability_DEAF)})["seat-a"]
+        self.assertTrue(seat_usability.deaf_only(deaf))
+        starved = _join([_hrow("seat-a", turn_state="starved")],
+                        panes=("seat-a",),
+                        reg={"seat-a": _att(seat_usability_DEAF)})["seat-a"]
+        self.assertFalse(seat_usability.deaf_only(starved))
+        usable = _join([_hrow("seat-a")], panes=("seat-a",),
+                       reg={"seat-a": _att("covered")})["seat-a"]
+        self.assertFalse(seat_usability.deaf_only(usable))
+
+
 class TheDispatchGateIsTheConsumer(unittest.TestCase):
     """THE POINT OF THE LANE. A rendered verdict nobody reads is the same bug
     one layer up, so the join has a caller that ACTS: the recipient-admission
@@ -1150,6 +1281,43 @@ class TheDispatchGateIsTheConsumer(unittest.TestCase):
         self.assertTrue(ok)
         self.assertTrue(refusal is None)
         self.assertTrue(warning is None)
+
+    def test_a_DEAF_recipient_with_a_live_pane_is_FILED_not_refused(self):  # noqa: VACUOUS_ASSERTION — ok True and the advisory's named content are the positive observables of the same gate call
+        """task/3055 A3, THE RED-FIRST ARM. The GONE pane's argument holds
+        word for word for a DEAF one: the ledger is durable and the row is
+        delivered when the beacon re-arms. MEASURED: a review booking was
+        refused for a seat 31 seconds from re-arming. The row is built by
+        the real join, so it is a row production can emit."""
+        row = _join([_hrow("seat-a")], panes=("seat-a",),
+                    reg={"seat-a": _att(seat_usability_DEAF)})["seat-a"]
+        self.assertIs(row["can_take_work"], False, "fixture: the join refuses")
+        ok, refusal, warning = self.gate(row["verdict"], row["reason"], row)
+        self.assertTrue(ok, refusal)
+        self.assertIsNone(refusal)
+        self.assertIn("DEAF", warning)
+        self.assertIn("filed", warning)
+        self.assertIn("re-arm", warning)
+        self.assertIn("helm seat resume-turn --nudge --seat seat-a", warning)
+
+    def test_CONTROL_a_DEAF_recipient_with_a_dead_turn_loop_is_REFUSED(self):
+        """A second refusal rung keeps the refusal: a starved turn loop is
+        the 42-hour hole this door was built for, DEAF or not."""
+        row = _join([_hrow("seat-a", turn_state="starved")],
+                    panes=("seat-a",),
+                    reg={"seat-a": _att(seat_usability_DEAF)})["seat-a"]
+        ok, refusal, warning = self.gate(row["verdict"], row["reason"], row)
+        self.assertFalse(ok)
+        self.assertIn("UNUSABLE", refusal)
+        self.assertIsNone(warning)
+
+    def test_CONTROL_a_DEAF_recipient_behind_a_wall_is_REFUSED(self):  # noqa: VACUOUS_ASSERTION — the join's refusals tuple is asserted equal to a non-empty value before the gate refuses
+        row = _join([_hrow("seat-a")], panes=("seat-a",),
+                    upstream={"codex": {"state": "AUTH-UNAVAILABLE",
+                                        "dark": True, "since": "T"}},
+                    reg={"seat-a": _att(seat_usability_DEAF)})["seat-a"]
+        self.assertEqual(("reachable", "upstream"), row["refusals"])
+        ok, refusal, _warning = self.gate(row["verdict"], row["reason"], row)
+        self.assertFalse(ok)
 
     def test_an_UNKNOWN_recipient_is_ADMITTED_and_SAYS_so(self):
         """Refusing on absence would brick every box where proxywatch has never
@@ -1245,6 +1413,13 @@ class TheLegendDoesNotSatisfyARowAssertion(unittest.TestCase):
         self.assertTrue("UNKNOWN" in legend, legend)
         self.assertTrue("holding" in legend, legend)
         self.assertFalse("turn=" in legend, legend)
+
+
+def setUpModule():
+    """No dispatch row this module writes walks the host's process table
+    (task/3039; see tests._tmphome.pin_live_seats)."""
+    from tests._tmphome import pin_live_seats
+    pin_live_seats()
 
 
 if __name__ == "__main__":

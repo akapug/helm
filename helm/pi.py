@@ -493,6 +493,10 @@ def pi_run(seat="codex", args=None):
     env["HELM_MODEL_FAMILY"] = desc["runtime"]["family"]
     env["HELM_MODEL_BACKEND"] = desc["runtime"]["backend"]
     env["HELM_CHAT_NAME"] = desc["seat"]
+    # THE SIGNING PROFILE IS THE SEAT, as at every other launch door
+    # (launch.build_env, seat.launch_line): set only the name and the child
+    # inherits the owner's shell export and signs as HIM (task/3049).
+    env["HELM_CELL_PROFILE"] = env["DREGG_PROFILE"] = desc["seat"]
     from . import seats
     seats.write_roster(desc["seat"], cwd=os.getcwd(), runtime=desc["runtime"],
                        presence_beat=False)

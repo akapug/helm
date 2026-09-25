@@ -122,7 +122,93 @@ alarm() {
     hd=${HELM_HOOK_ALARM_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/helm-hookalarm-${LOGNAME:-${USER:-helm}}}; mkdir -p "$hd" 2>/dev/null; hw=$(date -u +%Y%m%d%H%M); hp=$hd/$name; hf=$hp.${hw%?}; ha=; if [ -e "$hf" ]; then printf . >> "$hf" 2>/dev/null; else set -- "$hp".*; hc=$(cat "$@" 2>/dev/null); rm -f "$@" 2>/dev/null; if [ -n "$hc" ]; then hs=${1##*.}; hs=${hs#????????}; ha=" (+${#hc} suppressed since ${hs%?}:${hs#??}0Z)"; fi; printf '' > "$hf" 2>/dev/null; say "$m$ha"; fi
 }
 
-timeout "$budget" "$@"
+# THE BUDGET STARTS HERE, NOT WHERE THE CHILD'S FIRST LINE RUNS. The outer
+# `timeout` below is armed now, and the interpreter start and imports before a
+# handler's first line spend it. HELM_HOOK_T0 is /proc/uptime at this instant
+# (a builtin read, no fork), so the handler can charge that startup to its own
+# budget instead of discovering it at the kill (`procage.hook_elapsed`). A host
+# without /proc/uptime leaves it unset and the handler budgets as before.
+if read -r HELM_HOOK_T0 _ 2>/dev/null </proc/uptime; then
+    export HELM_HOOK_T0
+fi
+# The "which helm / stale tree" line is for a human typing `helm`; asked on a
+# hook's entry it costs git spawns on every event and nobody reads it. The
+# in-process dispatcher already sets this for its handlers (hookrun.run_event);
+# the wrapper sets it for every child it runs.
+HELM_NO_TREE_WARNING=1
+export HELM_NO_TREE_WARNING
+
+# THE INTERPRETER FLOOR: helm's own child does not start through its shebang.
+# `#!/usr/bin/env python3` means "the first python3 on PATH", and on an agents
+# box that is a bash shim (60 ms) in front of an interpreter whose site stage
+# runs a machine-local usercustomize.py that eagerly imports unittest and
+# doctest: 0.27-0.72 s of CPU per start, MEASURED, paid by 300+ hook starts a
+# minute inside one CPU-capped slice. helm is stdlib-only (no import anywhere
+# in helm/ or bin/helm names a module outside the standard library, and it
+# ships no .pth), so the site stage adds nothing it uses; `-S` skips it.
+#
+# RESOLVED ONCE, BY DISCOVERY, NEVER BY A HOST PATH. What the shebang finally
+# runs can only be learned by running it, so the old path is the discovery:
+# on a miss this hands helm the PATH python3 it found and the record file, and
+# helm writes `<that python3> TAB <sys.executable>` there
+# (`cli._record_hook_interpreter`). Every later hook whose PATH finds the same
+# python3 execs the recorded interpreter directly. PATH is walked the way
+# execvp walks it (an empty entry is the cwd), with builtins only: no fork.
+#
+# THE OLD PATH IS KEPT FOR EVERY STATE THAT IS NOT PROVEN: a child that is not
+# the helm beside this file, a first line that is not exactly the env shebang,
+# a child that is not an executable file (so 126 and 127 still mean what they
+# meant), no python3 on PATH, no record, a recorded interpreter that is gone,
+# or a PATH python3 changed since the record was written.
+py=
+key=
+pf=
+if [ "$child" = "${0%/*}/helm" ] && [ -f "$child" ] && [ -x "$child" ] \
+        && IFS= read -r line 2>/dev/null <"$child" \
+        && [ "$line" = "#!/usr/bin/env python3" ]; then
+    set -f
+    IFS=:
+    for d in $PATH; do
+        d=${d:-.}
+        if [ -f "$d/python3" ] && [ -x "$d/python3" ]; then
+            key=$d/python3
+            break
+        fi
+    done
+    unset IFS
+    set +f
+    pf=${HELM_HOME:-$HOME/.helm}/_global/.state/hook-interp
+    if [ -n "$key" ] && [ -f "$pf" ] && ! [ "$key" -nt "$pf" ]; then
+        while IFS='	' read -r k v; do
+            if [ "$k" = "$key" ]; then py=$v; fi
+        done 2>/dev/null <"$pf"
+        case "$py" in
+        /*) if ! [ -f "$py" ] || ! [ -x "$py" ]; then py=; fi ;;
+        *) py= ;;
+        esac
+    fi
+fi
+
+# THE BUDGET HAS A FLOOR TOO. The uutils `timeout` (0.8, the default `timeout`
+# on a rust-coreutils host) waits for its child in 100 ms polls, so every
+# hook's wall rounds UP to the next 100 ms. MEASURED on the agents box,
+# argv-guard with a warm interpreter: p50 105 ms / p90 205 ms through it,
+# 85 / 116 through GNU timeout, 84 / 108 with no timeout at all. Both speak
+# the one contract this file reads (TERM to the process group; 124, 125, 126,
+# 127 and 128+N measured identical), so the GNU one is used wherever the host
+# ships it beside the default, found by name with a builtin: no fork.
+tmo=timeout
+if command -v gnutimeout >/dev/null 2>&1; then
+    tmo=gnutimeout
+fi
+
+if [ -n "$py" ]; then
+    "$tmo" "$budget" "$py" -S -- "$@"
+elif [ -n "$key" ]; then
+    HELM_HOOK_INTERP_RECORD=$pf HELM_HOOK_INTERP_KEY=$key "$tmo" "$budget" "$@"
+else
+    "$tmo" "$budget" "$@"
+fi
 rc=$?
 
 # THE POSTTOOL RUNNER OWNS PUBLICATION AND ITS RECEIPT. After a kill or a

@@ -593,7 +593,7 @@ class SshTransport:
 
 def _remote_script(head, tree, label, timeout, challenge, focus=False,
                    trunk_name=None, trunk_sha=None, focus_runner="lane",
-                   session_ceiling=None):
+                   session_ceiling=None, sliced=False):
     """The one remote session, marker-structured so every outcome is in-band.
 
     EVERY MARKER CARRIES THE INVOCATION'S RANDOM CHALLENGE, so a REPLAYED
@@ -609,7 +609,9 @@ def _remote_script(head, tree, label, timeout, challenge, focus=False,
     and tracked through `stage` (or fd3-only `ship_stage`), because sh defers a
     trap until the foreground child exits and one blocked stage otherwise made
     the whole session unkillable."""
-    gate_args = " --focus" if focus else ""
+    if focus and sliced:
+        raise ValueError("a routed gate is focused or sliced, never both")
+    gate_args = " --focus" if focus else " --sliced" if sliced else ""
     trunk_fetch = "    'refs/helm-trunk/*:refs/helm-trunk/*' \\\n" \
         if focus else ""
     trunk_setup = ""
@@ -1199,7 +1201,7 @@ def _focus_uses_lane_runner(repo, head, trunk):
 
 
 def route(repo=None, box=None, label=None, timeout=None, transport=None,
-          nodes=None, focus=False):
+          nodes=None, focus=False, sliced=False):
     """Run this repo's whole or focused gate ON `box` and import the receipt.
 
     Focus ships the pinned trunk object too and installs the same trunk ref in
@@ -1214,6 +1216,9 @@ def route(repo=None, box=None, label=None, timeout=None, transport=None,
     `_launder` before it can reach a terminal (the display-launder
     tripwire's transport-projection law)."""
     repo = os.path.realpath(repo or os.getcwd())
+    if focus and sliced:
+        return None, ("a routed gate is focused or sliced, never both — "
+                      "--sliced runs helm's whole suite")
     row, err = pick_box(box, nodes=nodes, repo=repo)
     if err:
         return None, err
@@ -1258,7 +1263,7 @@ def route(repo=None, box=None, label=None, timeout=None, transport=None,
             _remote_script(head, tree, label, timeout, challenge, focus=focus,
                            trunk_name=trunk_name, trunk_sha=trunk_sha,
                            focus_runner=focus_runner,
-                           session_ceiling=ceiling),
+                           session_ceiling=ceiling, sliced=sliced),
             bundle_path, ceiling + _REMOTE_TEARDOWN_GRACE_S)
     finally:
         _bundle_cleanup(bundle_path)
@@ -1353,6 +1358,16 @@ def route(repo=None, box=None, label=None, timeout=None, transport=None,
     elif receipt.get("v") == gateimport.FOCUSED_VERSION:
         return None, ("the remote whole-suite command returned a focused "
                       "receipt — mode changed across the transport")
+    elif sliced != (receipt.get("v") == gate.SLICE_VERSION):
+        # THE ASKED KIND IS THE KIND THAT IMPORTS. A --sliced route that came
+        # back serial would pass off a slower answer as the one asked for,
+        # and a serial route that came back sliced would import a receipt no
+        # land door accepts where a serial one was wanted.
+        return None, ("the remote %s command returned a %s receipt — mode "
+                      "changed across the transport" % (
+                          "sliced" if sliced else "serial whole-suite",
+                          "sliced" if receipt.get("v") == gate.SLICE_VERSION
+                          else "serial"))
     # THE CALLER TREE, READ AGAIN (finding 7): minutes passed. An exit code
     # is read as "what I am standing on passed"; if the room moved, refuse.
     head2, tree2, dirty2, err = gate.tree_state(repo)
@@ -1370,14 +1385,15 @@ def route(repo=None, box=None, label=None, timeout=None, transport=None,
                                     sections.get("receipts") or "")
     if err:
         return None, err
-    if focus:
-        custody = {"receipt": receipt, "head": head, "tree": tree,
-                   "node": node, "challenge": challenge}
-        imported, verdict, err = gateimport.import_routed_focus(
-            artifact, repo, custody, want_id=receipt_id)
-    else:
-        imported, verdict, err = gateimport.import_receipt(
-            artifact, repo, want_id=receipt_id)
+    # ONE CUSTODY RECORD FOR BOTH KINDS: what this session read off its own
+    # challenge-framed channel. A focused receipt needs it to import at all;
+    # a whole suite needs it to be a receipt helm can prove it ran, which is
+    # the only kind a land takes (task/3066, gateimport.land_provenance).
+    custody = {"receipt": receipt, "head": head, "tree": tree,
+               "node": node, "challenge": challenge}
+    door = gateimport.import_routed_focus if focus \
+        else gateimport.import_routed_suite
+    imported, verdict, err = door(artifact, repo, custody, want_id=receipt_id)
     if err and imported is None:
         return None, "receipt fetched from box %r but REFUSED at import: %s" \
             % (box, _launder(err, "unknown import refusal"))
@@ -1403,12 +1419,14 @@ def route(repo=None, box=None, label=None, timeout=None, transport=None,
 
 
 def cmd_route(box, repo=None, label=None, timeout=None, as_json=False,
-              focus=False):
+              focus=False, sliced=False):
     """The `helm gate run --box` arm: route, import, bind, and report."""
     repo = os.path.realpath(repo or os.getcwd())
     kwargs = {"repo": repo, "box": box, "label": label, "timeout": timeout}
     if focus:
         kwargs["focus"] = True
+    if sliced:
+        kwargs["sliced"] = True
     result, err = route(**kwargs)
     if err:
         return gate.refusal_exit(err, as_json, routed=box)

@@ -60,7 +60,7 @@ import sys
 import threading
 import time
 
-from . import gitfacts, registry, repofacts
+from . import gitfacts, registry, repofacts, scheduler
 from .web_cache import _drop, _read_behind
 from .web_land import _api_lr
 from .web_quota import get_flags
@@ -148,6 +148,13 @@ _PUSHED_REFS = ("refs/remotes/origin/main", "refs/remotes/origin/master")
 # answered with no git spawn at all and a moved one is asked once. Bounded,
 # because a test run mints a repository per arm inside one process.
 _TRUNK_MEMO = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_TRUNK_MEMO": (
+        "keyed by common git dir and checked against the ref files' stat"),
+}
 _TRUNK_LOCK = threading.Lock()
 _TRUNK_MEMO_CAP = 1024
 
@@ -614,14 +621,58 @@ def _seats_join(projects, flags, measured_at, rep):
 
 
 def _kanban_card(c):
-    """One land-request card as the kanban draws it — the SAME four fields
-    for this project's pipeline and every other project's. `trunk_contains_tip`
-    is the pipeline's own tri-state (True only when trunk PROVABLY holds the
-    row's pinned tip with no verdict recorded), carried so the page draws that
-    row as landed rather than as waiting for a review of work in history."""
+    """One land-request card as the kanban draws it — the SAME fields for this
+    project's pipeline and every other project's. `trunk_contains_tip` is the
+    pipeline's own tri-state (True only when trunk PROVABLY holds the row's
+    work — for a BUILD, the work on its lane, never the base it was sent
+    against); `on_main_unverdicted` is the one predicate's answer over it
+    (`landreq.on_main_unverdicted`: that work with NO verdict recorded). The
+    server counts every such card on the on-main line and never sends it as
+    a card; the word rides the wire so a page reading an older server's
+    cards folds exactly those, and never a row under a recorded verdict."""
+    from . import landreq                   # DEFERRED — landreq is heavy
     return {"id": str(c.get("id") or ""), "lane": str(c.get("lane") or ""),
             "state": str(c.get("state") or ""),
-            "trunk_contains_tip": c.get("trunk_contains_tip")}
+            "trunk_contains_tip": c.get("trunk_contains_tip"),
+            "on_main_unverdicted": landreq.on_main_unverdicted(c)}
+
+
+def _kanban_split(cards, read_age_s):
+    """(live cards, on-main line or None, collapsed lines) for one project's
+    in-flight requests — the kanban's half of the owner board's rule: LIVE
+    obligations are drawn one card each, everything else is one line with its
+    count, its oldest age and the command that lists it (task/2381).
+
+    THE SAME JUDGEMENT AS THE WAITS, BY ONE CALL. `scheduler.collapse_class`
+    decides every card here exactly as it decides the waits' rows: placed off
+    the live frontier, unplaceable with its lane gone, or on main with no
+    verdict recorded (`landreq.on_main_unverdicted`) — every card here is on
+    the chain frontier, so none is superseded. The on-main line is drawn in
+    the landed column rather than under the columns, and carries the `lanes`
+    it counts so the page keeps placing them (a claim on one is not drawn as
+    building); it is the scheduler's own line otherwise, the same words, count
+    rule and command the waits draw. None when there is none, never a zero
+    claim."""
+    live, folded, lanes = [], [], []
+    for card in cards:
+        try:
+            age = int(card.get("dwell_s")) + int(read_age_s) \
+                if card.get("dwell_known") is True else None
+        except (TypeError, ValueError):
+            age = None
+        klass = scheduler.collapse_class(card)
+        if klass == "on_main":
+            lanes.append(str(card.get("lane") or ""))
+        if klass:
+            folded.append((klass, age, card.get("frontier")
+                           if klass == "off_frontier" else None))
+        else:
+            live.append(_kanban_card(card))
+    lines = scheduler.collapsed_lines(folded)
+    on_main = next((dict(line, lanes=lanes) for line in lines
+                    if line["class"] == "on_main"), None)
+    return live, on_main, [line for line in lines
+                           if line["class"] != "on_main"]
 
 
 def _lands_join(reader):
@@ -648,21 +699,23 @@ def _lands_join(reader):
                         unavailable=str(why)), {}
     filed = [c for c in body.get("loops") or ()
              if isinstance(c, dict) and not c.get("honored")]
+    live, on_main, folded = _kanban_split(filed, read_age or 0)
     building = body.get("building") or {}
     model = body.get("scheduler") or {}
     lands = body.get("recent_lands") or {}
     rec = {
-        "lanes": {"in_flight": len(filed),
-                  "filed": [str(c.get("lane") or "")
-                            for c in filed][:TOP_LANES],
+        "lanes": {"in_flight": len(live),
+                  "filed": [c["lane"] for c in live][:TOP_LANES],
                   "building": (None if building.get("unavailable")
                                else building.get("total")),
                   "building_lanes": [str(r.get("lane") or "")
                                      for r in building.get("rows") or ()
                                      if isinstance(r, dict)][:TOP_LANES],
-                  # THE KANBAN'S CARDS: every loop in flight with the state
-                  # the pipeline gave it, for the page to put in a column
-                  "loops": [_kanban_card(c) for c in filed][:KANBAN_ROWS]},
+                  # THE KANBAN'S CARDS: every LIVE loop in flight with the
+                  # state the pipeline gave it, for the page to put in a
+                  # column; the rest is counted on the two lines beside them
+                  "loops": live[:KANBAN_ROWS],
+                  "on_main": on_main, "collapsed": folded},
         "landed": None if lands.get("unavailable") else [
             {"lane": r.get("lane"), "task": r.get("task"),
              "age_s": r.get("age_s")}
@@ -680,6 +733,13 @@ def _lands_join(reader):
                       if isinstance(r, dict)]}
             for g in (model.get("groups") or ())[:TOP_WAITS]
             if isinstance(g, dict)],
+        # WHAT THE WAITS DO NOT LIST, one line per class, from the scheduler
+        # that decided it — the groups above hold live obligations only
+        "waits_collapsed": [] if model.get("unavailable") else [
+            {key: line.get(key) for key in ("class", "label", "count",
+                                            "oldest_age_s", "command")}
+            for line in model.get("collapsed") or ()
+            if isinstance(line, dict)],
     }
     return _section(source, at, SECTION_LIMIT_S, scope=scope), {scope: rec}
 
@@ -761,7 +821,8 @@ def _fleet_now(keys, now):
     scope = (body.get("withheld") or {}).get("scope")
     lands = body.get("recent_lands") or {}
     lands_read = isinstance(lands, dict) and not lands.get("unavailable")
-    out = {key: {"loops": [], "landed": [] if lands_read else None}
+    out = {key: {"loops": [], "landed": [] if lands_read else None,
+                 "on_main": None, "collapsed": []}
            for key in keys if key != scope}
     unplaced = 0
     aged = max(0, now - read_at)
@@ -770,17 +831,26 @@ def _fleet_now(keys, now):
         project = row.get("foreign_project")
         return out.get(project) if project else None
 
+    theirs = {}
     for card in body.get("loops") or ():
         if not isinstance(card, dict) or card.get("honored"):
             continue
         if not card.get("foreign_project") and not card.get(
                 "project_unresolved"):
             continue                        # the scope's own row
-        rec = home(card)
-        if rec is None:
+        if home(card) is None:
             unplaced += 1
-        elif len(rec["loops"]) < KANBAN_ROWS:
-            rec["loops"].append(_kanban_card(card))
+        else:
+            theirs.setdefault(card["foreign_project"], []).append(card)
+    # THE SAME SPLIT AS THIS PROJECT'S OWN KANBAN, per project, so the fleet
+    # view and the row's own view of one project cannot disagree
+    read_age = body.get("read_age_s")
+    for project, cards in theirs.items():
+        live, on_main, folded = _kanban_split(
+            cards, (read_age if isinstance(read_age, (int, float)) else 0)
+            + int(aged))
+        out[project].update(loops=live[:KANBAN_ROWS], on_main=on_main,
+                            collapsed=folded)
     for row in (lands.get("rows") or ()) if lands_read else ():
         if not isinstance(row, dict) or "foreign_project" not in row:
             continue
@@ -796,7 +866,6 @@ def _fleet_now(keys, now):
                 "lane": row.get("lane"), "task": row.get("task"),
                 "age_s": age + int(aged) if isinstance(age, (int, float))
                 else None})
-    read_age = body.get("read_age_s")
     measured_at = read_at - read_age if isinstance(read_age, (int, float)) \
         else None
     # THE LANDS LIST IS CAPPED FLEET-WIDE (the newest few), so a project with

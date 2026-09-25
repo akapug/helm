@@ -160,13 +160,57 @@ def _source_stats():
 _LOADED = _source_stats()
 _DIGEST = []
 
+# THE TREE IS COMPARED AT MOST ONCE PER SECOND, AND A MISMATCH IS FINAL
+# (task/3039, the design ruling). Every fold read asked `policy()`, and every
+# ask stat-walked the ~490 files: 6,198 walks in tests.test_lr_close, 16.6% of
+# its profile. The cost of the TTL is bounded and one-sided: a long-running
+# process may write ONE checkpoint under its old digest up to POLICY_TTL_S
+# after a deploy rewrites the tree, and no new process reads it, because a new
+# process names a new digest. Once this process has seen its tree differ it
+# never names its code again, even if the files are put back: stricter than
+# the per-call check, which answered with the old digest again.
+#
+# The clock is bound at import so a test that patches `time.monotonic` for
+# its own subject does not move this one; an arm about the TTL patches
+# `_monotonic` itself.
+POLICY_TTL_S = 1.0
+_POLICY = {"checked": None, "drifted": False}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_DIGEST": (
+        "the digest of the source this process imported, taken once by "
+        "design"),
+    "_POLICY": (
+        "this process's once-a-second drift check of its own source; the "
+        "arms about it patch it (test_foldckpt)"),
+}
+_monotonic = time.monotonic
+
+
+def _tree_still_loaded():
+    """Is the package still the one this process imported? Walks at most
+    once per POLICY_TTL_S; False is remembered for the process."""
+    if _POLICY["drifted"]:
+        return False
+    now = _monotonic()
+    checked = _POLICY["checked"]
+    if checked is not None and 0 <= now - checked < POLICY_TTL_S:
+        return True
+    if _source_stats() != _LOADED:
+        _POLICY["drifted"] = True
+        return False
+    _POLICY["checked"] = now
+    return True
+
 
 def policy():
     """The identity of the code the fold executes. -> hex, or None when this
     process cannot name it (the tree changed under it since import), in which
     case the caller neither reads nor writes a checkpoint."""
     try:
-        if _source_stats() != _LOADED:
+        if not _tree_still_loaded():
             return None
         if not _DIGEST:
             h = hashlib.sha256(("%s v%d python %s marshal %d\0" % (
@@ -175,7 +219,10 @@ def policy():
                 with open(os.path.join(_PKG, rel), "rb") as f:
                     h.update(rel.encode("utf-8", "surrogateescape") + b"\0"
                              + hashlib.sha256(f.read()).digest())
-            if _source_stats() != _LOADED:
+            # THE DIGEST WAS READ OVER TIME, so the files are compared again
+            # after it, whatever the TTL says.
+            _POLICY["checked"] = None
+            if not _tree_still_loaded():
                 return None
             _DIGEST.append(h.hexdigest())
         return _DIGEST[0]
@@ -447,10 +494,20 @@ def agrees(expr, obs, line):
 # `branch.<name>.*` is the one config family lane creation rewrites all day
 # (upstream tracking for every new lane branch), and no question in `_DERIVED`
 # resolves `@{upstream}` or names a branch implicitly. Hashing it would discard
-# the checkpoint on every lane a seat opens. Everything else git lists is kept:
-# a precondition that enumerates the config surface a git release reads is one
-# the next release edits, so the list of what is DROPPED is the short one.
-_CONFIG_DROPPED = (b"branch.",)
+# the checkpoint on every lane a seat opens.
+#
+# `credential.*` configures how git AUTHENTICATES to a remote, and no question
+# in `_DERIVED` contacts one: every one of them reads local objects. Orca
+# launches its seats with `GIT_CONFIG_COUNT=2` naming `credential.interactive`
+# and `credential.guiPrompt`, which `git config --list` reports like any
+# other entry, so hashing the family gave an Orca seat and a plain seat two
+# fingerprints for one repository. Each then judged the other's checkpoint
+# stale ("git's view changed") and replaced it through `_keeps`.
+#
+# Everything else git lists is kept: a precondition that enumerates the config
+# surface a git release reads is one the next release edits, so the list of
+# what is DROPPED is the short one.
+_CONFIG_DROPPED = (b"branch.", b"credential.")
 _ATTR_ENV = ("GIT_ATTR_NOSYSTEM", "GIT_ATTR_SOURCE")
 
 

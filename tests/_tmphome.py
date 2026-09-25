@@ -104,6 +104,17 @@ def helm_tree(case, repo):
     one that declares its own command — must NOT call this: that arm wants the
     declaration path, and marking the repo would take the default instead.
     """
+    path = plant_helm_root(repo)
+    cross_tree_gate(case)
+    return path
+
+
+def plant_helm_root(repo):
+    """The FILE half of `helm_tree`: helm/__init__.py, staged in `repo`.
+
+    A template repository built once per process plants this and nothing
+    else (`repo_from_template`); every case that copies the template still
+    owes `cross_tree_gate`, which is about the case, not the repository."""
     d = os.path.join(repo, "helm")
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, "__init__.py")
@@ -117,8 +128,48 @@ def helm_tree(case, repo):
     # that gate a bare scratch root) just keeps the file.
     subprocess.run(("git", "add", "helm/__init__.py"), cwd=repo,
                    capture_output=True, timeout=30)
-    own_env(case, "HELM_CROSS_TREE_GATE", "1")
     return path
+
+
+def cross_tree_gate(case):
+    """The ENVIRONMENT half of `helm_tree`: this case gates its fixture tree
+    from outside it, and says so (`HELM_CROSS_TREE_GATE`)."""
+    own_env(case, "HELM_CROSS_TREE_GATE", "1")
+
+
+_TEMPLATES = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_TEMPLATES": (
+        "template repositories built once per process; every caller gets a "
+        "whole copy"),
+}
+
+
+def repo_from_template(key, build, dest):
+    """Copy the process's template repository `key` to `dest` (which must
+    not exist), building the template with `build(path)` the first time.
+    Returns a copy of the facts `build` returned.
+
+    A FIXTURE REPOSITORY THAT IS THE SAME IN EVERY TEST IS BUILT ONCE
+    (task/3039). Building it in setUp cost about 21 git spawns per test in
+    the LandReqBase family. The copy is per call and whole (objects, refs,
+    index, config), so nothing a test writes reaches the template or the next
+    test. The template lives under this process's temp root and goes at exit.
+    A `build` may not depend on anything per test: the environment of the
+    first caller builds it for every caller.
+    """
+    if key not in _TEMPLATES:
+        root = tempfile.mkdtemp(prefix="helm-test-template-")
+        atexit.register(shutil.rmtree, root, ignore_errors=True)
+        path = os.path.join(root, "repo")
+        os.makedirs(path)
+        _TEMPLATES[key] = (path, build(path))
+    path, facts = _TEMPLATES[key]
+    shutil.copytree(path, dest, symlinks=True)
+    return dict(facts)
 
 
 def own_env(case, key, value):
@@ -186,6 +237,41 @@ def pin_dispatch_home(case, repo):
     dispatches.home_repo_id = lambda: (home, None)
     case.addCleanup(setattr, dispatches, "home_repo_id", real)
     return real
+
+
+def _measured_empty_fleet():
+    """(names, blind, per_seat) of a census that looked and saw no seat."""
+    return set(), None, {}
+
+
+def pin_live_seats(case=None):
+    """Stand `proxywatch._live_seats` in with a MEASURED EMPTY fleet.
+
+    THE COST AND THE DEFECT (task/3039). Every dispatch row a test writes asks
+    `dispatches._validate_recipient_usable`, which walks the whole process
+    table through `proxywatch._live_seats`: about 870 processes on a build
+    node, once per row, and more on a busy box. What the test then observed
+    depended on what else was running beside it. A build node answers an
+    empty fleet anyway, so the stand-in says exactly that: the census looked
+    (`blind` None) and saw no seat. A blind reading is a different claim, and
+    an arm that needs one plants it itself.
+
+    `case` scopes it to one case: its cleanup puts the real function back.
+    Called bare, from `setUpModule`, it covers every class of the module, and
+    a module cleanup puts the real function back. The production predicate is
+    never edited. tests/test_env_hygiene.py refuses a module that writes rows
+    without it.
+    """
+    import unittest
+    from unittest import mock
+    from helm import proxywatch
+    patch = mock.patch.object(proxywatch, "_live_seats", _measured_empty_fleet)
+    patch.start()
+    if case is None:
+        unittest.addModuleCleanup(patch.stop)
+    else:
+        case.addCleanup(patch.stop)
+    return patch
 
 
 @contextlib.contextmanager

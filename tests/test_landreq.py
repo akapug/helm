@@ -154,8 +154,12 @@ def setUpModule():
 
 
 def tearDownModule():
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT: other modules import from this
+    # one, so a stopped patcher left here is data they can reach (task/3039).
+    _LIVE_SEATS_PATCH = None
 
 
 class TheLivenessStandInIsInEffectTest(unittest.TestCase):
@@ -235,31 +239,31 @@ class LandReqBase(unittest.TestCase):
         os.environ["HELM_CHAT_NODE_URL"] = ""
         os.environ["HELM_CHAT_NAME"] = "integrator"
         self.repo = os.path.join(self.tmp, "repo")
-        os.makedirs(self.repo)
-        self.git("init", "-q")
-        self.git("config", "user.email", "test@example.com")
-        self.git("config", "user.name", "Test")
-        self.main = self.git("symbolic-ref", "--short", "HEAD")
+        # THE SAME FOUR COMMITS EVERY TIME, SO THEY ARE BUILT ONCE (task/3039).
+        # Building them here cost about 21 git spawns per test across the 18
+        # modules and about 1,900 tests on this base. Each test gets its own
+        # copy of the process's template (`_built`), so nothing it writes
+        # reaches the template or the next test.
+        from tests._tmphome import cross_tree_gate, repo_from_template
+        facts = repo_from_template("landreq-base", LandReqBase._built,
+                                   self.repo)
+        self.main, self.a, self.b, self.c, self.side = (
+            facts[k] for k in ("main", "a", "b", "c", "side"))
         # THIS FIXTURE REPO STANDS IN FOR A TREE THAT SHIPS HELM, which is
         # the only tree whose whole-suite command helm may assume — see
-        # `helm_tree`. An adopter project declares its own instead.
-        from tests._tmphome import helm_tree
-        helm_tree(self, self.repo)
-        self.a = self.commit("a")
-        self.git("branch", "side", self.a)
-        self.b = self.commit("b")
-        self.c = self.commit("c")
-        # a divergent reviewed tip that is NOT on trunk until an integrator
-        # merges it — the READY/MERGED_LOCAL/LANDED axis rides on this commit.
-        self.git("checkout", "-q", "side")
-        self.side = self.commit("side", path="g")
-        self.git("checkout", "-q", self.main)
+        # `helm_tree`. The template carries the package root; the override
+        # that gates it from outside is this case's own.
+        cross_tree_gate(self)
         # THIS FIXTURE IS ITS OWN PROJECT. Without the pin the dispatch write
         # door refuses every row here as foreign — a true refusal that says
         # nothing about landing. Inherited by CloseBase and LrApiBase, so one
         # pin covers test_lr_close and test_web_lr too.
-        from tests._tmphome import pin_dispatch_home
+        from tests._tmphome import pin_dispatch_home, pin_live_seats
         self._real_home_repo_id = pin_dispatch_home(self, self.repo)
+        # THE STAND-IN RIDES THE BASE TOO (task/3039). setUpModule above covers
+        # this module only; the other 17 modules built on this base run under
+        # their own module, and their rows walked the host's process table.
+        pin_live_seats(self)
         # Generated lifecycle verdicts use the current author/tier producer via
         # self.mark_verdict below. Only receipt capability is disabled here:
         # these synthetic repositories have no suite to gate. Explicit frozen
@@ -321,6 +325,28 @@ class LandReqBase(unittest.TestCase):
             else:
                 os.environ[key] = value
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _built(repo):
+        """Build the fixture repository at `repo` and name its commits: trunk
+        a-b-c on the default branch, and `side`, one commit off a, which is
+        NOT on trunk until an integrator merges it (the READY/MERGED_LOCAL/
+        LANDED axis rides on it). Run once per process; see setUp."""
+        from tests._tmphome import plant_helm_root
+        repo_ = _TemplateRepo(repo)
+        repo_.git("init", "-q")
+        repo_.git("config", "user.email", "test@example.com")
+        repo_.git("config", "user.name", "Test")
+        main = repo_.git("symbolic-ref", "--short", "HEAD")
+        plant_helm_root(repo)
+        a = repo_.commit("a")
+        repo_.git("branch", "side", a)
+        b = repo_.commit("b")
+        c = repo_.commit("c")
+        repo_.git("checkout", "-q", "side")
+        side = repo_.commit("side", path="g")
+        repo_.git("checkout", "-q", main)
+        return {"main": main, "a": a, "b": b, "c": c, "side": side}
 
     def git(self, *args, cwd=None):
         p = subprocess.run(["git", "-C", cwd or self.repo, *args],
@@ -476,6 +502,18 @@ class LandReqBase(unittest.TestCase):
         return base
 
 
+class _TemplateRepo(object):
+    """LandReqBase's own `git` and `commit`, run on the template repository
+    it builds once per process, so the template and a per-test build cannot
+    differ in how a commit is made."""
+
+    git = LandReqBase.git
+    commit = LandReqBase.commit
+
+    def __init__(self, repo):
+        self.repo = repo
+
+
 class AFailureChunkIsNotAGateReceiptTest(LandReqBase):
     """The receipt index skips a failure chunk, whose id is not a receipt id.
 
@@ -497,6 +535,87 @@ class AFailureChunkIsNotAGateReceiptTest(LandReqBase):
         landreq._GATE_INDEX_MEMO.clear()
         self.assertEqual(landreq._gate_receipt_index(), {})
         self.assertNotIn(chunk["id"], landreq._gate_receipt_index())
+
+
+class TheFixtureRepositoryIsCopiedFromATemplateTest(LandReqBase):
+    """Every LandReqBase fixture gets its own copy of one repository built
+    once per process (task/3039).
+
+    MEASURED BEFORE: setUp spent about 21 git spawns per test building
+    commits a, b, c and side, the same four commits every time, across the 18
+    modules and about 1,900 tests that use this base (24% of lr_retire's
+    profile). The copy is per test, so nothing one test writes reaches the
+    template or the next test.
+    """
+
+    @contextlib.contextmanager
+    def _second_fixture(self):
+        """A second LandReqBase fixture in this same process, torn down when
+        the block ends.
+
+        INSIDE THE TEST BODY, NEVER AS THIS CASE'S CLEANUP. The second
+        fixture's tearDown restores the environment it found, which is THIS
+        case's. Registered with addCleanup it ran after this case's tearDown
+        and put this case's HELM_HOME and HELM_CHAT_DIR back, naming a
+        directory that tearDown had just removed: tests.test_dispatches then
+        failed 11 arms on "claim lock is unavailable" in a whole-module run.
+        tests/test_env_hygiene.py's DeletedTempPathTest is the arm for that."""
+        case = LandReqBase("setUp")
+        case.setUp()
+        try:
+            yield case
+        finally:
+            case.tearDown()
+            case.doCleanups()
+
+    def test_a_second_fixture_builds_no_repository(self):  # noqa: VACUOUS_ASSERTION — the counter is proven live under the same patch by the fixture's own commit, and the fixture's trunk is asserted
+        built = []
+        real = subprocess.run
+
+        def counting(argv, *a, **kw):
+            if list(argv[:1]) == ["git"] and ("init" in argv
+                                             or "commit" in argv):
+                built.append(argv)
+            return real(argv, *a, **kw)
+
+        with mock.patch.object(subprocess, "run", counting), \
+                self._second_fixture() as other:
+            by_setup = list(built)
+            other.commit("counted")
+            parent = other.git("rev-parse", "HEAD~1")
+        self.assertEqual(len(built), 1,
+                         "control: the counter sees a fixture's own commit")
+        self.assertEqual(parent, other.c,
+                         "control: the second fixture has its trunk")
+        self.assertEqual(by_setup, [], "setUp built its repository again")
+
+    def test_each_fixture_owns_its_copy(self):  # noqa: VACUOUS_ASSERTION — the empty status is controlled by the same `git status --porcelain` on this fixture's copy, asserted non-empty after its own write
+        """The must-miss: a copy is never shared and never written back."""
+        home = os.environ["HELM_HOME"]
+        with self._second_fixture() as other:
+            self.assertNotEqual(os.path.realpath(other.repo),
+                                os.path.realpath(self.repo))
+            self.assertEqual(
+                (other.a, other.b, other.c, other.side, other.main),
+                (self.a, self.b, self.c, self.side, self.main))
+            mine = self.commit("only in this fixture")
+            self.assertEqual(self.git("rev-parse", "HEAD"), mine)
+            self.assertEqual(other.git("rev-parse", "HEAD"), other.c)
+        with open(os.path.join(self.repo, "untracked"), "w") as fh:
+            fh.write("only in this fixture\n")
+        self.assertIn("untracked", self.git("status", "--porcelain"),
+                      "control: status reports a change in a copy")
+        with self._second_fixture() as third:
+            self.assertEqual(third.git("rev-parse", "HEAD"), third.c,
+                             "a test's commit reached the template")
+            self.assertEqual(third.git("status", "--porcelain"), "",
+                             "a test's file reached the template")
+            self.assertEqual(os.environ.get("HELM_CROSS_TREE_GATE"), "1",
+                             "control: the helm-tree mark still sets its "
+                             "override")
+        self.assertEqual(os.environ["HELM_HOME"], home,
+                         "a second fixture did not give this case its "
+                         "environment back")
 
 
 class GeneratedVerdictClockTest(LandReqBase):
@@ -1292,11 +1411,14 @@ class AlreadyOnTrunkTest(LandReqBase):
         body = {"withheld": {"scope": "fixture"}, "loops": cards,
                 "read_age_s": 1}
         _sec, joined = web_board._lands_join(lambda _qs: (body, 200))
-        loops = {c["lane"]: c for c in joined["fixture"]["lanes"]["loops"]}
-        self.assertEqual(sorted(loops),
-                         sorted((contained["lane"], loose["lane"])))
-        self.assertIs(loops[contained["lane"]]["trunk_contains_tip"], True)
+        lanes = joined["fixture"]["lanes"]
+        loops = {c["lane"]: c for c in lanes["loops"]}
+        # THE CONTAINED ROW IS COUNTED ON THE ON-MAIN LINE, not drawn as a
+        # card (task/2381); the loose row, a PROVEN no, is a live card
+        self.assertEqual(sorted(loops), [loose["lane"]])
         self.assertIs(loops[loose["lane"]]["trunk_contains_tip"], False)
+        self.assertEqual(lanes["on_main"]["lanes"], [contained["lane"]])
+        self.assertEqual(lanes["on_main"]["count"], 1)
 
     def test_a_foreign_row_gets_no_git_leg_even_when_its_tip_IS_on_trunk(self):  # noqa: VACUOUS_ASSERTION — the owned row is the unconditional positive control on the SAME observable and the SAME tip: out['own']['trunk_contains_tip'] is asserted True in this arm, so a board answering nothing goes red here
         """AUTHORITY IS NOT INHERITED FROM THE ORACLE, so it is asserted here.
@@ -1517,6 +1639,297 @@ class AlreadyOnTrunkTest(LandReqBase):
         self.assertIsNot(out["unanswerable"]["trunk_contains_tip"], False,
                          "a sha this repository has never seen is UNKNOWN, "
                          "and unknown must never be published as a no")
+
+
+class BuildBaseIsNotALandTest(LandReqBase):
+    """A BUILD ROW'S TIP IS THE BASE IT WAS SENT AGAINST, NOT ITS WORK.
+
+    The owner read two lanes as LANDED the moment they were sent: each was a
+    BUILD dispatched with `--ref` the trunk itself, so its pinned tip was
+    already on trunk and the containment walk said "ALREADY ON TRUNK — this
+    work is in history". No work existed yet. A build is building until its
+    lane carries a tip of its own; only then can that WORK be on trunk, and
+    the question is asked of the lane through `work.lanes_landed`, the
+    producer `helm work list` prints.
+
+    Every arm pairs the build row with the REVIEW row on the same pinned tip,
+    which is contained — so an annotator that stopped answering fails too."""
+
+    def _row(self, ref, lane, kind):
+        row = self.dispatch(ref=ref, lane=lane, kind=kind, deadline_s=60)
+        dispatches._mark_delivered(row["id"], "post-" + lane)
+        self.age(row["id"], 3600)
+        return row["id"]
+
+    def _lane(self, lane, base, commits=(), merge=False):
+        """A real lane branch under `lane/`, minted and committed on the way
+        a seat does it, so its reflog tells authorship the way it does live."""
+        branch = "lane/" + lane
+        self.git("branch", branch, base)
+        self.git("checkout", "-q", branch)
+        tip = base
+        for text in commits:
+            tip = self.commit(text, path=lane)
+        self.git("checkout", "-q", self.main)
+        if merge:
+            self.git("merge", "--no-edit", "-q", branch)
+        return tip
+
+    def get(self, rid):
+        return landreq.get(rid)[0]
+
+    def test_a_build_sent_against_trunk_itself_is_not_already_on_trunk(self):
+        build = self._row(self.c, "sent-at-trunk", "build")
+        review = self._row(self.c, "review-at-trunk", "review")
+        b, r = self.get(build), self.get(review)
+        self.assertEqual(b["state"], "AWAITING_BUILD")
+        self.assertIsNot(b["trunk_contains_tip"], True,
+                         "a build whose lane authored nothing was read as "
+                         "work already in history")
+        self.assertNotIn("ALREADY ON TRUNK", landreq._line(b))
+        self.assertTrue(b["stalled"], "a build nobody started is a stall; "
+                        "reading its base as landed silenced it")
+        # THE CONTROL, same pinned tip: a REVIEW of that commit IS contained
+        self.assertIs(r["trunk_contains_tip"], True)
+        self.assertIn("ALREADY ON TRUNK", landreq._line(r))
+        self.assertIs(landreq.card(r)["trunk_contains_tip"], True)
+        self.assertIsNot(landreq.card(b)["trunk_contains_tip"], True)
+
+    def test_a_build_sent_against_an_ancestor_of_trunk_is_not_landed_either(self):  # noqa: VACUOUS_ASSERTION — the review row on the SAME pinned tip is asserted `trunk_contains_tip` True by identity in this arm, and the build row's own state, stall and printed line are asserted present first
+        build = self.get(self._row(self.b, "sent-at-ancestor", "build"))
+        # THE POSITIVE CONTROL on the same row and line: it is the build,
+        # projected and billed, so the absent mark below is a measurement
+        self.assertEqual(build["state"], "AWAITING_BUILD")
+        self.assertTrue(build["stalled"])
+        self.assertIn("AWAITING_BUILD", landreq._line(build))
+        self.assertIsNot(build["trunk_contains_tip"], True)
+        self.assertNotIn("ALREADY ON TRUNK", landreq._line(build))
+        self.assertIs(self.get(self._row(self.b, "ctl-ancestor", "review"))
+                      ["trunk_contains_tip"], True)
+
+    def test_a_lane_claimed_at_trunk_with_nothing_authored_is_still_building(self):
+        build = self._row(self.c, "claimed-only", "build")
+        self._lane("claimed-only", self.c)
+        b = self.get(build)
+        self.assertIs(b["trunk_contains_tip"], False,
+                      "the lane was measured: it authored nothing, so none "
+                      "of this build's work is on trunk")
+        self.assertTrue(b["stalled"])
+
+    def test_a_lane_tip_of_its_own_that_is_not_on_trunk_is_building(self):
+        build = self._row(self.c, "built-open", "build")
+        self._lane("built-open", self.c, commits=("work",))
+        b = self.get(build)
+        # UNANSWERED, NOT NO: the lane holds commits trunk lacks by object id,
+        # and only patch identity — too dear to ask of every build row on
+        # every projection — could say whether they landed rebased
+        self.assertIsNone(b["trunk_contains_tip"])
+        # THE POSITIVE CONTROL on the same line: the row is there and billed
+        self.assertIn("AWAITING_BUILD", landreq._line(b))
+        self.assertTrue(b["stalled"])
+        self.assertNotIn("ALREADY ON TRUNK", landreq._line(b))
+
+    def test_a_lane_tip_of_its_own_that_reached_trunk_IS_already_on_trunk(self):
+        """THE OTHER HALF: once the lane carries work and that work is on
+        trunk, the build row really is a ledger gap — work in history with no
+        verdict — and says so exactly as a review row does."""
+        build = self._row(self.c, "built-landed", "build")
+        self._lane("built-landed", self.c, commits=("work",), merge=True)
+        b = self.get(build)
+        self.assertIs(b["trunk_contains_tip"], True)
+        self.assertIn("ALREADY ON TRUNK", landreq._line(b))
+        self.assertFalse(b["stalled"])
+
+    def test_the_gone_rungs_are_the_census_own_words(self):  # noqa: VACUOUS_ASSERTION — every rung assertion is an exact equality on a verdict the census returned, and the readable-chain control asserts the PLACED reason on the same row before the polarity rung is driven
+        """`FRONTIER_GONE_RUNGS` decides which UNCLASSIFIED rows the owner
+        board folds away, so each of its words is driven through the census
+        here: a reviewed commit git gc really pruned answers `object`, and a
+        placed row whose chain polarity cannot be read answers `polarity`."""
+        self.git("checkout", "-q", "-b", "doomed", self.a)
+        doomed = self.commit("doomed", path="doomed")
+        self.git("checkout", "-q", self.main)
+        row = self.dispatch(ref=doomed, lane="pruned-away-lane")
+        dispatches._mark_delivered(row["id"], "post-pruned")
+        _out, err = self.mark_verdict(row["id"], doomed, "reviewed",
+                                      polarity="fix")
+        self.assertIsNone(err, err)
+        self.git("branch", "-D", "doomed")
+        self.prune(doomed)
+        got = landreq.off_frontier_reason(self.get(row["id"]))
+        self.assertEqual(got["reason"], landreq.OFF_FRONTIER_UNCLASSIFIED)
+        self.assertEqual(got["rung"], "object")
+        self.assertIn(got["rung"], landreq.FRONTIER_GONE_RUNGS)
+        placed = self.commit("placed-on-trunk", path="placed")
+        other = self.dispatch(ref=placed, lane="placed-away-lane")
+        dispatches._mark_delivered(other["id"], "post-placed")
+        _out, err = self.mark_verdict(other["id"], placed, "reviewed",
+                                      polarity="fix")
+        self.assertIsNone(err, err)
+        lrs, _raw, unavailable = landreq.project_raw()
+        self.assertIsNone(unavailable)
+        # THE CONTROL: with the chain readable the row is PLACED
+        self.assertEqual(landreq.frontier_verdicts([lrs[other["id"]]],
+                                                   lrs=lrs)[other["id"]]
+                         ["reason"], landreq.OFF_FRONTIER_LANDED_ANCESTRY)
+        with mock.patch.object(landreq, "_chain_polarity",
+                               return_value=(None, None, "chain unreadable")):
+            got = landreq.frontier_verdicts([lrs[other["id"]]],
+                                            lrs=lrs)[other["id"]]
+        self.assertEqual(got["reason"], landreq.OFF_FRONTIER_UNCLASSIFIED)
+        self.assertEqual(got["rung"], "polarity")
+        self.assertEqual(set(landreq.FRONTIER_GONE_RUNGS),
+                         {"object", "polarity"})
+
+    def test_the_census_does_not_place_a_build_by_its_base_either(self):  # noqa: VACUOUS_ASSERTION — the verdicted review on the SAME pinned commit is asserted PLACED by exact reason in this arm, and the build's rung is an exact equality on a verdict the census returned
+        """THE ANNOTATOR'S CURE HAS A SIBLING IN THE CENSUS. `off_frontier_reason`
+        reads a row's dispatch ref when it has no reviewed tip, and for a
+        BUILD that ref is the base it was sent against: a build sent at trunk
+        whose builder has not yet claimed its lane — no branch, no room, no
+        lease — walked the ladder to `landed-by-ancestry`, so the owner board
+        folded a build nobody had started into "left over after landing" and
+        `helm lr retire --off-frontier` offered to close it as landed. A build
+        with no reviewed tip has no commit to place: UNCLASSIFIED at the `tip`
+        rung, which the board keeps listed (`scheduler.collapse_class` None)
+        and the retire door never takes. THE CONTROL is a VERDICTED review on
+        the same commit, which IS placed by ancestry (an unverdicted review
+        has no full-sha tip of its own and answers the `tip` rung too) — so a
+        census that stopped placing anything fails here as well."""
+        from helm import scheduler
+        build = self.get(self._row(self.c, "sent-unclaimed", "build"))
+        review = self._row(self.c, "review-unclaimed", "review")
+        _out, err = self.mark_verdict(review, self.c, "reviewed",
+                                      polarity="fix")
+        self.assertIsNone(err, err)
+        got = landreq.off_frontier_reason(build)
+        self.assertEqual(got["reason"], landreq.OFF_FRONTIER_UNCLASSIFIED,
+                         "a build was placed by the base it was sent "
+                         "against: %r" % got)
+        self.assertEqual(got["rung"], "tip")
+        self.assertIsNone(scheduler.collapse_class(
+            {"frontier": got["reason"], "frontier_rung": got["rung"]}),
+            "the owner board folded a build nobody has started")
+        ctl = landreq.off_frontier_reason(self.get(review))
+        self.assertEqual(ctl["reason"], landreq.OFF_FRONTIER_LANDED_ANCESTRY,
+                         ctl)
+
+    # -- task/2381 round 2: patch identity for free --------------------------
+
+    def _picked(self, lane):
+        """A lane whose one authored commit lands on trunk by CHERRY-PICK, the
+        way this repository lands: trunk carries the same patch under a new
+        object id, so ancestry cannot see it. -> the lane's own tip."""
+        tip = self._lane(lane, self.c, commits=("work " + lane,))
+        # `-x` names the source commit, as a train's pick does: without a
+        # message of its own, a pick made in the same second as the commit it
+        # copies IS that commit, and trunk would hold it by ancestry
+        self.git("cherry-pick", "-x", tip)
+        return tip
+
+    @staticmethod
+    def _git_argv():
+        """(argvs, patch): every git argv any caller spawns while the patch is
+        active — landreq's own `_git`, the vcs backend `work` asks through,
+        and anything else that reaches `subprocess.run`."""
+        argvs, real = [], subprocess.run
+
+        def spy(argv, *a, **kw):
+            if isinstance(argv, (list, tuple)) and argv \
+                    and os.path.basename(str(argv[0])) == "git":
+                argvs.append([str(x) for x in argv])
+            return real(argv, *a, **kw)
+        return argvs, mock.patch.object(subprocess, "run", spy)
+
+    def test_a_cherry_picked_build_lane_is_on_trunk_by_its_kept_patch_proof(self):
+        """FINDING 4, RULED: `lanes_landed(content=False)` answers UNKNOWN for
+        every lane this repository lands by cherry-pick (37 of the 92 live
+        build lanes), because only patch identity can see a land under a new
+        object id and that leg walks every trunk patch since the lane's base.
+        The durable landing-proof ledger the census reads already holds that
+        answer for every tip a review proved, so it is consulted before an
+        UNKNOWN stands — and nothing on this path runs `git cherry`.
+
+        THE CONTROL is a second build whose lane landed the SAME way with no
+        proof kept: it stays UNKNOWN — None, never a no — carries no ALREADY
+        ON TRUNK and no BEHIND, and its stall clock is left as it was."""
+        build = self._row(self.c, "built-picked", "build")
+        control = self._row(self.c, "picked-unproved", "build")
+        tip = self._picked("built-picked")
+        self._picked("picked-unproved")
+        repo_id = self.get(build)["repo_id"]
+        trunk = self.git("rev-parse", "HEAD")
+        # THE LEDGER HOLDS WHAT A REVIEW OF THIS TIP PROVED, written through
+        # its one door from a real derive against this trunk (MUST-HIT)
+        self.assertEqual(landreq._landing_proof(repo_id, tip, trunk),
+                         landreq.PROOF_PATCH_EQUIVALENT)
+        argvs, spy = self._git_argv()
+        with spy:
+            b, c = self.get(build), self.get(control)
+        self.assertIs(b["trunk_contains_tip"], True)
+        self.assertEqual(b["trunk_contains_proof"],
+                         landreq.PROOF_PATCH_EQUIVALENT)
+        self.assertIn("ALREADY ON TRUNK", landreq._line(b))
+        self.assertFalse(b["stalled"])
+        self.assertIsNone(c["trunk_contains_tip"])
+        self.assertIsNone(c["trunk_contains_proof"])
+        self.assertTrue(c["stalled"])
+        line = landreq._line(c)
+        self.assertIn("AWAITING_BUILD", line)
+        self.assertNotIn("ALREADY ON TRUNK", line)
+        self.assertNotIn("BEHIND", line)
+        self.assertGreater(len(argvs), 0, "MUST-HIT: the projection asked git")
+        self.assertEqual([a for a in argvs if "cherry" in a], [],
+                         "the build-lane path ran git cherry")
+
+    def test_a_retired_cherry_picked_lane_is_answered_by_the_same_ledger(self):  # noqa: VACUOUS_ASSERTION — the None before the proof is the control for the True asserted by identity on the same row after it
+        """A RETIRED lane keeps its tip under `refs/helm-retired/`, and a
+        retired tip trunk holds only by patch identity is UNKNOWN to the cheap
+        read exactly as a live one is."""
+        from helm.work import _gc
+        build = self._row(self.c, "retired-picked", "build")
+        tip = self._picked("retired-picked")
+        self.git("update-ref", _gc.RETIRED_NS + "lane/retired-picked", tip)
+        self.git("branch", "-D", "lane/retired-picked")
+        repo_id = self.get(build)["repo_id"]
+        self.assertIsNone(self.get(build)["trunk_contains_tip"],
+                          "THE CONTROL: before the proof is kept the retired "
+                          "lane is UNKNOWN")
+        self.assertEqual(landreq._landing_proof(repo_id, tip,
+                                                self.git("rev-parse", "HEAD")),
+                         landreq.PROOF_PATCH_EQUIVALENT)
+        b = self.get(build)
+        self.assertIs(b["trunk_contains_tip"], True)
+        self.assertEqual(b["trunk_contains_proof"],
+                         landreq.PROOF_PATCH_EQUIVALENT)
+
+    def test_a_kept_ANCESTOR_proof_never_lands_a_lane_the_reflog_cannot_date(self):  # noqa: VACUOUS_ASSERTION — the cherry-picked control on the same projection is asserted True by identity, and the fixture's UNKNOWN lane is asserted by exact state first
+        """THE LEDGER IS READ FOR PATCH IDENTITY ONLY. A lane at a trunk
+        commit whose reflog is gone is UNKNOWN because landed and never
+        started look the same there; a kept `ancestor` proof for that commit
+        says only what the producer already measured, and reading it as a
+        land is how a build sent at trunk read LANDED before anybody wrote a
+        line. THE CONTROL on the same projection: the patch-identity proof of
+        a cherry-picked lane IS taken."""
+        build = self._row(self.b, "no-reflog", "build")
+        picked = self._row(self.c, "picked-ctl", "build")
+        self._lane("no-reflog", self.b)
+        os.unlink(os.path.join(self.repo, ".git", "logs", "refs", "heads",
+                               "lane", "no-reflog"))
+        tip = self._picked("picked-ctl")
+        repo_id = self.get(build)["repo_id"]
+        trunk = self.git("rev-parse", "HEAD")
+        self.assertEqual(landreq._landing_proof(repo_id, self.b, trunk),
+                         landreq.PROOF_ANCESTOR)
+        self.assertEqual(landreq._landing_proof(repo_id, tip, trunk),
+                         landreq.PROOF_PATCH_EQUIVALENT)
+        from helm import work
+        root = os.path.dirname(repo_id.rstrip(os.sep))
+        self.assertEqual(work.lanes_landed(root, ["no-reflog"], content=False)
+                         ["no-reflog"]["state"], work.LANE_UNKNOWN,
+                         "MUST-HIT: the fixture is the unreadable-reflog lane")
+        self.assertIsNone(self.get(build)["trunk_contains_tip"],
+                          "a kept ancestor proof landed a lane whose reflog "
+                          "cannot say it authored anything")
+        self.assertIs(self.get(picked)["trunk_contains_tip"], True)
 
 
 class ProjectionScopeTest(LandReqBase):

@@ -155,12 +155,12 @@ class RungTimingTest(LeaseLatchBase):
         # no opinion about the order, only about every transition being
         # announced. A second copy of a fact cannot notice the first one
         # moved. `response` is published by the caller and ends no boundary
-        # here, so the chain runs to `mechanical`.
+        # here, so the chain runs to `claim-evidence`.
         rungs = seats_stop_budget.RUNGS
         expected = tuple(zip(rungs[:-2], rungs[1:-1]))
         self.assertEqual(expected[0], ("identity", rungs[1]),
                          "control: the derived chain starts at the first rung")
-        self.assertEqual(expected[-1][1], "mechanical",
+        self.assertEqual(expected[-1][1], "claim-evidence",
                          "control: the derived chain ends at the last boundary")
         for name, next_name in expected:
             hits = [line for line in lines
@@ -169,25 +169,25 @@ class RungTimingTest(LeaseLatchBase):
             self.assertEqual(len(hits), 1, (name, next_name, lines))
             self.assertIn("elapsed=", hits[0])
             self.assertIn("total=", hits[0])
-        self.assertEqual(sum("DONE mechanical " in line for line in lines), 1,
+        self.assertEqual(sum("DONE claim-evidence " in line for line in lines),
+                         1, lines)
+        # THE LADDER NO LONGER FOLDS THE DISPATCH LEDGER: that span is gone,
+        # not renamed — the `helm web` resident computes the stop facts.
+        self.assertFalse(any("dispatch-ledger" in line for line in lines),
                          lines)
-        self.assertEqual(sum("BEGIN dispatch-ledger " in line for line in lines),
-                         1, lines)
-        self.assertEqual(sum("DONE dispatch-ledger " in line for line in lines),
-                         1, lines)
 
-    def test_interrupted_dispatch_leaves_its_begin_line_as_the_last_stage(self):  # noqa: VACUOUS_ASSERTION — the final BEGIN line is the unconditional positive control; DONE must be absent because interruption occurred inside that exact span
+    def test_interrupted_rung_leaves_its_begin_line_as_the_last_stage(self):  # noqa: VACUOUS_ASSERTION — the final BEGIN line is the unconditional positive control; DONE must be absent because interruption occurred inside that exact span
         self.claim("db-migration")
         out = io.StringIO()
-        with mock.patch.object(stop_guard_impl, "_ledger_snapshot",
+        with mock.patch.object(stop_guard_impl, "claims_rung",
                                side_effect=KeyboardInterrupt), \
                 contextlib.redirect_stderr(out), \
                 self.assertRaises(KeyboardInterrupt):
             self.guard()
         lines = [line for line in out.getvalue().splitlines()
                  if line.startswith("[helm stop-guard timing]")]
-        self.assertIn("BEGIN dispatch-ledger ", lines[-1], lines)
-        self.assertFalse(any("DONE dispatch-ledger " in line for line in lines),
+        self.assertIn("BEGIN claims ", lines[-1], lines)
+        self.assertFalse(any("DONE claims " in line for line in lines),
                          lines)
 
     def test_continuing_stop_times_only_the_warn_path(self):
@@ -683,11 +683,12 @@ class TheClaimsRungCallSiteBindsEveryFreeNameTest(unittest.TestCase):
     WHY THIS NEEDS AN ARM AND THE EXTRACTION ITSELF DID NOT. The moved body is
     byte-identical to the closure it replaced, so nothing in the rung can drift
     on its own. The CALL SITE is the new surface: as a closure, `blocks`,
-    `warns` and the dispatch snapshot were simply in scope and could not be
-    forgotten. Now they are keywords with defaults, and a caller that drops one
-    fails SILENTLY — `dispatch_snapshot=None` makes the lazy `_ledger()` raise
-    inside a fail-open rung, which is a guard that quietly stops reading the
-    dispatch ledger while every test of the rung's own logic stays green.
+    `warns` and the stop's one reading of the facts were simply in scope and
+    could not be forgotten. Now they are keywords with defaults, and a caller
+    that drops one fails SILENTLY — a dropped `facts` makes the rung take a
+    second, unsettled reading of the stop facts, so two rungs of one stop can
+    judge two different readings while every test of the rung's own logic
+    stays green.
 
     Read off the AST rather than the source text, so reformatting the call
     cannot pass while dropping an argument.

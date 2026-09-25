@@ -465,13 +465,13 @@ def _melded_with(peer, span_h, own, now=None):
             # glance, exactly like a seat label.
             return True, _clip(_scrub(str(st.get("room") or "?")), SEAT_BYTES)
     return False, "no converged meld with %s inside the window" % peer
-def _spiral_gate(session, room, seat, dispatch_snapshot=None):
-    """(block | None, warn | None) for the review-spiral rung."""
+def _spiral_gate(session, room, seat, dispatch_snapshot=None, spiral=None):
+    """(block | None, warn | None); `spiral` is review_spiral's own answer."""
     if _off("STOP_GUARD_SPIRAL") or not seat:
         return None, None
     from . import dispatches
     try:                      # fail-open TOTAL — a Stop rung must never wedge
-        info, err = dispatches.review_spiral(seat, snap=dispatch_snapshot)
+        info, err = spiral or dispatches.review_spiral(seat, snap=dispatch_snapshot)
     except Exception as _swallowed:
         record.swallow("seats_stop_signals._spiral_gate", _swallowed)
         return None, None

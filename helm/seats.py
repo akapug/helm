@@ -351,8 +351,7 @@ from .seats_work_offer import (  # noqa: F401
 # imports it is a cycle.
 from .seats_room_advice import (  # noqa: F401
     _ROOM_READS, _ROOM_ROWS_SHOWN,
-    _dispatch_advice, _ledger_snapshot, _missed, _room_advice,
-    _room_unfinished,
+    _dispatch_advice, _missed, _room_advice, _room_unfinished,
 )
 from .seats_stop_guard import (  # noqa: F401
     LEASE_LATCH, LEASE_TTL_ALARM_S, NDP_LATCH, _ndp_gate, stop_guard,
@@ -696,6 +695,20 @@ def _impl_modules(_stems=_IMPL_MODULES, _pkg=__name__.rsplit(".", 1)[0]):
 #   wrote there; a diverged sibling is left alone, because something else
 #   owns it now.
 _FANOUT_OWNERS = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_FANOUT_OWNERS": (
+        "what the facade last wrote to each sibling; a restore acts only "
+        "while the sibling still holds it"),
+    # Defined in seats_identity, which sits at its line budget; declared
+    # here, where the facade re-exports the same set.
+    "_FOREIGN_WARNED": (
+        "warn-once keys; the arms that assert the warning "
+        "(test_honest_presence) clear it first"),
+}
+
 _MISSING = object()
 
 

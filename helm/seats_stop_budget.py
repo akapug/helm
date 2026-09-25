@@ -15,114 +15,23 @@ from . import projscope, seats_stop_timing
 BUDGET_S = 17.5
 
 # A fat-tail rung starts only when its fitted cost AND its successors still
-# fit. OBSERVED_MAX_S includes the fresh 6.942s seam that falsified an exact
-# historical-max bound. COST_MARGIN is an INFERRED engineering choice: the
+# fit. OBSERVED_MAX_S once included the fresh 6.942s seam that falsified an
+# exact historical-max bound (the seam and claims rows are re-measured below). COST_MARGIN is an INFERRED engineering choice: the
 # measured seam drifted 6.8% above the pinned 6.500s maximum, so 1.25x leaves
 # further headroom; ADMISSION_COST_S rounds that product upward to a tenth. Any
 # rung exceeding its fitted cost, or outer `timeout 20` firing before fallback,
 # falsifies this fit and requires remeasurement. The local deadline remains
 # ambient-reserve, so overrun yields UNKNOWN instead of consuming the tail.
 #
-# THE dispatch-ledger PIN WAS FALSIFIED AND THE READ PATH WAS CURED, NOT THE
-# NUMBER (helm task/2394). The falsification is this module's own
-# instrument rather than an argument: `~/.helm/helm/pause-ops/stopprobe.log`
-# carried 175 records for this rung, p50 4.499s, p90 6.984s, p95 7.091s, max
-# 7.395s — 65 of them ABOVE the 5.139s pinned maximum, 31 above the 6.5s
-# admission cost, and 22 ladders whose rung ended at or past the 7.5s local
-# reserve, which is the cut that publishes COVERAGE UNKNOWN. The population is
-# censored at that cut, so the true tail is unknowable from it, and the fleet
-# spent those stops telling every seat to confirm its lane by hand.
-#
-# WHY A REFIT WAS REFUSED. The cost was not a constant to be re-pinned: profiled
-# on the live 14,444-event, 8,166,754-byte ledger, a cold `dispatches.snapshot()`
-# cost 5.384s of which 2.362s was TWO `carried`-close `carriage_proof`
-# re-derivations (18 git subprocesses, one `merge-tree --write-tree` at 1.183s
-# and one `git cherry` at 0.619s) and 1.059s was the successor-frontier rescan
-# (98 parents x ~2,650 rows = 259,881 liveness predicate calls). One term grows
-# with the carried-close count AND with trunk's own length; the other is
-# quadratic in the ledger's history. No margin survives either, so the cure is
-# in WHAT THE READ DOES, never in how much of the file it reads:
-# `dispatches._successor_frontier` now asks its cheap `supersedes` discriminator
-# before the liveness predicate, which takes that scan from 259,881 predicate
-# calls to a few hundred. THE FOLD STILL READS AND FOLDS THE WHOLE LEDGER —
-# `eventledger.checked_events` returns every event and `dispatches._fold` walks
-# all of them — and deliberately so: parsing the 14,444 lines measured
-# 0.060-0.104s, 2% of the rung, so an offset index over the appended bytes would
-# have cured 2% of this.
-#
-# AND THE CARRIAGE WITNESS IS NOT MEMOISED, DELIBERATELY. A durable memo of the
-# ancestry/patch-identity verdict is the obvious cure for the rest of that cost,
-# and it cannot be made correct: git answers about an id through a HISTORY VIEW,
-# and `refs/replace`, `info/grafts` and a shallow boundary each reinterpret the
-# same immutable ids without changing one of them, so a stored answer owes both a
-# semantic generation refusing every entry written under a different
-# interpretation and a view held immutable from the eligibility probe through the
-# witness. So `dispatches.carriage_proof` derives BOTH witness families on every
-# read instead, under
-# a view it PINS — replacement objects off and `GIT_GRAFT_FILE` at `os.devnull`,
-# the overlay `landreq._object_view` already defines — and REFUSES a shallow
-# repository outright, because there the parent objects are absent rather than
-# hidden.
-#
-# MEASURED WITH THE WITNESS STORE IN PLACE, same ledger, alternating cold
-# processes against trunk: 1.162-1.768s before, 0.397-1.024s after, with the
-# expensive git reads gone (18 spawns and 1.079s down to 6 spawns and 0.014s).
-# THOSE TWO NUMBERS BELONG TO THE STORE, AND THE STORE IS CUT — they describe an
-# arm this module no longer ships.
-#
-# THE SHIPPED READ'S COST, MEASURED ON THE FINAL TREE. Timed through THIS name —
-# `seats_room_advice._ledger_snapshot` -> `dispatches.snapshot()`, which is what
-# `seats_stop_guard` hands to `timing.measure("dispatch-ledger")` — on THE TREE
-# THIS COMMENT SHIPS IN, identified by the property that decides the cost rather
-# than by a sha a fresh clone cannot resolve: no witness store exists anywhere
-# under `helm/` and both witness families are re-derived on every read. The exact
-# tree of the run is recorded on the lane's review row. Against the live
-# 14,567-event, 8,349,380-byte ledger and the real helm home, read-only, five
-# cold processes, ONE call each:
-#
-#   load 29.7-30.7   median 3.351s (52% of the 6.5s below)  min 1.578s  max 4.452s
-#
-# Two carriage witnesses are derived per read, counted by spying the shipped
-# `dispatches.carriage_proof` call. ALL FIVE SAMPLES FIT ADMISSION_COST_S, the
-# slowest at 68% of it, on a box carrying a load average near 30. That is the
-# cost of the read this module budgets for.
-#
-# THE THREE ROWS BELOW ARE NOT THAT MEASUREMENT, and they are kept because they
-# are why the cut happened. They are the PRE-DELETION comparison — store-DISABLED
-# against store-ENABLED arms on the predecessor tree, the remembering write
-# replaced by a no-op, author-reported at that time against a 14,540-event,
-# 8,301,262-byte ledger, five cold processes per arm interleaved so box load is
-# common-mode:
-#
-#   load 10.4-10.8   store DISABLED 1.532s median (24% of 6.5s)  enabled 1.058s
-#   load 9-15        store DISABLED 4.470s median (69%)          enabled 5.425s
-#   load 27-51       store DISABLED 8.384s median (129%)         enabled 6.161s (95%)
-#
-# Witness time alone in those runs was 0.795s median without the store against
-# 0.374s with it. So the store bought about 0.4s at LOW load; at load 9-15 the
-# arm WITHOUT it was the faster of the two; and at load 27-51 the ENABLED median
-# fit ADMISSION_COST_S (6.161s under 6.5s) while the DISABLED median did NOT
-# (8.384s), with one enabled run producing a 12.867s TAIL sample rather than a
-# failing median. The cut rests on the correctness class the store carried being
-# removed, and on those comparative figures — not on a claim that the store
-# never mattered, and not on them being measurements of the code that ships.
-#
-# THAT BOX LOAD, RATHER THAN THE MEMO, SETS THE ABSOLUTE SCALE IS AN INFERENCE
-# drawn from interleaved observations, never a controlled isolation of load: on
-# the same instrument 7.677s at load 24-60 against 1.099s at load ~10 with the
-# memo disabled, plus the three rows above, where the ordering by load survives
-# the store being switched either way. Read it as the reason a constant pinned
-# from one box is untrustworthy on the next, which is why the pin below waits for
-# a production population.
-#
-# THE THREE CONSTANTS BELOW ARE DELIBERATELY UNCHANGED, and that is a posture,
-# not an oversight. Lowering them re-derives ADMISSION_COST_S downward, which
-# only ADMITS the rung more often — the direction this defect wants — but the
-# honest input for a new pin is a post-cure PRODUCTION population, and the
-# instrument that would supply it writes only above its 3.0s slow threshold.
-# Re-pin from the stop-ladder rung of `helm doctor` — which is what reads
-# `stopprobe.log` (see helm/stopprobe.py `read` and `findings`) — once this cure
-# has been running on the fleet, not from this box.
+# THE dispatch-ledger PIN IS GONE BECAUSE ITS RUNG IS GONE. The ladder read
+# the dispatch ledger through one shared, budgeted fold that the claims,
+# beacon, spiral and whisper rungs all drew on; it measured p50 7.4s against a
+# 7.5s wall on a busy fleet, and no pin could fit it, because its cost was
+# CPU times box load and both kept moving. The fold now happens in the `helm
+# web` resident, off every hook path (helm/stopfacts_resident.py), and the
+# rungs read its facts through O(1) witnesses (helm/stopfacts.py). Nothing on
+# this ladder runs as `dispatch-ledger` any more, so its observed maximum,
+# admission cost and reserve were deleted rather than left to be re-pinned.
 #
 # THE `wiring` PIN, AND WHY THE RUNG HAD NONE UNTIL IT CAUSED AN OUTAGE. This
 # rung walked the package's import graph under NO fitted cost and NO reserve,
@@ -185,13 +94,42 @@ BUDGET_S = 17.5
 # only, and a stale pin on one of those is still able to spend its successors'
 # time; that is the next rung to make interruptible, not a property this
 # module already has.
+#
+# THE claims AND seam PINS WERE RE-MEASURED WHEN THEIR WORK LEFT THE STOP
+# (task/3042). Both rungs now read the `helm web` resident's stop facts
+# (helm/stopfacts.py) instead of folding the ledger, asking git per lease and
+# walking every worktree, and neither waits on a reading. Their old pins
+# (claims 5.250s observed, 6.6s admitted, 8.0s reserved behind it; seam
+# 6.942s, 8.7s) described the old work, and an admission pin that large
+# refuses a millisecond rung on any stop that is slow for another reason:
+# claims could not start after 2.9s of ladder, seam after 6.8s. Measured on
+# the task/3042 lane tip, `helm chat stop-guard --hook-json` in its own
+# process over a COPY of the live home and chat dir with a resident running
+# on it, the integrator's session holding seven lane leases (six live lanes
+# and the scratch lane each post-commit cell commits in) among 16 claims,
+# n=10 per cell, fresh and post-commit interleaved with the predecessor tree,
+# in two runs at two loads:
+#
+#   load 11.6-13.2  claims  fresh median 0.046s max 0.076s  post-commit median 0.044s max 0.069s
+#                   seam    fresh median 0.005s max 0.009s  post-commit median 0.007s max 0.009s
+#   load 21.8-27.8  claims  fresh median 0.048s max 0.104s  post-commit median 0.064s max 0.140s
+#                   seam    fresh median 0.007s max 0.031s  post-commit median 0.009s max 0.050s
+#
+# The busier run's maxima are the pins: the same 1.25x margin, rounded
+# upward to a tenth, admits claims at 0.2s and seam at 0.1s. (Fitted to the
+# quiet run alone, claims would have pinned at 0.1s, and the busy run then
+# falsified it at 0.104s and 0.140s — the load-drift the wiring note above
+# measured, one rung over.) The claims RESERVE was 8.0s because the seam's
+# 6.5-8.7s fat tail came after it; what claims now owes is beacon and spiral
+# at the ordinary 0.3s each, seam's fitted 0.1s and seam's own 2.0s reserve:
+# 2.7s, which is also what `reserve()` derives for it. The seam reserve is
+# unchanged — it is owed to the rungs AFTER seam, whose cost this change did
+# not move.
 MEASURED_RUNS = 339
 COST_MARGIN = 1.25
-OBSERVED_MAX_S = {"dispatch-ledger": 5.139, "claims": 5.250, "seam": 6.942,
-                  "wiring": 4.615}
-ADMISSION_COST_S = {"dispatch-ledger": 6.5, "claims": 6.6, "seam": 8.7,
-                    "wiring": 5.8}
-RESERVE_S = {"dispatch-ledger": 10.0, "claims": 8.0, "seam": 2.0}
+OBSERVED_MAX_S = {"claims": 0.140, "seam": 0.050, "wiring": 4.615}
+ADMISSION_COST_S = {"claims": 0.2, "seam": 0.1, "wiring": 5.8}
+RESERVE_S = {"claims": 2.7, "seam": 2.0}
 
 # ORDER IS THE CHEAPEST HALF OF THIS BUDGET, AND IT WAS THE HALF NOBODY SET.
 #
@@ -221,11 +159,11 @@ RESERVE_S = {"dispatch-ledger": 10.0, "claims": 8.0, "seam": 2.0}
 # session that stopped (see `seats_stop_guard`, the latch that exists because
 # of it) — so deferring it costs the fleet one stop's notice of a standing
 # condition, while running it early cost the fleet every perishable rung behind
-# it. The three rungs still after it are the cheap ones: a WARN about claims
-# with no measurement, a silent index/scratch leg, and the response publisher.
+# it. The two rungs still after it are the cheap ones: a WARN about claims
+# with no measurement, and the response publisher. (The silent index/scratch
+# leg that once ran between them moved to the `helm web` resident.)
 RUNGS = ("identity", "inbox", "claims", "beacon", "spiral", "seam",
-         "ndp", "punt", "whisper", "wiring", "claim-evidence", "mechanical",
-         "response")
+         "ndp", "punt", "whisper", "wiring", "claim-evidence", "response")
 
 # WHAT AN UNPINNED RUNG COSTS, AND WHY THE TABLE MAY NOT STAY AN ALLOWLIST.
 #

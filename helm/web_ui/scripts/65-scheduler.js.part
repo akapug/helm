@@ -96,6 +96,19 @@ function schedulerAsksHTML(model, edgeMap) {
     : "";
 }
 
+/* WHAT THE GRAPH DOES NOT DRAW (task/2381): the model's groups hold live
+   obligations only, and every other non-terminal row is counted on one line
+   per class — its count, its oldest age, and the command that lists it. An
+   older server sends no lines and none is drawn. */
+function schedulerFoldHTML(model) {
+  const lines = model && Array.isArray(model.collapsed) ? model.collapsed : [];
+  return lines.length ? '<section class="schfolds">' + lines.map(c => '<div class="schfold"><b>'
+      + esc(String(c.count)) + "</b> " + esc(c.label || "")
+      + (typeof c.oldest_age_s === "number" ? ", oldest " + esc(lrDur(c.oldest_age_s)) : "")
+      + " — <code>" + esc(c.command || "") + "</code> lists them</div>").join("") + "</section>"
+    : "";
+}
+
 function schedulerHTML(d) {
   if (!d || d.pending)
     return '<div class="schwarming">scheduler not read yet — this is not an empty graph</div>';
@@ -139,12 +152,16 @@ function schedulerHTML(d) {
     + (suc.zero ? "zero" : "debt") + '"><strong>SUC · '
     + esc(schedulerSUC(suc, true)) + "</strong><span>"
     + (suc.zero ? "zero SUC — healthy live rows may remain" : schedulerSUC(suc, false))
-    + '</span></div><div class="schhero"><strong>' + esc(String(model.row_count))
-    + '</strong><span>non-terminal rows · ' + esc(String(model.active_count))
+    + '</span></div><div class="schhero"><strong>'
+    + esc(String(typeof model.listed_count === "number" ? model.listed_count : model.row_count))
+    + '</strong><span>' + (typeof model.listed_count === "number"
+      ? "live of " + esc(String(model.row_count)) + " non-terminal rows"
+      : "non-terminal rows") + " · " + esc(String(model.active_count))
     + ' active</span></div><div class="schfresh">' + esc(fresh)
     + ' · <a href="#work" data-scheduler-list>the kanban above, row by row ↑</a></div></div>'
-    + asksHTML + (graph ? '<div class="schgraph">' + graph + "</div>"
-      : '<div class="schempty">the read succeeded: no non-terminal land-request rows</div>');
+    + asksHTML + schedulerFoldHTML(model) + (graph ? '<div class="schgraph">' + graph + "</div>"
+      : '<div class="schempty">the read succeeded: no live land-request rows'
+        + (model.collapsed_count ? " — the lines above count the rest" : "") + "</div>");
 }
 
 function schedulerWire() {

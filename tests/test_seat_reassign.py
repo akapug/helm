@@ -3347,3 +3347,10 @@ class ATargetTheMoversCannotAddressTest(ReassignBase):
             self.assertEqual((rc, audit["remaining"]["leases"]), (1, 2),
                              "\n".join(lines))
             self.assertTrue(any("leases x2" in l for l in lines), lines)
+
+
+def setUpModule():
+    """No dispatch row this module writes walks the host's process table
+    (task/3039; see tests._tmphome.pin_live_seats)."""
+    from tests._tmphome import pin_live_seats
+    pin_live_seats()

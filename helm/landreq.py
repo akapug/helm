@@ -353,9 +353,17 @@ def _approval_refusal(row, index=None, epoch=None):
         return (_unknown_gate_caps_why(row), tier_state)
     bound = bool(dispatches._GATE_ID.fullmatch(str(row.get("gate") or "")))
     if requirement == "required" and not bound:
-        return (("approved with no minted gate receipt — run `helm gate run` on "
-                 "the reviewed tip and re-verdict with the evidence line it "
-                 "prints"), tier_state)
+        # THE REPAIR THE LAND SEQUENCE RUNS, and the same one the verdict door
+        # names (dispatches.mark_verdict). A whole suite on the reviewed tip
+        # is NOT that repair: nothing lands that tree, since the integrator
+        # rebases it, and the gate verb refuses a lane whole suite
+        # (task/3039).
+        return (("approved with no minted gate receipt — an approve binds the "
+                 "whole suite on the tree that LANDS, which is the "
+                 "integrator's train. If the source read is clean, hold it: "
+                 "`helm dispatch hold <row> --source-clean <tip> <reason>`, "
+                 "and record the approve against the token the train's land "
+                 "gate mints"), tier_state)
     return None, tier_state
 
 
@@ -876,8 +884,40 @@ def _ready_receipt_refusal(row, receipts):
     return None
 
 
+def live_ready(lr):
+    """True for a row that is READY AND not terminal: approved work that can
+    still land. THE ONE PREDICATE for that question, so every reader asks it
+    the same way.
+
+    THE STATE WORD ALONE IS THE WRONG KEY. The projection keeps the stored
+    state READY on a row that has since closed (closed-by-landing keeps the
+    verdict state by design) and marks the row `terminal`. The first live dry
+    run of `helm train` found 459 READY rows for helm, 457 of them closed as
+    landed, and `helm lr compose` admitted such a row when an integrator
+    passed its id, with only its patch-id screen behind it. Its readers:
+    `helm lr list` and `lr show` (the READY marks), `helm train` (its cars),
+    `helm lr compose` (its admission) and `ready_rung_why` (the ladder)."""
+    return isinstance(lr, dict) and str(lr.get("state")) == "READY" \
+        and not lr.get("terminal")
+
+
 def ready_rung(lr, index=None, contest=None, contributors=None):
-    """The SPECIFIC rung this READY row fails, or None when all pass.
+    """The SPECIFIC rung this READY row fails, or None when all pass — the
+    word alone. `ready_rung_why` is the ladder and carries the rung's reason
+    beside it; this is its one-word projection, so the two cannot drift."""
+    return ready_rung_why(lr, index=index, contest=contest,
+                          contributors=contributors)[0]
+
+
+def ready_rung_why(lr, index=None, contest=None, contributors=None):
+    """(rung, why) — the SPECIFIC rung this READY row fails and the sentence
+    that says why, or (None, None) when all pass.
+
+    THE REASON RIDES WITH THE RUNG because UNVERIFIED FOLDS SEVERAL UNKNOWNS
+    into one word — an unreadable contributor chain, an unreadable contest
+    join, a row helm could not observe, a receipt the ledger cannot speak for
+    — and a reader that must act differently on each (`helm train` excludes
+    the first and keeps the others) cannot recover which one from the word.
 
     Returns one of _READY_RUNG_ORDER, or "UNVERIFIED" when a rung cannot be
     EVALUATED (receipt absent from the ledger, trunk unreadable). UNVERIFIED is
@@ -922,8 +962,6 @@ def ready_rung(lr, index=None, contest=None, contributors=None):
     five open rows sat ready-on-a-dead-base at once, receipts internally
     perfect, every instrument reporting health (the task/266 finding), because
     nothing on this board computed behind-ness for a ready row."""
-    if str(lr.get("state")) != "READY":
-        return None
     # NO LIVE RUNG REACHES A TERMINAL ROW (round four, dispatch da34a297:
     # "Scope report and ready_word to nonterminal rows"). The projection mints
     # closed rows whose STORED state is READY — closed-by-landing keeps the
@@ -936,9 +974,9 @@ def ready_rung(lr, index=None, contest=None, contributors=None):
     # off refusals filed AFTER they closed, 95 READY-UNVERIFIED, two
     # READY-SELF-REVIEW. The contest door already answers empty for terminal
     # rows; this guard is what scopes the OTHER rungs, and the whole ladder
-    # with them.
-    if lr.get("terminal"):
-        return None
+    # with them. It is `live_ready`, the predicate every READY reader asks.
+    if not live_ready(lr):
+        return None, None
     # INDEPENDENCE IS A PROPERTY OF THE CHAIN. The rung keeps its name — every
     # consumer from the web board to the land nudge keys on SELF-REVIEW, and
     # the question it asks is still "did nobody independent look" — but the
@@ -949,11 +987,11 @@ def ready_rung(lr, index=None, contest=None, contributors=None):
     # rides the ladder's existing word for a rung it could not EVALUATE: an
     # unreadable chain never reaches plain READY.
     index = _gate_receipt_index() if index is None else index
-    independent, _why = independent_review(lr, index=contributors, receipts=index)
+    independent, why = independent_review(lr, index=contributors, receipts=index)
     if independent is None:
-        return "UNVERIFIED"
+        return "UNVERIFIED", why
     if not independent:
-        return "SELF-REVIEW"
+        return "SELF-REVIEW", why
     # CONTESTED — A REFUSAL ON THIS TIP THAT THIS ROW'S CHAIN CANNOT SEE.
     #
     # Measured 2026-08-06 and it nearly cost data: the todos-sweep lane read READY on
@@ -976,10 +1014,14 @@ def ready_rung(lr, index=None, contest=None, contributors=None):
     # this bites at the DOOR. READY is an INSTRUCTION — it prints a land
     # command — so a row carrying an unanswered FIX must not reach it.
     contested, span, err = contest_report(lr, index=contest)
-    if err:
-        return "UNVERIFIED"           # could not look; never a pass
+    if err:                           # could not look; never a pass
+        return "UNVERIFIED", ("UNKNOWN — the refusals on this tip could not "
+                              "be read (%s), so whether an unanswered FIX "
+                              "stands on it is unknown" % err)
     if contested and span and span <= CONTEST_WORK_SPAN:
-        return "CONTESTED"
+        return "CONTESTED", ("an unanswered FIX or SUPERSEDE stands on this "
+                             "tip (%d piece%s of work cite it)"
+                             % (span, "" if span == 1 else "s"))
     # UNOBSERVABLE IS A RUNG, AND ITS PLACE IN THE LADDER IS THE POINT. A row
     # helm could not observe has no measured base and no measured landedness,
     # so every rung BELOW this one reads instruments that were never taken —
@@ -989,10 +1031,13 @@ def ready_rung(lr, index=None, contest=None, contributors=None):
     # need no repository, so an unobservable row can still be refused for the
     # loudest reasons. It sits BEFORE the token rung, which is where the
     # repo-dependent evidence begins.
-    if lr.get("observable") is False:
-        return "UNVERIFIED"           # helm looked and could not; never a pass
-    if _ready_receipt_refusal(lr, index):
-        return "UNVERIFIED"
+    if lr.get("observable") is False:  # helm looked and could not; never a pass
+        return "UNVERIFIED", ("UNKNOWN — helm could not observe this row's "
+                              "repository: %s"
+                              % observe_reason(lr.get("observe_why")))
+    refusal = _ready_receipt_refusal(lr, index)
+    if refusal:
+        return "UNVERIFIED", refusal
     # RECEIPT VERSION IS DELIBERATELY NOT A RUNG HERE. It reads like one -- a
     # hostless pre-v4 receipt cannot bind to the tree it names -- and 81 of the
     # 131 live READY rows carry one. But the land door's landability check is
@@ -1021,15 +1066,16 @@ def ready_rung(lr, index=None, contest=None, contributors=None):
     behind = lr.get("base_behind")
     if isinstance(behind, int) and not isinstance(behind, bool) \
             and behind >= STALE_BASE_BEHIND:
-        return "STALE-BASE"
-    return None
+        return "STALE-BASE", ("the base lacks %d trunk commits (the line is "
+                              "%d)" % (behind, STALE_BASE_BEHIND))
+    return None, None
 
 
 def ready_word(lr, index=None, contest=None, contributors=None):
     """The state word a reader should SEE: plain READY only when every rung
     passes, else READY-<RUNG>. Every other state is returned untouched — and
     so is a TERMINAL row's, because a rung is door-caution for a row that can
-    still land (the terminal guard in `ready_rung`, round four)."""
+    still land (the terminal guard in `ready_rung_why`, round four)."""
     rung = ready_rung(lr, index=index, contest=contest,
                       contributors=contributors)
     return "READY-%s" % rung if rung else str(lr.get("state"))
@@ -1069,13 +1115,18 @@ def base_state(lr, stale_at=None):
 
 
 TERMINAL = ("LANDED", "SUPERSEDED", "ABANDONED", "DELIVERED_REPORT",
-            "RETIRED")
+            "RETIRED", "RETRACTED")
 _TERMINAL_ANNOTATIONS = (
     # FIRST, because it is EXCLUSIVE: the retire writer refuses over any other
     # standing terminal and every other writer refuses over it, so a row can
     # carry this annotation and no other. Reading it first is what lets a
     # surface name the terminal without asking four questions.
     ("retired_admin", "retire_ts", "RETIRED"),
+    # EXCLUSIVE THE SAME WAY (task/3060): a retraction refuses over any other
+    # terminal and every other terminal refuses over it, so the land nudge and
+    # the board say RETRACTED and never READY over a verdict that was taken
+    # back.
+    ("verdict_retracted", "retract_ts", "RETRACTED"),
     ("abandoned", "abandon_ts", "ABANDONED"),
     ("discharged", "discharge_ts", "DISCHARGED"),
     ("withdrawn", "withdraw_ts", "WITHDRAWN"),
@@ -4207,6 +4258,26 @@ OFF_FRONTIER_LANDED_PATCH_ID = "landed-by-patch-id"
 OFF_FRONTIER_ABANDONED = "abandoned-unreachable"
 OFF_FRONTIER_UNCLASSIFIED = "unclassified"
 
+#: THE UNCLASSIFIED RUNGS WHOSE ROW IS GONE, not merely unread. An
+#: UNCLASSIFIED answer is "counted as work owed" on the header (`filed_line`),
+#: and for most rungs that is exactly right: a reading failed (`lane-family`,
+#: `room`, `lease`, `trunk`, `live-hold`, `landing`), a ref outside the lane
+#: family still holds the tip (`reachability`), or — the common one — the row
+#: has no verdict tip to place (`tip`), which is every fresh review whose free
+#: text label matches no branch name. MEASURED on the live board: six
+#: AWAITING_REVIEW rows dispatched that day answered `tip`, each a review
+#: somebody owed. Only two rungs describe a row nobody can move: `object`,
+#: reached only after the lane, its room and its lease were all measured gone,
+#: where the reviewed commit no longer resolves in the repository at all; and
+#: `polarity`, where git PLACED the work off the frontier and only the close
+#: route could not be read. The owner board folds those two into a line of
+#: their own (`scheduler.collapse_class`) and keeps every other UNCLASSIFIED
+#: row listed — AN ALLOWLIST, so a rung added tomorrow keeps its rows on the
+#: list, the direction that cannot hide an obligation. The arm
+#: `test_the_gone_rungs_are_the_census_own_words` drives both rungs through
+#: the census so a renamed rung goes red.
+FRONTIER_GONE_RUNGS = ("object", "polarity")
+
 #: The three measurements that ADMIT a retirement. `unclassified` is
 #: deliberately absent: it is the bucket for every reading that did not
 #: happen, and a door keyed on this tuple can therefore never open on one.
@@ -4289,8 +4360,20 @@ def _off_frontier_tip(lr):
     review bound and the only one whose arrival on trunk says anything. A row
     with no verdict falls back to the dispatch ref it was sent against. A row
     with neither cannot be classified at all, which is UNCLASSIFIED and not a
-    licence to guess from the lane name."""
-    for key in ("reviewed_tip", "tip"):
+    licence to guess from the lane name.
+
+    A BUILD'S DISPATCH REF IS THE BASE IT WAS SENT AGAINST, NOT ITS WORK — the
+    same fact `_annotate_build_lanes` states for the containment mark. A build
+    sent at trunk pins a commit trunk holds the moment it is sent, so reading
+    that ref here walked a build nobody had started, its lane not yet claimed,
+    to `landed-by-ancestry`: the owner board folded it into "left over after
+    landing" and `helm lr retire --off-frontier` offered to close it as landed.
+    An unverdicted build has no commit to place, which is the `tip` rung's
+    honest answer (work owed, never retirable); a verdicted one is placed by
+    its reviewed tip exactly as a review is."""
+    keys = ("reviewed_tip",) if lr.get("kind") == "build" \
+        else ("reviewed_tip", "tip")
+    for key in keys:
         value = lr.get(key)
         if isinstance(value, str) and _FULL_SHA_RE.fullmatch(value.strip()):
             return value.strip().lower()
@@ -5548,6 +5631,10 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
     # the row out of the stalled / contrary / unmeasurable counts in one step
     # rather than four.
     admin_retired = bool(row.get("retired_admin"))
+    # A RETRACTED VERDICT (task/3060) is terminal the same way: its authority
+    # was withdrawn by a later event, the polarity replays UNDECLARED, and the
+    # row ends here rather than reading REVIEWED and owed by nobody-undeclared.
+    retracted = bool(row.get("verdict_retracted"))
     close_reason = row.get("close_reason")
     delivered_report = row.get("status") == "closed" \
         and close_reason == "delivered-report"
@@ -5653,7 +5740,7 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
     # non-approve verdict, and that is true). Only the DEBT is retired, exactly
     # as `discharged` does. The banner keeps rendering and gains a reason.
     evidence_consumed = bool(consumed) and rid in consumed and live_contrary
-    retired = abandoned or closed_by_landing or admin_retired \
+    retired = abandoned or closed_by_landing or admin_retired or retracted \
         or close_reason is not None and not close_contradicted \
         or (discharged or withdrawn) and not withdraw_contradicted \
         or evidence_consumed
@@ -5662,7 +5749,7 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
     active_contrary = live_contrary and not (
         discharged or (withdrawn and not withdraw_contradicted)
         or close_reason is not None and not close_contradicted
-        or evidence_consumed or admin_retired)
+        or evidence_consumed or admin_retired or retracted)
     # WHEN THE ROW ENTERED ITS POST-VERDICT STATE — and `or` answered the wrong
     # question. A verdict event carrying no readable ts is a verdict at an
     # UNKNOWN instant, and the fallthrough dated it from the DELIVERY instead:
@@ -5705,6 +5792,9 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
         # old stage instant here would keep a 27-day dwell growing under a
         # terminal that ended it.
         state, entered = "RETIRED", row.get("retire_ts")
+    elif retracted:
+        # DATED BY THE RETRACTION, for the retirement's reason one arm up.
+        state, entered = "RETRACTED", row.get("retract_ts")
     elif delivered_report:
         state, entered = "DELIVERED_REPORT", row.get("close_ts")
     elif build_landed:
@@ -6064,6 +6154,18 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
             "retire_seat": row.get("retire_seat"),
             "retire_note": row.get("retire_note"),
             "retire_ts": row.get("retire_ts"),
+            # THE RETRACTION, WHOLE, for the retirement's reason above: what
+            # was withdrawn, by whose door, what it now reads, how the hand
+            # knows, and which row carries the review now (task/3060).
+            "verdict_retracted": retracted,
+            "retracted_polarity": row.get("retracted_polarity"),
+            "retract_reason": row.get("retract_reason"),
+            "retract_reads": row.get("retract_reads"),
+            "retract_basis": row.get("retract_basis"),
+            "retract_seat": row.get("retract_seat"),
+            "retract_role": row.get("retract_role"),
+            "retract_successor": row.get("retract_successor"),
+            "retract_ts": row.get("retract_ts"),
             "close_reason": close_reason,
             "close_ts": row.get("close_ts"),
             "close_evidence": row.get("close_evidence"),
@@ -8054,6 +8156,35 @@ def project_raw(now=None, selector=None, repo_id=None, scope=None, cache=None):
 CARRIER_PROOFS = "carrier-proofs.jsonl"   # append-only; see _carrier_proof_ledger
 _CARRIER_PROOF_MEMO = {}
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_ANCESTRY_MEMO": (
+        "one entry keyed by the stamp of what it folds; a changed input "
+        "misses"),
+    "_CARRIER_PROOF_MEMO": (
+        "one entry keyed by the stamp of what it folds; a changed input "
+        "misses"),
+    "_CHAIN_CONTRIB_MEMO": (
+        "one entry keyed by the stamp of what it folds; a changed input "
+        "misses"),
+    "_CONTEST_MEMO": (
+        "one entry keyed by the stamp of what it folds; a changed input "
+        "misses"),
+    "_GATE_INDEX_MEMO": (
+        "one entry keyed by the stamp of what it folds; a changed input "
+        "misses"),
+    "_LAND_PROOF_MEMO": (
+        "one entry keyed by the stamp of what it folds; a changed input "
+        "misses"),
+    "_LEDGER_FOLD_MEMO": (
+        "one entry keyed by the stamp of what it folds; a changed input "
+        "misses"),
+    "_TRUNK_INDEX_MEMO": (
+        "one entry keyed by the stamp of what it folds; a changed input "
+        "misses"),
+}
+
 
 def carrier_proofs_path():
     return home.global_dir() + "/" + CARRIER_PROOFS
@@ -8467,6 +8598,41 @@ def _unbill_contained(lr):
     lr["stalled"] = False
 
 
+#: THE STATES A ROW HOLDS BEFORE ANY VERDICT IS RECORDED.
+PRE_VERDICT_STATES = ("OPEN", "AWAITING_REVIEW", "AWAITING_BUILD")
+
+
+def on_main_unverdicted(row):
+    """Is this row's WORK on main with NO VERDICT recorded? True only when
+    both halves are proven; every other answer is False, never a guess.
+
+    ONE PREDICATE FOR EVERY SURFACE THAT ASKS (task/2381). `helm lr list`'s
+    ALREADY ON TRUNK mark and the card's copy of it (the pipeline wall), the
+    scheduler's collapsed line (`scheduler.collapse_class`) and the kanban's
+    count line (`web_board._kanban_split`, through that same call) all read
+    this function, so a row cannot be counted "on main" by one surface and
+    listed as a wait by the one beside it — which the owner board did to 8
+    of the integrator's 16 listed waits while the kanban folded on the
+    containment mark and the scheduler never read it.
+
+    CONTAINMENT ALONE IS NOT THE QUESTION. `_annotate_trunk_containment`
+    measures every row whose own git leg came back unobserved, and a
+    verdicted row can be one. MEASURED on the live trunk board: seven rows whose work trunk holds by patch identity carried a recorded
+    APPROVE, CONCUR or FIX with `observable` False, and the kanban counted
+    them — two FIX rows owed by their author among them — as "no verdict
+    recorded", while `lr list` printed the same words on each. A recorded
+    verdict, or any state a verdict produced, keeps the row out: a row on
+    main under a live FIX is a contradiction somebody owes, never ledger
+    debris.
+
+    It reads three fields every card has carried since the containment mark
+    shipped — `trunk_contains_tip`, `state`, `polarity` — so a projection
+    row, a wire card and an older warm body all answer alike."""
+    return row.get("trunk_contains_tip") is True \
+        and row.get("state") in PRE_VERDICT_STATES \
+        and not row.get("polarity")
+
+
 def _annotate_trunk_containment(out, eligible=None, gitdir=None,
                                 proof=None, cache=None):
     """Does trunk ALREADY CONTAIN this row's own tip? Asked of the oracle the
@@ -8530,6 +8696,7 @@ def _annotate_trunk_containment(out, eligible=None, gitdir=None,
     proof = proof or _landing_proofs(gitdir)
     pin = getattr(proof, "pin", None)
     source = eligible or {}
+    builds, pins = {}, {}
     for rid, lr in out.items():
         # A terminal row is history and an observable row already has the
         # answer from its own leg; neither is a question this annotator owns.
@@ -8558,6 +8725,21 @@ def _annotate_trunk_containment(out, eligible=None, gitdir=None,
         # the oracle's own `_pin`, never from a second `_trunk_refs` read here.
         trunk = pin(lr.get("repo_id")) if pin else None
         got = _ancestry(lr.get("repo_id"), tip, trunk) if trunk else UNDETERMINED
+        # A BUILD ROW'S PINNED TIP IS ITS BASE, NOT ITS WORK. A build sent
+        # with `--ref` the trunk itself pins a commit trunk contains the
+        # moment it is sent, and asking containment of THAT commit read it
+        # "ALREADY ON TRUNK" and stopped its stall clock before anybody had
+        # written a line: the owner saw two lanes LANDED as they were sent.
+        # The work lives on the build's LANE, so the question goes there
+        # (`_annotate_build_lanes`), once per repository. The base distance
+        # is still the base's own fact, and it is kept.
+        if lr.get("kind") == "build":
+            if got == NOT_ANCESTOR and cache is not None:
+                lr["tip_behind_trunk"] = _base_behind(
+                    lr.get("repo_id"), tip, cache)
+            builds.setdefault(lr.get("repo_id"), []).append(lr)
+            pins[lr.get("repo_id")] = trunk
+            continue
         if got == ANCESTOR:
             lr["trunk_contains_proof"] = PROOF_ANCESTOR
             lr["trunk_contains_tip"] = True
@@ -8620,6 +8802,98 @@ def _annotate_trunk_containment(out, eligible=None, gitdir=None,
         lr["trunk_contains_tip"] = _PROOF_DISCHARGE.get(p)
         if lr["trunk_contains_tip"]:
             _unbill_contained(lr)
+    _annotate_build_lanes(builds, pins)
+
+
+def _build_lane(lane):
+    """The `helm work` lane name a build row's lane label names: the label
+    with its `lane/` branch prefix taken off, or None for no label."""
+    name = str(lane or "").strip()
+    name = name[len("lane/"):] if name.startswith("lane/") else name
+    return name or None
+
+
+def _annotate_build_lanes(builds, pins=None):
+    """Is a BUILD's WORK on trunk? Asked of its lane, never of its base.
+
+    `builds` is {repo_id: [build rows]} from `_annotate_trunk_containment`,
+    and `pins` its {repo_id: trunk sha}, the oracle's own pin for each.
+    THE ANSWER IS `work.lanes_landed`'s, the producer `helm work list` and the
+    board's lane column already print, so a lane reads one way on every
+    surface: LANDED — the lane authored commits and trunk carries them — is
+    True; UNSTARTED (at trunk with nothing authored: the build has not begun)
+    and UNLANDED (a kept full verdict) are False, a MEASURED no; GONE and
+    UNKNOWN are None, because no lane under that name is not proof the work
+    never landed — a builder may have claimed the lane under another name.
+
+    ANCESTRY AND AUTHORSHIP ONLY (`content=False`), because this runs for
+    every open build row on every projection: the producer's patch-identity
+    leg walks every trunk patch since a stale lane's base, which measured in
+    minutes over the live board's build lanes. So a lane tip trunk does not
+    hold by object id answers UNKNOWN from the producer — and that is every
+    lane this repository lands by cherry-pick, and every retired one: 37 of
+    the 92 live build lanes answered it the day this was measured, beside 2
+    LANDED.
+
+    PATCH IDENTITY FOR FREE, BEFORE AN UNKNOWN STANDS (`_lane_patch_proof`).
+    The durable landing-proof ledger the census already reads keeps the
+    patch-identity answer for every tip a review or the census proved, and a
+    build lane's tip is usually exactly the tip its review read. Reading it
+    spawns nothing and never runs `git cherry`. An UNKNOWN the ledger cannot
+    answer stays None: it is not contained, not proven absent, and bills
+    nobody for a rebase (`lr list` prints BEHIND only on a proven no).
+
+    A repository whose binding is not a `<checkout>/.git` directory has no
+    checkout to hand the producer, and a producer that raises answers
+    nothing; both leave every row None, never False."""
+    from . import work
+    answers = {work.LANE_LANDED: True, work.LANE_UNLANDED: False,
+               work.LANE_UNSTARTED: False}
+    for gitdir, rows in builds.items():
+        bound = str(gitdir or "").rstrip(os.sep)
+        root = os.path.dirname(bound) \
+            if os.path.basename(bound) == ".git" else None
+        lanes = {}
+        for lr in rows:
+            lane = _build_lane(lr.get("lane"))
+            if root and lane:
+                lanes.setdefault(lane, []).append(lr)
+        if not lanes:
+            continue
+        try:
+            got = work.lanes_landed(root, sorted(lanes), content=False)
+        except Exception:               # noqa: BLE001 — unread is None, never no
+            continue
+        for lane, members in lanes.items():
+            verdict = got.get(lane) or {}
+            answer = answers.get(verdict.get("state"))
+            proof = None if answer is None else verdict.get("proof")
+            if verdict.get("state") == work.LANE_UNKNOWN:
+                proof = _lane_patch_proof(gitdir, verdict.get("tip"),
+                                          (pins or {}).get(gitdir))
+                answer = True if proof else None
+            for lr in members:
+                lr["trunk_contains_tip"] = answer
+                lr["trunk_contains_proof"] = proof
+                if answer:
+                    _unbill_contained(lr)
+
+
+def _lane_patch_proof(gitdir, tip, pin):
+    """PROOF_PATCH_EQUIVALENT when the durable landing-proof ledger holds
+    that proof for this lane tip against `pin` (exactly, or carried forward
+    over a kept ancestry pair), else None. Spawns nothing.
+
+    PATCH IDENTITY ONLY, AND THE ANCESTOR WORD IS REFUSED ON PURPOSE. The
+    producer already asked ancestry and authorship of this tip: a tip it
+    found on trunk by object id and still answered UNKNOWN is one whose
+    reflog could not say whether the lane authored anything — landed and
+    never started look the same there. A kept `ancestor` proof for that tip
+    says only what the producer already knew, and taking it as a land is how
+    a build sent at trunk read LANDED before anybody wrote a line."""
+    return PROOF_PATCH_EQUIVALENT \
+        if _kept_landing_proof(gitdir, tip, pin) == PROOF_PATCH_EQUIVALENT \
+        else None
 
 
 def _annotate_frontier_debt(out, current, gitdir=None, proof=None):
@@ -9237,7 +9511,24 @@ def ref_tables(lr, cache):
     return cache[gitdir]
 
 
-def filed_split(lrs, raw):
+def census_verdicts(lrs, raw):
+    """{row id: off_frontier_reason(...)} for exactly the rows `filed_split`
+    classifies — the open bucket, this board's own rows — with each placed
+    row's door asked, on one walk.
+
+    THE BOARD READS THIS ONE WALK THREE TIMES and pays for it once: the
+    header's split (`filed_split`), the scheduler's collapsed lines and the
+    kanban's, which read each card's `frontier` word. Before, only the split
+    kept the answer and the per-row verdicts were thrown away, so the one
+    surface that needed them — the owner's list — had no way to say which
+    rows are left over without a second walk, and a second walk is a second
+    instant free to disagree with the strip beside it."""
+    return frontier_verdicts([lr for lr in open_bucket_rows(lrs)
+                              if _this_boards_row(lr)], lrs=lrs,
+                             world=frontier_world(raw))
+
+
+def filed_split(lrs, raw, verdicts=None):
     """The all-time FILED population behind the board, partitioned. ONE owner
     for the derivation: /api/lr's card strip and `helm lr list`'s headers both
     render this split, and two walks would let the two surfaces disagree about
@@ -9327,9 +9618,11 @@ def filed_split(lrs, raw):
     # population — so `frontier_world` hands the classification the ledger
     # instant it was already holding, and every placed row comes back carrying
     # whether its door would close it.
-    verdicts = frontier_verdicts([lr for lr in open_rows
-                                  if _this_boards_row(lr)], lrs=lrs,
-                                 world=frontier_world(raw))
+    # `verdicts` IS `census_verdicts` of this same projection when the caller
+    # already walked it (the web build does, to stamp each card); omitted,
+    # the walk is taken here exactly as before.
+    if verdicts is None:
+        verdicts = census_verdicts(lrs, raw)
     for lr in lrs.values():
         if not lr["terminal"]:
             # ASKED AND COULD NOT FINISH IS NOT OUTSTANDING WORK, and it is
@@ -13873,6 +14166,9 @@ def _retired_by(lr):
         return "abandon"
     if lr.get("retired_admin"):
         return "retire --reason %s" % lr.get("retire_reason")
+    if lr.get("verdict_retracted"):
+        return "retract (its %s verdict was taken back)" % str(
+            lr.get("retracted_polarity") or "undeclared").upper()
     if lr.get("close_reason"):
         return "close --reason %s" % lr["close_reason"]
     return None

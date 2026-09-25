@@ -432,6 +432,13 @@ def _rooms_summary(roster=None):
 # instead of by per-test clears. Prod cardinality: one root, one entry.
 _ROOMS_SUM_CACHE = {}           # chat-root -> (computed_at, summary)
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_ROOMS_SUM_CACHE": "keyed by chat root and bounded by a TTL",
+    "_ROOM_ROWS_MEMO": "keyed by room file and checked against its stat",
+}
+
 # HOW LONG THE SUMMARY MAY BE SERVED WITHOUT RECOMPUTING.
 #
 # MEASURED, `_rooms_summary` called straight through on the owner's own chat

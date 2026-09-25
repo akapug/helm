@@ -49,6 +49,9 @@
 .schsup.dangling{color:var(--warn)}
 .schdrop{padding:8px 12px;color:var(--mut);font-size:var(--f1);border-top:1px solid var(--line)}
 .schempty{padding:22px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--card);color:var(--mut)}
+.schfolds{margin:0 0 12px;padding:8px 14px;border:1px dashed var(--line);border-radius:var(--r-lg);background:var(--card)}
+.schfold{font-size:var(--f1);color:var(--mut);padding:2px 0;overflow-wrap:anywhere}
+.schfold b{color:var(--fg)}
 @media(max-width:680px){
   .schhead{display:grid;grid-template-columns:1fr 1fr}
   .schfresh{grid-column:1/-1}

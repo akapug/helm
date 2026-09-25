@@ -1368,10 +1368,12 @@ function lrMarks(c, reason) {
   if (c.withdraw_contradicted)
     marks.push({k: "bad", t: "WITHDRAWN, yet the change is on trunk — the withdrawal's premise no longer holds"});
   // THE SAME WORDS `helm lr list` PRINTS (landreq_cli._line) for a row whose
-  // pinned tip main already holds with no verdict recorded — without them
-  // this card draws it as a plain AWAITING_REVIEW row. Tri-state on the
-  // wire: only a proven true says it.
-  if (c.trunk_contains_tip === true)
+  // work main already holds with no verdict recorded — without them this
+  // card draws it as a plain AWAITING_REVIEW row. The server's own answer
+  // (`on_main_unverdicted`, `landreq.on_main_unverdicted`), never re-derived
+  // here: containment alone is also true of a row under a recorded FIX, and
+  // these words would call that contradiction "no verdict".
+  if (c.on_main_unverdicted === true)
     marks.push({k: "warn", t: "ALREADY ON TRUNK — this work is in history and the row "
       + "has NO VERDICT recorded; it is a LEDGER gap (a review that never "
       + "happened), not a slow reviewer and not a rebase its author owes"});

@@ -688,7 +688,25 @@ class JobAuthorityTest(RouteBase):
         self.assertEqual(rc, 0)
         routed.assert_called_once_with(
             "snoozy", repo=self.repo, label=None, timeout=None,
-            as_json=False, focus=True)
+            as_json=False, focus=True, sliced=False)
+
+    def test_sliced_box_reaches_the_routed_sliced_mode(self):
+        """`--sliced --box HOST` once dropped --sliced and ran a SERIAL
+        suite on the box without a word."""
+        with mock.patch.object(gateroute, "cmd_route", return_value=0) as routed:
+            rc = gate._cmd_run(["--sliced", "--box", "snoozy",
+                                "--repo", self.repo])
+        self.assertEqual(rc, 0)
+        routed.assert_called_once_with(
+            "snoozy", repo=self.repo, label=None, timeout=None,
+            as_json=False, focus=False, sliced=True)
+        with mock.patch.object(gateroute, "route",
+                               return_value=(None, "stop here")) as route, \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            gateroute.cmd_route("snoozy", repo=self.repo, sliced=True)
+        route.assert_called_once_with(repo=self.repo, box="snoozy",
+                                      label=None, timeout=None, sliced=True)
 
     def test_focus_plan_never_routes_even_when_box_is_spelled(self):  # noqa: VACUOUS_ASSERTION — the named local-only refusal is the positive effect; cmd_route is positively exercised by the preceding focus-box arm
         err = io.StringIO()
@@ -1154,6 +1172,31 @@ class HappyPathTest(RouteBase):
         self.assertIsNone(result)
         self.assertIn("mode changed", err)
 
+    def test_a_sliced_route_asks_for_slices_and_imports_only_the_sliced_kind(self):  # noqa: VACUOUS_ASSERTION — the script is asserted to carry --sliced on both launch lines and each refusal text positively; HappyPathTest's serial import is the control that the same ledger door writes
+        serial = self._receipt()
+        transport = self._happy(serial)
+        result, err = self._route(transport, sliced=True)
+        self.assertIsNone(result)
+        self.assertEqual(transport.calls[0]["script"].count("--json --sliced"),
+                         2)
+        self.assertIn("the remote sliced command returned a serial receipt",
+                      err)
+        sliced = self._receipt(v=gate.SLICE_VERSION,
+                               argv=["/usr/bin/python3",
+                                     "/dev/shm/helm-job.abc123/tree/helm/"
+                                     "gateslice.py"],
+                               slice_authority={"kind": "gateslice"})
+        transport = self._happy(sliced)
+        result, err = self._route(transport)
+        self.assertIsNone(result)
+        self.assertNotIn("--sliced", transport.calls[0]["script"])
+        self.assertIn("the remote serial whole-suite command returned a "
+                      "sliced receipt", err)
+        self.assertEqual(self._ledger(), [])
+        result, err = self._route(FakeTransport(), focus=True, sliced=True)
+        self.assertIsNone(result)
+        self.assertIn("focused or sliced, never both", err)
+
     def test_a_replayed_identical_receipt_refuses_not_noops(self):  # noqa: VACUOUS_ASSERTION — the replay refusal text is the positive effect and ledger len==1 (not 0) is an unconditional non-empty read
         """Review finding 6 flipped this arm's polarity: an honest fresh run
         mints a NEW receipt (ts is in the content id), so byte-identity with
@@ -1477,7 +1520,7 @@ class RemoteValueSafetyTest(RouteBase):
     def test_nonfatal_import_warning_preserves_routed_authority(self):
         row = self._receipt()
         with mock.patch.object(
-                gateimport, "import_receipt",
+                gateimport, "import_routed_suite",
                 return_value=(row, "imported", "audit pointer append failed")):
             result, err = self._route(self._happy(row))
         self.assertIsNone(err)
@@ -1487,7 +1530,7 @@ class RemoteValueSafetyTest(RouteBase):
     def test_import_refusal_text_is_laundered_at_the_route_sink(self):  # noqa: VACUOUS_ASSERTION — preserved refusal text is the positive effect; absent ESC and empty ledger prove laundering and no import, with HappyPathTest controlling successful import
         row = self._receipt()
         with mock.patch.object(
-                gateimport, "import_receipt",
+                gateimport, "import_routed_suite",
                 return_value=(None, None, "\x1b[31mremote refusal\x1b[0m")):
             result, err = self._route(self._happy(row))
         self.assertIsNone(result)

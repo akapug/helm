@@ -669,6 +669,14 @@ _BACKUPS_MAX_AGE_S = 300
 
 _BACKUPS_CACHE = {}       # backup-root -> (built_at, fingerprint, rows)
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_BACKUPS_CACHE": (
+        "keyed by backup root and checked against the directory's "
+        "fingerprint and age on every read"),
+}
+
 _BACKUPS_LOCK = threading.Lock()
 
 

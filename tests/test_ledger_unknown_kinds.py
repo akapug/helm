@@ -243,9 +243,14 @@ def _seq_writers(sources):
     def plus_one(node):
         return isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)
 
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
+    # THE WRITER IS THE OUTERMOST FUNCTION: its body runs as a nested
+    # `attempt` (`dispatches._ledger_write`), which is no writer of its own.
+    outer = [n for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    outer += [m for n in tree.body if isinstance(n, ast.ClassDef)
+              for m in n.body
+              if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for fn in outer:
         for sub in ast.walk(fn):
             if isinstance(sub, ast.Dict) and any(
                     isinstance(k, ast.Constant) and k.value == "seq"
@@ -280,6 +285,7 @@ _SEQ_WRITER_ARMS = {
     "_record_close_landed_proven": ("close-landed",),
     "_record_close_proven": ("close",),
     "record_delivered_report_correction": ("close-correction",),
+    "_record_retract": ("retract",),
 }
 
 
@@ -367,6 +373,11 @@ _WRITERS = (
     ("close-correction", None,
      lambda test, rid: dispatches_close.record_delivered_report_correction(
          rid, *_REPORT)),
+    ("retract",
+     lambda test, rid: dispatches.mark_verdict(rid, test.side, "matrix probe",
+                                               polarity="fix"),
+     lambda test, rid: dispatches.retract(rid, "matrix probe", "unknown",
+                                          "inferred")),
     ("findings pass", None,
      lambda test, rid: findingspass._run_locked(rid, 1)),
     ("stale-cure redispatch", None,
@@ -778,6 +789,13 @@ class SeqCollisionsSurfaceTest(_Base):
 
     def test_the_row_is_in_the_report(self):
         self.assertIn("check_dispatch_seq_collisions", doctor.CHECKS)
+
+
+def setUpModule():
+    """No dispatch row this module writes walks the host's process table
+    (task/3039; see tests._tmphome.pin_live_seats)."""
+    from tests._tmphome import pin_live_seats
+    pin_live_seats()
 
 
 if __name__ == "__main__":

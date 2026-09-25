@@ -103,10 +103,16 @@ this typed answer, and `line()` is a consumer of it like any other:
                        False — UNUSABLE, a MEASURED refusal
                        None  — UNKNOWN, helm could not tell
         holding        int, or None when the ledger would not read
+        refusal        the measured-refusal rung that decided an UNUSABLE
+                       verdict (pane | reachable | upstream | turn), else None
+        refusals       every rung that refuses, in ladder order; a caller
+                       that routes by KIND of refusal reads this, never the
+                       reason prose (`deaf_only` is the shared predicate)
         measured_at    epoch seconds of the pass that produced this row
         + the raw fields every verdict was derived from (turn_state,
           turn_evidence, semantic_age_s, pane, upstream, upstream_since,
-          upstream_dark, runtime_verified, registered, reachable, unknown)
+          upstream_dark, runtime_verified, registered, reachable,
+          reachable_why, reachable_state, unknown)
 
     seat_verdict(seat, ...) -> (verdict, reason, row) for ONE seat, scoped so
     a router pays for the seat it is asking about and not the whole fleet.
@@ -285,15 +291,60 @@ def _beacon_stale_s():
         return 3600
 
 
-def _read_reachable(entry, now):
-    """(reachable, why) — can helm WAKE this seat, per the attendance register.
+#: The register's word for a seat inside its re-arm grace — `beacons.WAKING`,
+#: spelled here because this module does not import beacons at load (a verb
+#: this hot pays for no census module it does not call). An arm pins the two
+#: spellings equal.
+_WAKING = "WAKING"
 
-    True   a census PROVED a live wake path.
-    False  a census PROVED there is none. This is beacons' DEAF, and DEAF is
-           defined there as a PROVEN ABSENCE of any wake path — the same
-           measured contradiction this module refuses on everywhere else.
+
+def _live_beacon(name, probe=None):
+    """([pids], trouble) — the live, attributable beacon of `name` NOW.
+
+    THE ACTUATOR'S OWN PROBE (`resumeturn._still_deaf`): the strict
+    `beacon_procs`, which counts a waiter only when a live session still holds
+    it, so an orphan left by a dead session never overturns a DEAF. Any
+    failure is TROUBLE, never an empty list: an empty list is the positive
+    answer "nothing is listening", and a probe that could not look has not
+    said that."""
+    try:
+        if probe is not None:
+            return probe(name)
+        from . import seats
+        return seats.beacon_procs(name, strict=True)
+    except Exception as e:                  # noqa: BLE001 — trouble, not empty
+        return [], "the live beacon probe failed (%s: %s)" % (
+            e.__class__.__name__, e)
+
+
+def _read_reachable(entry, now, name=None, probe=None):
+    """(reachable, why, state) — can helm WAKE this seat, per the attendance
+    register, re-proven live before a DEAF may refuse anything.
+
+    True   a census PROVED a live wake path, or the register said DEAF and a
+           live attributable beacon is running NOW.
+    False  a census PROVED there is none, and the live probe did not overturn
+           it. This is beacons' DEAF, and DEAF is defined there as a PROVEN
+           ABSENCE of any wake path — the same measured contradiction this
+           module refuses on everywhere else.
     None   nothing proved either way, which is the honest answer for a seat
-           with no register row, an UNPROVEN verdict, or a reading too old.
+           with no register row, an UNPROVEN or WAKING verdict, or a reading
+           too old.
+
+    `state` is the register's own word when the reading was fresh enough to
+    use, else None. The verdict reads it to give a WAKING seat its caveat.
+
+    THE REGISTER IS A MEASUREMENT OF A PAST INSTANT (task/3055). The census
+    writes it every five minutes, and a seat's beacon is gone for about 30
+    seconds every half hour while it re-arms after the harness's 30-minute
+    Monitor cap. A DEAF written inside that gap stood for a whole census
+    interval, and the dispatch door refused a seat that had re-armed seconds
+    after the pass. So a DEAF is refused on only while it is STILL TRUE: one
+    strict beacon probe for this one seat, the probe the actuator pays before
+    it types. A probe that fails keeps the register's DEAF — that was measured,
+    and the probe merely could not overturn it. The probe runs only for a seat
+    the register calls DEAF, so a fleet of reachable seats costs no extra
+    process walk.
 
     REACHABILITY IS NOT HEALTH, AND THAT IS WHY THIS FIELD HAD TO EXIST. A
     seat can answer USABLE on every other rung — pane live, upstream healthy,
@@ -310,27 +361,36 @@ def _read_reachable(entry, now):
     att = (entry or {}).get("attendance") if isinstance(entry, dict) else None
     if not isinstance(att, dict):
         return None, ("no attendance verdict on this seat's roster row — "
-                      "`helm beacons --post` writes it")
+                      "`helm beacons --post` writes it"), None
     state = att.get("state")
     at = att.get("at")
-    if state not in ("covered", "DEAF"):
+    if state not in ("covered", "DEAF", _WAKING):
         return None, ("beacon census answered %s: %s"
-                      % (state, att.get("why") or "no reason recorded"))
+                      % (state, att.get("why") or "no reason recorded")), None
     bound = _beacon_stale_s()
     try:
         age = None if at is None else float(now) - float(at)
     except (TypeError, ValueError):
         age = None
     if age is None:
-        return None, "the attendance verdict carries no measurement time"
+        return None, "the attendance verdict carries no measurement time", None
     if age > bound:
         return None, ("the attendance verdict is %s old, past the %s census "
                       "bound — too stale to gate on"
-                      % (_fmt_age(age), _fmt_age(bound)))
+                      % (_fmt_age(age), _fmt_age(bound))), None
+    if state == _WAKING:
+        return None, ("WAKING — %s" % (att.get("why") or "its beacon reached "
+                                        "its lease deadline and is re-arming")
+                      ), state
     if state == "DEAF":
+        pids, trouble = _live_beacon(name, probe) if name else ([], None)
+        if pids and not trouble:
+            return True, ("re-armed since the last census (the register's "
+                          "DEAF is %s old; live beacon pid %s now)"
+                          % (_fmt_age(age), pids[0])), state
         return False, (att.get("why")
-                       or "no live beacon: helm cannot wake this seat")
-    return True, None
+                       or "no live beacon: helm cannot wake this seat"), state
+    return True, None, state
 
 
 def _recipient(name, canonical=None):
@@ -354,7 +414,8 @@ def _recipient(name, canonical=None):
 # ---------------------------------------------------------------------------
 
 def _seat_row(name, hrow, herr, up, uperr, holding, holderr, reg, regerr,
-              canonical=None, panes=None, panes_blind=None, now=None):
+              canonical=None, panes=None, panes_blind=None, now=None,
+              beacon_live=None):
     """One seat's joined row. `unknown` maps FIELD -> why it could not read;
     an empty `unknown` is the only thing that lets a verdict be USABLE."""
     row = {"seat": name, "family": None, "turn_state": None,
@@ -362,6 +423,7 @@ def _seat_row(name, hrow, herr, up, uperr, holding, holderr, reg, regerr,
            "upstream": None, "upstream_since": None, "upstream_dark": None,
            "holding": None, "runtime_verified": None, "registered": None,
            "reachable": None, "reachable_why": None,
+           "reachable_state": None, "refusal": None, "refusals": (),
            "runtime_unreadable": None, "scope": "proxy",
            "holding_scope": "measured", "unknown": {}}
 
@@ -489,7 +551,8 @@ def _seat_row(name, hrow, herr, up, uperr, holding, holderr, reg, regerr,
         # SAME READ, NO NEW COST: the attendance register lives ON the roster
         # row this branch already holds, so reachability joins the verdict
         # without a second read, a probe, or a process census.
-        row["reachable"], row["reachable_why"] = _read_reachable(entry, now)
+        row["reachable"], row["reachable_why"], row["reachable_state"] = \
+            _read_reachable(entry, now, name=name, probe=beacon_live)
     return row
 
 
@@ -529,12 +592,15 @@ def _read_panes(live_seats=None):
 
 def join(seats=None, health=None, upstream=None, open_recipients=None,
          register=None, canonical=None, health_seats=None, now=None,
-         live_seats=None, need_holding=True):
+         live_seats=None, need_holding=True, beacon_live=None):
     """{seat name: typed row} — FOUR reads total, whatever the fleet size.
 
     See the module docstring for the row contract. The four readers run ONCE
     each here and every seat is derived from those same four results, so N
-    seats never cost N ledger folds or N process censuses.
+    seats never cost N ledger folds or N process censuses. The ONE per-seat
+    cost is `_read_reachable`'s live beacon probe, and it is paid only for a
+    seat whose register says DEAF: the price of not refusing a seat on a
+    verdict that stopped being true (task/3055). `beacon_live` is its seam.
 
     `seats` widens the result to names the CALLER renders that proxywatch does
     not watch (they come back UNKNOWN, which is the honest answer and also
@@ -560,7 +626,7 @@ def join(seats=None, health=None, upstream=None, open_recipients=None,
                         holderr, reg, regerr, canonical=canonical,
                         panes=panes,
                         panes_blind=panes_blind or panes_blind_by_seat.get(n),
-                        now=now)
+                        now=now, beacon_live=beacon_live)
         # THE VERDICT RIDES THE ROW. A caller that has to remember to call a
         # second function to find out what the row MEANS is a caller that will
         # eventually not, and every such caller would then have its own idea
@@ -568,6 +634,12 @@ def join(seats=None, health=None, upstream=None, open_recipients=None,
         row["verdict"], row["reason"] = verdict(row)
         row["can_take_work"] = {USABLE: True, DEGRADED: True,
                                 UNUSABLE: False}.get(row["verdict"])
+        # AND SO DOES THE RUNG THAT REFUSED (task/3055), for the same reason:
+        # a caller that routes differently on a DEAF seat than on a walled
+        # one reads a FIELD, never the reason prose. `refusals` is every rung
+        # that refuses, in ladder order; `refusal` is the one that decided.
+        row["refusals"] = _refusals(row)
+        row["refusal"] = row["refusals"][0] if row["refusals"] else None
         row["measured_at"] = now
         out[n] = row
     return out
@@ -1108,11 +1180,45 @@ def verdict(row):
     return state, why
 
 
+#: The four MEASURED-REFUSAL rungs, in the ladder's own order. Each is
+#: exactly one of the UNUSABLE returns in `_verdict_core`, which reads its
+#: branches off `_refusals` so the two cannot name different rungs.
+REFUSE_PANE, REFUSE_REACHABLE, REFUSE_UPSTREAM, REFUSE_TURN = (
+    "pane", "reachable", "upstream", "turn")
+
+
+def _refusals(row):
+    """(rung, ...) — every measured-refusal rung this row trips, in ladder
+    order. Empty for a row that no rung refuses."""
+    if not row:
+        return ()
+    return tuple(rung for rung, hit in (
+        (REFUSE_PANE, row.get("pane") is False),
+        (REFUSE_REACHABLE, row.get("reachable") is False),
+        (REFUSE_UPSTREAM, bool(row.get("upstream_dark"))),
+        (REFUSE_TURN, row.get("turn_state") in _TURN_UNUSABLE)) if hit)
+
+
+def deaf_only(row):
+    """Is this seat refused for ONE reason, that helm cannot wake it (task/3055)?
+
+    THE ONE PREDICATE for the three callers that must agree about a DEAF seat:
+    the dispatch write door, the router and the reviewer bench. True only when
+    the join refused the seat (`can_take_work is False`) and reachability is
+    the ONLY rung that refused it: the pane is not gone, the vendor is not
+    walled, the turn loop is not dead. Such a seat can work a row the moment
+    its beacon is back, and the durable ledger holds the row until then, so
+    it is queued rather than refused. Any second refusal keeps the refusal."""
+    return bool(row) and row.get("can_take_work") is False \
+        and tuple(row.get("refusals") or ()) == (REFUSE_REACHABLE,)
+
+
 def _verdict_core(row):
     """(verdict, reason) — the ladder. See the module docstring for why the
     precedence is measured-refusal, then UNKNOWN, then measured impairment."""
     if row is None:
         return UNKNOWN, "no joined row exists for this seat"
+    refusals = _refusals(row)
     unknown = row.get("unknown") or {}
     age = row.get("semantic_age_s")
     turn = row.get("turn_state")
@@ -1136,7 +1242,7 @@ def _verdict_core(row):
         measured.append("no completed turn in %s" % _fmt_age(age))
 
     # 1 — a MEASURED refusal outranks an unreadable sibling field.
-    if row.get("pane") is False:
+    if REFUSE_PANE in refusals:
         # THE REPAIR MUST MATCH THE SEAT CLASS. `helm seat spawn` mints a
         # PROXY seat; prescribing it for a native claude pane would hand the
         # operator an instrument that cannot fix their case — the bug class
@@ -1164,7 +1270,7 @@ def _verdict_core(row):
         return UNUSABLE, "; ".join(
             ["pane GONE — no live process holds this seat (%s)"
              % (repair % row.get("seat"))] + wall + measured)
-    if row.get("reachable") is False:
+    if REFUSE_REACHABLE in refusals:
         # AFTER THE PANE RUNG ON PURPOSE. A seat whose pane is GONE is also
         # unreachable, and `helm seat spawn` re-arms the beacon as part of
         # bringing the pane back — so that rung's prescription already fixes
@@ -1191,11 +1297,11 @@ def _verdict_core(row):
             ["%s (`helm chat wait --seat %s --follow` re-arms it)%s"
              % (row.get("reachable_why") or "helm cannot wake this seat",
                 row.get("seat"), live)] + measured)
-    if row.get("upstream_dark"):
+    if REFUSE_UPSTREAM in refusals:
         return UNUSABLE, "; ".join(
             [_dark_reason(row.get("upstream"), row.get("upstream_since"))]
             + measured)
-    if turn in _TURN_UNUSABLE:
+    if REFUSE_TURN in refusals:
         return UNUSABLE, "; ".join(
             ["turn=%s: %s" % (turn, row.get("turn_evidence")
                               or "proxywatch recorded no evidence")] + measured)
@@ -1211,6 +1317,15 @@ def _verdict_core(row):
             for field, why in sorted(unknown.items())])
 
     # 3 — measured, turning or turnable, but impaired.
+    # A WAKING SEAT CAN TAKE WORK, WITH A CAVEAT (task/3055). Its beacon ended
+    # at the harness's 30-minute lease and it is inside the re-arm grace, so a
+    # row sent now waits pending for seconds, not until someone notices.
+    # Refusing it would refuse every healthy seat for 30 seconds every half
+    # hour; saying nothing would hide that the wake path is down right now.
+    if row.get("reachable") is None \
+            and row.get("reachable_state") == _WAKING:
+        measured.append("%s; a row sent now is delivered when it re-arms"
+                        % (row.get("reachable_why") or _WAKING))
     if turn in _TURN_IMPAIRED:
         measured.append("turn=%s: %s" % (turn, row.get("turn_evidence")
                                          or "proxywatch recorded no evidence"))

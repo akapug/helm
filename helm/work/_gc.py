@@ -1873,14 +1873,9 @@ def seam_rooms(root, registered=None):
         branch = (w["branch"] or "")[len("refs/heads/"):]
         if not branch:
             continue                       # a detached room authors no half
-        # THE LEASE LEG IS ASKED ONLY OF A ROOM THAT COULD CARRY ONE. A lane
-        # resource is `worktree:<project>:<basename>`, so a nested room like
-        # `helm-wt/seats/codex` collides with a LANE named `codex` and would
-        # inherit that lane's holder — attributing a seam to the wrong seat.
-        # `managed_room_kind` is the registry's own answer to which rooms are
-        # lanes; everything else is live by occupancy alone.
-        held = (live.get(resource(root, os.path.basename(path)))
-                if managed_room_kind(root, path) == "lane" else None)
+        # The lease leg, asked only of a room that could carry one: see
+        # `_seam_held`, which the stop-facts witness shares.
+        held = _seam_held(root, path, live)
         pids = [p for p in (occ.get(path) or []) if str(p).isdigit()]
         declared, unread = _occupant_seats(pids)
         if unread:
@@ -1911,6 +1906,39 @@ def seam_rooms(root, registered=None):
                     "why": "lease" if held else ("occupied" if pids else "")})
     projscope.spend_or_raise("composition seam room census completion")
     return out, None, degraded
+
+
+def _seam_held(root, path, live):
+    """The lease row that makes a room live without an occupant, or None.
+
+    THE LEASE LEG IS ASKED ONLY OF A ROOM THAT COULD CARRY ONE. A lane
+    resource is `worktree:<project>:<basename>`, so a nested room like
+    `helm-wt/seats/codex` collides with a LANE named `codex` and would
+    inherit that lane's holder — attributing a seam to the wrong seat.
+    `managed_room_kind` is the registry's own answer to which rooms are
+    lanes; everything else is live by occupancy alone."""
+    if managed_room_kind(root, path) != "lane":
+        return None
+    return live.get(resource(root, os.path.basename(path)))
+
+
+def seam_lease_marks(root, paths, live):
+    """{room path: [held, holder]} — what `seam_rooms`' lease leg reads for
+    each lane room among `paths`, and nothing that moves on its own (a
+    lease's remaining time is not in it). The stop-facts resident records it
+    beside the census and the stop re-derives it from the claims file, so a
+    lease taken, released, handed or expired since the census reads STALE."""
+    if not root:
+        return {}
+    out = {}
+    for path in paths or ():
+        path = os.path.abspath(path)
+        if managed_room_kind(root, path) != "lane":
+            continue
+        held = _seam_held(root, path, live or {})
+        out[path] = [bool(held),
+                     str((held or {}).get("holder") or "").strip()]
+    return out
 
 
 def _rostered_seats(paths):
@@ -2019,7 +2047,7 @@ def _occupant_seats(pids):
 
 
 def seam_candidates(root, mine, holder=None, registered=None, green=None,
-                    rooms=None):
+                    rooms=None, memo=None):
     """(rows, err) — TWO GREEN HALVES WHOSE COMPOSITION NOBODY RAN.
 
     Owner, 2026-08-23: "Two green halves with an untested composition — this
@@ -2128,7 +2156,15 @@ def seam_candidates(root, mine, holder=None, registered=None, green=None,
     adds one `landed_state` per pair that reaches it — ancestry first, so the
     `git cherry` behind it is paid only where ancestry says no — and it is
     asked BEFORE the merge-tree it makes pointless, on the pairs that would
-    otherwise block."""
+    otherwise block.
+
+    `memo` SHARES THE PER-BRANCH AND PER-PAIR READS ACROSS CALLS, and only
+    the stop-facts resident passes one (helm/stopfacts_resident.py). It asks
+    this function once per live room, so without it every room re-derives
+    every peer's landedness, authored set and tip tree. Every entry is keyed
+    by branch name, so a memo is valid only while no ref moves: the resident
+    builds a fresh one per refresh, which is the lifetime these caches
+    already have inside one call."""
     projscope.spend_or_raise("composition seam setup")
     v = vcs.backend(root)
     trunk = _trunk(root)
@@ -2195,8 +2231,11 @@ def seam_candidates(root, mine, holder=None, registered=None, green=None,
     # a real cost, not a free simplification — it means this rung does not serve
     # a no-receipt project at all, and task/1377 (a receipt carries no durable
     # repo identity) is where the honest version of that question lives.
-    auth, ranges, logs, pairfiles, tips = {}, {}, {}, {}, {}
-    landed, contained = {}, {}
+    memo = {} if memo is None else memo
+    auth, ranges, pairfiles, tips, landed, contained, bases, merged = (
+        memo.setdefault(k, {}) for k in ("auth", "ranges", "pairfiles",
+                                         "tips", "landed", "contained",
+                                         "bases", "merged"))
 
     def _landed_room(room):
         """A room whose work has REACHED THE TRUNK is not a half.
@@ -2316,17 +2355,18 @@ def seam_candidates(root, mine, holder=None, registered=None, green=None,
             # block on a seam that may be one seat's own; the cost of dropping
             # is silence on the exact case the rung exists for, and only the
             # second failure is invisible.
-            if holder and peer["holder"] == str(holder).strip() \
-                    and peer["holder_why"] in ("lease", "environ"):
+            if seam_peer_exempt(peer, holder):
                 continue      # both rooms are mine: one seat sees both halves
             if _landed_room(peer):
                 continue      # a landed branch on an unreaped room is not a half
             b_files = _authored(v, root, trunk, br_b, auth)
             if b_files is _EVERYTHING or not b_files:
                 continue
-            rc, base, _e = v.text(root, "merge-base", br_a, br_b)
-            base = base.strip()
-            if rc != 0 or not base:
+            if (br_a, br_b) not in bases:
+                rc, base, _e = v.text(root, "merge-base", br_a, br_b)
+                bases[(br_a, br_b)] = base.strip() if rc == 0 else ""
+            base = bases[(br_a, br_b)]
+            if not base:
                 continue      # unrelated histories: no shared question
             for br in (br_a, br_b):
                 if (br, base) not in pairfiles:
@@ -2359,15 +2399,19 @@ def seam_candidates(root, mine, holder=None, registered=None, green=None,
             if ctree and ctree in local:
                 continue      # DISCHARGED: the composition is the container's
                               # tree and an arm ran against it, in this repo.
-            rc3, tree, _e3 = v.text(root, "merge-tree", "--write-tree",
-                                    br_a, br_b)
-            tree = tree.strip().split("\n")[0].strip()
-            # rc 0 is a CLEAN merge and the tree is the composition. rc 1 is a
-            # CONFLICT — git also prints a tree there, and reading it as the
-            # composition would let a conflicted merge discharge itself. rc 128
-            # is an error, or a git too old for --write-tree.
-            composed = (tree if rc3 == 0 and _SEAM_OID.fullmatch(tree)
-                        else None)
+            if (br_a, br_b) not in merged:
+                rc3, tree, _e3 = v.text(root, "merge-tree", "--write-tree",
+                                        br_a, br_b)
+                tree = tree.strip().split("\n")[0].strip()
+                # rc 0 is a CLEAN merge and the tree is the composition. rc 1
+                # is a CONFLICT — git also prints a tree there, and reading it
+                # as the composition would let a conflicted merge discharge
+                # itself. rc 128 is an error, or a git too old for
+                # --write-tree.
+                merged[(br_a, br_b)] = (tree if rc3 == 0
+                                        and _SEAM_OID.fullmatch(tree)
+                                        else None)
+            composed = merged[(br_a, br_b)]
             if composed and composed in local:
                 continue      # DISCHARGED: an arm ran against the composed tree
                               # HERE. `local`, never `trees`: a receipt nobody
@@ -2423,6 +2467,102 @@ def seam_candidates(root, mine, holder=None, registered=None, green=None,
     return out, None, gwarn
 
 
+def seam_peer_exempt(peer, holder):
+    """Does `holder` provably drive the peer room too? Then the pair is one
+    seat's to see, never a seam. ONE PREDICATE for `seam_candidates` and
+    `seam_assemble`, so the stop's reading of the resident's facts cannot
+    exempt a peer the rung itself would have kept: the exemption is EARNED by
+    a present-tense holder leg (a lease, or the occupant's own declaration),
+    never by the roster, which outlives its process, and never by silence."""
+    return bool(holder) and isinstance(peer, dict) \
+        and peer.get("holder") == str(holder).strip() \
+        and peer.get("holder_why") in ("lease", "environ")
+
+
+def seam_assemble(rooms, per_room, mine, holder=None, root_err=None,
+                  green_err=None, green_warn=None):
+    """`seam_candidates(root, mine, holder, rooms=rooms)`'s answer, rebuilt
+    from that function's own answers for ONE room at a time.
+
+    WHY IT EXISTS. The stop-facts resident cannot know which rooms a stopping
+    seat will call its own — that comes from the stop's cwd and its leases —
+    so it asks `seam_candidates(root, {room}, holder=None, rooms=rooms)` for
+    every LIVE room and records the rows (`per_room`). A pair's row depends on
+    the two rooms only; what depends on the seat is WHICH pairs count: the
+    peers are the live rooms outside `mine`, and a peer this seat provably
+    drives is exempt. So the seat's answer is the union, over its rooms, of
+    those rows whose peer is outside `mine` and not exempt — in the order the
+    one-call version yields them (own rooms in census order, peers in census
+    order). An arm pins that the two agree on a real repository.
+
+    `root_err` is the call's answer with NO room of mine (the trunk check,
+    which runs before anything else); `green_err`/`green_warn` are
+    `green_receipts`' error and legacy warning, which the one-call version
+    reports only once it has a room of mine and a peer. A row whose peer is
+    not in `rooms` is KEPT: an exclusion must be earned by a positive signal.
+
+    -> (rows, err, warning), or None when a room of mine that has a peer was
+    not computed (`per_room` has no entry for it) — the caller says UNKNOWN.
+    """
+    if root_err:
+        return [], root_err, None
+    mine_paths = {os.path.abspath(p) for p in (mine or ())}
+    ours = [r for r in rooms if r["path"] in mine_paths]
+    peers = [r for r in rooms if r["path"] not in mine_paths and r["live"]]
+    if not ours or not peers:
+        return [], None, None
+    if green_err:
+        return [], green_err, None
+    by_path = {r["path"]: r for r in rooms}
+    out = []
+    for room in ours:
+        got = per_room.get(room["path"])
+        if got is None:
+            return None
+        for row in got:
+            peer_path = row.get("peer_path")
+            if peer_path in mine_paths:
+                continue
+            if seam_peer_exempt(by_path.get(peer_path), holder):
+                continue
+            out.append(row)
+    return out, None, green_warn
+
+
+def _focused_inadmissible(row, consuming_repo=None):
+    """Why a receipt that is NOT a whole-suite run proves nothing, or None
+    for a VERIFIABLE FOCUSED one.
+
+    Verifiable means the kind whose content id binds its scope (v6, the one
+    `helm gate run --focus` mints), a runner-reported RAN set that is a
+    non-empty list, a positive test count, an interpreter helm chose, and
+    every row clause gate owns (clean bracket, exit code). A custom `--`
+    command carries none of that, and a pre-v6 row wearing a focus block
+    carries a scope nothing protects: both stay inadmissible, at both doors."""
+    try:
+        from .. import gate
+    except Exception as e:                       # noqa: BLE001
+        return "gate module unimportable (%s) — admissibility UNKNOWN" \
+            % type(e).__name__
+    focus = row.get("focus")
+    if row.get("v") != gate.FOCUSED_VERSION or not isinstance(focus, dict):
+        return "not a whole-suite run, and no verifiable focused scope " \
+            "(a custom command, or a focus block no content id protects)"
+    executed = focus.get("executed")
+    if not isinstance(executed, list) or not executed \
+            or not all(isinstance(m, str) and m for m in executed):
+        return "a focused run whose runner reported no module ran proves " \
+            "nothing about any tree"
+    ran = row.get("ran")
+    if type(ran) is not int or ran <= 0:
+        return "reports %r executed tests — a focused run that executed " \
+            "none proves nothing about any tree" % (ran,)
+    if not gate._ident_of(row).get("name"):
+        return "the focused run names no interpreter helm chose"
+    return gate.row_refusal(row, about=str(row.get("tree") or "")[:12],
+                            consuming_repo=consuming_repo)
+
+
 def receipt_inadmissible(row, consuming_repo=None):
     """Why a gate receipt PROVES nothing about a whole tree, or None.
 
@@ -2445,15 +2585,16 @@ def receipt_inadmissible(row, consuming_repo=None):
     property of the row rather than a judgement about it:
 
       status OK — the run concluded and passed.
-      suite is EXACTLY True — a whole-suite run. This is what makes FOCUSED
-        receipts inadmissible here, and `_bind_focused` states the reason in
-        its own words: "a whole-suite receipt earns a descendant arm because
-        its claim (everything passed) survives commits it contains; a focused
-        claim is anchored to the tree its scope was measured against". A
-        focused row's claim is its SCOPE, not the tree — which is exactly why
-        it cannot authorize a land — so it cannot stand for "this half is
-        green" either. `is True` rather than truthiness because a custom-argv
-        row records `suite` false too and is equally scope-bounded.
+      suite is EXACTLY True — a whole-suite run — OR a VERIFIABLE FOCUSED
+        run (`_focused_inadmissible`, task/3039). A focused claim is its
+        SCOPE, not its tree, which is why one cannot authorize a land. It
+        still answers this rung's question: a lane's rounds are focused and
+        `helm gate run` refuses a lane whole suite, so a whole-suite-only
+        reading would find no green half in any lane and no discharge the
+        block could print. A focused run on the MERGED tree selects the merged diff's
+        consumers, both halves together, which is the composition's own
+        question. `is True` rather than truthiness because a custom-argv row
+        records `suite` false too, and it stays refused.
       not dirty, before or after — a run over uncommitted bytes measured
         something no tree records, so no tree can inherit its result.
       head and tree UNMOVED across the run — the clean bracket. If the tree
@@ -2464,7 +2605,14 @@ def receipt_inadmissible(row, consuming_repo=None):
     if row.get("status") != "OK":
         return "status %r" % (row.get("status"),)
     if row.get("suite") is not True:
-        return "not a whole-suite run (focused or custom argv)"
+        # A VERIFIABLE FOCUSED RECEIPT COUNTS (task/3039). A lane's rounds are
+        # focused now, and `helm gate run` refuses a lane whole suite, so a
+        # rung that read only whole-suite receipts would find no green half in
+        # any lane and no discharge the block could print. It stays ONE
+        # predicate for both doors: a focused run on a half's tree is that
+        # half's verification, and one on the merged tree tests the
+        # composition, since its selection is the merged diff's consumers.
+        return _focused_inadmissible(row, consuming_repo)
     # THE `suite` FLAG IS A CLAIM AND THE ARGV IS THE RUN. Nothing cross-checked
     # them, so a row could assert `suite: true` beside a command naming ONE test
     # module and be read as "everything passed" — a WEAK receipt wearing the
@@ -2476,14 +2624,15 @@ def receipt_inadmissible(row, consuming_repo=None):
     # gate._STORED_SUITE_RUNNERS). The single-module form rejects those
     # legitimate legacy receipts; the pair admits both runners that ever
     # minted a whole-suite receipt and still refuses argv that names
-    # test ids. It is a CLOSED PAIR and not "any module with a
+    # test ids. A sliced (v10) row answers from its validated evidence
+    # instead, through the same `gate.stored_whole_suite` door. It is a CLOSED PAIR and not "any module with a
     # discovery-shaped tail": a whole-suite claim is worth exactly as much as
     # the runner that could have produced it, and this reader can neither
     # inspect nor re-run an arbitrary command, so a receipt naming one has
     # nothing behind its claim and must arm and discharge nothing.
     try:
         from .. import gate as _gate
-        shaped = _gate._suite_shaped(row.get("argv"), runner=None)
+        shaped = _gate.stored_whole_suite(row)
     except Exception as e:                       # noqa: BLE001
         return "the recorded command could not be read (%s) — whether this " \
             "was a whole-suite run is UNKNOWN" % type(e).__name__
@@ -2857,6 +3006,19 @@ _LANDED_LOCK = threading.Lock()
 _LANDED_MEMO = {}       # (common, lane) -> (files, stamp, verdict)
 _LANDED_STATE = {}      # (repo, tip, trunk sha) -> vcs landed_state
 _LANDED_AUTHORED = {}   # (repo, lane, tip, reflog stamp) -> (carried, dropped)
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_LANDED_MEMO": (
+        "keyed by repository and lane, checked against the ref files' stamp"),
+    "_LANDED_STATE": (
+        "keyed by repository, tip and trunk sha, which never change meaning"),
+    "_LANDED_AUTHORED": "keyed by repository, lane, tip and reflog stamp",
+    "_ROWED": (
+        "the dispatch ledger's lane labels once per process; the arms that "
+        "read them (test_work) reset it first"),
+}
 _LANDED_CAP = 4096
 
 # The reflog actions by which a lane AUTHORS a commit — `_branch_authored`'s
@@ -2971,18 +3133,38 @@ def _lane_verdict(state, proof, tip=None, trunk=None, trunk_sha=None,
             "trunk_sha": trunk_sha, "retired": retired}
 
 
-def _lane_judged(v, root, key, common, lane, tip, retired, trunk, trunk_sha):
+def _state(v, root, key, sha, trunk_sha, content):
+    """The landed state of one commit against the trunk, cached. With
+    `content` False the question is ANCESTRY ONLY: a kept full answer is still
+    served (it is the stronger one), but a missing one is asked of
+    `v.ancestry` and never kept, because the memo means patch identity was
+    asked and an ancestry-only NOT_ANCESTOR has not asked it."""
+    state = _kept(_LANDED_STATE, (key, sha, trunk_sha))
+    if state is None:
+        state = v.landed_state(root, sha, trunk_sha) if content \
+            else v.ancestry(root, sha, trunk_sha)
+        if content and state != vcs.UNKNOWN:
+            _kept(_LANDED_STATE, (key, sha, trunk_sha), state)
+    return state
+
+
+# WHAT AN ANCESTRY-ONLY READ SAYS WHERE ONLY PATCH IDENTITY COULD TELL: a lane
+# whose tip the trunk does not hold by object id may still have landed under
+# another sha (a rebased train), so that read answers UNKNOWN, never UNLANDED.
+_CONTENT_NOT_ASKED = ("the lane carries commits the trunk does not hold by "
+                      "object id, and patch identity was not asked")
+
+
+def _lane_judged(v, root, key, common, lane, tip, retired, trunk, trunk_sha,
+                 content=True):
     """One lane's verdict from its resolved tip. `key` names the repository
-    in the caches; the tip and trunk shas name everything else."""
+    in the caches; the tip and trunk shas name everything else. `content`
+    False asks ancestry and authorship only (see `lanes_landed`)."""
     if not tip:
         return _lane_verdict(
             LANE_GONE, "no lane branch and no retired tip — there is nothing "
             "under this lease to ask the trunk about", None, trunk, trunk_sha)
-    state = _kept(_LANDED_STATE, (key, tip, trunk_sha))
-    if state is None:
-        state = v.landed_state(root, tip, trunk_sha)
-        if state != vcs.UNKNOWN:
-            _kept(_LANDED_STATE, (key, tip, trunk_sha), state)
+    state = _state(v, root, key, tip, trunk_sha, content)
     word = _proof_word(state)
     if retired:
         word += " — the branch is retired; this is its preserved tip"
@@ -2991,7 +3173,9 @@ def _lane_judged(v, root, key, common, lane, tip, retired, trunk, trunk_sha):
         # tip was preserved only because it carried some: both authored work
         return _lane_verdict(LANE_LANDED, word, tip, trunk, trunk_sha, retired)
     if state == vcs.NOT_ANCESTOR:
-        return _lane_verdict(LANE_UNLANDED, word, tip, trunk, trunk_sha)
+        return _lane_verdict(LANE_UNLANDED if content else LANE_UNKNOWN,
+                             word if content else _CONTENT_NOT_ASKED,
+                             tip, trunk, trunk_sha)
     if state != vcs.ANCESTOR:
         return _lane_verdict(LANE_UNKNOWN, word, tip, trunk, trunk_sha)
     branch = lane_branch(lane)
@@ -3016,17 +3200,13 @@ def _lane_judged(v, root, key, common, lane, tip, retired, trunk, trunk_sha):
         # does, asked the same cached question as a tip: on the trunk under
         # any sha and the work landed before the reset; not there and the
         # work is only in the reflog, which is what a release deletes.
-        state = _kept(_LANDED_STATE, (key, dropped, trunk_sha))
-        if state is None:
-            state = v.landed_state(root, dropped, trunk_sha)
-            if state != vcs.UNKNOWN:
-                _kept(_LANDED_STATE, (key, dropped, trunk_sha), state)
+        state = _state(v, root, key, dropped, trunk_sha, content)
         where = "%s, which %s no longer carries" % (dropped[:12], branch)
         if state in RETIRABLE:
             return _lane_verdict(
                 LANE_LANDED, "%s — judged by its last authored commit %s"
                 % (_proof_word(state), where), tip, trunk, trunk_sha)
-        if state == vcs.NOT_ANCESTOR:
+        if state == vcs.NOT_ANCESTOR and content:
             return _lane_verdict(
                 LANE_UNLANDED, "the branch sits at the trunk, but the lane "
                 "wrote %s, and that work is on neither the branch nor the "
@@ -3041,11 +3221,14 @@ def _lane_judged(v, root, key, common, lane, tip, retired, trunk, trunk_sha):
         "cannot be told apart", tip, trunk, trunk_sha)
 
 
-def _lanes_read(root, common, lanes, stampable):
+def _lanes_read(root, common, lanes, stampable, content=True):
     """The verdicts for `lanes`, read from git: ONE `for-each-ref` for every
     tip and the trunk, then the cached per-(tip, trunk) question per lane. The
     stamp is taken BEFORE the read, so a ref that moves during it leaves a
-    stamp that no longer matches and is re-read next time — never the reverse."""
+    stamp that no longer matches and is re-read next time — never the reverse.
+    An ancestry-only read (`content` False) keeps no verdict: the memo is the
+    full producer's, and serving a weaker answer from it would change what
+    `helm work list` prints."""
     v = vcs.backend(root)
     trunk = _trunk(root)
     files = {lane: _lane_files(lane, trunk) for lane in lanes}
@@ -3074,15 +3257,15 @@ def _lanes_read(root, common, lanes, stampable):
         tip = refs.get("refs/heads/" + branch)
         retired = None if tip else refs.get(RETIRED_NS + branch)
         verdict = _lane_judged(v, root, key, common, lane, tip or retired,
-                               bool(retired), trunk, trunk_sha)
+                               bool(retired), trunk, trunk_sha, content)
         out[lane] = verdict
-        if stampable and verdict["state"] != LANE_UNKNOWN:
+        if content and stampable and verdict["state"] != LANE_UNKNOWN:
             _kept(_LANDED_MEMO, (common, lane),
                   (files[lane], stamps[lane], dict(verdict)))
     return out
 
 
-def lanes_landed(root, lanes):
+def lanes_landed(root, lanes, content=True):
     """{lane: verdict} — is each held lane's committed work on the trunk?
 
     `verdict` is {state, proof, tip, trunk, trunk_sha, retired}; `state` is
@@ -3094,7 +3277,17 @@ def lanes_landed(root, lanes):
     GONE when it has neither: absence of a branch is not proof of a land.
 
     See the block above for why it is one producer, why it reads authorship,
-    and why an unmoved repository costs no git call at all."""
+    and why an unmoved repository costs no git call at all.
+
+    `content=False` IS THE READ A PROJECTION CAN AFFORD FOR EVERY ROW. The
+    patch-identity leg runs `git cherry` against the trunk, which walks every
+    trunk patch since the lane's base — measured on the live repository, the
+    stale lanes of the open BUILD rows the land projection asks about cost
+    minutes cold. Without it the verdict is ancestry and the lane's own
+    reflog: LANDED, UNSTARTED and GONE are answered exactly as the full read
+    answers them, and a tip the trunk does not hold by object id is UNKNOWN,
+    because only patch identity could say whether it landed rebased. A kept
+    full verdict is still served, and this read keeps nothing."""
     lanes = sorted({str(l) for l in lanes or () if l})
     if not lanes:
         return {}
@@ -3115,7 +3308,7 @@ def lanes_landed(root, lanes):
         else:
             ask.append(lane)
     if ask:
-        out.update(_lanes_read(root, common, ask, stampable))
+        out.update(_lanes_read(root, common, ask, stampable, content))
     return out
 
 

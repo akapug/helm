@@ -619,6 +619,19 @@ class DurableProseVerbsTest(unittest.TestCase):
         self.assertIn("backtick", reason)
         self.assertIsNone(self._refusal('helm store add premise "$BODY"'))
 
+    def test_a_revised_statement_is_prose_too(self):
+        """`store revise <id> "<statement>"` rewrites a canon statement, and a
+        census of recorded commands found one whose double-quoted statement
+        held a backticked `git stash pop`: the shell ran it in the shared
+        checkout before helm saw the text. The id stays computable."""
+        _c, reason = self._refusal(
+            'helm store revise stash-reach "the `git stash pop` idiom"')
+        self.assertIn("backtick", reason)
+        _c, reason = self._refusal('helm store revise x "a $(id) statement"')
+        self.assertIn("$(", reason)
+        self.assertIsNone(self._refusal('helm store revise x "$STATEMENT"'))
+        self.assertIsNone(self._refusal('helm store revise $(cat id) "text"'))
+
 class SpecWiringTest(unittest.TestCase):
     def spec(self):
         from helm import hooks
@@ -3286,6 +3299,54 @@ class GitHubActionsRungTest(unittest.TestCase):
             self.assertEqual(chat._invocation_text(cmd), (cmd, frozenset()))
             self.assert_refused(cmd)
             self.assert_refused(post)
+
+
+class SharedDataPredicateTest(unittest.TestCase):
+    """The data predicate the GitHub-Actions, owner-posture and delegate
+    authority rungs cut with (`chat._command_data`, task/3060). A process
+    reader's arguments, python's -c text, and a git prose subcommand after a
+    `-c` that names nothing git runs are data. Python text that starts a
+    process, names the workflow directory or is a script's argv, a `-c` that
+    names a program git would run, and a substitution in any of them are
+    not. Asked through the Actions rung, which reads nothing but the cut."""
+
+    # built at runtime, so this FILE holds no whole spelling (see the rung
+    # class above)
+    ENABLE = "gh " + "workflow" + " enable" + " ci.yml"
+    WORKFLOWS = ".github/" + "workflows"
+
+    def refused(self, command):
+        return chat.github_actions_refusal(command=command)
+
+    def test_what_names_an_act_as_data_passes(self):  # noqa: VACUOUS_ASSERTION — the bare act is asserted refused through the same function before each data spelling is asserted to pass
+        self.assertIsNotNone(self.refused(self.ENABLE))
+        for command in (
+                "pgrep -f '%s'" % self.ENABLE,
+                "pkill -f '%s'" % self.ENABLE,
+                "ps -o pid= -C '%s'" % self.ENABLE,
+                "python3 -c \"print('%s')\"" % self.ENABLE,
+                "python3 -P -c \"print('%s')\"" % self.ENABLE,
+                "git -c user.name=a -c user.email=b commit -m '%s'"
+                % self.ENABLE):
+            with self.subTest(command=command):
+                self.assertIsNone(self.refused(command), command)
+
+    def test_what_may_run_or_write_stays_code(self):
+        self.assertIsNotNone(self.refused(self.ENABLE))
+        self.assertIsNone(self.refused("pgrep -f '%s'" % self.ENABLE))
+        for command in (
+                "python3 -c \"import subprocess; subprocess.run('%s', "
+                "shell=True)\"" % self.ENABLE,
+                "python3 -c \"import os; os.system('%s')\"" % self.ENABLE,
+                "python3 -c \"open('%s/ci.yml', 'w').write('x')\""
+                % self.WORKFLOWS,
+                "python3 script.py '%s'" % self.ENABLE,
+                "python3 -m tool '%s'" % self.ENABLE,
+                "git -c core.editor=vi commit -m '%s'" % self.ENABLE,
+                "git -c alias.c='!sh' c -m '%s'" % self.ENABLE,
+                "pgrep -f \"$(%s)\"" % self.ENABLE):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.refused(command), command)
 
 
 class SteerRungTest(unittest.TestCase):

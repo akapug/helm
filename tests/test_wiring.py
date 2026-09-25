@@ -1810,5 +1810,141 @@ class GateLinesLetsTheDeadlineOutTest(unittest.TestCase):
             self.assertEqual(wiring.gate_lines(), [])
 
 
+class RealTreeIsReadOncePerProcessTest(unittest.TestCase):
+    """The real package is parsed once per process; any other root is parsed
+    on every call (task/3039).
+
+    MEASURED BEFORE THE MEMO: 9 tests in this module read the real tree and
+    took 99.9% of its time. They called `census` 32 times, `tested` 36 times
+    and `graph` 96 times, which is 9,985 `ast.parse` calls. Each call parsed
+    about 480 helm modules and 458 test files, and nothing in them changes
+    while one process runs.
+
+    ONLY THE REAL TREE IS REMEMBERED. A planted root is a tree the caller
+    built to hold a probe, so a memo on it would hide the probe. The Stop
+    rung (`unwired_additions`) reads the tree fresh too, because it writes its
+    answer under a key taken from the files at that moment.
+    """
+
+    def _counted(self, name):
+        """Count the calls to `wiring.<name>` for this case."""
+        real = getattr(wiring, name)
+        calls = []
+
+        def spy(*a, **kw):
+            calls.append(1)
+            return real(*a, **kw)
+
+        patch = mock.patch.object(wiring, name, spy)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return calls
+
+    def _planted(self):
+        tmp = tempfile.mkdtemp(prefix="helm-test-wiring-planted-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for rel, body in (("cli.py", "from . import live\n"),
+                          ("live.py", "x = 1\n"),
+                          ("planted_probe_3039.py", "y = 2\n")):
+            with open(os.path.join(tmp, rel), "w") as fh:
+                fh.write(body)
+        return tmp
+
+    def test_the_real_graph_is_walked_once(self):  # noqa: VACUOUS_ASSERTION — the counter is proven live in this arm: a planted root walked under the same spy must add its three modules
+        walked = self._counted("imports_of")
+        first = wiring.graph()
+        after_first = len(walked)
+        second = wiring.graph()
+        by_second = len(walked)
+        wiring.graph(self._planted())
+        self.assertGreater(len(first), 100, "control: the real package was read")
+        self.assertEqual(second, first)
+        self.assertEqual(len(walked), by_second + 3,
+                         "control: the counter sees a walk that runs")
+        self.assertEqual(by_second, after_first,
+                         "a second real-tree graph() parsed the package again")
+
+    def test_the_real_test_files_are_read_once(self):
+        named = self._counted("_named_by_test")
+        faced = self._counted("_facade_names_used")
+        tested, reached = wiring.tested(), wiring.facade_reached()
+        seen = (len(named), len(faced))
+        self.assertTrue(tested, "control: the real tests name modules")
+        self.assertTrue(reached, "control: the facade rung found modules")
+        self.assertEqual((wiring.tested(), wiring.facade_reached()),
+                         (tested, reached))
+        self.assertEqual((len(named), len(faced)), seen,
+                         "a second real-tree read parsed tests/ again")
+
+    def test_a_planted_root_is_parsed_every_time(self):
+        """The must-miss: the real tree is remembered first, and a planted
+        root must still be walked, twice, and answer about its own files."""
+        real = wiring.graph()
+        tmp = self._planted()
+        walked = self._counted("imports_of")
+        self.assertEqual(sorted(wiring.graph(tmp)),
+                         ["cli", "live", "planted_probe_3039"])
+        self.assertEqual(len(walked), 3, "the planted root was not walked")
+        self.assertEqual(wiring.unreachable_modules(tmp),
+                         ["planted_probe_3039"])
+        self.assertEqual(len(walked), 6, "the second walk was not taken")
+        self.assertNotIn("planted_probe_3039", real)
+        self.assertNotIn("planted_probe_3039", wiring.graph())
+
+    def test_a_caller_that_edits_an_answer_cannot_change_the_next(self):
+        """The remembered answers are handed out as copies."""
+        graph, mods = wiring.graph(), wiring.modules()
+        tested, reached = wiring.tested(), wiring.facade_reached()
+        self.assertIn("cli", graph, "control: the real graph has cli")
+        self.assertTrue(reached, "control: the facade rung found modules")
+        graph["cli"].add("planted_3039")
+        graph["planted_3039"] = set()
+        mods["planted_3039"] = "/planted"
+        tested.add("planted_3039")
+        for row in reached.values():
+            row["named"].append("planted_3039")
+        self.assertIn("planted_3039", graph["cli"], "control: the edit took")
+        self.assertIn("planted_3039", tested, "control: the edit took")
+        graph_again, mods_again = wiring.graph(), wiring.modules()
+        tested_again, reached_again = wiring.tested(), wiring.facade_reached()
+        self.assertIn("cli", graph_again, "control: the next answer is whole")
+        self.assertIn("cli", mods_again, "control: the next answer is whole")
+        self.assertTrue(tested_again and reached_again,
+                        "control: the next answers are whole")
+        self.assertNotIn("planted_3039", graph_again["cli"])
+        self.assertNotIn("planted_3039", graph_again)
+        self.assertNotIn("planted_3039", mods_again)
+        self.assertNotIn("planted_3039", tested_again)
+        self.assertEqual([m for m, row in reached_again.items()
+                          if "planted_3039" in row["named"]], [])
+
+    def test_the_stop_rung_never_answers_from_the_remembered_graph(self):
+        """`unwired_additions` keys its file memo on the source as it is now,
+        so the graph it reads must be taken now too. A remembered graph under
+        a fresh key is the stale answer its TOCTOU rule exists to prevent."""
+        home = tempfile.mkdtemp(prefix="helm-test-wiring-stop-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        wiring.graph()                       # the real tree is remembered
+        walked = []
+
+        def parse_nothing(*_a, **_kw):       # the walk is counted, not paid
+            walked.append(1)
+            return set()
+
+        # A walk taken NOW sees no edges at all, so every added module is
+        # unreachable; the remembered graph reaches `vcs` from cli.
+        self.assertIn("vcs", wiring.reachable(wiring.graph()),
+                      "control: the remembered graph reaches vcs")
+        with mock.patch.dict(os.environ, {"HELM_HOME": home}), \
+                mock.patch.object(wiring, "imports_of", parse_nothing), \
+                mock.patch.object(wiring, "added_modules",
+                                  return_value=["vcs"]):
+            dead, note = wiring.unwired_additions(repo=home)
+        self.assertIsNone(note)
+        self.assertEqual(dead, ["vcs"],
+                         "the Stop rung answered from the remembered graph")
+        self.assertGreater(len(walked), 100, "the walk was not taken now")
+
+
 if __name__ == "__main__":
     unittest.main()

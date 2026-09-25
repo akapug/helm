@@ -1657,6 +1657,12 @@ def _wall_patterns():
 
 _WALL_LINE_RE = None
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_WALL_LINE_RE": "a pattern compiled once from a constant table",
+}
+
 
 def _is_wall_line(line):
     """True when this line is itself a quota wall — a restatement, not a reply."""

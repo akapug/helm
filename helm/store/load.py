@@ -32,6 +32,13 @@ def adopted_dir():
 # the registry load + dir stats off the per-turn hot path (20+ dirs otherwise).
 _ADOPTED_PROJECT_CACHE = {}
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_ADOPTED_PROJECT_CACHE": (
+        "keyed by project and checked against the registry's mtime"),
+}
+
 
 def _project_adopted_dirs(project, projects=None):
     """The claude per-project memory dirs helm ADOPTS as project-scoped store

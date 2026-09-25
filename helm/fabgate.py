@@ -76,8 +76,18 @@ class ClientDetached(Exception):
 
 
 def whole_scope():
-    """The immutable v2 whole-suite request contract."""
+    """The immutable v2 whole-suite request contract: the SERIAL suite, run
+    under `helm gate run` with no mode flag (`gateimport.FAB_WHOLE_SCOPES`),
+    which inside a Fab job is serial by rule (`gate.suite_mode`). The land
+    road (`gatewindow.job_identity`) names it explicitly."""
     return {"kind": "whole", "argv": list(WHOLE_ARGV)}
+
+
+def slice_scope():
+    """The sliced whole suite (task/3039, receipt v10), as a v10 receipt binds
+    it: kind "whole", argv the runner's path in the checkout, run under
+    `helm gate run --sliced`."""
+    return {"kind": "whole", "argv": list(gateimport.FAB_SLICE_ARGV)}
 
 
 def focused_scope(repo):
@@ -261,12 +271,12 @@ def request(repo, tree, scope, interpreter, runner, queue_timeout=None,
         return None, "tree must be one full lowercase object id"
     if gateimport._tree_of(repo, tree) != tree:
         return None, "tree does not resolve to a tree object in this repository"
-    if scope == "whole":
-        scope = whole_scope()
+    scope = {"whole": whole_scope(), "slice": slice_scope()}.get(scope, scope) \
+        if isinstance(scope, str) else scope
     if not isinstance(scope, dict) or scope.get("kind") not in ("whole", "focus"):
         return None, "scope must be the whole or exact focus contract"
-    if scope.get("kind") == "whole" and scope not in (
-            whole_scope(), {"kind": "whole", "argv": list(gateauthority.SUITE_ARGV)}):
+    if scope.get("kind") == "whole" \
+            and gateimport.fab_scope_gate_args(scope) is None:
         return None, "whole scope differs from helm's canonical suite"
     if scope.get("kind") == "focus":
         if set(scope) != {"kind", "plan"}:

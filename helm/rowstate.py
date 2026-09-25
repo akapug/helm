@@ -260,7 +260,11 @@ _CLOSE_TERMINAL = {
 # `close_reason="withdrawn"`, which is a structured close with its own proof
 # fields, ends a row. Two spellings, two meanings, and collapsing them would
 # cancel rows whose reviewer merely retracted an objection.
-_TERMINAL_FLAGS = {"abandoned": CANCELLED}
+#
+# `verdict_retracted` IS here, and it is not the withdrawn case (task/3060):
+# a retraction takes the verdict's AUTHORITY back with a later event, so the
+# row is ended and owes nothing; any review still owed lives on its successor.
+_TERMINAL_FLAGS = {"abandoned": CANCELLED, "verdict_retracted": CANCELLED}
 
 # What `_lifecycle`'s third element says about the LEDGER, which is a
 # different question from what its first element says about the ROW.

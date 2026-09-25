@@ -21,7 +21,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-landgate-home-", var="HELM_HOME")
 
-from helm import landgate  # noqa: E402
+from helm import gate as gatemod, landgate  # noqa: E402
+
+
+def _proven(row, repo, where=None):
+    return True, "fixture door"
+
+
+class ProvenIsNotTheQuestion:
+    """For arms about clause (ii)'s CONTENT (kind, status, tree derivation):
+    their hand-built rows are no receipts any door placed, so the clause's
+    last question, provenance (task/3066), is answered for them here. The
+    arms ABOUT provenance are `ProvenanceClauseTest`, which answer nothing."""
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(gatemod, "land_provenance", _proven)
+        patch.start()
+        self.addCleanup(patch.stop)
 
 
 class LandGateBase(unittest.TestCase):
@@ -80,7 +97,7 @@ class LandlockTest(LandGateBase):
         self.assertIn("declares no seat", d)
 
 
-class GateBindsTreeTest(LandGateBase):
+class GateBindsTreeTest(ProvenIsNotTheQuestion, LandGateBase):
     # suite=True DELIBERATELY: these fixtures stand in for WHOLE-SUITE
     # receipts, because that is the only kind this clause may pass. They
     # were minted before the flag was load-bearing and passed BECAUSE the
@@ -140,7 +157,7 @@ class GateBindsTreeTest(LandGateBase):
         self.assertIn("WHOLE-SUITE", d)
 
 
-class GateBindsTreeDerivedTest(LandGateBase):
+class GateBindsTreeDerivedTest(ProvenIsNotTheQuestion, LandGateBase):
     """task/285: the landed tree is DERIVED from the tip, never trusted from
     the caller — and compared at FULL length against a receipt tree that must
     itself be a real object."""
@@ -232,6 +249,66 @@ class GateBindsTreeDerivedTest(LandGateBase):
                                          repo=self.repo, tip="0" * 40)
         self.assertEqual(st, landgate.UNKNOWN, d)
         self.assertIn("unmeasured", d)
+
+
+class ProvenanceClauseTest(LandGateBase):
+    """task/3066: clause (ii) admits only a receipt an authenticated door
+    placed in the repository being landed, and asks it LAST, so every content
+    refusal keeps its own words. The seam is the answer an arm injects beside
+    an injected row; the default is the real reader."""
+
+    def _rec_for(self, tip):
+        tree = self.git("rev-parse", "%s^{tree}" % tip)
+        return {"id": "g1", "status": "OK", "tree": tree, "suite": True}
+
+    def test_an_unproven_receipt_refuses_on_the_right_tree_and_names_the_cure(self):
+        tip = self.commit("b.py", "two\n")
+        rec = self._rec_for(tip)
+        st, d = landgate.gate_binds_tree(
+            "g1", None, {"g1": rec}, repo=self.repo, tip=tip,
+            provenance=lambda row, repo: (False, "generic import door only"))
+        self.assertEqual(st, landgate.REFUSE, d)
+        self.assertIn("generic import door only", d)
+        self.assertIn("helm gate window launch", d)
+        # CONTROL on the same observable: the same row, proven.
+        st, d = landgate.gate_binds_tree("g1", None, {"g1": rec},
+                                         repo=self.repo, tip=tip,
+                                         provenance=_proven)
+        self.assertEqual(st, landgate.OK, d)
+        self.assertIn("fixture door", d)
+
+    def test_an_unreadable_provenance_is_UNKNOWN_and_UNKNOWN_never_qualifies(self):
+        tip = self.commit("b.py", "two\n")
+        st, d = landgate.gate_binds_tree(
+            "g1", None, {"g1": self._rec_for(tip)}, repo=self.repo, tip=tip,
+            provenance=lambda row, repo: (None, "ledger unreadable"))
+        self.assertEqual(st, landgate.UNKNOWN, d)
+        self.assertIn("provenance UNKNOWN", d)
+
+    def test_the_real_reader_refuses_a_row_no_door_placed(self):  # noqa: VACUOUS_ASSERTION — REFUSE and the refusal text are asserted positively; the seam arms above pass the same row when proven
+        """With the flip ACTIVE (a fresh home, activated before anything
+        reached its ledger): the injected row is no receipt any door placed."""
+        from tests._tmphome import own_env
+        from helm import gateimport
+        own_env(self, "HELM_HOME", os.path.join(self.repo, ".helm-home"))
+        record, err = gateimport.activate(ts="2000-01-01T00:00:00Z")
+        self.assertIsNone(err, err)
+        tip = self.commit("b.py", "two\n")
+        st, d = landgate.gate_binds_tree("g1", None,
+                                         {"g1": self._rec_for(tip)},
+                                         repo=self.repo, tip=tip)
+        self.assertEqual(st, landgate.REFUSE, d)
+        self.assertIn("cannot authorize a land", d)
+
+    def test_a_content_refusal_keeps_its_own_words(self):
+        tip = self.commit("b.py", "two\n")
+        other = self.commit("c.py", "three\n")
+        st, d = landgate.gate_binds_tree(
+            "g1", None, {"g1": self._rec_for(other)}, repo=self.repo, tip=tip,
+            provenance=lambda row, repo: (False, "never asked"))
+        self.assertEqual(st, landgate.REFUSE, d)
+        self.assertIn("DIFFERENT tree", d)
+        self.assertNotIn("never asked", d)
 
 
 class DisjointLandedTest(LandGateBase):
@@ -387,7 +464,7 @@ class FreezeTest(LandGateBase):
         self.assertIn("unprovable", d)
 
 
-class QualifyTest(LandGateBase):
+class QualifyTest(ProvenIsNotTheQuestion, LandGateBase):
     def ok_args(self, **over):
         mine = self.commit("mine.py", "x\n")
         tree = self.git("rev-parse", "HEAD^{tree}")

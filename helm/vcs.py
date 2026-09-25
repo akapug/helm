@@ -115,6 +115,14 @@ _COMMON_DIR = collections.OrderedDict()
 # THE INSTANT EACH MEMOISED ANSWER WAS MEASURED, keyed like `_COMMON_DIR` and
 # evicted with it — what `validated_at` reads and a fresh read re-stamps.
 _COMMON_DIR_AT = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_COMMON_DIR": "a bounded LRU of git common dirs keyed by path",
+    "_COMMON_DIR_AT": (
+        "when each _COMMON_DIR answer was measured, evicted with it"),
+}
 # helm web is a ThreadingHTTPServer, so every COMPOUND operation on the LRU
 # (get-then-move_to_end, insert-then-popitem) is a race: review drove a
 # deterministic interleaving where thread A takes a hit, thread B evicts that

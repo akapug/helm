@@ -42,7 +42,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from helm import foldcheck, foldcompose, gate, landreq, pk, vcs
+from helm import foldcheck, foldcompose, gate, gateimport, landreq, pk, vcs
 
 # The env this suite must not read THROUGH — an unisolated HELM_HOME points
 # `gate.receipts()` at the live fleet ledger, where the answer to "is there a
@@ -186,6 +186,12 @@ class FoldCheckBase(unittest.TestCase):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        # AND THE ROW HELM'S OWN RUNNER WRITES BESIDE IT (task/3066): the fold
+        # is a land, and a land takes only a receipt an authenticated door
+        # placed in this repository. This fixture stands in for a local mint,
+        # so it records one; the arms about provenance itself live in
+        # tests/test_land_provenance.py.
+        self.assertIsNone(gateimport.record_mint(row, repo))
         rows, unavailable, skipped = gate.receipts()
         self.assertIsNone(unavailable, "fixture store unreadable")
         self.assertEqual(skipped, 0, "the fixture receipt failed its own "

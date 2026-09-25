@@ -70,21 +70,21 @@ COVERAGE_EXCLUSION = (
 GUIDANCE = """\
 helm physics (you are a subagent; this is your initial context):
 - VERIFYING A CURE: route it through the fab, never locally. The rule is that
-  a cure round is FOCUSED and the WHOLE SUITE (`fab gate --repo .`) belongs at
-  the LAND gate. DO NOT TRUST THIS PARAGRAPH'S NUMBERS — RUN THE CHECK, which
-  is local and takes seconds: `helm gate run --repo . --focus --plan` prints
-  the selection without running anything, and REFUSES if your lane touches any
-  non-Python file ("focus can compute consumers only for Python modules"),
-  which is itself the answer — focus cannot help that lane at all.
-  WHEN LAST MEASURED, focus selected ~95% of modules whatever the lane touched,
-  because one constant-prefix import makes the CLI a consumer of everything
-  under `helm/` — so a cure round cost whole-suite money. That is task/1563 and
-  it is a coupling fact, not a slow node. If --plan now prints a small number,
-  1563 moved and this sentence is the stale one. Either way the WHOLE-SUITE
-  run is `fab gate --repo .`, no custom argv. `python3 -m unittest` is REFUSED locally
-  whatever its shape — named module, single method, under nice, any
-  interpreter spelling. Do not spend turns finding a wording that gets past
-  it; there isn't one.
+  a cure round is FOCUSED and the ONE WHOLE SUITE belongs at the LAND gate,
+  the integrator's train on the tree that lands. A lane's own whole suite
+  (`fab gate --repo .` in a lane room) is REFUSED by `helm gate run`, which
+  prints the focused route instead; a reviewer whose read is clean holds the
+  row `--source-clean` and approves on the train's token (task/3039).
+  RUN THE CHECK, which is local and takes seconds:
+  `helm gate run --repo . --focus --plan` prints the selection without
+  running anything. A non-Python change (a doc, a script) selects every
+  tree-wide audit plus the test modules that name the file. DO NOT TRUST A
+  NUMBER HERE: when last measured (task/3039) a change to one helm module
+  still selected about 439 of 445 test modules, because function-local
+  imports tie 312 modules into one cycle; --plan prints today's.
+  `python3 -m unittest` is REFUSED locally whatever its shape — named module,
+  single method, under nice, any interpreter spelling. Do not spend turns
+  finding a wording that gets past it; there isn't one.
 - THE CURE-ROUND ROUTE IS `fab test --repo . -- python3 -m unittest <modules>`
   run from the lane worktree: the test modules you touched PLUS every module
   that consumes a touched symbol (derive the set with `git grep -ln` over

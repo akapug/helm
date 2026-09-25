@@ -23,6 +23,18 @@ Nothing else is judged: an indented method, a local variable and a name
 re-added in the same file are not retirements, and a name whose only
 spelling was the retired line is simply gone.
 
+A NAME THE FILE STILL DEFINES IS NOT RETIRED, and "still defines" is narrow
+on purpose: an unconditional top-level `def`, `async def` or `class` of the
+name, with no module-scope `del` of it after that statement and no `global`
+or `nonlocal` of it anywhere in the file (`still_defines`). No other binder
+counts, so when in doubt the rung refuses. This narrow rule is the shape-A
+clearance and the own-def clearance of another file below; a declared
+satellite is read by the wider `defines_at_top_level`.
+A merge is judged like every commit, against its first parent, so merging
+trunk into a lane is charged with trunk's retirements: lanes compose in the
+train room with trunk as the first parent, and HELM_RETIRED_NAME_SKIP=1
+commits a merge made the other way.
+
 A DECLARED MOVE IS NOT A RETIREMENT, and relocation alone does not earn
 that. A name removed from F is spared only when F's index text carries an
 `_OWNER_NAMES` literal -- the form `web_compat` uses for the web split, a
@@ -42,29 +54,40 @@ path still contains that token, so it is found.
 
 A MODULE TOKEN IS NOT A BINDING. Another file that names the module and
 holds the name is still cleared when the ast resolves every spelling of the
-name to ANOTHER module: a bare NAME bound by `from other import NAME`, and
-`R.NAME` where an import binds R to something that is not the module. An
-alias import of the module (`import helm.mod as m; m.NAME`, `from helm
-import mod as m`) is resolved TO the module and refuses.
+name to something that is NOT the module: a bare NAME bound by `from other
+import NAME`; a bare NAME in a file that itself still defines NAME, by the
+same narrow `still_defines` test (an unconditional top-level def, async def
+or class, no module-scope `del` after it, no `global` or `nonlocal` of it);
+and `R.NAME` where an import binds R to something that is not the module.
+An alias import of the module (`import helm.mod as m; m.NAME`, `from helm
+import mod as m`) is resolved TO the module and refuses. The own def clears
+BARE spellings only: `mod.NAME`, `m.NAME` and `R.NAME` with R unbound
+refuse beside it, and so does `from mod import NAME` anywhere in the file,
+because either binding may be the one that wins. A file that only assigns
+NAME, or defines it under an `if` or `try`, is not cleared by this.
 
 WHAT IS NOT FOUND, said here rather than left for a reader to discover: a
 name built at runtime; a file that never names the module at all (`from
 other import *` where `other` re-exports the name, a module object passed
-in from another file); and a module rebound through a plain assignment
-(`c = mod; c.NAME`), because an assignment is never resolved: it refuses
-when no import binds `c`, and is missed when an import also binds `c` to
-another module. The trade is deliberate: the alternative is to warn about every file in the
-tree that happens to share a word with a retired symbol, which is the
-direction that gets a rung switched off. A re-export by import or by
-`mod.NAME` is still found, in the file that re-exports.
+in from another file); a module rebound through a plain assignment (`c =
+mod; c.NAME`), because an assignment is never resolved: it refuses when no
+import binds `c`, and is missed when an import also binds `c` to another
+module; and, in a file with its own top-level def of NAME, a later
+module-scope rebinding of NAME to the module's value through a spelling
+this rung does not read as a reference (`NAME = vars(mod)["NAME"]`), since
+the own def clears every bare spelling. The trade is deliberate: the
+alternative is to warn about every file in the tree that happens to share a
+word with a retired symbol, which is the direction that gets a rung
+switched off. A re-export by import or by `mod.NAME` is still found, in the
+file that re-exports.
 
 AND THE COST OF THE PRECISION, stated: a parameter or local that shares the
 retired name still reads as a surviving use in the retiring file, and in
-another file that names the module unless a foreign import binds the name.
-`R.NAME` beside a module token also reads as a use when no import binds R
-(`self`, a parameter, a local), because R can hold the module. Each refuses
-a correct commit, which is why the override exists and is named in the
-refusal.
+another file that names the module unless a foreign import or the file's
+own top-level def binds the name. `R.NAME` beside a module token also reads
+as a use when no import binds R (`self`, a parameter, a local, a class the
+file defines), because R can hold the module. Each refuses a correct
+commit, which is why the override exists and is named in the refusal.
 
 THE NEVERTRACK CLASS. This file is snapshotted beside the shared pre-commit
 hook and script-run as `python3 retired_name_rung.py --staged` where the helm
@@ -334,21 +357,50 @@ def _bound_elsewhere(text, mod, name):
     different function. So is a test that spells `seats.roster_path()`
     beside a `cell` token. Refusing either refuses a correct commit.
 
-    So the ast answers, and only for the two shapes it can resolve: a bare
-    `name` bound by `from X import name` where X is not `mod`, and `R.name`
-    where R is a name that an import binds to something other than `mod`.
-    Every other spelling is still a use: `from mod import name`, `from mod
-    import *`, a relative `from . import name`, `mod.name`, `pkg.mod.name`,
-    `alias.name` for an alias an import binds to `mod`, a bare `name` that no
-    foreign import binds, and `R.name` for a receiver no import binds. A
-    parameter or a local can hold the module, and a guess about that is not
-    this function's to make. An unparseable source answers False, because
-    this function only removes refusals and an unknown may not remove one."""
+    A FILE'S OWN DEFINITION IS A BINDING TOO. When `chat._ledger_write` is
+    retired, helm/dispatches.py names `chat` and the refusal listed 18 of its
+    lines, each one its own top-level `def _ledger_write`, a bare call to
+    that def, or prose about it. Measured by replaying the task/3060 commit
+    "argv-guard: one delegate rung". No spelling there can reach `chat`, and
+    refusing it refused a correct commit.
+
+    So the ast answers, and only for the three shapes it can resolve: a bare
+    `name` bound by `from X import name` where X is not `mod`; a bare `name`
+    in a file that itself still defines it, by the same narrow test as shape
+    A (`still_defines`: an unconditional top-level def, async def or class,
+    no module-scope `del` after it, no `global` or `nonlocal` of it); and
+    `R.name` where R is a name that an import binds to something other than
+    `mod`. Every other spelling is still a use: `from mod import name`,
+    `from mod import *`, a relative `from . import name` -- each refuses even
+    beside an own def, because it may be the binding that wins -- `mod.name`,
+    `pkg.mod.name`, `alias.name` for an alias an import binds to `mod`, a
+    bare `name` that no foreign import and no own def binds (an assignment or
+    a conditional def is not one), and `R.name` for a receiver no import
+    binds. A parameter or a local can hold the module, and a guess about that
+    is not this function's to make. An unparseable source answers False,
+    because this function only removes refusals and an unknown may not
+    remove one."""
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError):
         return False
-    to_mod, to_other, resolved = {mod}, set(), False
+    # THE OWN DEF IS ITSELF A RESOLVED SPELLING: a file whose only use is the
+    # def statement holds the name and has nothing that reaches `mod`.
+    own = still_defines(text, name)
+    if own:
+        # THE STRING DOOR BEATS THE OWN DEF: `getattr(c, "NAME")`,
+        # `c.__dict__["NAME"]` and `vars(c)["NAME"]` reach `mod`'s NAME
+        # through an alias the attribute walk never sees (c carries no
+        # `.NAME` attribute node), and the own def cleared the file anyway
+        # (a review of this lane). `_patch_site` answers exactly this
+        # question for the module's OWN name; here the alias is the file's,
+        # so the strings are asked of it directly: any alias bound to `mod`
+        # whose text reaches the name through one of those spellings refuses
+        # the clearance.
+        aliases = _aliases_to(tree, mod)
+        if aliases and _string_reach(tree, aliases, name):
+            return False
+    to_mod, to_other, resolved = {mod}, set(), own
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -374,10 +426,84 @@ def _bound_elsewhere(text, mod, name):
                 return False
             resolved = True
         elif isinstance(node, ast.Name) and node.id == name:
-            if name not in to_other or name in to_mod:
+            if not own and (name not in to_other or name in to_mod):
                 return False
             resolved = True
     return resolved
+
+
+def _aliases_to(tree, mod):
+    """The names an import statement binds TO `mod`, as a set: the alias of
+    `import helm.chat as c` / `from helm import chat as c`, the BARE name of
+    `from helm import chat` / `from . import chat` (the live shape), and the
+    module's own name for `import helm.chat`, whose receiver is the dotted
+    chain itself. A plain assignment (`c = chat`) is never resolved, exactly
+    as `_bound_elsewhere` states."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    if a.name.rpartition(".")[2] == mod:
+                        out.add(a.asname)
+                elif a.name == mod or a.name.endswith("." + mod):
+                    out.add(mod)
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name == mod:
+                    out.add(a.asname or mod)
+    return out
+
+
+def _receiver_names(node):
+    """The names an expression resolves through: a Name's own id, and every
+    attribute in a dotted chain (`helm.chat` yields both)."""
+    out = set()
+    while True:
+        if isinstance(node, ast.Name):
+            out.add(node.id)
+            return out
+        if isinstance(node, ast.Attribute):
+            out.add(node.attr)
+            node = node.value
+            continue
+        return out
+
+
+def _string_reach(tree, aliases, name):
+    """Does any call or subscript reach `name` as a STRING through one of
+    `aliases`: getattr/setattr/delattr/hasattr(a, "name"), a.__dict__["name"],
+    vars(a)["name"], where `a` may be a plain name or a dotted chain whose
+    last attribute is one (helm.chat). globals()["name"] names no receiver
+    and is not read."""
+    def on_alias(expr):
+        return bool(_receiver_names(expr) & aliases)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            spelling = func.id if isinstance(func, ast.Name) \
+                else func.attr if isinstance(func, ast.Attribute) else None
+            args = list(node.args) + [kw.value for kw in node.keywords]
+            holds = any(isinstance(a, ast.Constant) and a.value == name
+                        for a in args)
+            if holds and any(on_alias(a) for a in args) and spelling in (
+                    "getattr", "setattr", "delattr", "hasattr", "vars"):
+                return True
+        elif isinstance(node, ast.Subscript):
+            # a.__dict__["name"] or vars(a)["name"], keyed on the receiver
+            target = node.slice
+            if isinstance(target, ast.Constant) and target.value == name:
+                if isinstance(node.value, ast.Attribute) \
+                        and node.value.attr == "__dict__" \
+                        and on_alias(node.value.value):
+                    return True
+                if isinstance(node.value, ast.Call) \
+                        and isinstance(node.value.func, ast.Name) \
+                        and node.value.func.id == "vars" \
+                        and node.value.args and on_alias(node.value.args[0]):
+                    return True
+    return False
 
 
 def consumers(root, path, name, live_path=None):
@@ -389,8 +515,9 @@ def consumers(root, path, name, live_path=None):
     parenthesized multi-line import that a line-oriented search cannot see --
     or when it holds the name as a STRING beside the module, the shape a
     patched double takes. A file whose every spelling of the name the ast
-    resolves to ANOTHER module (`_bound_elsewhere`) is not a consumer, even
-    when it names the module somewhere else. The file that RETIRED the name
+    resolves to ANOTHER module or to the file's own top-level def
+    (`_bound_elsewhere`) is not a consumer, even when it names the module
+    somewhere else. The file that RETIRED the name
     is a consumer of itself whenever a token survives there.
 
     `git grep -l` is only a PREFILTER and is deliberately MORE PERMISSIVE than
@@ -454,9 +581,10 @@ def consumers(root, path, name, live_path=None):
             if patched != PATCH_DOTTED and (not mod or mod not in names):
                 continue
             # A MODULE TOKEN IS NOT A BINDING. The file names `mod`, but when
-            # every spelling of the name resolves to another module it is a
-            # different thing by the same name. A patch site is a string
-            # reaching into `mod` and is never resolved away.
+            # every spelling of the name resolves to another module or to the
+            # file's own top-level def, it is a different thing by the same
+            # name. A patch site is a string reaching into `mod` and is never
+            # resolved away.
             if not patched and _bound_elsewhere(text, mod, name):
                 continue
         elif name not in names:
@@ -530,6 +658,55 @@ def defines_at_top_level(text, name):
     return False
 
 
+#: A `del` or `except ... as` inside one of these touches that scope's own
+#: name. A `global` that would make it the module's refuses on its own.
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def still_defines(text, name):
+    """Does this source still DEFINE `name`? Parsed, never imported.
+
+    The shape-A clearance in `scan_staged`, and the own-def clearance of a
+    bare spelling in another file (`_bound_elsewhere`); a declared satellite
+    is read by the wider `defines_at_top_level`.
+
+    Yes only for an unconditional module-top-level `def`, `async def` or
+    `class` of the name, when no module-scope statement after the last one
+    deletes it (`del NAME`, or `except ... as NAME`, which Python deletes as
+    the handler ends) and no `global` or `nonlocal` of the name appears
+    anywhere in the file. No other binder counts -- an assignment, an
+    annotation, an import, a loop or with target -- and neither does a
+    definition under an `if` or `try`. That refuses some correct commits (a
+    def moved to a sibling and imported back), which the override is for. A
+    deletion built at runtime (`globals()`, `exec`) is not seen. An
+    unparseable source answers False."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    if any(isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names
+           for n in ast.walk(tree)):
+        return False
+    last = None
+    for i, node in enumerate(tree.body):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)) and node.name == name:
+            last = i
+    if last is None:
+        return False
+    stack = [n for n in tree.body[last + 1:] if not isinstance(n, _SCOPES)]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, ast.Name) and n.id == name and \
+                isinstance(n.ctx, ast.Del):
+            return False
+        if isinstance(n, ast.ExceptHandler) and n.name == name:
+            return False
+        stack.extend(c for c in ast.iter_child_nodes(n)
+                     if not isinstance(c, _SCOPES))
+    return True
+
+
 def moved_to_a_declared_satellite(root, path, name):
     """Did `name` leave `path` for a satellite that path DECLARES and that
     actually defines it? Then it was never retired.
@@ -559,12 +736,20 @@ def moved_to_a_declared_satellite(root, path, name):
 
 
 def scan_staged(root):
-    """({(path, name): [(path, lineno, text)]}, error)."""
+    """({(path, name): [(path, lineno, text)]}, error).
+
+    The staged diff is taken against HEAD, so a merge is judged against its
+    first parent, as every commit is."""
     done = _git(root, "diff", "--cached", "-U0", "--no-color", "--", "*.py")
     if done.returncode != 0:
         return None, os.fsdecode(done.stderr).strip() or "git diff failed"
     found = {}
     for path, name, live in parse(os.fsdecode(done.stdout)):
+        # One of two top-level definitions removed leaves the name defined.
+        # Asked at the live path, the file a rename produced.
+        text = _index_text(root, live)
+        if text is not None and still_defines(text, name):
+            continue
         if moved_to_a_declared_satellite(root, path, name):
             continue
         hits, err = consumers(root, path, name, live_path=live)

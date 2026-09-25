@@ -47,10 +47,25 @@ MAX_BLOCKED_IN = 512
 MAX_INTEGER = (1 << 63) - 1
 MAX_WALL_MS = MAX_INTEGER / 1_000_000
 OBSERVER = "python-cli-entry-v1"
+#: One stage per installed hook entry beside the PostToolUse internals; the
+#: entry table is `cli._HOOK_SPANS`, held to `hooks.SPECS` by a test.
+HANDLER_STAGES = ("inject", "delegation-stop", "saguide", "join", "resume-turn",
+                  "stop-guard", "argv-guard", "handoff")
 STAGES = frozenset(("event", "input", "record-registry", "delivery-registry",
                     "record", "prepare", "delivery", "lock-seats", "lock-proxywatch",
-                    "lock-room", "lock-whisper", "lock-send"))
-EVENTS = frozenset(("PostToolUse", "PostToolUseFailure", "PostToolUse-or-Failure"))
+                    "lock-room", "lock-whisper", "lock-send") + HANDLER_STAGES)
+#: EVERY HOOK EVENT helm installs, not only PostToolUse (task/3040): the Stop,
+#: PreToolUse and SessionStart hooks are the ones a seat waits on, and a ledger
+#: that could not name them could not show a single one of their timeouts. The
+#: two `-or-` labels are provisional: one argv serves two events and the START
+#: row is written before any payload is read.
+EVENTS = frozenset(("PostToolUse", "PostToolUseFailure", "PostToolUse-or-Failure",
+                    "UserPromptSubmit", "SubagentStart", "SubagentStop",
+                    "SessionStart", "Stop", "PreToolUse", "PreCompact",
+                    "SessionEnd", "PreCompact-or-SessionEnd"))
+#: Each provisional label and the events it can turn out to be.
+PROVISIONAL = {"PostToolUse-or-Failure": ("PostToolUse", "PostToolUseFailure"),
+               "PreCompact-or-SessionEnd": ("PreCompact", "SessionEnd")}
 OUTCOMES = ("completed", "acquired", "nonzero", "skipped", "unchecked", "exception",
             "failed-open", "cancelled", "timeout")
 _CURRENT = ContextVar("helm_hooklatency", default=())
@@ -75,6 +90,22 @@ SCHEMA = 2
 
 def path():
     return os.path.join(home.helm_home(), "_global", ".state", "hook-latency.jsonl")
+
+
+#: THE INCIDENTS OUTLIVE THE STREAM. At fleet rate the three generations above
+#: hold minutes (MEASURED on the agents box: 4,362 rows spanned 0.15 h), so "how many hooks
+#: timed out today" had no answer at all. A span that ENDS in one of these
+#: outcomes is copied, with its START, to a second stream sized for days of
+#: incidents: ~3 KB each, about 160 a day at that measurement, so
+#: RETAIN_BYTES x RETAIN_GENERATIONS keeps 24 h up to ~1,300 a day. That is a
+#: byte bound, not a clock, so the report prints the hours it actually holds.
+RETAINED = frozenset(("timeout", "cancelled"))
+RETAIN_BYTES = 2 * 1024 * 1024
+RETAIN_GENERATIONS = 3
+
+
+def incidents_path(dest=None):
+    return (path() if dest is None else dest) + ".incidents"
 
 
 def _identity(value):
@@ -116,6 +147,22 @@ def append(row):
     No fd1/stdin, diagnostics, delivery locks, retries, or cancellation catcher.
     A short append is not a successful measurement; the reader rejects it.
     """
+    return _append_to(path(), row, MAX_BYTES, GENERATIONS)
+
+
+def _retain(start, end):
+    """Copy one incident span, START first, to the incidents stream. Best
+    effort like every append here; a failure is not counted anywhere."""
+    try:
+        dest = incidents_path()
+        for row in (start, end):
+            if row is not None:
+                _append_to(dest, row, RETAIN_BYTES, RETAIN_GENERATIONS)
+    except Exception:
+        pass
+
+
+def _append_to(dest, row, max_bytes, generations):
     lock = fd = None
     try:
         if not _valid(row):
@@ -123,7 +170,6 @@ def append(row):
         wire = _wire(row)
         if len(wire) > MAX_ROW:
             return False
-        dest = path()
         os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
         lock = _open_regular(dest + ".lock", os.O_CREAT | os.O_RDWR)
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -131,8 +177,8 @@ def append(row):
             size = os.stat(dest, follow_symlinks=False).st_size
         except FileNotFoundError:
             size = 0
-        if size + len(wire) > MAX_BYTES:
-            for n in range(GENERATIONS - 1, 0, -1):
+        if size + len(wire) > max_bytes:
+            for n in range(generations - 1, 0, -1):
                 src = dest if n == 1 else dest + "." + str(n - 1)
                 try:
                     os.replace(src, dest + "." + str(n))
@@ -187,6 +233,10 @@ class _Event:
             written = False
         if not written:
             self.drops += 1
+        if kind == "START":
+            span.start_row = row
+        elif row["outcome"] in RETAINED:
+            _retain(span.start_row, row)
 
 
 class _Span:
@@ -195,6 +245,7 @@ class _Span:
         self.id = uuid.uuid4().hex
         self.outcome = "completed"
         self.blocked_in = None
+        self.start_row = None
 
 
 def active():
@@ -484,7 +535,7 @@ def _poll_flock(file, flags, deadline):
         delay = min(delay * 2, _POLL_CAP_S)
 
 
-def _snapshot(dest):
+def _snapshot(dest, generations=GENERATIONS, max_bytes=MAX_BYTES):
     """Fixed paths/byte ceilings; never create even a missing lock file."""
     coverage = dict(snapshot="uncertain", missing_generations=0,
                     unreadable_generations=0, oversized_generations=0,
@@ -500,7 +551,7 @@ def _snapshot(dest):
             if lock is not None:
                 os.close(lock)
                 lock = None
-        for n in range(GENERATIONS):
+        for n in range(generations):
             name = dest + ("." + str(n) if n else "")
             try:
                 fd = _open_regular(name, os.O_RDONLY)
@@ -508,10 +559,10 @@ def _snapshot(dest):
                     # Capture is bounded and under the shared lock; JSON parsing
                     # happens afterwards so a slow parser does not block writers.
                     with os.fdopen(fd, "rb", closefd=False) as stream:
-                        blob = stream.read(MAX_BYTES + 1)
-                    if len(blob) > MAX_BYTES:
+                        blob = stream.read(max_bytes + 1)
+                    if len(blob) > max_bytes:
                         coverage["oversized_generations"] += 1
-                        blob = blob[:MAX_BYTES]
+                        blob = blob[:max_bytes]
                     blobs.append(blob)
                 finally:
                     os.close(fd)
@@ -623,6 +674,9 @@ def report(dest=None, since=None, until=None):
     # multiply on the boundary it was given.
     lo_ns, hi_ns = lo, hi
     blobs, coverage = _snapshot(path() if dest is None else dest)
+    kept, kept_coverage = _snapshot(incidents_path(dest), RETAIN_GENERATIONS,
+                                    RETAIN_BYTES)
+    kept_stamps = []
     counts = dict(malformed=0, invalid=0, duplicates=0, conflicts=0,
                   orphan_ends=0, orphan_parents=0, sequence_conflicts=0,
                   censored=0, timeout=0, cancellation=0,
@@ -632,7 +686,10 @@ def report(dest=None, since=None, until=None):
     stamps = []
     sequences = {}
     bad = set()
-    for blob in blobs:
+    # THE MAIN STREAM FIRST, THEN THE INCIDENTS, so a retained row the main
+    # stream still holds is recognised as the same row and read once; only the
+    # rows rotation already took arrive from the second stream.
+    for retained, blob in [(False, b) for b in blobs] + [(True, b) for b in kept]:
         for wire in blob.splitlines(keepends=True):
             if not wire.strip():
                 continue
@@ -657,6 +714,11 @@ def report(dest=None, since=None, until=None):
                         or (hi_ns is not None and when >= hi_ns):
                     continue
             key = (row["event_id"], row["span_id"])
+            if retained:
+                if row["time_ns"] is not None:
+                    kept_stamps.append(row["time_ns"])
+                if spans.get(key, {}).get(row["kind"]) == row:
+                    continue
             seq = (row["writer"], row["sequence"])
             if seq in sequences and sequences[seq] != row:
                 counts["sequence_conflicts"] += 1
@@ -664,7 +726,7 @@ def report(dest=None, since=None, until=None):
                 bad.add((sequences[seq]["event_id"], sequences[seq]["span_id"]))
             sequences[seq] = row
             writers[row["writer"]] = max(writers.get(row["writer"], 0), row["observed_drops"])
-            if row["time_ns"] is not None:
+            if row["time_ns"] is not None and not retained:
                 stamps.append(row["time_ns"])
             pair = spans.setdefault(key, {})
             prior = pair.get(row["kind"])
@@ -715,7 +777,7 @@ def report(dest=None, since=None, until=None):
             fixed = ("event_id", "span_id", "parent_id", "stage", "mode", "observer", "seat")
             compatible = all(start[k] == end[k] for k in fixed)
             compatible &= start["session"] is None or start["session"] == end["session"]
-            compatible &= start["event"] == end["event"] or start["event"] == "PostToolUse-or-Failure"
+            compatible &= start["event"] == end["event"] or start["event"] in PROVISIONAL
             a, b = start["monotonic_ns"], end["monotonic_ns"]
             valid_clock = (a is not None and b is not None and b >= a and
                            end["wall_ms"] == (b - a) / 1_000_000)
@@ -756,6 +818,15 @@ def report(dest=None, since=None, until=None):
                     pre_marker_population="unobserved", startup_ms=None,
                     total_event_denominator="in-process registered spans only; unmatched launches unknown",
                     retained_time_range_hours=(max(stamps) - min(stamps)) / 3.6e12 if stamps else None,
+                    incidents=dict(kept_coverage, outcomes=sorted(RETAINED),
+                                   bytes_per_generation=RETAIN_BYTES,
+                                   generations=RETAIN_GENERATIONS,
+                                   retained_time_range_hours=(
+                                       (max(kept_stamps) - min(kept_stamps)) / 3.6e12
+                                       if kept_stamps else None),
+                                   scope="spans that ENDED timeout or cancelled, "
+                                         "with their START; a process killed from "
+                                         "outside writes no END and is not here"),
                     budget_decision="not authorized by this report; 24h live rows AND adequate coverage required",
                     lock_wait="nonblocking", filesystem_wall_bound=None,
                     numeric_schema="timestamps/counters: integers 0..2**63-1; wall_ms: finite 0..(2**63-1)/1e6; reject, never clamp",
@@ -774,7 +845,9 @@ def report(dest=None, since=None, until=None):
                                 "lock-proxywatch": "delivery_state_guard flock acquisition only, excludes file open/body",
                                 "lock-whisper": "pair latch flock acquisition only, excludes file open/body",
                                 "lock-room": "room acquisition including existing bounded poll loop, excludes file open/body",
-                                "lock-send": "chat node send lock acquisition including its bounded poll, excludes file open/body"},
+                                "lock-send": "chat node send lock acquisition including its bounded poll, excludes file open/body",
+                                **{name: "standalone CLI dispatch of the %s hook entry, from the observer marker in cli.main" % name
+                                   for name in HANDLER_STAGES}},
                     logger_overhead="START append/scheduling included in span wall time; END append excluded from its own span",
                     local_helm_web="unavailable: no installed hook call path to local web client established",
                     uninstrumented="other lock owners, filesystem calls, node/provider HTTP, imports before marker; no complete bottleneck attribution",
@@ -874,6 +947,10 @@ def cmd(args):
         print("Timed out IN: UNKNOWN for every timeout in this window — the "
               "rows predate the blocked_in field (schema 1) or the alarm "
               "could not read its own frame.")
+    held = (result["coverage"].get("incidents") or {}).get("retained_time_range_hours")
+    print("Incidents (timeout and cancelled spans) are kept past rotation in a "
+          "second stream; it holds %s. A byte bound, not a clock."
+          % ("%.1f h" % held if held is not None else "none yet"))
     print("Counts: " + json.dumps(result["counts"], sort_keys=True))
     print("Coverage: " + json.dumps(result["coverage"], sort_keys=True))
     return 0

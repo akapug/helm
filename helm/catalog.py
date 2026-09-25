@@ -35,13 +35,27 @@ def _localnames():
     return localnames
 
 
+def _home():
+    """`home`, the same two ways in as `_pk()`."""
+    try:
+        from . import home
+    except ImportError:               # run by pathname: no package parent
+        import home
+    return home
+
+
 HOME = os.path.expanduser("~")
-CACHE_DIR = os.path.join(HOME, ".cache", "helm")
+_DEFAULT_CACHE_DIR = os.path.join(HOME, ".cache", "helm")
+# HELM_CACHE_DIR moves the root, read the way registry.cache_root() reads it,
+# so the directory doctor classifies is the directory this module writes.
+CACHE_DIR = _home().env("CACHE_DIR") or _DEFAULT_CACHE_DIR
 # The predecessor's cache seeds helm's once, on a host whose local names
-# declare a predecessor (helm/localnames.py); elsewhere there is none.
+# declare a predecessor (helm/localnames.py); elsewhere there is none. Only
+# the default root is seeded: a moved root is a scratch or test home, and
+# copying this machine's cache into it would defeat the move.
 _LEGACY_CACHE_DIR = _localnames().legacy_path(".cache", "{}")
-if _LEGACY_CACHE_DIR and os.path.isdir(_LEGACY_CACHE_DIR) \
-        and not os.path.isdir(CACHE_DIR):
+if CACHE_DIR == _DEFAULT_CACHE_DIR and _LEGACY_CACHE_DIR \
+        and os.path.isdir(_LEGACY_CACHE_DIR) and not os.path.isdir(CACHE_DIR):
     try:
         import shutil
         shutil.copytree(_LEGACY_CACHE_DIR, CACHE_DIR)  # one-time seed from the legacy cache

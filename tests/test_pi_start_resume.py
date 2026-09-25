@@ -192,6 +192,10 @@ class PiCmdTest(unittest.TestCase):
         self.assertEqual(argv, ["/usr/bin/pi", "--model",
                                 "helm-seat-a/model-a", "--print", "probe"])
         self.assertEqual(env["HELM_CHAT_NAME"], "pi-seat-a")
+        # task/3049: the signing profile rides with the name, as at every
+        # launch door — never the owner's export inherited from the shell
+        self.assertEqual((env["HELM_CELL_PROFILE"], env["DREGG_PROFILE"]),
+                         ("pi-seat-a", "pi-seat-a"))
         self.assertEqual(env["HELM_PI_PROXY_KEY"], "secret-key")
 
     def test_run_refuses_a_model_from_another_provider_before_reading_key(self):  # noqa: VACUOUS_ASSERTION — the emitted provider error and status 2 are positive controls; the three untouched boundaries prove refusal ordering

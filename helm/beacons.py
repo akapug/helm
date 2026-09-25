@@ -143,6 +143,7 @@ import sys
 import time
 
 from . import beacon_origin, consumption, home, pk
+from .seats_advice import BEACON_TIMEOUT_MS
 
 PROC = "/proc"
 REG_SUBDIR = "beacons"
@@ -150,6 +151,14 @@ _SEAT_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 # Beacon-row states.
 LIVE, GHOST, UNKNOWN, GONE = "live", "ghost", "unknown", "gone"
+# EXPIRED is a GONE row whose death has the shape of the harness's own lease
+# (task/3055). Claude Code caps every Monitor at BEACON_TIMEOUT_MS and SIGTERMs
+# it there; the waiter's `finally` never runs, so its registry row survives it.
+# A row whose `armed` stamp puts its death at that deadline is not evidence of
+# a fault: it is the seat's half-hourly check-in, and the seat re-arms in the
+# turn the expiry wakes. The row is KEPT for REARM_GRACE_S so the census can
+# say so, instead of pruning it and calling the seat DEAF for a 30-second gap.
+EXPIRED = "expired"
 # Seat verdicts. UNPROVEN is not a softer DEAF: DEAF is a PROVEN absence of any
 # wake path, UNPROVEN means the instruments could not answer. Collapsing them
 # would either invent a crisis or hide one. VACANT is not a softer COVERED
@@ -173,6 +182,13 @@ DEAF_IN_EFFECT = "DEAF-IN-EFFECT"
 # because a subagent inherits the seat's environ, session id and HELM_CHAT_NAME
 # — only the harness boundary separates them.
 MISROUTED = "MISROUTED"
+# WAKING is not a softer DEAF either, and it is the verdict the 30-minute lease
+# made necessary (task/3055). No beacon is live, but the newest one ended at
+# its lease deadline within the re-arm grace, and a pane DECLARES the seat, so
+# the agent that re-arms it is home. It is the NORMAL state of a healthy seat
+# for about 30 seconds every half hour. It is outside the alarm class, the
+# re-arm nudge never types into it, and it becomes DEAF once the grace ends.
+WAKING = "WAKING"
 #: WHICH CONVERSATION armed a beacon. Named rather than spelled inline so the
 #: producer and every consumer share ONE spelling -- this module has already
 #: been bitten once by a second module-level binding of a verdict word, where
@@ -190,6 +206,27 @@ OWNER_SUBAGENT = "subagent"
 # turn. 45 minutes clears that by a wide margin and still catches a four-hour
 # outage in the first hour.
 UNDRAINED_S = 45 * 60
+
+# THE CENSUS CADENCE, defined here rather than beside the timer units below
+# because the re-arm grace is derived from it and module constants bind in
+# order. `timer_units` and `ensure_timer` read this same name.
+INTERVAL_S = 5 * 60
+
+# THE RE-ARM GRACE: two census passes (task/3055). A seat whose beacon ended at
+# its lease deadline re-arms in the turn the expiry wakes; measured on the
+# live fleet at 31 seconds. Two passes is long enough that one late or skipped
+# pass never turns that gap into DEAF, and short enough that a seat which
+# never re-arms reads DEAF within ten minutes. DERIVED, never a bare number,
+# for the reason `seat_usability._beacon_stale_s` gives: a bound written as a
+# number drifts when the cadence changes and nothing reports the drift.
+REARM_GRACE_S = 2 * INTERVAL_S
+
+# How far before its lease deadline a beacon may die and still read as having
+# EXPIRED. `armed` is stamped when the waiter registers, which is after the
+# harness started the Monitor, so the kill lands a little BEFORE armed +
+# timeout. One minute covers that start-up skew; a death earlier than this is
+# not the lease and stays DEAF at once.
+EXPIRY_SKEW_S = 60
 
 # "the caller did not probe" — distinct from a probe that ran and failed, which
 # is None. Without it a census that already knows the scan failed would re-run
@@ -628,6 +665,14 @@ _PY_ARGS = ("WX", ("--check-hash-based-pycs",))
 _HOPS = 8
 _NEAR_ANCESTORS = 4
 _READER_MEMO = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_READER_MEMO": (
+        "a TTL memo of process-tree reader lookups keyed by the waiter; a "
+        "hit only saves a /proc walk"),
+}
 _EMPTY_TTL_S = 15.0
 
 
@@ -2655,7 +2700,7 @@ def classify(pid, seat=None, row=None, live=None, proc_dir=None, records=None):
 
 
 def _verdict(live_, unknown, unlistable, agent, agent_why, undrained=None,
-             sidechain=False):
+             sidechain=False, expired=()):
     """(verdict, why) — the seat ladder, in one place so the verdicts cannot
     drift apart across two call sites.
 
@@ -2671,7 +2716,15 @@ def _verdict(live_, unknown, unlistable, agent, agent_why, undrained=None,
     IT REFINES COVERED AND NOTHING ELSE. A seat with no live beacon is DEAF
     whether or not rows are waiting — that verdict is already the stronger
     claim — and an unclassifiable seat stays UNPROVEN rather than acquiring a
-    verdict from a fact that cannot be attributed to it."""
+    verdict from a fact that cannot be attributed to it.
+
+    `expired` is the other refinement, and it refines DEAF only (task/3055):
+    the beacons `seat_census` kept because they ended at their lease deadline
+    inside the re-arm grace. With no live and no unknown beacon, at least one
+    expired row and a pane that DECLARES this seat (`agent` True — the same
+    independent evidence VACANT rests on, so a dead session cannot read
+    WAKING), the seat is re-arming, not deaf. Every other combination falls
+    through to DEAF unchanged."""
     if unlistable:
         return UNPROVEN, "the process table could not be listed"
     if live_:
@@ -2700,6 +2753,15 @@ def _verdict(live_, unknown, unlistable, agent, agent_why, undrained=None,
         return state, agent_why
     if unknown:
         return UNPROVEN, "no beacon could be PROVEN live (%d unknown)" % len(unknown)
+    if expired and agent is True:
+        # THE NEWEST EXPIRY SPEAKS: it is the one the seat is re-arming after,
+        # and it is the one whose grace ends last.
+        past = min(float(b.get("lease_past") or 0.0) for b in expired)
+        return WAKING, (
+            "beacon expired %s ago (%d-minute lease); %s; re-arm expected "
+            "within %s" % (_age_s(max(0.0, past)), BEACON_TIMEOUT_MS // 60000,
+                           agent_why or "a pane declares this seat",
+                           _age_s(max(0.0, REARM_GRACE_S - past))))
     return DEAF, "no live beacon: helm cannot wake it"
 
 
@@ -3078,7 +3140,13 @@ def unreachable(row):
     THE SEATS THIS CATCHES ARE THE NON-CLAUDE FAMILIES. `live_sessions` proves
     liveness from a claude session record; a kimi or codex seat therefore reads
     UNPROVEN while it is perfectly healthy AND while it is dead, and until this
-    predicate existed the census could only ever whisper about it."""
+    predicate existed the census could only ever whisper about it.
+
+    WAKING IS NOT IN IT (task/3055). A seat inside its re-arm grace has no
+    live beacon for about 30 seconds every half hour by the harness's design,
+    and an alarm on that fires for every healthy seat twice an hour. If the
+    seat does not re-arm, the next pass past the grace reads DEAF, and that
+    one alarms."""
     if row.get("verdict") in (DEAF, DEAF_IN_EFFECT, MISROUTED):
         return True
     return row.get("verdict") == UNPROVEN and not row.get("live")
@@ -3307,23 +3375,65 @@ def _row_epoch(row):
         return None
 
 
+def lease_age(row, now=None):
+    """Seconds past this registry row's LEASE DEADLINE (armed + the Monitor
+    timeout), when its death has the lease's shape, else None.
+
+    Shape means: the row was committed (an `arming` marker never entered wait,
+    so it had no lease), it carries a readable arm time, and now falls inside
+    [deadline - EXPIRY_SKEW_S, deadline + REARM_GRACE_S]. The value can be
+    slightly negative inside the skew. Only a caller that has already PROVEN
+    the pid GONE may use this: it is a statement about how a dead beacon died,
+    never about whether one is alive."""
+    if not isinstance(row, dict) or row.get("phase") == "arming":
+        return None
+    try:
+        armed = float(row.get("armed"))
+    except (TypeError, ValueError):
+        return None
+    past = (time.time() if now is None else float(now)) - armed \
+        - BEACON_TIMEOUT_MS / 1000.0
+    if -EXPIRY_SKEW_S <= past <= REARM_GRACE_S:
+        return past
+    return None
+
+
 def seat_census(seat, live=None, proc_dir=None, records=None, agents=_UNPROBED,
                 waited=None, undrained_unreadable=None,
-                undrained_evidence=None, homes=None):
+                undrained_evidence=None, homes=None, now=None):
     """Every beacon for ONE seat — EVERY one, not the newest.
 
     Taking the newest arm-time was the exact narrow-question error that made a
     seat with five waiters, four of them stale, read as "current" (chat #helm
-    row 622). The verdict is computed over the whole set."""
+    row 622). The verdict is computed over the whole set.
+
+    A GONE beacon's row is pruned, EXCEPT one that died at its lease deadline
+    and is still inside the re-arm grace (`lease_age`, task/3055). That row is
+    kept and reported EXPIRED, because the kill that ended it never let its
+    own `finally` release the row, and pruning it here would erase the only
+    evidence that the seat is re-arming rather than deaf. It is pruned by the
+    first pass after the grace, as every other dead row is."""
     rows = _rows_by_pid(seat)
     scanned = _scan(seat, proc_dir)
     unlistable = scanned is None
     beacons = [classify(pid, seat, rows.get(pid), live, proc_dir, records)
                for pid in sorted(set(rows) | set(scanned or []))]
+    expired = []
     for row in list(rows.values()):
-        if any(b["pid"] == row["pid"] and b["state"] == GONE for b in beacons):
+        gone = [b for b in beacons
+                if b["pid"] == row["pid"] and b["state"] == GONE]
+        if not gone:
+            continue
+        past = lease_age(row, now)
+        if past is None:
             prune(row)
-    beacons = [b for b in beacons if b["state"] != GONE]
+            continue
+        gone[0].update(state=EXPIRED, lease_past=past,
+                       why="pid %s ended at its %d-minute lease deadline "
+                           "%s ago" % (row["pid"], BEACON_TIMEOUT_MS // 60000,
+                                       _age_s(max(0.0, past))))
+        expired.append(gone[0])
+    beacons = [b for b in beacons if b["state"] not in (GONE, EXPIRED)]
     live_ = [b for b in beacons if b["state"] == LIVE]
     ghosts = [b for b in beacons if b["state"] == GHOST]
     unknown = [b for b in beacons if b["state"] == UNKNOWN]
@@ -3348,7 +3458,8 @@ def seat_census(seat, live=None, proc_dir=None, records=None, agents=_UNPROBED,
             owner_reasons.append(owner_why or "unattributed, no reason given")
     sidechain = bool(live_) and all(o == OWNER_SUBAGENT for o in owners)
     verdict, why = _verdict(live_, unknown, unlistable, agent, agent_why,
-                            undrained=waited, sidechain=sidechain)
+                            undrained=waited, sidechain=sidechain,
+                            expired=expired)
     return {"seat": seat, "verdict": verdict, "why": why, "agent": agent,
             "owners": owners, "unattributed": unattributed,
             "unstamped": unstamped, "owner_reasons": owner_reasons,
@@ -3362,6 +3473,10 @@ def seat_census(seat, live=None, proc_dir=None, records=None, agents=_UNPROBED,
             "undrained_unreadable": undrained_unreadable,
             "undrained_evidence": undrained_evidence or _NO_EVIDENCE,
             "live": live_, "ghosts": ghosts, "unknown": unknown,
+            # KEPT APART FROM `beacons`: an expired row is a dead process, and
+            # counting it among the beacons would put it in the fleet's beacon
+            # total and its surplus.
+            "expired": expired,
             "duplicates": max(0, len(live_) - 1),
             "unlistable": unlistable}
 
@@ -3590,6 +3705,7 @@ def census(seats=None, proc_dir=None):
         "live_probe": live is not None,
         "agent_probe": agents is not None,
         "covered": [r for r in rows if r["verdict"] == COVERED],
+        "waking": [r for r in rows if r["verdict"] == WAKING],
         "deaf": [r for r in rows if r["verdict"] == DEAF],
         "deaf_in_effect": [r for r in rows if r["verdict"] == DEAF_IN_EFFECT],
         "vacant": [r for r in rows if r["verdict"] == VACANT],
@@ -3618,7 +3734,9 @@ def census(seats=None, proc_dir=None):
 # The register is that verb's output written onto the ONE sheet that already
 # exists: each censused roster row gains an `attendance` field —
 #
-#   state    the census verdict (covered / DEAF / VACANT / UNPROVEN)
+#   state    the census verdict (covered / WAKING / DEAF / VACANT / UNPROVEN /
+#            DEAF-IN-EFFECT / MISROUTED); WAKING never advances `covered`,
+#            because a beacon that is re-arming is not a proven answer
 #   at       when this pass measured it
 #   since    when the CURRENT state began (carried while the state holds)
 #   seen     the seat's last presence beat, as this pass measured it
@@ -3981,7 +4099,8 @@ def _rebucket(rep, was, now_row):
         if keep and not any(row is now_row for row in bucket):
             bucket.append(now_row)
 
-    for key, verdict in (("covered", COVERED), ("deaf", DEAF),
+    for key, verdict in (("covered", COVERED), ("waking", WAKING),
+                         ("deaf", DEAF),
                          ("vacant", VACANT), ("unproven", UNPROVEN),
                          ("deaf_in_effect", DEAF_IN_EFFECT)):
         _swap(rep.get(key), now_row["verdict"] == verdict)
@@ -4370,7 +4489,10 @@ def escalate(transitions, rep, now=None):
     # different sentence -- but only while it OWES something (the actuator
     # asks; canon ping-silent-while-owing-never-wake-clean-idle). `agent` True only: None is a census that could not
     # name a pane (a dead roster row reads exactly so) and nothing is typed on
-    # a guess.
+    # a guess. And DEAF only: a WAKING seat (task/3055) is inside its re-arm
+    # grace after a lease expiry, which is its ordinary check-in, so it is
+    # never in this list and never typed into. It joins it only if the grace
+    # passes and the census reads it DEAF.
     mute = [row for row in (rep or {}).get("deaf") or ()
             if row.get("agent") is True]
     if not transitions and not die and not mute:
@@ -4587,10 +4709,10 @@ def _deliver_legs(out, chat_rows, push_rows, rep, now):
 # ---------------------------------------------------------------------------
 # the cadence — the census was the ONLY instrument that stayed correct through
 # the 2026-08-03 outage, and it ran only when a human typed it; nobody typed
-# it for four hours. proxywatch's unit pattern, verbatim.
+# it for four hours. proxywatch's unit pattern, verbatim. The cadence itself,
+# INTERVAL_S, is defined near the top of the module: REARM_GRACE_S is derived
+# from it.
 # ---------------------------------------------------------------------------
-
-INTERVAL_S = 5 * 60
 
 
 _SERVICE = """[Unit]
@@ -4812,12 +4934,17 @@ def _summary(rep):
     # counts what was PROVEN sidechain, and without the denominator a zero
     # reads as "none is misrouted" when the truth may be "none could be
     # attributed".
+    # WAKING JOINS IT for the same reason (task/3055), read with `.get`
+    # because a report built before the bucket existed, or by a caller that
+    # never asked for it, has no WAKING seat to count.
     own = _ownership_of(rep)
-    return ("helm beacons: %d seat%s, %d covered, %d DEAF, %d DEAF-IN-EFFECT, "
+    return ("helm beacons: %d seat%s, %d covered, %d WAKING, %d DEAF, "
+            "%d DEAF-IN-EFFECT, "
             "%d MISROUTED, %d VACANT, %d UNPROVEN, %d ghost waiter%s, "
             "%d beacon%s (%d surplus); %s" % (
                 len(rep["seats"]), "s"[:len(rep["seats"]) != 1],
-                len(rep["covered"]), len(rep["deaf"]),
+                len(rep["covered"]), len(rep.get("waking") or ()),
+                len(rep["deaf"]),
                 len(rep["deaf_in_effect"]), len(own["misrouted"]),
                 len(rep["vacant"]),
                 len(rep["unproven"]),
@@ -4880,10 +5007,11 @@ def _print_census(rep):
     if not rep["seats"]:
         print("  no seats in the roster and no registered beacons")
     for row in rep["seats"]:
-        print("  %-22s %-9s live %d  ghost %d  unknown %d%s" % (
+        print("  %-22s %-9s live %d  ghost %d  unknown %d%s%s" % (
             label(row["seat"]), row["verdict"], len(row["live"]),
             len(row["ghosts"]),
             len(row["unknown"]),
+            "  expired %d" % len(row["expired"]) if row.get("expired") else "",
             "   (+%d surplus)" % row["duplicates"] if row["duplicates"] else ""))
     # OWNERSHIP IS A FRACTION, NEVER A VERDICT ON ITS OWN. MISROUTED counts
     # what was PROVEN sidechain; this line counts the live beacons no
@@ -4926,6 +5054,11 @@ def _print_census(rep):
               "TOP-LEVEL conversation (not a subagent) with `helm chat wait "
               "--seat %s --follow --replace`." % (
                   label(row["seat"]), row["why"], label(row["seat"])))
+    for row in rep.get("waking") or ():
+        print("  WAKING SEAT %s — %s. Not DEAF: a beacon that reached its "
+              "lease deadline is the seat's check-in, and nothing is typed "
+              "into it; it reads DEAF only if the grace passes with no "
+              "re-arm." % (label(row["seat"]), row["why"]))
     for row in rep["deaf"]:
         print("  DEAF SEAT %s — no live beacon: helm cannot wake it. It must "
               "re-arm `helm chat wait --seat %s --follow` to be reachable "
@@ -5038,8 +5171,11 @@ def cmd_beacons(args):
     bounded nudge with a different sentence: its waiter died, so --post
     asks the pane to re-arm its beacon and names the exact Monitor call. A
     DEAF seat that owes nothing is never typed into. Nor is one of another
-    project, or one on a paid (proxy or codex) family: those are reported,
-    with what they owe, and never typed into.
+    project: it is reported, with what it owes, and never typed into. A seat
+    on a paid (proxy or codex) family that OWES is typed into like a native
+    one (task/3055, an owner ruling), and the report names the paid turn. A
+    WAKING seat — a beacon that reached its 30-minute lease inside the re-arm
+    grace — is never typed into.
     Same bounds, same pause refusal, one settled nudge per DEAF spell, and
     the latch closes when the seat reads covered again. A seat whose pane
     the census could not name is never typed into. --install-timer wires
@@ -5145,9 +5281,10 @@ def cmd_beacons(args):
                   % (label(seat), action, detail or "no reason given"),
                   file=sys.stderr)
     for seat, action, detail in sent.get("rearmed") or ():
-        if action in ("foreign-project", "paid-family"):
+        if action == "foreign-project":
             # REPORTED, NEVER TYPED: an owing DEAF seat that is not ours to
-            # wake (another project's, or a family billed per turn).
+            # wake (another project's). A paid family that owes is typed into
+            # now (task/3055) and reports through the "wake" arm below.
             print("helm beacons: DEAF seat %s NOT auto-nudged — %s"
                   % (label(seat), detail or action), file=sys.stderr)
         elif action == "wake":

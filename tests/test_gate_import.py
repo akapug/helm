@@ -2252,9 +2252,8 @@ class CanonicalBindingTest(ImportBase):
         """THE INVALIDATION, WHICH IS THE HALF THAT CAN ROT SILENTLY.
 
         One of this function's three callers appends a binding under the
-        ledger lock and the next reader must see it, so the obvious precedent
-        — a process-lifetime cache like `_dispatch_snapshot`'s — would be
-        WRONG here. The key is the file's (dev, ino, size, mtime_ns), which an
+        ledger lock and the next reader must see it, so the obvious shortcut
+        — a cache held for the life of the process — would be WRONG here. The key is the file's (dev, ino, size, mtime_ns), which an
         append moves by construction rather than by anyone remembering to
         clear anything. This arm is what proves that, and it fails LOUDLY if
         someone later swaps the key for a cheaper one.

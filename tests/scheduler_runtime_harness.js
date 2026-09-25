@@ -6,6 +6,12 @@ function lrAgo(s) {
   return n < 60 ? n + "s ago" : n < 3600 ? Math.round(n / 60) + "m ago"
     : n < 86400 ? Math.round(n / 3600) + "h ago" : Math.round(n / 86400) + "d ago";
 }
+function lrDur(s) {
+  if (s === null || s === undefined || s === "" || isNaN(Number(s))) return null;
+  const n = Math.max(0, Math.round(Number(s)));
+  return n < 60 ? n + "s" : n < 3600 ? Math.round(n / 60) + "m"
+    : n < 86400 ? Math.round(n / 3600) + "h" : Math.round(n / 86400) + "d";
+}
 /*__INJECT__*/
 
 const group = (label, rows, suc = {stalled: 0, unmeasurable: 0, contrary: 0, total: 0}) => ({
@@ -59,6 +65,16 @@ const zero = schedulerHTML({read_age_s: 1, ledger_age_s: 2, scheduler: {
   owner_asks_unavailable: null, owner_holds: [], owner_hold_count: 0,
   groups: [], edges: []
 }});
+const folded = schedulerHTML({read_age_s: 1, ledger_age_s: 2, scheduler: {
+  unavailable: null, row_count: 5, active_count: 2, listed_count: 0,
+  collapsed_count: 5, collapsed: [{class: "off_frontier", count: 5,
+    label: "left over after landing or abandonment (off the live frontier)",
+    oldest_age_s: 52 * 86400, command: "helm lr retire --off-frontier"}],
+  suc: {stalled: 0, unmeasurable: 0, contrary: 0, total: 0, zero: true},
+  owner_asks: [], owner_ask_count: 0, owner_asks_dropped: 0,
+  owner_asks_unavailable: null, owner_holds: [], owner_hold_count: 0,
+  groups: [], edges: []
+}});
 const owner = {innerHTML: "", querySelectorAll: () => []};
 global.$ = sel => sel === "#downer" ? owner : null;
 dashOwner({read_age_s: 3, scheduler: {owner_asks: [], owner_ask_count: 0,
@@ -102,7 +118,14 @@ console.log(JSON.stringify([{name: "assembled_scheduler_contract", detail: {
   unavailableKeepsAsk: unknownWithAsk.includes("relogin")
     && unknownWithAsk.indexOf("relogin") < unknownWithAsk.indexOf("scheduler UNKNOWN"),
   missingLoud: missing.includes("SCHEDULER NOT SENT — UNKNOWN"),
-  emptyMeasured: zero.includes("no non-terminal land-request rows") && zero.includes("zero SUC"),
+  emptyMeasured: zero.includes("no live land-request rows") && zero.includes("zero SUC")
+    && !zero.includes("schfolds") && !zero.includes("the lines above"),
+  foldLines: folded.includes("<b>5</b> left over after landing")
+    && folded.includes("oldest 52d")
+    && folded.includes("<code>helm lr retire --off-frontier</code>")
+    && folded.includes("the lines above count the rest")
+    && folded.includes("<strong>0</strong><span>live of 5 non-terminal rows")
+    && folded.indexOf("schfolds") < folded.indexOf("schempty"),
   ownerEmptyUnreadableLoud: ownerEmptyUnreadable.includes("pipeline UNKNOWN")
     && !ownerEmptyUnreadable.includes("no fleet-filed owner asks"),
   ownerKnownUnreadableVisible: ownerKnownUnreadable.includes("2 OWNER ASKS")

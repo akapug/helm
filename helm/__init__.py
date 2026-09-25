@@ -13,4 +13,4 @@ edit lands in the source, and the projection re-derives.
 
 from . import seat_reachability
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"

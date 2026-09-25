@@ -293,6 +293,17 @@ _REAL_EVENT_SHAPES = (
       # green over an event this ledger would have refused.
       "retire_proof_version": dispatches._RETIRE_PROOF_V}),
 
+    ("A VERDICT RETRACTION CREDITS THE SEAT WHOSE DOOR ADMITTED IT "
+     "(task/3060): the author, the integrator or the owner, resolved by the "
+     "writer from the acting process and never taken from a caller",
+     "retracting-seat",
+     {"v": 3, "event": "verdict-retract", "seq": 3, "id": "2c" * 16,
+      "ts": None, "retract_reason": "the approve was not the brief's",
+      "retract_reads": "unknown", "retract_basis": "measured",
+      "retract_role": "author", "retract_seat": "retracting-seat",
+      "retracted_polarity": "approve", "retracted_tip": "b" * 40,
+      "retract_proof_version": dispatches._RETRACT_PROOF_V}),
+
     ("a cancel records no hand at all", None,
      {"v": 3, "event": "cancel", "seq": 1, "id": "3c" * 16, "ts": None,
       "reason": "no longer needed"}),
@@ -3060,7 +3071,7 @@ class TheRetiredRowExemptionsAreDeclaredTest(RetireBase):
     a reason above.
     """
 
-    def test_every_allow_retired_opt_in_is_declared_with_a_reason(self):
+    def test_every_allow_retired_opt_in_is_declared_with_a_reason(self):  # noqa: VACUOUS_ASSERTION — the census must hit (assertTrue(opted)) unconditionally before the undeclared and stale sets are read as empty
         import ast
         import importlib
         opted = set()
@@ -3075,9 +3086,13 @@ class TheRetiredRowExemptionsAreDeclaredTest(RetireBase):
             # site would invite pruning a LIVE exemption.
             for _path, source in ledger_sources(prod):
                 tree = ast.parse(source)
-                for fn in ast.walk(tree):
-                    if not isinstance(fn, ast.FunctionDef):
-                        continue
+                # THE DOOR IS THE OUTERMOST FUNCTION. A writer's body runs as a
+                # nested `attempt` (`dispatches._ledger_write`), and a call
+                # inside it is that writer's opt-in, never a door of its own.
+                outer = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+                outer += [m for n in tree.body if isinstance(n, ast.ClassDef)
+                          for m in n.body if isinstance(m, ast.FunctionDef)]
+                for fn in outer:
                     for call in ast.walk(fn):
                         if not isinstance(call, ast.Call):
                             continue

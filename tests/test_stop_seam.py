@@ -128,6 +128,13 @@ class SeamBase(unittest.TestCase):
         r = _sh(self.root, "git", "commit", "-q", "-m", "seed")
         self.assertEqual(r.returncode, 0, r.stderr)
         os.makedirs(os.path.dirname(gate.receipts_path()), exist_ok=True)
+        # THE STOP READS THE RESIDENT'S SEAM FACTS, and a test process has no
+        # resident: this stands in one that recomputes them with the
+        # resident's own `compute` before every read (tests/_stopfacts.py),
+        # so a guard-level arm here judges exactly what a live resident would
+        # have written. ResidentSeamTest switches it off to drive freshness.
+        from tests._stopfacts import always_fresh
+        self.fresh_resident = always_fresh(self)
 
     def tearDown(self):
         gateimport._REPO_IDENTITIES.clear()
@@ -447,23 +454,35 @@ class FixtureTest(SeamBase):
         self.assertIn(self.tree_of("alpha"), local,
                       "the planted receipt does not resolve to this repo")
 
-    def test_beacon_and_lease_rungs_share_one_dispatch_snapshot(self):
+    def test_beacon_and_lease_rungs_read_the_stop_facts_and_fold_nothing(self):
+        """THE LADDER FOLDS THE DISPATCH LEDGER ZERO TIMES. It once shared one
+        fold between the beacon and lease rungs; now the `helm web` resident
+        folds, off the hook, and both rungs read its stop facts. The resident's
+        refresh is run here first, the way it runs in production, and only
+        the guard is watched."""
+        from helm import stopfacts_resident
         self.two_green_halves()
         os.environ["HELM_CHAT_NAME"] = "s1"
         self.roster("s1", self.path("alpha"))
+        stopfacts_resident.write(stopfacts_resident.compute())
+        self.fresh_resident.off()
         real = dispatches.snapshot
         obligation = seats_stop_signals._beacon_obligation
         with mock.patch.object(seats_stop_signals, "beacon_procs",
-                               return_value=([], None)), \
+                               return_value=([], None)) as procs, \
                 mock.patch.object(seats_stop_signals, "_beacon_obligation",
                                   wraps=obligation) as beacon_obligation, \
                 mock.patch.object(dispatches, "snapshot", wraps=real) as snapshot:
             blocks, _warns = self.guard()
         self.assertTrue(blocks, "control: the lease and seam ladder must have run")
+        self.assertTrue(procs.called, "control: the beacon rung must have run")
+        # THE BEACON ASKS ITS OWN QUESTION OF THE RESIDENT'S OWED FRONTIER —
+        # a readable pair, never the whole fold.
         beacon_obligation.assert_called_once_with("s1", mock.ANY)
-        self.assertIsNotNone(beacon_obligation.call_args.args[1],
-                             "control: beacon must consume the shared snapshot")
-        self.assertEqual(snapshot.call_count, 1)
+        pair = beacon_obligation.call_args.args[1]
+        self.assertIsNone(pair[1], "control: the frontier was readable")
+        self.assertEqual(snapshot.call_count, 0,
+                         "the stop guard folded the dispatch ledger")
 
     def test_the_two_branches_merge_cleanly_or_conflict_on_demand(self):  # noqa: VACUOUS_ASSERTION — clean and conflicting are two FIXTURE states, asserted across a setUp boundary
         """THE TRAP THIS FLEET KEEPS HITTING is a fixture whose two states
@@ -1389,15 +1408,62 @@ class AdmissibleReceiptTest(SeamBase):
                          "precondition: and left the tree alone")
         self.assertEqual([r["peer_branch"] for r in self.rows()], ["lane/beta"])
 
-    def test_a_FOCUSED_receipt_is_inadmissible(self):  # noqa: VACUOUS_ASSERTION — the control is TEMPORAL — the two calls straddle the state change, which is exactly why the pair proves anything
-        """A focused claim is its SCOPE, not its tree — which is why a focused
-        receipt cannot authorize a land, and equally cannot stand for "this
-        half passed everything"."""
+    def test_a_focus_SHAPE_without_a_verifiable_scope_is_inadmissible(self):  # noqa: VACUOUS_ASSERTION — the control is TEMPORAL — the two calls straddle the state change, which is exactly why the pair proves anything
+        """`suite: false` beside a focus block on a pre-v6 row is a scope NO
+        content id protects: nothing says the runner filled it. It stands for
+        nothing, at either door."""
         self.half()
         self.weaken("alpha", suite=False, focus={"selected": ["tests.x"]})
-        self.assertEqual(self.rows(), [], "a focused receipt was read as green")
+        self.assertEqual(self.rows(), [], "an unverifiable focus shape was "
+                         "read as green")
         self.green("alpha")
         self.assertTrue(self.rows(), "a whole-suite receipt must still count")
+
+    def focused(self, head, tree, **spoil):
+        """A VERIFIABLE focused receipt (v6): the scope block bound into its
+        content id, the runner's own RAN set filled, a named interpreter and a
+        clean bracket — the receipt `helm gate run --focus` mints."""
+        row = self.receipt(head=head, tree=tree, append=False)
+        row.pop("executed", None)
+        row.pop("id", None)
+        row.update({"v": gate.FOCUSED_VERSION, "suite": False,
+                    "argv": ["python3", "-m", "unittest", "-v",
+                             "tests.test_one"],
+                    "focus": {"policy": gate.FOCUS_POLICY, "trunk": "a" * 40,
+                              "base": "a" * 40, "changed": ["shared.py"],
+                              "selected": ["tests.test_one"], "universe": 3,
+                              "executed": ["tests.test_one"],
+                              "executed_ids": 1}})
+        row.update(spoil)
+        row["id"] = gate._receipt_id(row)
+        self.assertTrue(eventledger.append(gate.receipts_path(), row))
+        # MUST-HIT: the ledger reader keeps it, or every arm below measures
+        # an absent row and calls it a refusal.
+        self.assertIn(row["id"], [r["id"] for r in gate.receipts()[0]])
+        return row
+
+    def test_a_VERIFIABLE_focused_receipt_is_a_green_half(self):  # noqa: VACUOUS_ASSERTION — the positive names the peer; the control above it is the empty board before the receipt lands
+        """task/3039: a lane's rounds are FOCUSED now, so a focused receipt
+        on a half's current tree is that half's verification. Refusing it
+        would leave this rung silent for every lane the fleet runs."""
+        self.half()
+        self.assertEqual(self.rows(), [], "precondition: alpha is not green")
+        self.focused(self.tip("alpha"), self.tree_of("alpha"))
+        self.assertEqual([r["peer_branch"] for r in self.rows()],
+                         ["lane/beta"])
+
+    def test_a_focused_receipt_at_the_COMPOSED_tree_discharges(self):  # noqa: VACUOUS_ASSERTION — the seam stands before the receipt and is gone after it; the spoiled twin between them keeps it standing
+        """The discharge the block prints is `helm gate run --focus` on the
+        merged tree, so that receipt must END the block, or the cure is a
+        promise the rung does not keep."""
+        self.two_green_halves()
+        _rc, tree = self.merged_tree("alpha", "beta")
+        self.assertTrue(self.rows(), "precondition: the seam stands")
+        self.focused("c" * 40, tree, ran=0)
+        self.assertTrue(self.rows(), "a focused run that ran nothing cleared "
+                        "the seam")
+        self.focused("c" * 40, tree)
+        self.assertEqual(self.rows(), [])
 
     def test_a_DIRTY_receipt_is_inadmissible(self):  # noqa: VACUOUS_ASSERTION — the control is TEMPORAL — the two calls straddle the state change, which is exactly why the pair proves anything
         self.half()
@@ -2171,9 +2237,18 @@ class GateTest(SeamBase):
         self.assertIn("s2", block)
         self.assertIn("merge CLEANLY", block)
         room = self.path("alpha")
-        # the measured discharge, copy-pasteable, aimed at the real room
-        self.assertIn("git -C %s merge --no-ff lane/beta && fab gate --repo %s"
-                      % (room, room), block)
+        # the measured discharge, copy-pasteable, aimed at the real room: the
+        # FOCUSED gate on the merged tree (task/3039 F6), never a lane whole
+        # suite, which the lane door refuses.
+        self.assertIn("git -C %s merge --no-ff lane/beta && helm gate run "
+                      "--repo %s --focus" % (room, room), block)
+        self.assertNotIn("fab gate --repo", block)
+        # On a host that refuses local suites the same selection runs on the
+        # remote runner, aimed at the same room. `helm gate run` never routes
+        # through `fab gate`; that route does not exist (task/3039).
+        self.assertIn("fab test --repo %s -- python3 -m unittest <modules>"
+                      % room, block)
+        self.assertNotIn("routes through", block)
         # the declared discharge, with the exact trailer token the reader wants
         self.assertIn("HELM_STOP_GUARD_SEAM=0", block)
 
@@ -2197,6 +2272,8 @@ class GateTest(SeamBase):
                          "a conflicting seam was offered a merge command it "
                          "cannot complete from here")
         self.assertNotIn("fab gate --repo", block,
+                         "offered a gate on a tree that cannot be built")
+        self.assertNotIn("helm gate run --repo", block,
                          "offered a gate on a tree that cannot be built")
 
     def test_the_evidence_word_is_GREEN_and_never_BANKED(self):
@@ -2374,8 +2451,12 @@ class GateTest(SeamBase):
 
         THE CLAIM IS LOAD-BEARING, not scenery: without a room of my own the
         gate returns before it ever calls the predicate, and BOTH halves of
-        this arm would pass while measuring an early exit."""
+        this arm would pass while measuring an early exit. So is the PEER'S:
+        the rows are the resident's, computed per live room, and the stop
+        takes a room's rows only when it has a live peer for them to be about
+        — which is what the predicate itself requires before it yields one."""
         self.claim("alpha", "s1")
+        self.claim("beta", "s2")
         hostile = {"path": self.path("alpha"), "branch": "lane/alpha",
                    "peer_path": self.path("beta"),
                    "peer_branch": 'lane/beta" ; rm -rf /', "peer_holder": "s2",
@@ -2741,7 +2822,401 @@ class TrailerVacuityTest(SeamBase):
         block = "\n".join(self.guard()[0])
         self.assertIn("UNTESTED COMPOSITION", block)
         self.assertNotIn("Seam:", block)
-        self.assertIn("fab gate", block)
+        self.assertIn("helm gate run", block)
+
+
+class ResidentSeamTest(SeamBase):
+    """THE STOP READS THE RESIDENT'S SEAM FACTS: surface x state.
+
+    The census, the receipt ledger and every pair's git reads moved into the
+    `helm web` resident (stopfacts_resident `compute_seam`), and the stop
+    assembles its answer from what the resident wrote. SURFACE: a seat whose
+    repository has 0, 1 or several LIVE peer rooms, each colliding with its
+    own room on one code file. STATE: the resident up to date, the snapshot
+    stale on a lane HEAD move, the snapshot absent, the snapshot written by
+    other code. EXACT decides exactly as the one-call rung did; every other
+    state is an UNKNOWN warn and never a block the rung did not have.
+
+    The stand-in resident is OFF here: each arm writes the snapshot itself,
+    with the resident's own `compute`, and then moves the world under it."""
+
+    PEERS = ("beta", "gamma", "delta")
+
+    def setUp(self):
+        super().setUp()
+        self.fresh_resident.off()
+
+    def world(self, peers):
+        """alpha (mine, s1) plus `peers` live green rooms, each authoring
+        shared.py on its own line, so every one merges cleanly with alpha
+        and every pair is a seam."""
+        self.claim("alpha", "s1")
+        self.edit("alpha", at=1)
+        self.green("alpha")
+        names = self.PEERS[:peers]
+        for i, name in enumerate(names):
+            self.claim(name, "s%d" % (i + 2))
+            self.edit(name, at=20 + 10 * i)
+            self.green(name)
+        return names
+
+    def resident(self, **over):
+        """One resident write, the way `helm web` runs it, with any header
+        field overridden (a stand-in for other code)."""
+        from helm import stopfacts_resident
+        snap = stopfacts_resident.compute()
+        snap.update(over)
+        self.assertIsNone(stopfacts_resident.write(snap))
+        return snap
+
+    def unknown(self, warn):
+        return "composition-seam rung has no exact reading" in warn
+
+    def exact_control(self, peers, session):
+        """THE POSITIVE CONTROL every non-EXACT arm ends on: the same world,
+        with the resident brought up to date, decides as the rung does."""
+        self.resident()
+        block, warn = self.text(session=session)
+        self.assertFalse(self.unknown(warn), warn)
+        if peers:
+            self.assertIn("UNTESTED COMPOSITION", block)
+        else:
+            self.assertEqual(block, "")
+        return block
+
+    # ── the matrix: one method per (state, surface) cell, each on its own
+    # fixture, so no cell reads another's rooms, snapshot or latches ─────────
+    def fresh(self, peers):
+        """RESIDENT UP TO DATE: the one-call rung's decision, unchanged."""
+        self.world(peers)
+        self.resident()
+        block, warn = self.text(session="fresh")
+        self.assertFalse(self.unknown(warn), warn)
+        if not peers:
+            self.assertEqual(block, "", "a lone room has no seam")
+            return
+        self.assertIn("UNTESTED COMPOSITION", block)
+        self.assertIn("lane/alpha", block)
+        self.assertIn("lane/beta", block)
+        if peers > 1:
+            self.assertIn("%d further seam(s)" % (peers - 1), block)
+
+    def head_moved(self, peers):
+        """STALE ON A LANE HEAD MOVE — the commonest stale state: the seat
+        committed, then stopped, before the resident's next poll. With a live
+        peer the rows are about that HEAD, so the rung says UNKNOWN and names
+        it; with no live peer there is no pair for a HEAD to move, and the
+        answer is still exact."""
+        self.world(peers)
+        self.resident()
+        self.edit("alpha", "other.py", at=5)
+        block, warn = self.text(session="moved")
+        self.assertEqual(block, "", "a stale reading blocked")
+        if peers:
+            self.assertTrue(self.unknown(warn), warn)
+            self.assertIn("HEAD moved since in alpha", warn)
+            self.assertIn("UNKNOWN, not absent", warn)
+        else:
+            self.assertFalse(self.unknown(warn), warn)
+        # The moved half is a new tree, and a half is green only at a tested
+        # tree: gate it, as the seat would, before the resident's reading
+        # can show the seam again.
+        self.green("alpha")
+        self.exact_control(peers, "moved-exact")
+
+    def absent(self, peers):
+        """NO SNAPSHOT: even a lone room cannot be told it is alone, because
+        the census that would say so is the missing fact."""
+        from helm import stopfacts
+        self.world(peers)
+        self.assertFalse(os.path.exists(stopfacts.path()),
+                         "control: no snapshot on disk")
+        block, warn = self.text(session="absent")
+        self.assertEqual(block, "", "an absent reading blocked")
+        self.assertTrue(self.unknown(warn), warn)
+        self.assertIn("seam facts ABSENT", warn)
+        self.exact_control(peers, "absent-exact")
+
+    def other_code(self, peers):
+        """WRONG POLICY: facts a resident running other code computed."""
+        self.world(peers)
+        self.resident(policy="0" * 32)
+        block, warn = self.text(session="policy")
+        self.assertEqual(block, "", "other code's reading blocked")
+        self.assertTrue(self.unknown(warn), warn)
+        self.assertIn("computed by other code", warn)
+        self.exact_control(peers, "policy-exact")
+
+    def refolding(self, peers):
+        """THE RESIDENT MID-EXEC (task/3042): after a land the resident
+        re-execs onto the new tree, and the new image marks the facts it
+        found on disk as being refolded until its first write. The census is
+        the missing fact, so even a lone room is told UNKNOWN, and nothing
+        blocks on facts the new code has not computed."""
+        from helm import stopfacts, stopfacts_resident
+        self.world(peers)
+        self.resident(policy="0" * 32)    # facts from the code before the land
+        image = stopfacts_resident.Leg()
+        self.addCleanup(image.release)
+        image.announce()
+        self.assertIn("refolding", stopfacts.read().absent,
+                      "control: the new image marked the facts it found")
+        block, warn = self.text(session="refolding")
+        self.assertEqual(block, "", "a refolding reading blocked")
+        self.assertTrue(self.unknown(warn), warn)
+        self.assertIn("refolding", warn)
+        image.release()
+        self.exact_control(peers, "refolding-exact")
+
+    def malformed(self, peers):
+        """A SEAM ROW OF THE WRONG SHAPE (the file is another process's): the
+        rung swallows what it raises on, so a census it cannot index would
+        cost its UNKNOWN line and say nothing. The reader judges the shape
+        first and the rung says which field it could not read."""
+        from helm import pk, stopfacts
+        self.world(peers)
+        snap = self.resident()
+        root = sorted(snap["seam"]["roots"])[0]
+        roots = dict(snap["seam"]["roots"])
+        roots[root] = dict(roots[root], census="junk")
+        pk.atomic_write(stopfacts.path(), json.dumps(
+            dict(snap, seam=dict(snap["seam"], roots=roots))))
+        block, warn = self.text(session="malformed")
+        self.assertEqual(block, "", "a malformed reading blocked")
+        self.assertTrue(self.unknown(warn), warn)
+        self.assertIn("census of the wrong shape", warn)
+        self.exact_control(peers, "malformed-exact")
+
+    def test_refolding_with_no_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `refolding`, which ends on an unconditional positive control (the EXACT control after the refold)
+        self.refolding(0)
+
+    def test_refolding_with_one_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `refolding`, which ends on an unconditional positive control (the EXACT control after the refold)
+        self.refolding(1)
+
+    def test_malformed_with_no_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `malformed`, which ends on an unconditional positive control (the EXACT control after a good write)
+        self.malformed(0)
+
+    def test_malformed_with_one_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `malformed`, which ends on an unconditional positive control (the EXACT control after a good write)
+        self.malformed(1)
+
+    def test_fresh_with_no_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `fresh`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.fresh(0)
+
+    def test_fresh_with_one_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `fresh`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.fresh(1)
+
+    def test_fresh_with_several_peers(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `fresh`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.fresh(3)
+
+    def test_head_moved_with_no_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `head_moved`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.head_moved(0)
+
+    def test_head_moved_with_one_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `head_moved`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.head_moved(1)
+
+    def test_head_moved_with_several_peers(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `head_moved`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.head_moved(3)
+
+    def test_absent_with_no_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `absent`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.absent(0)
+
+    def test_absent_with_one_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `absent`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.absent(1)
+
+    def test_absent_with_several_peers(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `absent`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.absent(3)
+
+    def test_other_code_with_no_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `other_code`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.other_code(0)
+
+    def test_other_code_with_one_peer(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `other_code`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.other_code(1)
+
+    def test_other_code_with_several_peers(self):  # noqa: VACUOUS_ASSERTION — every assertion lives one frame down in `other_code`, which ends on an unconditional positive control (the rung's decision or the EXACT control after the move)
+        self.other_code(3)
+
+    def test_a_PEER_HEAD_move_is_UNKNOWN_too(self):
+        self.world(1)
+        self.resident()
+        self.edit("beta", "other.py", at=7)
+        block, warn = self.text(session="peer-moved")
+        self.assertEqual(block, "")
+        self.assertIn("HEAD moved since in beta", warn)
+        self.green("beta")
+        self.exact_control(1, "peer-moved-exact")
+
+    def test_the_root_is_found_the_way_git_finds_it(self):  # noqa: VACUOUS_ASSERTION — the None readings are compared to git's own answer on the same path, and `found == 4` after the loop is the unconditional positive: four of the six paths are in a repository
+        """NO GIT ON THE STOP, AND NO SECOND OPINION ABOUT WHERE A REPOSITORY
+        IS. `_seam_root` walks the checkout's files; `find_root` asks git.
+        They must agree on a lane room, the main checkout, a path inside
+        each, a path in no repository, and a path under a STRAY `.git`
+        directory git would reject (measured on the live box: a home
+        directory holding one sat above every seat standing in `~/dev`, and
+        the file walk named it a repository where git named none)."""
+        from helm.work import _lanes
+        room = self.claim("alpha", "s1")
+        stray = os.path.join(self.tmp, "stray")
+        os.makedirs(os.path.join(stray, ".git"))
+        os.makedirs(os.path.join(stray, "sub"))
+        cases = [room, os.path.join(room, "tests"), self.root,
+                 os.path.join(self.root, "sub"), self.tmp,
+                 os.path.join(stray, "sub")]
+        os.makedirs(os.path.join(room, "tests"), exist_ok=True)
+        os.makedirs(os.path.join(self.root, "sub"), exist_ok=True)
+        found = 0
+        for where in cases:
+            with self.subTest(where=where):
+                git = _lanes.find_root(where)
+                files, unreadable = seats_stop_seam._seam_root(where)
+                self.assertEqual(files, os.path.realpath(git) if git else None)
+                self.assertFalse(unreadable)
+                found += bool(files)
+        self.assertEqual(found, 4, "control: four of the six are in a repo")
+
+    def reading(self, seat="s1", session="sess-r", cwd=None):
+        """The rung's own reading: a Freshness when it is not EXACT, else
+        (rows, err, partial)."""
+        from helm import stopfacts
+        view = stopfacts.read()
+        got = seats_stop_seam._seam_census(view, session, seat,
+                                           cwd or self.path("alpha"))
+        self.assertIsNotNone(got, "control: this seat stands in a room")
+        facts, mine = got
+        if facts is None:
+            return mine
+        return seats_stop_seam._seam_rows(view, facts, mine, seat)
+
+    def test_every_witness_moves_the_reading_and_nothing_else_does(self):  # noqa: VACUOUS_ASSERTION — each subTest asserts the EXACT reading first and the STALE reading after, and the must-miss after the loop is an unconditional positive on the same accessor
+        """ONE WORLD, ONE INPUT AT A TIME: each mutation below is written up
+        EXACT first (the control), then moved, then read. A roster touch that
+        leaves every recorded cwd alone is the must-miss: the roster file is
+        rewritten whenever a seat is seen, and a witness on its stat would
+        make every stop STALE."""
+        from helm import pk, stopfacts
+        self.world(1)
+        self.room("eta")                     # registered, not yet leased
+        common = os.path.realpath(os.path.join(self.root, ".git"))
+        cases = [
+            ("a worktree was added or removed since",
+             lambda: self.room("zeta")),
+            ("a seat's recorded cwd changed since",
+             lambda: self.roster("s7", self.path("beta"))),
+            ("a lane lease changed since",
+             lambda: seats.claim("worktree:proj:eta", "s6", ttl=600,
+                                 repo=common)),
+            ("a gate receipt was recorded since",
+             lambda: self.receipt(head="a" * 40, tree="b" * 40)),
+            ("trunk moved since",
+             lambda: _sh(self.root, "git", "-c", "user.name=t", "-c",
+                         "user.email=t@t", "commit", "-q", "--allow-empty",
+                         "-m", "trunk moves")),
+        ]
+        self.roster("s1", self.path("alpha"))
+        for why, move in cases:
+            with self.subTest(why=why):
+                self.resident()
+                got = self.reading()
+                self.assertNotIsInstance(got, stopfacts.Freshness,
+                                         "control: EXACT first: %r" % (got,))
+                self.assertEqual(len(got), 3, "control: EXACT first")
+                move()
+                got = self.reading()
+                self.assertIsInstance(got, stopfacts.Freshness,
+                                      "%s did not move the reading" % why)
+                self.assertEqual(got.verdict, "STALE")
+                self.assertIn(why, got.reason)
+        # THE MUST-MISS: a roster rewrite that moves only `last_seen`.
+        self.resident()
+        from helm import seats as _s
+        rows = pk.read_json(_s.roster_path(), {}) or {}
+        rows["s1"] = dict(rows.get("s1") or {}, last_seen="2099-01-01")
+        pk.atomic_write(_s.roster_path(), json.dumps(rows))
+        self.assertNotIsInstance(self.reading(), stopfacts.Freshness,
+                                 "a roster touch that moved no cwd went "
+                                 "STALE")
+
+    def test_the_assembled_answer_IS_the_one_call_answer(self):
+        """NO SECOND ORACLE. The resident asks `seam_candidates` once per live
+        room and the stop keeps the rows whose peer is outside its own rooms
+        and not provably its own (`seam_assemble`); on a real repository that
+        must equal asking the function once with the seat's rooms and holder.
+        The board has a seam, a peer the seat also leases (the exemption), a
+        peer in a shared room (no exemption) and a non-green peer."""
+        from helm import stopfacts_resident
+        self.world(2)                                  # beta, gamma collide
+        self.claim("delta", "s1")                      # s1 drives delta too
+        self.edit("delta", at=45)
+        self.green("delta")
+        self.claim("eps", "s5")                        # live, never green
+        self.edit("eps", at=55)
+        facts, green = stopfacts_resident.seam_root_facts(
+            os.path.realpath(self.root))
+        census = facts["census"]
+        cases = [({self.path("alpha")}, "s1"),
+                 ({self.path("alpha"), self.path("delta")}, "s1"),
+                 ({self.path("alpha")}, "s9"),
+                 ({self.path("alpha")}, None),
+                 ({self.path("beta")}, "s2"),
+                 ({self.path("eps")}, "s5")]
+        seen_rows = seen_exempt = False
+        for mine, holder in cases:
+            with self.subTest(mine=sorted(mine), holder=holder):
+                one = _work_gc.seam_candidates(
+                    self.root, mine, holder=holder, rooms=census,
+                    green=(green["trees"], green["local"]))
+                got = _work_gc.seam_assemble(
+                    census, facts["rooms"], mine, holder=holder,
+                    root_err=facts["root_err"],
+                    green_err=facts["green_err"],
+                    green_warn=facts["green_warn"])
+                self.assertEqual(got, (json.loads(json.dumps(one[0])),
+                                       one[1], one[2]))
+                seen_rows = seen_rows or bool(one[0])
+        # THE CONTROLS: the board produced rows, and the lease exemption
+        # changed an answer (delta is a seam for s9, never for s1).
+        self.assertTrue(seen_rows, "control: the board has a seam")
+        for_s1 = _work_gc.seam_assemble(census, facts["rooms"],
+                                        {self.path("alpha")}, holder="s1")[0]
+        for_s9 = _work_gc.seam_assemble(census, facts["rooms"],
+                                        {self.path("alpha")}, holder="s9")[0]
+        seen_exempt = ("lane/delta" in [r["peer_branch"] for r in for_s9]
+                       and "lane/delta" not in [r["peer_branch"]
+                                                for r in for_s1])
+        self.assertTrue(seen_exempt, "control: the exemption moved an answer")
+
+    def test_the_two_legs_write_ONE_snapshot_and_keep_each_other(self):
+        """The lease leg and the seam leg refresh on their own read-behind
+        keys and meet in one file: a write by either carries the other's
+        latest answer, and the seam leg recomputes only the repository whose
+        input moved."""
+        from helm import stopfacts, stopfacts_resident
+        self.world(1)
+        leg = stopfacts_resident.Leg()
+        self.addCleanup(leg.release)
+        self.assertTrue(leg.refresh()["written"])
+        got = leg.seam_refresh()
+        self.assertTrue(got["written"], got)
+        self.assertTrue(got["full"])
+        on_disk, _why = stopfacts.load()
+        root = os.path.realpath(self.root)
+        self.assertIn(root, on_disk["seam"]["roots"])
+        self.assertIn("leases", on_disk)
+        before = leg.seam["roots"][root]
+        # THE LEASE LEG'S NEXT WRITE KEEPS THE SEAM FACTS.
+        leg.last_full = 0.0
+        self.assertTrue(leg.refresh()["written"])
+        on_disk, _why = stopfacts.load()
+        self.assertEqual(on_disk["seam"]["roots"][root]["census"],
+                         before["census"])
+        # A MOVED HEAD RECOMPUTES THAT REPOSITORY ONLY, and not as a full
+        # refresh: the seam leg saw which input moved.
+        self.assertFalse(leg.seam_changed(), "control: nothing moved yet")
+        self.edit("beta", "other.py", at=9)
+        self.assertTrue(leg.seam_changed())
+        got = leg.seam_refresh()
+        self.assertFalse(got["full"], got)
+        self.assertEqual(got["recomputed"], [root])
+        self.assertIsNot(leg.seam["roots"][root], before)
 
 
 def _cli(cwd, seat, session, room="main"):

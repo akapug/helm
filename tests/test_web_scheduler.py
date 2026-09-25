@@ -35,7 +35,13 @@ class SchedulerApiTest(_web_lr.LrApiBase):
         self.assertEqual([row["id"] for row in body["loops"]], [child["id"]])
         graphed = {row["id"] for group in body["scheduler"]["groups"]
                    for row in group["rows"]}
-        self.assertEqual(graphed, {parent["id"], child["id"]})
+        # THE ABSORBED PARENT OWES NOBODY A MOVE: counted on the superseded
+        # line of the same model, never drawn as a wait (task/2381)
+        self.assertEqual(graphed, {child["id"]})
+        self.assertEqual([(c["class"], c["count"])
+                          for c in body["scheduler"]["collapsed"]],
+                         [("superseded", 1)])
+        self.assertEqual(body["scheduler"]["row_count"], 2)
         self.assertEqual(body["scheduler"]["owner_asks"][0]["plain_title"],
                          "relogin")
 
@@ -209,7 +215,8 @@ class SchedulerRuntimeTest(unittest.TestCase):
         # value; stubbing them would let this harness render a strip the page
         # cannot produce.
         names = ("schedulerSUC", "schedulerEdgeMap", "schedulerAskHTML",
-                 "schedulerRowHTML", "schedulerAsksHTML", "schedulerHTML",
+                 "schedulerRowHTML", "schedulerAsksHTML", "schedulerFoldHTML",
+                 "schedulerHTML",
                  "cardBoundS", "cardStale", "cardSource", "dashOwner")
         functions = "\n\n".join(_extract_fn(src, name) for name in names)
         with open(HARNESS, encoding="utf-8") as stream:
@@ -243,6 +250,9 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertTrue(self.detail["unavailableKeepsAsk"])
         self.assertTrue(self.detail["missingLoud"])
         self.assertTrue(self.detail["emptyMeasured"])
+        # THE GRAPH COUNTS WHAT IT DOES NOT DRAW: one line per collapsed
+        # class, above an empty graph that says the lines hold the rest
+        self.assertTrue(self.detail["foldLines"])
         self.assertTrue(self.detail["ownerEmptyUnreadableLoud"])
         self.assertTrue(self.detail["ownerKnownUnreadableVisible"])
         self.assertTrue(self.detail["ownerCapDisclosed"])

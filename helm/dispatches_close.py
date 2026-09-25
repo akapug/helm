@@ -44,7 +44,6 @@ its own module body, after every name it needs exists. A module object is in
 `sys.modules` from the first line of its execution, so either import order
 resolves.
 """
-import contextlib
 import os
 
 from . import dispatches
@@ -81,8 +80,9 @@ def _record_discharge_proven(rid, reviewed_tip, superseding_tip,
     if contrary_target not in ("local", "upstream"):
         return None, "discharge needs the observed contrary trunk target"
     path = dispatches.ledger_path()
-    with eventledger.locked(path) as held:
-        if not held:
+
+    def attempt(txn):
+        if not txn.held:
             return None, "ledger unwritable (%s) — discharge NOT recorded" % path
         current, unavailable = dispatches.snapshot()
         if unavailable:
@@ -124,11 +124,15 @@ def _record_discharge_proven(rid, reviewed_tip, superseding_tip,
                  "discharge_ref": evidence,
                  "contrary_state": contrary_state,
                  "contrary_target": contrary_target}
-        if not dispatches._append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) — discharge NOT recorded" % path
-    out = dispatches._apply(row, event)
-    pk.event("dispatch-discharge", row["id"], superseding)
-    return out, None
+
+        def finish():
+            out = dispatches._apply(row, event)
+            pk.event("dispatch-discharge", row["id"], superseding)
+            return out, None
+        return txn.then(finish)
+    return dispatches._ledger_write(attempt, path)
 
 
 
@@ -149,8 +153,9 @@ def _record_withdraw_proven(rid, reviewed_tip, evidence):
     if err:
         return None, err
     path = dispatches.ledger_path()
-    with eventledger.locked(path) as held:
-        if not held:
+
+    def attempt(txn):
+        if not txn.held:
             return None, "ledger unwritable (%s) — withdraw NOT recorded" % path
         current, unavailable = dispatches.snapshot()
         if unavailable:
@@ -184,11 +189,15 @@ def _record_withdraw_proven(rid, reviewed_tip, evidence):
                  "id": row["id"], "ts": pk.now_ts(),
                  "reviewed_tip": reviewed,
                  "withdraw_ref": evidence}
-        if not dispatches._append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) — withdraw NOT recorded" % path
-    out = dispatches._apply(row, event)
-    pk.event("dispatch-withdraw", row["id"], reviewed)
-    return out, None
+
+        def finish():
+            out = dispatches._apply(row, event)
+            pk.event("dispatch-withdraw", row["id"], reviewed)
+            return out, None
+        return txn.then(finish)
+    return dispatches._ledger_write(attempt, path)
 
 
 
@@ -197,9 +206,11 @@ def _record_abandon_proven(rid, reviewed_tip, reason, object_exists_probe,
     """Append an honest terminal when the reviewed commit is MISSING.
 
     landreq owns the public lifecycle decision and Git interpretation. This
-    boundary re-resolves the immutable row under the ledger lock and invokes
-    one bounded exact-object probe immediately before append. Only explicit
-    MISSING (False) authorizes the event; EXISTS and UNKNOWN both refuse.
+    boundary re-resolves the immutable row on a read the ledger lock then
+    proves current (`dispatches._ledger_write`), and invokes one bounded
+    exact-object probe under that lock immediately before append. Only
+    explicit MISSING (False) authorizes the event; EXISTS and UNKNOWN both
+    refuse.
     """
     reviewed = str(reviewed_tip or "").strip().lower()
     if not dispatches._FULL_TIP.fullmatch(reviewed):
@@ -208,8 +219,9 @@ def _record_abandon_proven(rid, reviewed_tip, reason, object_exists_probe,
     if err:
         return None, err
     path = dispatches.ledger_path()
-    with eventledger.locked(path) as held:
-        if not held:
+
+    def attempt(txn):
+        if not txn.held:
             return None, "ledger unwritable (%s) — abandon NOT recorded" % path
         current, unavailable = dispatches.snapshot()
         if unavailable:
@@ -254,6 +266,11 @@ def _record_abandon_proven(rid, reviewed_tip, reason, object_exists_probe,
         repo_id = str(row.get("repo_id") or "")
         if not os.path.isabs(repo_id) or os.path.realpath(repo_id) != repo_id:
             return None, "dispatch %s has no canonical repository binding" % row["id"]
+        # THE MUTATION BOUNDARY STARTS HERE, UNDER THE LOCK: the fold above
+        # ran without it, and `lock` proves that read is the ledger now held
+        # before the live probes whose answers this event records.
+        if not txn.lock():
+            return None, "ledger unwritable (%s) — abandon NOT recorded" % path
         try:
             exists = object_exists_probe(repo_id, reviewed) \
                 if callable(object_exists_probe) else None
@@ -304,11 +321,15 @@ def _record_abandon_proven(rid, reviewed_tip, reason, object_exists_probe,
                  "worktree_proof_mode": "git-worktree-status",
                  "worktree_proof_version": 1,
                  "land_state": "UNKNOWN"}
-        if not dispatches._append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) — abandon NOT recorded" % path
-    out = dispatches._apply(row, event)
-    pk.event("dispatch-abandon", row["id"], reviewed)
-    return out, None
+
+        def finish():
+            out = dispatches._apply(row, event)
+            pk.event("dispatch-abandon", row["id"], reviewed)
+            return out, None
+        return txn.then(finish)
+    return dispatches._ledger_write(attempt, path)
 
 
 
@@ -316,10 +337,12 @@ def _record_retire_proven(rid, reason, seat, note, measure):
     """Append ONE administrative retirement, re-measured under the lock.
 
     `measure` is landreq's probe for THIS reason: it is called with the
-    freshly re-resolved raw row AND the locked snapshot it came from, and
-    answers (measurement, refusal). The snapshot rides along because a
-    succession probe must resolve its carrier against the ledger being held,
-    not against a read taken before the lock. The
+    freshly re-resolved raw row AND the snapshot it came from, which the lock
+    has just proven is the ledger being held (`dispatches._ledger_write`: the
+    fold ran without the lock, the probe runs under it), and answers
+    (measurement, refusal). The snapshot rides along because a succession
+    probe must resolve its carrier against the ledger being held, not
+    against a read that no longer describes it. The
     caller's claim is never recorded — only what the probe says HERE, inside
     the lock, immediately before the append. That is the abandon boundary's
     law and it is the whole reason this verb can be trusted: the reachability
@@ -349,8 +372,9 @@ def _record_retire_proven(rid, reason, seat, note, measure):
         return None, ("retire has no measurement probe — refusing to record "
                       "an unreachability nobody measured")
     path = dispatches.ledger_path()
-    with eventledger.locked(path) as held:
-        if not held:
+
+    def attempt(txn):
+        if not txn.held:
             return None, "ledger unwritable (%s) — retire NOT recorded" % path
         current, unavailable = dispatches.retire_read()
         if unavailable:
@@ -377,6 +401,10 @@ def _record_retire_proven(rid, reason, seat, note, measure):
             return None, ("dispatch %s is %s, which bills nothing — retire "
                           "clears a LIVE obligation"
                           % (row["id"], row.get("status") or "in an unknown state"))
+        # THE MEASUREMENT RUNS UNDER THE LOCK, against the snapshot `lock`
+        # proves is the ledger held: the fold above ran without it.
+        if not txn.lock():
+            return None, "ledger unwritable (%s) — retire NOT recorded" % path
         try:
             measurement, refusal = measure(row, current)
         except Exception as ex:             # noqa: BLE001 — fail closed
@@ -404,19 +432,23 @@ def _record_retire_proven(rid, reason, seat, note, measure):
             return None, ("retire does not bind: event fields do not match "
                           "the retire schema (missing=%s extra=%s)"
                           % (",".join(missing) or "-", ",".join(extra) or "-"))
-        if not dispatches._append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) — retire NOT recorded" % path
-    out = dispatches._apply(row, event)
-    if not out.get("retired_admin"):
-        # THE WRITE AND THE REPLAY MUST AGREE, asserted rather than assumed.
-        # abandon's own history is the reason: its door admitted polarities
-        # its `_apply` arm refused, so the ledger grew events the state
-        # machine ignored while the CLI printed a terminal that never took.
-        return None, ("retire appended an event the replay does not admit — "
-                      "dispatch %s is UNCHANGED; this is a helm defect, not "
-                      "a ledger repair" % row["id"])
-    pk.event("dispatch-retire", row["id"], reason)
-    return out, None
+
+        def finish():
+            out = dispatches._apply(row, event)
+            if not out.get("retired_admin"):
+                # THE WRITE AND THE REPLAY MUST AGREE, asserted rather than assumed.
+                # abandon's own history is the reason: its door admitted polarities
+                # its `_apply` arm refused, so the ledger grew events the state
+                # machine ignored while the CLI printed a terminal that never took.
+                return None, ("retire appended an event the replay does not admit — "
+                              "dispatch %s is UNCHANGED; this is a helm defect, not "
+                              "a ledger repair" % row["id"])
+            pk.event("dispatch-retire", row["id"], reason)
+            return out, None
+        return txn.then(finish)
+    return dispatches._ledger_write(attempt, path)
 
 
 
@@ -442,8 +474,9 @@ def _record_close_landed_proven(rid, reviewed_tip, repo_id, trunk_ref,
     if proof_mode not in ("ancestor", "patch-equivalent"):
         return None, "close-landed proof mode must be ancestor or patch-equivalent"
     path = dispatches.ledger_path()
-    with eventledger.locked(path) as held:
-        if not held:
+
+    def attempt(txn):
+        if not txn.held:
             return None, "ledger unwritable (%s) — close-landed NOT recorded" % path
         current, unavailable = dispatches.snapshot()
         if unavailable:
@@ -478,11 +511,15 @@ def _record_close_landed_proven(rid, reviewed_tip, repo_id, trunk_ref,
                  "landing_trunk_sha": trunk_sha,
                  "landing_proof_mode": proof_mode,
                  "landing_proof_version": 1}
-        if not dispatches._append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) — close-landed NOT recorded" % path
-    out = dispatches._apply(row, event)
-    pk.event("dispatch-close-landed", row["id"], trunk_sha)
-    return out, None
+
+        def finish():
+            out = dispatches._apply(row, event)
+            pk.event("dispatch-close-landed", row["id"], trunk_sha)
+            return out, None
+        return txn.then(finish)
+    return dispatches._ledger_write(attempt, path)
 
 
 
@@ -2378,17 +2415,18 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
                          compose_landed_by=None, dry_run=False):
     """Append ONE proven `close` event without rewriting its verdict.
 
-    landreq owns every live Git/liveness proof; this locked boundary
-    re-validates the immutable row state per reason and records exactly one
-    terminal annotation. Identical retries are idempotent under the
-    per-reason identity; everything else refuses. The git proofs necessarily
-    ran OUTSIDE the lock (seconds-wide window) — the row-STATE facts they
-    depended on are all re-read here under the lock, and the recorded pinned
+    landreq owns every live Git/liveness proof; this boundary re-validates
+    the immutable row state per reason and records exactly one terminal
+    annotation. Identical retries are idempotent under the per-reason
+    identity; everything else refuses. The git proofs necessarily ran
+    OUTSIDE the lock (seconds-wide window) — the row-STATE facts they
+    depended on are all re-read here, on a fold the append then proves is
+    still the ledger (`dispatches._ledger_write`), and the recorded pinned
     trunk sha keeps a proof that went stale-but-was-true auditable. The scoped
-    compose-land v3 path additionally remeasures its Git/gate inputs under this
-    lock; callers supply candidate artifacts, never a trusted protected set.
-    A `dry_run` runs every one of these checks WITHOUT the lock and appends
-    nothing."""
+    compose-land v3 path and the `discharged` re-walk re-measure their live
+    Git/gate inputs UNDER the lock (`txn.lock()` before them); callers supply
+    candidate artifacts, never a trusted protected set. A `dry_run` runs
+    every one of these checks without the lock and appends nothing."""
     reviewed = str(reviewed_tip or "").strip().lower()
     build_landed = reason == "landed" and close_proof_version == 2
     compose_landed = reason == "landed" and type(close_proof_version) is int \
@@ -2596,18 +2634,23 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
                               reason, ",".join(missing) or "-",
                               ",".join(extra) or "-"))
     path = dispatches.ledger_path()
-    # A REHEARSAL TAKES NO LEDGER LOCK. It writes nothing, and the lock exists
-    # only so a check and the append it authorizes see one ledger. Held here,
-    # it covers the whole-ledger fold below and every git proof under it, and
-    # the /api/lr rebuild asks `off_frontier_closable` a rehearsal per row: a
-    # board rebuild then holds the dispatch ledger lock without a break, and
-    # every fleet `dispatch send` and `dispatch verdict` waits for minutes
-    # behind questions that can never append. So a dry run reads the same
-    # snapshot unlocked and runs every check below on it; a real close still
-    # takes the lock and runs all of them again there.
-    with (contextlib.nullcontext(True) if dry_run
-          else eventledger.locked(path)) as held:
-        if not held:
+    # A REHEARSAL NEVER TAKES THE LEDGER LOCK. Every check below reads the
+    # fold without it (`dispatches._ledger_write`), and a dry run returns its
+    # rehearsal before any append, so it neither takes the lock nor reaches
+    # the locked last try. The /api/lr rebuild asks `off_frontier_closable` a
+    # rehearsal per row; a rehearsal that held the lock made that rebuild hold
+    # it without a break while every fleet `dispatch send` and `dispatch
+    # verdict` waited behind questions that can never append. A real close
+    # runs the same checks and appends only if the ledger is still the one
+    # they read.
+    given_candidate = candidate
+
+    def attempt(txn):
+        # EACH TRY STARTS FROM THE CALLER'S CANDIDATE: the checks below stamp
+        # fields onto it, and a try that read a ledger since moved must not
+        # hand those stamps to the next.
+        candidate = dict(given_candidate)
+        if not txn.held:
             return None, "ledger unwritable (%s) — close NOT recorded" % path
         current, verdicts, unavailable = dispatches.snapshot_with_verdicts()
         if unavailable:
@@ -2616,6 +2659,11 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
         if err:
             return None, err
         if compose_landed:
+            # THE RE-MEASUREMENT RUNS UNDER THE LOCK, as it always has: `lock`
+            # proves the snapshot above is the ledger now held, and from here
+            # to the append is one critical section. A rehearsal takes no lock.
+            if not dry_run and not txn.lock():
+                return None, "ledger unwritable (%s) — close NOT recorded" % path
             # Do not trust a caller's empty protected set, tree or gate claim.
             # Re-measure candidates against this lock's canonical row snapshot.
             # A retry validates the same captured composition at its ORIGINAL
@@ -2710,10 +2758,11 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
             # disabled `test_locked_writer_rechecks_selector_uniqueness`, which
             # injects THROUGH that function. The seam stays; the extra read is
             # confined to the one reason that needs a cutoff rather than
-            # charged to every close. A DRY RUN reads it unlocked, so an
-            # append between the two reads can make its preview cutoff one
-            # event ahead of its census; the real close reads both under the
-            # lock, where they cannot differ.
+            # charged to every close. A DRY RUN reads it with nothing to bind
+            # it, so an append between the two reads can make its preview
+            # cutoff one event ahead of its census; a real close appends only
+            # if the ledger has not moved since before both reads, so for it
+            # they cannot differ.
             locked_events, cerr = eventledger.checked_events(dispatches.ledger_path())
             if cerr:
                 return None, "dispatch ledger unavailable: %s" % cerr
@@ -2734,6 +2783,10 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
         event = dict(candidate, id=row["id"], seq=row["seq"] + 1,
                      ts=pk.now_ts())
         if reason == "discharged":
+            # UNDER THE LOCK FROM HERE (`lock` proves the snapshot above is the
+            # ledger held), so the live probe below answers at the write.
+            if not dry_run and not txn.lock():
+                return None, "ledger unwritable (%s) — close NOT recorded" % path
             # WRITER-SIDE re-walk under the lock, with the live git probe the
             # replay arm cannot run: the discharging row's recorded landing
             # names repo + trunk, and the reviewed tip must STILL be an
@@ -2781,9 +2834,10 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
             # mid-batch. The ladder's proof was never the thing that was
             # wrong: the row-STATE checks it skipped all live here, and a
             # ladder that answers before this function runs skips them all.
-            # A rehearsal runs them on an UNLOCKED snapshot (see above), so
+            # A rehearsal runs them on an unlocked snapshot (see above), so
             # its answer is a reading at one moment; the real close runs
-            # the same checks again under the lock before it appends.
+            # the same checks and appends only if the ledger is still the
+            # one they read.
             #
             # THE RESULT IS THE EVENT ITSELF, minus the two fields only an
             # append can fill. A rehearsal that reported a hand-built
@@ -2799,11 +2853,15 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
             if event.get("close_proof_mode") is not None:
                 rehearsal["proof_mode"] = event["close_proof_mode"]
             return rehearsal, None
-        if not dispatches._append_unlocked(path, event):
+        if not txn.append(event):
             return None, "ledger unwritable (%s) — close NOT recorded" % path
-    out = dispatches._apply(row, event, current=current, verdicts=verdicts)
-    pk.event("dispatch-close", row["id"], reason)
-    return out, None
+
+        def finish():
+            out = dispatches._apply(row, event, current=current, verdicts=verdicts)
+            pk.event("dispatch-close", row["id"], reason)
+            return out, None
+        return txn.then(finish)
+    return dispatches._ledger_write(attempt, path)
 
 
 
@@ -2820,8 +2878,9 @@ def record_delivered_report_correction(rid, artifact_ref, report_ref, evidence):
         return None, err
     artifact_ref, report_ref, evidence = values
     path = dispatches.ledger_path()
-    with eventledger.locked(path) as held:
-        if not held:
+
+    def attempt(txn):
+        if not txn.held:
             return None, ("ledger unwritable (%s) — delivered-report correction "
                           "NOT recorded" % path)
         current, unavailable = dispatches.snapshot()
@@ -2850,12 +2909,16 @@ def record_delivered_report_correction(rid, artifact_ref, report_ref, evidence):
         err = dispatches._delivered_report_event_error(event, row, correction=True)
         if err:
             return None, "delivered-report correction does not bind: %s" % err
-        if not dispatches._append_unlocked(path, event):
+        if not txn.append(event):
             return None, ("ledger unwritable (%s) — delivered-report correction "
                           "NOT recorded" % path)
-    out = dispatches._apply(row, event)
-    pk.event("dispatch-close-correction", row["id"], "delivered-report")
-    return out, None
+
+        def finish():
+            out = dispatches._apply(row, event)
+            pk.event("dispatch-close-correction", row["id"], "delivered-report")
+            return out, None
+        return txn.then(finish)
+    return dispatches._ledger_write(attempt, path)
 
 
 # ---------------------------------------------------------------------------

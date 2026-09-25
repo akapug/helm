@@ -459,8 +459,9 @@ class TheWriterAndTheReaderNEVERDISAGREE(unittest.TestCase):
 class ADISPUTEDIdentityIsNotADeclarer(unittest.TestCase):
     """Two identity sources that disagree attribute to NOBODY.
 
-    THESE DRIVE THE REAL PREDICATE. The seams patched are the two SOURCES it
-    reads — the process's declared name and the roster — never
+    THESE DRIVE THE REAL PREDICATE. The seams patched are the SOURCES it
+    reads — the process's declared name, the roster, and the claude process
+    census that says whether a rostered session is still held — never
     identity_disagreement itself, because an arm that fakes the predicate
     measures its own mock. That matters here more than usual: the first cut of
     this cure hand-wrote the comparison, and the arm written against the
@@ -472,11 +473,14 @@ class ADISPUTEDIdentityIsNotADeclarer(unittest.TestCase):
         import helm.seats_identity as ident
         import helm.seats as seats
         import helm.home as home_mod
+        import helm.session as session_mod
         saved = [(ident, "own_name", ident.own_name),
                  (ident, "roster", ident.roster),
                  (seats, "seat_for_session", seats.seat_for_session),
                  (seats, "nonpane_session", seats.nonpane_session),
-                 (home_mod, "session_id", home_mod.session_id)]
+                 (home_mod, "session_id", home_mod.session_id),
+                 (session_mod, "_proc_claude_census",
+                  session_mod._proc_claude_census)]
         for mod, attr, real in saved:
             self.addCleanup(setattr, mod, attr, real)
         ident.own_name = lambda: declared
@@ -484,6 +488,13 @@ class ADISPUTEDIdentityIsNotADeclarer(unittest.TestCase):
         seats.seat_for_session = lambda s: rostered
         seats.nonpane_session = lambda s: nonpane
         home_mod.session_id = lambda: "a-session"
+        # every rostered session is HELD by a planted live process
+        held = [{"pid": 4000 + i, "session": row.get("session")}
+                for i, row in enumerate((roster or {}).values())
+                if isinstance(row, dict) and row.get("session")]
+        session_mod._proc_claude_census = lambda: {
+            "rows": held, "listing_failed": False, "who_failed": False,
+            "census_partial": False}
         return away._declarer()
 
     def test_an_AGREEING_roster_records_the_name(self):

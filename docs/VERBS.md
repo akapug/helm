@@ -879,10 +879,10 @@ receipt; **dry-run by default**; on `--apply` MEMORY.md is locked, re-read fresh
 and atomically rewritten. Writers using the same projection lock serialize and
 changes visible at the protected re-read survive; an external unlocked writer
 racing the final replacement is outside that guarantee. The self-firing
-half is the **Stop hook**: `helm chat stop-guard` runs `index cap --apply`
-in-process as its silent mechanical leg (best-effort, never blocks, never
-prints; `HELM_STOP_GUARD_INDEX=0` disables) — so the write path structurally
-cannot exceed budget on any home `helm hooks install` covers.
+half is the **`helm web` resident**: its stop-facts leg runs `index cap
+--apply` every minute as a silent mechanical job (best-effort, never blocks,
+never prints; `HELM_STOP_GUARD_INDEX=0` disables) — it ran on every Stop
+until the Stop ladder shed everything that was not about the ending turn.
 
 ```console
 $ helm index cap
@@ -2773,8 +2773,23 @@ span whose START is inside and whose END is outside counts as CENSORED and one
 whose END is inside counts in `orphan_ends`; nothing about real termination may
 be inferred from that.
 Populations separate event, execution mode, stage, observer, seat, and outcome.
+Every hook entry helm installs is measured, not only PostToolUse's: `Stop`
+(stage `stop-guard`), `PreToolUse` (`argv-guard`), `UserPromptSubmit`
+(`inject`), `SessionStart` (`join`, `resume-turn`), `SubagentStart`
+(`saguide`), `SubagentStop` (`delegation-stop`) and the handoff check, whose
+one argv serves two events and is filed as `PreCompact-or-SessionEnd`.
 Completed spans use nearest-rank p50/p95 wall durations; empty completed
 populations have null quantiles. Nested stage spans overlap: do not sum them.
+
+The stream rotates in minutes at fleet rate, so a span that ENDS `timeout` or
+`cancelled` is also copied, START first, to an incidents stream beside it
+(`hook-latency.jsonl.incidents`, 3 generations of 2 MiB, sized for 24 h of
+incidents at about 1,300 a day). The report reads both and counts a row that
+both hold once. `coverage.incidents.retained_time_range_hours` and the text
+report's "Incidents" line say how many hours the incidents stream actually
+holds; the bound is bytes, not a clock. A hook killed from outside (the
+wrapper's `timeout`) writes no END, so that kill is not an incident here: its
+START is censored and rotates away with the main stream.
 
 Counts expose invalid/malformed rows, conflicts, duplicates, orphan terminals,
 timeouts, cancellation, and censored START records. A missing END means
@@ -3247,7 +3262,7 @@ helm beacons — the inbox beacon is helm's only wake path to a seat
   VACANT SEAT retired-seat — its wake path is LIVE and nobody is home: 1 live beacon consumes its addressed rows, and no live pane declares this seat, and the process behind its beacon (pid 42546) is seat codex's agent. A DM to it is swallowed exactly as a ghost's is — the inverse case, a live beacon for a dead seat. Only a relaunched agent (or that seat's own de-arm) ends it.
   UNPROVEN kimi — no beacon could be PROVEN live (1 unknown). Not a deaf seat and not a healthy one; the instruments could not answer.
   GHOST WAITER pid 798715 seat gemini armed 33h ago — its launcher is gone — the beacon was reparented to a reaper, so nothing reads the pipe it writes wakes into. It consumes that seat's addressed rows into a pipe nobody reads, and it satisfies a naive shape check, so it makes a dark seat read as covered.
-helm beacons: 4 seats, 1 covered, 1 DEAF, 0 DEAF-IN-EFFECT, 0 MISROUTED, 1 VACANT, 1 UNPROVEN, 1 ghost waiter, 10 beacons (6 surplus); seat-joined 7/8 live beacons; origin UNSTAMPED on all 8 (no stamp producer exists yet, so main versus subagent is not measured)
+helm beacons: 4 seats, 1 covered, 0 WAKING, 1 DEAF, 0 DEAF-IN-EFFECT, 0 MISROUTED, 1 VACANT, 1 UNPROVEN, 1 ghost waiter, 10 beacons (6 surplus); seat-joined 7/8 live beacons; origin UNSTAMPED on all 8 (no stamp producer exists yet, so main versus subagent is not measured)
 ```
 
 The summary's last clause holds TWO different joins. `seat-joined N/M` is
@@ -3268,16 +3283,27 @@ DEAF-IN-EFFECT path uses) or when it owes dispatch work (`dispatches.owed`).
 A DEAF seat that owes nothing is never typed into, and the census still
 reports it DEAF. Automatic typing is also limited in scope. It reaches only
 seats of the project the timer runs for (a seat's project is its roster
-checkout, resolved like any other), and only a verified native claude
-runtime. An owing DEAF seat of another project, or on a proxy or codex family,
-is reported with what it owes ("wake is a paid turn; not auto-nudged") and is
-never typed into. The pane is
+checkout, resolved like any other). An owing DEAF seat of another project is
+reported with what it owes ("another project's seat; not auto-nudged") and is
+never typed into. A seat on a proxy or codex family is typed into when it
+owes, like a native one (task/3055, owner ruling 2026-09-24: the owed row is
+the order for the turn), and the report names the paid turn. The pane is
 asked to re-arm its beacon with the exact `Monitor(...)` call. The nudge uses
 the DEAF-IN-EFFECT repair path, its bounds (debounce, spiral, per-hour cap) and
 its episode latch. It is refused while delivery to the seat is paused. The
 actuator checks again that the seat still has no beacon. The latch settles
 when the seat reads covered again. A seat whose pane the census could not name
 (`agent` unknown, such as a dead roster row) is never typed into.
+
+**WAKING is the half-hourly check-in, not a fault (task/3055).** Claude Code
+caps every `Monitor` at 30 minutes and kills the waiter at that deadline, so a
+beacon's registry row outlives it (the waiter's own cleanup never runs). A row
+whose arm time puts its death at the lease deadline is kept for the re-arm
+grace (`REARM_GRACE_S`, two census passes) and reported `expired`. With no live
+beacon, at least one expired row and a pane that declares the seat, the verdict
+is `WAKING`: outside the alarm class, never typed into, and `DEAF` only if the
+grace passes with no re-arm. `helm seat list` shows a WAKING seat as DEGRADED
+with the reason, and the dispatch door files work for it.
 
 `surplus` is the accumulation, counted in BEACONS and never in matching
 processes: each beacon is a process PAIR (a `bash -c` wrapper and its python
@@ -3578,14 +3604,21 @@ an incident: it produces zero signing traffic (no probe, no unlock), and
 status says `unsigned (no signer)` rather than letting a
 reachable node imply signed posts. Agents sign as `HELM_CELL_PROFILE` (else
 their own seat, else `helm-agent`), through the same identity gate as a
-coordination turn: a process that provably is seat X while `HELM_CELL_PROFILE`
-names someone else posts UNSIGNED, stamped `DEGRADED X/identity_conflict`, and
-never signs with the other profile's key; while the roster cannot be read, the
-same seat is stamped `identity_unreadable` instead, since an unreadable identity
-is not permission. The transport status asks the same gate, so that seat reads
-DEGRADED, never SIGNED on another profile's receipt, and `helm hooks install`
-and `helm seat launch` list its pane as posting UNSIGNED. An explicit profile
-still wins. The
+coordination turn. A process that provably is seat X, whose `HELM_CELL_PROFILE`
+is the OWNER's profile (a seat started outside `helm launch` inherits it from
+the owner's shell), signs as X with X's own key when the identity layer admits
+the process as X; the signer mints that key on first use. A seat's own old
+name inside a live rename window also signs. Any other profile that names
+someone else posts UNSIGNED, stamped `DEGRADED X/identity_conflict`, and never
+signs with the other profile's key. So does an owner profile on a seat the
+identity layer does not admit, or on a process whose session the roster binds
+to a fleet seat it does not name. While the roster cannot be read, the same seat
+is stamped `identity_unreadable` instead, since an unreadable identity is not
+permission. The transport status asks the same gate, so a refused seat reads
+DEGRADED, never SIGNED on another profile's receipt. `helm hooks install` and
+`helm seat launch` list a refused pane as posting UNSIGNED, and a pane that
+signs as its own seat despite the owner's export as INFO. `helm cell join|send`
+with no `--profile` asks the same gate. An explicit profile still wins. The
 owner's web posts sign server-side as the owner's derived handle. `helm chat
 node up` provisions
 the room node (`helm-chat-node.service`, `dregg-cave-node` on
@@ -4103,8 +4136,8 @@ frames; this lane is called *delivery*.)
   `HELM_STOP_GUARD_SPIRAL=0`; **BLOCK — UNTESTED COMPOSITION** — the worktree
   the stopping seat is standing in (plus any lane rooms it leases) and another
   LIVE worktree of the same repo, driven by a DIFFERENT holder, have both
-  AUTHORED the same code file; BOTH halves are verified by the strongest
-  evidence that repo produces; and nothing has ever run against the two
+  AUTHORED the same code file; BOTH halves' current trees carry an
+  admissible gate receipt; and nothing has ever run against the two
   together. Owner canon 2026-08-23: "two green halves with an untested
   composition ... the biggest failure mode across projects."
   THE SIGNAL IS GIT PLUS /proc, not helm bookkeeping, and that is a measured
@@ -4117,22 +4150,21 @@ frames; this lane is called *delivery*.)
   2 of that project's 6) OR a held helm lane lease (where the ledger has rows).
   The HOLDER comes from the lease, else from the occupants' own
   `HELM_CHAT_NAME`; UNKNOWN never claims a name.
-  VERIFIED IS TIERED PER REPO: an OK gate receipt on one of the branch's own
-  commits where the repo mints receipts (1,685 of 1,690 green heads resolve in
-  helm), else — where it has never minted one (0 of 1,690 in the sibling project) — the
-  git-only reading of "banked": own commits with the room CLEAN. The emitted
-  text says which, and never says GREEN about a repo with no receipts.
+  VERIFIED IS ONE BAR: a half is green only when its current tree carries an
+  admissible whole-suite gate receipt. A repo that has never minted one (0 of
+  1,690 in the sibling project) therefore has no green halves, and the rung is
+  silent there rather than blocking with a cure that proves nothing
+  (task/1378 carries the honest replacement).
   A CONFLICTING merge is STILL a seam: git is loud about the text and silent
   about the behaviour, and a hand-resolved merge is an untested composition by
   construction. (Every code-overlapping pair in the sibling project conflicts, so the
   earlier clean-merge-only filter made the rung unable to fire there.)
-  Discharged either way the owner named: an arm run against the COMPOSED tip —
-  the receipt binds the merged TREE, so `git merge --no-ff <peer>` + gate
-  clears it even if the merge is thrown away, and 3 of 40 clean pairs on the
-  helm board already had one — or a `Seam: <peer branch>` commit trailer
-  naming who owns the seam (a git trailer, not a chat row, because chat is
-  tmpfs and dies at reseed; the match is bound to the counterpart's name, so a
-  blanket trailer discharges nothing). A conflicting pair has no composed tree
+  Discharged by an arm run against the COMPOSED tip — the receipt binds the
+  merged TREE, so `git merge --no-ff <peer>` + gate clears it even if the merge
+  is thrown away, and 3 of 40 clean pairs on the helm board already had one —
+  or, where one branch already carries the other, by a receipt at that
+  container's own tree. A commit trailer discharges nothing: prose cannot
+  prove a composition was tested. A conflicting pair has no composed tree
   and is told so rather than handed a gate command that cannot clear it.
   ADMISSIBILITY IS THE WHOLE DISCHARGE: a receipt counts only if it is
   whole-suite, clean before and after, and unmoved across the run. FOCUSED and
@@ -4140,10 +4172,8 @@ frames; this lane is called *delivery*.)
   its scope rather than its tree, which is why it cannot authorize a land — and
   a half is GREEN only when its CURRENT TREE was tested, so a gate on an
   earlier commit no longer vouches for a branch that has moved past it (the
-  key is the tree, not the head, so the empty trailer commit that DISCHARGES a
-  seam does not cost the half its greenness). A trailer discharges only when it
-  names the counterpart AND an owner: a bare `Seam: <peer>` names the seam and
-  nobody.
+  key is the tree, not the head, so an empty commit does not cost the half its
+  greenness).
   Latched on the COMPOSED seam set — each pair plus what it composes to — so a
   NEW peer re-arms it and so does a MOVED half, which is a different untested
   composition; an unwritable latch degrades to the WARN.
@@ -4162,7 +4192,7 @@ frames; this lane is called *delivery*.)
   failed /proc occupancy census, and an unreadable receipt ledger each surface
   as an audible UNKNOWN warn instead of silently deleting peers, and a stale
   roster row may NAME a holder but may never buy the same-seat exemption.
-  UNKNOWN (no trunk, unreadable receipt ledger, unreadable tier probe) is an
+  UNKNOWN (no trunk, unreadable receipt ledger, unreadable import bindings) is an
   audible warn, never a block. An UNKNOWN peer HOLDER never buys the
   same-seat exemption — skipping a peer is an exclusion, and helm's own
   `seat-liveness-is-environ-not-cwd-and-not-comm` requires exclusions to be
@@ -4176,7 +4206,11 @@ frames; this lane is called *delivery*.)
   several seats answer to, once per arrangement, that the rung cannot look
   between them, because a can-tell-nothing must not read as a clean bill. It
   never blocks, and an unwritable latch makes it stay quiet rather than repeat.
-  Kill:
+  THE STOP COMPUTES NONE OF THIS: the `helm web` resident writes the census,
+  the green receipts and each live room's rows into the stop facts, and the
+  stop assembles its own answer from them (docs/HOOKS.md, "Stop facts"); a
+  reading that is STALE, ABSENT or from other code is one UNKNOWN warn and
+  never a block. Kill:
   `HELM_STOP_GUARD_SEAM=0`; **BLOCK — NON-DISTRACTION PROTOCOL** — the
   stopping seat is connected to 3+ live claim leases (minted by its session
   or naming it as holder) and has delegated to a SUBAGENT exactly zero times
@@ -5079,7 +5113,11 @@ which flag was starved — so that one shape is left to it.
   pushInsteadOf, and a readable `git push` argv); every reachable blob
   otherwise, or when that advertisement cannot be read or is empty. Its
   diagnostics name a configured remote or "a URL remote" and never print a
-  URL, a path or git's output; one-push skip `HELM_HOSTPATH_SKIP=1`). It
+  URL, a path or git's output; one-push skip `HELM_HOSTPATH_SKIP=1`). Only a
+  remote that `gh repo view` reads as private skips the scan. A failed probe
+  is asked once more, and a remote gh still cannot answer for is scanned and
+  refused as if public, with a refusal that says "visibility UNKNOWN
+  (<why>), treated as public" rather than calling it PUBLIC. It
   reads git's
   outgoing ref lines from stdin ONCE and feeds the same bytes to a composed
   `pre-push.helm-user` (git-lfs uploads by them) and then to the scanner, so a
@@ -5910,6 +5948,49 @@ recorded origin is a fab node's path this box has never had — provenance for a
 reader, never authority — and what admits it is the importing repository's own
 declaration of the same command.
 
+**A LAND TAKES ONLY A RECEIPT HELM CAN PROVE IT RAN (task/3066).** Every check
+`gate import` runs — schema, content id, head, tree — is one the artifact's
+submitter can run too. Measured on trunk: a v4 FAILED receipt with its status
+flipped to OK and its id recomputed imported and bound every land door, and so
+did a v10 OK reminted as v4. So every land door (`bind` at `NEED_LAND`,
+foldcheck's tree-vs-gate rung, landgate's clause (ii), compose's composed-tree
+gate, its capture and its replay) asks, LAST and after every content clause,
+which authenticated door placed the receipt in the repository being landed, and
+reads the answer only from rows those doors write: a **local mint** record
+(`_global/gate-mints.jsonl`, written by `gate run`'s own mint), a **Fab
+completion** helm built from its own observation of the job
+(`gate window launch` → `fab gate --import` → `gate fab reconcile`,
+`_global/gate-fab-completions.jsonl`) whose `artifact_sha256` is the artifact
+the import binding recorded and whose sha and tree are the receipt's, or a
+**routed custody** row from `gate run --box`'s challenge-framed session
+(`_global/gate-route-custodies.jsonl`). A receipt only `gate import` (or classic
+`fab gate`, which calls it) placed still binds every lane-level purpose — a
+review's APPROVE, a lane tip — and the land refusal names the cure: launch the
+land gate with `helm gate window launch --repo <room> --label <train>`.
+
+**A declared command has no authenticated remote door yet, so it is not refused
+on provenance.** The Fab gate job and `--box` both run helm's own suite, so a
+project that declares its own gate command (an adopter's `bash scripts/gate.sh`)
+cannot bring a receipt any of the three doors placed. Its land binds as before
+and every door says so: `provenance: unauthenticated-no-door`. The scope is
+never the receipt's word: a receipt is a declared-command land only when its
+argv runs no helm suite runner and the repository being landed declares exactly
+that command in its authored `gate` field. A block naming helm's runner, or one
+the landed repository never declared, answers the flip.
+
+**The flip is forward-only.** It governs land decisions made after its
+recorded ACTIVATION (`HELM_WORK_INTEGRATOR=1 helm gate provenance --activate`,
+write-once, a latch beside the record) and never re-reads the proof of a land
+that already happened. The activation lists every gate receipt helm's own
+ledger held at that instant; a receipt on that list, whose import binding in
+the repository being landed (when it has one) predates the activation, is
+judged by the rule in force when it was placed, which asked no provenance
+question, so `helm lr foldcheck` on a tip that landed on a classic receipt
+answers exactly as it did. The receipt's own `ts` is never that clock, since
+it is inside the artifact. Before the activation every land door answers as it
+did; a torn or unreadable activation is UNKNOWN and enforces the flip for every
+receipt. `helm gate provenance` prints the state.
+
 **A LINKED WORKTREE RESOLVES ITS REPOSITORY'S DECLARATION.** An adopter declares
 once at its root and then works in `git worktree`s of it, which is where a lane's
 gate actually runs; the repository is identified by `git rev-parse
@@ -5966,6 +6047,79 @@ overwritten by archive bytes.
 runs nothing — the seam anything outside helm asks before spending a box, so a
 remote gate runner never has to keep a second copy of this policy. (`--plan`
 beside `--focus` is still the focused-selection challenge surface.)
+
+**ONE WHOLE SUITE PER LANDING WINDOW: the doors a whole-suite request meets**
+(task/3039; helm's own tree only — an adopter project is unchanged). The land
+gate needs one green whole suite on the exact tree that lands, and the train's
+receipt is that suite; `landgate`, `foldcheck` and the APPROVE binding are
+unchanged. So, before anything is spent, on the local run, on `--box` and on
+`--plan` (the question `fab gate` asks on the hub, in the caller's own
+environment):
+
+- **A tree that already holds a GREEN whole-suite receipt** is refused, naming
+  that receipt and its evidence line: it binds this tree, so paste it. A tree
+  whose last receipt is RED re-runs only with `--again` (a suspected flake;
+  `HELM_GATE_AGAIN=1` through `fab gate`), recorded as `again` on the label. A
+  dirty tree has no answer here.
+- **A lane room** (`<repo>-wt/<lane>`) refuses a whole suite and prints the
+  focused route, fab first: `helm gate run --repo ROOM --focus --plan` (the
+  selection, running nothing), the `fab test` floor of that selection (the
+  audits plus the lane's own touched test modules; a focused receipt routed
+  through `fab gate` cannot come home, because `gate import` refuses a v6
+  artifact), and last `helm gate run --repo ROOM --focus`, for a box that may
+  run suites, since the hub is agents-only. The
+  escape is `--lane-suite --why TEXT` (`HELM_GATE_LANE_SUITE=TEXT` through `fab
+  gate`); the why rides on the receipt label as `lane-suite: TEXT` and every
+  escape writes a `gate-lane-suite` event.
+- **A compose room** (`<repo>-wt/compose/<name>`) hands a local whole suite to
+  `helm gate window launch` (`--supersede` passes through), which refuses a
+  second suite on the same window with its WAIT/SUPERSEDE doors and records
+  the launch in `runs.json`. The `--plan` question refuses there and names that
+  command, because a plain `fab gate` bypasses the record.
+
+**SLICED IS THE DEFAULT FOR LANE-LEVEL GATES, SERIAL FOR LANDS** (task/3039).
+A whole suite asked for with no mode flag runs as SLICES (`--sliced`, receipt
+v10: helm's suite as parallel slices of one serial discovery) only where helm
+can prove the run is not a land gate, and SERIAL everywhere else. The reason is
+the land door: a sliced receipt binds a lane tip and a review's APPROVE and
+NEVER a land (modules split across workers do not see the data one leaves for
+another, so `landgate`, `foldcheck` and compose refuse the sliced kind by name),
+so a land needs a serial receipt on the tree that lands, and a sliced run there
+would spend a whole suite on a receipt the land door refuses.
+
+- **Sliced by default**: a lane room admitted by `--lane-suite`, a peek
+  (`<repo>-wt/peeks/<x>`), a seat's home (`<repo>-wt/seats/<seat>`) and a
+  harness worktree (`<repo>/.claude/worktrees/<x>`). The whole suite there is
+  a lane-level question.
+- **Serial by rule**: the shared checkout; a compose room (it launches through
+  `gate window launch`, which submits Fab's serial scope by name, and
+  `--sliced` there is a usage error); any other checkout, such as a train
+  room outside the project's container (`/var/tmp/helm-train<N>`) or a routed
+  box's clone; a gate labelled `train...` (a usage error beside `--sliced`);
+  and any run inside a Fab job (`FAB_ID` set), where the flags Fab forwarded
+  ARE the scope Fab publishes the receipt under, so no flag means Fab's serial
+  scope. `--serial` forces serial anywhere.
+- **Falls back LOUDLY**: a lane-level room whose tree cannot run slices (it
+  ships no slice runner; its own `helm/gate.py` predates the sliced kind, as
+  trunk did while it shipped `gateslice.py` as a diagnostic; it runs a
+  declared command; or this host has fewer than four online CPUs) runs serial
+  and says why on stderr, and the `--plan` answer carries it as `note`. The
+  tree's OWN helm is asked because it is the helm a node or a box runs.
+
+`--plan --json` answers the resolved `mode` (`sliced` or `serial`) and
+`mode_reason` for every whole-suite question, and the `slice` block when the
+mode is sliced, so a runner outside helm that dispatches the run elsewhere
+forwards `--sliced` when the answer says sliced; a node given no flag runs
+serial. The CPU count is asked only for a local run, because a routed or
+dispatched run executes on a host this process cannot count. `gate.run()`
+itself keeps `sliced=False`: the default lives in the verb, so a programmatic
+caller (`gate equiv`) never inherits it.
+
+`--focus` meets none of these. For a change to a file outside the import graph
+(a doc, a script) it now selects every tree-wide audit (`helm gate audits`)
+plus each test module whose source names the file, instead of refusing; a tree
+that does not ship the whole audit list still refuses. The binder re-derives
+the same selection.
 
 **helm's own source tree keeps its own suite with no registry edit**, decided by
 the tree's own NARROW is-this-helm predicate (`selfrepo.is_helm_source_tree` —
@@ -6401,9 +6555,12 @@ the `gate:` token — see the binding rules there.
   of that repository; its common-dir binding then survives later lane cleanup.
 
 `show` prints one receipt in full; `list` is the recent ledger. `run`'s exit
-status **is** the binding — 0 only when a verdict citing the receipt would be
-accepted — so a run this verb calls green can never be one the land path
-refuses.
+status **is** the binding, asked at the bar the run can answer — 0 only when a
+verdict citing the receipt would be accepted: a whole-suite receipt at the
+APPROVE bar, a focused one at the cure-round bar — so a run this verb calls
+green can never be one that verdict refuses. A green exit is not land
+authority: the land doors ask for a SERIAL whole-suite receipt on the tree that
+lands, so they refuse a green focused or sliced receipt.
 
 **What this buys, and what it does not.** Every stored receipt is
 self-consistent, so an edited, corrupted, or hand-written row is rejected. It
@@ -6427,9 +6584,49 @@ first time at the whole-suite gate. The list is the one
 `docs/MODULE_REGISTRIES.md` enumerates plus the arms on the non-test rungs, and a
 test holds the two in step. Name the lane's own test modules after `--`
 (`tests.test_x`, `test_x` or the file's path) and they are appended once each.
-**Paste the printed command on the COMPOSED tree before every whole-suite gate.**
+**Paste the printed command in every focused round, a lane's or a cure's, and on
+the COMPOSED tree before its whole-suite gate.** A focused selection carries the
+audits only for a change outside the import graph (a doc, a script); for a
+Python change it carries only the audits whose imports happen to reach it.
 A listed audit the tree does not carry prints nothing and exits 1, because a
 command naming it would fail on import instead of auditing anything.
+
+### `helm gate canary [status] | run [--repo P] | compare <serial-id> <sliced-id> | clear --reason TEXT | --install-timer`
+
+**Checks each night that a sliced run still agrees with serial.** A sliced
+receipt (v10) runs the whole suite as slices of one serial discovery, and its
+runner audits every module for the process state AND the module data a unit
+leaves behind. That makes the two runners agree on the suite as it stands; the
+canary keeps checking it. `run` resolves trunk's tip and needs ONE serial and
+ONE sliced whole-suite receipt of its tree. The serial one is usually the
+receipt trunk's own train gate minted on those bytes; for each kind the tree
+lacks it stands a read-only peek room at the tip and gates it through the
+launcher with the mode named (`--serial` / `--sliced`) and `HELM_GATE_CANARY=1`
+set, which the one-suite-per-tree door admits for the kind the tree's last
+receipt is not (labelled `canary`); a second run of the same kind is refused
+as always. It then compares the two receipts test by test: every failure
+identity with its kind, plus the run and skip counts. A tree already judged is
+**SKIPPED** (exit 0, nothing run). The launcher is `fab gate` unless
+`HELM_GATE_CANARY_LAUNCH` names another (`helm gate run --box NAME`, or `helm
+gate run` on a build node).
+
+- **AGREE**: recorded in `_global/.state/gate-canary/last.json`; nothing is posted.
+- **DIVERGED**: any test whose outcome differs, a slice-only `LeakAudit`
+  error, or a count that differs. The canary writes the DISABLE marker
+  `_global/.state/gate-canary/sliced-land-disabled.json` and posts one alert
+  to the helm room. `gate.sliced_land_disabled()` reads it: while it stands,
+  a sliced receipt authorizes no land. (Today every land door refuses sliced
+  receipts by kind anyway; the marker is the predicate a later flip consults.)
+- **UNKNOWN**: a receipt did not come home, is unreadable, or the two are not
+  the same tree. No marker, and one alert, because a canary that silently
+  stops measuring is not a canary.
+
+The marker is durable: a later AGREE does not remove it. `clear --reason TEXT`
+archives it beside itself with the reason. A marker that cannot be read
+disables exactly as a readable one does. `compare` judges two stored receipts
+without writing anything. Bare or `status` exits 1 while the marker stands.
+`--install-timer` writes and enables `helm-gate-canary.timer` (nightly at
+03:30, persistent) running `helm gate canary run` from the shared checkout.
 
 ### `helm gate window launch [--repo P] [--label T] [--trunk REF] [--supersede] | show [--recover]`
 
@@ -6498,6 +6695,17 @@ redundant with the others. The window is a PROJECT fact; nothing measured it.
   and then retires itself. Neither WAIT nor `--supersede` is reachable for a run
   nobody can name, and the refusal says that rather than printing a cure that
   cannot be run.
+* **The label rides the job, when Fab takes it.** `--label train200` used to
+  stop at the window record: the request key is a hash of repository, tree,
+  scope, interpreter and runner, and Fab runs exactly that identity's argv on
+  the node, so nothing carried the label to the run that mints the receipt
+  (measured: receipt a8385c943e5d7a54, LAND 311, label empty). It now rides
+  `fab gate submit --label TEXT`, beside the request the way the budgets do,
+  and `helm gate run` inside a durable Fab job (`FAB_GATE_GENERATION`) mints
+  Fab's `FAB_GATE_LABEL` when no `--label` was typed. A Fab that does not list
+  `--label` among `gate measure`'s `submit_options` would refuse the whole
+  submit, so the door sends it only when listed, and the dispatch says which
+  happened: carried to the node, or recorded here only.
 * **A DIRTY room is refused before any of that.** Fab snapshots tracked
   and untracked bytes into a dangling commit, so it would gate a tree that is
   on no branch while the record claimed the room's head — and that head is what
@@ -6538,6 +6746,86 @@ redundant with the others. The window is a PROJECT fact; nothing measured it.
   identity has no import door at all, so its render names
   `fab gate reconcile --host H --repo ROOM` and the UNVERIFIED tier that sweep
   will report, rather than a cure that cannot be run.
+
+### `helm train [--repo PATH] [--trunk REF] [--name TRAIN] [--max-behind N] [--apply]`
+
+**The landing window composes itself.** Before this verb the integrator built
+every train by hand: a detached room on trunk, one `trainNNN: merge lane <name>`
+merge per approve-ready lane, then one whole-suite gate through
+`helm gate window launch`. Which rows were ready, what order they merged in and
+whether a conflict was resolved on the way lived in one session's memory.
+
+* **A dry run by default.** It lists this project's approve-ready rows, their
+  reviewed tips and the merge order, and names every READY row it excludes with
+  the reason (already on trunk, tip unreadable here, a second row on the same
+  tip, no repository binding). Approve-ready is the land-request projection's
+  own READY word on a LIVE row, the pair `helm lr list` reads: a row that has
+  since closed keeps the stored word READY and is marked terminal, and the
+  first dry run on the real ledger offered 214 such closed rows as cars. A row
+  whose word is READY-SELF-REVIEW or READY-CONTESTED is excluded by name. Those
+  are the READY word's own door-caution rungs (`landreq.ready_rung`: nobody
+  independent looked, or an unanswered FIX stands on this tip). No land verb
+  enforces them, so this verb does. This verb never re-judges a verdict. The
+  order is the order the rows became READY, oldest first.
+* **The drift cap.** Each car's line prints how many trunk commits its
+  reviewed tip lacks (`git rev-list --count <tip>..<trunk>`, against the exact
+  trunk commit the train stands on). A car more than `--max-behind N` commits
+  behind is skipped and named with its count and "rebase it or close it". Its
+  review and its gate saw a trunk that many commits older, so the composed
+  room is the first place that work meets trunk as it is now, and a failure
+  there fails the whole train's gate. A count git cannot give is UNKNOWN, and
+  that car is skipped too. The default is 200 and the floor is 10. A value
+  under the floor, or one that is not a whole number, refuses with exit 2
+  before anything is read.
+* **READY-UNVERIFIED is sorted by its cause.** The word folds several unknowns:
+  a receipt the ledger cannot speak for, a contributor chain helm could not
+  read, a row helm could not observe. This train's own gate answers the first,
+  and the plan measures each tip and its ancestry itself. Nothing answers the
+  second, so a row whose independence is UNKNOWN is excluded by name. Every
+  READY-UNVERIFIED row that stays prints the rung's reason beside its word.
+* **The trunk is checked against its authority.** The plan stands on the local
+  trunk snapshot (`origin/main` by default), which says what the last fetch
+  left, not what the remote holds. The header prints the repository's
+  declared trunk authority (`helm.trunkRef`, `helm.trunkRemote`), observed now
+  through the VCS seam with one bounded fetch, beside that snapshot. `--apply`
+  refuses when the two differ, naming both shas and asking you to fetch first.
+  It also refuses when the authority is UNKNOWN or undeclared, because UNKNOWN
+  is not agreement. The dry run only prints it.
+* **`--apply` mints ONE room and merges.** The room is a detached worktree at
+  `<repo>-wt/compose/<train>`, standing on the trunk head. Each reviewed tip is
+  merged by its exact sha with `git -c rerere.enabled=false merge --no-ff` and
+  the message `<train>: merge lane <lane>`. The train is numbered one past the
+  highest `trainN:` merge on trunk unless `--name` names it. A room that
+  already exists is refused, because its HEAD may be the only anchor of an
+  earlier train.
+* **Merge, never cherry-pick.** A verdict binds the reviewed tip by sha. A merge
+  keeps that sha as a parent, so once the train lands the reviewed commit is an
+  ANCESTOR of trunk and `helm lr foldcheck` proves the reviewed content landed by
+  ancestry alone. A cherry-pick mints new shas and the proof becomes patch
+  equivalence, one hop weaker. `helm lr compose` keeps its cherry-pick and its
+  patch-id re-measure for its own callers.
+* **The room is asserted before every merge.** Git is asked which checkout the
+  room path resolves to. It must be the room itself, a linked worktree of this
+  project, on a detached HEAD. A room directory that lost its `.git` pointer
+  resolves upward into an enclosing checkout, and a merge there would land in
+  the wrong tree, so the train stops instead.
+* **A conflict is aborted, never resolved.** The row and its lane are named, the
+  merge is aborted, and the room is checked to be exactly as it stood before
+  that merge. The other rows still compose and nothing else is removed. Rerere
+  is off for every merge, so no conflict is recorded and no earlier resolution
+  is applied by itself. An abort that fails or leaves residue stops the train
+  with nothing launched.
+* **The gate goes through the door, never around it.** After the merges the
+  verb calls the landing-window door on the room, with the train name as its
+  label and the trunk head the room stands on as its window. A second whole
+  suite on one window is refused by the door, and that refusal and its exit
+  code come back unchanged. The verb never dispatches a suite itself and never
+  supersedes one. Every car is READY, so each carries its approve before the
+  suite is spent.
+* **Exit codes.** 0: every car merged and the door dispatched. The door's own
+  code (2, 3 or 4) when the door refuses or fails. 1: a car was refused (the
+  door still gated the others), the train stopped, the trunk authority
+  refused, or nothing was approve-ready.
 
 ### `helm owed [--seat S] [--rows] [--json]`
 
@@ -6640,7 +6928,7 @@ whole mechanism would have been delivered a day late by a daily sweep. An
 unreadable ledger **exits 1** and delivers nothing, rather than publishing a
 clean burn-down from the one moment it cannot see.
 
-### `helm dispatch send <recipient> <lane> <message...|stdin> --ref TIP --kind build|review --new-work|--supersedes ID [--key K] [--force] [--posture-na REASON] [--read-only-because REASON] | add <recipient> <lane> --ref TIP --kind build|review --new-work|--supersedes ID [--force] [--posture-na REASON] [--read-only-because REASON] | verdict <id-or-unique-prefix> <full-reviewed-tip> --approve|--fix|--supersede|--concur [--patch-tip FULL_SHA|--no-patch-because REASON] [--imperfect] <evidence> | cancel <id-or-unique-prefix> <reason...> | rebind <id-or-unique-prefix> --to <seat> [--force] [--reason R] [--repo PATH] [--json] | retip <id-or-unique-prefix> --ref NEW_TIP --reason R [--repo PATH] [--json] | list [--open|--overdue|--held] [--mine] [--issued] [--to SEAT] [--all-projects] [--json] | triage [ID...] [--all-projects] | mix [--hours N] [--sender SEAT] [--json] | briefs [--cut] | collisions [--json]`
+### `helm dispatch send <recipient> <lane> <message...|stdin> --ref TIP --kind build|review --new-work|--supersedes ID [--key K] [--force] [--posture-na REASON] [--read-only-because REASON] | add <recipient> <lane> --ref TIP --kind build|review --new-work|--supersedes ID [--force] [--posture-na REASON] [--read-only-because REASON] | verdict <id-or-unique-prefix> <full-reviewed-tip> --approve|--fix|--supersede|--concur [--patch-tip FULL_SHA|--no-patch-because REASON] [--imperfect] <evidence> | cancel <id-or-unique-prefix> <reason...> | retract <id-or-unique-prefix> --reason R --reads source-clean|fix|supersede|unknown --measured|--inferred [--reissue|--successor ID] [--json] | rebind <id-or-unique-prefix> --to <seat> [--force] [--reason R] [--repo PATH] [--json] | retip <id-or-unique-prefix> --ref NEW_TIP --reason R [--repo PATH] [--json] | list [--open|--overdue|--held] [--mine] [--issued] [--to SEAT] [--all-projects] [--json] | triage [ID...] [--all-projects] | mix [--hours N] [--sender SEAT] [--json] | briefs [--cut] | collisions [--json]`
 
 **The project's light is checked at this door.** A NEW build row whose repository belongs to a project with an authored `red` light is refused as described under `helm projects state`; a `yellow` one is admitted with its reason printed as an admission note. `--force` does not change this, because it is a statement about the recipient.
 
@@ -7199,6 +7487,136 @@ reader is back, run `python3 -m helm.findingspass <id>` from a helm checkout; a
 row that already has a complete or partial read of its tip is skipped.
 `HELM_QWEN27_FINDINGS=0` switches the pass off (see `docs/ENVIRONMENT.md`).
 
+**`retract` corrects a WRONG verdict without rewriting it (task/3060).** A
+verdict is immutable: the door refuses a second verdict on the row, and
+`cancel` refuses a row whose verdict declared a polarity. Before `retract`
+there was no corrective, so a wrong APPROVE kept authorizing a land until
+somebody contested it or refused to land it. Measured case: a delegated
+reader running inside a seat wrote an APPROVE with zero findings that its
+brief never authorized.
+
+    helm dispatch retract <id> --reason "why the verdict was wrong" \
+        --reads source-clean|fix|supersede|unknown --measured|--inferred \
+        [--reissue | --successor ID] [--json]
+
+- **It appends, it does not rewrite.** One `verdict-retract` event goes on
+  the ledger after the verdict. The verdict event, its evidence, its gate and
+  its attestation stay as they were recorded.
+- **The row then reads RETRACTED everywhere authority is read.** The projected
+  polarity becomes `retracted` and the original moves to
+  `retracted_polarity`. Every reader that asks "is this an approve" or "is
+  this a fix" now gets no, so the row authorizes, contests and discharges
+  nothing, and that includes a reader nobody updated. `dispatch list` prints
+  `VERDICT approve / RETRACTED (reads source-clean) by <seat> -> <successor>`.
+  `dispatch triage <id>` prints `not triaged: verdict RETRACTED (was
+  APPROVE) — successor <id>|none`. `lr list`, `lr show` and `/api/lr` show
+  the terminal RETRACTED and carry every `retract_*` field. The land nudge
+  never says READY.
+- **Who may retract.** The verdict's AUTHOR may retract: that is the row's
+  recipient seat, from any session, because the session that erred is usually
+  gone. The INTEGRATOR (the roster's integrator role) and the OWNER (only
+  through his own capability, never a stated name) may also retract. Everybody
+  else is refused, and that includes the row's sender. A sender who disagrees
+  with a review contests it with `dispatch send --supersedes <id>`. The event
+  records which door admitted it (`retract_role`) and whether the retracting
+  session is the session that wrote the verdict (`retract_same_session`).
+- **`--reads` is a claim for the integrator, not a polarity.** `source-clean`
+  means the delta reads clean and the row waits on the land gate. `fix` and
+  `supersede` mean the review should have said that. `unknown` means the
+  verdict was wrong and nobody has read the tip again yet. A retraction must
+  declare `--measured` or `--inferred`; a retraction takes authority away,
+  so an unverified one is not accepted.
+- **`--reissue` mints the successor review in the same motion.** The
+  successor goes to the same recipient, lane, tip and kind and carries
+  `--supersedes <id>`. It inherits the lane author as sender, so it does not
+  read as a self-review by whoever retracted. The successor is written first.
+  If the retraction then fails, helm cancels the successor, so a failed call
+  never leaves a successor that claims an obligation that did not move.
+  `--successor ID` links an existing row instead, and that row must supersede
+  this one. With `--reads source-clean` the output names the next command:
+  `helm dispatch hold <successor> --source-clean <tip> <reason>`.
+- **A retracted row is terminal.** `verdict`, `cancel`, `lr close`, `lr
+  retire` and a second `retract` each refuse it and name the retraction and
+  the successor. An identical retry prints the standing retraction and writes
+  nothing.
+
+### `helm delegate allow --verbs "GROUP VERB[,GROUP VERB...]" [--ttl 30m] [--note TEXT] [--json] | list [--json] | revoke <id>|--all`
+
+**A delegate is not its seat, and only the hook payload can tell (task/3060).**
+A subagent (the Agent tool) or a Workflow agent inherits its seat's whole
+environment, its `HELM_CHAT_NAME` and its session id. So every identity door
+in helm reads the delegate as the seat, and records its ledger writes as the
+seat's own. Measured case: a delegated reader wrote an immutable APPROVE with
+zero findings, the third delegate ledger write beyond a brief that day. Claude
+Code's PreToolUse payload carries `agent_id` inside a subagent or a Workflow
+agent, and not in the main thread. The argv-guard reads that field.
+
+**What a delegate is refused.** The argv-guard refuses a delegate's Bash or
+Monitor call whose text runs one of these verdict-class writes:
+
+- `dispatch verdict`, `dispatch retract`, `dispatch hold`, `dispatch release`,
+  `dispatch cancel`, `dispatch rebind`, `dispatch retip`
+- `lr close` (and its aliases `discharge`, `withdraw`, `close-landed`),
+  `lr land`, `lr abandon`, `lr retire`, `lr expired`
+- `store confirm`, `store supersede`, `store revise`, `store retire`,
+  `store reject`
+- `handoff write`: a delegate that wrote a handoff under its parent's session
+  replaced the parent's continuity file. A delegate's handoff belongs in its
+  final report.
+- `delegate allow` and `delegate revoke`: no grant admits these.
+
+`dispatch send` and `add`, `work claim` and `release`, `chat post` and `dm`,
+and `gate run` stay open to a delegate. A delegated builder can file its own
+review request and run its own gate. The rung refuses a verb the shell RUNS,
+never one written as data. It reads the command the way the beacon rung does
+(the same fold, so a word assembled around an expansion counts), less the data
+the shell reader proves: a grep or rg pattern, a pgrep or ps argument, a
+quoted heredoc body read by `cat`, `tee` or python, a quoted `echo` argument,
+python's `-c` text, a commit message, a post. It asks for one invocation: the
+word `helm`, the group, at most three options, then the verb. A mention the
+reader cannot prove is data is refused like a run: an argument to a program
+it does not know (`awk`, `xargs`, `ssh`), a pipe into a stage that could run
+its input, an unquoted heredoc, python that starts a process, and text the
+reader cannot settle. The delegate can say those words without `helm`, or
+write the file with a tool that is not a shell.
+
+**What writes nothing passes.** A `dispatch` or `lr` verb given no arguments
+prints its usage, and so does one given `-h` or `--help`. An `lr` verb with
+`--dry-run` writes nothing, and neither do `lr expired` and `lr retire
+--off-frontier` without `--apply`. A call whose `HELM_HOME` names a test home
+writes that home's ledger: the assignment stands in the call's OWN prefix
+(`HELM_HOME=/tmp/h helm ...` or `env HELM_HOME=/tmp/h helm ...`), and its
+value is a literal path that resolves to neither the home helm resolves nor
+`~/.helm`. A value that holds another variable or a substitution is not a
+test home. An `export` in an earlier statement never makes one, because the
+guard cannot tell whether the shell kept it (a subshell, a pipeline, a
+background job, `bash -c`, `unset`). An option after `env` in the prefix, or
+`sudo`, voids the assignment, even `env -u OTHER`. These are read
+for each invocation, from the words the shell passes it: a `--dry-run` in a
+quoted reason or on the next line does not count. This rung is the only
+delegate rung; task/1388 built a second one from the same incident, and its
+verbs and these passes are folded into it.
+
+**A Workflow run is never a seat.** Its read is recorded BY the seat as an
+advisory: `helm dispatch verdict <id> <tip> --<polarity> --<basis>
+--reviewer-model M --reviewer-run RUN <evidence>`.
+
+**A grant is for deliberate same-family delegation.** The seat's main thread
+runs `helm delegate allow --verbs "dispatch verdict,lr close"` before it
+delegates. The grant is keyed on the session, which the seat and its delegates
+share. It admits exactly the verbs it names and lasts `--ttl` (default 30m, at
+most 24h). An admitted call runs and says which grant admitted it. A delegate
+cannot mint or revoke a grant, because both verbs are refused to it and no
+grant admits them. `list` prints the session's live grants. `revoke <id>`
+ends one grant and `revoke --all` ends every grant on the session. Grants live
+under `<helm home>/_global/.state/delegate-grants/<session>.json`. An
+unreadable grant file admits nothing.
+
+**What this rung cannot see.** A payload with no `agent_id` is the main
+thread. So a harness that does not send the field, or a home whose hook is not
+installed, admits a delegate's write. The corrective is `helm dispatch
+retract`.
+
 ### `helm lr list [--all] [--json] | show <id> [--json] | stalls [--json] | foldcheck <tip> [--gate gate:TOKEN] [--repo PATH] [--remote R] [--branch B] [--no-fetch] | legacy-completion-hints [--json] | land <id> [--json] | compose <id> [<id>...] [--trunk REF] [--repo PATH] [--bounded-concur] [--dry-run] [--json] | close <id> --reason landed|superseded|withdrawn|out-of-scope|stranded|subsumed|delivered-report|discharged|resolved|carried|chain-proof|expired|endorsement-moot [--evidence LINE] [--artifact-ref REF] [--report-ref CHAT_REF] [--tip FULL_SHA] [--repo PATH] [--trunk REF] [--live | --needs-restart WHAT] [--compose-manifest PATH --compose-gate gate:ID] [--dry-run] [--json] | annotate-delivered-report <id> --artifact-ref REF --report-ref CHAT_REF --evidence LINE [--json] | discharge <id> <full-superseding-tip> <evidence...> [--json] | withdraw <id> <evidence...> [--json] | abandon <id> --reason TEXT [--repo PATH] [--json] | close-landed <id> --trunk REF [--repo PATH] [--json]`
 
 **`--reason endorsement-moot` — the door for an endorsement over work that
@@ -7469,7 +7887,7 @@ that never existed are the same absence, and both read `UNKNOWN`.
 
 ### `helm lr list [--all] [--json] | show <id> [--json] | stalls [--json] | legacy-completion-hints [--json] | land <id> [--json] | compose <id> [<id>...] [--trunk REF] [--repo PATH] [--bounded-concur] [--dry-run] [--json] | close <id> --reason landed|superseded|withdrawn|out-of-scope|stranded|subsumed|delivered-report|discharged|resolved|carried|chain-proof|expired|endorsement-moot [--evidence LINE] [--artifact-ref REF] [--report-ref CHAT_REF] [--tip FULL_SHA] [--repo PATH] [--trunk REF] [--live | --needs-restart WHAT] [--compose-manifest PATH --compose-gate gate:ID] [--dry-run] [--json] | annotate-delivered-report <id> --artifact-ref REF --report-ref CHAT_REF --evidence LINE [--json] | discharge <id> <full-superseding-tip> <evidence...> [--json] | withdraw <id> <evidence...> [--json] | abandon <id> --reason TEXT [--repo PATH] [--json] | close-landed <id> --trunk REF [--repo PATH] [--json]`
 
-**`compose` stands N READY lanes on ONE measured tip** in a detached `<repo>-wt/compose/` room: members compose in caller-given order, each member's patch-id is re-measured across the cherry-pick with one instrument for both sides, and every refusal NAMES the member (conflict, drift, already-landed by patch-identity, partial stack, capped-screen UNPROVABLE). It runs NO suite — the one gate the caller runs on the composed tip is the only per-tree evidence there is (an APPROVE carries on CONTENT; a gate rebinds the TREE). On a red composed gate, localize by PREFIX: re-compose the first K members; the longest green prefix lands and the first red member evicts to its own re-gate. `--dry-run` composes, measures, reports, and removes the room.
+**`compose` stands N LIVE READY lanes on ONE measured tip** in a detached `<repo>-wt/compose/` room. Live READY is READY and not terminal (`landreq.live_ready`, the guard `helm train` puts on its cars): a row closed as landed keeps the stored state READY, so a closed row passed by id is refused by name with its closure instead of reaching the cherry-pick. Then members compose in caller-given order, each member's patch-id is re-measured across the cherry-pick with one instrument for both sides, and every refusal NAMES the member (conflict, drift, already-landed by patch-identity, partial stack, capped-screen UNPROVABLE). It runs NO suite — the one gate the caller runs on the composed tip is the only per-tree evidence there is (an APPROVE carries on CONTENT; a gate rebinds the TREE). On a red composed gate, localize by PREFIX: re-compose the first K members; the longest green prefix lands and the first red member evicts to its own re-gate. `--dry-run` composes, measures, reports, and removes the room. The one gate the caller runs on a composed room goes through `helm gate window launch`: `helm gate run` in a room under `<repo>-wt/compose/` hands itself to that door.
 
 #### Prospective bounded CONCUR exception
 
@@ -7926,6 +8344,15 @@ MISSING proof mode/version, reason, and `land_state=UNKNOWN`. Identical retries
 are idempotent; a different reason and every competing terminal annotation
 refuse. Default list/stalls/board stop billing it, while `show`, `list --all`,
 and the web closed section retain **ABANDONED — LAND STATE UNKNOWN** forever.
+
+**RETRACTED is a terminal too, and it is not a close reason.** A row whose
+verdict was taken back with `helm dispatch retract` (see the dispatch
+section) reads state `RETRACTED`, owed by nobody, never stalled. It is dated
+by the retraction. `list` marks it `RETRACTED (was APPROVE) by @<seat>
+(<role>) — reads <READING> (<basis>)` and names the successor that carries
+the review, and `show` adds the reason. `close`, `retire` and `abandon` each
+refuse it as already retired by `retract`, and `retract` refuses a row that
+another terminal already ended. The list of close reasons is unchanged.
 
 `retire <id> --reason <code> [--note TEXT] [--seat NAME] [--dry-run]` is the
 ADMINISTRATIVE terminal, and the one that claims nothing about the work. It

@@ -94,6 +94,10 @@ class LeaseRecoveryBase(unittest.TestCase):
         # the whole class is actually about.
         from tests._tmphome import pin_dispatch_home
         self._real_home_repo_id = pin_dispatch_home(self, self.root)
+        # THE STOP GUARD READS A RESIDENT'S FACTS; this stands in one that is
+        # exactly up to date at every stop (tests/_stopfacts.py).
+        from tests._stopfacts import always_fresh
+        self.fresh_resident = always_fresh(self)
 
     def tearDown(self):
         for k, v in self.prior.items():
@@ -1053,6 +1057,22 @@ class HandedLeaseOwnershipTest(ActuatorLeaseBase):
         self.assertIn("UNKNOWN", said[0])
         self.assertNotIn("--lease", said[0])
         self.assertNotIn("gatelock:helm", "\n".join(blocks))
+
+
+def setUpModule():
+    """No dispatch row this module writes walks the host's process table
+    (task/3039; see tests._tmphome.pin_live_seats)."""
+    from tests._tmphome import pin_live_seats
+    pin_live_seats()
+
+
+def tearDownModule():
+    """A stop that armed a surviving disclosure and never emitted it leaves
+    the text queued for whatever refuses next in this process, which is
+    another module's stop; drain it the way an interrupted response does
+    (task/3039: the slice runner's data audit named it)."""
+    from helm import seats_stop_seam
+    seats_stop_seam.fallback_lines(())
 
 
 if __name__ == "__main__":

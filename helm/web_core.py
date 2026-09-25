@@ -1165,6 +1165,14 @@ _READY_TTL_S = 30
 # because it reads the real number instead of a copy of it.
 _READY_FILL_S = 0.0
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_READY_FILL_S": (
+        "the last measured fill, a floor under the ready TTL; its arms "
+        "(test_ready) reset it"),
+}
+
 
 
 def _api_ready():

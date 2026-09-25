@@ -7199,6 +7199,20 @@ else:
         import threading
         from helm import resumeturn
         long_text = "a directive long enough to be stored " * 12
+        # THE ABANDONED READ IS WOKEN AND JOINED. The act door abandons a
+        # stalled final read at its deadline and moves on; the read itself
+        # keeps running on its daemon worker. The control's read stalls on a
+        # 3600s horizon, so a plain sleep kept that worker alive for an hour,
+        # into every module that ran after this one in the same process. The
+        # stall is an Event wait: it times out exactly like the sleep inside
+        # the arm, and cleanup sets it and joins what it held.
+        wake, stalled = threading.Event(), []
+
+        def release():
+            wake.set()
+            for worker in stalled:
+                worker.join(5)
+        self.addCleanup(release)
 
         def recover(ttl):
             with mock.patch.object(resumeturn, "injection_ttl_s",
@@ -7215,7 +7229,8 @@ else:
                 if threading.current_thread().name == "helm-act-capture" \
                         and not waited:
                     waited.append(expires - time.time())
-                    time.sleep(max(0.0, expires - time.time()) + 0.05)
+                    stalled.append(threading.current_thread())
+                    wake.wait(max(0.0, expires - time.time()) + 0.05)
                 return None
             ad.on_read = slow_final
             gen = resumeturn._record_injection("codex", SID, "h1", wire,
@@ -9111,6 +9126,143 @@ class TheStatusListingCountsSeatsNotKeysTest(ResumeTurnBase):
         self.assertEqual(self.seat_rows(lines), ["alpha", "codex"], lines)
         self.meta(lines, "(2 seat(s) across 4 record(s))")
 
+
+
+class _HostCLI(object):
+    """ONE metaharness's own CLI, at the subprocess boundary.
+
+    The REAL adapter class builds every argv (its `list`, `read` and `send`
+    are the code under test); this answers in that host's reply shape and
+    records what reached it. A composer that holds what was typed until a
+    bare Enter, then a clean composer: the smallest pane `submit` can prove a
+    turn on."""
+
+    def __init__(self, host):
+        self.host, self.argv, self.typed, self.entered = host, [], None, False
+
+    def frame(self):
+        if self.typed is not None and not self.entered:
+            return "\n".join(("─" * 40, "❯\xa0" + self.typed, "─" * 40,
+                              "  opus-5 | ~/dev/example/repo"))
+        return ADVANCED_PANE
+
+    def __call__(self, args, timeout=60, env=None):
+        args = list(args)
+        self.argv.append(args)
+        if self.host == "orca":
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [{"handle": "h1", "title": "codex",
+                                       "connected": True, "writable": True}]}
+            if args[:2] == ["terminal", "read"]:
+                return {"terminal": {"tail": self.frame().split("\n")}}
+            if args[:2] == ["terminal", "send"]:
+                if "--enter" in args:
+                    self.entered = True
+                else:
+                    self.typed = args[args.index("--text") + 1]
+                return {}
+        if self.host == "herdr":
+            if args[:2] == ["pane", "list"]:
+                return {"panes": [{"pane_id": "h1", "label": "codex",
+                                   "agent_status": "idle"}]}
+            if args[:2] == ["pane", "read"]:
+                return {"read": {"text": self.frame()}}
+            if args[:2] == ["pane", "send-text"]:
+                self.typed = args[3]
+                return {}
+            if args[:2] == ["pane", "run"]:
+                self.entered = True
+                return {}
+        raise AssertionError("no %s CLI verb for %r" % (self.host, args))
+
+
+class TheRearmKeystrokeReachesEveryDeclaredHostTest(ResumeTurnBase):
+    """task/3055, an owner requirement: the re-arm keystroke is a first-class
+    wake, and it must travel helm's METAHARNESS seam, never an orca-only
+    call. For every host `harness.ADAPTERS` declares, the keystroke either
+    completes through that host's own CLI, or is refused by a sentence that
+    NAMES the host.
+
+    The host list is READ from the abstraction, so a host added there gets
+    this arm by construction, and fails it until it is given a CLI shape
+    here."""
+
+    TEXT = None
+
+    def setUp(self):
+        super().setUp()
+        self.TEXT = resumeturn.rearm_text(
+            "codex", "you owe open dispatch work (`helm dispatch owed`)")
+
+    def adapter(self, host):
+        cli = _HostCLI(host)
+        ad = harness.ADAPTERS[host](path="/fake/bin/" + host)
+        ad._run = cli
+        return ad, cli
+
+    def test_a_registered_pane_takes_the_rearm_through_each_hosts_cli(self):  # noqa: VACUOUS_ASSERTION — the first assertion, outside the loop, pins the host list to harness.ADAPTERS, so the loop runs once per declared host and every per-host assertion is reached
+        sends = {"orca": (["terminal", "send"],),
+                 "herdr": (["pane", "send-text"], ["pane", "run"])}
+        self.assertEqual(sorted(sends), sorted(harness.ADAPTERS),
+                         "a declared host has no arm: give it a CLI shape in "
+                         "_HostCLI and its send verbs here")
+        for host in sorted(harness.ADAPTERS):
+            with self.subTest(host=host):
+                self.spawn(harness=host)
+                ad, cli = self.adapter(host)
+                mode, detail = resumeturn.deliver("codex", self.TEXT, SID,
+                                                  adapter=ad)
+                self.assertEqual("resumed", mode, detail)
+                self.assertEqual(self.TEXT, cli.typed)
+                self.assertTrue(cli.entered, "typed and never submitted")
+                used = {tuple(a[:2]) for a in cli.argv}
+                for verb in sends[host]:
+                    self.assertIn(tuple(verb), used,
+                                  "%s's own send verb never ran" % host)
+                self.assertIn("via %s" % host, detail)
+
+    def test_a_registered_pane_whose_host_is_unavailable_names_it(self):
+        """The recorded host, not the one this process happens to see."""
+        self.spawn(harness="herdr")
+        with mock.patch.object(harness, "detect", return_value=None), \
+                mock.patch("shutil.which", return_value=None):
+            mode, detail = resumeturn.deliver("codex", self.TEXT, SID)
+        self.assertNotEqual("resumed", mode)
+        self.assertIn("herdr", detail)
+
+    def test_a_headless_registration_names_its_host(self):
+        self.spawn(harness="headless")
+        why, pids = resumeturn._registered("codex", SID)
+        self.assertIn("headless", why or "")
+        self.assertIsNone(pids)
+
+    def test_an_adopted_pane_is_addressed_only_where_a_resolver_exists(self):
+        """An adopted pane is addressed by the pane key orca stamps and
+        orca's resolver turns into a handle. Under any other host the send is
+        REFUSED, and the refusal names the host it met."""
+        proc = {"pid": 4242, "pane_key": "tab-1:leaf-1"}
+        orca, _cli = self.adapter("orca")
+        with mock.patch.object(orca, "resolve_pane",
+                               return_value={"handle": "h1"}):
+            self.assertEqual(("h1", None), orcaadopt._pane_of(proc, orca))
+        herdr, _cli = self.adapter("herdr")
+        handle, why = orcaadopt._pane_of(proc, herdr)
+        self.assertIsNone(handle)
+        self.assertIn("the herdr metaharness exposes no pane resolver", why)
+        handle, why = orcaadopt._pane_of(proc, None)
+        self.assertIsNone(handle)
+        self.assertIn("metaharness", why)
+        self.assertIn("none detected", why)
+
+    def test_a_pane_with_no_orca_key_names_the_host_it_met(self):
+        herdr, _cli = self.adapter("herdr")
+        handle, why = orcaadopt._pane_of({"pid": 4242}, herdr)
+        self.assertIsNone(handle)
+        self.assertIn("(metaharness: herdr)", why)
+        with mock.patch.object(harness, "detect", return_value=herdr):
+            self.assertEqual("herdr", orcaadopt._detected_host())
+        with mock.patch.object(harness, "detect", return_value=None):
+            self.assertIn("none detected", orcaadopt._detected_host())
 
 if __name__ == "__main__":
     unittest.main()

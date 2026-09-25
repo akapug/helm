@@ -118,9 +118,9 @@ class TestInvite(MeldBase):
         signs = []
         real = chat._signed_row
 
-        def spy(row, text, profile, sign):
+        def spy(row, text, profile, sign, admitted=None):
             signs.append(sign)
-            return real(row, text, profile, sign)
+            return real(row, text, profile, sign, admitted=admitted)
 
         with mock.patch.object(chat, "_signed_row", side_effect=spy):
             room, _ = meld.invite("seat-b", "topic x", seat="seat-a")
@@ -477,6 +477,29 @@ class TestIdentity(MeldBase):
         os.environ["HELM_CHAT_NAME"] = "env-name"
         self.assertEqual(meld._self_seat(), "env-name")     # env WINS now
 
+    def test_self_seat_resolves_a_live_rename_alias_like_whoname(self):
+        """task/3049: a seat renamed while its process ran still carries the
+        OLD name. whoname and the actor layer resolve that live alias to the
+        renamed row; _self_seat read it raw, so the signing gate (which reads
+        through it) saw no seat and let the owner's inherited profile sign.
+        RED before: 'old-name'. Past the window it is a stranger again."""
+        path = seats.roster_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        live = {"new-name": {"home_room": "helm", "renamed": {
+            "old": "old-name", "at": pk.epoch_ts(time.time() - 60),
+            "until": pk.epoch_ts(time.time() + 3600)}}}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(live, f)
+        with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "old-name"}):
+            self.assertEqual(chat.whoname(), "new-name")
+            self.assertEqual(meld._self_seat(), "new-name")
+        live["new-name"]["renamed"]["until"] = pk.epoch_ts(time.time() - 1)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(live, f)
+        os.replace(path + ".tmp", path)   # a new inode, as the roster publishes
+        with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "old-name"}):
+            self.assertEqual(meld._self_seat(), "old-name")
+
     def test_invite_warns_when_peer_untracked(self):
         _room, lines = meld.invite("seat-b", "topic x", seat="seat-a")
         self.assertIn("NOT on the chat roster", "\n".join(lines))
@@ -554,7 +577,10 @@ class TestSelfSeat(MeldBase):
         derive_seat/auto_name handle cwd=None — the verb keeps its
         family-derived auto-name instead of a FileNotFoundError."""
         os.environ["CLAUDE_SESSION_ID"] = "sid-meld-gone-cwd"
-        saved = os.path.dirname(os.path.abspath(__file__))
+        # Back to the cwd this arm FOUND. The tests directory is not it, and
+        # every module that ran after this one in the same process would run
+        # from there.
+        saved = os.getcwd()
         self.addCleanup(os.chdir, saved)
         d = tempfile.mkdtemp(dir=self.tmp)
         os.chdir(d)

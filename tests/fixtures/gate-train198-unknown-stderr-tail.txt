@@ -1,0 +1,88 @@
+gistered pane; pane h1 holds a Helm RETRIEVAL PROMPT for directive adfe590bd0c142a9, and that directive is no longer available -- submitting it would deliver a command whose instruction cannot be fetched. Identity is proven; the payload is not; recovery routing UNKNOWN: synthetic route
+helm seat resume-turn: synthetic registered pane; pane h1 STILL holds the text in its composer after 1 read(s) — typed, never submitted; persistent recovery: synthetic registered pane; pane h1 holds a Helm RETRIEVAL PROMPT for directive adfe590bd0c142a9, and that directive is no longer available -- submitting it would deliver a command whose instruction cannot be fetched. Identity is proven; the payload is not; recovery routing UNKNOWN: synthetic route
+..helm seat resume-turn: recovery claim failed (claim storage unavailable)
+.helm seat resume-turn: held observation reset failed (reset storage temporarily unavailable)
+.........helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+helm seat resume-turn: observation finalization failed (observation finalization storage unavailable)
+....helm seat resume-turn: recovery claim failed (reservation storage unavailable)
+.......................[helm chat] session 33333333 is remembered by 2 seats ('acme-platform-claude', 'other-claude') — resolving to 'acme-platform-claude' by binding age. Repair it: `helm chat seat disown <wrong-seat> 33333333`
+.............helm seat resume-turn: native-auto — PreCompact said trigger=auto 0s ago and the transcript stands where it left it — the harness continues the interrupted turn itself; nothing injected, nothing alerted
+...................................................helm seat resume-turn: injection provenance clear failed (state store unwritable)
+.helm seat resume-turn: injection provenance clear failed (state store unwritable)
+helm seat resume-turn: recovery task close failed (recovery task close failed: task ledger unwritable)
+........helm seat resume-turn: recovery task close failed (recovery task close failed: ledger unwritable)
+................~/.local/share/uv/python/cpython-3.14.6-linux-x86_64-gnu/lib/python3.14/subprocess.py:1139: ResourceWarning: subprocess 1927807 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+....................../scratch/fab-hot/wt/helm-train198-822dcbee/tests/test_resumeturn.py:5911: ResourceWarning: unclosed file <_io.TextIOWrapper name='/scratch/fab-hot/wt/helm-train198-822dcbee/helm/handoff.py' mode='r' encoding='utf-8'>
+  src = open(handoff.__file__, encoding="utf-8").read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+......helm seat resume-turn: recovering an injection recorded by another leg (codex) for episode deaf:codex:33333333-3333-3333-3333-333333333333 — same handle, same text, same generation, so it is provably helm's
+....................helm seat resume-turn: the wall went up mid-settle; recovery routing UNKNOWN: synthetic route
+.................................................................................................................................................................................................................................................................................................................................................................[helm chat] REFUSED a cross-seat presence beat: this process is 'zz-writer', not 'zz-alpha' — presence and delivery are per-PROCESS facts, so a seat may only ever stamp its own row
+[helm chat] REFUSED a cross-seat presence beat: this process is 'zz-writer', not 'zz-beta' — presence and delivery are per-PROCESS facts, so a seat may only ever stamp its own row
+...........................................................................................................................................helm derive: the gate receipt ledger could not be read: receipts.jsonl: unreadable — refusing to publish stages that lean on its absence
+......................................................................................................................................................................................................................................................................................................................................................................................................./scratch/fab-hot/wt/helm-train198-822dcbee/tests/test_scratch.py:2634: ResourceWarning: unclosed file <_io.TextIOWrapper name='/scratch/fab-hot/wt/helm-train198-822dcbee/helm/scratch.py' mode='r' encoding='UTF-8'>
+  os.path.join(PKG, "scratch.py")).read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+........................................................./scratch/fab-hot/wt/helm-train198-822dcbee/tests/test_seat.py:8457: ResourceWarning: unclosed file <_io.TextIOWrapper name='/scratch/fab-hot/wt/helm-train198-822dcbee/helm/seat_catalog.py' mode='r' encoding='utf-8'>
+  catalog = open(c.__file__, encoding="utf-8").read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/scratch/fab-hot/wt/helm-train198-822dcbee/tests/test_seat.py:8459: ResourceWarning: unclosed file <_io.TextIOWrapper name='/scratch/fab-hot/wt/helm-train198-822dcbee/docs/VERBS.md' mode='r' encoding='utf-8'>
+  encoding="utf-8").read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+../scratch/fab-hot/wt/helm-train198-822dcbee/tests/test_seat.py:8078: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/tmp4b4taql3/launch-codex-4-gpt-5.3-codex-spark.sh' mode='r' encoding='UTF-8'>
+  text = open(pinned).read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/scratch/fab-hot/wt/helm-train198-822dcbee/tests/test_seat.py:8091: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/tmp4b4taql3/launch-codex-4-gpt-5.3-codex-spark.sh' mode='r' encoding='UTF-8'>
+  flat = shlex.split(open(pinned).read(), comments=True)
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+....../scratch/fab-hot/wt/helm-train198-822dcbee/tests/test_seat.py:5993: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-deny-ew_3g4s8/settings.json' mode='r' encoding='UTF-8'>
+  deny = json.load(open(os.path.join(d, "settings.json")))["permissions"]["deny"]
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/scratch/fab-hot/wt/helm-train198-822dcbee/tests/test_seat.py:5993: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-deny-e2r1yqp0/settings.json' mode='r' encoding='UTF-8'>
+  deny = json.load(open(os.path.join(d, "settings.json")))["permissions"]["deny"]
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/scratch/fab-hot/wt/helm-train198-822dcbee/tests/test_seat.py:5993: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-deny-56t0fqzv/settings.json' mode='r' encoding='UTF-8'>
+  deny = json.load(open(os.path.join(d, "settings.json")))["permissions"]["deny"]
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.....................................................................helm seat: REFUSED — codex claude dir: SHORTENED contract — 1 required guard(s) NOT installable here (suite-guard); no session was started. Install the guard or pin it, then retry
+helm seat: WARNING — codex claude dir: SHORTENED contract — 1 required guard(s) NOT installed (suite-guard); this is NOT the full hook contract. The seat and its config WERE created. LAUNCH WILL REFUSE until the guard is installed or pinned.
+helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-adi7e0gk/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+........helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-lb056okb/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: codex claude dir wired for full hook contract (add: inject + delivery + handoff + resume + beacon permit)
+helm seat: REFUSED — codex claude dir: SHORTENED contract — 1 required guard(s) NOT installable here (suite-guard); no session was started. Install the guard or pin it, then retry
+.....................................helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-zmhv73gu/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-zmhv73gu/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+..helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-ih2pyxr5/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-ih2pyxr5/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-ih2pyxr5/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+.helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-za9vyp7j/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+............helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-fypwasho/helm-home/_global/seats/codex/instances/codex-97/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: codex-97 claude dir wired for full hook contract (add: inject + delivery + handoff + resume + beacon permit)
+.helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-4sl_6o4r/helm-home/_global/seats/codex/instances/codex-97/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: codex-97 claude dir wired for full hook contract (add: inject + delivery + handoff + resume + beacon permit)
+...helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-zze8t8o_/helm-home/_global/seats/kimi/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: kimi claude dir wired for full hook contract (add: inject + delivery + handoff + resume + beacon permit)
+...............................................helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-td8vpf52/helm-home/_global/seats/ds4pro/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+................helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-1a2cx4f1/helm-home/_global/seats/codex/instances/codex-97/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: codex-97 claude dir wired for full hook contract (add: inject + delivery + handoff + resume + beacon permit)
+.......helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-lc41q_qu/helm-home/_global/seats/kimi/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: kimi claude dir wired for full hook contract (add: inject + delivery + handoff + resume + beacon permit)
+.helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-zgjduq73/helm-home/_global/seats/kimi/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+..helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-vb601yx_/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-vb601yx_/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+.helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-1lbq6c9v/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+helm seat: WARNING — feature cache not seeded for /tmp/helm-gate-scratch-p65r028_/helm-suite-env-tizhe_9i/tmp/helm-test-seat-1lbq6c9v/helm-home/_global/seats/codex/claude; no recent seat has a complete tengu_deferred_stub_tool cache. A launched seat may omit deferred tools including Monitor until Claude refreshes it
+../scratch/fab-hot/wt/helm-train198-822dcbee/helm/seat_launch_owner.py:300: DeprecationWarning: This process (pid=1299936) is multi-threaded, use of fork() may lead to deadlocks in the child.
+  pid = os.fork()

@@ -3,7 +3,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .playwright-mcp/
-.claude/settings.json
+# .claude/: settings.json is tracked on purpose. It holds only the commit and PR
+# attribution settings, which a cloud session on a fresh clone reads from the
+# repository. Everything else in .claude/ (settings.local.json, worktrees, locks)
+# is per-machine and stays out.
+.claude/*
+!.claude/settings.json
 *.png
 .env
 .env.*

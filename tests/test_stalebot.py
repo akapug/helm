@@ -2319,5 +2319,12 @@ class TheIntegratorIsResolvedNotSpelledTest(_CuredSweepHarness):
 
 
 
+def setUpModule():
+    """No dispatch row this module writes walks the host's process table
+    (task/3039; see tests._tmphome.pin_live_seats)."""
+    from tests._tmphome import pin_live_seats
+    pin_live_seats()
+
+
 if __name__ == "__main__":
     unittest.main()

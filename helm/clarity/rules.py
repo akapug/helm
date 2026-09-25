@@ -530,6 +530,15 @@ def _glossed_pattern(token):
 
 _TOKEN_RE_CACHE = {}
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_GLOSSED_RE_CACHE": (
+        "a pattern compiled per token, a pure function of its key"),
+    "_TOKEN_RE_CACHE": (
+        "a pattern compiled per token, a pure function of its key"),
+}
+
 
 def _token_pattern(token, wordlike):
     """Where a register token really occurs.

@@ -717,7 +717,8 @@ BOARD_ROW_FNS = ("age", "ago", "light", "pkey", "lineageN", "lightset", "dmsg",
                  "boardChips", "boardCount", "boardLanes", "boardLaneWord",
                  "boardProgress",
                  "boardRepoBadge", "boardRepos", "boardKanban",
-                 "boardKanbanHTML", "boardWide", "boardDetail",
+                 "boardKanbanHTML", "boardKanbanCount", "boardFoldLine",
+                 "boardWide", "boardWaits", "boardDetail",
                  "boardRowHTML")
 
 

@@ -234,7 +234,8 @@ class TheOrderedRetiredByQuestionTest(unittest.TestCase):
         # THE MUST-HIT: every assertion above is inside the loop, so an empty
         # or shrunken table would satisfy this arm having tested nothing.
         self.assertEqual(seen, ["discharged", "withdrawn",
-                                "closed_by_landing", "abandoned"],
+                                "closed_by_landing", "abandoned",
+                                "verdict_retracted"],
                          "the ordered table is not the one this arm pins")
         # AND THE ORDER ITSELF: a row with EVERY flag set resolves to the
         # first entry on both, which is what "the same ordered question"

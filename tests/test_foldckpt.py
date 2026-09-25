@@ -29,8 +29,7 @@ import unittest
 from unittest import mock
 
 from helm import (dispatches, eventledger, foldckpt, landreq, pk, projscope,
-                  seats_room_advice, seats_stop_budget, seats_stop_guard,
-                  seats_stop_timing, vcs)
+                  vcs)
 import tests.test_lr_close as lrc
 
 _LIVE_SEATS_PATCH = None
@@ -751,6 +750,98 @@ class ThePlan(unittest.TestCase):
             foldckpt.plan(rec)
 
 
+class ThePolicyAsksTheTreeAtMostOncePerSecond(unittest.TestCase):
+    """`policy()` compares the package's files with the ones this process
+    imported at most once per second, and a mismatch is final for the
+    process (task/3039, the design ruling).
+
+    MEASURED BEFORE: every fold read stat-walked about 490 files; the walk
+    ran 6,198 times in tests.test_lr_close and was 16.6% of its profile.
+
+    WHAT THE TTL COSTS, and why it is safe: a long-running process can write
+    one checkpoint under its old digest up to one second after a deploy
+    rewrites the tree. A new process computes a new digest, so it never reads
+    that checkpoint. And once this process has seen the tree differ it never
+    names its code again, which is stricter than the old check: that one
+    answered with the old digest again if the files were put back.
+    """
+
+    def setUp(self):
+        self.clock = [100.0]
+        self.walks = []
+        real = foldckpt._source_stats
+        self.drift = None
+
+        def walk():
+            self.walks.append(self.clock[0])
+            return self.drift if self.drift is not None else real()
+
+        for patch in (mock.patch.object(foldckpt, "_monotonic",
+                                        lambda: self.clock[0]),
+                      mock.patch.object(foldckpt, "_source_stats", walk),
+                      mock.patch.dict(foldckpt._POLICY,
+                                      {"checked": None, "drifted": False})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_a_second_ask_inside_the_second_walks_nothing(self):
+        code = foldckpt.policy()
+        self.assertIsNotNone(code, "control: this process names its code")
+        asked = len(self.walks)
+        self.assertGreater(asked, 0, "control: the first ask compared")
+        self.clock[0] += foldckpt.POLICY_TTL_S / 2
+        self.assertEqual(foldckpt.policy(), code)
+        self.assertEqual(len(self.walks), asked,
+                         "an ask inside the TTL walked the package")
+        self.clock[0] += foldckpt.POLICY_TTL_S
+        self.assertEqual(foldckpt.policy(), code)
+        self.assertEqual(len(self.walks), asked + 1,
+                         "an ask past the TTL did not compare again")
+
+    def test_the_ttl_is_one_second(self):
+        self.assertEqual(foldckpt.POLICY_TTL_S, 1.0)
+
+    def test_a_mismatch_inside_the_second_is_seen_at_its_end(self):
+        """The staleness bound, pinned: a tree that changes just after a
+        compare is answered with the old digest until the TTL runs out, and
+        never after."""
+        code = foldckpt.policy()
+        self.assertIsNotNone(code, "control: this process names its code")
+        self.drift = {"planted.py": (1, 2, 3, 4)}
+        self.clock[0] += 0.75 * foldckpt.POLICY_TTL_S
+        self.assertEqual(foldckpt.policy(), code)
+        self.clock[0] += 0.25 * foldckpt.POLICY_TTL_S
+        self.assertIsNone(foldckpt.policy(),
+                          "the changed tree was not seen once the TTL ran out")
+
+    def test_a_mismatch_is_final_for_the_process(self):  # noqa: VACUOUS_ASSERTION — the walk counter is proven live at the end of this arm: a fresh process state under the same patch must compare
+        self.drift = {"planted.py": (1, 2, 3, 4)}
+        self.assertIsNone(foldckpt.policy(), "control: a changed tree")
+        self.drift = None                      # the files are put back
+        asked = len(self.walks)
+        for _ in range(3):
+            self.clock[0] += 10 * foldckpt.POLICY_TTL_S
+            self.assertIsNone(foldckpt.policy(),
+                              "a process that saw its tree change named "
+                              "its code again")
+        self.assertEqual(len(self.walks), asked,
+                         "a drifted process kept walking the package")
+        with mock.patch.dict(foldckpt._POLICY,
+                             {"checked": None, "drifted": False}):
+            foldckpt.policy()
+        self.assertGreater(len(self.walks), asked,
+                           "control: a fresh process state does compare")
+
+    def test_a_new_process_names_its_code_again(self):
+        """Final is per process: a fresh state compares afresh."""
+        self.drift = {"planted.py": (1, 2, 3, 4)}
+        self.assertIsNone(foldckpt.policy(), "control: a changed tree")
+        self.drift = None
+        with mock.patch.dict(foldckpt._POLICY,
+                             {"checked": None, "drifted": False}):
+            self.assertIsNotNone(foldckpt.policy())
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1385,9 +1476,16 @@ class TheStoreIsAddressedPerLedger(FoldCheckpointBase):
             "which ledger the fold was over")
 
 
-class TheStopGuardRebuildsAMissingCheckpoint(FoldCheckpointBase):
+class ABudgetedReaderRebuildsAMissingCheckpoint(FoldCheckpointBase):
     """task/2949: the Stop guard read every obligation as UNKNOWN because it
     could never rebuild a checkpoint that a deploy had invalidated.
+
+    THE STOP GUARD NO LONGER READS THE LEDGER — the `helm web` resident folds
+    it off every hook path (helm/stopfacts_resident.py) — but the property this
+    class pins is the CHECKPOINT'S: a read under a cooperative deadline that
+    cannot finish banks its progress, and the next read resumes from it. So
+    the arms read under the same 7.5s slice the guard's span had, as any
+    budgeted reader of the ledger does.
 
     MEASURED ON THE LIVE LEDGER (18,924 events, 13.6 MB), through the exact
     function the guard hands to its `dispatch-ledger` span: a checkpoint hit
@@ -1412,6 +1510,11 @@ class TheStopGuardRebuildsAMissingCheckpoint(FoldCheckpointBase):
     ROW_COST_S = 0.006
     # Measured on the live ladder: the rung begins about 0.16s in.
     BEGAN_S = 0.16
+    # The slice the ladder's span read under: its 17.5s budget less the 10.0s
+    # its successors were owed. Kept as this arm's budget because the property
+    # is the checkpoint's, and a number the checkpoint was measured against.
+    SLICE_S = 7.5
+    SLICE_SPENT = "the read's slice was spent; coverage is UNKNOWN"
 
     def world(self, rows=ROWS):
         seed = self.dispatch(ref=self.a, lane="lane/ckpt-guard",
@@ -1432,10 +1535,11 @@ class TheStopGuardRebuildsAMissingCheckpoint(FoldCheckpointBase):
         return seed
 
     def guard_read(self, cost=None):
-        """The guard's own read: `seats_room_advice._ledger_snapshot` under
-        `State.run("dispatch-ledger", ...)`, with the fallback the guard uses,
-        inside an ambient scope of BUDGET_S. The clock moves only when a row
-        is folded."""
+        """One budgeted read: `dispatches.snapshot()` inside a SLICE_S
+        cooperative deadline, answering ({}, SLICE_SPENT) when the slice runs
+        out. The clock moves only when a row is folded. -> (pair, read) where
+        `read.expired` says whether the slice ran out."""
+        import types
         cost = self.ROW_COST_S if cost is None else cost
         clock = [1000.0]
         real = dispatches._new_state
@@ -1444,31 +1548,17 @@ class TheStopGuardRebuildsAMissingCheckpoint(FoldCheckpointBase):
             clock[0] += cost
             return real(row)
 
-        # THE LADDER CAN ARM A REAL WALL-CLOCK TIMER. `State()` starts the
-        # timing trace, whose one-shot flush is a daemon thread that prints to
-        # stderr 12.25 real seconds later. tests/__init__.py switches the
-        # trace off for the suite (HELM_STOP_TIMING_AFTER=off), so no timer is
-        # armed here today. This is the belt for a run that turns it on: the
-        # trace goes to this arm's own buffer, and the arm fails if a timer
-        # outlives the read.
-        self.addCleanup(seats_stop_timing.reset)
+        read = types.SimpleNamespace(expired=False)
         with mock.patch("time.monotonic", side_effect=lambda: clock[0]), \
-                mock.patch.object(dispatches, "_new_state", slow), \
-                contextlib.redirect_stderr(io.StringIO()):
-            try:
-                budget = seats_stop_budget.State()
-                with projscope.scope(
-                        deadline=clock[0] + seats_stop_budget.BUDGET_S):
-                    budget.bind_deadline()
-                    clock[0] += self.BEGAN_S
-                    snap = budget.run(
-                        "dispatch-ledger", seats_room_advice._ledger_snapshot,
-                        fallback=({}, seats_stop_guard.LEDGER_RESERVE_SPENT))
-            finally:
-                seats_stop_timing.settle()
-        self.assertIsNone(seats_stop_timing._STATE.timer,
-                          "the ladder's flush timer outlived this read")
-        return snap, budget
+                mock.patch.object(dispatches, "_new_state", slow):
+            clock[0] += self.BEGAN_S
+            with projscope.scope(deadline=clock[0] + self.SLICE_S):
+                try:
+                    snap = dispatches.snapshot()
+                except projscope.Expired:
+                    snap = ({}, self.SLICE_SPENT)
+                    read.expired = True
+        return snap, read
 
     def banked(self):
         if not os.path.isdir(self.store_dir()) \
@@ -1487,7 +1577,7 @@ class TheStopGuardRebuildsAMissingCheckpoint(FoldCheckpointBase):
             if why is None:
                 break
         # THE FIRST READ IS STILL HONEST: it could not finish, so it says so.
-        self.assertEqual(answers[0], seats_stop_guard.LEDGER_RESERVE_SPENT)
+        self.assertEqual(answers[0], self.SLICE_SPENT)
         self.assertIsNone(
             answers[-1], "the guard never finished the read in %d stops; the "
             "checkpoint it banked moved %r" % (len(answers), banked))
@@ -1506,35 +1596,33 @@ class TheStopGuardRebuildsAMissingCheckpoint(FoldCheckpointBase):
         self.assertEqual(len(owed), self.ROWS + 1)
         self.assertIn(seed["id"], rows)
         # AND THE NEXT STOP RESTORES AND FINISHES AT ONCE.
-        (again, why), budget = self.guard_read()
+        (again, why), read = self.guard_read()
         self.assertIsNone(why)
         self.assertEqual(repr(again), repr(out))
-        self.assertEqual(budget.yielded, set())
+        self.assertFalse(read.expired)
 
     def test_a_read_that_cannot_finish_still_reports_unknown_with_its_reason(self):
         self.world()
         total = len(self.ledger_events())
-        (rows, why), budget = self.guard_read()
-        self.assertEqual((rows, why), ({}, seats_stop_guard.LEDGER_RESERVE_SPENT))
-        self.assertEqual(budget.yielded, {"dispatch-ledger"})
-        self.assertTrue(any("dispatch-ledger=UNFINISHED" in w
-                            for w in budget.warns), budget.warns)
+        (rows, why), read = self.guard_read()
+        self.assertEqual((rows, why), ({}, self.SLICE_SPENT))
+        self.assertTrue(read.expired)
         # PROGRESS WAS BANKED, AND A BANKED PREFIX IS NOT AN ANSWER.
         self.assertTrue(0 < self.banked() < total, self.banked())
         # ONE ROW COSTS MORE THAN THE WHOLE SLICE: the check is cooperative,
         # so the first row finishes late and is banked, and the answer is
         # still the named UNKNOWN.
         shutil.rmtree(self.store_dir())
-        (rows, why), budget = self.guard_read(cost=8.0)
-        self.assertEqual((rows, why), ({}, seats_stop_guard.LEDGER_RESERVE_SPENT))
-        self.assertEqual(budget.yielded, {"dispatch-ledger"})
+        (rows, why), read = self.guard_read(cost=8.0)
+        self.assertEqual((rows, why), ({}, self.SLICE_SPENT))
+        self.assertTrue(read.expired)
         self.assertEqual(self.banked(), 1)
 
     def test_a_banked_prefix_resumes_exactly_and_a_stale_one_is_replayed(self):  # noqa: VACUOUS_ASSERTION — the positives are the byte-for-byte equality with a full replay on every read and the road each read took
         self.world()
         total = len(self.ledger_events())
-        (_rows, why), _budget = self.guard_read()
-        self.assertEqual(why, seats_stop_guard.LEDGER_RESERVE_SPENT)
+        (_rows, why), _read = self.guard_read()
+        self.assertEqual(why, self.SLICE_SPENT)
         k = self.banked()
         self.assertTrue(0 < k < total, k)
         # RESUMED: an unbudgeted read restores at K and answers the full
@@ -1578,8 +1666,8 @@ class TheCheckpointOnlyGrows(FoldCheckpointBase):
     never keep a longer checkpoint that no reader can use."""
 
     ROWS = 600
-    world = TheStopGuardRebuildsAMissingCheckpoint.world
-    banked = TheStopGuardRebuildsAMissingCheckpoint.banked
+    world = ABudgetedReaderRebuildsAMissingCheckpoint.world
+    banked = ABudgetedReaderRebuildsAMissingCheckpoint.banked
 
     def prefix_save(self, k):
         """(save, k): a save of the fold of the first `k` events, keyed on the
@@ -1657,8 +1745,8 @@ class TwoWritersContendForOneLock(FoldCheckpointBase):
     every refused lock attempt and the entry and exit of every write."""
 
     ROWS = 600
-    world = TheStopGuardRebuildsAMissingCheckpoint.world
-    banked = TheStopGuardRebuildsAMissingCheckpoint.banked
+    world = ABudgetedReaderRebuildsAMissingCheckpoint.world
+    banked = ABudgetedReaderRebuildsAMissingCheckpoint.banked
     prefix_save = TheCheckpointOnlyGrows.prefix_save
 
     def instrument(self, holder, waiter):
@@ -1822,3 +1910,36 @@ class TwoWritersContendForOneLock(FoldCheckpointBase):
         close()
         self.assertTrue(whole())
         self.assertEqual(self.banked(), total)
+
+
+class CredentialConfigIsNotGitsView(FoldCheckpointBase):
+    """An Orca seat and a plain seat share one checkpoint file per code
+    version, so a fingerprint that differs between them makes each judge the
+    other's checkpoint stale and replace it with a cold fold of its own."""
+
+    #: What Orca exports into every seat it launches (read off a live seat's
+    #: environment): two credential entries, which `git config --list` reports.
+    ORCA = {"GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "credential.interactive",
+            "GIT_CONFIG_VALUE_0": "never",
+            "GIT_CONFIG_KEY_1": "credential.guiPrompt",
+            "GIT_CONFIG_VALUE_1": "false"}
+
+    def test_an_orca_seat_restores_a_plain_seats_checkpoint(self):  # noqa: VACUOUS_ASSERTION — the fingerprints are asserted equal and the Orca read to restore, then a CONTROL config set the same way is asserted to change the fingerprint
+        self.carried()
+        self.settle()
+        cwds = sorted(self.header()["git"])
+        self.assertTrue(cwds, "the fold read no git, so no fingerprint is "
+                              "under test")
+        plain, _facts = foldckpt.fingerprint(cwds[0], {})
+        with mock.patch.dict(os.environ, self.ORCA):
+            orca, _facts = foldckpt.fingerprint(cwds[0], {})
+            roads, _out = self.assert_equivalent()
+        self.assertEqual(orca, plain, "credential config changed git's view")
+        self.assert_restored(roads)
+        # THE CONTROL, set through the same channel: a config git's merge
+        # machinery reads is still part of the key.
+        with mock.patch.dict(os.environ, {
+                "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "merge.renames",
+                "GIT_CONFIG_VALUE_0": "false"}):
+            self.assertNotEqual(foldckpt.fingerprint(cwds[0], {})[0], plain)

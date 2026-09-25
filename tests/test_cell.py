@@ -879,9 +879,11 @@ class SigningIdentityTest(CellBase):
 
     def test_an_ADOPTED_seat_with_an_AMBIENT_OWNER_profile_REFUSES(self):
         """Population 2 — THE P0. The process can prove it is helm-claude-2 and
-        the environment names the OWNER. Signing as him attributes the row to a
-        person who did not write it; signing as helm-claude-2 is impossible
-        without that seat's key. So it refuses, and the reason names BOTH."""
+        the environment names someone else. Signing as them attributes the row
+        to a person who did not write it, so it refuses, and the reason names
+        BOTH. (task/3049: `owner-profile` is NOT an owner name in this fixture
+        and nothing here admits the seat, so this stays a refusal; an ADMITTED
+        seat under a real owner name signs as itself — OwnerExportSignsAsTheSeatTest.)"""
         os.environ["HELM_CELL_PROFILE"] = "owner-profile"
         a, b = self._as("helm-claude-2", self.ACTOR)
         with a, b:
@@ -999,6 +1001,298 @@ class SigningIdentityTest(CellBase):
             profile, refusal = cell.signing_identity()
         self.assertEqual(profile, "owner-profile")
         self.assertIsNone(refusal)
+
+
+SID = "sid-seat-a-0000-0001"
+OTHER_SID = "sid-seat-b-0000-0002"
+SESSION_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID",
+                "CODEX_SESSION_ID")
+WORLD_VARS = SESSION_VARS + (
+    "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
+    "HELM_ACTORS", "MELD_ACTORS", "HELM_CHAT_OWNER_NAMES",
+    "MELD_CHAT_OWNER_NAMES") + cell.PROFILE_ENV
+
+
+def _actor_row(sid=SID, sessions=None, **extra):
+    row = {"session": sid, "sessions": list(sessions or [sid]),
+           "home_room": "helm"}
+    row.update(extra)
+    return row
+
+
+class OwnerExportWorld(CellBase):
+    """A REAL roster file and a real actor store under this test's HELM_HOME,
+    never a mocked `_self_seat`: the rule is only as good as the two readings
+    it composes (`seat_reading` and the actor layer), so the arms drive both
+    for real. `OWNER` is an owner name because HELM_CHAT_OWNER_NAMES says so,
+    never because of whoever runs the suite."""
+
+    OWNER = "owner-profile"
+
+    @contextlib.contextmanager
+    def _world(self, rows, name=None, sid=None, ambient=OWNER, owners=None):
+        import json
+        from helm import seats
+        with mock.patch.dict(os.environ):
+            for k in WORLD_VARS:
+                os.environ.pop(k, None)
+            os.environ["HELM_CHAT_OWNER_NAMES"] = owners or self.OWNER
+            path = seats.roster_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(rows, f)
+            if name:
+                os.environ["HELM_CHAT_NAME"] = name
+            if sid:
+                os.environ["CLAUDE_CODE_SESSION_ID"] = sid
+            if ambient:
+                os.environ["HELM_CELL_PROFILE"] = ambient
+            yield
+
+    def _store(self):
+        from helm import actors
+        return actors.store_path()
+
+
+class OwnerExportSignsAsTheSeatTest(OwnerExportWorld):
+    """task/3049. A seat started outside `helm launch` inherits the owner's
+    profile from his shell (his rc exports it on purpose, for the premises he
+    states). The gate refused it — 29 of 300 live rows DEGRADED — on the
+    premise that a seat cannot sign without its own key, which is false: the
+    signing leg's `join` mints the seat's key. Now an ADMITTED seat signs as
+    itself; every other refusal stands, and nothing new can sign as the
+    owner."""
+
+    def test_an_admitted_DECLARED_seat_under_the_owners_profile_signs_as_ITSELF(self):  # noqa: VACUOUS_ASSERTION — the swap is asserted positively by assertEqual; the store absence is the no-write pin, and test_an_admission_for_ANOTHER_seat_cannot_swap writes that same store path unconditionally through resolve_actor
+        """THE FIX: HELM_CHAT_NAME, the session bound to that row, a fleet
+        actor, the owner's inherited profile. RED before: identity_conflict."""
+        with self._world({"seat-a": _actor_row()}, name="seat-a", sid=SID):
+            self.assertEqual(cell.signing_identity(), ("seat-a", None))
+            self.assertFalse(os.path.exists(self._store()),
+                             "the signing gate wrote the actor store")
+
+    def test_a_ROSTERED_seat_with_NO_declared_name_signs_as_ITSELF(self):
+        """No HELM_CHAT_NAME: the SessionStart join named the session and made
+        it an actor (an Orca seat, or the owner's own ad-hoc session in a
+        project cwd — both are auto-named actor rows). Its rows already carry
+        that name in `from`, so the signer agrees with the author."""
+        with self._world({"seat-under-test": _actor_row()}, sid=SID):
+            self.assertEqual(cell.signing_identity(), ("seat-under-test", None))
+
+    def test_a_HISTORY_bound_session_signs_as_its_seat(self):
+        """The session sits in the row's `sessions` history while its current
+        session is another one — an older incarnation. Every act door admits
+        this shape as the seat's lineage, so signing does too."""
+        rows = {"seat-a": _actor_row(sid=OTHER_SID, sessions=[SID, OTHER_SID])}
+        with self._world(rows, name="seat-a", sid=SID):
+            self.assertEqual(cell.signing_identity(), ("seat-a", None))
+
+    def test_a_FOREIGN_seat_profile_stays_REFUSED_for_an_admitted_seat(self):
+        """Control for the swap, same admitted process: a profile naming
+        ANOTHER SEAT is the pane-contagion shape and stays loud."""
+        rows = {"seat-a": _actor_row(), "seat-b": _actor_row(sid=OTHER_SID)}
+        with self._world(rows, name="seat-a", sid=SID, ambient="seat-b"):
+            profile, refusal = cell.signing_identity()
+        self.assertIsNone(profile)
+        self.assertIn("identity conflict", refusal)
+        self.assertIn("'seat-a'", refusal)
+        self.assertIn("'seat-b'", refusal)
+
+    def test_a_seat_NAMED_like_the_owner_is_never_swapped(self):
+        """The swap may never land on an owner name, even for an admitted
+        seat: that would be a new owner signature."""
+        with self._world({"owner-seat": _actor_row()}, name="owner-seat",
+                         sid=SID, owners="owner-profile,owner-seat"):
+            profile, refusal = cell.signing_identity()
+        self.assertIsNone(profile)
+        self.assertIn("identity conflict", refusal)
+
+    def test_an_UNCORROBORATED_seat_is_REFUSED_and_says_why(self):
+        """A declared name with no session to check it against is a value any
+        process can export. The refusal now names why the owner's profile was
+        not set aside."""
+        with self._world({"seat-a": _actor_row()}, name="seat-a"):
+            profile, refusal = cell.signing_identity()
+        self.assertIsNone(profile)
+        self.assertIn("set aside", refusal)
+        self.assertIn("corroborates", refusal)
+
+    def test_a_DISPUTED_seat_is_REFUSED_and_says_why(self):
+        """TAKEOVER: this process declares seat-a while its session is bound
+        to seat-b. The actor layer refuses; so does the swap."""
+        rows = {"seat-a": _actor_row(sid=OTHER_SID),
+                "seat-b": _actor_row(sid=SID)}
+        with self._world(rows, name="seat-a", sid=SID):
+            profile, refusal = cell.signing_identity()
+        self.assertIsNone(profile)
+        self.assertIn("set aside", refusal)
+        self.assertIn("disputed", refusal)
+
+    def test_a_FIRST_admission_refusal_surfaces_as_a_conflict_with_its_reason(self):
+        """A split identity configuration (or a pending rename) refuses a first
+        Actor admission; the gate reports it rather than signing."""
+        with self._world({"seat-a": _actor_row()}, name="seat-a", sid=SID), \
+                mock.patch("helm.actors._split_configuration_refusal",
+                           return_value="split identity configuration probe"):
+            profile, refusal = cell.signing_identity()
+        self.assertIsNone(profile)
+        self.assertIn("split identity configuration probe", refusal)
+
+    def test_an_admission_for_ANOTHER_seat_cannot_swap(self):
+        """A capability the caller hands down is the identity layer's answer
+        only for the seat it names. One minted for seat-b cannot swap seat-a,
+        and one minted for seat-a swaps with no second admission."""
+        from helm import actors
+        rows = {"seat-a": _actor_row(), "seat-b": _actor_row(sid=OTHER_SID)}
+        with self._world(rows, name="seat-b", sid=OTHER_SID):
+            other, err = actors.resolve_actor(OTHER_SID)
+        self.assertIsNone(err)
+        with self._world(rows, name="seat-a", sid=SID):
+            own, err = actors.resolve_actor(SID)
+            self.assertIsNone(err)
+            with mock.patch("helm.actors.admitted_name",
+                            side_effect=AssertionError("re-ran admission")):
+                self.assertEqual(cell.signing_identity(admitted=own),
+                                 ("seat-a", None))
+                profile, refusal = cell.signing_identity(admitted=other)
+        self.assertIsNone(profile)
+        self.assertIn("not 'seat-a'", refusal)
+
+    def test_a_READER_that_does_not_admit_consults_nothing(self):
+        """`admit=False` (a fleet status panel discards the refusal anyway)
+        never reaches the actor layer."""
+        with self._world({"seat-a": _actor_row()}, name="seat-a", sid=SID), \
+                mock.patch("helm.actors.admitted_name",
+                           side_effect=AssertionError("consulted")):
+            profile, refusal = cell.signing_identity(admit=False)
+        self.assertIsNone(profile)
+        self.assertIn("identity conflict", refusal)
+
+    def test_owner_premises_are_still_labelled_as_the_owner(self):  # noqa: VACUOUS_ASSERTION — both observables are asserted positively by assertEqual on non-empty values (the owner label and the swapped seat)
+        """Premise attestation never passes this gate: its `attest_by` label is
+        the raw profile, so an owner-export seat capturing a premise for him
+        still records the owner."""
+        from helm import premise
+        with self._world({"seat-a": _actor_row()}, name="seat-a", sid=SID):
+            self.assertEqual(premise.attest_profile(), self.OWNER)
+            self.assertEqual(cell.signing_identity(), ("seat-a", None))
+
+
+class RenameAliasSigningTest(OwnerExportWorld):
+    """task/3049 meld change 1, MEASURED on the live roster: a process spelling
+    a seat by its live rename alias read as "no seat" (the raw name is no
+    roster key), so the owner's inherited profile stood and the rows went out
+    SIGNED BY THE OWNER with `from` naming the renamed seat — silently."""
+
+    def _renamed(self, until):
+        return {"seat-new": _actor_row(renamed={
+            "old": "seat-old", "at": pk_ts(time.time() - 60),
+            "until": pk_ts(until)})}
+
+    def test_a_live_ALIAS_under_the_owners_profile_signs_as_the_NEW_name(self):
+        """RED before: ('owner-profile', None)."""
+        with self._world(self._renamed(time.time() + 3600),
+                         name="seat-old", sid=SID):
+            self.assertEqual(cell.seat_reading(), ("seat-new", ""))
+            self.assertEqual(cell.signing_identity(), ("seat-new", None))
+
+    def test_an_EXPIRED_alias_under_the_owners_profile_is_REFUSED(self):
+        """Past the window the old name is a stranger again, and the session is
+        still bound to the renamed seat: the owner's profile must not stand.
+        RED before: ('owner-profile', None)."""
+        with self._world(self._renamed(time.time() - 60),
+                         name="seat-old", sid=SID):
+            self.assertEqual(cell.seat_reading(), ("", ""))
+            profile, refusal = cell.signing_identity()
+        self.assertIsNone(profile)
+        self.assertIn("stale or expired", refusal)
+        self.assertIn("seat-new", refusal)
+
+    def test_the_seats_OWN_old_name_as_profile_still_signs_in_the_window(self):
+        """Control: a seat launched as seat-old (profile seat-old) and renamed
+        keeps signing with its own key through the window, as it did before
+        the alias became readable — the same actor, not a conflict."""
+        with self._world(self._renamed(time.time() + 3600),
+                         name="seat-old", sid=SID, ambient="seat-old"):
+            self.assertEqual(cell.signing_identity(), ("seat-old", None))
+
+    def test_the_owners_own_terminal_still_signs_as_the_owner(self):
+        """Control: no name, no session — not a seat, so the owner stands."""
+        with self._world(self._renamed(time.time() - 60)):
+            self.assertEqual(cell.signing_identity(), (self.OWNER, None))
+
+
+def pk_ts(epoch):
+    from helm import pk
+    return pk.epoch_ts(epoch)
+
+
+class CellPassthroughIdentityTest(OwnerExportWorld):
+    """task/3049 meld change 5: `helm cell send` with no `--profile` let the
+    signer read DREGG_PROFILE, which `build_env` mapped from the owner's
+    inherited HELM_CELL_PROFILE — the one door that signed as the owner with no
+    refusal anywhere."""
+
+    STUB = ("#!/bin/sh\n"
+            'echo "argv:$@" >> "$STUB_LOG"\n'
+            'echo "DREGG_PROFILE=$DREGG_PROFILE" >> "$STUB_LOG"\n'
+            "exit 0\n")
+
+    def _stub(self):
+        path = os.path.join(self.tmp, "cellbin-stub")
+        with open(path, "w") as f:
+            f.write(self.STUB)
+        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+        os.environ["HELM_CELL_BIN"] = path
+        # the world restores os.environ on exit, so the log path is kept here
+        self.log_path = os.environ["STUB_LOG"] = os.path.join(self.tmp,
+                                                              "stub.log")
+
+    def _log(self):
+        try:
+            with open(self.log_path) as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
+
+    def tearDown(self):
+        os.environ.pop("STUB_LOG", None)
+        super().tearDown()
+
+    def test_a_bare_send_from_an_owner_export_seat_signs_as_the_SEAT(self):
+        """RED before: the stub saw DREGG_PROFILE=owner-profile."""
+        with self._world({"seat-a": _actor_row()}, name="seat-a", sid=SID):
+            self._stub()
+            rc, _out, _err = self.run_cli(["send", "--to", CELL_HEX, "x"])
+        self.assertEqual(rc, 0)
+        self.assertIn("DREGG_PROFILE=seat-a", self._log())
+
+    def test_a_bare_send_the_gate_refuses_is_REFUSED_not_signed_as_the_owner(self):  # noqa: VACUOUS_ASSERTION — the empty stub log is the refusal; test_a_bare_send_from_an_owner_export_seat_signs_as_the_SEAT writes that same log unconditionally on the same fixture
+        """RED before: rc 0 and the signer ran as the owner."""
+        with self._world({"seat-a": _actor_row()}, name="seat-a"):
+            self._stub()
+            rc, _out, err = self.run_cli(["send", "--to", CELL_HEX, "x"])
+        self.assertEqual(rc, 1)
+        self.assertIn("refusing to send as the owner's profile", err)
+        self.assertEqual(self._log(), "", "the signer was started anyway")
+
+    def test_an_explicit_profile_in_argv_passes_through_untouched(self):
+        """Control: `--profile` is stated intent; the signer reads it over the
+        env, and helm does not second-guess it."""
+        with self._world({"seat-a": _actor_row()}, name="seat-a"):
+            self._stub()
+            rc, _out, _err = self.run_cli(["send", "--profile", "kimi",
+                                           "--to", CELL_HEX, "x"])
+        self.assertEqual(rc, 0)
+        self.assertIn("argv:send --profile kimi", self._log())
+
+    def test_the_owners_own_terminal_passes_through_as_the_owner(self):
+        """Control: no seat context, so the owner's profile is his own."""
+        with self._world({"seat-a": _actor_row()}):
+            self._stub()
+            rc, _out, _err = self.run_cli(["send", "--to", CELL_HEX, "x"])
+        self.assertEqual(rc, 0)
+        self.assertIn("DREGG_PROFILE=%s" % self.OWNER, self._log())
 
 
 class A2ATransportTest(CellBase):

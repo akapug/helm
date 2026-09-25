@@ -27,6 +27,8 @@ with `del os.environ[...]`, or named in a dict passed to mock.patch.dict.
 """
 import ast
 import os
+import shutil
+import tempfile
 import unittest
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -261,23 +263,129 @@ def reentrant_setups(tree):
     return sorted(hits)
 
 
-class EnvHygieneTest(unittest.TestCase):
-    def _scan(self):
-        """[(rel, {key: line})] for every test module that leaks."""
-        leaks, scanned = [], 0
+def _dotted(node):
+    """'a.b.c' for a Name/Attribute chain, None for anything computed."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        head = _dotted(node.value)
+        return head + "." + node.attr if head else None
+    return None
+
+
+def plants_live_seats(fn):
+    """Does this function stand `proxywatch._live_seats` in?
+
+    Three spellings do: `pin_live_seats(...)` (the shared door in
+    tests/_tmphome.py), `patch.object(<...>proxywatch, "_live_seats", ...)`
+    and `patch("<...>proxywatch._live_seats", ...)`. A patch of another
+    module's `_live_seats` (seats_work_offer has one) is not this census."""
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        name = (_dotted(node.func) or "").rpartition(".")[2]
+        if name == "pin_live_seats":
+            return True
+        if name == "object" and len(node.args) >= 2 \
+                and (_dotted(node.args[0]) or "").rpartition(".")[2] \
+                == "proxywatch" and _literal(node.args[1]) == "_live_seats":
+            return True
+        if name == "patch" and node.args and (
+                _literal(node.args[0]) or "").endswith("proxywatch._live_seats"):
+            return True
+    return False
+
+
+_WRITERS = ("add", "send")
+_SETUPS = ("setUp", "setUpClass", "asyncSetUp")
+
+
+def live_seat_facts(tree):
+    """What the live-seat census needs from one module, and nothing else.
+
+    `writes`: the module calls `dispatches.add` or `dispatches.send` itself,
+    under any name it bound helm.dispatches to. `module_plant`: its
+    setUpModule stands the census in. `classes`: {name: (base expressions,
+    its own setUp plants, it defines a test)}. `imports`: {local name:
+    (tests module, name or None for the module itself)}."""
+    aliases, imports, receivers = {"helm.dispatches"}, {}, set()
+    for node in ast.walk(tree):                  # ONE walk: the census cost
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in _WRITERS:
+            receivers.add(_dotted(node.func.value))
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if node.level == 0 and mod == "helm":
+                aliases |= {a.asname or a.name for a in node.names
+                            if a.name == "dispatches"}
+            if (node.level, mod) in ((0, "tests"), (1, "")):
+                # `from tests import test_x` binds the MODULE
+                imports.update({a.asname or a.name: (a.name, None)
+                                for a in node.names})
+                continue
+            if node.level == 0 and mod.startswith("tests."):
+                mod = mod.split(".", 1)[1]
+            elif node.level != 1:
+                continue
+            imports.update({a.asname or a.name: (mod, a.name)
+                            for a in node.names})
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "helm.dispatches" and a.asname:
+                    aliases.add(a.asname)
+                if a.name.startswith("tests.") and a.asname:
+                    imports[a.asname] = (a.name.split(".", 1)[1], None)
+    writes = bool(receivers & aliases)
+    classes, module_plant = {}, False
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "setUpModule":
+            module_plant = plants_live_seats(node)
+        if isinstance(node, ast.ClassDef):
+            methods = [m for m in node.body
+                       if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            classes[node.name] = (
+                tuple(_dotted(b) for b in node.bases),
+                any(m.name in _SETUPS and plants_live_seats(m) for m in methods),
+                any(m.name.startswith("test") for m in methods))
+    return {"writes": writes, "module_plant": module_plant,
+            "classes": classes, "imports": imports}
+
+
+_SUITE = []
+
+
+def suite_census():
+    """[(rel, facts)] for every tests/*.py, each file parsed ONCE per process.
+
+    Every census arm in this module reads the same files, and the parse was
+    the cost: 12.9 s of the module's 12.9 s, two full parses of 27 MB of
+    tests plus `restorations(tree)` re-walked once per assigned key inside
+    the filter below (896 whole-tree walks where 208 suffice; task/3039).
+    Only the FACTS are kept: the trees of 459 files would hold about a
+    gigabyte for the rest of the process."""
+    if not _SUITE:
         for name in sorted(os.listdir(_TESTS)):
             if not name.endswith(".py"):
                 continue
             rel = "tests/" + name
             with open(os.path.join(_TESTS, name), encoding="utf-8") as f:
                 tree = ast.parse(f.read(), filename=rel)
-            scanned += 1
-            missing = {k: ln for k, ln in assignments(tree).items()
-                       if k not in restorations(tree)
-                       and k not in INTENTIONAL_GLOBAL.get(rel, ())}
-            if missing:
-                leaks.append((rel, missing))
-        return leaks, scanned
+            restored = restorations(tree)
+            _SUITE.append((rel, {
+                "leaks": {k: ln for k, ln in assignments(tree).items()
+                          if k not in restored
+                          and k not in INTENTIONAL_GLOBAL.get(rel, ())},
+                "reentry": reentrant_setups(tree),
+                "live_seats": live_seat_facts(tree)}))
+    return _SUITE
+
+
+class EnvHygieneTest(unittest.TestCase):
+    def _scan(self):
+        """[(rel, {key: line})] for every test module that leaks."""
+        census = suite_census()
+        return ([(rel, facts["leaks"]) for rel, facts in census
+                 if facts["leaks"]], len(census))
 
     def test_every_test_module_restores_the_env_vars_it_sets(self):
         leaks, scanned = self._scan()
@@ -422,16 +530,10 @@ class ReentrantSetUpTest(unittest.TestCase):
     """
 
     def test_no_test_runs_its_own_setUp_over_a_live_fixture(self):  # noqa: VACUOUS_ASSERTION — the scanned floor proves the walk reached the suite, and the planted-reentry arm below proves reentrant_setups reports on this parser path; this arm is the census they license
-        hits, scanned = [], 0
-        for name in sorted(os.listdir(_TESTS)):
-            if not name.endswith(".py"):
-                continue
-            rel = "tests/" + name
-            with open(os.path.join(_TESTS, name), encoding="utf-8") as f:
-                tree = ast.parse(f.read(), filename=rel)
-            scanned += 1
-            hits += ["%s:%d in %s()" % (rel, line, fn)
-                     for line, fn in reentrant_setups(tree)]
+        census = suite_census()
+        scanned = len(census)
+        hits = ["%s:%d in %s()" % (rel, line, fn)
+                for rel, facts in census for line, fn in facts["reentry"]]
         self.assertGreater(scanned, 100,
                            "the scan must actually reach the suite -- a walk "
                            "that finds nothing proves nothing")
@@ -494,6 +596,232 @@ class ReentrantSetUpTest(unittest.TestCase):
                     "        super().setUp()\n"))):
             with self.subTest(shape=why):
                 self.assertEqual(reentrant_setups(src), [])
+
+
+def _resolve(census, module, dotted, seen=frozenset()):
+    """(module, class) that a base expression in `module` names, or None
+    when it is not a class defined under tests/ (unittest.TestCase, say)."""
+    facts = census.get(module)
+    if facts is None or not dotted or (module, dotted) in seen:
+        return None
+    if dotted in facts["classes"]:
+        return module, dotted
+    seen = seen | {(module, dotted)}
+    head, _, rest = dotted.partition(".")
+    if head == "tests" and rest:                 # `import tests.test_x`
+        owner, _, name = rest.partition(".")
+        return _resolve(census, owner, name, seen)
+    bound = facts["imports"].get(head)
+    if bound is None:
+        return None
+    owner, name = bound
+    if name is None:                             # a module: `test_x.Base`
+        return _resolve(census, owner, rest, seen)
+    return None if rest else _resolve(census, owner, name, seen)
+
+
+def _inherits(census, module, cls, field, seen=frozenset()):
+    """Does `cls` or any base it names under tests/ carry `field`
+    (1: its setUp plants the stand-in, 2: it defines a test)?"""
+    if (module, cls) in seen:
+        return False
+    row = census[module]["classes"][cls]
+    if row[field]:
+        return True
+    seen = seen | {(module, cls)}
+    return any(_inherits(census, hit[0], hit[1], field, seen)
+               for hit in (_resolve(census, module, b) for b in row[0])
+               if hit)
+
+
+def unplanted_writers(census):
+    """{module: [test classes]} for every module that writes a dispatch row
+    and runs a test class without the live-seat stand-in.
+
+    `census` is {module name: live_seat_facts}. A module is clean when its
+    setUpModule plants, or when every class that runs tests plants in its
+    own setUp or inherits a base that does."""
+    out = {}
+    for module, facts in sorted(census.items()):
+        if not facts["writes"] or facts["module_plant"]:
+            continue
+        bare = sorted(cls for cls in facts["classes"]
+                      if _inherits(census, module, cls, 2)
+                      and not _inherits(census, module, cls, 1))
+        if bare:
+            out[module] = bare
+    return out
+
+
+class LiveSeatStandInCensusTest(unittest.TestCase):
+    """Every module that writes a dispatch row runs under the live-seat
+    stand-in (task/3039).
+
+    THE COST. `dispatches.add` and `dispatches.send` ask
+    `_validate_recipient_usable`, which walks the whole process table through
+    `proxywatch._live_seats` once per row: about 870 processes on a build
+    node, and more on a busy one. 22 of the 31 modules that write rows did not
+    stand it in, so each paid the walk on every row and its answer depended
+    on what else ran on the box. `tests._tmphome.pin_live_seats` stands in a
+    MEASURED EMPTY fleet, which is what a build node answers anyway.
+
+    THE CENSUS KEYS ON THE WRITERS, not on every importer of
+    helm.dispatches. 88 modules import it; the walk is paid only where a row
+    is written, and some importers exist to measure the real census (the
+    proxywatch suite drives `_live_seats` over synthetic /proc rows). A module
+    that reaches the writers only through an imported fixture helper takes
+    that fixture's plant: LandReqBase and DispatchBase both call
+    `pin_live_seats`.
+    """
+
+    def _census(self):
+        return {rel[len("tests/"):-len(".py")]: facts["live_seats"]
+                for rel, facts in suite_census()}
+
+    def test_every_row_writing_module_plants_the_stand_in(self):  # noqa: VACUOUS_ASSERTION — the writer floor proves the census read the suite, and the planted-writer arm below proves unplanted_writers reports on this path
+        census = self._census()
+        writers = sorted(m for m, f in census.items() if f["writes"])
+        self.assertGreater(len(writers), 20,
+                           "control: the census must find the row writers")
+        bare = unplanted_writers(census)
+        self.assertEqual(bare, {}, "\n".join(
+            "%s writes dispatch rows and runs %s without the live-seat "
+            "stand-in: call tests._tmphome.pin_live_seats() from setUpModule "
+            "(or pin_live_seats(self) in the class's setUp)"
+            % (module, ", ".join(classes)) for module, classes in bare.items()))
+
+    @staticmethod
+    def _facts(**modules):
+        return {name: live_seat_facts(ast.parse(src))
+                for name, src in modules.items()}
+
+    def test_the_census_SEES_a_writer_without_the_stand_in(self):
+        """The control, then each way of being clean, then the look-alike
+        that is not a plant."""
+        writer = ("from helm import dispatches as d\n"
+                  "class T(unittest.TestCase):\n"
+                  "    def test_x(self):\n"
+                  "        d.add('seat', 'one')\n")
+        self.assertEqual(unplanted_writers(self._facts(test_w=writer)),
+                         {"test_w": ["T"]})
+        module = writer + ("def setUpModule():\n"
+                           "    pin_live_seats()\n")
+        self.assertEqual(unplanted_writers(self._facts(test_w=module)), {})
+        based = self._facts(
+            test_base=("class Base(unittest.TestCase):\n"
+                       "    def setUp(self):\n"
+                       "        mock.patch.object(proxywatch, '_live_seats',"
+                       " lambda: (set(), None, {})).start()\n"),
+            test_w=("from tests.test_base import Base\n"
+                    "from helm import dispatches\n"
+                    "class T(Base):\n"
+                    "    def test_x(self):\n"
+                    "        dispatches.send('seat', 'one')\n"))
+        self.assertEqual(unplanted_writers(based), {})
+        other = writer + ("def setUpModule():\n"
+                          "    mock.patch.object(seats_work_offer, "
+                          "'_live_seats', lambda: set()).start()\n")
+        self.assertEqual(unplanted_writers(self._facts(test_w=other)),
+                         {"test_w": ["T"]},
+                         "another module's _live_seats is not this stand-in")
+
+    def test_the_shared_door_stands_in_and_puts_the_census_back(self):
+        """`pin_live_seats` for one case and for one module. The production
+        predicate itself is never edited: after each scope it is the same
+        function object again."""
+        from helm import proxywatch
+        from tests._tmphome import pin_live_seats
+        real = proxywatch._live_seats
+        case = unittest.TestCase()
+        pin_live_seats(case)
+        self.assertIsNot(proxywatch._live_seats, real)
+        self.assertEqual(proxywatch._live_seats(), (set(), None, {}),
+                         "the stand-in is a MEASURED empty fleet, never blind")
+        case.doCleanups()
+        self.assertIs(proxywatch._live_seats, real)
+        pin_live_seats()
+        self.assertIsNot(proxywatch._live_seats, real)
+        unittest.doModuleCleanups()
+        self.assertIs(proxywatch._live_seats, real)
+
+    def test_a_module_that_writes_no_row_owes_nothing(self):
+        reader = ("from helm import dispatches\n"
+                  "class T(unittest.TestCase):\n"
+                  "    def test_x(self):\n"
+                  "        dispatches.snapshot()\n")
+        writer = ("from helm import dispatches\n"
+                  "class T(unittest.TestCase):\n"
+                  "    def test_x(self):\n"
+                  "        dispatches.add('seat', 'one')\n")
+        facts = self._facts(test_r=reader, test_w=writer)
+        self.assertFalse(facts["test_r"]["writes"])
+        self.assertEqual(unplanted_writers(facts), {"test_w": ["T"]},
+                         "only the writer owes the stand-in")
+
+
+def deleted_tmp_paths(environ, tmp=None):
+    """{KEY: value} for every environment value naming a path inside a temp
+    directory that no longer exists.
+
+    A path is judged by the directory directly under the temp root, which is
+    the one a fixture's mkdtemp made: a leaf the fixture had not created yet
+    is not a leak, a path whose whole fixture directory is gone is. A value
+    is split on os.pathsep, so a search-path variable is read entry by
+    entry. `tmp` defaults to this process's temp root (tests/__init__.py
+    routes it under the suite root)."""
+    root = tmp or tempfile.gettempdir()
+    roots = {root, os.path.realpath(root)}
+    out = {}
+    for key, value in environ.items():
+        for part in value.split(os.pathsep):
+            for base in roots:
+                if not part.startswith(base + os.sep):
+                    continue
+                first = part[len(base) + 1:].split(os.sep, 1)[0]
+                if first and not os.path.lexists(os.path.join(base, first)):
+                    out[key] = value
+    return out
+
+
+class DeletedTempPathTest(unittest.TestCase):
+    """No environment variable may name a path into a temp directory that
+    is gone (task/3039).
+
+    MEASURED on trunk 04b8131fddd: after tests.test_codexhomes, HELM_HOME and
+    HELM_CODEX_HOMES_DIR both named paths inside its deleted temp directory.
+    The static arms above could not see it, because every key WAS restored:
+    the fixture restored it in tearDown, and a cleanup a test registered then
+    ran after tearDown and put the fixture's paths back.
+
+    THE BOUND: this arm reads the process when it runs, so it sees what every
+    module that ran BEFORE it in the same process left behind. The gateslice
+    leak audit diffs the environment at every unit boundary and is the
+    instrument that sees each unit.
+    """
+
+    def test_no_variable_names_a_deleted_temp_directory(self):
+        gone = tempfile.mkdtemp(prefix="helm-test-gone-")
+        shutil.rmtree(gone)
+        env = dict(os.environ, HELM_PLANTED_3039=gone)
+        self.assertEqual(deleted_tmp_paths(env), {"HELM_PLANTED_3039": gone},
+                         "an earlier test left these variables naming a temp "
+                         "directory it removed (the planted one is the "
+                         "control)")
+
+    def test_the_detector_SEES_a_path_into_a_deleted_temp_directory(self):
+        gone = tempfile.mkdtemp(prefix="helm-test-gone-")
+        live = tempfile.mkdtemp(prefix="helm-test-live-")
+        self.addCleanup(shutil.rmtree, live, True)
+        shutil.rmtree(gone)
+        env = {"GONE_LEAF": os.path.join(gone, "helm-home"),
+               "GONE_DIR": gone,
+               "SEARCH": os.pathsep.join(("/usr/bin", os.path.join(gone, "x"))),
+               "LIVE_LEAF": os.path.join(live, "not-made-yet"),
+               "LIVE_DIR": live,
+               "PLAIN": "value",
+               "OUTSIDE": "/nonexistent-3039/x"}
+        self.assertEqual(sorted(deleted_tmp_paths(env)),
+                         ["GONE_DIR", "GONE_LEAF", "SEARCH"])
 
 
 if __name__ == "__main__":

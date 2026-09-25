@@ -323,6 +323,73 @@ class BriefTravelsWholeByReferenceTest(td.DispatchBase):
                              % dispatches.MESSAGE_BODY_CAP in text,
                              expect_over,
                              "the over-cap clause fired on the wrong brief")
+            if expect_over:
+                self.assertIn("the recipient sees the first", text,
+                              "send receipt must state what recipient sees")
+                self.assertIn("bytes unless it follows the reference", text)
+
+    def test_triage_labels_truncated_bounded_copy_when_falling_back(self):
+        """A bounded fallback render must be labelled TRUNCATED bounded copy,
+        not 'as sent'."""
+        brief = self.big_brief()
+        row = self._send(brief)
+        stored = dispatches.rows()[row["id"]]
+        os.unlink(dispatches.brief_file_path(stored["brief_ref"]))
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            dispatches.cmd_dispatch(["triage", row["id"]])
+        text = out.getvalue()
+        self.assertIn("TRUNCATED bounded copy", text,
+                      "triage fallback did not label the truncated bounded copy")
+
+    def test_stored_notice_names_triage_command_when_reference_exists(self):
+        """When a brief_ref exists, the truncation notice must name helm dispatch triage
+        and NOT claim the tail is unrecoverable."""
+        brief = self.big_brief()
+        row = self._send(brief)
+        stored = dispatches.rows()[row["id"]]
+        bounded, _absent = dispatches.body_of(stored)
+        self.assertIn("helm dispatch triage", bounded,
+                      "the notice did not name helm dispatch triage")
+        self.assertNotIn("NOT recoverable", bounded,
+                         "the notice claimed the tail is not recoverable when brief_ref exists")
+
+    def test_triage_labels_undercap_brief_missing_ref_as_stored_on_row(self):
+        """An under-cap brief whose reference file is missing must be labelled
+        'as sent, stored on the row', not 'TRUNCATED'."""
+        brief = "short brief under cap"
+        row = self._send(brief)
+        stored = dispatches.rows()[row["id"]]
+        os.unlink(dispatches.brief_file_path(stored["brief_ref"]))
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            dispatches.cmd_dispatch(["triage", row["id"]])
+        text = out.getvalue()
+        self.assertIn("BRIEF (as sent, stored on the row):", text,
+                      "triage did not label under-cap missing ref as stored on the row")
+        self.assertNotIn("BRIEF (TRUNCATED", text,
+                         "triage incorrectly labelled an under-cap brief header as TRUNCATED")
+
+    def test_triage_fills_the_notice_id_and_never_rewrites_the_brief(self):
+        """The row id replaces the `<id>` in helm's notice only; a sender's
+        brief that quotes `<id>` as an instruction reaches the reader intact."""
+        brief = "Run `helm dispatch verdict <id> <tip>` when done.\n" + self.big_brief()
+        row = self._send(brief)
+        stored = dispatches.rows()[row["id"]]
+        os.unlink(dispatches.brief_file_path(stored["brief_ref"]))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            dispatches.cmd_dispatch(["triage", row["id"]])
+        text = out.getvalue()
+        self.assertIn("helm dispatch verdict <id> <tip>", text,
+                      "triage rewrote the sender's own <id> placeholder")
+        self.assertIn("helm dispatch triage %s" % row["id"][:12], text,
+                      "triage did not fill the notice's row id")
 
     # --------------------------------------------------- write order + census
 

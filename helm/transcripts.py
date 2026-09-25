@@ -99,6 +99,15 @@ def _load_cwd_overrides():
 # writers of this file — a snapshot-at-import would go stale and clobber.
 _cwd_overrides = _load_cwd_overrides()
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_cwd_overrides": "read again from its file before every use",
+    "_state": (
+        "a TTL memo per query; the arms that count builds (test_brief, "
+        "test_transcripts) clear it first"),
+}
+
 
 def _refresh_cwd_overrides():
     global _cwd_overrides

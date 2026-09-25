@@ -428,10 +428,11 @@ def capture(row, rows, repo, pinned, manifest, receipt, authority=None):
     state, gate_id, why = gate.bind(receipt, composed, repo_id=repo,
                                    reviewed_ts=row.get("ts"),
                                    consuming_repo=row.get("repo_root"),
-                                   need=gate.NEED_SUITE)
+                                   need=gate.NEED_LAND)
     if state != "VERIFIED":
         return None, "whole composed-tree gate does not bind: " + str(why)
-    state, why = landgate.gate_binds_tree(gate_id, tree, repo=repo, tip=pinned)
+    state, why = landgate.gate_binds_tree(gate_id, tree, repo=repo, tip=pinned,
+                                          where=row.get("repo_root"))
     if state != landgate.OK:
         return None, "whole composed-tree gate refuses: " + str(why)
     receipt_row, err = gate.by_id(gate_id)
@@ -510,7 +511,7 @@ def proof_error(proof, row, rows):
     state, gate_id, why = gate.bind("gate:" + proof["gate"], proof["gate_head"],
                                    repo_id=proof["repo"],
                                    consuming_repo=row.get("repo_root"),
-                                   need=gate.NEED_SUITE)
+                                   need=gate.NEED_LAND)
     if state != "VERIFIED" or gate_id != proof["gate"]:
         return "compose-land gate authority refuses: " + str(why)
     member = proof["member"]

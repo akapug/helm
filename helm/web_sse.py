@@ -69,6 +69,12 @@ def _sse_state():
 
 
 _CHAT_NAMES = {}          # base dir -> (dir mtime_ns, read_at, [.jsonl names])
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_CHAT_NAMES": "room names per base dir, checked against the dir's mtime",
+}
 _NAMES_MAX_AGE_S = 30.0   # the backstop below; NOT the freshness mechanism
 
 

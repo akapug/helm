@@ -60,7 +60,60 @@ SEAM_FILES_SHOWN = 2          # one seam is the point; a list is wallpaper
 _SEAM_PATH = re.compile(r"[A-Za-z0-9._/@+=-]{1,400}\Z")
 
 
-def _seam_rooms(session, seat, cwd=None):
+def _seam_root(where):
+    """(repository root or None, marker seen) for a path, by FILE READS.
+
+    `work._lanes.find_root`'s answer — the common dir's parent, worktree
+    shapes folded (`automap._git_root`, `_strip_worktree`) — without spawning
+    git, by git's own discovery walk: upward from the path to the first
+    `.git` git would accept (a directory holding HEAD, or a file naming a
+    gitdir that does), never across a filesystem boundary (unless
+    GIT_DISCOVERY_ACROSS_FILESYSTEM) nor into a GIT_CEILING_DIRECTORIES entry.
+    A `.git` directory git would reject is passed over, as git passes over
+    it — measured: a home directory holding a stray `.git` sits above every
+    seat standing in `~/dev`, and git itself stops at that mount. A common
+    dir not named `.git` (bare, a submodule's modules dir) is no project
+    checkout, exactly as `_git_root` rules, and says nothing.
+
+    The second value is whether a repository marker was found that this
+    could NOT read — a `.git` file naming no readable gitdir, or a `.jj` —
+    so that one is told UNKNOWN instead of being read as no repository."""
+    try:
+        here = os.path.abspath(where)
+        device = os.stat(here).st_dev
+    except (OSError, TypeError, ValueError):
+        return None, False
+    from . import automap, stopfacts
+    ceilings = {os.path.abspath(c) for c in os.environ.get(
+        "GIT_CEILING_DIRECTORIES", "").split(os.pathsep) if c}
+    across = os.environ.get("GIT_DISCOVERY_ACROSS_FILESYSTEM", "").strip() \
+        .lower() in ("1", "true", "yes", "on")
+    while True:
+        dotgit = os.path.join(here, ".git")
+        if os.path.lexists(dotgit):
+            gitdir, common = stopfacts.git_dirs(here)
+            if gitdir and os.path.isfile(os.path.join(gitdir, "HEAD")):
+                common = (common or "").rstrip(os.sep)
+                if os.path.basename(common) != ".git":
+                    return None, False
+                return os.path.realpath(automap._strip_worktree(
+                    os.path.dirname(common))), False
+            if not os.path.isdir(dotgit):
+                return None, True
+        if os.path.lexists(os.path.join(here, ".jj")):
+            return None, True
+        parent = os.path.dirname(here)
+        if parent == here or parent in ceilings:
+            return None, False
+        try:
+            if not across and os.stat(parent).st_dev != device:
+                return None, False
+        except OSError:
+            return None, False
+        here = parent
+
+
+def _seam_rooms(session, seat, cwd=None, registry=(), root=None):
     """({my absolute room paths}, root) — the rooms THIS seat is working in.
 
     CWD FIRST, LEASE SECOND, AND THAT ORDER IS THE CORRECTION. The first cut
@@ -71,6 +124,12 @@ def _seam_rooms(session, seat, cwd=None):
     derivable from git in every repo — the Stop hook's own JSON carries the
     cwd — so that is the primary, and a held lane lease only ADDS rooms for the
     delegated-build case where nobody's cwd is inside the room.
+
+    NO GIT ON THE STOP. The root is read from the checkout's own files
+    (`_seam_root`) and the registry is the one the `helm web` resident listed
+    beside the census (`registry`), so the room this seat stands in is found
+    in the same row set the census pairs against, by the same longest-prefix
+    rule, with no git process spawned.
 
     SESSION-BOUND ON THE LEASE LEG, unchanged: a display name alone must never
     reach a rung that blocks. Rows match on the session that minted them or on
@@ -84,7 +143,8 @@ def _seam_rooms(session, seat, cwd=None):
         # rooms through it for exactly this reason. A Stop hook can run from
         # anywhere; the room it is about is the one the seat is standing in.
         where = cwd or safe_cwd()
-        root = _lanes.find_root(where)
+        if root is None:
+            root, _marker = _seam_root(where)
     except projscope.Expired:
         raise
     except Exception:
@@ -93,17 +153,17 @@ def _seam_rooms(session, seat, cwd=None):
         return set(), None
     mine = set()
     # THE ROOM CONTAINING cwd, by longest-prefix over the registry rather than
-    # by `git rev-parse --show-toplevel`: one git spawn saved, and the registry
-    # is the same row set `seam_rooms` will pair against, so the two cannot
-    # disagree about which room a path belongs to.
+    # by `git rev-parse --show-toplevel`: the registry is the same row set the
+    # census pairs against, so the two cannot disagree about which room a path
+    # belongs to.
     try:
         here = os.path.realpath(where).rstrip(os.sep)
-        best = ""
-        for w in _lanes.worktrees(root):
-            p = os.path.realpath(w["path"]).rstrip(os.sep)
+        best, best_real = "", ""
+        for path in registry or ():
+            p = os.path.realpath(path).rstrip(os.sep)
             inside = here == p or here.startswith(p + os.sep)
-            if inside and len(p) > len(best):
-                best = os.path.abspath(w["path"])
+            if inside and len(p) > len(best_real):
+                best, best_real = os.path.abspath(path), p
         if best:
             mine.add(best)
     except projscope.Expired:
@@ -133,6 +193,22 @@ def _seam_rooms(session, seat, cwd=None):
             except Exception:
                 continue
     return mine, root
+
+
+def _seam_unknown(fresh, blind=None):
+    """(None, warn) for a stop the rung cannot answer EXACTLY. Never a block:
+    the rung is advisory about facts it does not have, so a stale or absent
+    reading says UNKNOWN and names why, and the resident's next refresh is
+    what the next stop reads."""
+    age = (" as of %ds" % int(fresh.age)
+           if fresh.age is not None and fresh.verdict != "ABSENT" else "")
+    return None, _join(blind, (
+        "[helm stop-guard] composition-seam rung has no exact reading for "
+        "this stop — seam facts %s%s: %s. An untested composition is "
+        "UNKNOWN, not absent; the `helm web` resident recomputes them and a "
+        "later stop reads them."
+        % (fresh.verdict, age,
+           _clip(_scrub(str(fresh.reason or "")).strip(), STATUS_BYTES))))
 
 
 def _join(*parts):
@@ -470,16 +546,21 @@ def _cotenancy_warn(rooms, mine, room, seat, session):
     return survives_refusal(text)
 
 
-def _seam_gate(session, room, seat, cwd=None, blocks=None, warns=None):
+def _seam_gate(session, room, seat, cwd=None, blocks=None, warns=None,
+               facts=None):
     """APPENDS to `blocks`/`warns` when they are given, and returns the pair
     either way. The append form exists so the caller in `stop_guard` is ONE
     line: this rung's own fail-open try/except and its two conditional
     appends belonged here beside the rung they guard, not spread across the
     ladder — and the ladder is on a 1000-line budget the rung pushed past.
     Fail-open is TOTAL and lives here: a rung that decides whether a seat may
-    stop must never raise into the stop path."""
+    stop must never raise into the stop path.
+
+    `facts` is the stop's one reading of the resident's stop facts
+    (`stopfacts.Lazy`), shared with every other rung of the ladder; a caller
+    with none gets a reading of its own."""
     try:
-        block, warn = _seam_gate_inner(session, room, seat, cwd)
+        block, warn = _seam_gate_inner(session, room, seat, cwd, facts=facts)
     except projscope.Expired:
         raise
     except Exception:            # noqa: BLE001 — see the fail-open law above
@@ -491,7 +572,69 @@ def _seam_gate(session, room, seat, cwd=None, blocks=None, warns=None):
     return block, warn
 
 
-def _seam_gate_inner(session, room, seat, cwd=None):
+def _seam_census(view, session, seat, cwd):
+    """The stop's reading of the resident's seam census -> None (this seat
+    stands in no room: nothing to say), (None, Freshness) when there is no
+    EXACT census for its repository, or (facts, mine)."""
+    from . import stopfacts
+    where = cwd or safe_cwd()
+    root, unreadable = _seam_root(where)
+    if not root:
+        if unreadable:
+            return None, stopfacts.Freshness(
+                stopfacts.ABSENT, "this checkout's git files could not be "
+                "read without git", None, None)
+        return None
+    facts, fresh = view.seam(root)
+    if not fresh.exact:
+        return None, fresh
+    mine, _root = _seam_rooms(session, seat, where,
+                              registry=facts.get("registry") or (),
+                              root=facts.get("root") or root)
+    if not mine:
+        return None
+    return facts, mine
+
+
+def _seam_rows(view, facts, mine, seat):
+    """`seam_candidates(root, mine, holder=seat)`'s answer from the
+    resident's per-room rows -> (rows, err, partial) or a Freshness naming
+    why there is no EXACT answer, or "raised" when the resident's own call
+    for one of this seat's rooms raised (the rung's swallow)."""
+    from . import stopfacts
+    from .work import _gc
+    if facts.get("root_raised"):
+        return "raised"
+    census = facts.get("census") or []
+    rooms = facts.get("rooms") if isinstance(facts.get("rooms"), dict) else {}
+    raised = facts.get("raised") if isinstance(facts.get("raised"),
+                                               dict) else {}
+    mine_paths = {os.path.abspath(p) for p in mine}
+    ours = [r["path"] for r in census if r["path"] in mine_paths]
+    peers = [r["path"] for r in census
+             if r["path"] not in mine_paths and r.get("live")]
+    if not facts.get("root_err") and ours and peers:
+        if facts.get("green_err"):
+            fresh = view.seam_pairs(facts, ())
+        else:
+            missing = [p for p in ours if p not in rooms and p not in raised]
+            if missing:
+                return stopfacts.Freshness(
+                    stopfacts.ABSENT, "your room %s is neither occupied nor "
+                    "leased, and the resident computes seams for live rooms "
+                    "only" % os.path.basename(missing[0]), None, None)
+            fresh = view.seam_pairs(facts, ours + peers)
+        if not fresh.exact:
+            return fresh
+        if any(p in raised for p in ours) and not facts.get("green_err"):
+            return "raised"
+    return _gc.seam_assemble(census, rooms, mine, holder=seat,
+                             root_err=facts.get("root_err"),
+                             green_err=facts.get("green_err"),
+                             green_warn=facts.get("green_warn"))
+
+
+def _seam_gate_inner(session, room, seat, cwd=None, facts=None):
     """(block | None, warn | None) for the UNTESTED-COMPOSITION rung.
 
     OWNER REQUEST, 2026-08-23, verbatim: "Two green halves with an untested
@@ -534,7 +677,17 @@ def _seam_gate_inner(session, room, seat, cwd=None):
     pair key made the latch swallow that re-arm. An unwritable latch DEGRADES
     to the compact WARN, the spiral rung's law: a gate that cannot remember may
     not block every stop forever. Fail-open TOTAL;
-    HELM_STOP_GUARD_SEAM=0 disables."""
+    HELM_STOP_GUARD_SEAM=0 disables.
+
+    THE STOP COMPUTES NONE OF IT. The census (a registry listing and a /proc
+    pass), the receipt ledger and the per-pair git reads cost seconds on a
+    busy box, so the `helm web` resident computes them with these same
+    functions and writes them into the stop facts (stopfacts_resident
+    `compute_seam`); this rung reads them through `stopfacts` and assembles
+    its own answer with `work._gc.seam_assemble`. A reading that is not
+    EXACT — the snapshot absent, other code, a room's HEAD or the trunk moved,
+    a receipt recorded since — is an UNKNOWN warn, never a block: the rung
+    only ever blocks on facts it has."""
     if _off("STOP_GUARD_SEAM") or not seat:
         return None, None
     projscope.spend_or_raise("composition seam census")
@@ -544,16 +697,21 @@ def _seam_gate_inner(session, room, seat, cwd=None):
     # precisely what a seat needs when the instrument has just failed. The
     # census and the disclosure are computed first and kept; the predicate's
     # failure can now cost only the predicate.
-    blind, census, root, cdeg = None, None, None, ()
+    blind, census, cdeg = None, None, ()
     try:                      # fail-open TOTAL — a Stop rung must never wedge
-        mine, root = _seam_rooms(session, seat, cwd)
-        if not mine or not root:
+        from . import stopfacts
+        view = (facts if facts is not None else stopfacts.Lazy()).view()
+        got = _seam_census(view, session, seat, cwd)
+        if got is None:
             return None, None
-        from .work import _gc
+        seam, mine = got
+        if seam is None:            # `mine` is the Freshness saying why
+            return _seam_unknown(mine)
         # ONE ROOM CENSUS PER STOP, shared by the predicate and the blind-spot
-        # disclosure: both want the same /proc pass and the same seat sets, and
-        # two passes could disagree about who is in a room.
-        census, cerr, cdeg = _gc.seam_rooms(root)
+        # disclosure: both want the same seat sets, and two readings could
+        # disagree about who is in a room.
+        census = seam.get("census") or []
+        cerr, cdeg = seam.get("cerr"), seam.get("cdeg") or ()
         projscope.spend_or_raise("composition seam census result")
         blind = _cotenancy_warn(census, mine, room, seat, session)
     except projscope.Expired:
@@ -587,14 +745,20 @@ def _seam_gate_inner(session, room, seat, cwd=None):
                            % _clip(_scrub(str(cerr)).strip(), STATUS_BYTES))
     try:
         projscope.spend_or_raise("composition seam candidates")
-        rows, err, partial = _gc.seam_candidates(
-            root, mine, holder=seat, rooms=census)
+        got = _seam_rows(view, seam, mine, seat)
         projscope.spend_or_raise("composition seam candidate result")
     except projscope.Expired:
         raise
     except Exception as _swallowed:
         record.swallow("seats_stop_seam._seam_gate", _swallowed)
         return None, blind
+    if got == "raised":
+        return None, blind    # the resident's call raised: the rung's swallow
+    # A Freshness IS a tuple (a namedtuple), so the reading is told apart by
+    # its type and never by its shape.
+    if isinstance(got, stopfacts.Freshness):
+        return _seam_unknown(got, blind)
+    rows, err, partial = got
     if err:
         # UNKNOWN SEAMS ARE NOT ZERO SEAMS — the spiral rung's own correction,
         # applied at birth here rather than after a seat runs ten rounds inside
@@ -722,21 +886,36 @@ def _seam_gate_inner(session, room, seat, cwd=None):
                  "must run the suite ON THE RESOLVED TREE, not on either half; "
                  "a receipt at that tree is what ends the block.\n" % peer)
     elif _SEAM_PATH.fullmatch(room_a):
-        cures = ("  DISCHARGE IT: run the arm against the COMPOSED tip. The "
-                 "receipt binds the merged TREE, so this clears even if you "
-                 "throw the merge away afterwards:\n"
-                 "    git -C %s merge --no-ff %s && fab gate --repo %s\n"
-                 % (room_a, peer, room_a))
+        # THE FOCUSED GATE ON THE MERGED TREE (task/3039 F6). The merged tree
+        # stands in a LANE room, where `helm gate run` refuses a whole suite,
+        # and a focused run over the merged diff selects both halves'
+        # consumers together, which is the composition's own question. Its
+        # receipt ends the block: `work._gc.receipt_inadmissible` admits a
+        # verifiable focused receipt at both doors.
+        cures = ("  DISCHARGE IT: run the FOCUSED gate against the COMPOSED "
+                 "tip. The receipt binds the merged TREE, so this clears even "
+                 "if you throw the merge away afterwards:\n"
+                 "    git -C %s merge --no-ff %s && helm gate run --repo %s "
+                 "--focus\n"
+                 "  On a host that refuses local suites, run the same "
+                 "selection on the remote runner (`helm gate run --focus "
+                 "--plan` names the modules): `fab test --repo %s -- python3 "
+                 "-m unittest <modules>`. Its Ran/OK line tests the "
+                 "composition but is not a receipt, because `helm gate "
+                 "import` refuses a focused artifact; the once-per-seam latch "
+                 "below lets the next stop pass.\n"
+                 % (room_a, peer, room_a, room_a))
     else:
         # A COMMAND THAT CANNOT BE QUOTED INERTLY IS NOT OFFERED. Laundering the
         # room path would produce a command that runs somewhere else, which is
         # worse than no command; the seat still gets the finding and the one
         # discharge described in words it can act on.
         cures = ("  DISCHARGE IT by merging the peer lane into yours and "
-                 "gating — the receipt binds the merged TREE, so it clears "
-                 "even if you throw the merge away. This room's path cannot be "
-                 "quoted inertly, so no command is offered rather than a "
-                 "laundered one that would run somewhere else.\n")
+                 "running the focused gate (`helm gate run --focus`) — the "
+                 "receipt binds the merged TREE, so it clears even if you "
+                 "throw the merge away. This room's path cannot be quoted "
+                 "inertly, so no command is offered rather than a laundered "
+                 "one that would run somewhere else.\n")
     block = ("[helm stop-guard] UNTESTED COMPOSITION — " + line + ".\n"
              "  A PASSING RUN IS TRUE ABOUT ITS OWN TREE AND SILENT ABOUT EVERY "
              "OTHER. Your half was verified, theirs was verified, and nothing "

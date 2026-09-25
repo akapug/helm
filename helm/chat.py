@@ -139,6 +139,14 @@ QUOTE_CHARS = 72            # the quoted parent's snippet budget (one line)
 SIGN_FAILURES_FILE = ".sign-failures.json"  # RAM-only per-profile owner truth
 SIGN_FAILURES_ROOT = "/dev/shm/helm-chat-failures"
 _SIGN_FAILURE_FALLBACK = {}  # owner path -> exact raw profile -> private state
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_SIGN_FAILURE_FALLBACK": (
+        "keyed by owner path, and every chat dir a test plants is its own "
+        "key"),
+}
 _SIGN_FAILURE_FALLBACK_LOCK = threading.RLock()
 _QUOTED_VALUE = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
 _UNCLOSED_QUOTED_VALUE = r'''(?:"[^\r\n;}]*|'[^\r\n;}]*')'''
@@ -1219,7 +1227,7 @@ def _incident_state_unreadable(exc, now=None):
     reason = "incident state unreadable (%s: %s)" % (
         exc.__class__.__name__, exc)
     d = _diag("incident_state_unreadable", reason, event_epoch=now)
-    rec = {"profile": _post_identity(None)[0], "code": d["code"],
+    rec = {"profile": _post_identity(None, admit=False)[0], "code": d["code"],
            "reason": d["reason"], "first_failure": d["_event_ts"],
            "last_failure": d["_event_ts"], "failure_count": 1,
            "remediation": d["remediation"],
@@ -1446,7 +1454,11 @@ def transport_status(fleet=False):
            "signer": signer["usable"],
            "signer_configured": signer["configured"]}
     attempts = signer["configured"] and (not signer["usable"] or bool(u))
-    me, refused = _post_identity(None) if attempts else (None, None)
+    # A FLEET READER DISCARDS `refused` BELOW, so it asks for the label only:
+    # the label is the seat whether the gate would swap or refuse, and a web
+    # poll must not run the identity layer (task/3049).
+    me, refused = (_post_identity(None, admit=not fleet) if attempts
+                   else (None, None))
     if refused and not fleet:
         current = next((f for f in failures
                         if f.get("profile") == _dsan(me)
@@ -2146,11 +2158,16 @@ def emit_coordination_turn(topic, payload, profile=None):
                            "%s: %s" % (exc.__class__.__name__, exc))
 
 
-def _post_identity(profile):
+def _post_identity(profile, admitted=None, admit=True):
     """(label, refusal) for one chat row: who signs it, or whose row it is when
-    it may not be signed. `label` is never empty; `refusal` is None or the
-    structured diagnostic to stamp (`identity_conflict`, `identity_unreadable`,
-    or `signing_exception` when the gate itself raised). Never raises.
+    it may not be signed. `admitted` is the `AdmittedActor` the caller's door
+    already minted for this process (the CLI's `_seat_actor`), so a seat under
+    the owner's inherited profile is swapped to itself without a second
+    admission; `admit=False` is a reader that only wants the LABEL (the label
+    is the seat whether the gate swaps or refuses) and consults nothing more.
+    `label` is never empty; `refusal` is None or the structured diagnostic to
+    stamp (`identity_conflict`, `identity_unreadable`, or `signing_exception`
+    when the gate itself raised). Never raises.
 
     THE POST PATH MUST ASK THE SAME GATE AS THE EMIT PATH. Reading
     `cell.profile_name()` here, the raw HELM_CELL_PROFILE with no identity
@@ -2200,7 +2217,8 @@ def _post_identity(profile):
     label = _profile(profile or own or ambient)
     try:
         p, refusal = cell.signing_identity(profile,
-                                           reading=(seat, unreadable))
+                                           reading=(seat, unreadable),
+                                           admitted=admitted, admit=admit)
     except Exception as exc:
         return label, _diag("signing_exception", "the identity gate raised "
                             "%s: %s" % (exc.__class__.__name__, exc))
@@ -2209,6 +2227,16 @@ def _post_identity(profile):
     if not ambient:
         return _profile(None), None
     return label, _identity_refusal(refusal, unreadable)
+
+
+def _own_admission(who):
+    """`who` when it is an `AdmittedActor` — the capability the CLI door
+    minted for THIS process — else None. The signing gate takes it as the
+    identity layer's answer instead of asking again (task/3049), so the
+    common post path re-runs no admission. A raw name is not one: a string
+    can never stand in for the capability."""
+    from . import actors
+    return who if isinstance(who, actors.AdmittedActor) else None
 
 
 def _identity_refusal(refusal, roster_unreadable):
@@ -2223,7 +2251,7 @@ def _identity_refusal(refusal, roster_unreadable):
                  else "identity_conflict", refusal)
 
 
-def _signed_row(row, payload_text, profile, sign):
+def _signed_row(row, payload_text, profile, sign, admitted=None):
     """Common signing owner for posts/reactions. The RAM row ALWAYS lands.
     A failed attempted signature is stamped + retained per profile; only an
     observed signed send clears that profile's incident. On the production
@@ -2250,7 +2278,7 @@ def _signed_row(row, payload_text, profile, sign):
                 return row
         elif not sign:
             return row
-        p, refused = _post_identity(profile)
+        p, refused = _post_identity(profile, admitted=admitted)
         if refused:
             return _stamp_sign_failure(row, p, refused)
         if sign is None:
@@ -2863,7 +2891,8 @@ def post(text, room=None, who=None, profile=None, sign=None, origin=None,
         row["vrid"] = str(verdict["rid"])
         row["vref"] = str(verdict.get("ref") or "")
     _touch_poster_presence(row["from"])
-    return _append(_signed_row(row, text, profile, sign), room,
+    return _append(_signed_row(row, text, profile, sign,
+                               admitted=_own_admission(who)), room,
                    event_id=event_id)
 
 
@@ -3003,7 +3032,8 @@ def react(target, code, room="main", who=None, profile=None, sign=None):
         row["un"] = True   # toggle OFF — the tombstone every renderer honors
     # the payload is derived from the ROW (payload_for -> _react_payload), so
     # the signer and `helm chat verify` read one definition, never two
-    return _append(_signed_row(row, None, profile, sign), room), None
+    return _append(_signed_row(row, None, profile, sign,
+                               admitted=_own_admission(who)), room), None
 
 
 def _react_state(rows):
@@ -3807,7 +3837,9 @@ def restore_journal(apply=False):
 _BODY_VERBS = re.compile(
     r"helm[\w./-]*\s+(?:chat\s+(?:post|reply|dm)\b"
     r"|chat\s+(?:standup|meld|council)\s+say\b"
-    r"|store\s+add\b"
+    # a revised statement is canon text like an added one; the id before it
+    # stays computable
+    r"|store\s+(?:add|revise)\b"
     # THE TASK LEDGER IS PROSE TOO, and it was missing for the same reason
     # store add was: nobody added it. MEASURED 2026-09-09 — a `helm task add`
     # note describing a hazard had two backticked phrases EXECUTED by the
@@ -7034,6 +7066,12 @@ class _ShellReader(object):
                 self.bodies.append((self.starts[i] + op.start(), quoted,
                                     start, end))
         self.seen, self.nested, self.outproc = {}, set(), False
+        # (start, end) of the text inside every `$(…)`, backtick span and
+        # `<(…)` read, nested ones included, and of every `>(…)` in `outs`:
+        # the env-dump rung re-reads what a printer's argument runs, and what
+        # an output substitution runs on this shell's stdout. Recorded only;
+        # nothing here reads it.
+        self.substs, self.outs = [], []
 
     def line_of(self, i):
         return bisect.bisect_right(self.starts, i) - 1
@@ -7151,7 +7189,8 @@ class _ShellReader(object):
                 i, plain = i + 2, False
             elif c in "<>" and nxt == "(":
                 self.outproc = self.outproc or c == ">"
-                i = self.tokens(i + 2, True)[1]
+                at, i = i + 2, self.tokens(i + 2, True)[1]
+                (self.substs if c == "<" else self.outs).append((at, i - 1))
                 subst, plain = True, False
             elif c in _WORD_BREAKS:
                 break
@@ -7232,13 +7271,14 @@ class _ShellReader(object):
         raise _Unsettled
 
     def backtick(self, i):
-        t, n = self.t, self.n
+        t, n, at = self.t, self.n, i
         while i < n and t[i] != "`":
             if t[i] == "\n":
                 self.inside(i)
             i += 2 if t[i] == "\\" else 1
         if i >= n:
             raise _Unsettled
+        self.substs.append((at, i))
         return i + 1
 
     def expansion(self, i):
@@ -7260,7 +7300,9 @@ class _ShellReader(object):
                 raise _Unsettled
             return i, True
         if t.startswith("$(", i):
-            return self.tokens(i + 2, True)[1], True
+            end = self.tokens(i + 2, True)[1]
+            self.substs.append((i + 2, end - 1))
+            return end, True
         depth, ran, i = 1, False, i + 2
         while i < n:
             c = t[i]
@@ -7446,6 +7488,110 @@ _GIT_PROSE_GLOBALS = frozenset(("-C", "--no-pager", "-P"))
 _GH_PROSE = frozenset(("gist", "issue", "label", "pr", "release", "repo",
                        "search"))
 _GREPS = frozenset(("grep", "egrep", "fgrep", "rg"))
+#: the programs that find or list processes: every argument is a pattern or a
+#: selector, and none of them runs or writes anything it is given
+_PROCESS_READERS = frozenset(("pgrep", "pkill", "pidof", "ps"))
+#: the configuration a `git -c` may set before a prose subcommand and leave
+#: it prose: none of these names a program git would run (an editor, a pager,
+#: a hook, an alias) or a file it would write
+_GIT_SAFE_CONFIG = frozenset(("user.name", "user.email", "commit.gpgsign",
+                              "core.quotepath", "color.ui"))
+#: python text that starts another process, and so is code wherever a rung
+#: would otherwise read python's text as data. The module name is matched
+#: QUOTED TOO: `__import__("os").system(...)` and
+#: `importlib.import_module("subprocess")` hide it behind string marks, and
+#: the pre-cut fold caught the verb in that text (a cross-family delta read).
+#: Kept for `_authority_text`'s command-wide spawn question; python's own
+#: text is decided by the allowlist (`python_text_inert`), never this list.
+_SPAWNS = re.compile(r"subprocess|\bPopen\b|\bpexpect\b|\brunpy\b"
+                     r"|\b__import__\b|\bimport_module\b"
+                     r"|[\"']?os[\"']?\s*\.\s*(?:system|popen|exec|spawn|posix_spawn)"
+                     r"|[\"']?pty[\"']?\s*\.\s*spawn")
+
+#: THE INERT-IMPORT ALLOWLIST (task/3071). Python's `-c` text and a heredoc
+#: fed to python count as DATA only when every import comes from this set —
+#: modules that cannot start a process, open a socket or write a file the
+#: text did not name — and no dynamic primitive appears anywhere. The
+#: denylist it replaces (`_SPAWNS` as the data test) enumerated ways to
+#: spawn and kept missing them: from-os-import-system, `import os as o`,
+#: `getattr(os, "system")` and `exec` of a built string all read as data
+#: beside it (a cross-family delta read of task/3060). An allowlist fails the other
+#: way: what it does not know is code.
+_PY_INERT_MODULES = frozenset((
+    "re", "json", "sys", "pathlib", "ast", "difflib", "textwrap",
+    "collections", "itertools", "functools", "io", "datetime", "hashlib",
+    "base64", "csv", "glob", "fnmatch", "string", "math", "statistics",
+    "tokenize", "shlex", "time", "typing"))
+#: the os attributes that start nothing and write nothing
+_PY_OS_SAFE = frozenset((
+    "path", "environ", "getcwd", "listdir", "walk", "makedirs", "remove",
+    "rename", "replace", "mkdir", "rmdir", "getenv", "urandom", "sep",
+    "linesep"))
+#: the dynamic primitives: text naming one is code, however it was imported
+_PY_DYNAMIC = frozenset((
+    "exec", "eval", "compile", "__import__", "import_module", "getattr",
+    "globals", "vars", "breakpoint"))
+
+
+def _parses_python(src):
+    """Whether the text parses as python at all. A body that does not is
+    prose the interpreter would only crash on, and the standing answer for
+    it (task/2973) is data."""
+    import ast                              # local: paid only by python calls
+    try:
+        ast.parse(src)
+        return True
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+
+
+def python_text_inert(src):
+    """Whether python source is INERT under the allowlist above: every import
+    from _PY_INERT_MODULES (os only through its safe attributes), no dynamic
+    primitive named or attributed anywhere. Unparseable is False — text that
+    may not be read as data is never data."""
+    import ast                              # local: paid only by python calls
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    os_aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                root, _, rest = a.name.partition(".")
+                if root == "os":
+                    if rest:
+                        # import os.path: the safe subtree, whole
+                        if rest.split(".")[0] != "path":
+                            return False
+                    else:
+                        os_aliases.add(a.asname or "os")
+                elif root not in _PY_INERT_MODULES:
+                    return False
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            root, _, rest = module.partition(".")
+            if root == "os":
+                if rest.split(".")[0] == "path":
+                    continue            # from os.path import X: safe whole
+                for a in node.names:
+                    if a.name.partition(".")[0] not in _PY_OS_SAFE:
+                        return False
+            elif root not in _PY_INERT_MODULES:
+                return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _PY_DYNAMIC:
+            return False
+        if isinstance(node, ast.Attribute):
+            if node.attr in _PY_DYNAMIC:
+                return False
+            # an attribute off an os alias must be a safe one
+            if isinstance(node.value, ast.Name) \
+                    and node.value.id in os_aliases \
+                    and node.attr not in _PY_OS_SAFE:
+                return False
+    return True
 #: the programs whose stdin is DATA, besides the recording ones above
 _STDIN_DATA = frozenset(("cat", "tee")) | _GREPS
 _PYTHON = re.compile(r"python(?:[23](?:\.\d+)?)?")
@@ -7540,9 +7686,47 @@ def _names_the_directory(word):
                for reading in folded_commands(word.raw))
 
 
-def _command_data(words, interpreters=None):
+def _python_text(args):
+    """The `-c` program text of a python invocation (`args` are the words
+    after the program), as the one data word, or [] where there is none or
+    it is code: the text is not INERT under the import allowlist
+    (`python_text_inert`, task/3071), it holds a substitution the shell runs
+    first, or it names the workflow directory (the belt above). A script
+    path or `-m` makes every later word the program's argv, which it may
+    run, so nothing after it is data."""
+    j = 0
+    while j < len(args):
+        v = args[j].value()
+        if v is None or v == "-m" or not v.startswith("-") or v == "-":
+            return []
+        if re.fullmatch(r"-[A-Za-z]*c", v):
+            code = args[j + 1] if j + 1 < len(args) else None
+            if code is None or code.subst \
+                    or not python_text_inert(code.value() or "") \
+                    or _names_the_directory(code):
+                return []
+            return [code]
+        j += 2 if v in ("-W", "-X") else 1
+    return []
+
+
+def _command_data(words, interpreters=None, bodies=None, docs=()):
     """(the words of one simple command that are data, what its program
     makes of its stdin: "data", "shell" or None where unknown).
+
+    THE ONE DATA PREDICATE, shared by the GitHub-Actions, owner-posture and
+    sidechain authority rungs: which words a program is handed that it never
+    runs (a grep pattern, a process reader's selector, a post's prose, a
+    commit message, python's `-c` text under the inert-import allowlist), and
+    whether the body it reads on stdin is data. A program it does not name
+    answers nothing, and its words stay code.
+
+    `bodies` maps a heredoc's operator token to its text and `docs` is the
+    operator tokens THIS command owns (the caller's reader.bodies keyed by
+    `_simple_commands`' docs), so a program whose stdin is data ONLY of one
+    kind — python's, which must parse inert under the allowlist (task/3071)
+    — can ask the body which it is. Without them, python's stdin answers as
+    before: data.
 
     `interpreters` (a compiled pattern, or None) names programs a CALLER's
     rung reads as running their text: their arguments and their stdin are
@@ -7571,15 +7755,39 @@ def _command_data(words, interpreters=None):
         if _runs_a_program(args, ("--pre", "--hostname-bin")):
             return (), None
         return every, "data"
-    if name in _STDIN_DATA or _PYTHON.fullmatch(name):
+    if name in _PROCESS_READERS:
+        return every, "data"
+    if _PYTHON.fullmatch(name):
+        # A HEREDOC BODY FED TO PYTHON IS ITS PROGRAM, and a program is data
+        # only under the same allowlist as the -c text (task/3071): the body
+        # that imports os.system read as data beside the denylist. A body
+        # that does not PARSE as python is prose python would only crash on
+        # (task/2973's standing answer: a python body is data); only a
+        # parseable body that fails the allowlist stays code.
+        if bodies:
+            for at in docs:
+                body = bodies.get(at)
+                if body is not None and _parses_python(body) \
+                        and not python_text_inert(body):
+                    return _python_text(args), None
+        return _python_text(args), "data"
+    if name in _STDIN_DATA:
         return (), "data"
     if name == "helm":
         verb = args[0].value() if args else None
         return (prose, "data") if verb in _HELM_PROSE else ((), None)
     if name == "git":
         j = 0
-        while j < len(args) and args[j].value() in _GIT_PROSE_GLOBALS:
-            j += 2 if args[j].value() == "-C" else 1
+        while j < len(args):
+            v = args[j].value()
+            if v in _GIT_PROSE_GLOBALS:
+                j += 2 if v == "-C" else 1
+            elif v == "-c" and j + 1 < len(args) and (
+                    args[j + 1].value() or "").split("=", 1)[0].lower() \
+                    in _GIT_SAFE_CONFIG:
+                j += 2
+            else:
+                break
         sub = args[j].value() if j < len(args) else None
         # `-O` runs a pager and `--output` WRITES a file (`_GIT_WRITES`,
         # the read exemption's own list)
@@ -7669,7 +7877,10 @@ def _cut_data(command, interpreters=None):
                               for name, k in programs)
     safe = not unseen and not reader.outproc and all(
         _safe_stage(cmd) for cmd in commands if cmd.stage)
-    stdins = [_command_data(cmd.words, interpreters) for cmd in commands]
+    body_text = {at: "\n".join(reader.lines[start:end])
+                 for at, _q, start, end in reader.bodies}
+    stdins = [_command_data(cmd.words, interpreters, body_text, cmd.docs)
+              for cmd in commands]
     # A SHELL ANYWHERE in the command can be the one that reads a body a
     # program the reader does not know hands on — through a pipe into `(sh)`
     # or `{ sh; }`, or a loop whose body runs each line it reads (`while read
@@ -8037,6 +8248,618 @@ def sidechain_beacon_presence(command):
         all(word.search(readings) for word in _BEACON_WORDS)
 
 
+# ---------------------------------------------------------------------------
+# THE SIDECHAIN AUTHORITY RUNG (task/3060) — the beacon rung's fact, one
+# ledger over, and the ONE delegate rung. A delegate (an Agent-tool subagent
+# or a Workflow agent) shares its seat's session and HELM_CHAT_NAME, so a
+# verdict it writes is recorded as the seat's own and no field on the row can
+# say otherwise. Measured: a delegated reader wrote an immutable APPROVE with
+# zero findings that its brief never authorized. The table of refused verbs,
+# the grant that admits them, the reason each is on it and the spellings of
+# them that write nothing live in helm/delegate_grant.py. task/1388 built a
+# second rung from the same incident; its verbs and the spellings it let
+# through are folded into that one table and into `_authority_exempt` below.
+#
+# IT READS WHAT THE SHELL RUNS, NOT WHAT THE COMMAND MENTIONS (the
+# integrator's ruling). A delegate writes ABOUT these verbs all day: a grep
+# or rg pattern, a pgrep or ps argument, a brief in a heredoc fed to cat or
+# tee, an echo or printf argument, a python edit whose string names a verb,
+# a commit message, a post. None of those runs the verb, and a census of
+# recorded delegate commands found them to be two thirds of what a
+# text-reading rung refused. So the fold reads the command LESS THE DATA the
+# shell reader proves (`_invocation_text`, the predicate the GitHub-Actions
+# and owner-posture rungs already cut with: `_command_data` says which words
+# of each program, and which heredoc bodies, are data).
+#
+# WHY THE COMMAND LESS ITS DATA, AND NOT THE READER'S HELM CALLS ALONE. A verb
+# runs through programs the reader does not unwrap: `/usr/bin/time
+# ./bin/helm ...`, `$HELM dispatch verdict` and `python3 bin/helm ...` (each
+# measured in the census), `xargs helm ...`, `ssh host 'helm ...'`, `find
+# -exec helm ...`, and a script the same command writes and then runs. Reading only the invocations the reader
+# resolves to helm would pass every one of them. Cutting only what is PROVEN
+# data keeps them all: an unknown program's arguments, a body fed to an
+# unknown program, and text the reader cannot settle are code, and the verb
+# the fold finds there is refused (unknown refuses).
+#
+# THE SAME FOLD AS THE BEACON RUNG, AND ONE DIFFERENCE IN WHAT IT ASKS. The
+# readings and the mark-spanning pieces are the beacon rung's, so a word
+# assembled around an expansion (dis$(echo patch), for the group `dispatch`)
+# is the word it assembles to. What differs is ORDER: the beacon's three
+# pieces may stand anywhere, and a verb pair here must stand as one
+# invocation, `helm`, the group, at most three options, the verb. A delegate
+# reads the ledger all day (`helm dispatch list | grep verdict`, `helm lr
+# show X` beside a `close`), and a rung that refused every command holding
+# both words would refuse the reads the delegate exists to do.
+#
+# WHAT IT STILL COSTS: a mention the reader cannot prove is data is refused
+# like a run. That covers args to a program the predicate does not know
+# (awk, node -e, a for-loop's word list), anything piped into a stage that
+# could run its input (python, sed), a heredoc fed to a program given as a
+# value (`$H dispatch send <<EOF`), an unquoted heredoc (its substitutions
+# run), and python text that starts a process. The cure is the same words
+# without `helm`, or a file written with a tool that is not a shell. A word
+# supplied WHOLE by a runtime value (`$H dispatch verdict`) is outside this
+# rung, exactly as it is outside the beacon rung.
+_AUTHORITY_OPTION = r"(?: +--?[\w.-]+(?:=\S*)?(?: +(?!-)\S+)?){0,3}"
+_AUTHORITY_HELM = r"(?<![\w-])" + _mark_spanning("helm") + r"(?![\w-])"
+# THE CHEAP GATE: a delegate command that never names `helm` pays for no
+# import and no table, which is almost every command a delegate runs.
+_AUTHORITY_GATE = re.compile(_AUTHORITY_HELM)
+_AUTHORITY_PATTERNS = []
+_HOME_ASSIGNMENT = "HELM_HOME="
+
+
+def _authority_patterns():
+    """[(pattern, "group verb")] for the refused table, compiled once."""
+    if not _AUTHORITY_PATTERNS:
+        from . import delegate_grant
+        helm = _AUTHORITY_HELM
+        for group, verb in delegate_grant.REFUSED:
+            _AUTHORITY_PATTERNS.append((re.compile(
+                helm + " +" + _mark_spanning(group) + r"(?![\w-])"
+                + _AUTHORITY_OPTION + " +" + _mark_spanning(verb)
+                + r"(?![\w-])"), "%s %s" % (group, verb)))
+    return _AUTHORITY_PATTERNS
+
+
+# WHAT WRITES NOTHING, READ PER INVOCATION. A refused verb may be spelled so
+# that it writes nothing (delegate_grant.writes_nothing: its usage, -h and
+# --help, an lr --dry-run, `lr expired` and `lr retire --off-frontier`
+# without --apply), or pointed at a TEST home with HELM_HOME, and a delegate
+# runs all of these (the census of recorded commands). The fold deleted what
+# says which: quote marks, word boundaries and newlines, so `--reason "not a
+# --dry-run"` and `close x` on one line with `--dry-run` on the next both
+# fold to text holding the flag. So the arguments are read from the SHELL
+# READER's words for each invocation (`_commands_run`), and a verb is let
+# through only when the reader reads as many helm invocations of it as the
+# fold found in its busiest reading, and every one of them writes nothing.
+# A spelling the reader does not see (a word assembled around an expansion,
+# an option between the group and the verb, a quoted mention) leaves a text
+# match unaccounted for, and the verb is refused; so is every verb in text
+# the reader cannot settle. The reader only ever LETS THROUGH what the fold
+# found: it never adds a refusal.
+#
+# A TEST HOME is a HELM_HOME assignment in the invocation's OWN prefix
+# (`HELM_HOME=v helm ...`, `env HELM_HOME=v helm ...`) that names a LITERAL
+# path: `~` and a leading `$HOME` expand as bash expands them, a relative
+# path joins the directory the invocation runs in, and the result must
+# resolve (realpath) to neither the home this process's helm resolves
+# (home.helm_home) nor the default one (home.default_home). A value holding
+# another variable or a substitution, no value, and a relative path in a
+# directory the text does not settle are not test homes.
+#
+# OWN PREFIX ONLY, BECAUSE THE READER DOES NOT MODEL SHELL STATE. A value set
+# by an earlier statement (`export HELM_HOME=v; helm ...`) reaches the
+# invocation only if nothing between them ended or undid it, and the reader
+# cannot say: it flattens a subshell `( ... )`, a pipeline element and a
+# background job, which each drop the export; it reads what `bash -c` runs
+# without knowing that the child's export dies with it; and `unset`, `export
+# -n` and every env spelling that clears a name undo it. Each of those was
+# measured exempting a write to the LIVE ledger, one instance at a time
+# (a reviewer's fold read, then the coordinator's), so no export counts at
+# all: a delegate that means a test home spells it on the call. For the same
+# reason, in the prefix any option word after an `env` word (`-`, `-i`, `-u
+# X`, `-uX`, `--unset=X`, `-C`, `-S`, a cluster, a word the text does not
+# settle) voids the assignment beside it, and so does `sudo`: refusing `env
+# -u OTHER HELM_HOME=v helm ...` is the accepted cost.
+
+
+def _named_home(raw, here):
+    """The helm home the value `raw` of a HELM_HOME assignment names, as
+    helm resolves it, or None where the text does not settle it."""
+    m = _HOME_WORD.match(raw)
+    if m:
+        rest = raw[m.end():]
+        if "$" in rest or "`" in rest or rest.count('"') > 1:
+            return None
+        path = os.path.expanduser("~") + rest.replace('"', "")
+    else:
+        if "$" in raw or "`" in raw:
+            return None
+        try:
+            parts = shlex.split(raw)
+        except ValueError:
+            return None
+        if len(parts) != 1 or not parts[0]:
+            return None
+        path = os.path.expanduser(parts[0])
+    if not os.path.isabs(path):
+        if here is None:
+            return None
+        path = os.path.join(here, path)
+    return path
+
+
+def _test_home(raw, here):
+    """Whether HELM_HOME value `raw`, for an invocation run in `here`, names
+    a home that is not the live one."""
+    path = None if raw is None else _named_home(raw, here)
+    if path is None:
+        return False
+    live = {os.path.realpath(home.helm_home()),
+            os.path.realpath(home.default_home())}
+    return os.path.realpath(path) not in live
+
+
+def _helm_argv(name, words, k):
+    """The argument values of a helm invocation (the words after `helm`),
+    or None when the command at words[k] is not helm."""
+    vals = [w.value() for w in words[k + 1:]]
+    if name and _PYTHON.fullmatch(name) and vals[:2] == ["-m", "helm"]:
+        return vals[2:]
+    if name and name.rsplit("/", 1)[-1] == "helm":
+        return vals
+    return None
+
+
+def _own_home(prefix):
+    """The value of the HELM_HOME assignment in an invocation's own prefix
+    words, or None: none there, or voided by `sudo` or by any option word
+    after an `env` word (see above)."""
+    if any(w.value() == "sudo" for w in prefix):
+        return None
+    for i, w in enumerate(prefix):
+        if w.value() == "env" and any(
+                (v.value() or "-").startswith("-") for v in prefix[i + 1:]):
+            return None
+    own = [w.raw[len(_HOME_ASSIGNMENT):] for w in prefix
+           if w.raw.startswith(_HOME_ASSIGNMENT)]
+    return own[-1] if own else None
+
+
+#: xargs/parallel options that take a VALUE in the next word (a superset of
+#: both tools': skip the value so it is not read as the invoked command)
+_FED_VALUE_OPTS = frozenset((
+    "-a", "--arg-file", "-E", "-I", "--replace", "-L", "--max-lines",
+    "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars",
+    "-d", "--delimiter", "--process-slot-var", "-j", "--jobs", "-N",
+    "--colsep", "-S", "--sshlogin", "--slf", "--sshloginfile", "--tmpdir",
+    "--joblog", "--results", "--retries", "--timeout"))
+#: their value-less flags
+_FED_FLAG_OPTS = frozenset((
+    "-0", "--null", "-p", "--interactive", "-r", "--no-run-if-empty",
+    "-t", "--verbose", "-x", "--exit", "-o", "--open-tty", "--show-limits",
+    "-i", "-l", "-e", "-k", "--keep-order", "-u", "--ungroup", "-m", "-X",
+    "--will-cite", "-c", "--gnu"))
+#: wrappers that RUN the command after their own options; helm reached
+#: through one is still invoked (`xargs sudo helm`), so an unpeeled wrapper
+#: is the unknown. `env` is peeled below because it is the common one and a
+#: grep it wraps (`xargs env grep helm`) is a read.
+_FED_WRAPPERS = frozenset(("sudo", "doas", "nohup", "setsid", "nice",
+                           "ionice", "stdbuf", "time", "timeout", "chrt",
+                           "taskset"))
+#: env options that take a value in the next word
+_ENV_VALUE_OPTS = frozenset(("-u", "--unset", "-C", "--chdir", "-P",
+                             "-S", "--split-string"))
+
+
+def _peel_env(ws, i):
+    """The index in `ws` of the command `env` runs, past its assignments and
+    its own options, or None where the words do not settle it."""
+    while i < len(ws):
+        w = ws[i].value()
+        if w is None:
+            return None
+        if w == "--":
+            return i + 1
+        if re.match(r"[A-Za-z_][A-Za-z_0-9]*=", w):
+            i += 1                          # NAME=VALUE assignment
+            continue
+        if not w.startswith("-"):
+            return i                        # the command word
+        if "=" in w:                        # --unset=NAME
+            i += 1
+            continue
+        if len(w) > 2 and w[1] != "-" and ("-" + w[1]) in _ENV_VALUE_OPTS:
+            i += 1                          # -uNAME: value attached
+            continue
+        if w in _ENV_VALUE_OPTS:            # -u NAME: value in the next word
+            i += 2
+            continue
+        i += 1                              # a flag (-i, -0, -v) or unknown
+    return None
+
+
+def _fed_command_word(ws):
+    """The basename of the command xargs/parallel invokes, or None when the
+    option list cannot be settled — an unknown option that might take a value,
+    an unpeeled wrapper, a word the reader cannot read, or a `parallel` arg
+    separator (task/3071 cure). "" where the tool runs its default (only
+    options, no command). Only the INVOKED command is the runtime feed:
+    `xargs grep -n helm` runs grep and hands it helm as a pattern, which is a
+    read; `xargs env helm`, `xargs sudo helm` and `xargs python3 -m helm` run
+    helm and are the feed."""
+    i = 0
+    while i < len(ws):
+        w = ws[i].value()
+        if w is None:
+            return None                     # a substitution/unsettleable word
+        if w in (":::", "::::", ":::+", "::::+"):
+            return None                     # parallel arg separators
+        if not w.startswith("-") or w == "-":
+            base = w.rsplit("/", 1)[-1]
+            if _PYTHON.fullmatch(base):
+                # python -m helm runs helm; python script.py does not
+                rest = [ws[j].value() for j in range(i + 1, len(ws))]
+                if "-m" in rest:
+                    nxt = rest[rest.index("-m") + 1:rest.index("-m") + 2]
+                    if nxt and nxt[0] and nxt[0].rsplit("/", 1)[-1] == "helm":
+                        return "helm"
+                return base
+            if base == "env":
+                nxt = _peel_env(ws, i + 1)
+                if nxt is None:
+                    return None
+                i = nxt
+                continue
+            if base in _FED_WRAPPERS:
+                return None                 # a wrapper we do not peel
+            return base
+        if "=" in w:                        # --opt=value: attached
+            i += 1
+            continue
+        if w in _FED_FLAG_OPTS:
+            i += 1
+            continue
+        if w in _FED_VALUE_OPTS:            # value in the next word
+            i += 2
+            continue
+        if len(w) > 2 and w[1] != "-" and ("-" + w[1]) in _FED_VALUE_OPTS:
+            i += 1                          # short option with attached value
+            continue
+        if len(w) >= 2 and w[1] != "-" \
+                and all(("-" + c) in _FED_FLAG_OPTS for c in w[1:]):
+            i += 1                          # a cluster of known flags
+            continue
+        return None                         # unknown option → cannot settle
+    return ""                               # no command word: the default
+
+
+def _runtime_fed_helm(command):
+    """Whether `command` hands `helm` its arguments at RUNTIME: xargs or
+    parallel INVOKING `helm` (its verb then arriving from stdin), or
+    eval/source of text the reader cannot settle that the fold saw the name
+    in (task/3071, the row owner's ruling: the reader sees helm but not its
+    verb, and unknown refuses). The verb then comes from stdin or a
+    substitution, and no spelling rule can see it. Only the invoked command
+    counts: helm handed to another program as data (`xargs grep -n helm`) is
+    a read; an option list the reader cannot settle is the unknown too."""
+    try:
+        calls = _commands_run((command or "").replace("\\\n", ""), None)
+    except Exception:
+        return False
+    for name, words, k in ((c[0], c[1], c[2]) for c in calls):
+        if name in ("xargs", "parallel"):
+            word = _fed_command_word(words[k + 1:])
+            if word is None or word == "helm":
+                return True
+        if name in ("eval",):
+            # eval of a COMMAND SUBSTITUTION or variable whose raw text names
+            # helm: the helm the fold saw may live inside the text eval runs.
+            # A $'...' ANSI-C word is statically readable and its content has
+            # already met the fold — only a substitution ($(...) or `...`),
+            # where the text is genuinely unknowable, is the unknown.
+            for w in words[k + 1:]:
+                if w.value() is None and "helm" in w.raw \
+                        and ("$(" in w.raw or "`" in w.raw):
+                    return True
+    return False
+
+
+def _authority_exempt(command, cwd, hits, readings):
+    """The verbs of `hits` [(pattern, "group verb")] that `command` runs only
+    in spellings that write nothing (see above), as a set."""
+    from . import delegate_grant
+    try:
+        calls = _commands_run((command or "").replace("\\\n", ""),
+                              cwd if isinstance(cwd, str)
+                              and os.path.isabs(cwd) else None)
+    except Exception:          # _Unsettled, or the reader's defect
+        return set()
+    runs = {}
+    for name, words, k, at in calls:
+        vals = _helm_argv(name, words, k)
+        if not vals or len(vals) < 2 \
+                or (vals[0], vals[1]) not in delegate_grant.REFUSED:
+            continue
+        raw = _own_home(words[:k])
+        quiet = delegate_grant.writes_nothing(vals[0], vals[1], vals[2:]) \
+            or _test_home(raw, at)
+        seen = runs.setdefault("%s %s" % (vals[0], vals[1]), [0, True])
+        seen[0] += 1
+        seen[1] = seen[1] and quiet
+    texts = readings.split(_READING_BREAK)
+    out = set()
+    for pattern, verb in hits:
+        count, quiet = runs.get(verb, (0, False))
+        if quiet and count >= max(len(pattern.findall(t)) for t in texts):
+            out.add(verb)
+    return out
+
+
+def _runs_what_it_wrote(command):
+    """Whether `command` runs a file it writes itself: a file an output
+    redirect or `tee` writes that is also a program word, or a script handed
+    to a shell, node, perl or ruby. What the data cut took from such a
+    command may be that script's text, so none of it is data. A script
+    handed to python counts only where the command names a way to start a
+    process (`_SPAWNS`), the rule python's own text is read by. Text the
+    reader cannot settle is answered True."""
+    try:
+        tokens = _ShellReader(command).read()
+    except Exception:          # _Unsettled, or the reader's defect
+        return True
+    commands = _simple_commands(tokens)
+    written = {tok[2].raw for tok in tokens if tok[0] == "r" and ">" in tok[1]
+               and not tok[2].raw.isdigit()
+               and not tok[2].raw.startswith("/dev/")}
+    for cmd in commands:
+        name, k = _program(cmd.words)
+        if name == "tee":
+            written.update(w.raw for w in cmd.words[k + 1:]
+                           if not (w.value() or "-").startswith("-"))
+    if not written:
+        return False
+    bases = {posixpath.basename(w.strip("'\"")) for w in written}
+    # python's own text is read by the allowlist now (task/3071): a written
+    # script fed to python counts as code when its TEXT is not inert — the
+    # denylist this replaces read `import os as o` beside a written spawn as
+    # data and the verb in it never reached the fold.
+    import re as _re
+    py_texts = [m.group(2) for m in
+                _re.finditer(r"(?ms)<<'?(\w+)'?\n(.*?)\n\1", command)]
+    python_is_code = bool(_SPAWNS.search(command)) or any(
+        not python_text_inert(t) for t in py_texts)
+    for cmd in commands:
+        name, k = _program(cmd.words)
+        if k is None:
+            continue
+        base = (name or "").rsplit("/", 1)[-1]
+        runs = [cmd.words[k]]
+        if base in _STDIN_SHELLS or base in ("node", "perl", "ruby") or (
+                _PYTHON.fullmatch(base) and python_is_code):
+            runs += cmd.words[k + 1:]
+        if any(w.raw in written
+               or posixpath.basename(w.raw.strip("'\"")) in bases
+               for w in runs):
+            return True
+    return False
+
+
+def _argv_sequence_verbs(elts):
+    """The refused verbs a SEQUENCE of ast elements spells as an argv, or [].
+
+    ONE RULE for every way python spells an argv as separate words (task/3071,
+    the row owner's ruling): the elements of a list or tuple
+    (`subprocess.run(["helm","dispatch","verdict",row,tip,"--approve"])`) and
+    the positional args of a call (`os.execlp("helm","helm","lr","close",x)`,
+    `os.execvp("helm",[...])`, `asyncio.create_subprocess_exec("helm",...)`).
+    A constant `helm` word — `helm`, a string ending in `/helm`, or `helm`
+    after a constant `-m` — with the constant group and verb after it names
+    the invocation, and no text pattern sees it: the words are comma-joined,
+    not shell-spaced. Elements BEFORE the helm word may be anything (a
+    variable python path, `sys.executable`, an exec mode); elements AFTER the
+    verb may be variables (the row, the tip). Only the group and the verb
+    must be spelled constants — which is exactly what the table asks about.
+
+    THE READ REUSES THE TEXT TABLE, not a second rule for the option window.
+    (An `import ast` is local, paid only by python calls.)
+    Each maximal RUN of single-token string constants (a value with a space
+    is one arg, not two, so it never joins a run — a whole `helm dispatch
+    verdict` STRING handed to grep stays one word and spells nothing) is
+    joined with spaces and the refused-verb patterns are searched over it,
+    so `helm dispatch --json verdict` matches through the same option window
+    as a shell invocation, and `helm` beside a variable group or verb does
+    not."""
+    import ast                              # local: paid only by python calls
+    out = []
+    run = []
+    runs = []
+    for e in elts:
+        if isinstance(e, ast.Constant) and isinstance(e.value, str) \
+                and " " not in e.value and "\t" not in e.value:
+            run.append(e.value)
+        else:
+            if run:
+                runs.append(run)
+            run = []
+    if run:
+        runs.append(run)
+    for run in runs:
+        text = " ".join(run)
+        for pattern, verb in _authority_patterns():
+            if pattern.search(text):
+                out.append(verb)
+    return out
+
+
+def _python_argv_verbs(command):
+    """The refused verbs ("group verb") a python text in `command` spells as
+    an argv of separate words (`_argv_sequence_verbs`, task/3071): a list or
+    tuple, or the positional args of a call. The walk is ast over each python
+    text the command holds — a `-c` word, a heredoc body fed to python, and
+    the body of a python script the same command WRITES then RUNS (task/3071:
+    `cat > s.py <<'EOF' … EOF; python3 s.py`, the body `_runs_what_it_wrote`
+    proves is run). Each invocation found is judged by the same table and
+    joins the hits, so the grant door below admits it exactly as a spelled
+    invocation would be admitted. The writes-nothing exemptions do NOT reach
+    it — a `--dry-run` or `--help` SPELLED INSIDE A LIST is refused, and the
+    cure is to spell that read in the shell, where the exemption is read."""
+    import ast                              # local: paid only by python calls
+
+    texts = []
+
+    try:
+        tokens = _ShellReader(command or "").read()
+    except Exception:
+        return ()
+    for cmd in _simple_commands(tokens):
+        name, k = _program(cmd.words)
+        if not name or not _PYTHON.fullmatch(name.rsplit("/", 1)[-1]):
+            continue
+        args = cmd.words[k + 1:]
+        j = 0
+        while j < len(args):
+            v = args[j].value()
+            if v is None or v == "-m" or not v.startswith("-") or v == "-":
+                break
+            if re.fullmatch(r"-[A-Za-z]*c", v) and j + 1 < len(args):
+                if args[j + 1].value():
+                    texts.append(args[j + 1].value())
+                break
+            j += 2 if v in ("-W", "-X") else 1
+    # heredoc bodies fed to a python command, and — when the command writes a
+    # python script and then runs it — every heredoc body it holds (the
+    # written script is fed to `cat`, not python, so `cmd.docs` misses it;
+    # `_runs_what_it_wrote` proves a written file is run). An inert or
+    # non-python body is dropped by the loop below.
+    try:
+        reader = _ShellReader(command or "")
+        reader.read()
+        bodies = {at: "\n".join(reader.lines[start:end])
+                  for at, _q, start, end in reader.bodies}
+        for cmd in _simple_commands(tokens):
+            name, k = _program(cmd.words)
+            if name and _PYTHON.fullmatch(name.rsplit("/", 1)[-1]):
+                for at in cmd.docs:
+                    if at in bodies:
+                        texts.append(bodies[at])
+        if _runs_what_it_wrote(command or ""):
+            texts.extend(bodies.values())
+    except Exception:
+        pass
+
+    out = []
+    for src in texts:
+        # an INERT text is data the cut removed; judging its contents is the
+        # write-about refusal the data cut exists to lift
+        if python_text_inert(src):
+            continue
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.List, ast.Tuple)):
+                out.extend(_argv_sequence_verbs(node.elts))
+            elif isinstance(node, ast.Call):
+                out.extend(_argv_sequence_verbs(node.args))
+    return tuple(dict.fromkeys(out))
+
+
+def _authority_text(command):
+    """`command` less the data the shell reader proves (see above). Python's
+    text is code when the command anywhere names a way to start a process or
+    holds python text that is not inert under the allowlist (task/3071);
+    a command that runs a file it writes keeps all its text."""
+    interpreters = _PYTHON if _SPAWNS.search(command or "") else None
+    text, _code = _invocation_text(command or "", interpreters)
+    if text != command and _runs_what_it_wrote(command or ""):
+        return command
+    return text
+
+
+def sidechain_authority_verbs(command, cwd=None):
+    """Every refused verb ("group verb") `command` RUNS, in the table's order,
+    less those it runs only in spellings that write nothing; () when it runs
+    none. The fold reads the command less its data (`_authority_text`), and
+    only once its whole text has named a refused verb, so a command that
+    names none pays for no cut. `cwd` is the payload's, for a relative
+    HELM_HOME."""
+    readings = _readings(command)
+    if not _AUTHORITY_GATE.search(readings):
+        return ()
+    # a python argv LIST holds its words comma-joined, which no text pattern
+    # matches; the ast walk answers it and pays only where python is spelled
+    extra = _python_argv_verbs(command) \
+        if _PYTHON.search(readings) else ()
+    runtime_unknown = not extra and _runtime_fed_helm(command)
+    if not any(pattern.search(readings)
+               for pattern, _verb in _authority_patterns()) and not extra \
+            and not runtime_unknown:
+        return ()
+    readings = _readings(_authority_text(command))
+    hits = [(pattern, verb) for pattern, verb in _authority_patterns()
+            if pattern.search(readings)]
+    # the LIST walk's verbs join the hits and pass through the same grant
+    # door and exemptions below
+    extra = [verb for verb in extra if verb not in {v for _p, v in hits}]
+    # RUNTIME-SUPPLIED ARGS (task/3071, the owner's ruling): the command
+    # named helm but its verb arrives at runtime — xargs/parallel feeding a
+    # helm word, eval of unsettleable text. Unknown refuses, and the refusal
+    # says UNKNOWN rather than naming a verb nobody saw.
+    if runtime_unknown and not extra and not hits:
+        extra = ["helm (runtime-supplied arguments)"]
+    if not hits and not extra:
+        return ()
+    if extra == ["helm (runtime-supplied arguments)"]:
+        return tuple(extra)
+    exempt = _authority_exempt(command, cwd, hits, readings)
+    return tuple(verb for _pattern, verb in hits if verb not in exempt) \
+        + tuple(verb for verb in extra if verb not in exempt)
+
+
+def sidechain_authority_presence(command, cwd=None):
+    """The first refused verb `command` runs, or None — the one question the
+    rung asks of a delegate's command before it asks the grant."""
+    verbs = sidechain_authority_verbs(command, cwd)
+    return verbs[0] if verbs else None
+
+
+def _sidechain_authority(d, cmd):
+    """(refusal-or-None, admitted lines) for a DELEGATE's Bash or Monitor
+    command. Every refused verb the command runs must be admitted by a live
+    grant on the payload's session, or the call is refused naming the first
+    that is not; each admitted verb says which grant admitted it."""
+    verbs = sidechain_authority_verbs(cmd, d.get("cwd"))
+    if not verbs:
+        return None, []
+    from . import actors, delegate_grant
+    # RUNTIME-SUPPLIED ARGS: no grant can name a verb nobody saw, so the
+    # unknown is refused outright, in its own words.
+    if verbs[0] == "helm (runtime-supplied arguments)":
+        return ("[helm argv-guard] BLOCKED: %s"
+                % actors.sidechain_authority_refusal(
+                    "(runtime-supplied arguments: the command runs helm with "
+                    "words the reader cannot see — xargs/parallel feeding it, "
+                    "or eval of unsettleable text — and unknown refuses. "
+                    "Spell the invocation, or report to your parent)",
+                    False)), []
+    admitted = []
+    for verb in verbs:
+        grant = delegate_grant.admits(d.get("session_id"), verb)
+        if grant is None:
+            grantable = tuple(verb.split()) in delegate_grant.GRANTABLE
+            return ("[helm argv-guard] BLOCKED: %s"
+                    % actors.sidechain_authority_refusal(verb, grantable)), []
+        admitted.append((
+            "delegate-grant-%s" % grant["id"],
+            "[helm argv-guard] admitted under grant %s: `%s` from a "
+            "delegate, by this seat's own grant"
+            % (grant["id"], "helm " + verb)))
+    return None, admitted
+
+
 # TWO ROUTES, BECAUSE THE LONG FORM LIVES IN TWO PLACES. The premise carries the
 # owner's rule in his words and nothing else; the folding semantics that decide
 # where the character index counts, and the full allow list (a single spelling
@@ -8392,6 +9215,1357 @@ def owner_posture_forge_message(hit, tool="Bash"):
             % ("command" if tool in ("Bash", "Monitor") else tool + " call",
                what))
 
+
+# THE ENV-DUMP RUNG (task/3037). A command that PRINTS the environment, the
+# value of a secret-looking variable or a credentials file puts every value in
+# it into the transcript, and the transcript goes to the model provider. In
+# another project a real production secret left that way, through a box's
+# env dump. This rung refuses the PRINT and never the USE: a variable passed
+# to the command that needs it, a presence check, and a file that is loaded or
+# copied all pass.
+#
+# IT READS PROGRAMS, NOT WORDS. The command goes through the shell reader the
+# Actions rung uses (`_ShellReader`), and a rule applies only to the program a
+# simple command RUNS. So `env` in a quoted string, a commit message, a grep
+# pattern or a heredoc body written to a file is never read as a dump. The
+# rung follows a command into a printer's `$(…)` (and `$(< FILE)`, which is
+# FILE), a reader's `<(…)` as an operand, a redirect or a here-string, the
+# substitutions of an unquoted heredoc body a reader prints, `bash -c`,
+# `eval`, a heredoc a shell reads, and the command that `ssh`, `docker exec`,
+# `kubectl exec` or `su -c` runs somewhere else, because that output comes
+# back to this terminal. The command in an output substitution `>(…)` writes
+# to THIS shell's stdout, so a dump run in one is read as a command of its own.
+#
+# A PRINT LEAKS ONLY WHERE IT REACHES THE TERMINAL: through every later stage
+# of its pipeline that passes its input on (`_ENV_PASSES`), and with no
+# redirect of its stdout to a file. A redirect to stderr or the tty, a `tee`
+# operand or an output file that is one, and a `>(…)` whose command passes
+# its input on reach it past the pipe. A reader whose output option or
+# operand names a file (`sort -o F`, `uniq IN OUT`, `_ENV_WRITERS`) writes
+# there and prints nothing, and that file is never one it reads. So `env |
+# sort` and `grep KEY .env` are refused, and `env | wc -l`, `grep -c KEY
+# .env`, `printenv TOKEN | gh auth login --with-token`, `cat .env > backup`,
+# `sort -o out .env` and `x=$(cat token)` pass. A
+# NAMES-ONLY filter (`cut -d= -f1`, `sed 's/=.*//'`, `awk -F= '{print $1}'`)
+# passes too: it prints no value. `export $(…)` is refused wherever its output
+# goes: an empty substitution runs a bare `export`, which prints every value,
+# and bash's error for a malformed line quotes that line.
+#
+# WHAT IT CANNOT SEE, stated for the next reader: a script run by its path,
+# an interpreter's own dump (`python3 -c 'print(os.environ)'`), `set -x`
+# tracing an expanded secret, a recursive grep that walks into a `.env`, a CLI
+# that prints its own token (`gh auth token`), and a file that is SOURCED but
+# is not valid shell, whose parse errors echo its values. The argv-guard never
+# reads file content, so the cures that load a file send its errors away
+# (`. FILE 2>/dev/null`). A lowercase name (`$key`) is read as a shell variable of
+# the command itself, not as an environment secret. Where the shell reader
+# cannot settle the text, only a bare dump on a line of its own is refused.
+_ENV_GATE = re.compile(
+    r"\b(?:env|printenv|export|set|declare|typeset|inspect)\b|environ"
+    r"|\$\{?[#!]?[A-Z_0-9]*(?:KEY|TOKEN|SECRET|PASS|CRED|PRIVATE|AUTH|MASTER"
+    r"|DSN|_UR[LI])"
+    r"|\$\{!|(?i:cred|secret|\.pem\b|\.key\b|token|\.netrc|\.pgpass"
+    r"|\.npmrc|\.pypirc|id_(?:rsa|[a-z]*dsa|ed\d+))")
+# a secret-looking NAME: a part (split at `_`) that is, or ends with, one of
+# these words, or starts with one of the heads. AUTHOR and AUTHORITY are not
+# AUTH, a name whose last part says WHERE a secret lives (FILE, PATH, DIR,
+# SOCK) holds a location, not the secret, and a KEY after a word that says
+# what it indexes (ORCA_PANE_KEY, SORT_KEY) is a handle, not a secret. A
+# database's URL, URI or DSN carries its password, so it is one.
+_SECRET_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE",
+                 "PASS", "CRED", "PRIVATE", "AUTH", "MASTER")
+_SECRET_HEADS = ("SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CRED",
+                 "PRIVATE", "AUTH")
+_SECRET_WHERE = frozenset(("FILE", "PATH", "DIR", "SOCK"))
+_SECRET_HANDLES = frozenset(("PANE", "SORT", "CACHE", "PARTITION", "ROUTING",
+                             "LOOKUP", "IDEMPOTENCY", "PRIMARY", "FOREIGN"))
+_SECRET_STORES = frozenset(("DATABASE", "DB", "POSTGRES", "POSTGRESQL", "PG",
+                            "MYSQL", "REDIS", "MONGO", "MONGODB", "AMQP",
+                            "RABBITMQ"))
+# a credentials file, by its base name; a template, a public key and a source
+# or document file are not one
+_CRED_FILE = re.compile(
+    r"(?i)^\.env(?:$|[._-])|\.env$|(?<![a-z])(?:credential|secret)"
+    r"|\.pem$|\.key$|(?<![a-z])token(?!s|i[sz])|(?:^|[._-])creds?(?:$|[._-])"
+    r"|^id_(?:rsa|[a-z]*dsa|ed\d+)"
+    r"|^\.(?:netrc|pgpass|npmrc|pypirc)$")
+_NOT_CRED_FILE = re.compile(
+    r"(?i)\.(?:example|sample|template|tmpl|dist)(?:\.|$)"
+    r"|\.(?:pub|py|pyc|js|mjs|cjs|ts|tsx|jsx|rs|go|rb|java|kt|kts|scala|c|h"
+    r"|cc|cpp|hpp|cs|swift|php|sh|bash|zsh|fish|md|rst|html|css|scss|vue"
+    r"|svelte|lua|pl|pm|ex|exs|erl|hs|ml|sql|proto|lock|orig|rej|diff|patch"
+    r"|mdx|log|jsonl|out|err|csv|tsv)$")
+_PROC_ENVIRON = re.compile(r"^/proc/[^/\s]+/(?:task/[^/\s]+/)?environ$")
+# the readers whose first operand is a pattern or a script, not a file
+_ENV_SCRIPTED = frozenset(("grep", "egrep", "fgrep", "zgrep", "rg", "ag",
+                           "ugrep", "sed", "awk", "gawk", "mawk", "nawk",
+                           "jq", "yq"))
+_ENV_GREPS = frozenset(("grep", "egrep", "fgrep", "zgrep", "rg", "ag",
+                        "ugrep"))
+_ENV_AWKS = frozenset(("awk", "gawk", "mawk", "nawk"))
+# a grep's options that take the NEXT word as their value, which is neither
+# its pattern nor a file (rg alone reads -E and -r so)
+_ENV_GREP_VALUED = frozenset((
+    "-A", "-B", "-C", "-m", "-d", "-D", "--include", "--exclude",
+    "--exclude-dir", "--exclude-from", "--label", "--context",
+    "--after-context", "--before-context", "--max-count", "-g", "--glob",
+    "--iglob", "-t", "--type", "-T", "--type-not", "-M", "--max-columns",
+    "--max-depth", "-j", "--threads", "--max-filesize", "--encoding",
+    "--replace", "--sort", "--sortr", "--pre", "--pre-glob", "--ignore-file",
+    "--type-add", "--colors", "--path-separator", "--context-separator",
+    "--engine"))
+# the programs that print what they read from a FILE operand. The formatters
+# fmt/pr/expand/unexpand print a file operand exactly as `cat` does, so they
+# belong here, not only in _ENV_PASSES (task/3037).
+_ENV_READERS = _ENV_SCRIPTED | frozenset((
+    "cat", "tac", "head", "tail", "less", "more", "bat", "batcat", "nl",
+    "strings", "od", "xxd", "hexdump", "base64", "sort", "uniq", "cut",
+    "diff", "column", "fold", "paste", "rev", "zcat", "fmt", "pr", "expand",
+    "unexpand", "comm", "join", "iconv"))
+# THE READERS THAT CAN WRITE WHAT THEY PRINT TO A FILE (task/3037): the file
+# an output option or an output operand names is WRITTEN, never read, and a
+# reader that writes to a file prints nothing. Each: the short letters and the
+# long options that take a value (xxd reads whole words, `-c 8`, `-cols 8`),
+# the role of an option whose value is a file ("in" read, "out" written), and
+# whether the second operand is the output (uniq, xxd). BSD base64 takes -i and
+# -o; GNU base64 refuses -o and prints nothing.
+_ENV_WRITERS = {
+    "sort": ("kotST", ("--key", "--output", "--field-separator",
+                       "--buffer-size", "--temporary-directory",
+                       "--files0-from", "--batch-size", "--parallel",
+                       "--compress-program", "--random-source", "--sort"),
+             {"-o": "out", "--output": "out"}, False),
+    "uniq": ("fsw", ("--skip-fields", "--skip-chars", "--check-chars"), {},
+             True),
+    "base64": ("bwio", ("--wrap", "--break", "--input", "--output"),
+               {"-i": "in", "--input": "in", "-o": "out", "--output": "out"},
+               False),
+    "xxd": ("", ("-c", "-cols", "-g", "-groupsize", "-l", "-len", "-n",
+                 "-name", "-o", "-offset", "-s", "-seek", "-R"), {}, True),
+    "iconv": ("fto", ("--from-code", "--to-code", "--output"),
+              {"-o": "out", "--output": "out"}, False),
+}
+# the programs that print what they read from STDIN: a stage of these carries
+# a dump on to the terminal, and any other program is the command that NEEDS
+# the value (a login, an upload, a count) and prints none of it. `tee` reads
+# stdin but takes no cred-file OPERAND (its operands are write targets), so
+# it is here and not in _ENV_READERS.
+_ENV_PASSES = _ENV_READERS | frozenset((
+    "tr", "tee", "xargs"))
+_ENV_PRINTERS = frozenset(("echo", "printf", "print"))
+_ENV_SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh", "mksh", "ash",
+                         "fish"))
+_ENV_BOXES = frozenset(("docker", "podman", "nerdctl", "kubectl", "oc",
+                        "lxc", "incus"))
+_ENV_BOX_VALUED = frozenset((
+    "-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir",
+    "--detach-keys", "-n", "--namespace", "-c", "--container", "--context",
+    "--cluster", "--kubeconfig", "--name", "-v", "--volume", "-p",
+    "--publish", "--network", "--net", "--entrypoint", "--platform", "-l",
+    "--label", "--mount", "-m", "--memory", "--cpus", "--add-host", "-h",
+    "--hostname", "--restart", "--pull", "--cap-add", "--cap-drop",
+    "--device", "--gpus", "--ipc", "--pid", "--security-opt", "--tmpfs",
+    "--ulimit", "--log-driver", "--log-opt", "--shm-size", "-f", "--file",
+    "--project-name", "--profile", "--index", "--pod-running-timeout"))
+# a container runtime's `inspect` of these nouns prints no environment
+_ENV_BOX_NOUNS = frozenset(("network", "volume", "node", "plugin", "context",
+                            "manifest", "buildx", "secret"))
+_SSH_VALUED = frozenset("BbcDEeFIiJLlmOopPQRSWw")
+# a write target that is this command's stdout, and one that is the terminal
+# past its stdout; a bare digit is an fd only after `>&`, and a file elsewhere
+_ENV_STDOUTS = frozenset(("/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"))
+_ENV_ASIDE = frozenset(("/dev/stderr", "/dev/tty", "/dev/fd/2",
+                        "/proc/self/fd/2"))
+_ENV_EXPANSION = re.compile(
+    r"\$(?:([A-Za-z_]\w*)|\{([#!]?)([A-Za-z_]\w*)([^}]*)\})")
+_ENV_ENUMERATES = re.compile(r"\bcompgen\b|\$\{![A-Za-z_]\w*[*@]\}")
+_ENV_CRUDE_SPLIT = re.compile(r"&&|\|\||[;&|\n()`]|\$\(")
+_ENV_CRUDE_DOC = re.compile(
+    r"(?<!<)<<-?[ \t]*['\"]?([A-Za-z_][\w.-]*)")
+_ENV_SPELL = 60
+
+
+def _secret_name(name):
+    """Whether an environment NAME looks like it holds a secret."""
+    if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name or "") \
+            or not re.search(r"[A-Z]", name):
+        return False
+    parts = [p for p in name.split("_") if p]
+    if len(parts) > 1 and (parts[-1] in _SECRET_WHERE or (
+            parts[-1] == "KEY" and parts[-2] in _SECRET_HANDLES)):
+        return False
+    if "DSN" in parts or (_SECRET_STORES.intersection(parts)
+                          and {"URL", "URI"}.intersection(parts)):
+        return True
+    return any(not (p.startswith("AUTHOR") and not p.startswith("AUTHORIZ"))
+               and (p.startswith(_SECRET_HEADS)
+                    or any(p == w or p.endswith(w) for w in _SECRET_WORDS))
+               for p in parts)
+
+
+def _env_text(word):
+    """What a word spells with its quotes gone: its value where the text
+    settles it, else its raw text less one pair of outer quotes."""
+    v = word.value()
+    if v is not None:
+        return v
+    raw = word.raw
+    if len(raw) > 1 and raw[0] == raw[-1] and raw[0] in "'\"":
+        return raw[1:-1]
+    return raw
+
+
+def _cred_path(text):
+    """The spelling of a credentials file or a process environment that a
+    path names, or None."""
+    if _PROC_ENVIRON.match(text):
+        return "/proc/<pid>/environ"
+    base = text.rstrip("/").rsplit("/", 1)[-1]
+    if _CRED_FILE.search(base) and not _NOT_CRED_FILE.search(base):
+        return base
+    return None
+
+
+def _secret_expansions(raw, body=False):
+    """(the first secret-looking name whose VALUE `raw` expands, whether it
+    expands a variable by indirection). Single quotes hide an expansion
+    except in a heredoc `body`; a length (`${#N}`), an alternate value
+    (`${N:+x}`) and a list of names (`${!N*}`) print no value."""
+    found, indirect, dq, i, n = None, False, False, 0, len(raw)
+    while i < n:
+        c = raw[i]
+        if c == "\\":
+            i += 2
+        elif c == "'" and not dq and not body:
+            j = raw.find("'", i + 1)
+            i = n if j < 0 else j + 1
+        elif c == '"' and not body:
+            dq, i = not dq, i + 1
+        elif c == "$" and raw.startswith("$'", i) and not dq and not body:
+            j = i + 2
+            while j < n and raw[j] != "'":
+                j += 2 if raw[j] == "\\" else 1
+            i = j + 1
+        elif c == "$":
+            m = _ENV_EXPANSION.match(raw, i)
+            if not m:
+                i += 1
+                continue
+            name, mark, braced, op = m.groups()
+            if name:
+                found = found or (name if _secret_name(name) else None)
+            elif mark == "!":
+                indirect = indirect or not op.startswith(("*", "@", "["))
+            elif not mark and not op.startswith((":+", "+")) \
+                    and _secret_name(braced):
+                found = found or braced
+            i = m.end()
+        else:
+            i += 1
+    return found, indirect
+
+
+def _env_redirect_fd(text, op, target):
+    """The fd a redirection names before its operator, '' for none. The
+    reader drops it, and `2>/dev/null` must not read as stdout."""
+    j = target.start
+    while j > 0 and text[j - 1] in " \t":
+        j -= 1
+    j -= len(op)
+    m = re.search(r"(?:^|[\s;&|()])(\d+|\{[A-Za-z_]\w*\})$",
+                  text[max(0, j - 16):j])
+    return m.group(1) if m else ""
+
+
+def _env_stages(tokens, text):
+    """The pipelines of a token stream: each a list of stages, each stage
+    (words, redirections as (op, fd, target), heredoc positions)."""
+    pipes = [[([], [], [])]]
+    for tok in tokens:
+        kind, stage = tok[0], pipes[-1][-1]
+        if kind == "w":
+            stage[0].append(tok[1])
+        elif kind == "r":
+            stage[1].append((tok[1], _env_redirect_fd(text, tok[1], tok[2]),
+                             tok[2]))
+        elif kind == "h":
+            stage[2].append(tok[1])
+        elif kind == "p":
+            pipes[-1].append(([], [], []))
+        else:
+            pipes.append([([], [], [])])
+    return pipes
+
+
+def _env_options(words, k, valued=(), flags=()):
+    """`_options` for a program whose unknown option is a flag."""
+    while k < len(words):
+        v = words[k].value()
+        if v is None or v == "-" or not v.startswith("-"):
+            return k
+        if v == "--":
+            return k + 1
+        k += 2 if v in valued else 1
+    return k
+
+
+def _env_unwrap(words):
+    """(index, name, dump) of what a stage runs: past its prefix words,
+    assignments and wrappers, and past `env` launching a command. `dump` is
+    the spelling of an `env` that launches nothing and so prints the
+    environment; `name` is None where nothing runs or the text does not
+    settle it. `env -S` hands its string on as `(index, "env -S", None)`."""
+    k = 0
+    while k < len(words):
+        w = words[k]
+        v = w.value()
+        if w.plain and w.raw in _COMMAND_PREFIX:
+            k += 2 if w.raw == "time" and k + 1 < len(words) \
+                and words[k + 1].raw == "-p" else 1
+        elif _GRANT_ASSIGNMENT.match(w.raw):
+            k += 1
+        elif v == "env" or (v or "").endswith("/env"):
+            k, cleared = k + 1, False
+            while k < len(words):
+                o = words[k].value()
+                if o in ("-S", "--split-string") or (o or "").startswith(
+                        ("-S", "--split-string=")):
+                    return k, "env -S", None
+                if o in ("-u", "--unset", "-C", "--chdir"):
+                    k += 2
+                elif o == "--":
+                    k += 1
+                    break
+                elif o in ("-", "--ignore-environment") or (
+                        o and re.fullmatch(r"-[i0v]*i[i0v]*", o)):
+                    cleared, k = True, k + 1
+                elif o and o.startswith("-") and len(o) > 1:
+                    k += 1
+                else:
+                    break
+            while k < len(words) and _GRANT_ASSIGNMENT.match(words[k].raw):
+                k += 1
+            if k >= len(words):
+                return k, None, None if cleared else "env"
+        elif v in _WRAPPERS:
+            k = _WRAPPERS[v](words, k + 1)
+            if k is None:
+                return None, None, None
+        elif v is None:
+            return k, None, None
+        else:
+            return k, v.rsplit("/", 1)[-1], None
+    return k, None, None
+
+
+def _env_getopt(name, args):
+    """(read, written) of a reader in _ENV_WRITERS, under its own reading of
+    its options: the operands and input files it reads, less the ones a
+    substitution fills, and the write targets its output goes to."""
+    short, valued, roles, second = _ENV_WRITERS[name]
+    ops, read, written, k = [], [], [], 0
+    while k < len(args):
+        w, k = args[k], k + 1
+        v = _env_text(w)
+        if v == "--":
+            ops += args[k:]
+            break
+        if w.subst or v == "-" or not v.startswith("-"):
+            ops.append(w)
+            continue
+        opt, value = v, None
+        if v.startswith("--") and "=" in v:
+            opt, value = v.split("=", 1)
+        elif v.startswith("--") or not short:
+            if v in valued:
+                value, k = args[k] if k < len(args) else None, k + 1
+        else:
+            at = next((i for i, c in enumerate(v) if i and c in short), None)
+            if at is not None:
+                opt, value = "-" + v[at], v[at + 1:] or None
+                if value is None:
+                    value, k = args[k] if k < len(args) else None, k + 1
+        if roles.get(opt) and value is not None:
+            (read if roles[opt] == "in" else written).append(value)
+    if second and len(ops) > 1:
+        written.append(ops.pop(1))
+    return ([_env_text(x) for x in ops + read
+             if isinstance(x, str) or not x.subst],
+            [x if isinstance(x, str) else _env_text(x) for x in written])
+
+
+def _env_sink(text):
+    """Where a write target sends what is written to it: "stdout", "aside"
+    (the terminal past this command's stdout: stderr, the tty, or an output
+    substitution whose command passes its input on), or None for a file."""
+    if text in _ENV_STDOUTS or text == "-":
+        return "stdout"
+    return "aside" if text in _ENV_ASIDE or _env_proc_passes(text) else None
+
+
+def _env_proc_passes(text):
+    """Whether `text` is an output substitution `>(…)` whose command carries
+    what it reads on to the terminal, since its stdout is this shell's."""
+    if not (text.startswith(">(") and text.endswith(")")):
+        return False
+    inner = text[2:-1]
+    try:
+        pipes = _env_stages(_ShellReader(inner).read(), inner)
+    except _Unsettled:
+        return True
+    return any(_env_reaches([([], [], [])] + p, 0) for p in pipes)
+
+
+def _env_quiet(name, args):
+    """Whether a reader stage prints NONE of what it reads: a grep that
+    counts, tests or lists files, a sed or yq editing in place, a reader
+    writing its output to a file, or a names-only filter over NAME=value
+    lines."""
+    vals = [_env_text(a) for a in args]
+    if name in _ENV_WRITERS:
+        return any(_env_sink(t) is None for t in _env_getopt(name, args)[1])
+    if name == "yq":
+        return any(v in ("-i", "--inplace") or v.startswith("--inplace=")
+                   for v in vals)
+    if name in _ENV_GREPS:
+        return any(v in ("--count", "--quiet", "--silent", "--count-matches",
+                         "--files-with-matches", "--files-without-match")
+                   or (re.fullmatch(r"-[A-Za-z]+", v)
+                       and set(v[1:]) & set("cqlL"))
+                   for v in vals)
+    if name == "sed":
+        if any(v.startswith("--in-place") or re.match(r"-[A-Za-z]*i", v)
+               for v in vals):
+            return True
+        return any(re.fullmatch(r"s(.)=\.\*\$?\1\1g?", v) for v in vals)
+    if name in _ENV_AWKS:
+        sep = any(v in ("-F=", "-F'='") for v in vals) or any(
+            a == "-F" and b == "=" for a, b in zip(vals, vals[1:]))
+        return sep and any(re.fullmatch(r"\{\s*print\s+\$1\s*;?\s*\}", v)
+                           for v in vals)
+    if name == "cut":
+        joined = " ".join(vals)
+        return bool(re.search(r"(?:^| )(?:-d ?=|--delimiter[= ]=)(?: |$)",
+                              joined)
+                    and re.search(r"(?:^| )(?:-f ?1|--fields[= ]1)(?: |$)",
+                                  joined))
+    return False
+
+
+def _env_narrows(name, args):
+    """Whether a grep prints no value but a named variable's: every pattern
+    alternative an exact NAME that does not look secret, bounded by `=`, -w
+    or -x so it matches no longer name; or, with -o, a pattern over name
+    characters that prints the name alone. Context lines, -v, -a and -f
+    patterns can print any line, so none of them narrows."""
+    if name not in _ENV_GREPS:
+        return False
+    words = [_env_text(a) for a in args]
+    pats, flags, k = [], set(), 0
+    while k < len(words):
+        w = words[k]
+        if w in ("-e", "--regexp"):
+            pats.append(words[k + 1] if k + 1 < len(words) else "")
+            k += 2
+        elif w.startswith("--regexp="):
+            pats.append(w.split("=", 1)[1])
+            k += 1
+        elif w.startswith("--"):
+            flags.add(w.split("=", 1)[0])
+            k += 2 if w in _ENV_GREP_VALUED else 1
+        elif w.startswith("-") and len(w) > 1:
+            k += 1
+            for i, ch in enumerate(w[1:]):
+                flags.add(ch)
+                if ch == "e" or ch in "ABCmdDgtTMj":
+                    rest = w[i + 2:]
+                    if ch == "e":
+                        pats.append(rest or (words[k] if k < len(words)
+                                             else ""))
+                    k += 0 if rest else 1
+                    break
+        else:
+            if not pats:
+                pats.append(w)
+            k += 1
+    if not pats or flags & {"v", "f", "a", "A", "B", "C", "--invert-match",
+                            "--file", "--text", "--context", "--after-context",
+                            "--before-context", "--passthru"}:
+        return False
+    only = bool(flags & {"o", "--only-matching"})
+    whole = bool(flags & {"w", "x", "--word-regexp", "--line-regexp"})
+    # after `=`: anything where the whole line is printed (the name is exact
+    # and not secret), but only literal text where -o prints the match, or
+    # `=.+` would print the value itself
+    value = r"=[A-Za-z0-9_:/@-]*" if only else r"=.*"
+    for pat in pats:
+        group = re.fullmatch(r"\^?\((.*)\)(%s)?\$?" % value, pat)
+        body, eq = group.groups() if group else (pat, None)
+        for alt in re.split(r"\\?\|", body):
+            m = re.fullmatch(r"\^?([A-Za-z_][A-Za-z0-9_]*)(%s)?\$?" % value,
+                             alt)
+            if only:
+                if not (m or re.fullmatch(
+                        r"(?:\^|[A-Za-z_]{3})[\w\[\]^*+?{}(),-]*(%s)?"
+                        % value, alt)):
+                    return False
+            elif not m or _secret_name(m.group(1).upper()) \
+                    or not (eq or m.group(2) or whole):
+                return False
+    return True
+
+
+def _env_files(name, args):
+    """The words a reader reads as FILES: its operands, less the pattern or
+    script a scripted reader takes first unless an option already gave it,
+    less a file it writes (_ENV_WRITERS), and with the file jq's --rawfile or
+    --slurpfile loads into a variable its program can print."""
+    if name in _ENV_WRITERS:
+        return _env_getopt(name, args)[0]
+    files, loaded, given, skip, ended = [], [], False, 0, False
+    for i, a in enumerate(args):
+        if skip:
+            skip -= 1
+            continue
+        if a.subst:                 # read by `_env_inner`, not as a name
+            continue
+        s = _env_text(a)
+        if not ended and s.startswith("-") and s != "-":
+            if s == "--":
+                ended = True
+            elif name == "jq":
+                given = given or s in ("-f", "--from-file")
+                if s in ("--slurpfile", "--rawfile") and i + 2 < len(args) \
+                        and not args[i + 2].subst:
+                    loaded.append(_env_text(args[i + 2]))
+                skip = 2 if s in ("--arg", "--argjson", "--slurpfile",
+                                  "--rawfile") else int(
+                    s in ("-f", "--from-file", "--indent"))
+            elif name in _ENV_GREPS and (s in _ENV_GREP_VALUED or (
+                    name == "rg" and s in ("-E", "-r"))):
+                skip = 1
+            elif s in ("--regexp", "--file", "--expression", "--source") or (
+                    name in _ENV_SCRIPTED
+                    and re.fullmatch(r"-[A-Za-z]*[ef]", s)):
+                given, skip = True, 1
+            elif name in _ENV_SCRIPTED and re.fullmatch(r"-[A-Za-z]*[ef].+",
+                                                        s):
+                given = True
+            elif name in _ENV_AWKS and s in ("-v", "-F"):
+                skip = 1
+            continue
+        files.append(s)
+    return (files[1:] if name in _ENV_SCRIPTED and not given else files) \
+        + loaded
+
+
+def _env_xargs(args):
+    """(whether xargs prints what it reads, the file it reads with -a)."""
+    k, src = 0, None
+    while k < len(args):
+        v = args[k].value()
+        if v is None:
+            break
+        if v in ("-a", "--arg-file"):
+            src = _env_text(args[k + 1]) if k + 1 < len(args) else None
+            k += 2
+        elif v.startswith("--arg-file="):
+            src, k = v.split("=", 1)[1], k + 1
+        elif v.startswith("-a") and len(v) > 2:
+            src, k = v[2:], k + 1
+        elif v == "--":
+            k += 1
+            break
+        elif v.startswith("-") and v != "-":
+            k += 2 if v in ("-I", "-n", "-L", "-P", "-d", "-E", "-s", "-J",
+                            "-R") else 1
+        else:
+            break
+    prog = args[k].value() if k < len(args) else "echo"
+    return (prog or "").rsplit("/", 1)[-1] in _ENV_PASSES | _ENV_PRINTERS, src
+
+
+def _env_passes_on(stage):
+    """Whether a later pipeline stage carries what it reads to its stdout."""
+    k, name, _dump = _env_unwrap(stage[0])
+    if name == "xargs":
+        return _env_xargs(stage[0][k + 1:])[0]
+    return name in _ENV_PASSES and not _env_quiet(name, stage[0][k + 1:]) \
+        and not _env_narrows(name, stage[0][k + 1:])
+
+
+def _env_out(stage):
+    """Where what a stage prints goes: "stdout" on down its pipeline,
+    "aside" to the terminal past it (a redirect to stderr or the tty, a tee
+    operand or an output file that is one, or a `>(…)` that passes its input
+    on), or None into a file or nowhere."""
+    k, name, _dump = _env_unwrap(stage[0])
+    args = stage[0][k + 1:] if k is not None else []
+    if name in _ENV_WRITERS or name == "tee":
+        outs = _env_getopt(name, args)[1] if name != "tee" else [
+            _env_text(a) for a in args if not _env_text(a).startswith("-")]
+        if any(_env_sink(t) == "aside" for t in outs):
+            return "aside"
+    out = "stdout"
+    for op, fd, target in stage[1]:
+        if op.startswith("<") or (fd not in ("", "1")
+                                  and not op.startswith("&")):
+            continue
+        text = _env_text(target)
+        if op == ">&" and text.isdigit():
+            out = {"1": "stdout", "2": "aside"}.get(text)
+        else:                               # `> -` is a file, `>&-` a close
+            out = None if text == "-" else _env_sink(text)
+    return out
+
+
+def _env_reaches(pipe, s):
+    """Whether what stage `s` prints reaches the terminal."""
+    for i, st in enumerate(pipe[s:]):
+        if i and not _env_passes_on(st):
+            return False
+        out = _env_out(st)
+        if out != "stdout":
+            return out == "aside"
+    return True
+
+
+def _env_inner(reader, word, depth):
+    """The first leak a command or process substitution inside `word`
+    prints into it."""
+    outer = -1
+    for start, end in sorted(reader.substs):
+        if start < word.start or start >= word.end or start < outer:
+            continue
+        outer = end
+        text = reader.t[start:end]
+        hit = _env_source(text if reader.t[start - 2:start] == "<(" else
+                          _env_lone_read(text), depth + 1)
+        if hit:
+            return hit
+    return None
+
+
+def _env_lone_read(text):
+    """A command substitution's text as bash runs it: `$(< FILE)` alone is
+    FILE's content, read as `cat` reads it."""
+    s = text.strip()
+    return "cat " + s if s.startswith("<") and not s.startswith(
+        ("<<", "<(")) else text
+
+
+def _env_body_substs(body, depth):
+    """The first leak a `$(…)` or backtick substitution in an unquoted
+    heredoc body prints into it: bash substitutes there as it does inside
+    double quotes, so a single quote is a letter and a backslash escapes.
+    ONE reader walks the body, so a body of many substitutions costs its
+    length, not its length times their count."""
+    if "`" not in body and "$(" not in body:
+        return None
+    try:
+        r = _ShellReader(body)
+    except _Unsettled:
+        return _env_crude(body)
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if c == "`" or (body.startswith("$(", i)
+                        and not body.startswith("$((", i)):
+            try:
+                i = r.backtick(i + 1) if c == "`" else r.expansion(i)[0]
+            except _Unsettled:
+                return _env_crude(body[i:])
+            start, end = r.substs[-1]         # the outermost, recorded last
+            hit = _env_source(_env_lone_read(body[start:end]), depth + 1)
+            if hit:
+                return hit
+        else:
+            i += 2 if c == "\\" else 1
+    return None
+
+
+def _env_bodies(reader, docs, depth):
+    """The first leak in a heredoc body a shell reads as its script."""
+    for at, _quoted, start, end in reader.bodies:
+        if at in docs:
+            hit = _env_source("\n".join(reader.lines[start:end]), depth + 1)
+            if hit:
+                return hit
+    return None
+
+
+def _env_wrap(prefix, hit):
+    """A leak found in text a stage runs, spelled with that stage."""
+    return (hit[0], prefix + " " + hit[1], hit[2]) if hit else None
+
+
+def _env_stage(stage, reader, depth):
+    """(kind, spelling, always) of what one stage prints, or None."""
+    words, redirs, docs = stage
+    k, name, dump = _env_unwrap(words)
+    if dump:
+        return "dump", dump, False
+    if k is None or name is None:
+        return None
+    args = words[k + 1:]
+    vals = [a.value() for a in args]
+    if name == "env -S":
+        head = _env_text(words[k])
+        head = "" if head in ("-S", "--split-string") else re.sub(
+            r"^(?:--split-string=|-S)", "", head)
+        return _env_wrap("env -S", _env_source(" ".join(
+            [head] + [_env_text(a) for a in args]).strip(), depth + 1))
+    if name == "printenv":
+        ops = [_env_text(a) for a in args if not _env_text(a).startswith("-")]
+        if not ops:
+            return "dump", "printenv", False
+        hit = next((o for o in ops if _secret_name(o)), None)
+        return ("name", "printenv " + hit, False) if hit else None
+    if name == "set":
+        return None if args else ("dump", "set", False)
+    if name in ("export", "declare", "typeset"):
+        opts, ops = set(), []
+        for a in args:
+            v = a.value()
+            if not ops and v and v.startswith("-") and len(v) > 1:
+                opts |= set(v[1:])
+            else:
+                ops.append(a)
+        if not ops:
+            return None if opts & set("fFn") else (
+                "dump", name + ("" if not opts else " -"
+                                + "".join(sorted(opts))), False)
+        if name == "export":
+            risky = [a for a in ops if not _GRANT_ASSIGNMENT.match(a.raw)
+                     and a.raw[:1] not in "'\"" and ("$" in a.raw
+                                                     or "`" in a.raw)]
+            if any(a.subst for a in risky) or len(risky) == len(ops):
+                return ("export", "export $(…)" if any(a.subst for a in risky)
+                        else "export $NAME", True)
+            return None
+        hit = next((o for o in (_env_text(a).split("=", 1)[0] for a in ops)
+                    if _secret_name(o)), None)
+        return ("name", "%s -p %s" % (name, hit), False) \
+            if "p" in opts and hit else None
+    if name in _ENV_PRINTERS:
+        if name == "printf" and any((v or "").startswith("-v") for v in vals):
+            return None
+        for a in args:
+            found, indirect = _secret_expansions(a.raw)
+            if found:
+                return "name", "%s $%s" % (name, found), False
+            if indirect and _ENV_ENUMERATES.search(reader.t):
+                return "dump", name + " ${!name} over every name", False
+            hit = _env_inner(reader, a, depth) if a.subst else None
+            if hit:
+                return _env_wrap(name, hit)
+        return None
+    if name in _ENV_READERS or name in ("tr", "tee", "xargs", "done"):
+        if _env_quiet(name, args) or _env_narrows(name, args):
+            return None
+        paths = [] if name in ("tr", "tee", "done") else _env_files(name, args)
+        if name == "xargs":
+            prints, src = _env_xargs(args)
+            if not prints:
+                return None
+            paths = [src] if src else []
+        paths += [_env_text(t) for op, _fd, t in redirs if op in ("<", "<>")]
+        for p in paths:
+            found = _cred_path(p)
+            if found:
+                return ("proc" if found.startswith("/proc/") else "file",
+                        "%s %s" % (name, found), False)
+        for op, _fd, t in redirs:
+            found = _secret_expansions(t.raw)[0] if op == "<<<" else None
+            if found:
+                return "name", "%s <<< $%s" % (name, found), False
+        for at, quoted, start, end in reader.bodies:
+            if at in docs and not quoted:
+                body = "\n".join(reader.lines[start:end])
+                found = _secret_expansions(body, body=True)[0]
+                if found:
+                    return "name", "%s <<EOF $%s" % (name, found), False
+                hit = _env_body_substs(body, depth)
+                if hit:
+                    return _env_wrap(name + " <<EOF", hit)
+        # an operand, and what a `<`, `<>` or `<<<` hands its stdin
+        for a in args + [t for op, _fd, t in redirs
+                         if op in ("<", "<>", "<<<")]:
+            hit = _env_inner(reader, a, depth) if a.subst else None
+            if hit:
+                return _env_wrap(name, hit)
+        return None
+    if name == "eval":
+        # eval joins its words and runs them in THIS shell, so a dump reaches
+        # this terminal exactly as `bash -c` does (task/3037). A leading
+        # `-` or `--` is eval's only option; the rest is the command it runs.
+        j = 0
+        while j < len(vals) and vals[j] in ("-", "--"):
+            j += 1
+        joined = " ".join(_env_text(a) for a in args[j:]).strip()
+        return _env_wrap("eval", _env_source(joined, depth + 1))
+    if name in _ENV_SHELLS:
+        j = 0
+        while j < len(args):
+            v = vals[j]
+            if v is None:
+                return None
+            if v in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+                j += 2
+            elif v.startswith("--"):
+                j += 1
+            elif v[:1] in "-+" and len(v) > 1:
+                if v[0] == "-" and "c" in v[1:]:
+                    return _env_wrap(name + " -c", _env_source(
+                        _env_text(args[j + 1]), depth + 1)) \
+                        if j + 1 < len(args) else None
+                j += 1
+            else:
+                return None                # a script file: not readable here
+        return _env_wrap(name, _env_bodies(reader, docs, depth))
+    if name in ("su", "runuser"):
+        for j, v in enumerate(vals):
+            if v in ("-c", "--command") and j + 1 < len(args):
+                return _env_wrap(name + " -c", _env_source(
+                    _env_text(args[j + 1]), depth + 1))
+            if v and v.startswith("--command="):
+                return _env_wrap(name + " -c", _env_source(
+                    v.split("=", 1)[1], depth + 1))
+        return None
+    if name == "ssh":
+        j = 0
+        while j < len(args) and vals[j] and vals[j].startswith("-") \
+                and len(vals[j]) > 1:
+            at = next((i for i, ch in enumerate(vals[j][1:])
+                       if ch in _SSH_VALUED), None)
+            j += 1 if at is None or at < len(vals[j]) - 2 else 2
+        rest = args[j + 1:]
+        if rest:
+            return _env_wrap("ssh …", _env_source(
+                " ".join(_env_text(a) for a in rest), depth + 1))
+        return _env_wrap("ssh …", _env_bodies(reader, docs, depth))
+    if name in _ENV_BOXES:
+        verb = next((j for j, v in enumerate(vals[:4])
+                     if v in ("exec", "run", "inspect")), None)
+        if verb is None:
+            return None
+        if vals[verb] == "inspect":
+            if name in ("kubectl", "oc", "lxc", "incus") or (
+                    verb and vals[verb - 1] in _ENV_BOX_NOUNS):
+                return None
+            return None if _env_inspect_narrow(args[verb + 1:]) else (
+                "inspect", name + " inspect", False)
+        rest = args[verb + 1:]
+        cut = next((j for j, a in enumerate(rest) if a.value() == "--"),
+                   None)
+        if cut is not None:
+            run = rest[cut + 1:]
+        else:
+            j = _env_options(rest, 0, valued=_ENV_BOX_VALUED)
+            run = rest[j + 1:]
+        if not run:
+            return None
+        inner = _env_stage((run, [], docs), reader, depth + 1)
+        return _env_wrap("%s %s …" % (name, vals[verb]), inner)
+    return None
+
+
+def _env_inspect_narrow(args):
+    """Whether `docker inspect` is given a --format that prints no
+    environment: one that names neither Env nor the whole object."""
+    for j, a in enumerate(args):
+        v = a.value() or ""
+        fmt = None
+        if v in ("-f", "--format") and j + 1 < len(args):
+            fmt = _env_text(args[j + 1])
+        elif v.startswith("--format="):
+            fmt = v.split("=", 1)[1]
+        elif v.startswith("-f") and not v.startswith("--") and len(v) > 2:
+            fmt = v[2:]
+        if fmt is not None:
+            # a count of the variables prints none of them
+            fmt = re.sub(r"len\s+\.Config\.Env\b", "", fmt)
+            return not re.search(
+                r"(?i)env|\{\{-?\s*(?:json\s+)?\.\s*(?:Config\s*)?-?\}\}"
+                r"|^\s*json\s*$", fmt)
+    return False
+
+
+def _env_crude(text):
+    """The reading where the shell reader cannot settle the text: a bare
+    dump standing as a command of its own, OUTSIDE every heredoc body and
+    every quote. The census found this reading's refusals were all prose
+    when it read those too: a markdown table in a --body, a python line."""
+    for words in _crude_commands(text):
+        prog, rest = words[0], words[1:]
+        if (prog in ("env", "printenv", "set", "export", "declare", "typeset")
+                and not rest) or (prog in ("export", "declare", "typeset")
+                                  and rest in (["-p"], ["-x"], ["-px"])):
+            return "dump", " ".join(words), False
+    return None
+
+
+def _crude_commands(text):
+    """The words of each command in `text` as a crude split reads them,
+    for a rung whose shell reader could not settle the text: every heredoc
+    body and every quoted string is cut, the rest is split at every
+    separator, and a command's prefix words, wrappers and assignments are
+    stepped over. Yields each non-empty list of words."""
+    kept, end = [], None
+    for line in text.split("\n"):
+        if end is not None:
+            end = None if line.lstrip("\t") == end else end
+            continue
+        kept.append(line)
+        m = _ENV_CRUDE_DOC.search(line)
+        end = m.group(1) if m else None
+    code, quote, i, text = [], None, 0, "\n".join(kept)
+    while i < len(text):
+        c = text[i]
+        if quote:
+            i += 2 if c == "\\" and quote == '"' else 1
+            quote = None if c == quote else quote
+        elif c == "\\":
+            code.append(" ")
+            i += 2
+        else:
+            quote = c if c in "'\"" else None
+            code.append(" _ " if quote else c)
+            i += 1
+    for seg in _ENV_CRUDE_SPLIT.split("".join(code)):
+        words = seg.split()
+        while words and (words[0] in _COMMAND_PREFIX
+                         or words[0] in ("sudo", "command", "builtin", "exec",
+                                         "nohup")
+                         or _GRANT_ASSIGNMENT.match(words[0])):
+            words.pop(0)
+        if words:
+            yield words
+
+
+def _env_source(text, depth=0):
+    """(kind, spelling, always) of the first leak `text` prints to its
+    stdout, or None. `always` marks a leak refused wherever its output goes
+    (`export $(…)`)."""
+    if depth > 4 or not _ENV_GATE.search(text):
+        return None
+    try:
+        reader = _ShellReader(text)
+        tokens = reader.read()
+    except _Unsettled:
+        return _env_crude(text)
+    for pipe in _env_stages(tokens, text):
+        for s, stage in enumerate(pipe):
+            hit = _env_stage(stage, reader, depth)
+            if hit and (hit[2] or _env_reaches(pipe, s)):
+                return hit
+    # the command in a `>(…)` writes to this text's stdout, unless it stands
+    # inside a substitution whose output something else takes
+    for start, end in reader.outs:
+        if not any(a <= start < b for a, b in reader.substs):
+            hit = _env_wrap(">(…)", _env_source(text[start:end], depth + 1))
+            if hit:
+                return hit
+    return None
+
+
+def env_dump_refusal(command):
+    """(kind, spelling) of the environment, secret variable or credentials
+    file a Bash command prints to the transcript, or None. kind is "dump",
+    "name", "file", "proc", "export" or "inspect"."""
+    text = (command or "").replace("\\\n", "")
+    try:
+        hit = _env_source(text)
+    except Exception:           # the reader's defect must not open the rung
+        hit = _env_crude(text)
+    if hit is None:
+        return None
+    spelling = hit[1]
+    if len(spelling) > _ENV_SPELL:
+        spelling = spelling[:_ENV_SPELL - 1] + "…"
+    return hit[0], spelling
+
+
+_ENV_WHAT = {
+    "dump": "the whole environment",
+    "name": "the value of a secret-looking variable",
+    "file": "a credentials file",
+    "proc": "a process's whole environment",
+    "export": "the whole environment when its argument expands to nothing",
+    "inspect": "a container's environment (Config.Env)",
+}
+_ENV_CURE = {
+    "dump": "Check a name without its value ([ -n \"$NAME\" ] && echo "
+            "set), list names only (env | cut -d= -f1), or print exact names "
+            "that are not secrets (printenv HOME, grep -E '^(A|B)=').",
+    "name": "Check it without printing it ([ -n \"$NAME\" ] && echo set, or "
+            "${#NAME} for its length), and pass it to the command that needs "
+            "it.",
+    "file": "List its names only (cut -d= -f1 FILE), check one (grep -c "
+            "'^NAME=' FILE), or load it for the command that needs it (set "
+            "-a; . FILE 2>/dev/null; set +a).",
+    "proc": "Print exact names that are not secrets, or count one: tr "
+            "'\\0' '\\n' < /proc/PID/environ | grep -E '^(A|B)=' (or grep "
+            "-c '^NAME=').",
+    "export": "Load the file without printing it: set -a; . ./.env "
+              "2>/dev/null; set +a.",
+    "inspect": "Give it --format with a template that leaves out "
+               ".Config.Env, such as --format '{{.State.Status}}'.",
+}
+
+
+def env_dump_message(hit):
+    """The refusal: what the command would print, why that leaks, and the
+    route that does not. Writes words and decides nothing."""
+    kind, spelling = hit
+    return ("[helm argv-guard] BLOCKED: this command prints %s (%s) into the "
+            "transcript, and the transcript goes to the model provider. %s"
+            % (_ENV_WHAT[kind], spelling, _ENV_CURE[kind]))
+
+
+# WHAT A COMMAND RUNS, AND WHERE. Two rungs ask this reader two questions:
+# which git verb runs in which directory (the shared-checkout rung below),
+# and which spellings of a refused helm verb write nothing (the sidechain
+# authority rung above, `_authority_exempt`). The walk is theirs alone; the
+# env-dump rung above reads output, not directories.
+_CHDIR_OPTIONS = frozenset(("-C", "--chdir", "-D"))
+_HOME_WORD = re.compile(r"\A\"?\$(?:HOME|\{HOME\})(?=[/\"]|\Z)")
+
+
+def _walk_dir(word, here):
+    """The directory a `cd` operand or a `git -C` value names, resolved
+    against `here`, or None where the text does not settle it. A leading
+    `~/` and a leading `$HOME` are the directory bash expands them to."""
+    v = word.value()
+    if v is None:
+        m = _HOME_WORD.match(word.raw)
+        rest = word.raw[m.end():] if m else "$"
+        if "$" in rest or "`" in rest or rest.count('"') > 1:
+            return None
+        v = os.path.expanduser("~") + rest.replace('"', "")
+    elif word.raw == "~" or word.raw.startswith("~/"):
+        v = os.path.expanduser(v)
+    if not os.path.isabs(v):
+        if here is None:
+            return None
+        v = os.path.join(here, v)
+    return os.path.normpath(v)
+
+
+def _cd_dir(args, here):
+    """Where `cd ARGS` leaves the shell: HOME with no operand, None for
+    `cd -` and anything the text does not settle."""
+    j = 0
+    while j < len(args) and (args[j].value() or "") in (
+            "-L", "-P", "-e", "-@", "-LP", "-PL"):
+        j += 1
+    if j < len(args) and args[j].value() == "--":
+        j += 1
+    if j >= len(args):
+        return os.path.expanduser("~")
+    return None if args[j].value() == "-" else _walk_dir(args[j], here)
+
+
+def _shell_script(args):
+    """What a shell given ARGS runs: ("c", word) for its -c string, ("stdin",
+    None) when it reads its script from stdin, or None for a script file or
+    options the text does not settle."""
+    j = 0
+    while j < len(args):
+        v = args[j].value()
+        if v is None:
+            return None
+        if v in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            j += 2
+        elif v.startswith("--"):
+            j += 1
+        elif v[:1] in "-+" and len(v) > 1:
+            if v[0] == "-" and "c" in v[1:]:
+                return ("c", args[j + 1]) if j + 1 < len(args) else None
+            j += 1
+        else:
+            return None
+    return "stdin", None
+
+
+def _commands_run(text, cwd, depth=0):
+    """[(name, words, k, here)] for every simple command `text` runs: the
+    program `_program` names (None where the text does not settle it), the
+    command's words, the index of the program word, and the directory the
+    command runs in, None where the text does not settle it.
+
+    A `cd` or `pushd` that stands as a pipeline of its own moves every later
+    command in its scope, and a subshell's parentheses close the scope; a
+    `cd` in a pipeline runs in a subshell and moves nothing. A wrapper that
+    changes directory itself (`env -C`, `sudo -D`) leaves its command's
+    directory unsettled. The walk goes into what a command's `$(…)`,
+    backticks, `<(…)` and `>(…)` run, the string a shell runs with -c, the
+    words `eval` joins, and a heredoc a shell reads as its script, each in
+    the directory of the command that holds it. Raises `_Unsettled` where
+    the reader cannot settle `text`; nested text it cannot settle is not
+    read."""
+    reader = _ShellReader(text)
+    tokens = reader.read()
+    spans, end = [], -1
+    for a, b in sorted(reader.substs + reader.outs):
+        if a >= end:                    # the outermost of each nest
+            spans.append((a, b))
+            end = b
+    # each pipeline with the operator before it: a `cd` after `||` runs only
+    # when the command before it failed, so it settles no directory
+    items, pipe, cur, sep = [], [], ([], [], []), None
+    for tok in tokens:
+        if tok[0] == "w":
+            cur[0].append(tok[1])
+        elif tok[0] == "r":
+            cur[2].append(tok[2])
+        elif tok[0] == "h":
+            cur[1].append(tok[1])
+        else:
+            pipe.append(cur)
+            cur = ([], [], [])
+            if tok[0] == "s":
+                items.append((pipe, sep))
+                pipe, sep = [], tok[1]
+                if tok[1] in ("(", ")"):
+                    items.append(tok[1])
+    items.append((pipe + [cur], sep))
+    out, scope = [], [cwd]
+
+    def inner(body, at):
+        if depth >= 4:
+            return
+        try:
+            out.extend(_commands_run(body, at, depth + 1))
+        except _Unsettled:
+            pass
+
+    for item in items:
+        if item == "(":
+            scope.append(scope[-1])
+            continue
+        if item == ")":
+            if len(scope) > 1:
+                scope.pop()
+            continue
+        pipe, sep = item
+        for words, docs, targets in pipe:
+            at = scope[-1]
+            for a, b in spans:
+                if any(w.start <= a < w.end for w in words + targets):
+                    inner(text[a:b], at)
+            if not words:
+                continue
+            name, k = _program(words)
+            if k is None:
+                continue
+            if any((w.value() or "") in _CHDIR_OPTIONS
+                   or (w.value() or "").startswith("--chdir=")
+                   for w in words[:k]):
+                at = None
+            out.append((name, words, k, at))
+            args = words[k + 1:]
+            if name in ("cd", "pushd") and len(pipe) == 1:
+                scope[-1] = None if sep == "||" else _cd_dir(args, at)
+            elif name == "popd" and len(pipe) == 1:
+                scope[-1] = None
+            elif name == "eval":
+                inner(" ".join(_env_text(a) for a in args), at)
+            elif name in _ENV_SHELLS:
+                script = _shell_script(args)
+                if script and script[0] == "c":
+                    inner(_env_text(script[1]), at)
+                elif script:
+                    for op, _q, start, stop in reader.bodies:
+                        if op in docs:
+                            inner("\n".join(reader.lines[start:stop]), at)
+    return out
+
+
+# THE SHARED-CHECKOUT RUNG (task/3057). A `git stash pop` meant for a lane
+# ran in helm's shared checkout and left a conflict marker in a module every
+# helm verb imports, so every verb and hook in the fleet raised SyntaxError
+# until the tree was cleaned by hand. Two facts made it easy to do: git's
+# stash is ONE list for every worktree of a repository, so a lane's stash
+# pops anywhere, and the Bash tool puts a seat back in the shared checkout
+# after every call. This rung refuses a WORKING-TREE git verb whose effective
+# directory is the shared checkout, and its refusal spells the same verb with
+# `git -C <lane>`.
+#
+# THE EFFECTIVE DIRECTORY is the payload's cwd, moved by `cd X &&` / `cd X;`
+# (and `pushd`) in its scope, then by every `git -C X`, each resolved against
+# the one before (`_commands_run`). A directory the text does not settle
+# (`cd "$d"`, `git -C $d`, `cd -`, a `cd` after `||`, `env -C`), a
+# repository chosen by
+# --git-dir, --work-tree or GIT_DIR, and text the shell reader cannot settle
+# all PASS: a guard on every Bash call misses an exotic edge rather than
+# block work it cannot read.
+#
+# THE SHARED CHECKOUT is the PRIMARY worktree (its `.git` is a directory; a
+# lane's is a file) of a repository with at least one linked worktree, that
+# DECLARES the rail guard profile, and whose top is a path the registry
+# holds. A repository with no lane has no lane's stash to pop and no fleet
+# working from its checkout (`lane_discipline`'s estate clause). And the rail
+# is helm's own shared-checkout law, opt-in for a project repository (the
+# guard profiles, work._guard): a census of the fleet's recorded commands
+# found a rung keyed on registration and lanes alone refusing 740 commands in
+# other projects' checkouts, most of them a lead's branch work in its own
+# tree. A repository that declares nothing is not refused, even helm's own
+# source checkout, whose undeclared default is the rail. The rung reads the
+# directory tree first, then one git config read, and the registry last.
+#
+# THE VERBS are the ones that write the working tree or leave a merge in it
+# (`_TREE_WRITES`). Reads, fetch, `pull --ff-only` and `merge --ff-only`
+# (which never leave a conflict), `worktree add/remove`, branch reads and a
+# `stash`/`stash push`/`stash list` pass; so does `-h`/`--help`. Anything is
+# allowed with HELM_WORK_INTEGRATOR=1 in the command or the environment, the
+# declaration the integrator already makes to the reference-transaction
+# hook. What it cannot see: a git alias, `git apply`, `rm`/`mv`, and a verb
+# run by a script or a program that is not git.
+_TREE_GATE = re.compile(r"(?<![\w-])(?:stash|checkout|restore|reset|merge"
+                        r"|rebase|cherry-pick|revert|am|switch|clean|pull)"
+                        r"(?![\w-])")
+_TREE_WRITES = {
+    "stash": lambda a: bool(a) and a[0] in ("pop", "apply", "drop", "branch"),
+    "checkout": bool,
+    "restore": bool,
+    "switch": lambda a: True,
+    "reset": lambda a: any(v in ("--hard", "--merge", "--keep") for v in a),
+    "merge": lambda a: "--ff-only" not in a,
+    "pull": lambda a: "--ff-only" not in a,
+    "rebase": lambda a: True,
+    "cherry-pick": lambda a: True,
+    "revert": lambda a: True,
+    "am": lambda a: True,
+    "clean": lambda a: not any(v == "--dry-run" or re.fullmatch(
+        r"-[A-Za-z]*n[A-Za-z]*", v or "") for v in a),
+}
+# git's own options that take the next word; --git-dir and --work-tree choose
+# another repository or tree and are read as unsettled
+_GIT_VALUED = frozenset(("-c", "--namespace", "--config-env",
+                         "--attr-source"))
+_GIT_ELSEWHERE = ("--git-dir", "--work-tree", "--bare")
+_RAIL_KEY, _RAIL = "helm.guard.profile", "rail"
+INTEGRATOR_DECLARATION = "HELM_WORK_INTEGRATOR=1"
+_TREE_SPELL = 60
+
+
+def _git_subcommand(words, k, at):
+    """(directory, index of the subcommand word) for `git` at words[k], its
+    -C chain applied to `at`, or None where the text does not settle which
+    tree the verb writes."""
+    if any(w.raw.startswith(("GIT_DIR=", "GIT_WORK_TREE="))
+           for w in words[:k]):
+        return None
+    j = k + 1
+    while j < len(words):
+        v = words[j].value()
+        if v is None or v.startswith(_GIT_ELSEWHERE):
+            return None
+        if v == "-C":
+            if j + 1 >= len(words):
+                return None
+            at = _walk_dir(words[j + 1], at)       # an absolute one settles it
+            j += 2
+        elif v in _GIT_VALUED:
+            j += 2
+        elif v.startswith("-"):
+            j += 1
+        else:
+            return (at, j) if at is not None else None
+    return None
+
+
+def _under_the_rail(top):
+    """Whether the repository at `top` DECLARES the rail guard profile. One
+    git read, through the seam: the key and the profile name are the guard's
+    own (work._guard.PROFILE_KEY, GUARD_PROFILES), pinned equal by a test
+    rather than imported, because importing the guard costs this hook half a
+    second."""
+    from . import vcs
+    return vcs.backend(top).probe(top, "config", "--get", _RAIL_KEY,
+                                  timeout=2) == _RAIL
+
+
+def _shared_checkout(path):
+    """The top of the shared checkout `path` stands in, or None: a primary
+    worktree with a linked lane, whose repository declares the rail and whose
+    top the registry holds. Any directory this cannot read answers None."""
+    try:
+        top = os.path.realpath(path)
+        if not stat.S_ISDIR(os.stat(top).st_mode):
+            return None
+        while True:
+            try:
+                dot = os.stat(os.path.join(top, ".git"))
+                break
+            except FileNotFoundError:
+                up = os.path.dirname(top)
+                if up == top:
+                    return None
+                top = up
+        if not stat.S_ISDIR(dot.st_mode):
+            return None                          # a lane: `.git` is a file
+        with os.scandir(os.path.join(top, ".git", "worktrees")) as lanes:
+            if next(lanes, None) is None:
+                return None
+    except OSError:
+        return None
+    if not _under_the_rail(top):
+        return None
+    paths = [str(r.get("path")) for r in _tree_registry().values()
+             if isinstance(r, dict) and r.get("path")]
+    if any(os.path.normpath(p) == top for p in paths) or any(
+            os.path.realpath(p) == top for p in paths):
+        return top
+    return None
+
+
+def shared_checkout_refusal(command, cwd=None, env=None):
+    """(checkout, spelling) when a working-tree git verb in `command` would
+    run in the shared checkout of a registered repository, else None. `cwd`
+    is the payload's; `env` defaults to this process's environment."""
+    text = (command or "").replace("\\\n", "")
+    if "git" not in text or not _TREE_GATE.search(text) \
+            or INTEGRATOR_DECLARATION in text \
+            or (os.environ if env is None else env).get(
+                "HELM_WORK_INTEGRATOR") == "1":
+        return None
+    try:
+        start = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+        for name, words, k, at in _commands_run(text, start):
+            call = _git_subcommand(words, k, at) if name == "git" else None
+            if call is None:
+                continue
+            at, j = call
+            args = [w.value() for w in words[j + 1:]]
+            write = _TREE_WRITES.get(words[j].value())
+            if write is None or "-h" in args or "--help" in args \
+                    or not write(args):
+                continue
+            top = _shared_checkout(at)
+            if top:
+                spelled = " ".join(w.raw for w in words[j:])
+                if len(spelled) > _TREE_SPELL:
+                    spelled = spelled[:_TREE_SPELL - 1] + "…"
+                return top, spelled
+    except Exception:          # _Unsettled, or the reader's defect: fail open
+        return None
+    return None
+
+
+def shared_checkout_message(hit):
+    """The refusal: where the verb would run, why that breaks the fleet, and
+    the same verb spelled with the lane. Writes words and decides nothing."""
+    top, spelled = hit
+    return ("[helm argv-guard] BLOCKED: git %s would run in %s, the shared "
+            "checkout: a conflict or another lane's stash left there breaks "
+            "every seat working from it (git stash is one list for every "
+            "worktree). Use your lane: git -C %s-wt/<lane> %s. The integrator "
+            "declares %s." % (spelled, top, top, spelled,
+                              INTEGRATOR_DECLARATION))
+
+
 def cmd_argv_guard(args):
     """chat argv-guard --hook-json — the PreToolUse gate over Bash, Monitor,
     Write, Edit and Agent.
@@ -8405,7 +10579,14 @@ def cmd_argv_guard(args):
 
     Reads the hook payload, applies argv_guard to a Bash tool_input.command,
     and exits 2 with the cure when it matches. A Bash or Monitor call from a
-    subagent (agent_id present) whose TEXT names a beacon arm exits 2 too.
+    subagent (agent_id present) whose TEXT names a beacon arm exits 2 too,
+    and so does one that runs a verdict-class write from
+    helm.delegate_grant.REFUSED, in a spelling that writes something, unless
+    a live grant on the payload's session admits it (the sidechain authority
+    rung above, the one delegate rung); an admitted call says which grant
+    admitted it. A Bash or Monitor command that runs a working-tree git verb
+    in the shared checkout of a registered repository exits 2 (the
+    shared-checkout rung above), for a seat and a subagent alike.
     A Bash or Monitor command whose folded text holds a GitHub-Actions
     spelling — a gh Actions noun and verb, an Actions API path, the workflow
     directory — exits 2 unless the command carries HELM_ALLOW_GITHUB_ACTIONS=1
@@ -8474,18 +10655,40 @@ def cmd_argv_guard(args):
         # the beacon process it would start inherits the seat's name and so
         # passes every identity door. The key is read before the import so a
         # main-thread call, which carries no agent_id, pays nothing for it.
+        # THE SIDECHAIN AUTHORITY RUNG rides the same key (task/3060): a
+        # delegate may not run a verdict-class write unless its seat granted
+        # it (`_sidechain_authority`, helm/delegate_grant.py).
+        granted = []
         if d.get("agent_id"):
             from . import actors
             if actors.sidechain_agent(d) and sidechain_beacon_presence(cmd):
                 print("[helm argv-guard] BLOCKED: %s"
                       % actors.sidechain_beacon_refusal(), file=sys.stderr)
                 return 2
+            if actors.sidechain_agent(d):
+                refusal, granted = _sidechain_authority(d, cmd)
+                if refusal:
+                    print(refusal, file=sys.stderr)
+                    return 2
         act = github_actions_refusal(command=cmd)
         if act is not None:
             print(github_actions_message(act), file=sys.stderr)
             return 2
+        # THE ENV-DUMP RUNG, Bash and Monitor alike (task/3037): a command
+        # whose output would carry the environment, a secret-looking
+        # variable or a credentials file into the transcript.
+        leak = env_dump_refusal(cmd)
+        if leak is not None:
+            print(env_dump_message(leak), file=sys.stderr)
+            return 2
+        # THE SHARED-CHECKOUT RUNG, Bash and Monitor alike (task/3057): a
+        # working-tree git verb whose directory is the shared checkout.
+        tree = shared_checkout_refusal(cmd, d.get("cwd"))
+        if tree is not None:
+            print(shared_checkout_message(tree), file=sys.stderr)
+            return 2
         if tool != "Bash":
-            _tree_advise(d, cmd)
+            _tree_advise(d, cmd, first=granted)
             return 0
         blocked = argv_guard(cmd)
         if not blocked:
@@ -8509,7 +10712,7 @@ def cmd_argv_guard(args):
             # reaches the debug log and nobody else, so a steer printed there
             # spends its once-per-session latch on telling no one. The lines
             # ride the pass path's one envelope (see `advise`).
-            _tree_advise(d, cmd, first=[
+            _tree_advise(d, cmd, first=granted + [
                 (sid, "[helm steer] " + text)
                 for sid, text in argv_steers(cmd, d.get("cwd"),
                                              d.get("tool_input"))])

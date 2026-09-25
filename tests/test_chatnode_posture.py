@@ -52,6 +52,17 @@ class PostureBase(unittest.TestCase):
             os.environ["HOME"] = self.prior_home
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def node_bin(self, name="dregg-node"):
+        """A node binary `up` can hash and record; the unit never runs it.
+        `up` writes that record into the chat-node state, so only an arm
+        whose HELM_HOME is its own (BootBase) may drive `up`."""
+        b = os.path.join(self.tmp, name)
+        with open(b, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(b, 0o755)
+        return mock.patch.object(chatnode, "bin_resolution", return_value={
+            "path": b, "source": "env", "reason": None})
+
     def declare(self, body, unit=None, name="override.conf"):
         d = os.path.join(self.units, (unit or chatnode.PEER_UNIT) + ".d")
         os.makedirs(d, exist_ok=True)
@@ -406,8 +417,7 @@ class BootWaitTest(BootBase):
         provisioned = []
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(chatnode, "_systemctl", self.systemctl), \
-                mock.patch.object(chatnode, "bin_path",
-                                  return_value=os.path.join(self.tmp, "n")), \
+                self.node_bin("n"), \
                 mock.patch.object(chatnode.cell, "get_json", return_value=[]), \
                 mock.patch.object(chatnode, "snapshot_identity",
                                   lambda *_a, **_k: real_snap(cave)), \
@@ -461,9 +471,8 @@ class BootWaitTest(BootBase):
 
     def _up(self):
         out, err = io.StringIO(), io.StringIO()
-        b = os.path.join(self.tmp, "dregg-node")
         with mock.patch.object(chatnode, "_systemctl", self.systemctl), \
-                mock.patch.object(chatnode, "bin_path", return_value=b), \
+                self.node_bin(), \
                 mock.patch.object(chatnode.cell, "get_json", return_value=None), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = chatnode.cmd_node(["up"])

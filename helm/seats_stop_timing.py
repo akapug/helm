@@ -117,6 +117,14 @@ class _Trace:
 
 _STATE = _Trace()
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_STATE": (
+        "the ladder's trace; settle() stops every timer, and the arms that "
+        "read it (test_hook_wrapper) reset() it first"),
+}
+
 
 def stream_after():
     """Seconds of quiet before the trace speaks, or `NEVER`. Resolved ONCE.

@@ -458,6 +458,13 @@ class _Resolver:
 _RESOLVER = None        # _Resolver for the file under analysis
 _SITE = (None, None)    # (evaluation scope of the assertion, tree)
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_RESOLVER": "set for the file under analysis when each analysis starts",
+    "_SITE": "set for the file under analysis when each analysis starts",
+}
+
 
 def _module_constant(node, fn=None, tree=None):
     """-> (resolved, value) for `alias.NAME` naming a module-level literal."""
@@ -623,8 +630,17 @@ def _call_info(node):
     if not (leaf.startswith("assert") or low.startswith("assert_")):
         return None
     args = node.args
-    if low in ("assertfalse", "assertisnone", "assertnotregex",
-               "assert_not_called", "assert_not_awaited"):
+    # A MOCK'S OWN ASSERTION OBSERVES ITS RECEIVER, NOT ITS ARGUMENTS, in BOTH
+    # polarities. `spy.assert_not_called()` takes no argument, so rooting it
+    # on `args[0]` gave it NO roots: an absence no positive control could
+    # ever reach, warned even beside `spy.send.assert_called_once_with(...)`
+    # on the very same double. Rooted on the receiver it roots exactly as
+    # `assertFalse(spy.called)` does, and still warns when nothing positive
+    # constrains that spy (task/3039).
+    receiver = node.func.value if isinstance(node.func, ast.Attribute) else node
+    if low in ("assert_not_called", "assert_not_awaited"):
+        return False, _roots(receiver)
+    if low in ("assertfalse", "assertisnone", "assertnotregex"):
         return False, _roots(args[0]) if args else set()
     if low in ("assertraises", "assertraisesregex"):
         # AN EXPECTED RAISE IS AN EVENT THAT HAPPENED, NOT AN ABSENCE.
@@ -681,7 +697,6 @@ def _call_info(node):
                "assert_called_once_with", "assert_has_calls", "assert_awaited",
                "assert_awaited_once", "assert_awaited_with",
                "assert_awaited_once_with"):
-        receiver = node.func.value if isinstance(node.func, ast.Attribute) else node
         return True, _roots(receiver)
     if low == "asserttrue":
         return _expr_info(args[0]) if args else (False, set())

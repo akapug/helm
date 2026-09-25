@@ -543,10 +543,15 @@ def _supervise(argv):
 
     try:
         child = subprocess.Popen(cmd)
-        return _wait_reaping_adopted(child)
+        rc = _wait_reaping_adopted(child)
     except BaseException:
         _exit_process()
         raise
+    # A suite killed by signal N waits as -N, and `sys.exit(-N)` exits 256-N:
+    # MEASURED (task/3070), a suite that died of TERM reached its receipt as
+    # rc 241, which reads as an exit code. 128+N is the encoding `_guard`
+    # already gives its own child.
+    return rc if rc >= 0 else 128 - rc
 
 
 def main(argv=None):

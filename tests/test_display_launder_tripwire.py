@@ -30,6 +30,7 @@ Two tripwires, deliberately BOTH — one proves today, one guards tomorrow:
 """
 import ast
 import contextlib
+import functools
 import io
 import os
 import re
@@ -237,6 +238,13 @@ _ROSTER_CONSUMERS = {
         "latch identity; any holder rendered in a verdict comes from the claim "
         "row, while ambiguous roster names are laundered by seats_roster's "
         "canonical resolver before its warning."),
+    "stopfacts_resident.py": (
+        "INTERNAL-MATCHING-ONLY: the stop-facts resident takes one tri-state "
+        "roster snapshot per refresh to choose WHICH seats to compute review "
+        "rounds for and to index a claim's minting session to its seat. Roster "
+        "keys are used as lookup keys in the snapshot file the Stop hook reads; "
+        "the hook looks facts up by the seat it already resolved and never "
+        "prints a key it read from the file."),
     "seats_stop_signals.py": (
         "INTERNAL-MATCHING-ONLY: the stop ladder reads the roster once, to "
         "ask whether THIS seat's own row is present and armed before it "
@@ -313,11 +321,14 @@ _ROSTER_CONSUMERS = {
         "`signing_identity`) reads the roster STRICTLY to answer ONE "
         "boolean about a name it already holds — is this row a FLEET ACTOR "
         "(home_room set) rather than an observed session? The name comes from "
-        "`meld._self_seat`, never from a roster key; the read is `.get(name)`, "
-        "a membership lookup whose miss returns \"\"; and the only value that "
-        "leaves is that same already-held name. No roster key is ever bound, "
-        "so none can reach a sink. It emits nothing itself — its caller uses "
-        "the answer to decide whether to SIGN or refuse."),
+        "`meld._self_seat`, which resolves a live rename alias to the renamed "
+        "row's key (task/3049), so it re-passes `home.validate_seat_arg` "
+        "before it can leave; the read is `.get(name)`, a membership lookup "
+        "whose miss returns \"\". `_session_dispute`, asked only where the "
+        "owner's profile would stand, reads which rows bind this process's "
+        "session, and the one key it can return is laundered through "
+        "`seats_common._seat_label`. It emits nothing itself — its caller "
+        "uses the answer to decide whether to SIGN or refuse."),
     "chat.py": (
         "LAUNDERED via seats_common._seat_label at the seam in "
         "_live_same_family (the spawn steer, via _spawn_roster): the ONE "
@@ -693,9 +704,13 @@ _ROSTER_CALL_COUNTS = {
                            # skip a miss. The shape test below pins function,
                            # ITERATES/MEMBERSHIP polarity, AND mapping attrs, so
                            # this count cannot bless an arbitrary new reader.
-    "cell.py": 1,          # seat_reading's fleet-actor check: ONE `.get(name)`
+    "cell.py": 2,          # seat_reading's fleet-actor check: ONE `.get(name)`
                            # membership lookup on a name it already holds; the
-                           # miss returns "" and no key is ever bound
+                           # miss returns "" and no key is ever bound.
+                           # +1 (task/3049): _session_dispute, asked only where
+                           # the owner's profile would stand — which rows bind
+                           # this process's session; the one key it can return
+                           # goes through seats_common._seat_label first
     "chat.py": 3,          # THREE SITES, AND TWO OF THEM CAN EMIT.
                            # (3) _tree_roster, the tree rung's read — its
                            # consumer tree_steers EMITS a key and that row's
@@ -1022,6 +1037,8 @@ _ROSTER_CALL_COUNTS = {
                           # spell, keys leave only as _mentionable @mentions
     "scratch.py": 1,      # `_wake`: one read per opened spell, keys leave
                           # only as _inert_seat-validated @mentions
+    "stopfacts_resident.py": 1,  # `compute`: one read per refresh, keys used
+                                 # only to select and index seats
     "stalebot.py": 3,     # THREE distinct operations, one fail-closed read each:
                           # sweep classification (_seat_roster), explicit cured
                           # redispatch, and digest delivery (_post). The sweep read
@@ -1099,6 +1116,29 @@ def _called_name(func):
     if isinstance(func, ast.Attribute):
         return func.attr
     return None
+
+
+# THE REAL TREE IS SCANNED ONCE PER PROCESS (task/3039). The site scanners
+# below were called again by every arm that reads them -- 3,491 `ast.parse`
+# calls, 95% of this module -- and helm/ does not change while one process
+# runs. Only a call about the real package is remembered: a planted package is
+# a tree an arm built to hold a probe, so it is scanned every time, and so is
+# any call made while PKG itself is pointed elsewhere. Answers are copies.
+_REAL_PKG = PKG
+_REAL_SCANS = {}
+
+
+def _real_tree_once(scan):
+    @functools.wraps(scan)
+    def remembered(*args, **kw):
+        if PKG != _REAL_PKG or any(v != _REAL_PKG
+                                   for v in args + tuple(kw.values())):
+            return scan(*args, **kw)
+        if scan.__name__ not in _REAL_SCANS:
+            _REAL_SCANS[scan.__name__] = scan(*args, **kw)
+        got = _REAL_SCANS[scan.__name__]
+        return set(got) if isinstance(got, set) else list(got)
+    return remembered
 
 
 def _package_sources(pkg):
@@ -1188,6 +1228,7 @@ def _refuse_escapes(module, tree):
                            alias.name))
 
 
+@_real_tree_once
 def _roster_call_sites(pkg=PKG):
     """[(module, lineno, text)] for every site under pkg that OBTAINS the roster.
 
@@ -2006,6 +2047,7 @@ _HOME_ENV_READ = re.compile(r"""\benv\(\s*['"]CHAT_NAME['"]""")
 _ACCESSOR_MODULE = "home.py"
 
 
+@_real_tree_once
 def _chat_name_read_sites():
     """[(module, lineno, text)] for every helm/*.py line that reads the
     HELM_CHAT_NAME env var — directly (os.environ/getenv) or via home.env's
@@ -2597,6 +2639,7 @@ def _from_field_files(pkg=PKG):
     return out
 
 
+@_real_tree_once
 def _from_field_read_sites(pkg=PKG):
     """[(owner, lineno, text)] for every helm chat-identity read.
 
@@ -3068,6 +3111,7 @@ def _transport_projection_functions(source):
     return functions
 
 
+@_real_tree_once
 def _transport_projection_sites():
     sites = set()
     for fn in sorted(os.listdir(PKG)):
@@ -3209,6 +3253,84 @@ class FleetSeatLaunderTest(unittest.TestCase):
         # this a tightening rather than a blanket refusal.
         plain, _ = fleet._seat_for(None, {"HELM_CHAT_NAME": "codex-3"}, {}, False)
         self.assertEqual(plain, "codex-3")
+
+
+class RealTreeScannedOncePerProcessTest(unittest.TestCase):
+    """The site scanners read helm/ once per process; a planted package is
+    read on every call (task/3039).
+
+    MEASURED BEFORE THE MEMO: 9 of 56 tests took 95% of this module, with
+    3,491 `ast.parse` calls. `_roster_call_sites` read the real tree 3 times,
+    `_from_field_read_sites` about 4 times and `_transport_projection_sites`
+    twice, and helm/ does not change while one process runs.
+    """
+
+    _SCANS = ("_roster_call_sites", "_from_field_read_sites",
+              "_transport_projection_sites", "_chat_name_read_sites")
+
+    def _reads(self):
+        """Count every source file this module opens during the case."""
+        real_open, opened = open, []
+
+        def counting(path, *a, **kw):
+            if str(path).endswith(".py"):
+                opened.append(path)
+            return real_open(path, *a, **kw)
+
+        patch = unittest.mock.patch("builtins.open", counting)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return opened
+
+    def test_a_second_real_tree_scan_reads_no_file(self):  # noqa: VACUOUS_ASSERTION — the counter is proven live in this arm: a planted package scanned under the same patch must add its file
+        module = sys.modules[__name__]
+        first = [getattr(module, name)() for name in self._SCANS]
+        pkg = tempfile.mkdtemp(prefix="helm-scan-control-")
+        self.addCleanup(shutil.rmtree, pkg, True)
+        with open(os.path.join(pkg, "planted.py"), "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+        opened = self._reads()
+        second = [getattr(module, name)() for name in self._SCANS]
+        by_second = list(opened)
+        _roster_call_sites(pkg)
+        self.assertTrue(all(first), "control: every scanner found real sites")
+        self.assertEqual(second, first)
+        self.assertEqual(len(opened), len(by_second) + 1,
+                         "control: the counter sees a file a scan reads")
+        self.assertEqual(by_second, [], "a second real-tree scan read helm/ again")
+
+    def test_a_planted_package_is_scanned_every_time(self):
+        """The must-miss, after the real tree is remembered."""
+        _roster_call_sites()
+        _from_field_read_sites()
+        pkg = tempfile.mkdtemp(prefix="helm-scan-planted-")
+        self.addCleanup(shutil.rmtree, pkg, True)
+        path = os.path.join(pkg, "planted.py")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("from helm import seats\nrows = seats.roster()\n"
+                     "who = row['from']\n")
+        self.assertEqual([m for m, _n, _t in _roster_call_sites(pkg)],
+                         ["planted.py"])
+        self.assertEqual([m for m, _n, _t in _from_field_read_sites(pkg)],
+                         ["planted.py"])
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("again = seats.roster()\nwho = row['from']\n")
+        self.assertEqual(len(_roster_call_sites(pkg)), 2,
+                         "the planted package was served a remembered scan")
+        self.assertEqual(len(_from_field_read_sites(pkg)), 2)
+
+    def test_a_caller_that_edits_a_scan_cannot_change_the_next(self):
+        sites = _roster_call_sites()
+        self.assertTrue(sites, "control: the real tree has roster sites")
+        sites.append(("planted.py", 1, "planted"))
+        projections = _transport_projection_sites()
+        projections.add(("planted.py", "planted"))
+        sites_again, projections_again = (_roster_call_sites(),
+                                          _transport_projection_sites())
+        self.assertTrue(sites_again and projections_again,
+                        "control: the next scans answered")
+        self.assertNotIn(("planted.py", 1, "planted"), sites_again)
+        self.assertNotIn(("planted.py", "planted"), projections_again)
 
 
 if __name__ == "__main__":

@@ -126,7 +126,15 @@ def _self_seat():
     # home.chat_name is THE validated seam (hostile names rejected at source).
     name = home.chat_name()
     if name:
-        return name
+        # A LIVE RENAME ALIAS NAMES THE RENAMED ROW, as it does for
+        # chat.whoname and the actor layer (seats_common.declared_name). Read
+        # raw, a seat renamed while its process ran looked its OLD name up as a
+        # roster key, found nothing, and read as "no seat" — and `cell`'s
+        # signing gate then let the owner's inherited profile stand, so its
+        # rows went out SIGNED BY THE OWNER with `from` naming the new seat
+        # (task/3049, measured on a live alias). The raw read above still runs
+        # first, so a hostile name raises exactly as before.
+        return seats.own_name() or name
     sid = home.session_id()
     # safe_cwd, not os.getcwd(): a bare getcwd here crashed ALL five meld
     # verbs from a deleted cwd (eager-getcwd class); derive_seat handles None.
@@ -143,6 +151,14 @@ _DURABLE_FIELDS = ("role", "peer", "peers", "exchanges", "cap", "status",
                    "created", "done_peers", "spoke_peers")
 _STATUSES = {"invited", "active", "done", "peer-done", "done-mutual", "aborted"}
 _UNKNOWN = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_UNKNOWN": (
+        "why a room's lifecycle read UNKNOWN, per lifecycle path; a replay "
+        "clears it and test_meld clears it first"),
+}
 
 
 class LifecycleError(RuntimeError):

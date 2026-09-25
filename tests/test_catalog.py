@@ -84,5 +84,44 @@ class CacheRepairTest(unittest.TestCase):
         self.assertEqual([r["i"] for r in rows if r["h"] == "codex"], [UUID_DIGITS])
 
 
+class CacheRootTest(unittest.TestCase):
+    """HELM_CACHE_DIR moves the catalog's cache root, as it moves
+    registry.cache_root(); unset, the root is ~/.cache/helm. Read in a fresh
+    interpreter, because the root is fixed when the module is imported."""
+
+    def _root(self, env):
+        import subprocess, sys
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "from helm import catalog, registry; "
+             "print(catalog.CACHE_DIR); print(catalog.SYN_CACHE); "
+             "print(registry.cache_root())"],
+            cwd=repo, env=env, capture_output=True, text=True, check=True)
+        return out.stdout.splitlines()
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.env = {k: v for k, v in os.environ.items()
+                    if k not in ("HELM_CACHE_DIR", "MELD_CACHE_DIR")}
+        self.env["HOME"] = os.path.join(self.tmp, "home")
+
+    def test_override_moves_the_root_and_matches_the_registry(self):
+        moved = os.path.join(self.tmp, "moved")
+        cache_dir, syn, registry_root = self._root(
+            dict(self.env, HELM_CACHE_DIR=moved))
+        self.assertEqual(cache_dir, moved)
+        self.assertEqual(syn, os.path.join(moved, "syn-cache.json"))
+        self.assertEqual(cache_dir, registry_root)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "home", ".cache")))
+
+    def test_unset_keeps_the_default_root(self):
+        cache_dir, _, registry_root = self._root(self.env)
+        self.assertEqual(cache_dir,
+                         os.path.join(self.tmp, "home", ".cache", "helm"))
+        self.assertEqual(cache_dir, registry_root)
+
+
 if __name__ == "__main__":
     unittest.main()

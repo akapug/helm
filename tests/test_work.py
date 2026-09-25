@@ -6038,6 +6038,113 @@ class StaleGuardHookTest(WorkBase):
                          "a read pass must never rewrite a hook")
 
 
+class HooksDirectoryIsAskedOncePerEvaluationTest(WorkBase):
+    """One guard evaluation asks git for the hooks directory once, and the
+    next evaluation asks again (task/3039).
+
+    MEASURED BEFORE: `hook_path` asked `git rev-parse --git-path hooks` for
+    every hook name, about 41 times per `helm work claim`, and 7,995 times in
+    tests.test_stop_seam alone. The directory is resolved at the top of each
+    evaluation and passed down. It is NOT remembered across evaluations,
+    because `core.hooksPath` can change between two of them, and a memo
+    keyed on the repository path would then name a directory git no longer
+    runs.
+    """
+
+    def _asks(self):
+        real = _work_guard._git
+        asked = []
+
+        def counting(where, *args, **kw):
+            if "--git-path" in args:
+                asked.append(args)
+            return real(where, *args, **kw)
+
+        patch = mock.patch.object(_work_guard, "_git", counting)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return asked
+
+    def test_each_evaluation_asks_for_the_hooks_directory_once(self):
+        rc, _o, _e = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0)
+        asked = self._asks()
+        _work_guard.hook_path(self.root, "pre-commit")
+        self.assertEqual(len(asked), 1, "control: the counter sees one ask")
+        for name, evaluate in (
+                ("stale_guard_hooks", _work_guard.stale_guard_hooks),
+                ("guard_remedy", _work_guard.guard_remedy),
+                ("guard_remedy_note", _work_guard.guard_remedy_note),
+                ("installed_profile", _work_guard.installed_profile),
+                ("install_guard dry", lambda root: _work_guard.install_guard(
+                    root, apply=False))):
+            with self.subTest(evaluation=name):
+                asked = self._asks()
+                evaluate(self.root)
+                self.assertEqual(len(asked), 1, asked)
+
+    def test_one_claim_asks_for_the_hooks_directory_once(self):
+        """A claim's rail check and the remedy it prints for a rail that is
+        not armed are ONE evaluation: they read one hooks directory. Measured
+        before: three asks per claim, the check and each half of the remedy."""
+        asked = self._asks()
+        rc, _o, err = self.work("claim", "alpha", "--seat", "s1")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("GUARD RAIL NOT ARMED", err,
+                      "control: the check ran and printed its remedy")
+        self.assertIn("install-guard --apply --profile rail", err)
+        self.assertEqual(len(asked), 1, asked)
+
+    def test_one_staleness_check_resolves_the_profile_once(self):
+        """The plan and the scanner snapshots a staleness check compares are
+        judged under ONE profile resolution. Measured before: two per check,
+        585 `config --get helm.guard.profile` spawns in tests.test_stop_seam,
+        and two resolutions that could disagree if the repo changed between
+        them."""
+        real = _work_guard._git
+        asked = []
+
+        def counting(where, *args, **kw):
+            if args[:2] == ("config", "--get"):
+                asked.append(args)
+            return real(where, *args, **kw)
+
+        with mock.patch.object(_work_guard, "_git", counting):
+            drift = _work_guard.stale_guard_hooks(self.root)
+        self.assertIn(("MISSING", "reference-transaction"),
+                      [(state, name) for state, name, _why in drift],
+                      "control: the check compared an unarmed rail")
+        self.assertEqual(len(asked), 1, asked)
+
+    def test_the_answer_is_unchanged_by_the_hoist(self):
+        """The plan's targets and snapshots still sit in the hooks directory
+        git reports."""
+        hooks = _sh(self.root, "git", "rev-parse", "--path-format=absolute",
+                    "--git-path", "hooks").stdout.strip()
+        _base, plan = _work_guard._guard_plan(self.root)
+        self.assertTrue(plan, "control: the rail plans hooks")
+        self.assertEqual({os.path.dirname(p["target"]) for p in plan}, {hooks})
+        self.assertEqual({os.path.dirname(os.path.dirname(p))
+                          for p in _work_guard._scanner_assets(self.root)},
+                         {hooks})
+
+    def test_a_hooks_path_changed_between_evaluations_is_seen(self):
+        """The must-miss: nothing is remembered across evaluations."""
+        rc, _o, _e = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0)
+        self.assertEqual(_work_guard.stale_guard_hooks(self.root), [],
+                         "control: the installed rail is fresh")
+        moved = os.path.join(self.root, ".git", "moved-hooks")
+        self.assertEqual(_sh(self.root, "git", "config", "core.hooksPath",
+                             moved).returncode, 0)
+        drift = _work_guard.stale_guard_hooks(self.root)
+        self.assertIn(("MISSING", "reference-transaction"),
+                      [(state, name) for state, name, _why in drift],
+                      "the second evaluation read the old hooks directory")
+        self.assertTrue(all(os.path.dirname(p["target"]) == moved
+                            for p in _work_guard._guard_plan(self.root)[1]))
+
+
 class LandlockGuardTest(WorkBase):
     """LANDLOCK enforced in the ref-transaction hook (three same-day land
     races 2026-07-29 — SI merged inside CD's held window 8 minutes after the
@@ -9794,6 +9901,48 @@ class LanesLandedTest(LandedWorld):
         got = work.lanes_landed(self.root, ["merged", "idle"])
         self.assertEqual(got["merged"]["state"], work.LANE_LANDED, got)
         self.assertEqual(got["idle"]["state"], work.LANE_UNSTARTED, got)
+
+
+class LanesLandedByAncestryTest(LandedWorld):
+    """THE CHEAP READ THE LAND PROJECTION ASKS OF EVERY OPEN BUILD'S LANE.
+
+    A build row's work lives on its lane, so the projection asks the lane —
+    for every open build row, on every board rebuild. The full producer's
+    patch-identity leg runs `git cherry` against the trunk, which walks every
+    trunk patch since the lane's base: measured on the live repository, the
+    stale build lanes cost minutes on a cold process. `content=False` answers
+    from ancestry and the lane's own reflog alone, says UNKNOWN (never
+    UNLANDED) where only patch identity could tell, and writes nothing into
+    the memo the full reader serves."""
+
+    def test_ancestry_and_authorship_answer_and_patch_identity_is_never_asked(self):
+        self.lane("merged", commits=1)
+        self.land("merged")
+        self.lane("open", commits=1)
+        self.lane("fresh")             # claimed after the land: at the trunk
+        calls, spy = self.spy()
+        with spy:
+            got = work.lanes_landed(self.root, ["merged", "open", "fresh",
+                                                "never-had-a-branch"],
+                                    content=False)
+        self.assertEqual(got["merged"]["state"], work.LANE_LANDED, got)
+        self.assertEqual(got["fresh"]["state"], work.LANE_UNSTARTED, got)
+        self.assertEqual(got["never-had-a-branch"]["state"], work.LANE_GONE)
+        self.assertEqual(got["open"]["state"], work.LANE_UNKNOWN, got)
+        self.assertIn("patch identity was not asked", got["open"]["proof"])
+        self.assertGreater(len(calls), 0, "MUST-HIT: git was asked at all")
+        self.assertEqual([c for c in calls if c and c[0] in ("cherry", "log")],
+                         [], "the ancestry-only read walked patches")
+
+    def test_it_leaves_nothing_for_the_full_reader_to_be_served(self):  # noqa: VACUOUS_ASSERTION — every assertion is an equality on a named state of the same lane: the cheap UNKNOWN, the full UNLANDED after it, and the kept UNLANDED served back
+        self.lane("open", commits=1)
+        cheap = work.lanes_landed(self.root, ["open"], content=False)
+        self.assertEqual(cheap["open"]["state"], work.LANE_UNKNOWN)
+        full = work.lanes_landed(self.root, ["open"])
+        self.assertEqual(full["open"]["state"], work.LANE_UNLANDED, full)
+        # AND A FULL VERDICT ALREADY KEPT IS A STRONGER ANSWER, served as is
+        again = work.lanes_landed(self.root, ["open"], content=False)
+        self.assertEqual(again["open"]["state"], work.LANE_UNLANDED, again)
 
 
 class TheTrunkNameFlippingUnderTheMemoTest(WorkBase):

@@ -17,10 +17,12 @@ THE SIGNATURE IS THE PRECEDENT'S. `_seam_gate(session, room, seat, cwd=None,
 blocks=None, warns=None)` takes the identity triple and the two accumulators;
 this takes the same plus the dispatch snapshot.
 
-`dispatch_snapshot` IS PASSED RATHER THAN MOVED, and that is not a shortcut:
-it memoises over `_dispatch_cache`, `budget` and `timing` — per-invocation
-state of one _stop_guard call — so moving it would drag the budget machinery
-with it. A caller-supplied reader keeps the memo exactly one stop wide.
+`facts` IS THE STOP'S ONE READING OF THE RESIDENT'S STOP FACTS
+(`helm/stopfacts.py`), passed rather than taken here so every rung of one stop
+judges the same reading. This rung folds no ledger and asks git nothing: the
+gate exemption, the room advice and the dispatch advice are the resident's
+answers from the guard's own functions, and an exemption is granted only on
+EXACT facts. STALE or ABSENT facts keep the block and say why.
 
 THE TWO CONSTANTS CAME WITH IT because only this rung reads them, and
 seats_stop_guard re-exports them because helm/seats.py and the suite both
@@ -43,15 +45,14 @@ meanwhile is that an exemption has exactly ONE door out of the loop
 """
 import hashlib
 
-from . import pk, projscope
+from . import pk, projscope, stopfacts
 from .seats_common import (STATUS_BYTES, _clip, _now_mono, _scrub, _sweep,
                            claims_path)
 from .seats_roster import roster_acquired, roster_indexes, seat_for_session_in
-from .seats_delegation import (_delegated_build, _gate_pending, proc_scan,
-                               release_hint)
+from .seats_delegation import _delegated_build, proc_scan, release_hint
 from .seats_cursor import _remove_stop_latch, _write_stop_latch
 from .seats_stop_signals import _off, _stop_fp_path
-from .seats_room_advice import _dispatch_advice, _room_advice
+from .seats_room_advice import _ROOM_READS, _missed, _room_advice
 
 # stoplease is the latch lane (the `.state` idiom every other rung uses,
 # per (room, seat, session) via _stop_fp_path). LEASE_TTL_ALARM_S is the one
@@ -105,8 +106,44 @@ def _ttl_band(left):
     return "expiring" if left <= LEASE_TTL_ALARM_S else "held"
 
 
+def _room_reads(facts, fresh):
+    """(findings, unknowns) for `_room_advice` from one lease's stop facts.
+    ABSENT facts measured nothing, and facts that carry no LIST of findings
+    and of unknowns carry no reading, so every read is UNKNOWN — one entry
+    per read, the denominator `_room_advice` counts."""
+    if isinstance(facts, dict) and fresh.verdict != stopfacts.ABSENT:
+        findings, unknowns = facts.get("findings"), facts.get("unknowns")
+        if isinstance(findings, list) and isinstance(unknowns, list):
+            return list(findings), list(unknowns)
+        return [], _missed(_ROOM_READS, "the stop facts carry no reading "
+                                        "of this room")
+    return [], _missed(_ROOM_READS, "no stop facts")
+
+
+def _dispatch_line(facts, fresh, seat, brief):
+    """The resident's `_dispatch_advice` sentence for this seat, or the
+    UNKNOWN sentence when the facts carry none."""
+    adv = facts.get("advice") if isinstance(facts, dict) else None
+    got = adv.get(str(seat or "").strip()) if isinstance(adv, dict) else None
+    if fresh.verdict == stopfacts.ABSENT or not isinstance(got, dict) \
+            or not isinstance(got.get("brief"), str):
+        return (" — what this claim is owed is UNKNOWN (no stop facts for "
+                "it)" if brief else
+                "   — whether this row is still owed is UNKNOWN: the stop "
+                "facts carry no reading of it. `helm dispatch list` reads the "
+                "ledger itself")
+    return got["brief"] if brief else str(got.get("long") or got["brief"])
+
+
+def _aged(text, fresh):
+    """A sentence plus the note saying how old its facts are, when they are
+    not EXACT or the trunk moved under them."""
+    note = fresh.note() if fresh is not None else ""
+    return "%s [%s]" % (text, note) if note else text
+
+
 def claims_rung(session, room, seat, blocks=None, warns=None,
-                dispatch_snapshot=None, detail=False):
+                facts=None, detail=False):
     """The claims/leases rung: append to `blocks` and `warns`, return None.
 
     `detail` RENDERS THE LONG FORM AND CHANGES NOTHING ELSE — no read, no
@@ -265,14 +302,27 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
             lease_fps.append("%s\x1f%s\x1fexempt:%s\x1f%s" % (
                 r, v.get("lease") or "", state, _ttl_band(left)))
 
-        # ONE LEDGER READ PER STOP, memoised across every lane lease in this
-        # loop and across both rungs that want it (the gate-pending exemption
-        # and the release advice's review read). Measured 190ms on a
-        # 1,577-event ledger, so N leases x 2 rungs of naive re-reads is the
-        # difference between a guard that runs on every stop and one someone
-        # switches off. Read LAZILY: a stop with no lane lease pays nothing.
-        def _ledger():
-            return dispatch_snapshot()
+        # ONE READING OF THE STOP FACTS PER STOP, taken lazily — a stop with
+        # no lane or dispatch lease reads nothing — and NEVER WAITED FOR.
+        # A fail-closed rung does not wait on state (owner rule, task/3042).
+        # The commonest reading that is not EXACT is this seat's own lease
+        # just after its own commit: the lane is unfinished anyway, so the
+        # lease is held with the line printed for unproven idleness and the
+        # snapshot's age, at once. The bounded wait this replaced bought an
+        # exemption the lane had not earned and cost such a stop up to 1.5s.
+        facts = facts if facts is not None else stopfacts.Lazy()
+
+        def _view():
+            return facts.view()
+
+        not_exact = []            # (res, Freshness) for the sermon's footer
+
+        def _lease(r):
+            """(facts, Freshness) for one lease, the footer noting a miss."""
+            got, fresh = _view().lease(r)
+            if not fresh.exact and all(x[0] != r for x in not_exact):
+                not_exact.append((r, fresh))
+            return got, fresh
 
         # AND ONE PROCESS-TABLE READ PER STOP, for the same reason and on the
         # same lazy terms. The delegation exemption below asks the table one
@@ -420,7 +470,15 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
             proof = None
             if not _off("STOP_GUARD_DELEGATION"):
                 try:  # UNKNOWN → BLOCK: a raise here is not proof of anything
-                    proof = _delegated_build(r, session, scan=_scan())
+                    # THE ROOM WITHOUT GIT: the resident resolved it, or the
+                    # claim's own recorded repository names it. A room neither
+                    # can name offers no proof, and UNKNOWN blocks.
+                    lf, _fresh = _view().lease(r) \
+                        if str(r).startswith("worktree:") else (None, None)
+                    lroom = (lf or {}).get("room") \
+                        or stopfacts.lease_room(r, v)
+                    proof = _delegated_build(r, session, scan=_scan(),
+                                             room=lroom) if lroom else None
                 except projscope.Expired:
                     raise
                 except Exception:
@@ -442,16 +500,19 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
             # landing the integrator's. Same law: positive proof only,
             # re-derived every stop; a fix/supersede verdict re-blocks.
             gate = None
-            if not _off("STOP_GUARD_DELEGATION"):
+            if not _off("STOP_GUARD_DELEGATION") \
+                    and str(r).startswith("worktree:"):
                 try:
-                    # An UNAVAILABLE ledger already folds to {} in
-                    # `snapshot()`, which is the same empty mapping
-                    # `rows()` handed this rung before — so the threaded
-                    # value never changes an answer, it only stops the
-                    # second read.
-                    _snap, _note = _ledger()
-                    gate = _gate_pending(
-                        r, snap=_snap if isinstance(_snap, dict) else None)
+                    # `_gate_pending`'s answer as the resident computed it, and
+                    # ONLY when EXACT: the ledger, the lane's HEAD and the code
+                    # are what they were when it was computed. A witness that
+                    # moved is not proof the gate ended, but it is no longer
+                    # proof the gate stands — UNKNOWN, and the block stays.
+                    lf, fresh = _lease(r)
+                    got = lf.get("gate") if isinstance(lf, dict) else None
+                    if fresh.exact and isinstance(got, list) \
+                            and len(got) == 3:
+                        gate = tuple(str(x) for x in got)
                 except projscope.Expired:
                     raise
                 except Exception:
@@ -559,9 +620,8 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
             # reads per lane lease and stays out of the latch path.
             advice_fp = ""
             if str(r).startswith("dispatch:"):
-                _snap, _note = _ledger()
-                _sentence = _dispatch_advice(
-                    r, seat, snap=_snap, ledger_note=_note)
+                lf, fresh = _lease(r)
+                _sentence = _dispatch_line(lf, fresh, seat, brief=False)
                 advice_fp = "\x1f" + hashlib.blake2b(
                     _sentence.encode("utf-8"), digest_size=8).hexdigest()
             lease_fps.append("%s\x1f%s\x1f%s%s" % (
@@ -670,9 +730,10 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
                     # reads it against "NO release command is offered", and a
                     # branch that ever earns a True must pass through here.
                     if cmd and str(_r).startswith("worktree:"):
-                        _snap, _note = _ledger()
+                        lf, fresh = _lease(_r)
                         keep, advice = _room_advice(
-                            _r, snap=_snap, ledger_note=_note, brief=not detail)
+                            _r, brief=not detail, reads=_room_reads(lf, fresh))
+                        advice = _aged(advice, fresh)
                         cmd = (cmd + advice) if keep else advice.lstrip(" —").strip()
                     # A DISPATCH CLAIM GETS THE SAME TREATMENT AND NEVER DID.
                     # It was listed with its resource and its TTL and nothing
@@ -687,10 +748,10 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
                         # so there is no branch where withholding the command
                         # protects anything, while withholding it denies the
                         # seat the only printing of its own lease token.
-                        _snap, _note = _ledger()
-                        advice = _dispatch_advice(
-                            _r, seat, snap=_snap, ledger_note=_note,
-                            brief=not detail)
+                        lf, fresh = _lease(_r)
+                        advice = _aged(_dispatch_line(lf, fresh, seat,
+                                                      brief=not detail),
+                                       fresh)
                         cmd = (cmd + advice) if cmd \
                             else advice.lstrip(" —").strip()
                     lines.append(
@@ -747,6 +808,13 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
                 # stop; naming the verb that reprints it costs one line however
                 # many lanes are held, and `--detail` is that verb's flag
                 # rather than a second surface that could answer differently.
+                # WHY AN EXEMPTION WAS NOT GRANTED, WHEN THE FACTS ARE THE
+                # REASON. Each lane's own line carries its note; this one line
+                # names the snapshot's standing once — so "held" is never read
+                # as "helm measured this lane and found it idle".
+                if not_exact:
+                    lines.append("  " + _clip(_scrub(_view().headline()),
+                                              2 * STATUS_BYTES))
                 sermon = ("[helm stop-guard] leases held by this session — "
                           "act per line, then stop:\n" + "\n".join(lines)
                           + ("" if detail else

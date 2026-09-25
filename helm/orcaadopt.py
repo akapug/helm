@@ -1460,9 +1460,11 @@ def turn_restart_identity(seat, session, procs=None, unreadable=None):
     live = [p for p in named if p.get("pane_key")]
     if not live:
         return None, ("%d live process%s name%s %s but none carries an "
-                       "ORCA_PANE_KEY — helm has no address to inject into"
+                       "ORCA_PANE_KEY — helm has no address to inject into "
+                       "(metaharness: %s)"
                        % (len(named), "" if len(named) == 1 else "es",
-                          "s" if len(named) == 1 else "", seat))
+                          "s" if len(named) == 1 else "", seat,
+                          _detected_host()))
 
     # RUNG 2 — the session id, the one field that names WHICH process compacted.
     how = "no session evidence either way, and an absent record is not a " \
@@ -1639,8 +1641,9 @@ def _nameless_identity(session, procs, unreadable):
                                                     p["seat"]))
     if not p.get("pane_key"):
         return None, ("pid %d holds --resume %s… but carries no "
-                      "ORCA_PANE_KEY — helm has no address to inject into"
-                      % (p["pid"], session[:8]))
+                      "ORCA_PANE_KEY — helm has no address to inject into "
+                      "(metaharness: %s)"
+                      % (p["pid"], session[:8], _detected_host()))
     return ident_of(p), ("pid %d, argv --resume %s… (nameless pane, resolved "
                          "from this session's own sid)"
                          % (p["pid"], session[:8]))
@@ -1684,6 +1687,27 @@ def _nameless_identity(session, procs, unreadable):
 # live session and reports success.
 
 
+def _host_label(adapter):
+    """The metaharness an adopted-pane refusal met, by the adapter's own name,
+    or the no-host case `harness.detect` answers with None."""
+    name = getattr(adapter, "name", None)
+    if name:
+        return str(name)
+    return ("none detected (HELM_METAHARNESS=none, or no orca or herdr CLI "
+            "on PATH)" if adapter is None else "unnamed adapter")
+
+
+def _detected_host():
+    """`_host_label` of the metaharness `harness.detect` would pick — an env
+    read and a PATH lookup, no RPC, so an identity rung that must not probe a
+    metaharness can still name the host its refusal met."""
+    try:
+        from . import harness
+        return _host_label(harness.detect())
+    except Exception as e:                          # noqa: BLE001 — prose only
+        return "unknown (detection failed: %s)" % e.__class__.__name__
+
+
 def _pane_of(proc, adapter):
     """(handle, reason) — the handle of THIS process's OWN pane. Never a list.
 
@@ -1691,14 +1715,21 @@ def _pane_of(proc, adapter):
     the whole reason this returns a handle rather than candidates.
     """
     pid = proc["pid"]
+    # THE REFUSAL NAMES THE HOST (task/3055, an owner requirement). An adopted
+    # pane is addressed through the metaharness's own pane resolver, and only
+    # an adapter that exposes one can turn a pane key into a handle. Under any
+    # other host the answer is a refusal, and a refusal that does not say
+    # WHICH host it met reads as a broken seat rather than a missing seam.
+    host = _host_label(adapter)
     if not proc.get("pane_key"):
         return None, ("pid %d carries no ORCA_PANE_KEY — helm has no address "
-                      "to inject into" % pid)
+                      "to inject into (metaharness: %s)" % (pid, host))
     resolver = getattr(adapter, "resolve_pane", None)
     if resolver is None:
-        return None, ("no live pane resolves for pid %d — this metaharness "
+        return None, ("no live pane resolves for pid %d — the %s metaharness "
                       "exposes no pane resolver, so its ORCA_PANE_KEY cannot "
-                      "become a handle; refusing to inject into another" % pid)
+                      "become a handle; refusing to inject into another"
+                      % (pid, host))
     try:
         pane = resolver(proc["pane_key"]) or {}
     except Exception as e:                          # noqa: BLE001 — fail-open
@@ -1796,8 +1827,10 @@ def authorized_handle(expect_pids, adapter):
     holders = [live[k] for k in keys if live[k].get("pane_key")]
     if not holders:
         return None, ("no authorized process (pid %s) carries an "
-                      "ORCA_PANE_KEY — helm has no address to inject into"
-                      % ", ".join(str(k[0]) for k in keys))
+                      "ORCA_PANE_KEY — helm has no address to inject into "
+                      "(metaharness: %s)"
+                      % (", ".join(str(k[0]) for k in keys),
+                         _host_label(adapter)))
     if len(holders) > 1:
         return None, ("%d authorized processes each carry a pane (pid %s) — a "
                       "send must never guess which one holds the session"

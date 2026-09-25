@@ -1,5 +1,6 @@
 """The guard identity that is deliberately not a queue slot."""
 import io
+import json
 import os
 import tempfile
 import sys
@@ -310,6 +311,69 @@ class FocusEnvIsSuiteEnvTest(_IsolatedGateHome):
         self.assertIn("HELM_GATE_SUITE_CAP", tuple(env))
         self.assertEqual("0", env.get("PYTHON_COLORS"))
         self.assertEqual("1", env.get("NO_COLOR"))
+
+
+class SuiteNeverWritesTheGateLedgerTest(unittest.TestCase):
+    """The suite a gate runs resolves its OWN stores, never the launcher's.
+
+    Measured on a fab gate: two tests append gate rows under whatever home
+    they resolve, the suite inherited the gate's HELM_HOME, and the fetched
+    artifact held their rows beside the real receipt, so the import refused
+    it. The chat root is the same channel one variable over: an inherited
+    chat dir is kept by tests/__init__, so a launcher that exports it hands
+    the serial suite the live bus. The probe imports `tests` exactly as
+    discovery does and asks the real resolvers where they landed.
+    """
+
+    PROBE = ("import json, sys; sys.path.insert(0, %r); import tests; "
+             "from helm import chat, gate; print(json.dumps("
+             "{'ledger': gate.receipts_path(), 'chat': chat.chat_dir()}))"
+             % os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    def resolved(self, env):
+        proc = subprocess.run([sys.executable, "-c", self.PROBE], env=env,
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        return {k: os.path.realpath(v)
+                for k, v in json.loads(proc.stdout).items()}
+
+    def test_the_suite_resolves_its_stores_outside_the_launchers(self):  # noqa: VACUOUS_ASSERTION — the loop runs a fixed four-spelling tuple, and in each pass the positive control (the inherited environment resolves INSIDE the planted root) precedes the absence on the same observable
+        for spelling, store, pair in (
+                ("HELM_HOME", "ledger", ("HELM_HOME", "MELD_HOME")),
+                ("MELD_HOME", "ledger", ("HELM_HOME", "MELD_HOME")),
+                ("HELM_CHAT_DIR", "chat", ("HELM_CHAT_DIR", "MELD_CHAT_DIR")),
+                ("MELD_CHAT_DIR", "chat", ("HELM_CHAT_DIR", "MELD_CHAT_DIR"))):
+            with self.subTest(spelling=spelling), \
+                    tempfile.TemporaryDirectory() as planted, \
+                    mock.patch.dict(os.environ, {spelling: planted}):
+                planted = os.path.realpath(planted)
+                for other in pair:
+                    if other != spelling:
+                        os.environ.pop(other, None)
+                # CONTROL: the inherited environment IS the leak.
+                self.assertTrue(self.resolved(dict(os.environ))[store]
+                                .startswith(planted), store)
+                suite = gate._suite_env()
+                self.assertFalse(self.resolved(suite)[store].startswith(
+                    planted), "the suite resolved the launcher's %s" % store)
+                self.assertFalse(set(pair) & set(suite))
+
+    def test_the_serial_child_and_a_slice_worker_share_one_env_contract(self):  # noqa: VACUOUS_ASSERTION — the control asserts every key is PRESENT in the environment both producers copy, so an empty result is a drop, never a key that was never there
+        """Serial and sliced claim the same thing, so a key the worker scrub
+        drops must not reach the serial child either; otherwise the verdict
+        depends on what the launching shell exported."""
+        from helm import gateshard, pathenv
+        keys = (gateshard._TEST_ENV_KEYS + pathenv.IDENTITY_PATH_ENV_KEYS
+                + gateshard._ROLE_ENV_KEYS + gateshard._MEASURE_ENV_KEYS
+                + ("OLDTOOL_CONFIG_ROOTS",))
+        with mock.patch.dict(os.environ, {k: "/planted/" + k for k in keys}):
+            # CONTROL: every key is present to be dropped.
+            self.assertEqual(sorted(k for k in keys if k in os.environ),
+                             sorted(keys))
+            worker = gateshard._fresh_env("HELM_GATESLICE_WORKER")
+            serial = gate._suite_env()
+        self.assertEqual(sorted(k for k in keys if k in worker), [])
+        self.assertEqual(sorted(k for k in keys if k in serial), [])
 
 
 class TheSwitchIsReachedByThisSuiteTest(unittest.TestCase):

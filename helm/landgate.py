@@ -95,7 +95,8 @@ def holds_landlock(seat, claims=None):
     return OK, "%s held by %s" % (LANDLOCK, seat)
 
 
-def gate_binds_tree(receipt, tree, gates=None, repo=None, tip=None):
+def gate_binds_tree(receipt, tree, gates=None, repo=None, tip=None,
+                    provenance=None, where=None):
     """(state, detail) — clause (ii): the receipt must name the tree BEING
     LANDED, not the tree that was reviewed.
 
@@ -114,7 +115,17 @@ def gate_binds_tree(receipt, tree, gates=None, repo=None, tip=None):
     resolve is UNKNOWN, never a pass. The caller's `tree`, when also
     supplied, is only a cross-check: disagreeing with the derived tree is a
     REFUSE that names both, because one of the two inputs is lying and the
-    clause cannot tell which."""
+    clause cannot tell which.
+
+    AND ITS LAST QUESTION IS PROVENANCE (task/3066): after every content
+    clause, which authenticated door placed the receipt in `repo`
+    (`gate.land_provenance`). A receipt handed in through `gates` is still a
+    receipt somebody must prove ran, so an arm that injects the row injects
+    that answer too (`provenance`, a callable (row, repo) -> the same
+    (True|False|None, why)); no production caller passes either. `where` is
+    the CHECKOUT the land happens in, when `repo` names the repository by
+    its shared admin dir: a declared command's scope is read against the
+    location's own declaration."""
     if not receipt:
         return REFUSE, "no gate receipt cited for the post-rebase tree"
     derived = None
@@ -176,6 +187,12 @@ def gate_binds_tree(receipt, tree, gates=None, repo=None, tip=None):
                         "it selected, and a land is authorized only by a "
                         "WHOLE-SUITE run on the tree being landed; run `helm "
                         "gate run`" % (receipt, kind))
+    # AND ONLY A SERIAL ONE: the receipt's kind is gate.py's question, asked
+    # here because this clause authorizes the merge.
+    from . import gate as gatemod
+    refusal = gatemod.land_refusal(rec)
+    if refusal:
+        return REFUSE, refusal
     got = str(rec.get("tree") or "")
     if not got:
         return UNKNOWN, "gate %s records no tree" % receipt
@@ -192,7 +209,13 @@ def gate_binds_tree(receipt, tree, gates=None, repo=None, tip=None):
         return REFUSE, ("gate %s binds tree %s but the tree being landed is %s "
                         "— a receipt for a DIFFERENT tree proves nothing about "
                         "this merge" % (receipt, got[:12], tree[:12]))
-    return OK, "gate %s binds the post-rebase tree %s" % (receipt, tree[:12])
+    answer = provenance(rec, repo) if provenance \
+        else gatemod.land_provenance(rec, repo, where=where)
+    refusal = gatemod.land_provenance_refusal(rec, repo, answer=answer)
+    if refusal:
+        return (UNKNOWN if answer[0] is None else REFUSE), refusal
+    return OK, "gate %s binds the post-rebase tree %s%s" % (
+        receipt, tree[:12], " (%s)" % answer[1] if answer[1] else "")
 
 
 def changed_files(repo, base, tip):
@@ -289,7 +312,8 @@ def freeze_admits(board=None):
 
 
 def qualify(seat, repo, base, tip, tree, receipt, queue, board=None,
-            claims=None, verdict_ok=None, gates=None, landed=None):
+            claims=None, verdict_ok=None, gates=None, landed=None,
+            provenance=None):
     """The five clauses -> (bool, [(clause, state, detail)]).
 
     Qualified ONLY when every clause is OK. UNKNOWN never qualifies: a land is
@@ -297,7 +321,8 @@ def qualify(seat, repo, base, tip, tree, receipt, queue, board=None,
     clauses = [
         ("i-landlock", holds_landlock(seat, claims)),
         ("ii-gate-binds-landed-tree",
-         gate_binds_tree(receipt, tree, gates, repo=repo, tip=tip)),
+         gate_binds_tree(receipt, tree, gates, repo=repo, tip=tip,
+                         provenance=provenance)),
         ("iii-cross-family-approve", verdict_ok
          if verdict_ok is not None
          else (UNKNOWN, "no verdict state supplied by the caller")),

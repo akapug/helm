@@ -765,6 +765,44 @@ class BenchAndPolicyTest(unittest.TestCase):
         self.assertNotIn(DS4PRO, world.families(report))
         self.assertEqual(world.refused(report, DS4PRO)["node"], route.N4)
 
+    def test_a_DEAF_only_seat_keeps_its_family_at_the_live_node(self):
+        """task/3055 A3, THE RED-FIRST ARM. The dispatch door files a row for
+        a seat whose ONLY refusal is that helm cannot wake it, so the router
+        must not call its family seatless: it is a candidate, ranked last."""
+        world = World()
+        bench = json.loads(json.dumps(world.bench))
+        bench["seats"]["seat-c"].update(can_take_work=False, reachable=False,
+                                        refusals=["reachable"])
+        world.bench = bench
+        report = world.ask("council")
+        self.assertIsNone(world.refused(report, DS4PRO),
+                          "a DEAF-only seat dropped its family at N4")
+        row = world.admitted(report, DS4PRO)
+        self.assertEqual("seat-c", row["seat"])
+        self.assertEqual(2, row["reach_rank"])
+
+    def test_CONTROL_a_DEAF_seat_with_a_second_refusal_still_drops(self):  # noqa: VACUOUS_ASSERTION — the refusal row's node N4 is a positive observable; its mirror is test_a_DEAF_only_seat_keeps_its_family_at_the_live_node
+        world = World()
+        bench = json.loads(json.dumps(world.bench))
+        bench["seats"]["seat-c"].update(can_take_work=False, reachable=False,
+                                        refusals=["reachable", "upstream"])
+        world.bench = bench
+        report = world.ask("council")
+        self.assertEqual(route.N4, world.refused(report, DS4PRO)["node"])
+
+    def test_a_DEAF_only_seat_ranks_after_a_reachable_one_in_its_family(self):  # noqa: VACUOUS_ASSERTION — the admitted seat's name is the positive observable; the DEAF seat would win on idleness alone
+        """Listed last, not first: the DEAF seat is IDLE and its sibling is
+        RUNNING, so idleness alone would pick the seat helm cannot wake."""
+        world = World()
+        bench = json.loads(json.dumps(world.bench))
+        bench["seats"]["seat-c2"] = dict(bench["seats"]["seat-c"],
+                                         pane="RUNNING")
+        bench["seats"]["seat-c"].update(can_take_work=False, reachable=False,
+                                        refusals=["reachable"])
+        world.bench = bench
+        report = world.ask("council")
+        self.assertEqual("seat-c2", world.admitted(report, DS4PRO)["seat"])
+
     def test_a_busy_seat_is_ranked_down_and_never_excluded(self):
         """E14 — capacity is LIVE seats, not idle seats."""
         world = World()

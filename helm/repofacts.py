@@ -70,6 +70,13 @@ def cache_path():
 # -- the remotes --------------------------------------------------------------
 
 _REMOTES_MEMO = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_REMOTES_MEMO": (
+        "remotes per common git dir, checked against its config stamp"),
+}
 _REMOTES_LOCK = threading.Lock()
 _REMOTES_MEMO_CAP = 1024
 

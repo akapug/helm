@@ -236,6 +236,14 @@ that render it all:
   before the land gate by a reader who wrote none of it.
 - **Minted whole-suite gates** — `helm gate run` binds interpreter, exact tree,
   before/after cleanliness, process exit and unittest summary into one receipt.
+  In helm's own tree the whole suite belongs to the land gate: a lane is
+  tested in focused rounds (`helm gate run --focus` plus `helm gate audits`), and
+  `helm gate run` refuses a whole suite in a lane room, refuses a second one
+  on a tree that is already green, and runs a red tree again only with
+  `--again`. Only a SERIAL receipt authorizes a land. A sliced one (the
+  default with no mode flag in a lane-level room) binds a lane tip and a
+  review's approve and never a land — see
+  [How a change is tested](CONTRIBUTING.md#how-a-change-is-tested).
   Expensive whole-suite runs enter a process-owned repository FIFO first: every
   linked worktree shares one ordered slot, poll speed cannot barge, dead
   positions are skipped visibly, and the slot stays held through receipt append.
@@ -320,9 +328,11 @@ $ ./bin/helm web               # the same, warm, in a browser
 ### Requirements
 
 **Requires Python 3.9+ on Linux**, and nothing else. That floor is declared
-here and in `scripts/install.sh`. Run the suite with
-`python3 -m unittest discover -s tests`. Maintainers test on newer
-interpreters; 3.9 is declared, not CI-tested. `tomllib` (3.11+) is used when present
+here and in `scripts/install.sh`. The suite is
+`python3 -m unittest discover -s tests`; how a change is tested (focused
+rounds, then one whole suite at the land gate) is in
+[CONTRIBUTING](CONTRIBUTING.md#how-a-change-is-tested). Maintainers test on
+newer interpreters; 3.9 is declared, not CI-tested. `tomllib` (3.11+) is used when present
 and config validation degrades to a warning without it.
 
 **Linux specifically, and stdlib-only does not mean portable.** helm's chat

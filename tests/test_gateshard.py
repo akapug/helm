@@ -1738,3 +1738,100 @@ class CanonicalRunCompositionTest(_ShardHarness):
                          chain["inner_artifact_digest"],
                          "the supervisor's claim must be the SHA-256 of the "
                          "worker artifact's actual bytes")
+
+
+class TheSupervisorReportsASignalDeathAs128PlusNTest(_ShardHarness):
+    """task/3075: a worker killed by TERM reached the pool as "exited 241".
+
+    `_supervise` handed the inner worker's wait status (-15) to `SystemExit`,
+    which exits 256-15, and `_wait_status` read 241 as an exit code. The
+    supervisor now reports 128+N, as gatechild's supervisor does (task/3070),
+    and the reader reads 128+N as the signal. Each supervisor arm runs the
+    real `--supervise` door as a script, the way the pool launches it, over a
+    real test module in a real worker."""
+
+    def supervise(self, body):
+        module = self.write(
+            "test_exit_arm",
+            "import atexit, os, signal, unittest\n"
+            "class Probe(unittest.TestCase):\n"
+            "    def test_probe(self):\n"
+            "        %s\n" % body)
+        with tempfile.TemporaryDirectory() as work:
+            manifest = os.path.join(work, "shard-1.modules.json")
+            meta = os.path.join(work, "shard-1.json")
+            with open(manifest, "w", encoding="utf-8") as fh:
+                json.dump({"modules": [module], "counts": {module: 1},
+                           "ids": {module: [module + ".Probe.test_probe"]}},
+                          fh)
+            # A worker killed mid-test never runs the fixture's atexit
+            # cleanup, so its temporary root lands in `work` and goes with it.
+            env = dict(gateshard._fresh_env("HELM_GATESHARD_WORKER"),
+                       TMPDIR=work)
+            run = subprocess.run(
+                SHARD + ["--supervise", "1", manifest,
+                         os.path.join(work, "shard-1.protocol"), meta],
+                cwd=self.repo, env=env, capture_output=True, text=True,
+                timeout=120, start_new_session=True)
+            return run.returncode, run.stderr, os.path.exists(meta)
+
+    def test_a_worker_killed_by_TERM_reports_143_and_reads_as_TERM(self):
+        rc, err, promoted = self.supervise(
+            "os.kill(os.getpid(), signal.SIGTERM)")
+        self.assertEqual(rc, 143, err)      # 128 + SIGTERM (15); trunk gave 241
+        self.assertFalse(promoted, "a worker that died mid-test certifies nothing")
+        said = gateshard._wait_status(rc)
+        self.assertIn("died on signal 15 (SIGTERM)", said)
+        self.assertNotIn("exited", said)
+
+    def test_a_worker_killed_by_KILL_reports_137_and_reads_as_KILL(self):
+        rc, err, _promoted = self.supervise(
+            "os.kill(os.getpid(), signal.SIGKILL)")
+        self.assertEqual(rc, 137, err)      # 128 + SIGKILL (9)
+        self.assertIn("died on signal 9 (SIGKILL)", gateshard._wait_status(rc))
+
+    def test_a_signal_after_the_meta_is_staged_reports_128_plus_N(self):
+        """The supervisor's OTHER exit: the worker stages its meta, the
+        supervisor promotes it, and only then reports the inner's status. A
+        TERM from an atexit handler dies after the meta is written, so this
+        arm reaches that last return and the arms above do not."""
+        rc, err, promoted = self.supervise(
+            "atexit.register(os.kill, os.getpid(), signal.SIGTERM)")
+        self.assertTrue(promoted, err)
+        self.assertEqual(rc, 143, err)
+
+    def test_an_exit_code_passes_through_unchanged(self):
+        """The control: exit 3 and a passing module are reported as 3 and 0,
+        and read as exits, so the arms above are about signals only."""
+        rc, err, promoted = self.supervise("os._exit(3)")
+        self.assertEqual(rc, 3, err)
+        self.assertFalse(promoted)
+        self.assertEqual(gateshard._wait_status(rc), "exited 3")
+        rc, err, promoted = self.supervise("self.assertTrue(True)")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(promoted, err)
+        self.assertEqual(gateshard._wait_status(rc), "exited 0")
+
+    def test_the_reader_still_reads_a_negative_status_as_a_signal(self):
+        """The pool's own wait on a supervisor it killed (the deadline reaps
+        the whole tree) is Popen's -N, and stays a signal."""
+        self.assertEqual(gateshard._wait_status(-9),
+                         "died on signal 9 (SIGKILL)")
+        self.assertEqual(gateshard._wait_status(128), "exited 128")
+
+    def test_the_pool_names_a_TERM_death_as_a_signal(self):
+        """The reader through the whole pool: `run_bins` launches the
+        supervisor, reads its exit, and quotes it in the crash block."""
+        module = self.write("test_term_arm", """
+            import os, signal, unittest
+            class Probe(unittest.TestCase):
+                def test_probe(self): os.kill(os.getpid(), signal.SIGTERM)
+        """)
+        with tempfile.TemporaryDirectory() as scratch, \
+                mock.patch.dict(os.environ, {"TMPDIR": scratch}):
+            text, rc = self.run_bins([[module]])
+        self.assertNotEqual(0, rc)
+        self.assertIn(module, text)
+        self.assertIn("died on signal 15 (SIGTERM) (reported as exit 143)",
+                      text)
+        self.assertNotIn("exited 241", text)

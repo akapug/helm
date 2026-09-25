@@ -10,8 +10,17 @@ CURE: PATTERN, not literal. A regex over the host-path SHAPE removes the
 literal AND generalises — `/home/<user>/path` or `/Users/<user>/path`.
 
 PUBLIC-ONLY: a private-repo push to a named collaborator has a different bar.
-UNKNOWN fails SAFE: treat as public and REFUSE — a refused push costs a
-retry, a leaked path on a public remote may already be cloned or indexed.
+The visibility answer has three values (`_visibility`): PRIVATE skips the
+scan, PUBLIC scans, and UNKNOWN scans too. UNKNOWN fails SAFE: treat as public
+and REFUSE — a refused push costs a retry, a leaked path on a public remote may
+already be cloned or indexed. But UNKNOWN is not PUBLIC, and the refusal must
+not say PUBLIC. MEASURED: a push of main to a PRIVATE repo was refused with
+"must not be pushed to a PUBLIC remote", `gh repo view` read isPrivate:true
+409 ms later, and the retried push went through. A one-bool answer cannot
+tell a gh failure (non-zero exit, timeout, no gh, output that is not JSON)
+from a public repository. So a failed probe is asked once more before the
+answer is UNKNOWN, and the UNKNOWN answer carries the failure in fixed words,
+which the refusal prints: "visibility UNKNOWN (<why>), treated as public".
 
 THE SCAN READS WHAT THE PUSH ADDS TO THE REMOTE. A diff of `old..new` sees
 only the files this push changes, and a host path committed in an earlier,
@@ -105,6 +114,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 # `/home/<user>/` or `/Users/<user>/` where <user> starts with a letter.
 # Excludes bare /home/ and /home without a trailing path segment.
@@ -120,6 +130,13 @@ _NAMED_N = 3
 _ZERO = "0000000000000000000000000000000000000000"
 _CHUNK = 32 << 20
 _LS_REMOTE_TIMEOUT = 30
+# The three visibility answers (`_visibility`), the gh budget for one probe,
+# and the pause before the one retry of a failed probe.
+PRIVATE, PUBLIC, UNKNOWN = "PRIVATE", "PUBLIC", "UNKNOWN"
+_GH_TIMEOUT = 30
+_GH_RETRY_PAUSE = 1.0
+# The note level that carries the visibility answer to the refusal.
+_DESTINATION = "destination"
 _ARGV_DEPTH = 16
 _NOT_PROVEN = "push destination not proven to be the queried one (%s)"
 # A -c or --config-env key in the push argv that can move the destination.
@@ -280,32 +297,61 @@ def _remote_url(root, remote):
     return out.strip() if rc == 0 and out.strip() else None
 
 
-def _is_public(remote_url):
-    """True if the remote is PUBLIC or UNKNOWN (fail-safe)."""
+def _visibility(remote_url):
+    """-> (PRIVATE | PUBLIC | UNKNOWN, why). `why` is None unless UNKNOWN.
+
+    Only PRIVATE skips the scan; the caller treats UNKNOWN as public. A URL
+    that is not on GitHub, or names no owner/repo, is UNKNOWN at once, since
+    asking again cannot change it. A failed gh probe is asked once more after
+    _GH_RETRY_PAUSE seconds, and only two failures make UNKNOWN. `why` is
+    fixed words and an exit code or exception type name, never gh's output:
+    that output can carry the repository slug and whatever gh says about
+    its credential."""
     if not remote_url:
-        return True
+        return UNKNOWN, "no remote URL"
     # Normalise: SSH git@github.com:owner/repo -> https://github.com/owner/repo
     url = re.sub(r"^git@([^:]+):", r"https://\1/", remote_url)
     parts = url.split("github.com/", 1)
     if len(parts) != 2:
-        return True  # non-GitHub, cannot determine -> public
+        return UNKNOWN, "not a GitHub URL"
     slug = parts[-1].rstrip("/").replace(".git", "").split("/")
     if len(slug) < 2:
-        return True
+        return UNKNOWN, "no owner/repo in the GitHub URL"
     owner_repo = "/".join(slug[:2])
+    state, first = _gh_visibility(owner_repo)
+    if state != UNKNOWN:
+        return state, None
+    time.sleep(_GH_RETRY_PAUSE)
+    state, second = _gh_visibility(owner_repo)
+    if state != UNKNOWN:
+        return state, None
+    return UNKNOWN, ("%s, twice" % first if second == first
+                     else "%s, then %s" % (first, second))
+
+
+def _gh_visibility(owner_repo):
+    """One `gh repo view` probe -> (PRIVATE | PUBLIC | UNKNOWN, why)."""
     try:
         p = subprocess.run(
             ("gh", "repo", "view", owner_repo, "--json", "isPrivate"),
-            capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return True  # gh unavailable -> public
-    if p.returncode != 0 or not p.stdout.strip():
-        return True
+            capture_output=True, text=True, timeout=_GH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return UNKNOWN, "gh repo view timed out after %gs" % _GH_TIMEOUT
+    except OSError as exc:
+        return UNKNOWN, "cannot run gh (%s)" % type(exc).__name__
+    if p.returncode != 0:
+        return UNKNOWN, "gh repo view exited %d" % p.returncode
     try:
         data = json.loads(p.stdout)
-        return not isinstance(data, dict) or not data.get("isPrivate", True)
-    except (json.JSONDecodeError, TypeError):
-        return True
+    except (ValueError, TypeError):
+        return UNKNOWN, "gh repo view printed no JSON"
+    # A boolean or nothing: the old read took a missing key as private and a
+    # string "false" as private, which skipped the scan on an answer gh never
+    # gave.
+    flag = data.get("isPrivate") if isinstance(data, dict) else None
+    if not isinstance(flag, bool):
+        return UNKNOWN, "gh repo view gave no isPrivate true/false"
+    return (PRIVATE if flag else PUBLIC), None
 
 
 def _advertised_base(root, name, url, config):
@@ -432,7 +478,11 @@ def _read_blobs(root, blobs):
 
 def scan_push(root, old, new, remote_name, remote_url=None):
     """-> (violations, notes) for the push to `remote_name`: THE DOOR FOR A
-    CALLER. Any exception becomes a fresh `_ScanError` in fixed words
+    CALLER. `notes` are (level, text) pairs: "note" is printed as it stands,
+    and a _DESTINATION pair rides with violations only: it says what the
+    visibility answer was, for the refusal's last line ("a PUBLIC remote", or
+    "<remote>: visibility UNKNOWN (<why>), treated as public").
+    Any exception becomes a fresh `_ScanError` in fixed words
     (`_scan_failure`), raised outside the handler so it chains no context: an
     exception's message or repr can carry raw git output or a push URL.
     SystemExit and KeyboardInterrupt pass, for `main` to answer."""
@@ -459,7 +509,8 @@ def _scan_push(root, old, new, remote_name, remote_url):
     config = _remote_config(root)
     label = _remote_label(config, remote_name)
     url = remote_url if remote_url else _remote_url(root, remote_name)
-    if not _is_public(url):
+    visibility, unknown = _visibility(url)
+    if visibility == PRIVATE:
         return [], [("note", "remote %s is private — host-path scan skipped"
                      % label)]
     base, why = _advertised_base(root, remote_name, remote_url, config)
@@ -482,6 +533,11 @@ def _scan_push(root, old, new, remote_name, remote_url):
         notes.append(("note", "%d blob(s) scanned%s — no host-path matches"
                       % (len(blobs), "" if why else
                          ", the ones %s does not already have" % label)))
+    else:
+        notes.append((_DESTINATION, "a PUBLIC remote"
+                      if visibility == PUBLIC else
+                      "%s: visibility UNKNOWN (%s), treated as public"
+                      % (label, unknown)))
     return hits, notes
 
 
@@ -595,8 +651,12 @@ def _main(argv):
               % _scan_failure(exc),
               file=sys.stderr)
         return 2
+    destinations = []
     for level, msg in notes:
-        print("[helm hostpath] %s" % msg, file=sys.stderr)
+        if level != _DESTINATION:
+            print("[helm hostpath] %s" % msg, file=sys.stderr)
+        elif msg not in destinations:
+            destinations.append(msg)
     if not hits:
         return 0
     n = len(hits)
@@ -611,8 +671,12 @@ def _main(argv):
         d_rel = rel if len(rel) <= _HIT_CLIP else rel[:_HIT_CLIP] + "..."
         d_m = match if len(match) <= _HIT_CLIP else match[:_HIT_CLIP] + "..."
         print("[helm hostpath]   %s: %s" % (d_rel, d_m), file=sys.stderr)
+    # The scan's own visibility answer, never an assumed PUBLIC: an UNKNOWN
+    # answer refuses exactly as PUBLIC does, and says it is UNKNOWN.
     print("[helm hostpath] these match a host filesystem-path pattern "
-          "and must not be pushed to a PUBLIC remote", file=sys.stderr)
+          "and must not be pushed to %s"
+          % ("; ".join(destinations) or "a remote not proven private"),
+          file=sys.stderr)
     print("[helm hostpath] false positive? that is an OWNER decision: "
           "HELM_HOSTPATH_SKIP=1 skips this scan for one push",
           file=sys.stderr)

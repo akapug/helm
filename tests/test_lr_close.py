@@ -59,8 +59,12 @@ def setUpModule():
 
 
 def tearDownModule():
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT: other modules import from this
+    # one, so a stopped patcher left here is data they can reach (task/3039).
+    _LIVE_SEATS_PATCH = None
 
 
 class TheLivenessStandInIsInEffectHereTooTest(unittest.TestCase):

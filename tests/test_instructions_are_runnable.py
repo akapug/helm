@@ -714,5 +714,14 @@ class PrintedCommandGrammarTest(InstructionBase):
             whisper)
 
 
+def tearDownModule():
+    """A stop that armed a surviving disclosure and never emitted it leaves
+    the text queued for whatever refuses next in this process, which is
+    another module's stop; drain it the way an interrupted response does
+    (task/3039: the slice runner's data audit named it)."""
+    from helm import seats_stop_seam
+    seats_stop_seam.fallback_lines(())
+
+
 if __name__ == "__main__":
     unittest.main()

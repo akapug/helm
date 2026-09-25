@@ -468,15 +468,27 @@ def _awake_shape(row):
 def _rung_awake(seat, row, join_why):
     """Can helm reach this seat, and can the seat complete a turn?
 
-    THE PREDICATE IS `can_take_work is False` AND NOTHING ELSE — the identical
-    value the dispatch write door refuses on, so an eligibility display and
-    the door it feeds can never disagree about one seat. None is helm saying
-    it could not tell and it must not block; True covers DEGRADED, which can
-    work with a caveat.
+    THE PREDICATE IS THE DOOR'S OWN — `can_take_work is False`, less the one
+    carve-out the door makes, `seat_usability.deaf_only` (task/3055) — so an
+    eligibility display and the door it feeds can never disagree about one
+    seat. None is helm saying it could not tell and it must not block; True
+    covers DEGRADED, which can work with a caveat.
+
+    A DEAF-ONLY SEAT PASSES WITH A NOTE. Its only refusal is that helm cannot
+    wake it; the door files the row, the ledger holds it until the beacon
+    re-arms, and the owed row is what the census's re-arm nudge fires on. The
+    note says so, and it counts as a caveat, so the seat ranks below a clean
+    one at the same idleness.
     """
     if row is None:
         return "unknown", (join_why or "no joined usability row for this seat")
     can = row.get("can_take_work")
+    from . import seat_usability
+    if seat_usability.deaf_only(row):
+        return "pass", ("%s (nudge pending) — %s; a row filed now waits in "
+                        "the ledger until it re-arms"
+                        % (DEAF, row.get("reachable_why")
+                           or "no live beacon: helm cannot wake it"))
     if can is False:
         return "exclude", "%s — %s" % (_awake_shape(row),
                                        row.get("reason") or "no reason recorded")

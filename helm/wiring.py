@@ -366,9 +366,44 @@ def node_name(rel):
     return parts[-2] if stem == "__init__" else "%s.%s" % (parts[-2], stem)
 
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+# THE REAL PACKAGE IS READ ONCE PER PROCESS (task/3039). Every rung below that
+# is asked about the real tree (`root` None) parses the same ~480 modules and
+# ~460 test files, and nothing in them changes while one process runs: a CLI
+# verb and a hook are one process per invocation. Measured before this memo:
+# tests.test_wiring alone made 9,985 `ast.parse` calls, 99.9% of its time.
+#
+# ONLY THE REAL TREE. A planted root is a tree a caller built to hold a probe,
+# so it is walked on every call. Every answer is handed out as a copy, so a
+# caller that edits one cannot change the next. The Stop rung
+# (`unwired_additions`) walks fresh anyway: it files its answer under a key
+# taken from the files at that moment, and a graph remembered from earlier in
+# the process would answer for a tree that key does not describe.
+_REAL = {}
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_REAL": "the real package's wiring, read once per process (task/3039)",
+}
+
+
+def _real(name, compute):
+    """`compute()` once per process under `name`."""
+    if name not in _REAL:
+        _REAL[name] = compute()
+    return _REAL[name]
+
+
 def modules(root=None):
     """{name: path} for every module in the helm package."""
-    root = root or os.path.dirname(os.path.abspath(__file__))
+    if not root:
+        return dict(_real("modules", lambda: _modules(_HERE)))
+    return _modules(root)
+
+
+def _modules(root):
     out = {}
     for p in sorted(glob.glob(os.path.join(root, "*.py"))):
         out[_module_name(p)] = p
@@ -483,8 +518,11 @@ def imports_of(path, known, pkg=""):
     return {m for m in out if m in known}
 
 
-def graph(root=None):
+def graph(root=None, fresh=False):
     """{module: {modules it imports}} over the whole package.
+
+    The real tree (`root` None) is walked once per process unless `fresh`;
+    see `_REAL`.
 
     A PACKAGE SUBMODULE IS ITS OWN NODE, and that is the whole subtlety here.
     Two wrong models were tried first, in this order:
@@ -505,7 +543,14 @@ def graph(root=None):
     reaches `clarity.rules` because __init__ imports it, and `clarity.rules`
     reaches `helmese`. A dead submodule is simply unreached, which is exactly
     what it is."""
-    mods = modules(root)
+    if root or fresh:
+        return _graph(root)
+    return {name: set(edges)
+            for name, edges in _real("graph", lambda: _graph(None)).items()}
+
+
+def _graph(root):
+    mods = _modules(root or _HERE)
     # THE ONE COOPERATIVE CHECKPOINT ON THE WHOLE STOP RUNG, and without it a
     # budget over this walk is a PREDICTION rather than a bound. `projscope`
     # deadlines are cooperative: nothing interrupts a running frame, so a
@@ -609,8 +654,16 @@ def tested(root=None):
     proof that anything asserts its behaviour. It is, however, a hard floor —
     a module no test even names is certainly unverified.
     """
-    root = root or os.path.dirname(os.path.abspath(__file__))
-    tests = os.path.join(os.path.dirname(root), "tests")
+    if root:
+        return _tested(root)
+    return set(_real("tested", lambda: _tested(None)))
+
+
+def _tested(root):
+    """`tested` read now. A `root` of None is the real package, and its
+    import closure comes from the remembered real graph."""
+    pkg = root or _HERE
+    tests = os.path.join(os.path.dirname(pkg), "tests")
     known, out = modules(root), set()
     for p in glob.glob(os.path.join(tests, "*.py")):
         try:
@@ -801,7 +854,15 @@ def facade_reached(root=None):
     module here is credited by nothing; it is reported with the share of its
     re-exported names some test reads, and the rest are named as unnamed.
     """
-    root = root or os.path.dirname(os.path.abspath(__file__))
+    if root:
+        return _facade_reached(root)
+    return {owner: dict(row, named=list(row["named"]),
+                        unnamed=list(row["unnamed"]))
+            for owner, row in _real("facade_reached",
+                                    lambda: _facade_reached(_HERE)).items()}
+
+
+def _facade_reached(root):
     tests = os.path.join(os.path.dirname(root), "tests")
     bindings = facade_bindings(root)
     if not bindings:
@@ -1370,7 +1431,7 @@ def _dead(g, live):
     return sorted(m for m in set(g) - live if m not in ALLOWED)
 
 
-def unreachable_modules(root=None):
+def unreachable_modules(root=None, fresh=False):
     """The REACHABILITY rung alone — the one answer the Stop gate reads.
 
     THE GATE ASKED FOR A CENSUS AND USED ONE FIELD OF IT. `unwired_additions`
@@ -1394,8 +1455,9 @@ def unreachable_modules(root=None):
 
     INTERRUPTIBLE, and that is the other half. `graph` yields to the caller's
     deadline per module, so a caller that budgets this rung gets a bound
-    rather than a forecast — see the checkpoint there."""
-    g = graph(root)
+    rather than a forecast — see the checkpoint there. `fresh` walks the
+    real tree now instead of reading the process memo (`_REAL`)."""
+    g = graph(root, fresh=fresh)
     return _dead(g, reachable(g))
 
 
@@ -1637,7 +1699,8 @@ def unwired_additions(root=None, repo=None, base="origin/main"):
     graph_fp = _source_graph_fp(root)
     if graph_fp is None:
         # an unreadable graph yields no key at all: compute live, memo nothing
-        return sorted(set(added) & set(unreachable_modules(root))), None
+        return sorted(set(added) & set(unreachable_modules(root,
+                                                           fresh=True))), None
     key = hashlib.blake2b(
         ("%s\0%s\0%s\0%s" % (os.path.realpath(repo), base,
                              ",".join(added), graph_fp)).encode(),
@@ -1654,7 +1717,8 @@ def unwired_additions(root=None, repo=None, base="origin/main"):
         memo = pk.read_json(_unwired_memo_path(), None)
         if _unwired_memo_valid(memo, key):
             return sorted(memo["dead"]), None
-        dead = sorted(set(added) & set(unreachable_modules(root)))
+        dead = sorted(set(added) & set(unreachable_modules(root,
+                                                           fresh=True)))
         # TOCTOU, the strict rule (an A->B repro): the source moved
         # DURING the census, so the answer describes no single state — it is
         # A's beginning read against B's end. Publishing it under EITHER key

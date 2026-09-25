@@ -181,11 +181,14 @@ class DeafSeatRearmNudgeTest(tb.Base):
             json.dump(r, f)
 
     def pass_(self, agent=True, covered=False, fresh=True, owed=None,
-              obligation=False, **row):
+              obligation=False, expired_ago=None, **row):
         """One census, attend and escalate. `agent` plants a pane that
         DECLARES alpha; `covered` plants a live waiter for it. `owed` puts
         one addressed row in alpha's room, read WHOLE (default: owed unless
-        covered); `obligation` is the dispatch reader's answer."""
+        covered); `obligation` is the dispatch reader's answer.
+        `expired_ago` plants the registry row of a waiter that is GONE and
+        was armed that many seconds ago — the row a Monitor killed at its
+        30-minute deadline leaves behind (task/3055)."""
         owed = (not covered) if owed is None else owed
         if fresh:
             self.roster("alpha")
@@ -199,6 +202,13 @@ class DeafSeatRearmNudgeTest(tb.Base):
             for path in os.listdir(beacons.registry_dir()) \
                     if os.path.isdir(beacons.registry_dir()) else ():
                 os.unlink(os.path.join(beacons.registry_dir(), path))
+        if expired_ago is not None:
+            os.makedirs(beacons.registry_dir(), exist_ok=True)
+            with open(beacons._entry_path("alpha", 4242), "w") as f:
+                json.dump({"seat": "alpha", "pid": 4242,
+                           "session": tb.SID_A, "starttime": 100,
+                           "armed": time.time() - expired_ago,
+                           "home": os.environ["HELM_HOME"]}, f)
         ev = {"oldest": None, "scanned": ("helm",), "seen": (),
               "bounded": {}, "estate": ("complete", "")}
         waited = None
@@ -298,15 +308,106 @@ class DeafSeatRearmNudgeTest(tb.Base):
         self.assertIn(theirs, detail, "the report must name its project")
         self.assertIn("owes at least 1 row", detail)
 
-    def test_a_paid_family_seat_is_reported_and_never_typed_into(self):  # noqa: VACUOUS_ASSERTION — positive control is test_a_DEAF_seat_with_an_owed_addressed_row_is_nudged, the same owing seat on native claude
-        """RULING: automatic typing reaches native claude seats only. A
-        proxy or codex family is billed per turn."""
+    def test_a_paid_family_seat_that_owes_gets_one_rearm_nudge(self):
+        """RULING, RE-SCOPED (task/3055, the owner: "yes, I think
+        [that] is totally reasonable"). The old refusal said a wake of a proxy
+        or codex family was "a paid turn the owner did not order"; the row the
+        seat owes IS the order. So an owing paid-family DEAF seat is typed
+        into like a native one, and the report names the paid turn."""
         _rep, out = self.pass_(family="grok", backend="proxy")
-        self.assertEqual([], self.spawned)
+        self.assertEqual(1, len(self.spawned), out)
         (seat, action, detail), = out.get("rearmed") or [(None,) * 3]
-        self.assertEqual(("alpha", "paid-family"), (seat, action))
-        self.assertIn("owes at least 1 row; wake is a paid turn; not "
-                      "auto-nudged", detail)
+        self.assertEqual(("alpha", "wake"), (seat, action))
+        self.assertIn("a paid turn on grok/proxy", detail)
+        self.assertIn(beacon_monitor("alpha"), self.spawned[0][1],
+                      "the paid wake types the same exact recipe")
+
+    def test_a_paid_family_seat_that_owes_nothing_is_never_typed_into(self):  # noqa: VACUOUS_ASSERTION — positive control is test_a_paid_family_seat_that_owes_gets_one_rearm_nudge, the same paid seat with one owed row
+        """THE OTHER HALF OF THE RULING: the owing gate is what stands where
+        the family refusal stood, so a paid seat that owes nothing costs
+        nothing, exactly as a native one does."""
+        rep, out = self.pass_(family="grok", backend="proxy", owed=False)
+        self.assertEqual([beacons.DEAF], [r["verdict"] for r in rep["seats"]])
+        self.assertEqual([], self.spawned)
+        self.assertIsNone(out.get("rearmed"))
+
+    def test_a_paid_family_seat_gets_one_paid_turn_per_spell(self):  # noqa: VACUOUS_ASSERTION — the first pass's spawn count of 1 is the unconditional positive control on the same observable
+        """The spend is bounded by the machinery every nudge shares: an
+        immediate second pass in the same DEAF spell meets the debounce."""
+        self.pass_(family="grok", backend="proxy")
+        self.assertEqual(1, len(self.spawned))
+        _rep, out = self.pass_(fresh=False)
+        self.assertEqual(1, len(self.spawned),
+                         "a second paid turn inside the debounce")
+        self.assertEqual([("alpha", "debounce")],
+                         [e[:2] for e in out.get("rearmed") or ()])
+
+    def test_a_WAKING_seat_is_never_typed_into(self):  # noqa: VACUOUS_ASSERTION — positive control is test_CONTROL_past_the_grace_the_same_seat_is_nudged, the same owing seat with its expired row an hour older
+        """task/3055 B1: a beacon that reached its 30-minute lease is the
+        seat's check-in. The census reads WAKING for the re-arm grace, and
+        the re-arm leg keys on DEAF, so nothing is typed into a seat that is
+        re-arming — native or paid, owing or not."""
+        for family, backend in (("claude", "native"), ("grok", "proxy")):  # noqa: SEAT_NAME — runtime FAMILY values, not seat identities
+            with self.subTest(family=family):
+                self.spawned = []
+                rep, out = self.pass_(expired_ago=1800 + 10, family=family,
+                                      backend=backend)
+                self.assertEqual([beacons.WAKING],
+                                 [r["verdict"] for r in rep["seats"]])
+                self.assertEqual([], self.spawned)
+                self.assertIsNone(out.get("rearmed"))
+                self.assertEqual(beacons.WAKING, self.att()["state"])
+                self.assertFalse(self.att()["alarm"])
+
+    def test_CONTROL_past_the_grace_the_same_seat_is_nudged(self):
+        rep, out = self.pass_(expired_ago=1800 + 3600)
+        self.assertEqual([beacons.DEAF], [r["verdict"] for r in rep["seats"]])
+        self.assertEqual(1, len(self.spawned), out)
+
+    def test_a_paused_spell_is_nudged_once_the_pause_lifts(self):
+        """task/3055 B3 — the cooldown case: a seat whose delivery is paused
+        (the proxy-cooldown shape). Refused while paused, and the SAME spell
+        is still owed when the pause lifts: a pause must spend neither the
+        spell's one episode nor the rate budget. Driven on the native family
+        so the arm is about the latch alone; a paid family reaches the same
+        path since the re-scope above."""
+        self.paused = "PROXY-COOLDOWN"
+        self.pass_()
+        self.assertEqual([], self.spawned)
+        since = self.att()["since"]
+        self.assertTrue(beacons._repair_due(self.att()))
+        self.paused = ""
+        _rep, out = self.pass_(fresh=False)
+        self.assertEqual(since, self.att()["since"], "fixture: same spell")
+        self.assertEqual(1, len(self.spawned), out)
+        self.assertEqual([("alpha", "wake")],
+                         [e[:2] for e in out.get("rearmed") or ()])
+        self.assertEqual(since, self.att()["repair"]["since"],
+                         "the nudge must belong to the spell that was paused")
+
+    def test_the_rearm_sentence_says_the_grace_was_waited(self):
+        """task/3055 B4: the nudge says why it fired now. A seat that reads
+        it knows the census waited out the re-arm grace after its 30-minute
+        lease (or the beacon died early) before typing."""
+        text = resumeturn.rearm_text("alpha", "you owe open dispatch work")
+        self.assertIn("%d-minute re-arm grace" % (beacons.REARM_GRACE_S // 60),
+                      text)
+        self.assertIn("30-minute lease", text)
+        self.assertIn("ended before its lease", text)
+        # THE CONTROL: the exact recipe every other instruction renders is
+        # still the thing the seat is told to run.
+        self.assertIn(beacon_monitor("alpha"), text)
+
+    def test_a_settled_episode_is_owed_again_when_its_spell_moves(self):
+        """The latch the recovery arm above leans on, planted directly: one
+        settled repair per spell, and a new spell (a moved `since`) is owed
+        again whatever the old episode says."""
+        ep = {"since": 100.0, "attempt": "100.0#1", "outcome": "typed"}
+        self.assertFalse(beacons._repair_due({"since": 100.0, "repair": ep}))
+        self.assertTrue(beacons._repair_due({"since": 200.0, "repair": ep}))
+        self.assertTrue(beacons._repair_due(
+            {"since": 100.0, "repair": dict(ep, outcome="paused")}),
+            "a paused refusal is a deferral, never a settlement")
 
     def test_a_DEAF_seat_whose_agent_is_unknown_is_never_typed_into(self):  # noqa: VACUOUS_ASSERTION — positive control is test_a_DEAF_seat_with_a_declared_pane_gets_one_rearm_nudge, the same pass with the pane planted
         rep, out = self.pass_(agent=False)

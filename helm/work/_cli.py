@@ -14,7 +14,7 @@ from ._gc import (LANE_LANDED, _rowed_lanes, format_gc_summary, gc_enact,
                   gc_scan, lane_overlaps, phantom_scan, prune_phantom_records,
                   was_reclassified, refresh_trunk, list_rows,
                   post_gc_summary, release_command, trunk_sync)
-from ._guard import stale_guard_hooks, guard_remedy, guard_remedy_note
+from ._guard import Hooks, stale_guard_hooks, guard_remedy_and_note
 from ._claims import (_infer_lane, _positional, claim, release_lane,
                       release_stale_lane)
 from . import _guard
@@ -638,16 +638,20 @@ def cmd_work(args):
             # say "not armed" for missing and unreadable too — which at CLAIM
             # time is the more useful reading anyway, because the room being
             # born right now gets no birth guard in any of those states.
+            # ONE EVALUATION: the check and the remedy it prints read one
+            # hooks directory and one profile resolution (task/3039).
             try:
-                drift = stale_guard_hooks(root)
+                hooks = Hooks(root)
+                drift = stale_guard_hooks(root, hooks)
                 if drift:
+                    remedy, note = guard_remedy_and_note(root, hooks)
                     print("helm work: GUARD RAIL NOT ARMED for this room — "
                           "%s. These hooks are SHARED by every worktree, so "
                           "this is the whole checkout, not just your lane. "
                           "Arm them: `%s`%s"
                           % ("; ".join("%s is %s" % (n, s.lower())
                                        for s, n, _w in drift),
-                             guard_remedy(root), guard_remedy_note(root)),
+                             remedy, note),
                           file=sys.stderr)
             except Exception:
                 pass
@@ -807,9 +811,9 @@ def cmd_work(args):
         # and must never be a side effect of a read pass.
         # THE SAME REMEDY AS CLAIM'S, and it carries the profile for the same
         # reason: a flagless refresh is what the reader pastes.
-        _remedy = guard_remedy(root)
-        _remedy_note = guard_remedy_note(root)
-        for _state, _name, _why in stale_guard_hooks(root):
+        _hooks = Hooks(root)
+        _remedy, _remedy_note = guard_remedy_and_note(root, _hooks)
+        for _state, _name, _why in stale_guard_hooks(root, _hooks):
             print("helm work gc: GUARD-%s %s — %s; run `%s`%s"
                   % (_state, _name, _why, _remedy, _remedy_note))
         rows = gc_scan(root)

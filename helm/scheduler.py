@@ -5,6 +5,16 @@ were already built by :mod:`helm.landreq`; it does not read the dispatch ledger,
 recompute succession, or reinterpret ``owed_by``.  HTML and ASCII callers may
 choose geometry, but they receive the same holder groups, ages, SUC totals,
 owner asks, ordering, caps, and declared edges.
+
+THE GROUPS HOLD LIVE OBLIGATIONS ONLY (task/2381, the owner's board). A row
+whose lane is gone and whose work is on trunk, a row nobody can place, a row
+whose work is on main with no verdict recorded, and a row a later round
+absorbed are not waits: each is COUNTED on one collapsed line with its oldest
+age and the command that lists it, so availability is kept and attention is
+not spent. The frontier half of that decision is the census `helm lr retire
+--off-frontier` runs, carried on each card as `frontier`/`frontier_rung`; the
+on-main half is `landreq.on_main_unverdicted` over the card's containment
+mark. This module reads those words, it never measures.
 """
 import os
 import re
@@ -25,6 +35,102 @@ _STAGE = {
     "MERGED_LOCAL": "landing",
 }
 _OWNER_STATES = {"waiting-owner", "waiting-owner-decision"}
+
+#: THE COLLAPSED LINES, in the order a reader meets them: (class, label,
+#: the command that lists every row the line counts). The frontier lines name
+#: the census verb because it prints each of those rows with the measurement
+#: that placed it; the on-main line names the default list, which marks each
+#: of its rows ALREADY ON TRUNK; the superseded line names `--all` because
+#: the default list folds exactly those rows away. A class with no rows draws
+#: no line.
+COLLAPSE_LINES = (
+    ("off_frontier",
+     "left over after landing or abandonment (off the live frontier)",
+     "helm lr retire --off-frontier"),
+    ("unclassified",
+     "unclassified with the lane gone and the work unplaceable "
+     "(its commit no longer resolves, or its close route cannot be read)",
+     "helm lr retire --off-frontier"),
+    ("on_main",
+     "on main with no verdict recorded",
+     "helm lr list"),
+    ("superseded",
+     "absorbed or settled by a later round (nobody owes a move)",
+     "helm lr list --all"),
+)
+
+
+def collapse_class(card, active=True):
+    """Which collapsed line a non-terminal card belongs on, or None when it is
+    a LIVE obligation the board lists.
+
+    THE CENSUS'S OWN WORDS, READ AND NEVER RE-DERIVED. `frontier` is the
+    reason `landreq.off_frontier_reason` gave this row on the walk that also
+    fed the header's split; a card without one (an older warm body, a held
+    REVIEWED row, a foreign row — none of them in the census population)
+    makes no frontier claim at all.
+
+    UNCLASSIFIED IS MOSTLY WORK OWED AND STAYS LISTED — the header counts it
+    so, and a fresh review whose label matches no branch answers it. Only the
+    census rungs that describe a row nobody can move
+    (`landreq.FRONTIER_GONE_RUNGS`: the reviewed commit no longer resolves, or
+    git placed the work and only its close route is unreadable) fold into the
+    unclassified line. A failed read, an unplaceable fresh row, or a rung
+    added later stays on the list: a failed read must never hide an
+    obligation.
+
+    ON MAIN WITH NO VERDICT IS ONE LINE ON EVERY SURFACE, by one predicate
+    (`landreq.on_main_unverdicted`): the waits and the kanban both call this
+    function, so a row the kanban counts on its on-main line is never also a
+    listed wait (task/2381: it was, for 8 of the integrator's 16). A row whose
+    tip is on main under a recorded verdict — a live FIX above all — fails
+    that predicate and stays listed. So does an OWNER-GATED row: its hold is
+    a decision only the owner can make, the landing does not make it, and
+    folding it would take an ask off the owner's own queue (`owner_holds`
+    counts listed rows only).
+
+    ONE LINE PER ROW, frontier first, because the frontier line names the verb
+    that acts on the row. `active` False is the scheduler's own judgement: a
+    row a later round absorbed, or whose verdict was discharged, owes nobody a
+    move — and it comes before the on-main line, whose command (`helm lr
+    list`) prints the chain frontier only, so a superseded round counted there
+    could not be found by the command the line names."""
+    from . import landreq                  # DEFERRED — landreq is heavy
+    frontier = card.get("frontier")
+    if frontier in landreq.OFF_FRONTIER_REASONS:
+        return "off_frontier"
+    if frontier == landreq.OFF_FRONTIER_UNCLASSIFIED \
+            and card.get("frontier_rung") in landreq.FRONTIER_GONE_RUNGS:
+        return "unclassified"
+    if not active:
+        return "superseded"
+    if landreq.on_main_unverdicted(card) and card.get("owner_gated") is not True:
+        return "on_main"
+    return None
+
+
+def collapsed_lines(members):
+    """[(class, age_s or None, frontier reason or None)] -> the ordered lines.
+
+    ONE SHAPE FOR EVERY SURFACE that collapses rows — the scheduler here and
+    the board's kanban — so a line reads the same wherever it is drawn."""
+    by = {}
+    for klass, age, reason in members:
+        line = by.setdefault(klass, {"count": 0, "ages": [], "by_reason": {}})
+        line["count"] += 1
+        if age is not None:
+            line["ages"].append(age)
+        if reason:
+            line["by_reason"][reason] = line["by_reason"].get(reason, 0) + 1
+    out = []
+    for klass, label, command in COLLAPSE_LINES:
+        line = by.get(klass)
+        if line:
+            out.append({"class": klass, "label": label, "count": line["count"],
+                        "oldest_age_s": max(line["ages"]) if line["ages"]
+                        else None,
+                        "by_reason": line["by_reason"], "command": command})
+    return out
 _OWNER_HOLD_KINDS = {
     "waiting-owner": {"owner-input", "usage-reset"},
     "waiting-owner-decision": {"decision"},
@@ -130,6 +236,7 @@ def read_owner_asks():
 def _empty(unavailable, asks, asks_error, asks_dropped=0):
     return {"unavailable": unavailable,
             "row_count": None, "active_count": None,
+            "listed_count": None, "collapsed": [], "collapsed_count": None,
             "suc": {"stalled": None, "unmeasurable": None,
                     "contrary": None, "total": None, "zero": None},
             "groups": [], "owner_holds": [], "owner_hold_count": None,
@@ -150,8 +257,10 @@ def project(cards, stalled_ids=(), unmeasurable=(), active_ids=None,
             unavailable=None):
     """Project already-built cards into one renderer-neutral scheduler model.
 
-    Every card whose ``terminal`` field is exactly ``False`` appears in exactly
-    one holder group.  ``holder_role``/``holder_seat`` are copied as display
+    Every card whose ``terminal`` field is exactly ``False`` is accounted for
+    exactly once: in one holder group when it is a live obligation, or on one
+    ``collapsed`` line (``collapse_class``) — so ``listed_count`` plus
+    ``collapsed_count`` is ``row_count``.  ``holder_role``/``holder_seat`` are copied as display
     authority; raw ``owed_by`` remains beside them as enforcement truth.
     Missing holder authority becomes an explicit UNKNOWN group.  The only work
     identity edge is the record-declared ``supersedes`` link; ``waits_on`` edges
@@ -270,6 +379,11 @@ def project(cards, stalled_ids=(), unmeasurable=(), active_ids=None,
                "honored": bool(card.get("honored")),
                "owner_gated": owner_gated,
                "owner_ask": False,
+               "frontier": card.get("frontier"),
+               "frontier_rung": card.get("frontier_rung"),
+               # the on-main predicate's inputs, copied as the card has them
+               "trunk_contains_tip": card.get("trunk_contains_tip"),
+               "polarity": card.get("polarity"),
                "detail": " ".join(str(card.get("hold_reason") or "").split())}
         rows.append(row)
 
@@ -290,8 +404,17 @@ def project(cards, stalled_ids=(), unmeasurable=(), active_ids=None,
     active_set = set(active_list)
     for row in rows:
         row["active"] = row["id"] in active_set
+        row["collapse"] = collapse_class(row, row["active"])
+    # LISTED ROWS ARE THE LIVE OBLIGATIONS; every other row is counted on its
+    # line and drawn nowhere else. `seen` still holds every row, so a live
+    # successor's declared edge to a collapsed predecessor stays KNOWN.
+    collapsed = collapsed_lines(
+        [(row["collapse"], row["age_s"], row["frontier"]
+          if row["collapse"] == "off_frontier" else None)
+         for row in rows if row["collapse"]])
+    listed = [row for row in rows if not row["collapse"]]
     grouped = {}
-    for row in rows:
+    for row in listed:
         key = (row["holder_role"], row["holder_seat"])
         grouped.setdefault(key, []).append(row)
     def _group_order(key):
@@ -339,17 +462,25 @@ def project(cards, stalled_ids=(), unmeasurable=(), active_ids=None,
                 edges.append({"kind": "supersedes", "from": row["id"],
                               "to": row["supersedes"],
                               "target_known": row["supersedes"] in seen})
+    # THE BILL IS THE LIST'S. A stall on a row whose lane is gone and whose
+    # work is on trunk accuses nobody who can act, so SUC and the owner's
+    # holds count the listed rows — every listed row is active by
+    # construction — and `active_count` keeps the whole chain frontier.
     active = [row for row in rows if row["active"]]
+    live = [row for row in listed if row["active"]]
     owner_holds = sorted(
-        [row for row in active if row["holder_role"] == "owner"],
+        [row for row in live if row["holder_role"] == "owner"],
         key=lambda row: (row["age_s"] is None, -(row["age_s"] or 0), row["id"]))
-    suc = {"stalled": sum(row["id"] in stalled for row in active),
-           "unmeasurable": sum(row["id"] in reasons for row in active),
-           "contrary": sum(row["contrary"] for row in active)}
+    suc = {"stalled": sum(row["id"] in stalled for row in live),
+           "unmeasurable": sum(row["id"] in reasons for row in live),
+           "contrary": sum(row["contrary"] for row in live)}
     suc["total"] = sum(suc.values())
     suc["zero"] = suc["total"] == 0
     return {"unavailable": None, "row_count": len(rows),
-            "active_count": len(active), "suc": suc,
+            "active_count": len(active), "listed_count": len(listed),
+            "collapsed": collapsed,
+            "collapsed_count": sum(line["count"] for line in collapsed),
+            "suc": suc,
             "groups": groups, "edges": edges,
             "owner_holds": owner_holds, "owner_hold_count": len(owner_holds),
             "owner_asks": asks, "owner_ask_count": None if asks_error else len(asks) + asks_dropped,

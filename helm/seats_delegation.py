@@ -626,7 +626,7 @@ def proc_scan(proc_dir=None):
 
 
 def _delegated_build(resource, session, proc_dir=None,
-                     window_s=DELEGATION_WINDOW_S, scan=None):
+                     window_s=DELEGATION_WINDOW_S, scan=None, room=None):
     """(proof_info, room) positively proving delegated work, else None.
 
     `scan` is one `proc_scan()` shared across the lane leases of one stop. Left
@@ -645,8 +645,13 @@ def _delegated_build(resource, session, proc_dir=None,
     foreign-clone evidence, holder/child death or reuse, expired activity, and
     lease/session drift all return None. The failure mode is an exemption that
     un-guards idle stops fleet-wide, so no declaration or mtime substitutes for
-    positive evidence."""
-    room = _lease_worktree(resource)
+    positive evidence.
+
+    `room` is the lane room when the caller already knows it — the stop
+    guard reads it from the resident's stop facts or from the claim's own
+    recorded repository, because resolving it here asks git, and a Stop hook
+    spawns nothing."""
+    room = room or _lease_worktree(resource)
     if not room or not session:
         return None
     want = os.path.realpath(room).rstrip(os.sep)
@@ -735,7 +740,7 @@ def _lane_stem(name):
     family prefixes AND round/role suffixes stripped, case-folded."""
     from . import landreq
     return landreq._lane_stem(name)
-def _gate_pending(resource, snap=None):
+def _gate_pending(resource, snap=None, cwd=None):
     """(dispatch_id, reviewer, stage) POSITIVELY proving lease `resource`
     backs a lane that is PARKED ON SOMEONE ELSE'S VERB, else None. Two
     stages, one TWO-PART proof — the dispatch row must correspond to THE
@@ -786,8 +791,12 @@ def _gate_pending(resource, snap=None):
     `snap` is the caller's ALREADY-READ ledger state, threaded rather than
     re-read: one stop asks this ledger twice (here, and again for the release
     advice's review read) and the read measured 190ms on a 1,577-event
-    ledger. Omitted, it reads its own — the contract is unchanged."""
-    room = _lease_worktree(resource)
+    ledger. Omitted, it reads its own — the contract is unchanged.
+
+    `cwd` anchors the lane room the way `_lease_worktree` takes it: the stop
+    resident, which runs from no checkout, anchors each lease at the
+    repository its claim recorded."""
+    room = _lease_worktree(resource, cwd=cwd)
     if not room:
         return None
     family = _lane_stem(str(resource).split(":", 2)[2])

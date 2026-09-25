@@ -397,8 +397,10 @@ class DispatchBase(unittest.TestCase):
         # exercise it can restore it; pinning it here would otherwise mean the
         # suite tests a lambda and never the resolver — the exact gap that let
         # the registry fail-open ship.
-        from tests._tmphome import pin_dispatch_home
+        from tests._tmphome import pin_dispatch_home, pin_live_seats
         self._real_home_repo_id = pin_dispatch_home(self, self.repo)
+        # NO ROW WRITTEN HERE WALKS THE HOST'S PROCESS TABLE (task/3039).
+        pin_live_seats(self)
 
         # THE ROSTER STAYS EMPTY HERE, DELIBERATELY. Do not add
         # `seats.write_roster(...)` to this setUp: an empty roster is UNKNOWN,
@@ -1932,7 +1934,8 @@ class CarryingSemanticsTest(unittest.TestCase):
         # every successor "carrying".
         self.assertEqual(set(dispatches._NON_CARRYING_STATUS), {"cancelled"})
         self.assertEqual(set(dispatches._NON_CARRYING_FLAGS),
-                         {"withdrawn", "abandoned", "retired_admin"})
+                         {"withdrawn", "abandoned", "retired_admin",
+                          "verdict_retracted"})
         # THE STATUS ARM. Only "cancelled" is a status replay actually writes;
         # this test used to pin "withdrawn" and "abandoned" as statuses too,
         # and BOTH SPELLINGS ARE UNREACHABLE — which is exactly why a withdrawn
@@ -3597,8 +3600,9 @@ class AtomicSendTest(DispatchBase):
 
     def test_ordinary_send_refuses_a_known_alternate_recipient_token(self):
         seats.write_roster("seat-c")
-        os.environ["HELM_SEAT_ALIASES"] = "owner:ALT=seat-c"
-        with mock.patch.object(seats, "dm") as dm:
+        with mock.patch.dict(os.environ,
+                             {"HELM_SEAT_ALIASES": "owner:ALT=seat-c"}), \
+                mock.patch.object(seats, "dm") as dm:
             row, why, sent = dispatches.send(
                 "ALT", "ordinary-alias", "one", self.a, repo=self.repo,
                 key="ordinary-alias", sign=False, new_work=True)
@@ -15150,11 +15154,11 @@ class TheCarriageWitnessIsDerivedOnEveryReadTest(DispatchBase):
                       "the listing is not an instrument")
         self.assertNotEqual(grown, base, "the listing never moves at all")
         self.assertIn(row["id"], dispatches.snapshot()[0])
-        # THE SHIPPED RUNG, BY THE NAME THE STOP GUARD MEASURES
-        # (`seats_stop_guard` hands this to `timing.measure("dispatch-ledger")`).
-        from helm import seats_room_advice
+        # THE SHIPPED READ, AS THE STOP-FACTS RESIDENT MAKES IT
+        # (`stopfacts_resident.compute` folds through `dispatches.snapshot`;
+        # the Stop guard itself reads the ledger nowhere).
         settled = self._home_listing()
-        snap, unavailable = seats_room_advice._ledger_snapshot()
+        snap, unavailable = dispatches.snapshot()
         self.assertIsNone(unavailable)
         self.assertIn(row["id"], snap)
         # AND THE PROOF DOOR ITSELF, EXERCISED WITH THE ANSWER A MEMO WOULD
@@ -16013,6 +16017,13 @@ class ReviewerPatchTipIsCoAuthorWorkTest(DispatchBase):
 # probe rather than as a working memo.
 _SCOPE_PROBE_SEQ = [0]
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_SCOPE_PROBE_SEQ": (
+        "a counter that only mints unique keys; nothing reads its value"),
+}
+
 
 def _memo_double_ask(tag):
     """Ask projscope for ONE key twice, here, and report how often it computed.
@@ -16131,3 +16142,10 @@ class ReadVerbsRunInsideOneMemoScopeTest(DispatchBase):
         self.assertEqual(
             [v for v in writers if v in dispatches.DISPATCH_READ_VERBS], [],
             "a verb that APPENDS is inside the memo scope")
+
+
+def setUpModule():
+    """No dispatch row this module writes walks the host's process table
+    (task/3039; see tests._tmphome.pin_live_seats)."""
+    from tests._tmphome import pin_live_seats
+    pin_live_seats()

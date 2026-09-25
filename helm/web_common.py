@@ -168,6 +168,17 @@ def _chat_profile():
 
 _COCKPIT_BEAT = [0.0]
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_COCKPIT_BEAT": (
+        "the cockpit's last-beat stamp; the arms that assert a beat "
+        "(test_fleetnotes) set it first"),
+    "_DEFAULT_ROOM": (
+        "a one-slot lazy cache; the arms that depend on the derivation "
+        "(test_web) clear it first"),
+}
+
 
 
 def _cockpit_beat():

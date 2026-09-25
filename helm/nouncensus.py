@@ -200,6 +200,25 @@ def _mark_ambiguous(rows):
     return rows
 
 
+# THE REAL TREE IS CENSUSED ONCE PER PROCESS FOR EACH OWNER TABLE (task/3039).
+# Measured before: 13 real-tree censuses in tests.test_nouncensus at about
+# 8.3 s profiled each, 90% of the module. The key is the IDENTITY of `_OWNER`,
+# held here so no other table can ever reuse its id: a caller that patches the
+# table (the seven-noun comparison does) gets that table's census, and the real
+# table's is still the real one afterwards. A planted `root` is censused on
+# every call, and every answer is handed out as a copy.
+_REAL = []          # [(owner table, rows, unparsed)], newest last
+
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_REAL": (
+        "the real tree's census, once per process per owner table "
+        "(task/3039)"),
+}
+_REAL_KEEP = 4
+
+
 def census(root=None):
     """(rows, unparsed) — every identity-bearing site under helm/.
 
@@ -211,6 +230,18 @@ def census(root=None):
     hole in the closure, and a census that drops it reports a smaller, cleaner
     world than the one it measured.
     """
+    if root:
+        return _census(root)
+    owner = _OWNER
+    hit = next((row for row in _REAL if row[0] is owner), None)
+    if hit is None:
+        hit = (owner,) + _census(None)
+        _REAL[:] = _REAL[-(_REAL_KEEP - 1):] + [hit]
+    return ([{k: list(v) if isinstance(v, list) else v for k, v in r.items()}
+             for r in hit[1]], [dict(u) for u in hit[2]])
+
+
+def _census(root):
     rows, unparsed = [], []
     for name, path in sorted(wiring.modules(root).items()):
         try:

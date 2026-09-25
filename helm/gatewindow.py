@@ -684,10 +684,32 @@ def measure_argv(room, tree):
             "--scope-json", _canonical(fabgate.whole_scope()), "--json"]
 
 
-def submit_argv(room, job):
+# THE LAUNCH LABEL REACHES THE RECEIPT ONLY THROUGH FAB (task/3066). MEASURED:
+# `--label train200` stopped here. The label rode the window record and never
+# the job: the request identity is a hash of repository, tree, scope,
+# interpreter and runner (a label inside it would split one suite into two
+# jobs), and Fab runs exactly `dispatch_argv(identity)` on the node, so no
+# argv can carry it either. It travels beside the request, the way the
+# budgets do: `fab gate submit --label TEXT` records it first-writer and hands
+# it to the node as FAB_GATE_LABEL, where `helm gate run` inside a durable job
+# mints it (`gate.fab_job_label`). A Fab that cannot take the option would
+# refuse the whole submit, so the door passes it only when `fab gate measure`
+# says `--label` is among its `submit_options`.
+LABEL_OPTION = "--label"
+
+
+def forwards_label(measured):
+    """Does the Fab that answered this `gate measure` take `submit --label`?"""
+    options = measured.get("submit_options") if isinstance(measured, dict) \
+        else None
+    return isinstance(options, list) and LABEL_OPTION in options
+
+
+def submit_argv(room, job, label=None):
     """The dispatch this door allows: a KEYED gate job, never a plain gate."""
     return [FAB_BINARY, "gate", "submit", "--repo", room,
-            "--request-json", _canonical(job), "--json"]
+            "--request-json", _canonical(job), "--json"] \
+        + ([LABEL_OPTION, label] if label else [])
 
 
 def observe_argv(row):
@@ -829,14 +851,22 @@ def job_identity(request, fab=None):
         return None, _no_identity(
             "`fab gate measure` did not name a host, an interpreter and the "
             "installed runner (exit %s)." % rc, out_text, err_text)
-    job, err = fabgate.request(room, tree, "whole", measured["interpreter"],
-                               measured["runner"])
+    # THE SERIAL SCOPE, BY NAME (task/3039). This door launches the gate a
+    # train LANDS on, and a land needs a serial receipt: a sliced one is
+    # refused by every land door. Fab runs the whole scope with no mode flag
+    # and publishes its receipt under that scope, so the scope is this road's
+    # explicit serial mode, and it never rides `helm gate run`'s default.
+    job, err = fabgate.request(room, tree, fabgate.whole_scope(),
+                               measured["interpreter"], measured["runner"])
     if err:
         return None, _no_identity(
             "helm could not build the gate-job request: %s" % err,
             out_text, err_text)
+    label = " ".join(str(request.get("label") or "").split())[:120]
     return {"tree": tree, "host": measured["host"], "request": job,
-            "key": job["key"], "job_id": "gate-" + job["key"]}, None
+            "key": job["key"], "job_id": "gate-" + job["key"],
+            "label": label if label and forwards_label(measured) else None}, \
+        None
 
 
 def dispatch(identity, room, fab=None):
@@ -849,7 +879,8 @@ def dispatch(identity, room, fab=None):
     """
     from . import fabgate
     call = fab or _fab
-    rc, out_text, err_text = call(submit_argv(room, identity["request"]),
+    rc, out_text, err_text = call(submit_argv(room, identity["request"],
+                                              label=identity.get("label")),
                                   SUBMIT_TIMEOUT_S)
     event = last_event(out_text)
     if not isinstance(event, dict) or event.get("event") != "gate-job" \
@@ -960,6 +991,9 @@ def launch(room, label=None, trunk_ref=None, supersede=False, path=None,
                      "key": identity["key"], "job_id": identity["job_id"],
                      "host": (handle or {}).get("host") or identity["host"],
                      "generation": (handle or {}).get("generation"),
+                     # WHETHER THE LABEL RODE THE JOB: a label the record
+                     # holds and the receipt will not is said, not implied.
+                     "label_forwarded": bool(identity.get("label")),
                      # A SUBMIT NOBODY COULD READ STILL MAY HAVE DISPATCHED.
                      # fab decides same-key existence at its own sink, so the
                      # honest states are HELD and EXPIRED, which is exactly
@@ -999,9 +1033,16 @@ def dispatched(row, disposition):
     """What a launch prints: the job identity, and the two commands that reach
     it. Neither needs this process to be alive."""
     cmd = _commands(row) or {}
+    label = row.get("label")
+    labelled = () if not label else (
+        "  label:      %s (%s)" % (label, "carried to the node; the receipt "
+                                   "will name it" if row.get("label_forwarded")
+                                   else "recorded here only: this Fab takes no "
+                                   "`gate submit --label`, so the receipt's "
+                                   "label stays empty"),)
     return "\n".join((
         "helm gate window: DISPATCHED %s (%s) on %s"
-        % (row.get("job_id"), disposition, row.get("host")),
+        % (row.get("job_id"), disposition, row.get("host")),) + labelled + (
         "  generation: %s" % row.get("generation"),
         "  room:       %s at %s (trunk %s)"
         % (row.get("room"), _short(row.get("head")), _short(row.get("trunk"))),

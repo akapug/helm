@@ -364,7 +364,11 @@ class CapacityGrantFlowTest(GateBase):
     def assert_grant_flow(self, argv=None):
         topology = mock.Mock(return_value=self.TOPOLOGY)
         admit = mock.Mock(return_value=(self.GRANT, None))
-        suite_env = mock.Mock(return_value=self.ENV)
+        # A COPY PER ARM: the run writes into the env it is handed, and the
+        # class's own dict is shared by every arm and every module that
+        # imports this one (task/3039).
+        env = dict(self.ENV)
+        suite_env = mock.Mock(return_value=env)
         child = mock.Mock(return_value=(
             "", "Ran 1 test in 0.001s\n\nOK\n", 0, None))
         with mock.patch.object(gate, "_capacity_topology", topology), \
@@ -377,7 +381,7 @@ class CapacityGrantFlowTest(GateBase):
         topology.assert_called_once_with()
         self.assertIs(admit.call_args.kwargs["topology"], self.TOPOLOGY)
         suite_env.assert_called_once_with(self.GRANT)
-        self.assertIs(child.call_args.kwargs["env"], self.ENV)
+        self.assertIs(child.call_args.kwargs["env"], env)
 
     def test_one_grant_reaches_queued_suite_admission_and_environment(self):  # noqa: VACUOUS_ASSERTION — assert_grant_flow unconditionally asserts the minted row plus topology, admission, env-render, and child mock calls
         self.assert_grant_flow()
@@ -598,8 +602,14 @@ class CapacityRefusalIsNotRedTest(GateBase):
         self.assertEqual(rc, 1, err)
         self.assertIn("FAILED", out)
         self.assertEqual([r["status"] for r in gate.receipts()[0]], ["FAILED"])
+        # THE SAME RED TREE RE-GATES ONLY AS A DECLARED FLAKE (task/3039):
+        # nothing changed, so the bare rerun is refused before it spends, and
+        # `--again` is the declaration that admits it.
+        rc, _out, err = self.cli()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("--again", err)
         with serial_process(ran=1):
-            rc, out, err = self.cli()
+            rc, out, err = self.cli("--again")
         self.assertEqual(rc, 0, err)
         self.assertEqual([r["status"] for r in gate.receipts()[0]],
                          ["FAILED", "OK"])
@@ -802,6 +812,53 @@ RuntimeError: %s
 
 
 class ParseResult(GateBase):
+    # task/3070: the last 16 KiB of train198's whole-suite stderr, as the
+    # UNKNOWN receipt gate:d3ecc40f7dc72b6f kept it (stderr_tail, 904984 bytes
+    # in all, truncated), read back from the fab node's per-run ledger. One
+    # interpreter path was redacted to `~/`; no other byte differs.
+    TRAIN198_TAIL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "fixtures",
+                                 "gate-train198-unknown-stderr-tail.txt")
+    TRAIN198_REFUSAL = ("the summary says OK but the run count is unreadable "
+                        "or not its terminal footer")
+
+    def train198_tail(self):
+        with open(self.TRAIN198_TAIL, encoding="utf-8") as f:
+            return f.read()
+
+    def test_the_real_train198_tail_ends_mid_suite_and_reads_as_UNKNOWN(self):
+        """The run died of SIGTERM (receipt rc 241, -15 through the gate
+        supervisor) inside tests/test_seat.py, on the fork warning its
+        launch-owner test prints, so no unittest footer was ever written.
+        The kept tail holds no summary at all, and the parse says so."""
+        tail = self.train198_tail()
+        self.assertTrue(tail.endswith(
+            "DeprecationWarning: This process (pid=1299936) is multi-threaded,"
+            " use of fork() may lead to deadlocks in the child.\n"
+            "  pid = os.fork()\n"))
+        got = gate.parse_result(tail)
+        self.assertEqual((got["status"], got["ran"], got["detail"]),
+                         ("UNKNOWN", None, ""))
+        self.assertEqual(got["unreadable_reason"],
+                         "the run printed no readable summary")
+
+    def test_a_summary_followed_by_the_real_tail_stays_UNKNOWN(self):
+        """The refusal the gate printed. The whole stream is gone; the receipt
+        says an OK summary sat somewhere before the kept 16 KiB. The prefix
+        here is the parser's own documented shape for that (a well-formed
+        unittest summary), labelled as such; everything after it is the real
+        captured tail. Anchoring on the LAST well-formed Ran/OK pair and
+        ignoring what follows would read this as OK, Ran 3, for a suite that
+        died part-way through. The control shows the same prefix alone is a
+        well-formed OK, so only the real text after it makes the UNKNOWN."""
+        summary = ("-" * 70 + "\nRan 3 tests in 0.010s\n\nOK\n")
+        control = gate.parse_result(summary)
+        self.assertEqual((control["status"], control["ran"]), ("OK", 3))
+        got = gate.parse_result(summary + self.train198_tail())
+        self.assertEqual((got["status"], got["ran"], got["detail"]),
+                         ("UNKNOWN", None, self.TRAIN198_REFUSAL))
+        self.assertTrue(got["failures_unreadable"])
+
     def test_ok_with_skips(self):
         got = gate.parse_result("Ran 5115 tests in 154.773s\n\nOK (skipped=8)\n")
         self.assertEqual(got["status"], "OK")
@@ -3182,7 +3239,11 @@ class CodexRound1(GateBase):
         row, err = gate.by_id("a" * 16)
         self.assertIsNone(row)
         self.assertIn("no minted gate receipt", err)
-        self.assertIn("run `helm gate run`", err)
+        # task/3039: the advice names each room's gate, because a lane room
+        # refuses a bare whole suite.
+        self.assertIn("`helm gate run --focus`", err)
+        self.assertIn("land gate", err)
+        self.assertNotIn("run `helm gate run`", err)
         self.assertNotIn("IS in the ledger", err)
 
     def test_self_consistent_UNKNOWN_version_receipt_never_binds(self):
@@ -7207,7 +7268,8 @@ class HelpAndFlagGuardTest(GateBase):
         # must NEVER arrive focused, or a caller-supplied command could ride
         # the focused kind's binding rights.
         run.assert_called_once_with(repo=None, argv=["python3", "--help"],
-                                    label=None, timeout=None, focus=False)
+                                    label=None, timeout=None, focus=False,
+                                    sliced=False, timings=None)
 
     def test_show_still_resolves_a_real_id(self):
         """The regression control for the whole class: the positional still
@@ -7276,7 +7338,10 @@ class ReceiptNamesWhereItRan(GateBase):
         self.assertEqual(state, "REFUSED")
         self.assertEqual(rid, blind["id"])
         self.assertIn("does not name the HOST", why)
-        self.assertIn("re-run", why.lower())
+        self.assertIn("mint a receipt that names its machine", why.lower())
+        # a lane room refuses a whole suite, so its road is a focused round
+        self.assertIn("`helm gate run --focus`", why)
+        self.assertNotIn("Re-run `helm gate run`", why)
 
     def test_a_LEGACY_receipt_minted_before_the_host_existed_REFUSES(self):
         """Absence is refused, never grandfathered: "it was probably this box"
@@ -10235,3 +10300,10 @@ class TheUnrunnableGateSaysSoInsteadOfFailing(unittest.TestCase):
             with self.assertRaises(unittest.SkipTest) as caught:
                 _gate_supervisor.require_supervisor()
         self.assertIn("lacks write access", str(caught.exception))
+
+
+def setUpModule():
+    """No dispatch row this module writes walks the host's process table
+    (task/3039; see tests._tmphome.pin_live_seats)."""
+    from tests._tmphome import pin_live_seats
+    pin_live_seats()

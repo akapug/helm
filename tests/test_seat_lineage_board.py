@@ -19,9 +19,14 @@ def row():
 class BoardProjectionTest(Base):
     def render(self, **cases):
         from tests.test_web_lr import CardRuntimeBase
-        CardRuntimeBase.setUpClass()
-        self.addCleanup(CardRuntimeBase.tearDownClass)
-        return CardRuntimeBase().render(**cases)
+        # A PRIVATE SUBCLASS carries the harness's class fixtures, so
+        # CardRuntimeBase itself -- the base every card class in test_web_lr
+        # inherits -- never keeps this module's tmp dir and node path after
+        # it (task/3039: the slice runner's data audit named them).
+        harness = type("BoardRenderHarness", (CardRuntimeBase,), {})
+        harness.setUpClass()
+        self.addCleanup(harness.tearDownClass)
+        return harness().render(**cases)
 
     def test_actual_browser_renderer_shows_orphan_standing(self):
         self.plant({"alpha": {"session": "s-alpha"}})

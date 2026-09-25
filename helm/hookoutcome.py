@@ -42,6 +42,14 @@ _RANK = {ANSWERED: 0, SKIPPED: 1, UNCHECKED: 2}
 
 _declared = []
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_declared": (
+        "a per-dispatch slot that begin() clears before every handler, so "
+        "no reader sees an earlier one"),
+}
+
 
 def begin():
     """Clear the slot before a handler runs. Idempotent, never raises."""

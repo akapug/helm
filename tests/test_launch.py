@@ -602,7 +602,10 @@ class LaunchTest(unittest.TestCase):
         HELM_CHAT_NAME died with FileNotFoundError instead of launching
         un-homed as the adjacent comment promises. safe_cwd is hoisted above
         the seat default; the seat falls to <host>-here, the room to main."""
-        saved = os.path.dirname(os.path.abspath(__file__))
+        # Back to the cwd this arm FOUND. The tests directory is not it, and
+        # every module that ran after this one in the same process would run
+        # from there.
+        saved = os.getcwd()
         self.addCleanup(os.chdir, saved)
         d = tempfile.mkdtemp(dir=self.tmp)
         os.chdir(d)

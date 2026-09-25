@@ -457,9 +457,21 @@ function boardRepos(j, named) {
 }
 
 /* WHICH KANBAN COLUMN each land-request state belongs in. A state this map
-   does not name is still in flight, so it reads as under review. */
-const KANBAN_OF = {OPEN: "review", AWAITING_REVIEW: "review", AWAITING_BUILD: "review",
+   does not name is still in flight, so it reads as under review. A request
+   AWAITING_BUILD is building: nothing exists to review until its lane has a
+   tip of its own. */
+const KANBAN_OF = {OPEN: "review", AWAITING_REVIEW: "review", AWAITING_BUILD: "building",
   REVIEWED: "review", CHANGES_REQUESTED: "building", READY: "gate", MERGED_LOCAL: "gate"};
+
+/* ONE COLLAPSED LINE, in the words every board surface draws it: the count,
+   what the rows are, how old the oldest is, and the command that lists every
+   one of them. The rows themselves are not drawn: they are not live
+   obligations, and the line keeps them one command away. */
+function boardFoldLine(c) {
+  return "<b>" + esc(c.count) + "</b> " + esc(c.label || "")
+    + (typeof c.oldest_age_s === "number" ? ", oldest " + esc(lrDur(c.oldest_age_s)) : "")
+    + " — <code>" + esc(c.command || "") + "</code> lists them";
+}
 
 /* ONE PROJECT'S KANBAN, as data: building, review, gate, landed. Building is
    its running lanes (a seat at work with no claim is its own card, `@seat`),
@@ -477,16 +489,27 @@ const KANBAN_OF = {OPEN: "review", AWAITING_REVIEW: "review", AWAITING_BUILD: "r
    card that their paperwork would draw as building or review belong in
    landed: a claimed
    lane whose own branch is on main (`running[].landed`, the verdict
-   `helm work list` prints) and a request whose pinned tip main already holds
-   with no verdict recorded (`trunk_contains_tip`, the ALREADY ON TRUNK mark
-   `helm lr list` prints). When the landed column itself could not be read,
+   `helm work list` prints) and a request whose work main already holds
+   with no verdict recorded (`lanes.on_main`, the rows `helm lr list` marks
+   ALREADY ON TRUNK). When the landed column itself could not be read,
    each stays in the column it came from and says LANDED / ON MAIN there. A
    lane drawn as landed is not also building unless its branch now carries
    commits main does not have, or could not be read — either may be the next
    round — or its room is DIRTY (`running[].dirty`, the flag `helm work list`
    prints beside LANDED): uncommitted work is still in flight, so that lane
    is drawn in BOTH columns and says so in each, exactly as the CLI prints
-   it and `helm lr foldcheck` keeps it rather than offering its release. */
+   it and `helm lr foldcheck` keeps it rather than offering its release.
+
+   A REQUEST ON MAIN WITH NO VERDICT IS ONE COUNT LINE, not a card each
+   (task/2381): it is ledger debris nobody moves, and the owner read a column
+   of them as landed lanes. The SERVER decides which (`scheduler.collapse_
+   class`, the one call its waits make too) and counts them (`lanes.on_main`,
+   whose `lanes` stay placed, so a claim on one is not drawn building); the
+   page draws every card it is sent and never re-folds one — a card the
+   server kept listed (a row under a recorded verdict, an owner-gated hold)
+   is a live obligation whatever its containment mark says. Requests the
+   census placed off the live frontier come back as `collapsed` lines, drawn
+   under the columns. */
 function boardKanban(p, j, d) {
   const lands = boardSec(d, "lands"), fleet = boardSec(d, "fleet");
   // a scoped read still being read has not named its project yet; the
@@ -496,7 +519,8 @@ function boardKanban(p, j, d) {
   const word = {unread: "loading", loading: "loading", unknown: "unknown", stale: "stale"}[st];
   const read = st === "ok";
   const ln = mine ? (j && j.lanes) || {} : {};
-  const pipe = mine ? {loops: ln.loops, landed: j && j.landed} : (j && j.pipeline) || null;
+  const pipe = mine ? {loops: ln.loops, landed: j && j.landed, on_main: ln.on_main,
+    collapsed: ln.collapsed} : (j && j.pipeline) || null;
   const col = got => (!read ? word : pipe ? got : null);
   const sst = boardSecState(boardSec(d, "seats")), running = sst === "ok";
   const cols = {building: running || (read && pipe) ? []
@@ -507,13 +531,16 @@ function boardKanban(p, j, d) {
   const key = s => String(s || "").replace(/^lane\//, "");
   const run = running ? (j && j.running) || [] : [];
   const placed = new Set(), fixing = [], onMain = [];
+  const sum = read && pipe && pipe.on_main && typeof pipe.on_main.count === "number"
+    ? {count: pipe.on_main.count, oldest: pipe.on_main.oldest_age_s,
+       label: pipe.on_main.label || "on main with no verdict recorded",
+       command: pipe.on_main.command || "helm lr list"}
+    : {count: 0, oldest: null, label: "on main with no verdict recorded", command: "helm lr list"};
+  const counted = new Set();                         // lanes the on-main line counts
   if (read && pipe) {
+    ((pipe.on_main && pipe.on_main.lanes) || []).forEach(lane => { placed.add(lane); counted.add(key(lane)); });
+    if (Array.isArray(pipe.collapsed) && pipe.collapsed.length) cols.collapsed = pipe.collapsed;
     (pipe.loops || []).forEach(c => {
-      if (c.trunk_contains_tip === true) {           // in history, no verdict
-        onMain.push({lane: c.lane, note: "on main · no verdict recorded", from: "review"});
-        placed.add(c.lane);
-        return;
-      }
       const at = KANBAN_OF[c.state] || "review";
       if (at === "building") fixing.push({lane: c.lane, note: c.state});
       else if (!cols[at].some(r => r.lane === c.lane)) {     // one card per lane
@@ -531,22 +558,33 @@ function boardKanban(p, j, d) {
     onMain.push({lane: r.lane, from: "building", note: "lease still held · " + (r.landed.proof || "landed")
       + (r.dirty === true ? " · " + BOARD_DIRTY : "")});
   });
+  // THE ON-MAIN LINE: one card, the count on it, placed where its cards were
+  const line = sum.count ? {lane: null, summary: sum.count,
+    note: sum.label + (typeof sum.oldest === "number" ? ", oldest " + lrDur(sum.oldest) : "")
+      + " — " + sum.command + " lists them"} : null;
   if (Array.isArray(cols.landed)) {
-    const have = new Set(cols.landed.map(r => key(r.lane)));
+    // one entry per lane: a lane the on-main line already counts is not drawn
+    // again as a lease card beside it
+    const have = new Set(cols.landed.map(r => key(r.lane)).concat([...counted]));
     // a lane its land request already drew as landed still says its room is dirty
     cols.landed.forEach(r => { if (dirty.has(key(r.lane))) r.note = [r.note, BOARD_DIRTY].filter(Boolean).join(" · "); });
     onMain.forEach(r => {
       if (!have.has(key(r.lane))) { have.add(key(r.lane)); cols.landed.push({lane: r.lane, note: r.note}); }
     });
+    if (line) cols.landed.push(line);
     // the fleet-wide lands list is the newest few: none of them here is not
     // "none landed"
     if (!mine && !cols.landed.length && src.landed_partial) cols.landed = "partial";
-  } else onMain.forEach(r => {
-    const at = cols[r.from];
-    if (Array.isArray(at)) at.push({lane: r.lane, note: (r.from === "review" ? "ON MAIN, " : "LANDED, ") + r.note});
-  });
+  } else {
+    onMain.forEach(r => {
+      const at = cols[r.from];
+      if (Array.isArray(at)) at.push({lane: r.lane, note: "LANDED, " + r.note});
+    });
+    if (line && Array.isArray(cols.review)) cols.review.push(Object.assign(line, {note: "ON MAIN, " + line.note}));
+  }
   if (Array.isArray(cols.building)) {
-    const landed = new Set(Array.isArray(cols.landed) ? cols.landed.map(r => key(r.lane)) : []);
+    const landed = new Set(Array.isArray(cols.landed)
+      ? cols.landed.filter(r => r.lane).map(r => key(r.lane)) : []);
     // the cards an unread landed column left in building are already here
     const seen = new Set(cols.building.map(r => r.lane).concat([...placed]));
     const add = r => { if (!seen.has(r.lane)) { seen.add(r.lane); cols.building.push(r); } };
@@ -575,15 +613,24 @@ function boardKanbanHTML(kb) {
                 stale: '<div class="bkcard bunk">STALE</div>',
                 partial: '<div class="bkcard bmut">none among the newest lands read</div>'};
   const col = (name, rows) => '<div class="bkcol"><div class="bkhead">' + name
-    + (Array.isArray(rows) ? ' <span class="bmut">' + rows.length + "</span>" : "") + "</div>"
+    + (Array.isArray(rows) ? ' <span class="bmut">' + boardKanbanCount(rows) + "</span>" : "") + "</div>"
     + (rows === null ? '<div class="bkcard bmut">not read here</div>'
       : typeof rows === "string" ? said[rows] || said.unknown
       : !rows.length ? '<div class="bkcard bmut">none</div>'
-      : rows.map(r => '<div class="bkcard"><b>' + esc(r.lane) + "</b>"
-        + (r.note ? ' <span class="bmut">' + esc(r.note) + "</span>" : "") + "</div>").join(""))
+      : rows.map(r => r.summary
+        ? '<div class="bkcard bksum"><b>' + esc(r.summary) + "</b> " + '<span class="bmut">' + esc(r.note) + "</span></div>"
+        : '<div class="bkcard"><b>' + esc(r.lane) + "</b>"
+          + (r.note ? ' <span class="bmut">' + esc(r.note) + "</span>" : "") + "</div>").join(""))
     + "</div>";
+  const folds = Array.isArray(kb.collapsed) ? kb.collapsed : [];
   return '<div class="bkb">' + col("building", kb.building) + col("review", kb.review)
-    + col("gate", kb.gate) + col("landed", kb.landed) + "</div>";
+    + col("gate", kb.gate) + col("landed", kb.landed) + "</div>"
+    + folds.map(c => '<div class="bkfold bmut">' + boardFoldLine(c) + "</div>").join("");
+}
+
+/* HOW MANY REQUESTS A COLUMN HOLDS: a card is one, a count line is its count. */
+function boardKanbanCount(rows) {
+  return rows.reduce((n, r) => n + (typeof r.summary === "number" ? r.summary : 1), 0);
 }
 
 /* THE FLEET KANBAN: every project with anything in flight or landed, each as
@@ -594,7 +641,7 @@ function fleetKanbanHTML(rows, d) {
   if (!d) return '<div class="fkline bmut">land requests not read yet</div>';
   if (d.unavailable)
     return '<div class="fkline"><span class="bunk">UNKNOWN</span> <span class="bmut">— ' + esc(d.unavailable) + "</span></div>";
-  const n = x => Array.isArray(x) ? x.length : 0;
+  const n = x => Array.isArray(x) ? boardKanbanCount(x) : 0;
   const groups = rows.filter(p => !p.retired).map(p => {
     const kb = boardKanban(p, d.projects ? d.projects[pkey(p)] : undefined, d);
     return {p, kb, moving: n(kb.building) + n(kb.review) + n(kb.gate), landed: n(kb.landed)};
@@ -643,6 +690,28 @@ function boardWide(p, j, d) {
     + '<span class="bwide brepo">' + boardRepos(j, false) + "</span>";
 }
 
+/* WHAT WAITS, on the project the land pipeline projects: its LIVE
+   obligations grouped by who holds the next move, then one line per class of
+   what is not listed (task/2381) — rows left over after landing, rows helm
+   cannot place, rows a later round absorbed — each with its count, its
+   oldest age and the command that lists every one. An older server sends no
+   lines, and the section then reads exactly as it did. */
+function boardWaits(p, j, d) {
+  const line = t => "<div class='dline'>" + esc(t) + "</div>";
+  const lands = boardSec(d, "lands"), scope = lands && lands.scope;
+  if (boardSecState(lands) !== "ok") return line("land pipeline " + boardSecWord(lands));
+  if (scope !== pkey(p)) return line("not read here: the land pipeline projects " + scope + " only");
+  const groups = (j && j.waits) || [], folds = (j && j.waits_collapsed) || [];
+  if (!groups.length && !folds.length) return line("nothing is waiting");
+  return (groups.length
+    ? groups.map(g => "<div class='dline'><b>" + esc(g.label) + "</b> · " + esc(g.count)
+        + " waiting · oldest " + esc(lrAgo(g.oldest_age_s)) + "</div>"
+        + (g.rows || []).map(r => line("  " + (r.plain_title || "?") + " · " + (r.stage_class || "?")
+          + " · " + lrAgo(r.age_s))).join("")).join("")
+    : line("no live obligation is waiting"))
+    + folds.map(c => "<div class='dline bfold'>" + boardFoldLine(c) + "</div>").join("");
+}
+
 /* THE OPEN ROW: the setter, then what burns, what is open, who is seated,
    what waits, and what is on file. */
 function boardDetail(p, j, d) {
@@ -651,7 +720,6 @@ function boardDetail(p, j, d) {
   const flags = boardSec(d, "flags"), fst = boardSecState(flags);
   const seats = boardSec(d, "seats"), sst = boardSecState(seats);
   const tasks = boardSec(d, "tasks"), tst = boardSecState(tasks);
-  const lands = boardSec(d, "lands"), lst = boardSecState(lands);
   const fams = (j && j.families) || [];
   const burn = sst !== "ok" ? line("seats " + boardSecWord(seats))
     : !fams.length ? line("no seat of this project is spending right now")
@@ -677,16 +745,7 @@ function boardDetail(p, j, d) {
     : !((j && j.seats) || []).length ? line("nobody is seated on this project")
     : j.seats.map(s => "<div class='dline'><span class='rdot " + esc(s.presence || "absent") + "'>●</span> <b>"
         + esc(s.seat) + "</b> · " + esc(s.family || "family unknown") + " · " + esc(s.presence || "?") + "</div>").join("");
-  const scope = lands && lands.scope;
-  let waits;
-  if (lst !== "ok") waits = line("land pipeline " + boardSecWord(lands));
-  else if (scope !== pkey(p)) waits = line("not read here: the land pipeline projects " + scope + " only");
-  else waits = ((j && j.waits) || []).length
-    ? j.waits.map(g => "<div class='dline'><b>" + esc(g.label) + "</b> · " + esc(g.count)
-        + " waiting · oldest " + esc(lrAgo(g.oldest_age_s)) + "</div>"
-        + (g.rows || []).map(r => line("  " + (r.plain_title || "?") + " · " + (r.stage_class || "?")
-          + " · " + lrAgo(r.age_s))).join("")).join("")
-    : line("nothing is waiting");
+  const waits = boardWaits(p, j, d);
   const run = (j && j.running) || [];
   const lanes = sst !== "ok" ? line("lanes " + boardSecWord(seats))
     : !run.length ? line("no lane is running here")

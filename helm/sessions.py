@@ -613,8 +613,8 @@ def mint_resume_script(row, home=None, skip_permissions=False, env=None):
 
 
 def resume_identity_env(sid):
-    """Identity exports for a resumed pane — {HELM_CHAT_NAME: seat} when
-    exactly ONE rostered seat owns `sid`, else None.
+    """Identity exports for a resumed pane — {HELM_CHAT_NAME, HELM_CELL_PROFILE,
+    DREGG_PROFILE: seat} when exactly ONE rostered seat owns `sid`, else None.
 
     D of the identity refusal set (owner-declared P0, 2026-08-02): `helm
     sessions resume --go` passed NO env, so the resumed pane inherited
@@ -627,7 +627,11 @@ def resume_identity_env(sid):
     incident 1."""
     from . import seats
     hits = seats.seats_for_session(sid)
-    return {"HELM_CHAT_NAME": hits[0]} if len(hits) == 1 else None
+    # THE SIGNING PROFILE RIDES WITH THE NAME, as at every launch door: a
+    # resumed pane handed only its name inherits the owner's shell export
+    # and signs as him (task/3049).
+    return ({"HELM_CHAT_NAME": hits[0], "HELM_CELL_PROFILE": hits[0],
+             "DREGG_PROFILE": hits[0]} if len(hits) == 1 else None)
 
 
 def spawn_resume(row, title=None, home=None, skip_permissions=False, env=None):

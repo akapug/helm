@@ -22,6 +22,7 @@ THE FIXTURE IS REUSED BY REFERENCE, NEVER COPIED. `SeatsBase` is imported from
 the module these arms came from, so one fixture serves both files and the two
 cannot drift.
 """
+import contextlib
 import json
 import os
 import shutil
@@ -56,6 +57,10 @@ _ENV_PRIOR = {}
 def setUpModule():
     _ENV_PRIOR["HELM_SCRATCH_GC"] = os.environ.get("HELM_SCRATCH_GC")
     os.environ["HELM_SCRATCH_GC"] = "0"
+    # No dispatch row this module writes walks the host's process table
+    # (task/3039; see tests._tmphome.pin_live_seats).
+    from tests._tmphome import pin_live_seats
+    pin_live_seats()
 
 
 def tearDownModule():
@@ -187,7 +192,7 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         # The row must still ride the REAL owed replay, or this arm would be
         # asserting about a row the reader never saw — same re-proof the
         # legacy arm makes, not assumed.
-        snap, note = seats._ledger_snapshot()
+        snap, note = dispatches.snapshot()
         self.assertFalse(note, note)
         carried = [r for r in dispatches.owed(snap) if r.get("id") == row["id"]]
         self.assertEqual(len(carried), 1,
@@ -211,7 +216,7 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         other = self.other_repo()
 
         def owes(row_id):
-            snap, note = seats._ledger_snapshot()
+            snap, note = dispatches.snapshot()
             self.assertFalse(note, note)
             return len([r for r in dispatches.owed(snap)
                         if r.get("id") == row_id])
@@ -263,7 +268,7 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
             self.ledger = os.path.join(self.tmp, "d-spell-%d.jsonl" % i)
             row = self.plant(ref=self.head)
             self.corrupt_ledger_repo_id(spelling)
-            snap, note = seats._ledger_snapshot()
+            snap, note = dispatches.snapshot()
             self.assertFalse(note, note)
             carried = [r for r in dispatches.owed(snap)
                        if r.get("id") == row["id"]]
@@ -343,7 +348,7 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         self.ledger = os.path.join(self.tmp, "d-bare-slash.jsonl")
         row = self.plant(ref=self.head)
         self.corrupt_ledger_repo_id(os.sep)
-        snap, note = seats._ledger_snapshot()
+        snap, note = dispatches.snapshot()
         self.assertFalse(note, note)
         carried = [r for r in dispatches.owed(snap)
                    if r.get("id") == row["id"]]
@@ -459,7 +464,7 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         foreign = self.plant(ref=self.rev(other), repo=other)
         # the fixture's own premise, measured: the writer stamped a real,
         # DIFFERENT canonical repo_id on the foreign row
-        snap, note = seats._ledger_snapshot()
+        snap, note = dispatches.snapshot()
         self.assertFalse(note, note)
         frow = snap[foreign["id"]]
         self.assertTrue(frow.get("repo_id"), "the real writer stamps repo_id")
@@ -494,7 +499,7 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         self.age_ledger_to_pre_repo_id()
         # the aging is honest only if the REAL replay still owes the row —
         # re-proven here, not assumed
-        snap, note = seats._ledger_snapshot()
+        snap, note = dispatches.snapshot()
         self.assertFalse(note, note)
         carried = [r for r in dispatches.owed(snap)
                    if r.get("id") == row["id"]]
@@ -1189,7 +1194,7 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         failing, and its failure must never collapse to 'no reviews'."""
         os.unlink(self.ledger) if os.path.exists(self.ledger) else None
         os.makedirs(self.ledger)         # a directory: unreadable as a ledger
-        snap, note = seats._ledger_snapshot()
+        snap, note = dispatches.snapshot()
         self.assertTrue(note, "fixture: the ledger must read as unavailable")
         findings, unknowns = seats._room_unfinished(self.res, snap, note)
         self.assertEqual(findings, [])
@@ -1210,19 +1215,17 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         the producer's own sentence for the read that failed, bounded, never
         rephrased. Pinned against the producer's CONSTANT so a rewording
         moves both sides together instead of silently unpinning the arm."""
-        from helm import seats_stop_guard as guard_impl
+        from helm import stopfacts_resident
         seats.claim(self.res, "alice", session=self.sid)
 
         def raised():
             raise RuntimeError("probe")
 
         import unittest.mock as _m
-        # THE GUARD'S OWN DOOR, not the wrapper's: the producer the constant
-        # belongs to is the snapshot the LADDER takes, and patching one module
-        # over (the renderer's import of the same function) would measure a
-        # path the stop never takes.
-        with _m.patch.object(guard_impl, "_ledger_snapshot",
-                             side_effect=raised):
+        # THE PRODUCER'S OWN DOOR: the stop facts are the RESIDENT'S fold, so
+        # its reason is what a failed fold leaves in the facts the guard
+        # reads — patched where the resident calls it, never one module over.
+        with _m.patch.object(dispatches, "snapshot", side_effect=raised):
             blocks, warns = seats.stop_guard(session=self.sid, room="main",
                                              seat="alice", cwd=self.root)
         text = " ".join(blocks + warns)
@@ -1230,7 +1233,7 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         # rung and DID print this lease's line, so the reason's presence
         # below is a measured property and not a rung that never ran.
         self.assertIn(self.res, text)
-        self.assertIn(guard_impl.LEDGER_RAISED, text,
+        self.assertIn(stopfacts_resident.LEDGER_RAISED, text,
                       "the brief line must carry the producer's reason "
                       "verbatim: %s" % text)
 
@@ -1530,7 +1533,7 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         with mock.patch.object(vcs, "backend",
                                side_effect=lambda *a, **k:
                                _HeadIsSimplyAbsent(real_backend(*a, **k))), \
-                mock.patch.object(seats_room_advice, "_ledger_snapshot",
+                mock.patch.object(dispatches, "snapshot",
                                   side_effect=_ledger_expires):
             _findings, unknowns = seats._room_unfinished(self.res)
         named = [u.split(":")[0] for u in unknowns]
@@ -1544,59 +1547,75 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
                       unknowns)
         self.assertIn("review: " + seats_room_advice._BUDGET_SPENT, unknowns)
 
-    def test_a_FAILED_shared_read_opens_NO_SECOND_ledger_fold(self):  # noqa: VACUOUS_ASSERTION — the zero-fold rows have their unconditional positive pole on the SAME observable as the FIRST row of the same loop: the shape this cure replaced must count exactly ONE fold, so a broken spy or an unreached rung reddens this arm before either zero is read
-        """The guard reads the dispatch ledger ONCE per stop and threads the
-        pair. Its failure fallback said `(None, reason)` while the producer's
-        own contract — stated in `dispatches._snapshot`, and asserted one
-        class over as "a failed snapshot is ({}, reason)" — is an EMPTY
-        MAPPING plus a reason. The gate exemption keys on `isinstance(_snap,
-        dict)`, so `None` read as NO OBSERVATION SUPPLIED and `_gate_pending`
-        opened its own `dispatches.rows()`: a second whole fold, per held lane
-        lease, on the exact stop whose first fold had just spent its reserve.
+    def test_the_claims_rung_opens_NO_ledger_fold_whatever_the_facts_say(self):  # noqa: VACUOUS_ASSERTION — the zero-fold rows have their unconditional positive pole on the SAME observable in the FIRST row of the same loop: the resident's own compute must count at least ONE fold through the same spy, so a broken spy or an unreached rung reddens this arm before either zero is read
+        """THE CLAIMS RUNG READS THE LEDGER NOWHERE: not one shared fold
+        per stop, and not a second whole fold per held lane lease on the
+        unreadable-ledger shape, because the gate exemption and the room
+        advice are the resident's facts (helm/stopfacts_resident.py).
 
-        The ruling is identical either way — an unreadable ledger earns no
-        exemption and the claims block stands — so this arm counts FOLDS and
-        pins that the verdict did not move with them."""
+        The ruling does not move with the fold count: facts that are ABSENT
+        earn no exemption and the claims block stands, and facts computed over
+        an unreadable ledger earn none either."""
+        from helm import stopfacts, stopfacts_resident
         seats.claim(self.res, "alice", ttl=600, session=self.sid)
         folds = []
-        real_rows = dispatches.rows
+        real_snapshot, real_rows = dispatches.snapshot, dispatches.rows
+
+        def _counting_snapshot(*a, **k):
+            folds.append("snapshot")
+            return real_snapshot(*a, **k)
 
         def _counting_rows(*a, **k):
-            folds.append(1)
+            folds.append("rows")
             return real_rows(*a, **k)
 
-        # THE FIRST ROW IS THE POSITIVE CONTROL AND THE MUTANT AT ONCE: it
-        # is the shape this cure replaced, and it proves the counter counts.
-        # Without it a broken spy would report zero folds for every row and
-        # this arm would pass having measured nothing.
-        for label, pair, expected in (
-                ("the shape this cure replaced", (None, "UNKNOWN"), 1),
-                ("the producer's shape", ({}, "coverage is UNKNOWN"), 0),
-                ("a READABLE ledger", ({}, None), 0)):
+        # THE FIRST ROW IS THE POSITIVE CONTROL: the resident's compute folds
+        # through the same spy, so a spy that counts nothing reddens here.
+        with mock.patch.object(dispatches, "snapshot",
+                               side_effect=_counting_snapshot), \
+                mock.patch.object(dispatches, "rows",
+                                  side_effect=_counting_rows):
+            stopfacts_resident.write(stopfacts_resident.compute())
+        self.assertGreaterEqual(len(folds), 1, "the spy counted nothing")
+        self.fresh_resident.off()
+        for label, prepare in (
+                ("facts the resident wrote", lambda: None),
+                ("NO facts at all",
+                 lambda: os.unlink(stopfacts.path()))):
+            prepare()
             folds.clear()
+            # EACH ARM IS A FIRST STOP: an unchanged held set would compress
+            # to one line that names no lease, which is the latch doing its
+            # job and not this arm's question.
+            for name in os.listdir(chat.chat_dir()):
+                if seats.LEASE_LATCH in name:
+                    os.unlink(os.path.join(chat.chat_dir(), name))
             blocks, warns = [], []
-            with mock.patch.object(dispatches, "rows",
-                                   side_effect=_counting_rows):
+            with mock.patch.object(dispatches, "snapshot",
+                                   side_effect=_counting_snapshot), \
+                    mock.patch.object(dispatches, "rows",
+                                      side_effect=_counting_rows):
                 seats_stop_claims.claims_rung(
                     self.sid, "a-room", "alice", blocks=blocks, warns=warns,
-                    dispatch_snapshot=lambda: pair)
-            self.assertEqual(len(folds), expected,
-                             "%s: the rung must not re-read the ledger the "
-                             "guard already read (%d fold(s))"
-                             % (label, len(folds)))
-            self.assertNotIn("lease retained", " ".join(blocks + warns),
+                    facts=stopfacts.Lazy())
+            text = " ".join(blocks + warns)
+            self.assertIn(self.res, text, label)
+            self.assertEqual(folds, [], "%s: the claims rung folded the "
+                             "ledger: %r" % (label, folds))
+            self.assertNotIn("lease retained", text,
                              "%s: an unexempted lease is not exempted" % label)
 
-    def test_THE_GUARD_ITSELF_emits_the_producers_failure_shape(self):  # noqa: VACUOUS_ASSERTION — the zero-fold assertion has two unconditional positive poles on the same stop it measures: the lease resource and the ledger-unreadable sentence must BOTH appear in the guard's own output, so a rung that never ran, a lease never seen, or a guard that died early reddens this arm before either zero is read; the fold counter itself is proven live by the sibling arm, whose first row must count exactly ONE
-        """The producer half of the arm above, bound end to end.
+    def test_THE_GUARD_ITSELF_carries_the_producers_failure_reason(self):  # noqa: VACUOUS_ASSERTION — the zero-fold assertion has two unconditional positive poles on the same stop it measures: the lease resource and the producer's reason must BOTH appear in the guard's own output, so a rung that never ran, a lease never seen, or a guard that died early reddens this arm before the zero is read; the fold counter itself is proven live by the sibling arm, whose first row must count at least ONE
+        """The producer half, bound end to end, for both ways the facts can
+        fail to carry a reading of this lane.
 
-        Asserting that the claims rung handles `({}, reason)` correctly proves
-        nothing about the guard unless something pins that the guard EMITS
-        that shape — mutation found exactly this hole: reverting the guard's
-        fallback to `(None, reason)` left the shape arm green. So this one
-        drives the REAL guard, makes its one ledger read fail, and counts the
-        folds the claims rung then opens.
-        """
+        THE RESIDENT'S FOLD RAISED: the lease facts carry its reason
+        (`stopfacts_resident.LEDGER_RAISED`) into the room advice, and the
+        guard prints it. NO RESIDENT AT ALL: there are no facts, the lease is
+        held, and the guard says the stop facts are absent. In both, the
+        guard itself opens no fold of its own — the second-fold shape
+        `_gate_pending` once took is unreachable from the stop path."""
+        from helm import stopfacts, stopfacts_resident
         seats.claim(self.res, "alice", ttl=600, session=self.sid)
         folds = []
         real_rows = dispatches.rows
@@ -1605,31 +1624,23 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
             folds.append(1)
             return real_rows(*a, **k)
 
-        from helm import seats_stop_guard as guard_impl
-
-        def _ledger_is_gone():
+        def _ledger_is_gone(*_a, **_k):
             raise RuntimeError("the ledger read blew up")
 
-        # BOTH WAYS THE ONE READ CAN FAIL, because the guard spells a fallback
-        # for each and one of them is the PRODUCTION shape: the rung that is
-        # refused admission because its fitted cost plus its successor reserve
-        # no longer fit. The budget arm mutates the ADMISSION INPUT and lets
-        # the real predicate decide, rather than restating its verdict.
-        real_start = seats_stop_budget.State.start_deadline
-
-        def _already_past(state, stage):
-            return (time.monotonic() - 1.0) if stage == "dispatch-ledger" \
-                else real_start(state, stage)
+        def _no_resident():
+            self.fresh_resident.off()
+            try:
+                os.unlink(stopfacts.path())
+            except FileNotFoundError:
+                pass
+            return contextlib.nullcontext()
 
         arms = (
-            ("the read RAISED",
-             mock.patch.object(guard_impl, "_ledger_snapshot",
-                               side_effect=_ledger_is_gone),
-             guard_impl.LEDGER_RAISED),
-            ("the rung was REFUSED ADMISSION",
-             mock.patch.object(seats_stop_budget.State, "start_deadline",
-                               _already_past),
-             guard_impl.LEDGER_RESERVE_SPENT),
+            ("the resident's fold RAISED",
+             lambda: mock.patch.object(dispatches, "snapshot",
+                                       side_effect=_ledger_is_gone),
+             stopfacts_resident.LEDGER_RAISED),
+            ("NO resident", _no_resident, "stop-facts ABSENT"),
         )
         for label, failure, reason in arms:
             folds.clear()
@@ -1639,32 +1650,18 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
             for name in os.listdir(chat.chat_dir()):
                 if seats.LEASE_LATCH in name:
                     os.unlink(os.path.join(chat.chat_dir(), name))
-            with failure, mock.patch.object(dispatches, "rows",
-                                            side_effect=_counting_rows):
+            with failure(), mock.patch.object(dispatches, "rows",
+                                              side_effect=_counting_rows):
                 blocks, warns = seats.stop_guard(session=self.sid,
                                                  seat="alice")
             text = " ".join(blocks + warns)
-            # POSITIVE POLE, unconditional: the guard DID reach the claims rung
-            # and DID speak about this lease, so the zero below is a measured
-            # absence and not a rung that never ran.
             self.assertIn(self.res, text, "%s: %s" % (label, text))
-            # THE PRODUCER'S REASON, NOT THE WRAPPER'S SENTENCE. The arm's
-            # own docstring says it proves THE GUARD EMITS THE PRODUCER'S
-            # SHAPE, and the literal it pinned was the renderer's — free to
-            # be rewritten by any lane, and one already did. What the guard
-            # may never drop is the reason itself, pinned as the producer's
-            # CONSTANT so a rewording moves arm and producer together.
             self.assertIn(reason, text,
                           "%s: the guard's block must carry the PRODUCER's "
                           "reason, however the line is worded: %s"
                           % (label, text))
-            self.assertEqual(
-                len(folds), 0,
-                "%s: the guard read the ledger once and its failure must not "
-                "send the claims rung back for a second fold (%d opened)"
-                % (label, len(folds)))
-
-    # --- end to end, through the guard the owner actually reads -----------
+            self.assertEqual(folds, [], "%s: the guard opened a fold of its "
+                             "own" % label)
     def test_the_release_advice_NAMES_THE_WORK_and_no_longer_asks_about_delegation(self):
         """The deliverable. Two real facts in the room, both named in the
         block that carries the release command — and the retired question
@@ -1735,11 +1732,13 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
                          "the ledger was folded %d times in one stop"
                          % len(folds))
 
-    def test_a_LATCHED_re_stop_does_not_recompute_advice_nobody_prints(self):
-        """The other half of the cost story. The same-state latch compresses
-        a re-stop to one line that never carried a hint, so the four reads
-        must not run for it — the advice is built inside the branch that
-        prints it."""
+    def test_NO_stop_makes_the_four_reads_the_resident_made_them(self):  # noqa: VACUOUS_ASSERTION — the resident's own refresh through the same counter must count exactly ONE read first, and the first stop must print that read's finding, so a counter that counts nothing or a stop that never read the facts reddens this arm before either zero is read
+        """The cost story, finished. The four reads once ran on the stop that
+        printed them (and the latch kept them off the compressed re-stop);
+        now they run in the `helm web` resident when an input moves, and NO
+        stop runs them — the first prints the resident's finding and the
+        re-stop compresses, both without one read of their own."""
+        from helm import stopfacts_resident
         seats.claim(self.res, "alice", ttl=600, session=self.sid)
         self.commit("lane work", self.wt)
         calls, real = [], seats._room_unfinished
@@ -1749,13 +1748,16 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
             return real(*a, **kw)
 
         with mock.patch.object(seats, "_room_unfinished", counted):
+            stopfacts_resident.write(stopfacts_resident.compute())
+            self.assertEqual(len(calls), 1, "the resident must measure")
+            self.fresh_resident.off()
+            calls.clear()
             blocks, _w = seats.stop_guard(session=self.sid, seat="alice")
-            self.assertEqual(len(calls), 1, "the first stop must measure")
-            self.assertIn("unfinished work is bound to this room", " ".join(blocks))
+            self.assertIn("unfinished work is bound to this room",
+                          " ".join(blocks))
             _b2, warns2 = seats.stop_guard(session=self.sid, seat="alice")
         self.assertIn("unchanged. Reprint:", " ".join(warns2))
-        self.assertEqual(len(calls), 1,
-                         "the compressed re-stop paid for four git reads")
+        self.assertEqual(calls, [], "a stop paid for the four git reads")
 
     def test_a_LATCHED_second_stop_promises_nothing_the_first_did_not_print(self):
         """THE HEADER RULING, EXTENDED TO THE LATCH PATH — the one path the

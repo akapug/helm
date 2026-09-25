@@ -914,5 +914,399 @@ class TheHarnessDeclaresTheTraceOffTest(unittest.TestCase):
                          seats_stop_timing.STREAM_OFF)
 
 
+# THE SHEBANG THE WRAPPER'S FAST PATH STANDS IN FOR, spelled once for the arms.
+_ENV_SHEBANG = "#!/usr/bin/env python3"
+
+# THE SURFACES WHOSE START THE FLOOR IS FOR: the per-tool-call gate, the
+# per-tool-call delivery (standalone and composite) and the Stop gate outside
+# helm. name, kind, event, consequence, argv, payload extras. Each runs the REAL
+# bin/helm through the REAL bin/helm-hook, from a cwd no project claims, so
+# the fleet-scoped ones take the scope door and nothing live is touched.
+_FLOOR_SURFACES = (
+    ("argv-guard", "gate", "PreToolUse", "tool call",
+     "chat argv-guard --hook-json",
+     {"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+    ("deliver", "lane", "PostToolUse", "pending chat is deferred",
+     "chat deliver --hook-json",
+     {"tool_name": "Read", "tool_input": {"file_path": "/nonexistent"},
+      "tool_response": {}}),
+    ("posttool", "posttool", "PostToolUse", "-",
+     "hooks run PostToolUse --installed --hook-json",
+     {"tool_name": "Read", "tool_input": {"file_path": "/nonexistent"},
+      "tool_response": {}}),
+    ("stop-guard", "gate", "Stop", "stop", "chat stop-guard --hook-json",
+     {"stop_hook_active": False}),
+)
+
+
+class TheHookInterpreterFloorTest(unittest.TestCase):
+    """helm's hook child starts WITHOUT the site stage once its interpreter is
+    known, and on the old shebang path in every state that is not proven.
+
+    THE WORLD IS PLANTED, NOT BORROWED. The PATH python3 is a shim that logs
+    its own argv and then becomes this interpreter, which is the shape of the
+    agents box (a bash shim in front of the real python), and a
+    `sitecustomize.py` on PYTHONPATH stands for the box's site stage: any
+    process that runs the site stage leaves its argv in a mark file. A hook
+    that skipped both leaves neither, and that is read, not timed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-hookinterp-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+        def j(*parts):
+            return os.path.join(self.tmp, *parts)
+        self.home = j("home")
+        self.cwd = j("elsewhere")
+        for d in ("home", "pathbin", "site", "chat", "proc", "alarm",
+                  "elsewhere", os.path.join("home", "_global")):
+            os.makedirs(j(d), exist_ok=True)
+        self.shim_log = j("shim.log")
+        self.site_mark = j("site.mark")
+        self.shim = j("pathbin", "python3")
+        with open(self.shim, "w") as f:
+            f.write("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\nexec %s \"$@\"\n"
+                    % (shlex.quote(self.shim_log), shlex.quote(sys.executable)))
+        os.chmod(self.shim, 0o755)
+        with open(j("site", "sitecustomize.py"), "w") as f:
+            f.write("import sys\nwith open(%r, 'a') as _f:\n"
+                    "    _f.write(' '.join(sys.orig_argv) + '\\n')\n"
+                    % self.site_mark)
+        # helm registered where this tree's hooks say it lives, so the scope
+        # door can answer "outside helm" for the cwd above.
+        root = os.path.dirname(os.path.dirname(hooks.helm_bin()))
+        with open(j("home", "_global", "registry.json"), "w") as f:
+            json.dump({"projects": {"helm": {"path": root}}}, f)
+        self.record = j("home", "_global", ".state", "hook-interp")
+        self.env = dict(
+            os.environ,
+            PATH=j("pathbin") + os.pathsep + os.environ.get("PATH", ""),
+            PYTHONPATH=j("site"), HELM_HOME=self.home,
+            HELM_CHAT_DIR=j("chat"), HELM_PROC=j("proc"),
+            HELM_SCRATCH_GC="0", HELM_HOOK_ALARM_DIR=j("alarm"),
+            HELM_CHAT_NAME="interp-fixture", HELM_NO_TREE_WARNING="1",
+            HELM_STOPPROBE_LOG=j("stopprobe.log"))
+        for k in ("HELM_HOOK_INTERP_RECORD", "HELM_HOOK_INTERP_KEY",
+                  "PYTHONNOUSERSITE", "PYTHONSAFEPATH"):
+            self.env.pop(k, None)
+
+    def hook(self, surface, child=None, wrapper=None, budget=60):
+        name, kind, event, what, args, extra = surface
+        payload = dict(extra, session_id="interp-fixture-session",
+                       hook_event_name=event, cwd=self.cwd)
+        # THIS TREE's helm beside THIS TREE's wrapper: the fast path is for
+        # `${0%/*}/helm`, so the pair must be the one the arm is about.
+        cmd = "%s %s %s %s %d %s %s %s" % (
+            shlex.quote(wrapper or WRAPPER), kind, name, event, budget,
+            shlex.quote(what),
+            shlex.quote(child or os.path.join(ROOT, "bin", "helm")), args)
+        return subprocess.run(["sh", "-c", cmd], input=json.dumps(payload),
+                              capture_output=True, text=True, env=self.env,
+                              cwd=self.cwd, timeout=120)
+
+    def seen(self, path, needle):
+        """Lines of `path` that name `needle` -- the hook's own argv, so a
+        child the hook spawned is never mistaken for the hook."""
+        try:
+            with open(path) as f:
+                return [ln for ln in f if needle in ln]
+        except FileNotFoundError:
+            return []
+
+    def recorded(self):
+        with open(self.record) as f:
+            return [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+
+    def plant(self, interpreter):
+        os.makedirs(os.path.dirname(self.record), exist_ok=True)
+        with open(self.record, "w") as f:
+            f.write("%s\t%s\n" % (self.shim, interpreter))
+
+    def reset_marks(self):
+        for p in (self.shim_log, self.site_mark):
+            if os.path.exists(p):
+                os.unlink(p)
+
+    def test_each_surface_cold_then_warm_then_stale(self):  # noqa: VACUOUS_ASSERTION — every absence (no shim line, no site mark on WARM) is preceded in the SAME iteration by the COLD positive on the same two files, asserted unconditionally for that surface
+        """THE MATRIX, surface by state. COLD (nothing recorded): the old
+        shebang path runs, site stage and shim included, and it RECORDS where
+        the shim led. WARM: the same hook skips both and answers the same rc
+        and stdout. STALE (the recorded interpreter is gone): the old path
+        again, and the record is repaired."""
+        gone = os.path.join(self.tmp, "gone", "python3")
+        for surface in _FLOOR_SURFACES:
+            name, args = surface[0], surface[4]
+            with self.subTest(surface=name):
+                if os.path.exists(self.record):
+                    os.unlink(self.record)
+                self.reset_marks()
+                cold = self.hook(surface)
+                self.assertIn(cold.returncode, (0, 2), cold.stderr)
+                self.assertTrue(self.seen(self.shim_log, args),
+                                "COLD: the PATH python3 never ran — the "
+                                "control that the shim is on this path")
+                self.assertTrue(self.seen(self.site_mark, args),
+                                "COLD: the site stage never ran")
+                (key, exe), = self.recorded()
+                self.assertEqual(key, self.shim)
+                self.assertEqual(os.path.realpath(exe),
+                                 os.path.realpath(sys.executable))
+
+                self.reset_marks()
+                warm = self.hook(surface)
+                self.assertEqual(self.seen(self.shim_log, args), [],
+                                 "WARM: the hook still started through the "
+                                 "PATH python3 shim")
+                self.assertEqual(self.seen(self.site_mark, args), [],
+                                 "WARM: the hook still ran the site stage")
+                self.assertEqual((warm.returncode, warm.stdout),
+                                 (cold.returncode, cold.stdout),
+                                 "WARM answered differently from COLD: %s"
+                                 % warm.stderr)
+
+                self.plant(gone)
+                self.reset_marks()
+                stale = self.hook(surface)
+                self.assertTrue(self.seen(self.shim_log, args),
+                                "STALE: a missing recorded interpreter did "
+                                "not fall back to the old path")
+                self.assertEqual((stale.returncode, stale.stdout),
+                                 (cold.returncode, cold.stdout))
+                (key, exe), = self.recorded()
+                self.assertEqual(os.path.realpath(exe),
+                                 os.path.realpath(sys.executable),
+                                 "STALE: the record was not repaired")
+
+    def test_a_path_python3_newer_than_the_record_is_resolved_again(self):
+        """An edited or replaced PATH python3 may now lead somewhere else, so
+        a record older than it proves nothing about it."""
+        surface = _FLOOR_SURFACES[0]
+        self.plant(sys.executable)
+        self.reset_marks()
+        self.hook(surface)
+        self.assertEqual(self.seen(self.shim_log, surface[4]), [],
+                         "control: a fresh record IS used")
+        later = time.time() + 120
+        os.utime(self.shim, (later, later))
+        self.reset_marks()
+        self.hook(surface)
+        self.assertTrue(self.seen(self.shim_log, surface[4]),
+                        "a record older than the PATH python3 was trusted")
+
+    def test_only_the_helm_beside_the_wrapper_with_the_env_shebang(self):
+        """The fast path stands in for ONE thing: `#!/usr/bin/env python3` on
+        the helm this wrapper ships beside. A shell child named helm, a
+        python child with another name, and a helm that is not executable all
+        keep exactly the old behaviour, including the 126 a non-executable
+        child has always produced."""
+        self.plant(sys.executable)
+        d = os.path.join(self.tmp, "stubs")
+        report = ("%s\nimport json, sys\nprint(json.dumps(bool(sys.flags.no_site)))\n"
+                  % _ENV_SHEBANG)
+        helm_py = _stub(d, report)
+        surface = ("stub", "lane", "SessionStart", "-", "", {})
+        # MUST-HIT: the helm-python child beside the wrapper goes direct.
+        p = self.hook(surface, child=helm_py,
+                      wrapper=os.path.join(d, hooks.HOOK_WRAPPER))
+        self.assertEqual(p.stdout.strip(), "true", p.stderr)
+        # A shell child named helm runs under its own shebang.
+        sh_helm = _stub(os.path.join(self.tmp, "sh"), "#!/bin/sh\necho sh-ran\n")
+        p = self.hook(surface, child=sh_helm,
+                      wrapper=os.path.join(self.tmp, "sh", hooks.HOOK_WRAPPER))
+        self.assertEqual(p.stdout.strip(), "sh-ran", p.stderr)
+        # A python child that is not the helm beside the wrapper: old path.
+        other = os.path.join(d, "other")
+        with open(other, "w") as f:
+            f.write(report)
+        os.chmod(other, 0o755)
+        p = self.hook(surface, child=other,
+                      wrapper=os.path.join(d, hooks.HOOK_WRAPPER))
+        self.assertEqual(p.stdout.strip(), "false", p.stderr)
+        # A helm that is not executable: still the shell's 126, still loud.
+        os.chmod(helm_py, 0o644)
+        p = self.hook(surface, child=helm_py,
+                      wrapper=os.path.join(d, hooks.HOOK_WRAPPER))
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("FAILED rc=126", p.stderr)
+
+    def test_the_hosts_gnu_timeout_is_the_budget_where_it_ships(self):
+        """uutils `timeout` 0.8 waits in 100 ms polls, so every hook's wall
+        rounded up to the next 100 ms (argv-guard p50 105 ms against 85 ms).
+        Where the host ships GNU's beside it as `gnutimeout`, the wrapper
+        uses that one, and the arms still read the same: an answer passes,
+        a kill at the budget is the 124 arm."""
+        gnu_log = os.path.join(self.tmp, "gnu.log")
+        gnu = os.path.join(self.tmp, "pathbin", "gnutimeout")
+        with open(gnu, "w") as f:
+            f.write("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\nexec timeout \"$@\"\n"
+                    % shlex.quote(gnu_log))
+        os.chmod(gnu, 0o755)
+        surface = ("stub", "lane", "SessionStart", "the stub did not run", "", {})
+        quick = _stub(os.path.join(self.tmp, "quick"), "#!/bin/sh\nexit 0\n")
+        p = self.hook(surface, child=quick,
+                      wrapper=os.path.join(self.tmp, "quick", hooks.HOOK_WRAPPER))
+        self.assertEqual((p.returncode, p.stderr), (0, ""))
+        self.assertTrue(self.seen(gnu_log, quick),
+                        "the host's GNU timeout was not the budget")
+        slow = _stub(os.path.join(self.tmp, "slow"), "#!/bin/sh\nsleep 30\n")
+        p = self.hook(surface, child=slow, budget=1,
+                      wrapper=os.path.join(self.tmp, "slow", hooks.HOOK_WRAPPER))
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("TIMED OUT at 1s", p.stderr)
+        self.assertTrue(self.seen(gnu_log, slow))
+
+    def test_the_shipped_helm_starts_with_the_shebang_the_wrapper_matches(self):  # noqa: VACUOUS_ASSERTION — every assertion is an equality or containment against a non-empty literal; nothing here asserts an absence
+        """A reworded first line would switch the fast path off in silence:
+        every hook would quietly go back to paying the site stage."""
+        with open(os.path.join(ROOT, "bin", "helm"), encoding="utf-8") as f:
+            self.assertEqual(f.readline().rstrip("\n"), _ENV_SHEBANG)
+        with open(WRAPPER, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn('[ "$line" = "%s" ]' % _ENV_SHEBANG, text)
+        self.assertIn('"$py" -S -- "$@"', text)
+
+
+class TheInterpreterRecorderTest(unittest.TestCase):
+    """`cli._record_hook_interpreter`, the helm half of the floor."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-interprec-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.dest = os.path.join(self.tmp, "state", "hook-interp")
+        from helm import cli
+        self.cli = cli
+
+    def ask(self, key, dest=None):
+        env = {self.cli.HOOK_INTERP_RECORD: dest or self.dest,
+               self.cli.HOOK_INTERP_KEY: key, "OTHER": "kept"}
+        done = self.cli._record_hook_interpreter(env)
+        self.assertEqual(env, {"OTHER": "kept"},
+                         "the request survived into this process's children")
+        return done
+
+    def lines(self):
+        with open(self.dest) as f:
+            return f.read().splitlines()
+
+    def test_it_records_the_path_python3_and_where_it_led(self):
+        self.assertTrue(self.ask("/opt/bin/python3"))
+        self.assertEqual(self.lines(), ["/opt/bin/python3\t%s" % sys.executable])
+        self.assertTrue(self.ask("/other/python3"))
+        self.assertTrue(self.ask("/opt/bin/python3"))
+        self.assertEqual(self.lines(),
+                         ["/other/python3\t%s" % sys.executable,
+                          "/opt/bin/python3\t%s" % sys.executable],
+                         "a key is replaced, never duplicated, and others stay")
+
+    def test_the_record_is_bounded(self):  # noqa: VACUOUS_ASSERTION — the length is asserted EQUAL to the bound and the newest key is asserted present, both non-empty observables
+        for n in range(self.cli.HOOK_INTERP_KEEP + 5):
+            self.assertTrue(self.ask("/p%d/python3" % n))
+        kept = self.lines()
+        self.assertEqual(len(kept), self.cli.HOOK_INTERP_KEEP)
+        self.assertEqual(kept[-1].split("\t")[0],
+                         "/p%d/python3" % (self.cli.HOOK_INTERP_KEEP + 4))
+
+    def test_it_refuses_what_the_wrapper_could_misread_and_never_raises(self):
+        for key in ("relative/python3", "/tab\there/python3", "/nl\nhere/python3"):
+            self.assertFalse(self.ask(key), repr(key))
+        self.assertFalse(os.path.exists(self.dest))
+        wall = os.path.join(self.tmp, "wall")
+        with open(wall, "w") as f:
+            f.write("a file, not a directory")
+        self.assertFalse(self.ask("/opt/bin/python3",
+                                  dest=os.path.join(wall, "x", "hook-interp")))
+        # CONTROL: the same key to a writable place is recorded.
+        self.assertTrue(self.ask("/opt/bin/python3"))
+        self.assertTrue(os.path.exists(self.dest))
+
+    def test_a_relative_record_path_is_refused_and_plants_nothing_in_the_cwd(self):  # noqa: VACUOUS_ASSERTION — the empty cwd listing is read after an unconditional refusal, and the same call to an absolute path is the control that writes
+        """The wrapper spells the record from `$HELM_HOME` unexpanded, so a
+        `HELM_HOME=~/.helm` (a settings env block never expands the tilde)
+        reaches helm as a path relative to the hook's cwd. Writing it would
+        leave a literal `~/` tree inside the project the hook ran in."""
+        cwd = os.path.join(self.tmp, "project")
+        os.makedirs(cwd)
+        before = os.getcwd()
+        os.chdir(cwd)
+        self.addCleanup(os.chdir, before)
+        self.assertFalse(self.ask("/opt/bin/python3",
+                                  dest="~/.helm/_global/.state/hook-interp"))
+        self.assertEqual(os.listdir(cwd), [], "a relative record was planted "
+                                              "in the hook's cwd")
+        self.assertTrue(self.ask("/opt/bin/python3"))      # control
+        self.assertTrue(os.path.exists(self.dest))
+
+    def test_no_request_writes_nothing(self):  # noqa: VACUOUS_ASSERTION — the absent file is read against the SAME path existing after the unconditional control call two lines below
+        env = {}
+        self.assertFalse(self.cli._record_hook_interpreter(env))
+        self.assertFalse(os.path.exists(self.dest))
+        self.assertTrue(self.ask("/opt/bin/python3"))      # control
+        self.assertTrue(os.path.exists(self.dest))
+
+
+# STDLIB ON A NEWER PYTHON than some interpreter that reads this tree, and so
+# absent from that interpreter's `sys.stdlib_module_names`. Each is imported
+# under an ImportError guard for the 3.9 floor. Held stale-free below: a name
+# nothing imports any more leaves this list.
+_NEWER_STDLIB = {
+    "compression": "stdlib from 3.14 (PEP 784); helm/upstream_surface.py "
+                   "reads zstd assets with it and reports them unreadable "
+                   "below 3.14",
+}
+
+
+class HelmNeedsNothingTheSiteStageProvidesTest(unittest.TestCase):
+    """THE PRECONDITION OF `-S`, pinned. The site stage adds site-packages
+    and every .pth in them to sys.path, runs sitecustomize/usercustomize, and
+    defines the exit/quit/help/copyright/credits/license builtins. helm uses
+    none of those: every import anywhere in helm/ or bin/helm, guarded or
+    nested, is the standard library or helm itself, and no helm source calls a
+    site builtin. Green on the base by nature: this is the fact the floor
+    stands on, and it must stay true for as long as the floor does."""
+
+    def _sources(self):
+        yield os.path.join(ROOT, "bin", "helm")
+        for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "helm")):
+            for fn in files:
+                if fn.endswith(".py"):
+                    yield os.path.join(dirpath, fn)
+
+    def test_every_import_is_stdlib_or_helm_and_no_site_builtin_is_called(self):  # noqa: VACUOUS_ASSERTION — the empty lists are the finding; the walk's own positive is the >1000 imports it read and the exact _NEWER_STDLIB set it found, both asserted unconditionally
+        import ast
+        if not hasattr(sys, "stdlib_module_names"):
+            self.skipTest("python < 3.10 has no stdlib_module_names")
+        std = set(sys.stdlib_module_names)
+        own = {"helm"} | {fn[:-3] for fn in os.listdir(os.path.join(ROOT, "helm"))
+                          if fn.endswith(".py")}
+        builtins_of_site = {"exit", "quit", "help", "copyright", "credits",
+                            "license"}
+        foreign, calls, seen, newer = [], [], 0, set()
+        for path in self._sources():
+            with open(path, encoding="utf-8") as f:
+                tree = ast.parse(f.read(), path)
+            for node in ast.walk(tree):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and not node.level:
+                    names = [node.module or ""]
+                for name in names:
+                    seen += 1
+                    top = name.split(".")[0]
+                    if top in _NEWER_STDLIB:
+                        newer.add(top)
+                    elif top not in std | own:
+                        foreign.append("%s:%d %s" % (path, node.lineno, name))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                        and node.func.id in builtins_of_site:
+                    calls.append("%s:%d %s()" % (path, node.lineno, node.func.id))
+        self.assertGreater(seen, 1000, "MUST-HIT: the walk read no imports")
+        self.assertEqual(foreign, [], "a module the -S launch cannot find")
+        self.assertEqual(newer, set(_NEWER_STDLIB),
+                         "a stale _NEWER_STDLIB entry: nothing imports it")
+        self.assertEqual(calls, [], "a builtin only the site stage defines")
+
+
 if __name__ == "__main__":
     unittest.main()

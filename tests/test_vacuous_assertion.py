@@ -778,6 +778,50 @@ class T:
         self.assertIn("spy instrumentation", got[0][3])
 
 
+class MockReceiverTest(unittest.TestCase):
+    """A mock's own `assert_not_called()` observes its RECEIVER (task/3039).
+
+    It takes no argument, so rooting it on `args[0]` left it with no roots at
+    all: no positive control could ever cover it, and the rung warned on a
+    method that held one on the very same double. The two arms are the two
+    halves of the contract: a positive on the same double clears it, and the
+    same absence with no positive on that double still warns."""
+
+    CHILD = '''
+class T:
+    def test_keeps_the_socket_open(self):
+        sock, log = Mock(), Mock()
+        deliver(sock, log, b"x")
+        %s.send.assert_called_once_with(b"x")
+        sock.close.assert_not_called()
+'''
+    BARE = '''
+class T:
+    def test_a_refused_retry_never_sends(self):
+        send = Mock(side_effect=[OSError("down")])
+        with self.assertRaises(OSError):
+            deliver(send)
+        %s
+        send.reset_mock()
+        retry_later(send)
+        send.assert_not_called()
+'''
+
+    def test_not_called_beside_a_positive_on_the_same_double_CLEARS(self):  # noqa: VACUOUS_ASSERTION — detector silence arm; its firing twin is the next arm
+        self.assertEqual(findings(self.CHILD % "sock"), [])
+        self.assertEqual(
+            findings(self.BARE % "self.assertEqual(send.call_count, 1)"), [])
+
+    def test_not_called_with_no_positive_on_that_double_still_FIRES(self):
+        child = findings(self.CHILD % "log")
+        self.assertEqual([x[2] for x in child], ["test_keeps_the_socket_open"])
+        self.assertIn("empty/absent", child[0][3])
+        bare = findings(self.BARE % "pass")
+        self.assertEqual([x[2] for x in bare],
+                         ["test_a_refused_retry_never_sends"])
+        self.assertIn("empty/absent", bare[0][3])
+
+
 class StagedScanTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-vacuous-")

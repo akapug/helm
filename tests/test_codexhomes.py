@@ -90,6 +90,9 @@ class CodexHomesBase(unittest.TestCase):
         self._env = {k: os.environ.get(k) for k in
                      ("HELM_HOME", "MELD_HOME", "HELM_CODEX_HOMES_DIR",
                       "MELD_CODEX_HOMES_DIR")}
+        # The first cleanup runs last, after every cleanup a test registers,
+        # so no later snapshot restore can re-plant this fixture's paths.
+        self.addCleanup(self._restore_env)
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm-home")
         os.environ["HELM_CODEX_HOMES_DIR"] = os.path.join(self.tmp, "codex-homes")
         os.environ.pop("MELD_HOME", None)
@@ -98,12 +101,14 @@ class CodexHomesBase(unittest.TestCase):
         # a seat mint refuses a contract it cannot write in full
         pin_suite_guard(self, self.tmp)
 
-    def tearDown(self):
+    def _restore_env(self):
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # -- helpers -----------------------------------------------------------

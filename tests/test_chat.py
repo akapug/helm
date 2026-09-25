@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -246,6 +247,29 @@ class ListRoomsIsOneGetdentsPerPassTest(ChatBase):
             self.assertEqual(["alpha", "beta", "gamma"],
                              chat.list_rooms())
         self.assertIsNot(mine, theirs)
+
+
+class _ChatClock:
+    """chat.py's OWN `time`: the keyed lock's clock and nap are doubles, and
+    every other attribute is the real module.
+
+    `chat.time` IS the process-wide time module, so a double patched onto it
+    answers for EVERY caller in the process. post() spawns git before it
+    reaches the keyed lock (`rev-parse` for the home room, `config` for the
+    owner name), and the stdlib reaps each child in Popen._wait with a capped
+    backoff (1 ms doubling to 50 ms) through that same `time.sleep`. Under CPU
+    load the child is often not yet reapable when its pipes close, and those
+    naps landed on the test's `sleep`: 110 of 200 loaded runs failed with
+    `Called N times`, and every call came from Popen._wait (task/3039).
+    Binding the doubles to chat's module global scopes them to the code the
+    claim is about. It narrows no bound: the planted instants are the same."""
+
+    def __init__(self, *instants):
+        self.monotonic = mock.Mock(side_effect=instants)
+        self.sleep = mock.Mock()
+
+    def __getattr__(self, name):
+        return getattr(time, name)
 
 
 class RoomTest(ChatBase):
@@ -504,13 +528,13 @@ class RoomTest(ChatBase):
             if len(calls) == 1:
                 raise BlockingIOError
 
+        clock = _ChatClock(10.0, 10.1)
         with mock.patch.object(fcntl, "flock", side_effect=flock), \
-                mock.patch.object(chat.time, "monotonic",
-                                  side_effect=(10.0, 10.1)), \
-                mock.patch.object(chat.time, "sleep") as sleep:
+                mock.patch.object(chat, "time", clock):
             with chat._room_lock("main", timeout_s=5) as locked:
                 self.assertTrue(locked)
-        sleep.assert_called_once_with(0.05)
+        clock.sleep.assert_called_once_with(0.05)
+        self.assertEqual(clock.monotonic.call_count, 2)  # set, checked once
         self.assertEqual(calls[:2], [fcntl.LOCK_EX | fcntl.LOCK_NB] * 2)
         self.assertEqual(calls[-1], fcntl.LOCK_UN)
 
@@ -540,14 +564,20 @@ class RoomTest(ChatBase):
                 raise BlockingIOError
             return real(fd, flags)
 
+        # The clock and the nap are chat's own (_ChatClock): the git children
+        # post() reaps before the keyed lock nap through the stdlib, and those
+        # naps are not the wait this arm is about.
+        clock = _ChatClock(10.0, 15.1)
         with mock.patch.object(fcntl, "flock", side_effect=flock), \
-             mock.patch.object(chat.time, "monotonic",
-                               side_effect=(10.0, 15.1)), \
-             mock.patch.object(chat.time, "sleep") as sleep, \
+             mock.patch.object(chat, "time", clock), \
              self.assertRaisesRegex(OSError, "unproven idempotent append"):
             chat.post("must not hang", who="a1", sign=False,
                       event_id="refusal-event-lock-timeout")
-        sleep.assert_not_called()  # the deadline, not a nap, ended the wait
+        # The deadline, not a nap, ended the wait. The positive control is on
+        # the same clock: both planted instants were read (set, then expired),
+        # which also proves the scoped doubles are the clock the lock reads.
+        self.assertEqual(clock.sleep.call_args_list, [])
+        self.assertEqual(clock.monotonic.call_count, 2)
         self.assertIn(fcntl.LOCK_EX | fcntl.LOCK_NB, calls)
         self.assertEqual(chat.read(), ([], 0))  # noqa: VACUOUS_ASSERTION — product law: a refused keyed write appends nothing; the exact refusal above is its positive control
 

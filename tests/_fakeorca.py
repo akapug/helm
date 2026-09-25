@@ -79,7 +79,17 @@ class FakeDaemon:
         connects while _serve blocks in accept() (the fd's kernel listener
         survives the in-syscall reference — measured 2026-08-04: a client
         connected and got answered after close), so the socket PATH is
-        unlinked too, the shape a vanished daemon leaves behind."""
+        unlinked too, the shape a vanished daemon leaves behind.
+
+        Closed also means GONE: shutdown() on the listener wakes the accept()
+        _serve is blocked in, so the serving thread returns and is joined.
+        A fake closed without it keeps its thread for the rest of the
+        process, and every module that runs after its creator inherits it.
+        """
+        try:
+            self.srv.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             self.srv.close()
         except OSError:
@@ -92,3 +102,4 @@ class FakeDaemon:
             os.rmdir(os.path.dirname(self.sock_path))
         except OSError:
             pass
+        self.thread.join(timeout=2)

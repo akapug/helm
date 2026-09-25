@@ -22,14 +22,21 @@ def card(rid, **kw):
 
 
 class SchedulerProjectionTest(unittest.TestCase):
-    def test_every_nonterminal_row_appears_once_and_terminal_never_appears(self):
+    def test_every_nonterminal_row_is_accounted_once_and_terminal_never_is(self):
+        """A LIVE row is listed in one holder group; every other non-terminal
+        row is COUNTED in exactly one collapsed line; a terminal row is in
+        neither. The two halves partition `row_count`."""
         rows = [card("a"), card("b", honored=True, holder_role="nobody"),
                 card("closed", terminal=True)]
         got = scheduler.project(rows, active_ids=["a"], now=NOW,
                                 projection_age_s=5)
         shown = [row["id"] for group in got["groups"] for row in group["rows"]]
-        self.assertEqual(sorted(shown), ["a", "b"])
+        self.assertEqual(shown, ["a"])
+        self.assertEqual([(c["class"], c["count"]) for c in got["collapsed"]],
+                         [("superseded", 1)])
         self.assertEqual(got["row_count"], 2)
+        self.assertEqual(got["listed_count"], 1)
+        self.assertEqual(got["collapsed_count"], 1)
         self.assertEqual(got["active_count"], 1)
 
     def test_resolved_holder_groups_without_reinterpreting_owed_by(self):
@@ -64,7 +71,11 @@ class SchedulerProjectionTest(unittest.TestCase):
         by = {g["label"]: g["suc"] for g in got["groups"]}
         self.assertEqual(by["integrator"]["stalled"], 1)
         self.assertEqual(by["reviewer @r"]["unmeasurable"], 1)
-        self.assertEqual(by["nobody"]["total"], 0)
+        # the settled row owes nobody a move, so it is not a group at all:
+        # it is counted on the superseded line, and its stall bills no one
+        self.assertNotIn("nobody", by)
+        self.assertEqual([(c["class"], c["count"]) for c in got["collapsed"]],
+                         [("superseded", 1)])
 
     def test_known_age_adds_projection_age_and_unknown_stays_unknown(self):
         got = scheduler.project(
@@ -112,9 +123,16 @@ class SchedulerProjectionTest(unittest.TestCase):
                                 now=NOW, projection_age_s=0)
         projected = {r["id"]: r for g in got["groups"] for r in g["rows"]}
         waits = [e["from"] for e in got["edges"] if e["kind"] == "waits_on"]
-        self.assertFalse(projected["old"]["active"])
+        self.assertEqual(sorted(projected), ["new"])
         self.assertEqual(waits, ["new"])
         self.assertEqual(got["suc"]["stalled"], 0)
+        # the predecessor is still ACCOUNTED — counted, never dropped — and
+        # the successor's declared edge still knows it exists
+        self.assertEqual([(c["class"], c["count"]) for c in got["collapsed"]],
+                         [("superseded", 1)])
+        sup = [e for e in got["edges"] if e["kind"] == "supersedes"]
+        self.assertEqual(sup, [{"kind": "supersedes", "from": "new",
+                                "to": "old", "target_known": True}])
 
     def test_active_membership_is_typed_complete_and_names_known_rows(self):
         missing = scheduler.project([card("a")], active_ids=None, now=NOW,
@@ -273,6 +291,283 @@ class SchedulerProjectionTest(unittest.TestCase):
                                     now=NOW, projection_age_s=0)
         self.assertIn("terminal truth", missing["unavailable"])
         self.assertIsNone(missing["suc"]["total"])
+
+
+class LiveObligationsTest(unittest.TestCase):
+    """THE OWNER BOARD LISTS LIVE OBLIGATIONS; EVERYTHING ELSE IS ONE LINE.
+
+    The owner read a waits list of 900 rows up to 60 days old — ledger debris
+    whose lane is gone and whose work is on trunk, next to the few rows that
+    need a move. The frontier classification those rows carry is the census
+    `helm lr retire --off-frontier` runs (one classifier, no second oracle);
+    this model only DECIDES, per row, listed or which collapsed line. Every
+    arm pairs a collapsed row with a listed control in the SAME projection."""
+
+    def project(self, rows, active=None, **kw):
+        ids = [r["id"] for r in rows if not r.get("terminal")]
+        return scheduler.project(rows, active_ids=ids if active is None
+                                 else active, now=NOW, projection_age_s=10,
+                                 **kw)
+
+    @staticmethod
+    def listed(got):
+        return sorted(r["id"] for g in got["groups"] for r in g["rows"])
+
+    @staticmethod
+    def lines(got):
+        return {c["class"]: c for c in got["collapsed"]}
+
+    def test_on_frontier_rows_are_listed_and_off_frontier_rows_are_one_line(self):
+        got = self.project([
+            card("live", frontier="on-frontier", frontier_rung="lane-family"),
+            card("anc", frontier="landed-by-ancestry", frontier_rung="landing",
+                 dwell_s=86400 * 52),
+            card("pid", frontier="landed-by-patch-id", frontier_rung="landing",
+                 dwell_s=86400 * 9),
+            card("gone", frontier="abandoned-unreachable",
+                 frontier_rung="reachability", dwell_s=3600)])
+        self.assertEqual(self.listed(got), ["live"])
+        off = self.lines(got)["off_frontier"]
+        self.assertEqual(off["count"], 3)
+        self.assertEqual(off["by_reason"], {"landed-by-ancestry": 1,
+                                            "landed-by-patch-id": 1,
+                                            "abandoned-unreachable": 1})
+        # the OLDEST age is the oldest row's, projection age included
+        self.assertEqual(off["oldest_age_s"], 86400 * 52 + 10)
+        self.assertEqual(off["command"], "helm lr retire --off-frontier")
+        self.assertIn("off the live frontier", off["label"])
+        self.assertEqual(got["row_count"], 4)
+        self.assertEqual(got["listed_count"] + got["collapsed_count"],
+                         got["row_count"], "the lines no longer partition "
+                         "the non-terminal rows")
+
+    def test_unclassified_rows_whose_work_is_gone_get_their_own_line(self):
+        got = self.project([
+            card("pruned", frontier="unclassified", frontier_rung="object",
+                 dwell_s=86400 * 20),
+            card("unroutable", frontier="unclassified",
+                 frontier_rung="polarity", dwell_s=86400 * 3),
+            card("control", frontier="on-frontier",
+                 frontier_rung="lane-family")])
+        self.assertEqual(self.listed(got), ["control"])
+        line = self.lines(got)["unclassified"]
+        self.assertEqual(line["count"], 2)
+        self.assertEqual(line["oldest_age_s"], 86400 * 20 + 10)
+        self.assertEqual(line["command"], "helm lr retire --off-frontier")
+        self.assertNotIn("off_frontier", self.lines(got),
+                         "unplaced rows were counted as placed residue")
+
+    def test_every_other_unclassified_row_is_work_owed_and_stays_listed(self):
+        """UNCLASSIFIED IS COUNTED AS WORK OWED on the header, and a review
+        dispatched minutes ago answers the `tip` rung whenever its label
+        matches no branch — it has no verdict tip to place. A failed reading of the
+        lane, room, lease, trunk, hold or landing, and a ref outside the lane
+        family still holding the tip, may all be live work too. Each stays on
+        the list; only the work-gone rungs fold (the control in this same
+        projection)."""
+        kept = ("lane-family", "room", "lease", "tip", "trunk", "live-hold",
+                "landing", "reachability", "a-rung-from-later")
+        got = self.project([
+            card(rung, frontier="unclassified", frontier_rung=rung)
+            for rung in kept] + [
+            card("gone", frontier="unclassified", frontier_rung="object")])
+        self.assertEqual(self.listed(got), sorted(kept))
+        self.assertEqual(self.lines(got)["unclassified"]["count"], 1)
+
+    def test_a_live_READY_whose_content_is_not_on_trunk_is_listed(self):
+        got = self.project([
+            card("ready", state="READY", holder_role="lander",
+                 owed_by="lander", frontier="on-frontier",
+                 frontier_rung="lane-family", dwell_s=86400 * 13),
+            card("ready-left-over", state="READY", holder_role="lander",
+                 owed_by="lander", frontier="landed-by-patch-id",
+                 frontier_rung="landing", dwell_s=86400 * 8)])
+        self.assertEqual(self.listed(got), ["ready"])
+        lander = [g for g in got["groups"] if g["label"] == "lander"]
+        self.assertEqual([g["count"] for g in lander], [1])
+        self.assertEqual(lander[0]["oldest_age_s"], 86400 * 13 + 10)
+        self.assertEqual(self.lines(got)["off_frontier"]["count"], 1)
+
+    def test_a_row_the_census_never_classified_is_listed_as_before(self):
+        """An older warm body, a held REVIEWED row, a foreign row: no
+        frontier field, so no frontier claim. Listed while it is live."""
+        got = self.project([card("old-body"),
+                            card("held", state="REVIEWED", frontier=None),
+                            card("future", frontier="a-word-from-later")])
+        self.assertEqual(self.listed(got), ["future", "held", "old-body"])
+        self.assertEqual(got["collapsed"], [])
+        self.assertEqual(got["collapsed_count"], 0)
+
+    def test_an_absorbed_or_settled_row_owes_nobody_and_is_one_line(self):
+        got = self.project([
+            card("new", supersedes="old", frontier="on-frontier",
+                 frontier_rung="lane-family"),
+            card("old", holder_role="author", holder_seat="s",
+                 frontier="on-frontier", frontier_rung="lane-family",
+                 dwell_s=86400 * 60),
+            card("settled", honored=True, holder_role="nobody",
+                 dwell_s=86400 * 2)], active=["new"])
+        self.assertEqual(self.listed(got), ["new"])
+        line = self.lines(got)["superseded"]
+        self.assertEqual(line["count"], 2)
+        self.assertEqual(line["oldest_age_s"], 86400 * 60 + 10)
+        self.assertEqual(line["command"], "helm lr list --all")
+
+    def test_the_frontier_line_wins_over_superseded_for_one_row(self):
+        """ONE LINE PER ROW. A predecessor whose lane is gone and whose work
+        landed is named by the frontier line, because that is the line whose
+        command acts on it."""
+        got = self.project([
+            card("new", frontier="on-frontier", frontier_rung="lane-family"),
+            card("old", frontier="landed-by-ancestry", frontier_rung="landing")],
+            active=["new"])
+        self.assertEqual({k: v["count"] for k, v in self.lines(got).items()},
+                         {"off_frontier": 1})
+        self.assertEqual([c["class"] for c in got["collapsed"]],
+                         ["off_frontier"])
+
+    def test_suc_owner_holds_and_edges_bill_only_listed_rows(self):
+        got = self.project(
+            [card("live", stalled=True, frontier="on-frontier",
+                  frontier_rung="lane-family"),
+             card("gone", stalled=True, holder_role="owner",
+                  owner_gated=True, hold_ts="2033-05-18T03:32:50Z",
+                  frontier="landed-by-ancestry", frontier_rung="landing")],
+            stalled_ids=["live", "gone"])
+        self.assertEqual(got["suc"]["stalled"], 1)
+        self.assertEqual(got["owner_hold_count"], 0)
+        waits = sorted(e["from"] for e in got["edges"]
+                       if e["kind"] == "waits_on")
+        self.assertEqual(waits, ["live"])
+        self.assertEqual(got["active_count"], 2)
+
+    def test_the_vocabulary_is_the_census_own(self):
+        """A reason added to the census with no home here would read as
+        on-frontier and stay listed; one renamed would stop collapsing. Both
+        directions are pinned against the census constants themselves."""
+        from helm import landreq
+        for reason in landreq.OFF_FRONTIER_REASONS:
+            self.assertEqual(scheduler.collapse_class(
+                {"frontier": reason, "frontier_rung": "landing"}),
+                "off_frontier", reason)
+        for rung in landreq.FRONTIER_GONE_RUNGS:
+            self.assertEqual(scheduler.collapse_class(
+                {"frontier": landreq.OFF_FRONTIER_UNCLASSIFIED,
+                 "frontier_rung": rung}), "unclassified", rung)
+        self.assertIsNone(scheduler.collapse_class(
+            {"frontier": landreq.OFF_FRONTIER_UNCLASSIFIED,
+             "frontier_rung": "tip"}))
+        self.assertIsNone(scheduler.collapse_class(
+            {"frontier": landreq.ON_FRONTIER}))
+        self.assertEqual(scheduler.collapse_class(
+            {"frontier": landreq.ON_FRONTIER}, active=False), "superseded")
+
+    def test_an_unavailable_model_claims_no_collapse(self):
+        got = scheduler.project([card("a")], active_ids=None, now=NOW,
+                                projection_age_s=0)
+        self.assertIsNotNone(got["unavailable"])
+        self.assertEqual(got["collapsed"], [])
+        self.assertIsNone(got["collapsed_count"])
+        self.assertIsNone(got["listed_count"])
+
+    # -- task/2381 round 2: one rule on both surfaces -------------------------
+
+    def test_on_main_with_no_verdict_is_one_line_never_a_listed_wait(self):
+        """FINDING 3, RULED. The kanban folded a row whose work trunk holds
+        with no verdict recorded; the waits never read the mark, so 8 of the
+        integrator's 16 listed waits were the same rows the kanban counted on
+        main. They are one line here too: count, oldest age, and the listing
+        that marks each ALREADY ON TRUNK. THE CONTROLS in this projection: a
+        PROVEN not-on-trunk row and an unasked one stay listed."""
+        got = self.project([
+            card("held-clean", state="AWAITING_REVIEW", owed_by="integrator",
+                 trunk_contains_tip=True, frontier="unclassified",
+                 frontier_rung="tip", dwell_s=86400 * 2),
+            card("build-landed", state="AWAITING_BUILD", kind="build",
+                 holder_role="builder", trunk_contains_tip=True,
+                 frontier="on-frontier", frontier_rung="lane-family",
+                 dwell_s=3600),
+            card("loose", state="AWAITING_REVIEW", trunk_contains_tip=False,
+                 frontier="on-frontier", frontier_rung="lane-family"),
+            card("unasked", state="AWAITING_REVIEW", trunk_contains_tip=None)])
+        self.assertEqual(self.listed(got), ["loose", "unasked"])
+        line = self.lines(got)["on_main"]
+        self.assertEqual(line["count"], 2)
+        self.assertEqual(line["oldest_age_s"], 86400 * 2 + 10)
+        self.assertEqual(line["command"], "helm lr list")
+        self.assertEqual(line["label"], "on main with no verdict recorded")
+        self.assertEqual(got["listed_count"] + got["collapsed_count"],
+                         got["row_count"])
+
+    def test_a_row_on_main_under_a_recorded_verdict_stays_listed(self):
+        """MEASURED on the live trunk board: a verdicted row whose own git leg
+        came back unobserved is measured for containment too, and seven such
+        rows — APPROVE, CONCUR and two FIX owed by their author — carried the
+        mark. A FIX whose tip is on main is a contradiction somebody owes; it
+        is never "no verdict recorded". THE CONTROL: the unverdicted row on
+        the same mark folds in this same projection."""
+        got = self.project([
+            card("fix", state="CHANGES_REQUESTED", polarity="fix",
+                 holder_role="author", holder_seat="s",
+                 trunk_contains_tip=True),
+            card("approve", state="REVIEWED", polarity="approve",
+                 holder_role="unknown (declared verdict held)",
+                 trunk_contains_tip=True),
+            card("none", state="AWAITING_REVIEW", trunk_contains_tip=True)])
+        self.assertEqual(self.listed(got), ["approve", "fix"])
+        self.assertEqual({k: v["count"] for k, v in self.lines(got).items()},
+                         {"on_main": 1})
+
+    def test_an_owner_gated_row_on_main_stays_on_the_owners_queue(self):
+        """An owner-gated hold is a decision only the owner can make, and the
+        landing does not make it: folding it would take an ask off the one
+        queue whose whole job is to show him what he owes (`owner_holds`
+        counts listed rows). THE CONTROL: an ungated row on the same mark
+        folds."""
+        got = self.project([
+            card("gated", state="AWAITING_REVIEW", holder_role="owner",
+                 owner_gated=True, hold_ts="2033-05-18T03:30:00Z",
+                 trunk_contains_tip=True),
+            card("plain", state="AWAITING_REVIEW", trunk_contains_tip=True)])
+        self.assertEqual(self.listed(got), ["gated"])
+        self.assertEqual(got["owner_hold_count"], 1)
+        self.assertEqual(self.lines(got)["on_main"]["count"], 1)
+
+    def test_one_line_per_row_with_on_main_between_frontier_and_superseded(self):
+        """A row the census placed off the frontier is named by the frontier
+        line, whose command acts on it; a round a later round absorbed is
+        named by the superseded line, because `helm lr list` — the on-main
+        line's command — prints the chain frontier only."""
+        got = self.project([
+            card("live", trunk_contains_tip=False),
+            card("left", trunk_contains_tip=True,
+                 frontier="landed-by-ancestry", frontier_rung="landing"),
+            card("absorbed", trunk_contains_tip=True),
+            card("on-main", trunk_contains_tip=True)],
+            active=["live", "left", "on-main"])
+        self.assertEqual(self.listed(got), ["live"])
+        self.assertEqual([(c["class"], c["count"]) for c in got["collapsed"]],
+                         [("off_frontier", 1), ("on_main", 1),
+                          ("superseded", 1)])
+
+    def test_the_on_main_line_speaks_the_kanbans_words(self):  # noqa: VACUOUS_ASSERTION — every pre-verdict state is asserted True by identity on the same predicate before the non-True marks are asserted False
+        """ONE LINE, ONE WORDING: the kanban's on-main line is this model's
+        own line (`web_board._kanban_split` reads it), so the label and the
+        command are pinned once, here."""
+        from helm import landreq
+        classes = [klass for klass, _label, _cmd in scheduler.COLLAPSE_LINES]
+        self.assertEqual(classes, ["off_frontier", "unclassified", "on_main",
+                                   "superseded"])
+        self.assertEqual(scheduler.collapse_class(
+            {"state": "AWAITING_REVIEW", "trunk_contains_tip": True}),
+            "on_main")
+        for state in landreq.PRE_VERDICT_STATES:
+            self.assertIs(landreq.on_main_unverdicted(
+                {"state": state, "trunk_contains_tip": True}), True, state)
+        for mark in (False, None, "yes", 1):
+            self.assertIs(landreq.on_main_unverdicted(
+                {"state": "AWAITING_REVIEW", "trunk_contains_tip": mark}),
+                False, mark)
 
 
 class OwnerAskReadTest(unittest.TestCase):

@@ -96,15 +96,23 @@ class ComposeTest(_landreq.LandReqBase):
         return run(["compose", *args])
 
     def ready_rows(self, *rows):
-        """The real projection with the named rows FORCED to READY. Pins
+        """The real projection with the named rows FORCED to LIVE READY. Pins
         the verb's OWN rungs deterministically: the projection's landed
         observation is order-flaky in a shared test process (measured —
         batch-blind, isolation-sighted), and its derivation
-        is its own module's test subject, not this class's."""
+        is its own module's test subject, not this class's.
+
+        LIVE, SO `terminal` IS FORCED WITH THE WORD. The projection derives it
+        from the state for a row nothing retired (LANDED is terminal), so a
+        row it had observed as LANDED and this helper forced to READY read
+        READY, terminal and retired by nothing, a row the projection never
+        mints. Compose admits only `landreq.live_ready` rows, and these arms
+        are about the screens behind that admission: a LIVE row whose work
+        reached trunk before the projection observed it."""
         lrs, unavailable = landreq.project()
         self.assertIsNone(unavailable)
         for r in rows:
-            lrs[r["id"]]["state"] = "READY"
+            lrs[r["id"]].update(state="READY", terminal=False)
         return mock.patch.object(landreq, "project",
                                  lambda now=None: (lrs, None))
 
@@ -415,6 +423,58 @@ class ComposeTest(_landreq.LandReqBase):
         self.assertNotIn("tier=", x["reason"])
         self.assertEqual(x["tier"], "none")
         self.assertIsNone(x["ungated"])
+
+    def test_a_closed_row_the_projection_still_calls_READY_is_refused_by_name(self):  # noqa: VACUOUS_ASSERTION — the refusal is asserted positively (rc 1, the EXCLUDED line naming the row and its closure, the JSON record); the absent room follows it, and the live-row control composes on the SAME projection
+        """THE GUARD `helm train` PUTS ON ITS CARS, on this verb's admission.
+        The projection keeps the stored state READY on a row closed as landed
+        and marks it terminal, and `_resolve_row` hands a retired row back to
+        compose by design. Passed by id, such a row reached the cherry-pick
+        with only the patch-id ALREADY-ON screen behind it, and a row that
+        landed under a rewritten patch (this one's tip is not on trunk at all)
+        was composed back in."""
+        one, two = self.approved_pair()
+        lrs, unavailable = landreq.project()
+        self.assertIsNone(unavailable)
+        # THE SHAPE THE LIVE LEDGER CARRIES: stored READY, closed as landed.
+        # The projection mints both fields on every row; the state is forced
+        # the way `ready_rows` forces it, for the same measured flake.
+        for row in (one, two):
+            self.assertIn("terminal", lrs[row["id"]])
+            self.assertIn("close_reason", lrs[row["id"]])
+            lrs[row["id"]]["state"] = "READY"
+        lrs[two["id"]] = dict(lrs[two["id"]], terminal=True,
+                              close_reason="landed")
+        # PRECONDITION: its reviewed tip is NOT on trunk, so no ancestry or
+        # patch-id screen stands between it and the cherry-pick.
+        self.assertEqual(subprocess.run(
+            ["git", "-C", self.repo, "merge-base", "--is-ancestor",
+             lrs[two["id"]]["reviewed_tip"], self.main]).returncode, 1)
+        with mock.patch.object(landreq, "project",
+                               lambda now=None: (lrs, None)):
+            rc, _out, err = self.compose(two["id"][:12])
+            rc_json, out, _err = self.compose(two["id"][:12], "--json")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("EXCLUDED %s (two): is CLOSED by close --reason "
+                      "landed, though its stored state reads READY"
+                      % two["id"][:12], err)
+        self.assertIn("compose takes only a LIVE READY row", err)
+        self.assertEqual(rc_json, 1)
+        got = json.loads(out)
+        self.assertIsNone(got["composed_tip"])
+        self.assertEqual([(x["id"], x["closed_by"]) for x in got["excluded"]],
+                         [(two["id"], "close --reason landed")])
+        # NOTHING COMPOSED: no room was minted for it.
+        self.assertFalse(os.path.exists(self.room_of(two)))
+        self.assertNotIn("compose", self.git("worktree", "list"))
+        # CONTROL, on the same projection: the live READY row composes.
+        with mock.patch.object(landreq, "project",
+                               lambda now=None: (lrs, None)):
+            rc, out, err = self.compose(one["id"][:12], "--json")
+        self.assertEqual(rc, 0, err)
+        got = json.loads(out)
+        self.assertNotEqual(got["composed_tip"],
+                            self.git("rev-parse", self.main))
+        self.assertEqual([m["carries"] for m in got["members"]], [True])
 
     def test_context_drift_carries_when_the_changed_lines_are_identical(self):
         # THE BATCH-2 MOVED-TARGET EVICTION, as a fixture: a CLEAN cherry-pick
@@ -1227,7 +1287,7 @@ class ComposeTest(_landreq.LandReqBase):
         docs = os.path.join(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))), "docs", "VERBS.md")
         with open(docs, encoding="utf-8") as f:
-            self.assertIn("`compose` stands N READY lanes", f.read())
+            self.assertIn("`compose` stands N LIVE READY lanes", f.read())
         # cleanup: the standing room from this compose is test exhaust
         room = self.room_of(row)
         if os.path.exists(room):

@@ -362,14 +362,14 @@ def _stamp_stop_allowed(payload):
     except Exception:                             # noqa: BLE001
         return
 
-def run_one(spec, payload, argv=None, outcome=None):
+def run_one(spec, payload, argv=None, outcome=None, left=None):
     from . import hooklatency
     phase = {"record": "record", "deliver": "delivery", "whisper-prepare": "prepare"}.get(spec.get("name"))
     with hooklatency.dispatch_scope(), hooklatency.stage(phase):
-        return _run_one(spec, payload, argv=argv, outcome=outcome)
+        return _run_one(spec, payload, argv=argv, outcome=outcome, left=left)
 
 
-def _run_one(spec, payload, argv=None, outcome=None):
+def _run_one(spec, payload, argv=None, outcome=None, left=None):
     """Run ONE handler in-process on `payload`. Returns its rc, or 0 fail-open.
 
     `outcome`, when given, is a dict this stamps with ``status``, one of
@@ -390,6 +390,12 @@ def _run_one(spec, payload, argv=None, outcome=None):
     back even when the handler raises, times out, or calls os.chdir. A handler
     that leaks one of those into its sibling is the in-process hazard that does
     not exist when each runs in its own process.
+
+    `left` is what remains of this handler's share of the hook's budget
+    measured from the WRAPPER'S start (`run_event` computes it from
+    HELM_HOOK_T0). The alarm is the smaller of it and the handler's own
+    budget, so interpreter startup is charged to the handler instead of being
+    discovered by the outer `timeout`. None keeps the handler's own budget.
     """
     import shlex
     from . import cli, hookoutcome, hooklatency
@@ -423,7 +429,8 @@ def _run_one(spec, payload, argv=None, outcome=None):
         sys.argv = ["helm"] + args
         if budget > 0 and hasattr(signal, "SIGALRM"):
             prev_handler = signal.signal(signal.SIGALRM, _alarm)
-            signal.setitimer(signal.ITIMER_REAL, budget)
+            alarm = budget if left is None else max(0.001, min(budget, left))
+            signal.setitimer(signal.ITIMER_REAL, alarm)
             armed = True
         rc = cli.main(args)
         if outcome is not None:
@@ -617,9 +624,23 @@ def run_event(event, payload=None, tool_name=None, specs=None):
         # ignores this reports "every handler answered" about a set that was
         # silently shortened.
         registry_complete = not _AUTH_MISSING
+        # THE HOOK'S CLOCK STARTED IN THE WRAPPER. The outer timeout is the
+        # sum of these handlers' budgets, armed before this interpreter began,
+        # so each handler's alarm is its share of that sum measured from the
+        # wrapper's start: startup is charged to the first handler, and a
+        # handler that finishes early gives no later one more than its own.
+        from . import procage
+        import time as _time
+        before = procage.hook_elapsed()
+        began = _time.monotonic()
+        shares = 0.0
         for spec in dispatch:
             outcome = {}
-            rc = run_one(spec, payload, outcome=outcome)
+            shares += float(spec.get("timeout") or 0)
+            left = None if before is None else \
+                shares - before - (_time.monotonic() - began)
+            rc = run_one(spec, payload, outcome=outcome,
+                         **({} if left is None else {"left": left}))
             worst = _stronger(worst, rc, spec)
             # `_stronger` stays the ONE judge of what escapes: asked from a
             # clean slate, it answers whether THIS handler's rc is a refusal.

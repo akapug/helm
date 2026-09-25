@@ -55,17 +55,27 @@ with open(os.path.join(_HOMEDIR, "settings.json"), "w") as f:
 from helm import configs, skills, web  # noqa: E402
 from helm.configs._resolve import _CONFIG_SUBDIR  # noqa: E402
 
-_CWD_ROOTS_PRIOR = list(configs.CWD_ROOTS)
-_HOME_ROOTS_PRIOR = list(configs.HOME_ROOTS)
+_CWD_ROOTS_PRIOR = []
+_HOME_ROOTS_PRIOR = []
 
-# unittest discovery can import helm.configs while walking the helm package,
-# before it imports this test module. Mutate the shared frozen list in place so
-# every configs submodule sees the planted root under either test runner.
-configs.CWD_ROOTS[:] = [_ROOT]
 
-# the synthetic cred home must be on the resolve allowlist (resolve refuses
-# homes outside HOME_ROOTS — the audit's arbitrary-directory read gate)
-configs.HOME_ROOTS.append(_HOMEDIR)
+def setUpModule():
+    """PLANTED WHEN THIS MODULE RUNS, NOT WHEN IT IS IMPORTED (task/3039).
+    tearDownModule takes the plant back, so an import-time plant was seen by
+    every module that ran before this one and by none after it -- and a
+    slice worker that never runs this module kept it for the rest of its
+    run. The slice runner's data audit named it."""
+    _CWD_ROOTS_PRIOR[:] = configs.CWD_ROOTS
+    _HOME_ROOTS_PRIOR[:] = configs.HOME_ROOTS
+    # unittest discovery can import helm.configs while walking the helm
+    # package, before it imports this test module. Mutate the shared frozen
+    # list in place so every configs submodule sees the planted root under
+    # either test runner.
+    configs.CWD_ROOTS[:] = [_ROOT]
+    # the synthetic cred home must be on the resolve allowlist (resolve
+    # refuses homes outside HOME_ROOTS — the audit's arbitrary-directory read
+    # gate)
+    configs.HOME_ROOTS.append(_HOMEDIR)
 
 
 def _mk_skill(name, content="skill body"):

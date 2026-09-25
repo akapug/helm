@@ -157,6 +157,11 @@ class SeatsBase(unittest.TestCase):
         proc = os.path.join(self.tmp, "proc")
         os.makedirs(proc)
         os.environ["HELM_PROC"] = proc
+        # THE STOP GUARD READS A RESIDENT'S FACTS, and a test process has no
+        # resident: this stands one in that is exactly up to date at every
+        # stop (tests/_stopfacts.py). Freshness is tests/test_stopfacts.py's.
+        from tests._stopfacts import always_fresh
+        self.fresh_resident = always_fresh(self)
 
     def tearDown(self):
         os.chdir(self.cwd_prior)
@@ -10279,6 +10284,18 @@ class CanonicalKeyResolverTest(SeatsBase):
         it was measured open by an adversary: inherited name plus a FRESH sid
         produced no dispute and every rung opened. A case-variant name is the
         same hole one axis over."""
+        from helm import session as helm_session
+        # LIVE MEANS A PROCESS HOLDS IT: the claim-jump asks the claude census,
+        # so the arm plants the holder instead of reading the host's table.
+        held = mock.patch.object(helm_session, "_proc_claude_census",
+                                 return_value={
+                                     "rows": [{"pid": 4242,
+                                               "session": self.LIVE}],
+                                     "listing_failed": False,
+                                     "who_failed": False,
+                                     "census_partial": False})
+        held.start()
+        self.addCleanup(held.stop)
         seats.write_roster("kimi", session=self.LIVE, cwd=self.tmp)
         mine = "M" * 32                      # a fresh sid, rostered nowhere
         self.addCleanup(os.environ.pop, "HELM_CHAT_NAME", None)
@@ -10883,10 +10900,13 @@ class AChangedDispatchRowUnlatchesItsAdvice(SeatsBase):
                 "exp_mono": seats._now_mono() + 3600}}))
 
     def _stop(self, snapshot):
+        """One stop whose resident folded `snapshot`: the stand-in resident
+        computes the stop facts from it, and the rung reads those (its own
+        one reading, the default)."""
         warns, blocks = [], []
-        seats_stop_claims.claims_rung(
-            self.SESSION, "a-room", self.SEAT, blocks=blocks, warns=warns,
-            dispatch_snapshot=lambda: snapshot)
+        with mock.patch.object(dispatches, "snapshot", return_value=snapshot):
+            seats_stop_claims.claims_rung(
+                self.SESSION, "a-room", self.SEAT, blocks=blocks, warns=warns)
         return "\n".join(blocks + warns)
 
     def _row(self, **over):

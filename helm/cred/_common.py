@@ -85,6 +85,14 @@ def backup_root():
 # ---------------------------------------------------------------- identity ---
 _CACHE = {}   # realpath -> (stat_key, account_dict)
 
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_CACHE": (
+        "an account per realpath, checked against its stat key on every "
+        "read"),
+}
+
 
 def cache_clear():
     """Drop the identity cache (after a write that changed a home's account)."""

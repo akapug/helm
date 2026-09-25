@@ -153,12 +153,19 @@ def _tip_exists(backend, repo, tip):
     return Rung("tip-exists", PASS, "%s is a commit" % tip[:12])
 
 
-def _tree_matches_gate(backend, repo, tip, gate_ref):
+def _tree_matches_gate(backend, repo, tip, gate_ref, land=True):
     """THE RUNG THAT MUST NOT BE FED ITS OWN ANSWER — see the module docstring.
 
     `gate_ref` is a RECEIPT HANDLE (`gate:<16-hex>`), and the tree it binds is
     read out of the receipt store. Anything else is UNKNOWN: a caller-supplied
     tree can only ever prove that two strings agree, which is not the question.
+
+    `land` says what the answer authorizes. The fold (`check`) spends it on a
+    LAND, so the receipt's kind must be serial (gate.land_refusal) and an
+    authenticated door must have placed it in `repo`
+    (gate.land_provenance_refusal, task/3066); the approval replay
+    (`gate_authority`) spends it on a lane's APPROVE, which a sliced or a
+    generic-imported receipt may carry.
     """
     if not gate_ref:
         return Rung("tree-vs-gate", UNKNOWN,
@@ -202,6 +209,9 @@ def _tree_matches_gate(backend, repo, tip, gate_ref):
                     "receipt %s is not a whole-suite run — it proves the "
                     "tests it selected, never the suite a fold vouches for; "
                     "run `helm gate run` on this tree" % token)
+    refusal = gate.land_refusal(row) if land else None
+    if refusal:
+        return Rung("tree-vs-gate", REFUSE, refusal)
     if row.get("dirty"):
         return Rung("tree-vs-gate", REFUSE,
                     "receipt %s was minted on a DIRTY tree (%s), so the tree "
@@ -222,6 +232,24 @@ def _tree_matches_gate(backend, repo, tip, gate_ref):
                     "tree %s != receipt %s tree %s — the gate vouches for a "
                     "different tree than the one you are about to push"
                     % (out[:12], token, receipt_tree[:12]))
+    if land:
+        # THE LAND'S LAST QUESTION (task/3066): which authenticated door put
+        # this receipt in the repository being folded. Every clause above is
+        # about the receipt's CONTENT, and a generic import's content is its
+        # submitter's own word; UNKNOWN (a ledger it cannot read) is not a no.
+        answer = gate.land_provenance(row, repo)
+        refusal = gate.land_provenance_refusal(row, repo, answer=answer)
+        if refusal:
+            return Rung("tree-vs-gate",
+                        UNKNOWN if answer[0] is None else REFUSE, refusal)
+        if answer[1]:
+            # The door that placed it, or `unauthenticated-no-door`. EMPTY
+            # when the rule in force at the receipt's placement asked no
+            # provenance question, so a fold that already happened reads
+            # exactly as it did (forward-only, task/3066).
+            return Rung("tree-vs-gate", PASS,
+                        "tree %s is the tree receipt %s passed on (%s)"
+                        % (out[:12], token, answer[1]))
     return Rung("tree-vs-gate", PASS,
                 "tree %s is the tree receipt %s passed on"
                 % (out[:12], token))
@@ -882,7 +910,8 @@ def gate_authority(repo, tip, gate_ref):
     semantics. Both enter the same tree-vs-receipt rung; this wrapper only owns
     backend selection so callers do not reach through the VCS seam themselves.
     """
-    return _tree_matches_gate(vcs.backend(repo), repo, tip, gate_ref)
+    return _tree_matches_gate(vcs.backend(repo), repo, tip, gate_ref,
+                              land=False)
 
 
 def check(repo, tip, gate_ref=None, remote="origin", branch="main", fetch=True):
@@ -936,7 +965,7 @@ def check(repo, tip, gate_ref=None, remote="origin", branch="main", fetch=True):
 
     return [
         _tip_exists(backend, repo, tip),
-        _tree_matches_gate(backend, repo, tip, gate_ref),
+        _tree_matches_gate(backend, repo, tip, gate_ref, land=True),
         _ff_able(backend, repo, tip, trunk_ref, snapshot, landed),
         _clean(backend, repo, tip),
         _origin_has_it(backend, repo, tip, remote, branch, snapshot, landed),

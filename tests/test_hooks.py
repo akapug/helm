@@ -4848,6 +4848,72 @@ class UnsignedPanesTest(HooksBase):
         self.assertEqual(sorted(rows), ["seat-e"])
         self.assertIn("identity_unreadable", rows["seat-e"])
 
+    OWNER_SID = "sid-seat-a-0000-0001"
+
+    def _owner_export(self):
+        """seat-a is a fleet actor whose session is OWNER_SID, and
+        `owner-profile` is an owner name (pinned, never the runner's)."""
+        rows = dict(self.ACTORS)
+        rows["seat-a"] = {"home_room": "helm", "session": self.OWNER_SID,
+                          "sessions": [self.OWNER_SID]}
+        return rows
+
+    def test_an_OWNER_EXPORT_pane_bound_to_its_row_is_INFO_not_a_refusal(self):
+        """task/3049: the gate sets the owner's inherited profile aside for a
+        seat whose session is bound to its row, so the pane SIGNS — as itself.
+        Reporting it under "posting UNSIGNED — relaunch" would spend its
+        context on nothing. RED before: flagged identity_conflict."""
+        bin_env = self._signer_env()
+        proc = self.mk_proc(31, [b"claude"],
+                            [b"HELM_CHAT_NAME=seat-a", bin_env,
+                             b"HELM_CELL_PROFILE=owner-profile",
+                             ("CLAUDE_CODE_SESSION_ID=%s"
+                              % self.OWNER_SID).encode()])
+        # control on the same scan: an owner-export actor pane whose session
+        # is NOT bound to its row keeps the refusal line
+        self.mk_proc(32, [b"claude"],
+                     [b"HELM_CHAT_NAME=seat-c", bin_env,
+                      b"HELM_CELL_PROFILE=owner-profile",
+                      b"CLAUDE_CODE_SESSION_ID=sid-elsewhere"])
+        with mock.patch.dict(os.environ,
+                             {"HELM_CHAT_OWNER_NAMES": "owner-profile"}), \
+                mock.patch("helm.seats.roster_checked",
+                           return_value=(self._owner_export(), False)), \
+                mock.patch("helm.sessions.live_sids", return_value={}):
+            rows = {p["seat"]: p for p in hooks.unsigned_panes(proc)}
+        self.assertTrue(rows["seat-a"].get("sign_info"))
+        self.assertIn("signs as its own seat 'seat-a'",
+                      rows["seat-a"]["sign_reason"])
+        self.assertFalse(rows["seat-c"].get("sign_info"))
+        self.assertIn("identity_conflict", rows["seat-c"]["sign_reason"])
+        self.assertIn("session is not", rows["seat-c"]["sign_reason"])
+
+    def test_a_CLAUDE_pane_is_bound_through_its_pid_keyed_session_record(self):
+        """A claude pane's own environ carries NO session id (Claude Code sets
+        it only for its children — measured on every live pane), so the scan
+        reads the pid-keyed session record `sessions.live_sids` keeps."""
+        bin_env = self._signer_env()
+        proc = self.mk_proc(33, [b"claude"],
+                            [b"HELM_CHAT_NAME=seat-a", bin_env,
+                             b"HELM_CELL_PROFILE=owner-profile"])
+        with mock.patch.dict(os.environ,
+                             {"HELM_CHAT_OWNER_NAMES": "owner-profile"}), \
+                mock.patch("helm.seats.roster_checked",
+                           return_value=(self._owner_export(), False)), \
+                mock.patch("helm.sessions.live_sids",
+                           return_value={self.OWNER_SID: 33}):
+            rows = hooks.unsigned_panes(proc)
+            out = io.StringIO()
+            with mock.patch.object(hooks, "running_panes",
+                                   return_value=hooks.running_panes(proc)), \
+                    mock.patch.object(hooks, "uncovered_panes",
+                                      return_value=[]):
+                hooks.surface_uncovered(out=out)
+        self.assertEqual([(p["pid"], bool(p.get("sign_info"))) for p in rows],
+                         [(33, True)])
+        self.assertIn("SIGN AS THEIR OWN SEAT", out.getvalue())
+        self.assertNotIn("posting UNSIGNED", out.getvalue())
+
     def test_unnamed_pane_not_judged_and_surface_prints(self):
         proc = self.mk_proc(15, [b"claude"], [b"TERM=xterm"])
         self.assertEqual(hooks.unsigned_panes(proc), [])

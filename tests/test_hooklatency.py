@@ -38,7 +38,12 @@ class HookLatencyTest(unittest.TestCase):
     def pair(self, milliseconds=1, outcome="completed"):
         rows = []
         ticks = iter([1_000_000, 1_000_000 + int(milliseconds * 1_000_000)])
+        # THE FIXTURE CAPTURES ROWS INSTEAD OF WRITING THEM, so it holds BOTH
+        # writers: an incident outcome is also copied to the incidents stream
+        # (`_retain`), and a copy on disk of rows an arm then edits would be a
+        # second, contradicting witness the arm never asked for.
         with patch.object(latency, "append", lambda row: rows.append(dict(row)) or True), \
+             patch.object(latency, "_retain", lambda start, end: None, create=True), \
              patch.object(latency.time, "monotonic_ns", lambda: next(ticks)):
             with latency.event_scope("standalone"):
                 latency.bind("fake-session")
@@ -409,7 +414,11 @@ class HookLatencyTest(unittest.TestCase):
         self.assertIn("2 timeouts in 1 event  " + where, out.getvalue())
         # THE CONTROL, unconditional: ONE handler's timeout, echoed by its
         # event span, is one timeout -- the echo the event key existed for.
+        # A CLEAN WORLD IS BOTH STREAMS: a timeout is also kept in the
+        # incidents stream precisely so that removing the main one does not
+        # forget it (task/3040).
         os.unlink(latency.path())
+        os.unlink(latency.incidents_path())
         with latency.event_scope("composite"):
             with latency.stage("record"):
                 latency.mark("timeout")
@@ -1187,3 +1196,113 @@ class HookLatencyTest(unittest.TestCase):
         self.assertTrue(all(g["outcome"] == "skipped" and g["mode"] == "standalone"
                             and g["matched"] == 1 and g["completed"] == 0
                             for g in result["populations"]))
+
+    # ---- task/3040: every hook event, and incidents that outlive rotation ----
+
+    def test_every_installed_hook_entry_is_a_measured_event(self):  # noqa: VACUOUS_ASSERTION — the loop's positives run once per installed spec, and the unconditional must-hit above it refuses an empty SPECS
+        """THE CLOSED SET, BOTH DIRECTIONS. Every hook helm installs files its
+        spans under its own event and a stage the reader accepts, and no
+        measured entry names a hook helm does not install."""
+        installed = [s for s in hooks.SPECS if not s.get("external")]
+        self.assertGreater(len(installed), 5, "MUST-HIT: no specs were read")
+        for spec in installed:
+            with self.subTest(spec=spec["name"]):
+                selected = cli._hook_selector(spec["args"].split())
+                self.assertIsNotNone(selected, "installed and never measured")
+                _mode, event, stage = selected
+                self.assertIn(event, latency.EVENTS)
+                self.assertIn(stage, latency.STAGES)
+                self.assertTrue(event == spec["event"]
+                                or spec["event"] in latency.PROVISIONAL.get(event, ()),
+                                "%s filed under %s" % (spec["event"], event))
+        self.assertEqual(set(cli._HOOK_SPANS)
+                         - {tuple(s["args"].split()) for s in installed}, set(),
+                         "a measured entry that no installed hook runs")
+        self.assertLessEqual({s["event"] for s in hooks.SPECS}, latency.EVENTS)
+        for label, events in latency.PROVISIONAL.items():
+            self.assertIn(label, latency.EVENTS)
+            self.assertLessEqual(set(events), latency.EVENTS)
+
+    def test_each_installed_entry_files_a_span_under_its_own_event(self):  # noqa: VACUOUS_ASSERTION — every iteration asserts a completed count of 1 on two populations, and the unconditional must-hit before the loop refuses an empty table
+        """The Stop, PreToolUse, SessionStart, SubagentStart/Stop, PreCompact
+        and UserPromptSubmit entries write rows a report can read; before
+        task/3040 only PostToolUse's did, so none of them had a p95."""
+        self.assertGreater(len(cli._HOOK_SPANS), 5, "MUST-HIT: an empty table")
+        for argv, (event, stage) in sorted(cli._HOOK_SPANS.items()):
+            with self.subTest(argv=" ".join(argv)):
+                root = self.root / ("entry-" + stage)
+                root.mkdir()
+                with patch.object(latency, "path", lambda r=root: str(r / "ledger")), \
+                     patch.object(cli, "VERBS", {argv[0]: lambda args: 0}), \
+                     patch.object(hooks, "hook_skips_here", return_value=False):
+                    self.assertEqual(0, cli.main(list(argv)))
+                    got = latency.report()
+                self.assertEqual(0, got["counts"]["invalid"])
+                pops = {(g["stage"], g["event"], g["mode"]): g
+                        for g in got["populations"]}
+                for key in (("event", event, "standalone"),
+                            (stage, event, "standalone")):
+                    self.assertIn(key, pops)
+                    self.assertEqual(1, pops[key]["completed"])
+
+    def _timeout_event(self, event="Stop"):
+        with latency.event_scope("standalone", event), latency.stage("stop-guard"):
+            latency.mark("timeout")
+
+    def test_a_timed_out_span_outlives_the_stream_that_rotated_it_away(self):
+        """THE QUESTION 0.15 h OF STREAM COULD NOT ANSWER: how many hooks
+        timed out today. A timeout span is kept, START and END, in a second
+        stream, and the report still counts it after the main stream lost it."""
+        self._timeout_event()
+        self.assertEqual(2, latency.report()["counts"]["timeout"])
+        for n in range(latency.GENERATIONS):
+            name = latency.path() + ("." + str(n) if n else "")
+            if os.path.exists(name):
+                os.unlink(name)                  # rotation took every row
+        got = latency.report()
+        self.assertEqual(2, got["counts"]["timeout"])
+        self.assertEqual(2, got["counts"]["matched"])
+        self.assertEqual(0, got["counts"]["invalid"])
+        self.assertIsNotNone(got["coverage"]["incidents"]["retained_time_range_hours"])
+
+    def test_a_row_both_streams_hold_is_read_once_and_completions_are_not_kept(self):
+        self._timeout_event()
+        got = latency.report()
+        self.assertEqual((2, 0, 2), (got["counts"]["timeout"],
+                                     got["counts"]["duplicates"],
+                                     got["counts"]["matched"]))
+        kept = Path(latency.incidents_path())
+        size = kept.stat().st_size
+        self.assertGreater(size, 0, "control: the timeout WAS kept")
+        with latency.event_scope("standalone", "Stop"), latency.stage("stop-guard"):
+            pass
+        self.assertEqual(size, kept.stat().st_size,
+                         "a completed span was copied to the incidents stream")
+        self.assertEqual(4, latency.report()["counts"]["matched"])   # control
+
+    def test_the_incident_stream_is_bounded_by_bytes_and_generations(self):
+        with patch.object(latency, "RETAIN_BYTES", 4096):
+            for _ in range(12):
+                self._timeout_event()
+        names = [latency.incidents_path() + ("." + str(n) if n else "")
+                 for n in range(latency.RETAIN_GENERATIONS + 1)]
+        present = [n for n in names if os.path.exists(n)]
+        self.assertEqual(present, names[:latency.RETAIN_GENERATIONS],
+                         "rotation kept the wrong number of generations")
+        self.assertTrue(all(os.path.getsize(n) <= 4096 for n in present))
+
+    def test_an_incident_from_23_hours_ago_is_inside_a_24_hour_window(self):
+        import datetime
+        now = time.time_ns()
+        with patch.object(latency.time, "time_ns", lambda: now - 23 * 3600 * 10**9):
+            self._timeout_event()
+        for n in range(latency.GENERATIONS):
+            name = latency.path() + ("." + str(n) if n else "")
+            if os.path.exists(name):
+                os.unlink(name)
+        since = (datetime.datetime.fromtimestamp(now / 1e9, datetime.timezone.utc)
+                 - datetime.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(2, latency.report(since=since)["counts"]["timeout"])
+        later = (datetime.datetime.fromtimestamp(now / 1e9, datetime.timezone.utc)
+                 - datetime.timedelta(hours=22)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(0, latency.report(since=later)["counts"]["timeout"])  # control

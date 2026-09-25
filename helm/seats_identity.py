@@ -237,16 +237,16 @@ def identity_disagreement(session=None):
     commented. If that field ever stops being the one `bound` consults, this
     reasoning dies with it — the arms below are the tripwire.
 
-    Claim-jump is deliberately narrow: it fires only when the claimed row
-    carries a live session. A row with no session (a spawn
-    mirror, a seat between panes) is a name waiting to be claimed, not a
-    seat being impersonated — refusing there would break every legitimate
-    first join and is the reason this is not simply "name is taken".
+    Claim-jump is deliberately narrow: it fires only while the claimed row's
+    session is HELD — `session.held_or_unproven`, which fails closed. A row
+    with no session, or whose session no live process holds (a spawn mirror,
+    a relaunch onto a fresh session), is a seat between panes: a name waiting
+    to be claimed, and refusing there locks a live pane out of its own seat.
     """
-    # DEFERRED, to close the identity<->roster cycle at its thinnest
-    # leg. See this module's docstring: the cycle is real and was
-    # measured; this is the smaller side of it.
+    # DEFERRED, to close the identity<->roster cycle at its thinnest leg (see
+    # this module's docstring); the process census is deferred with it.
     from .seats import nonpane_session, seat_for_session
+    from .session import held_or_unproven as _held
     own = own_name()
     if not (own and session):
         return None
@@ -259,8 +259,8 @@ def identity_disagreement(session=None):
         return own, bound                       # TAKEOVER
     if bound:
         return None                             # my sid, my name — clean
-    if _live_session_of(own) and not nonpane_session(session):  # CLAIM-JUMP
-        return own, own
+    if not nonpane_session(session) and _held(_live_session_of(own)):
+        return own, own                         # CLAIM-JUMP
     return None
 def _dispute_sentence(own, bound, session):
     """The dispute, described by SHAPE — the two read nothing alike.
@@ -280,12 +280,12 @@ def _dispute_sentence(own, bound, session):
                 "HELM_CHAT_NAME, or `helm chat seat disown %s %.8s`"
                 % (own, str(session), bound, bound, str(session)))
     return ("this process declares %r and session %.8s is rostered NOWHERE, "
-            "but %r is already held by live session %.8s. A crash-restarted "
-            "pane inherits its predecessor's HELM_CHAT_NAME and arrives with "
-            "a FRESH session id — that is this exact shape. Fix: unset/"
-            "re-export HELM_CHAT_NAME to the seat you actually are, or if "
-            "you ARE that seat, `helm chat seat disown %s %.8s` the stale "
-            "session first"
+            "but %r is already held by live session %.8s: a claude process "
+            "holds it or may, or the census could not prove it closed. A pane "
+            "that inherited another seat's HELM_CHAT_NAME arrives in exactly "
+            "this shape. Fix: unset/re-export HELM_CHAT_NAME to the seat you "
+            "actually are; if you ARE that seat, close the process holding "
+            "that session, or `helm chat seat disown %s %.8s` if none does"
             % (own, str(session), own, str(_live_session_of(own) or "?"),
                own, str(_live_session_of(own) or "")))
 def _live_session_of(seat):
@@ -293,9 +293,9 @@ def _live_session_of(seat):
 
     None covers three different clean states on purpose — no such row, a row
     with no session, and an unreadable roster — because every one of them
-    means "no live occupant to displace". Only a present, different session
-    is a claim-jump; anything softer would refuse the first honest join of a
-    freshly spawned seat."""
+    means "no live occupant to displace". A present session is a BINDING, not
+    proof of life (the row keeps it after the pane dies): `held_or_unproven`
+    decides whether it still displaces a fresh join."""
     try:
         rows = roster() or {}
         keys = canonical_keys(seat, rows)

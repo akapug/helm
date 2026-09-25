@@ -1582,6 +1582,139 @@ class PostsSignThroughTheIdentityGateTest(V2Base):
         self.assertEqual(chat.sign_failures(), [])
 
 
+class OwnerExportPostsSignAsTheSeatTest(V2Base):
+    """task/3049 on the post, emit and status paths, over a REAL roster file
+    and actor store (no mocked `_self_seat`): a seat that inherited the
+    owner's profile from his shell signs its rows as ITSELF once the identity
+    layer admits it, the CLI door's admission is threaded rather than re-run,
+    and no read verb writes the actor store."""
+
+    OWNER = "owner-profile"
+    SID = "sid-seat-a-0000-0001"
+    VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID",
+            "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_ACTORS", "MELD_ACTORS",
+            "HELM_CHAT_OWNER_NAMES", "MELD_CHAT_OWNER_NAMES")
+
+    @contextlib.contextmanager
+    def _world(self, name="seat-a", sid=SID, ambient=OWNER):
+        from helm import seats
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ))
+            for k in self.VARS + cellmod.PROFILE_ENV:
+                os.environ.pop(k, None)
+            os.environ["HELM_CHAT_OWNER_NAMES"] = self.OWNER
+            os.environ["HELM_CELL_PROFILE"] = ambient
+            if name:
+                os.environ["HELM_CHAT_NAME"] = name
+            if sid:
+                os.environ["CLAUDE_CODE_SESSION_ID"] = sid
+            path = seats.roster_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"seat-a": {"session": self.SID,
+                                      "sessions": [self.SID],
+                                      "home_room": "helm"}}, f)
+            stack.enter_context(mock.patch.object(
+                cellmod, "bin_status", return_value=READY_SIGNER))
+            stack.enter_context(mock.patch.object(
+                chat, "node_head", return_value={"chain_index": 1}))
+            yield stack.enter_context(mock.patch.object(
+                chat, "_sign_send", return_value=(dict(SENT), None)))
+
+    def _store(self):
+        from helm import actors
+        return actors.store_path()
+
+    def test_a_post_with_no_admitted_caller_signs_as_the_SEAT(self):  # noqa: VACUOUS_ASSERTION — the signer call, from and chain are asserted positively; the store absence is the no-write pin, and test_the_CLI_doors_admission_is_THREADED_not_re_run writes that store unconditionally through resolve_speaker
+        """A hook or machine caller hands no capability down, so the gate asks
+        the identity layer itself — and writes nothing. RED before: the row
+        landed DEGRADED identity_conflict and the signer was never called."""
+        with self._world() as ss:
+            m = chat.post("from the seat", room="main")
+            self.assertFalse(os.path.exists(self._store()),
+                             "a post wrote the actor store through the gate")
+        ss.assert_called_once_with(chat.digest_payload("from the seat"),
+                                   "seat-a")
+        self.assertEqual((m["from"], m["chain"]), ("seat-a", 7))
+        self.assertNotIn("transport", m)
+
+    def test_the_CLI_doors_admission_is_THREADED_not_re_run(self):  # noqa: VACUOUS_ASSERTION — both read counts come from one wrapped reader that the agreeing control post must hit, and the signer call and chain are asserted positively
+        """`_seat_actor` already admitted this process; the post hands that
+        capability to the gate, which asks the identity layer nothing more.
+        The CONTROL is the same post from the same seat under its OWN profile
+        (no swap branch at all): the owner-export post takes exactly as many
+        strict roster reads, so the swap adds none on the CLI path."""
+        from helm import actors, seats
+        counts = []
+        for ambient in ("seat-a", self.OWNER):
+            with self._world(ambient=ambient) as ss:
+                actor, err = actors.resolve_speaker(self.SID)
+                self.assertIsNone(err)
+                with mock.patch("helm.actors.admitted_name",
+                                side_effect=AssertionError("re-ran admission")), \
+                        mock.patch("helm.seats.roster_checked",
+                                   wraps=seats.roster_checked) as reads:
+                    m = chat.post("threaded", room="main", who=actor)
+                counts.append(reads.call_count)
+            ss.assert_called_once_with(chat.digest_payload("threaded"),
+                                       "seat-a")
+            self.assertEqual(m["chain"], 7)
+        self.assertEqual(counts[1], counts[0], counts)
+
+    def test_a_REACTION_from_the_seat_signs_as_the_seat(self):
+        chat.post("target", room="main", who="a1")
+        with self._world() as ss:
+            row, err = chat.react(1, ":tada:", room="main")
+        self.assertIsNone(err)
+        ss.assert_called_once_with(mock.ANY, "seat-a")
+        self.assertEqual(row["chain"], 7)
+
+    def test_the_EMIT_path_signs_as_the_seat(self):  # noqa: VACUOUS_ASSERTION — the signer call is asserted positively (called with the seat); the None is the absence of a refusal on that same call
+        """Land and claim receipts ride the same gate. RED before: refused."""
+        with self._world() as ss:
+            info, failure = chat.emit_coordination_turn("helm.land", "x")
+        self.assertIsNone(failure)
+        self.assertEqual(ss.call_args.args[1], "seat-a")
+
+    def test_a_retained_conflict_retires_on_the_seats_first_signed_post(self):
+        """The DEGRADED incident the old refusal filed under the seat clears
+        the moment the seat signs as itself — no manual ack."""
+        with self._world():
+            chat._record_sign_failure(
+                "seat-a", chat._diag("identity_conflict", "old refusal"))
+            self.assertEqual([f["profile"] for f in chat.sign_failures()],
+                             ["seat-a"])
+            chat.post("signs now", room="main")
+            self.assertEqual(chat.sign_failures(), [])
+            self.assertEqual(chat.transport_status()["state"], "SIGNED")
+
+    def test_STATUS_reads_never_write_the_actor_store(self):  # noqa: VACUOUS_ASSERTION — the state READY is asserted positively; the store absence is the no-write pin, and test_the_CLI_doors_admission_is_THREADED_not_re_run writes that store unconditionally
+        """`transport_status` is behind `helm doctor`, the owner TUI and the
+        web panels. With no actor record yet, neither the process's own
+        status nor a fleet read may mint one, and a fleet read never asks the
+        identity layer at all. RED before on the state: DEGRADED."""
+        with self._world():
+            st = chat.transport_status()
+            with mock.patch("helm.actors.admitted_name",
+                            side_effect=AssertionError("fleet admitted")):
+                fleet = chat.transport_status(fleet=True)
+            self.assertFalse(os.path.exists(self._store()),
+                             "a status read wrote the actor store")
+        self.assertEqual(st["state"], "READY")
+        self.assertNotEqual(fleet.get("code"), "identity_conflict")
+
+    def test_an_unadmitted_seat_still_posts_UNSIGNED_under_its_own_name(self):  # noqa: VACUOUS_ASSERTION — the stamp code, label and reason are asserted positively; the called-signer control on this fixture is test_a_post_with_no_admitted_caller_signs_as_the_SEAT
+        """Control on the same world: no session, so the declared name is
+        uncorroborated and the owner's profile is NOT set aside."""
+        with self._world(sid=None) as ss:
+            m = chat.post("no session", room="main")
+        ss.assert_not_called()
+        self.assertEqual((m["transport"]["code"], m["transport"]["profile"]),
+                         ("identity_conflict", "seat-a"))
+        self.assertIn("set aside", m["transport"]["reason"])
+
+
 class DreggSignerBinTest(V2Base):
     """The dregg-native signer (dregg-client-sign) as HELM_CELL_BIN: the
     signing leg must drive its argv contract (join/send --profile --to
@@ -2625,7 +2758,10 @@ class NodeSupervisorTest(V2Base):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.assertEqual(chatnode.cmd_node(["bogus"]), 2)
-        with mock.patch.object(chatnode, "bin_path", return_value=None), \
+        with mock.patch.object(chatnode, "bin_resolution", return_value={
+                "path": None, "source": None,
+                "reason": "dregg-cave-node binary not found — set "
+                          "HELM_CHAT_NODE_BIN or install to ~/.local/bin"}), \
              contextlib.redirect_stderr(err):
             self.assertEqual(chatnode.cmd_node(["up"]), 1)
         self.assertIn("not found", err.getvalue())

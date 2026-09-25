@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import collections
+import functools
 import tempfile
 import threading
 import time
@@ -2220,8 +2221,13 @@ def scan_spawns(source, module="<source>"):
     return sorted(set(git)), sorted(set(static)), sorted(set(unresolved))
 
 
+@functools.lru_cache(maxsize=1)
 def _sweep_helm():
-    """The three buckets over the whole package."""
+    """The three buckets over the whole package, as tuples.
+
+    ONCE PER PROCESS (task/3039): three arms read this sweep and the package
+    does not change while one process runs; it was 132 of this module's 142 s
+    profiled. Tuples, so no caller can edit what the next one reads."""
     git, static, unresolved = [], [], []
     for fn in _helm_sources():
         with open(os.path.join(_PKG, fn), encoding="utf-8") as f:
@@ -2229,7 +2235,7 @@ def _sweep_helm():
         git += g
         static += s
         unresolved += u
-    return sorted(git), sorted(static), sorted(unresolved)
+    return tuple(sorted(git)), tuple(sorted(static)), tuple(sorted(unresolved))
 
 
 # The allowlist IS the law (the display-launder tripwire's pattern): every module
@@ -2427,6 +2433,14 @@ _DYNAMIC_ARGV_MODULES = {
     # identity and every containment answer — all go through the helm/vcs.py
     # seam, which is why nothing here belongs in _DIRECT_SPAWN_DEBT.
     "gatewindow.py",
+    # gatecanary.py — CONFIRMED not git, read off every subprocess in the
+    # module. `_launch` runs the operator's launcher prefix (`fab gate` by
+    # default, HELM_GATE_CANARY_LAUNCH otherwise) with `--repo ROOM
+    # [--sliced]`, which gates a tree and is not version control, and
+    # `ensure_timer` runs the runtime-discovered systemctl twice, the shape
+    # keepalive.py is listed for. Its repository questions (trunk, tree,
+    # the peek room) go through the helm/vcs.py seam and helm/work.
+    "gatecanary.py",
     "tasksmirror.py",
     "transcripts.py",
     # upstream_watch.py — CONFIRMED not git, read off every subprocess in the
@@ -2463,6 +2477,14 @@ _DYNAMIC_ARGV_MODULES = {
     # whole-suite argv so launcher death can kill the complete process group;
     # the command comes from gate.py and is executed verbatim.
     "gatechild.py",
+    # stopfacts_resident.py — CONFIRMED not git, read off every subprocess in
+    # the module. `_preflight` runs `<the running interpreter> -c "import
+    # helm.cli, helm.web_server, helm.stopfacts_resident"` to check that a
+    # changed tree imports before the resident re-execs onto it, and the
+    # re-exec itself is `os.execv` of this process's own command line. The
+    # head is sys.executable, which the static pass cannot decode; the git
+    # the module's facts need is asked by the guard's own functions it calls.
+    "stopfacts_resident.py",
     # relevance.py — CONFIRMED not git, by reading its one spawn: `_spawn`
     # detaches `<the running interpreter> -m helm relevance score-turn`, the
     # re-rank's per-turn worker. The head is sys.executable, which is why the
@@ -2562,6 +2584,11 @@ _DYNAMIC_ARGV_MODULES = {
     # fresh `--plan` discovery process and once per `--worker` shard. Both are
     # Python/unittest sharding infrastructure; neither invokes version control.
     "gateshard.py",
+    # gateslice.py — CONFIRMED not git. Its one dynamic argv launches the
+    # current interpreter with this tool-owned absolute script as argv[1] and
+    # `--worker <index> <work dir>` after it, once per slice worker. Python
+    # unittest infrastructure; nothing in the module invokes version control.
+    "gateslice.py",
     # resumeturn.py — CONFIRMED not git, and named here rather than hidden
     # behind another module's helper because spawning is this module's central
     # mechanism: the post-compaction resume MUST detach (a SessionStart hook
@@ -2961,6 +2988,36 @@ class DirectSpawnAuditTest(unittest.TestCase):
                     self.assertEqual(child["HOME"], ambient["HOME"])
                     for key, value in rowworld._history_view_env().items():
                         self.assertEqual(child[key], value)
+
+    def test_the_package_sweep_is_scanned_once_per_process(self):  # noqa: VACUOUS_ASSERTION — the spy is proven live in this arm: an uncached sweep under the same patch must scan every module
+        """Three arms read the same whole-package sweep, and nothing they
+        read changes while one process runs. MEASURED before the memo: 132 of
+        142 s profiled in this module were the sweep, taken three times
+        (task/3039). The answer is a tuple of tuples, so no caller can edit
+        what the next one reads."""
+        first = _sweep_helm()
+        scanned = []
+        real = scan_spawns
+
+        def spy(*a, **kw):
+            scanned.append(1)
+            return real(*a, **kw)
+
+        module = sys.modules[__name__]
+        with mock.patch.object(module, "scan_spawns", spy):
+            second = _sweep_helm()
+            by_second = list(scanned)
+            # The control pays for one file, not for the package again.
+            with mock.patch.object(module, "_helm_sources",
+                                   return_value=["vcs.py"]):
+                _sweep_helm.__wrapped__()
+        self.assertTrue(first[0], "control: the sweep found git spawns")
+        self.assertEqual(second, first)
+        self.assertEqual(len(scanned), 1,
+                         "control: the spy sees a sweep that runs")
+        self.assertEqual(by_second, [], "a second sweep scanned the package")
+        self.assertIsInstance(first, tuple)
+        self.assertTrue(all(isinstance(bucket, tuple) for bucket in first))
 
     def test_every_direct_git_spawn_is_declared_with_a_reason(self):
         git, _static, _unresolved = _sweep_helm()

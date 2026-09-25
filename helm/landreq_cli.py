@@ -158,6 +158,16 @@ def card(lr):
             "retire_measurement": lr.get("retire_measurement"),
             "retire_seat": lr.get("retire_seat"),
             "retire_ts": lr.get("retire_ts"),
+            # THE RETRACTION RIDES THE WIRE for the same reason (task/3060).
+            "verdict_retracted": lr.get("verdict_retracted", False),
+            "retracted_polarity": lr.get("retracted_polarity"),
+            "retract_reason": lr.get("retract_reason"),
+            "retract_reads": lr.get("retract_reads"),
+            "retract_basis": lr.get("retract_basis"),
+            "retract_seat": lr.get("retract_seat"),
+            "retract_role": lr.get("retract_role"),
+            "retract_successor": lr.get("retract_successor"),
+            "retract_ts": lr.get("retract_ts"),
             "observable": lr["observable"],
             "land_state": lr.get("land_state"),
             "landed": lr["landed"], "merged_local": lr["merged_local"],
@@ -169,6 +179,12 @@ def card(lr):
             # dropped the field. Tri-state and copied: None is "not asked".
             "trunk_contains_tip": lr.get("trunk_contains_tip"),
             "trunk_contains_proof": lr.get("trunk_contains_proof"),
+            # AND THE CLASSIFICATION ITSELF, for the one surface that is not
+            # Python: the wall's ALREADY ON TRUNK mark reads this word rather
+            # than re-deriving "on main with no verdict" in a JS twin
+            # (`honored` below, same reason). Every Python surface calls
+            # `landreq.on_main_unverdicted` on the card's own fields.
+            "on_main_unverdicted": landreq.on_main_unverdicted(lr),
             # PROJECT-SCOPE MARKS RIDE THE WIRE (task/974): the escape view
             # renders foreign rows and a row without its label is a row the
             # reader mistakes for their own — the exact confusion the scope
@@ -400,6 +416,20 @@ def _card_standing(state, why):
     return {"state": state, "why": why} if state in ("ORPHANED",
                                                      "RENAMED") else None
 
+def _retracted_mark(lr):
+    """ONE sentence for a retracted verdict (task/3060), shared by the list
+    line and `lr show`: what was taken back, by whose door, what the review
+    now reads, and which row carries it."""
+    successor = str(lr.get("retract_successor") or "")
+    return ("RETRACTED (was %s) by @%s (%s) — reads %s (%s)%s" % (
+        str(lr.get("retracted_polarity") or "undeclared").upper(),
+        lr.get("retract_seat") or "?", lr.get("retract_role") or "?",
+        str(lr.get("retract_reads") or "unknown").upper(),
+        lr.get("retract_basis") or "?",
+        "; successor %s carries the review" % successor[:12] if successor
+        else "; no successor carries the review"))
+
+
 def _line(lr, avail=None):
     marks = []
     # PROJECT PROVENANCE FIRST (task/974): these rows reach a listing only
@@ -418,6 +448,8 @@ def _line(lr, avail=None):
     if lr.get("abandoned"):
         marks.append("ABANDONED — LAND STATE UNKNOWN: %s" %
                      (lr.get("abandon_reason") or "reason unavailable"))
+    if lr.get("verdict_retracted"):
+        marks.append(_retracted_mark(lr))
     # THE REVIEW IS OVER AND THE STAGE CANNOT SAY SO. A source-clean hold is a
     # structured claim that the reviewer read the delta and found nothing, and
     # could not mint an approve only because one binds a whole-suite token the
@@ -445,7 +477,14 @@ def _line(lr, avail=None):
     # is actually missing is a VERDICT: the change reached trunk without one,
     # and the close door is right to refuse to stamp it landed, because git
     # cannot prove a review happened. The row IS the finding.
-    if lr.get("trunk_contains_tip"):
+    #
+    # THE WORDS SAY "NO VERDICT", SO THE PREDICATE ASKS FOR NONE: a verdicted
+    # row whose own leg came back unobserved is measured for containment too,
+    # and printing this over a recorded FIX called a contradiction ledger
+    # debris. `landreq.on_main_unverdicted` is the one predicate every board
+    # surface folds on (task/2381), so this line and the owner's count line
+    # name the same rows.
+    if landreq.on_main_unverdicted(lr):
         marks.append("ALREADY ON TRUNK — this work is in history and the row "
                      "has NO VERDICT recorded; it is a LEDGER gap (a review "
                      "that never happened), not a slow reviewer and not a "
@@ -678,7 +717,7 @@ def _line(lr, avail=None):
     if lr["state"] in ("READY", "MERGED_LOCAL") and not lr["observable"]:
         marks.append("landing unobservable — "
                      + landreq.observe_reason(lr.get("observe_why")))
-    if lr["state"] == "READY" and not lr.get("terminal"):
+    if landreq.live_ready(lr):
         # THE NAME BESIDE THE READY-SELF-REVIEW WORD. The word says nobody
         # independent looked; a board reader ordering a compose queue needs to
         # know WHICH seat, because the cure is to send the composed tip to a
@@ -772,6 +811,10 @@ def _render_show(lr):
         "  [model %s]" % lr["reviewer_model"] if lr.get("reviewer_model")
         else ""))
     out.append("  lane      %s" % (lr["lane"] or "-"))
+    if lr.get("verdict_retracted"):
+        out.append("  retract   %s at %s: %s" % (
+            _retracted_mark(lr), lr.get("retract_ts") or "?",
+            lr.get("retract_reason") or "no reason recorded"))
     # THE CHAIN, where someone is already asking "what work is this".
     # `discharge` now REFUSES on chain mismatch and its refusal names a
     # `--supersedes <id>` to use; a reader sent here by that message must be
@@ -815,7 +858,7 @@ def _render_show(lr):
             out.append("  exit      no cure committed, because: %s"
                        % lr["no_patch_because"])
         out.append("  gate      %s" % (lr.get("gate") or "UNVERIFIED"))
-    if lr.get("state") == "READY" and not lr.get("terminal"):
+    if landreq.live_ready(lr):
         # WHO READ THIS THAT DID NOT WRITE IT — the whole promise the review
         # procedure makes, said on the detail page the integrator opens before
         # a land. The word on the list line says a rung bit; this says which
@@ -2773,7 +2816,31 @@ def _cmd_compose(rest):
                 excluded.append({"id": lr["id"], "lane": lr.get("lane") or "?",
                                  "reason": berr, "state": lr.get("state")})
                 continue
-        if str(lr.get("state")) != "READY" and bounded is None:
+        if bounded is None and not landreq.live_ready(lr):
+            # A CLOSED ROW IS NO MEMBER, whatever its stored state says. The
+            # projection keeps READY on a row closed as landed and marks it
+            # terminal, and `_resolve_row` hands a retired row back here by
+            # design (allow_retired), so an id passed by hand reached the
+            # cherry-pick with only the patch-id ALREADY-ON screen behind it,
+            # and a row that landed under a rewritten patch would be composed
+            # back in. `live_ready` is the guard `helm train` puts on its cars
+            # and `helm lr list` on its READY marks. The refusal names the
+            # closure, so nobody re-derives why a READY row was turned away.
+            if lr.get("terminal"):
+                state = lr.get("state") or "UNKNOWN"
+                closed = landreq._retired_by(lr) or (
+                    landreq.terminal_annotation(lr) or (None,))[0]
+                why = ("is CLOSED by %s, though its stored state reads %s"
+                       % (closed, state) if closed
+                       else "is terminal in state %s" % state)
+                excluded.append({
+                    "id": lr["id"], "lane": lr.get("lane") or "?",
+                    "reason": "%s: a closed row has no door left, and compose "
+                              "takes only a LIVE READY row. `helm lr show %s` "
+                              "names the closure" % (why, lr["id"][:12]),
+                    "state": lr.get("state"), "terminal": True,
+                    "closed_by": closed})
+                continue
             # SAY WHAT THIS PROJECTION ITSELF READ, and say WHICH KIND of
             # reading it was. Measured twice 2026-08-11 (task/1067): an approve
             # the DM had already called ready refused here as REVIEWED and the
