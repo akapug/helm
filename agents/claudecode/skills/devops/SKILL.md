@@ -19,17 +19,26 @@ verifies them, lands them, deploys them, and proves the live target changed.
 
 ## Invariants
 
-1. **Ordered intake.** Read ready-to-integrate and review messages from one
-   ordered view. Do not let contributors self-merge around the integrator.
+1. **Ordered intake, one land door.** Read ready-to-integrate and review
+   messages from one ordered view. Nobody merges AROUND the land door; any seat
+   may land THROUGH it, once `helm landgate` passes and it holds the landlock
+   (store premise landing-five-clauses-review-gated-by-reversibility). The
+   integrator schedules the landing window, resolves conflicts between lanes
+   and audits every land; it is the account, not the only hands.
 2. **Main stays green.** Integrate from current main, fast-forward or rebase as
    required by repo policy, and know the exact post-merge HEAD.
 3. **Author != verifier.** Non-trivial work gets independent review before land.
-   Bounded MECHANICAL findings are fixed in-pass by the reviewer of EITHER
-   family, committed off the exact reviewed tip and named with `--patch-tip` on
-   the FIX verdict; you rebase the lane onto that tip or cherry-pick it, and you
-   credit both authors at close. Design findings go to a meld. A lane carrying
-   several authors is normal; what it owes is ONE re-read of the composed tip by
-   a reader who wrote none of it, before the land gate.
+   The reviewer of EITHER family owns the bounded MECHANICAL cure in the row's
+   REVIEW FIX MODE: PATCH commits off the exact reviewed tip and names
+   `--patch-tip` on FIX, for you to rebase onto or cherry-pick; MELD-DIFF posts
+   the exact diff in the pair meld for the author to apply, and records FIX
+   with validated `--diff-handoff ROOM/MSGID` plus `--no-patch-because`. Only
+   that receipt plus send/add proof that the advancing direct child applies
+   the diff permit it to confirm the cure and suppress T1; an unrelated child
+   remains an ordinary round. Reason prose alone (including historical rows)
+   proves no cure and leaves an ordinary round/T1 nudge.
+   Credit the actual authors on close. Design findings go to a meld. A safety door or non-mechanical composed cure owes
+   one re-read by a reader who wrote none of that tip before the land gate.
 4. **Merged != live.** State deploy tier and carry it through.
 5. **Live verification closes the loop.** Verify the target that users or seats
    actually run, not only the source tree.
@@ -168,5 +177,8 @@ evidence.
 - `helm route` for who should take a review, build or verify.
 - `/fix` and `/build` for contributor work before integration.
 - `reviewer-implements-own-findings` — the review procedure behind invariant 3:
-  reviewer patches, lane carries both authors, close credits each.
+  PATCH reviewer commits and its cure is adopted; MELD-DIFF reviewer posts the exact diff
+  in the pair meld for the author to apply and records validated
+  `--diff-handoff ROOM/MSGID`; a bare reason is no cure receipt. Credit the actual
+  authors on close.
 - `helm route review` for who should take an independent review.

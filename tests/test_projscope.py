@@ -116,6 +116,37 @@ class ScopeTest(unittest.TestCase):
         self.assertEqual(control, ["v3", "v3"])
         self.assertEqual(self.calls, 3)
 
+    def test_a_held_resource_closes_when_the_outermost_scope_ends(self):
+        """`on_exit` (task/3056): what a scope HOLDS — the `vcs` batch process
+        — dies at the instant its cache does, never at an inner exit, newest
+        first, and a closer that raises neither replaces the scope's own
+        exception nor stops an older closer."""
+        closed = []
+
+        def boom():
+            closed.append("boom")
+            raise RuntimeError("a closer that fails")
+
+        with self.assertRaises(ValueError):
+            with projscope.scope():
+                self.assertTrue(projscope.on_exit(
+                    lambda: closed.append("first")))
+                with projscope.scope():
+                    self.assertTrue(projscope.on_exit(boom))
+                    self.assertTrue(projscope.on_exit(
+                        lambda: closed.append("last")))
+                # AN INNER EXIT CLOSES NOTHING: the outer scope still shares
+                # the cache that remembers the resource.
+                self.assertEqual(closed, [])
+                raise ValueError("the scope's own exception")
+        self.assertEqual(closed, ["last", "boom", "first"])
+        # OUTSIDE A SCOPE nothing is held, so nothing is registered, and a
+        # later scope does not run the earlier scope's closers again.
+        self.assertFalse(projscope.on_exit(lambda: closed.append("never")))
+        with projscope.scope():
+            pass
+        self.assertEqual(closed, ["last", "boom", "first"])
+
     def test_the_cache_is_per_thread(self):
         """helm web is a ThreadingHTTPServer: a module-level dict lets one
         request's snapshot answer another's read, and one thread's exit clear

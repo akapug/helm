@@ -2,8 +2,8 @@
 """helm seats — stop_guard: the single decision about whether a seat may idle.
 
 ONE FUNCTION, AND ITS SIZE IS THE POINT. Every rung feeds here: inbox, claims,
-leases, beacon, review spiral, seam, NDP, punt, whisper, wiring and claim
-evidence. They resolve in ONE place because a seat either stops or it does
+leases, beacon, review spiral, seam, NDP, punt, whisper, owed rows, wiring and
+claim evidence. They resolve in ONE place because a seat either stops or it does
 not, and a posture resolved twice can disagree with itself.
 
 NO RUNG HERE FOLDS THE DISPATCH LEDGER OR ASKS GIT PER LEASE. Those facts are
@@ -34,26 +34,28 @@ import json
 import os
 import time
 
-from . import (chat, home, pk, projscope, seats_advice, seats_stop_budget,
-               stopfacts, vcs)
+from . import (chat, home, pk, projscope, seat_rest, seats_advice,
+               seats_stop_budget, stopfacts, vcs)
 from .seats_common import STATUS_BYTES, _clip, _scrub
-from .seats_identity import _delivery_pause, derive_seat, identity_disagreement
-from .seats_roster import seat_for_session
+from .seats_identity import _delivery_pause, identity_disagreement
 from .seats_delegation import (_claim_evidence_warning, _lane_stem,
                                _lease_worktree)
 from .seats_cursor import _write_stop_latch
 from .seats_roomscan import _ESTATE_FAILED
-from .seats_stop_signals import (_beacon_block, _off, _pending_all, _rows_fp,
-                                 _spiral_gate, _stop_fp_path)
+from .seats_stop_signals import (_beacon_block, _off, _pair_turn_gate,
+                                 _pending_all, _rows_fp, _spiral_gate,
+                                 _stop_fp_path, _wake_is_local, _wake_is_pane,
+                                 one_walk)
 from .seats_stop_ndp import NDP_LATCH, _ndp_gate
+from .seats_stop_owed import _owed_rung, live_delegation
 from . import seats_stop_seam
 from .seats_stop_seam import _seam_gate
 # RE-EXPORTED, NOT MERELY IMPORTED: helm/seats.py and tests/test_seats.py
 # both read these two FROM THIS MODULE, so the extraction owes them the
 # name they have always had here.
 from .seats_stop_claims import (LEASE_LATCH,  # noqa: F401
-                                LEASE_TTL_ALARM_S, claims_rung)
-from .seats_work_offer import _stop_whisper
+                                LEASE_TTL_ALARM_S, claims_rung, posture_seat)
+from .seats_work_offer import _session_holds_claim, _stop_whisper
 from .seats_room_advice import (_ROOM_READS, _ROOM_ROWS_SHOWN,  # noqa: F401
                                 _missed, _room_unfinished)
 
@@ -63,8 +65,47 @@ _ROOM_ROWS_SHOWN = 2      # findings are advice, not a report
 INBOX_CLEAN_LATCH = "inboxclean"
 
 
-def _rearm_rung(session, seat):
-    """The line a seat gets on EVERY turn it has no proven wake path, or None.
+def rearm_refusal(name):
+    """The refusal a LOCAL-family seat gets when no beacon is bound to its
+    stop. SHORT, because it is an instruction and not an argument: the
+    Monitor call, the deferred-tool fallback, and the promise that it refuses
+    once. The call carries --replace, because a live waiter that does not bind
+    (another session's, a one-shot wait, a room tap) makes a plain re-arm exit
+    "already armed" or refuse as a conflict, and the seat would idle deaf
+    after doing exactly what it was told."""
+    return ("[helm stop-guard] NO BEACON — seat '%s' runs on a local model and "
+            "no live `helm chat wait --follow` is bound to this session, so "
+            "nothing can wake it once this turn ends. Arm it, then stop "
+            "(--replace retires any stale waiter):\n  %s\nMonitor missing from "
+            "your tools means DEFERRED: ToolSearch(query: \"select:Monitor\") "
+            "first. Refused once per stop: the stop that ends this "
+            "continuation passes."
+            % (name, seats_advice.beacon_monitor(name, replace=True)))
+
+
+def _rearm_rung(session, seat, paused=False):
+    """-> (line, proven_absent): the line a seat gets on EVERY turn it has no
+    proven wake path, or (None, False).
+
+    `proven_absent` IS THE REFUSAL (task/3382). It is True only for a seat
+    whose VERIFIED runtime is a local family (`_wake_is_local`) when the
+    strict probe, asked about THIS session, answers with no pids and no
+    trouble; `line` is then `rearm_refusal`'s text, which the ladder puts on
+    the exit-2 channel. It is asked of no other seat, so a paid or unverified
+    seat keeps the advice below, and its silence, exactly as before. Nor of a
+    `paused` one (a delivery pause): the inbox and owed rungs skip a walled
+    seat because a refusal would buy a turn its provider cannot serve.
+
+    WHY LOCAL SEATS ARE REFUSED (measured over ~41 h of three local seats):
+    128 turn-ends into a deaf idle produced 1 block and 1 recorded advisory,
+    and by the hook contract an exit-0 Stop hook's stderr is not shown to the
+    model. Told directly, the seats armed: 41 of 42 idle expiries, 14 of 17
+    blocks. A continuation on a local model is free, and there is NO LATCH,
+    because `stop_hook_active` already bounds this to one continuation per
+    stop chain.
+    That same flag is the bound's residual: when ANOTHER rung makes the
+    continuation, its stop asks nothing about the beacon, so the guarantee is
+    one re-arm opportunity per fresh stop.
 
     WHY A SECOND BEACON RUNG EXISTS BESIDE `_beacon_block`. That one is a
     REFUSAL, so it is built the way a refusal has to be built: it asks the
@@ -89,9 +130,10 @@ def _rearm_rung(session, seat):
     SESSION behind the shape, which is what makes an orphan waiter from a dead
     session stop reading as coverage; and a seat that cannot be woken has not
     become acceptable by being unreachable for one more turn, so there is no
-    state a latch could legitimately spend. It is an ADVISORY, not a block:
-    `_beacon_block` remains the only beacon rung that can refuse a stop, so
-    adding this cannot wedge a seat that has no Monitor tool to comply with.
+    state a latch could legitimately spend. For every seat but a verified
+    local one it is an ADVISORY, not a block, so it cannot wedge a seat that
+    has no Monitor tool to comply with; the local refusal is bounded by
+    `stop_hook_active` instead (above).
 
     FAIL LOUD, NEVER SILENT-COVERED. Three answers, and the two that are not a
     proven wake path both speak. A probe that cannot answer says UNPROVEN in
@@ -112,15 +154,23 @@ def _rearm_rung(session, seat):
     from .seats_stop_signals import beacon_procs, owes_beacon
     name = None if _off("STOP_GUARD_BEACON") else owes_beacon(seat, session)
     if not name:
-        return None                      # not a launched fleet seat: owes none
+        return None, False               # not a launched fleet seat: owes none
+    if _wake_is_pane(name, session):
+        return None, False               # this family is woken through its pane
+    local = not paused and _wake_is_local(name, session)
     try:
-        pids, trouble = beacon_procs(name, strict=True)
+        # ONLY THE REFUSAL ASKS ABOUT THIS SESSION: every other seat's probe
+        # is the call it always was, so its advice and its silence are too.
+        pids, trouble = beacon_procs(name, strict=True, session=session) \
+            if local else beacon_procs(name, strict=True)
     except projscope.Expired:
         raise
     except Exception as exc:             # noqa: BLE001 — see FAIL LOUD above
         pids, trouble = [], "the beacon probe raised %s" % type(exc).__name__
     if pids:
-        return None                      # a live wake path was PROVEN
+        return None, False               # a live wake path was PROVEN
+    if local and not trouble:
+        return rearm_refusal(name), True
     head = ("coverage could not be PROVEN (%s)"
             % _clip(_scrub(str(trouble)), STATUS_BYTES)) if trouble else \
         "NO live `helm chat wait` process is waiting for it"
@@ -135,7 +185,7 @@ def _rearm_rung(session, seat):
             "latched — it repeats every turn until a live beacon is proven, "
             "so silence from this rung is the only evidence that arming "
             "worked." % (name, head, seats_advice.beacon_monitor(name),
-                         seats_advice.BEACON_EXPIRY_TERSE))
+                         seats_advice.BEACON_EXPIRY_TERSE)), False
 
 
 def _inbox_clean_line(room, seat, session):
@@ -146,10 +196,12 @@ def _inbox_clean_line(room, seat, session):
     because the STATE here is constant — "this seat has been told how to arm
     in this session". Every failure path returns the FULL form: a latch that
     cannot be read or written must never be the reason a seat never learns the
-    command. That direction matters more than the bytes."""
-    full = ("[helm stop-guard] inbox clean. If you intend to idle-wait, arm "
-            "the beacon first: %s — Monitor missing from your tools "
-            "means DEFERRED not absent: ToolSearch(query: \"select:Monitor\")"
+    command. That direction matters more than the bytes. The call grew by the
+    description the Monitor tool requires (task/3435), and the sentence
+    around it gave that width back."""
+    full = ("[helm stop-guard] inbox clean. Before you idle-wait, arm the "
+            "beacon: %s — no Monitor tool means DEFERRED, not absent: "
+            "ToolSearch(query: \"select:Monitor\")"
             % seats_advice.beacon_monitor(seat))
     try:
         path = _stop_fp_path(room, seat, session, kind=INBOX_CLEAN_LATCH)
@@ -299,10 +351,15 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
           the same claim and enclosing Claude holder until SubagentStop.
           The WARN names its proof and retains the lease. Every UNKNOWN blocks;
           HELM_STOP_GUARD_DELEGATION=0 disables both producers and readers.
-          LATCHED once per held-set fingerprint (resource + lease id + TTL
-          band, kind=stoplease): a re-stop on the SAME set compresses to a
-          one-line WARN; a CHANGED set — a new lease, a release, or a
-          remainder crossing LEASE_TTL_ALARM_S — re-prints the full block;
+          A `dispatch:` lease on a row not proven discharged is IN PROGRESS,
+          the mark the owed-row rung asks for: it refuses nothing unless it
+          is expiring, and is said once (task/3696).
+          LATCHED PER LEASE (resource + lease id + TTL band + exempt state,
+          kind=stoplease; task/3123): a re-stop on the SAME set compresses to
+          a one-line WARN; a CHANGED set prints only the lines that are new
+          or changed — a new lease, an exempt/held flip, a remainder crossing
+          LEASE_TTL_ALARM_S — plus one tally of the rest, and BLOCKS only when
+          a printed line is a held lease; a release is a count, never a line;
           an unwritable latch degrades the block to the WARN, never a wall.
       (b2) BLOCK — a LAUNCHED fleet seat (HELM_CHAT_NAME names it, roster row
           exists) with owed dispatch work or an unreadable obligation ledger
@@ -310,6 +367,10 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
           A measured zero makes the beacon optional and re-arms the gate if
           work later appears. Once per state, absence must be PROVEN;
           HELM_STOP_GUARD_BEACON=0 disables (the restarted-integrator class).
+      (b2r) BLOCK — a LOCAL-family seat (verified runtime) with no live beacon
+          bound to this session, proven: `_rearm_rung`, unlatched, one
+          refusal per fresh stop, never beside (b2)'s; every other seat and
+          every unproven answer gets its advice line instead (task/3382).
       (b3) BLOCK — a REVIEW SPIRAL (_spiral_gate): this seat has review-
           dispatched ONE lane at 3+ DISTINCT tips inside the window, i.e.
           round three, which the store's own `review-begins-with-cat-file`
@@ -318,6 +379,10 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
           cure point). Latched on (lane, round-count): one block per state, a
           further round re-arms, an unwritable latch degrades to the warn.
           HELM_STOP_GUARD_SPIRAL=0 disables.
+      (b3p) BLOCK — a PAIR-MELD TURN (_pair_turn_gate): a round of a task's
+          pair meld whose floor is this seat's (the peer yielded, joined, or
+          closed). Its chunks carry no @mention, so the inbox rung cannot see
+          it. Latched per set of owed turns; HELM_STOP_GUARD_PAIR=0 disables.
       (b4) BLOCK — an UNTESTED COMPOSITION (_seam_gate): the worktree this seat
           stands in (plus any lane rooms it leases) and another LIVE worktree
           of the same repo under a DIFFERENT holder have both authored the same
@@ -336,8 +401,8 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
           HELM_STOP_GUARD_SEAM=0 disables. It also emits
           a WARN-only SEAM RUNG BLIND SPOT line: this rung is keyed on the
           WORKTREE, so seats sharing ONE room are invisible to it, and a seat
-          stopping in such a room is told once per arrangement rather than
-          being left to read silence as a clean bill. The census and the rows
+          stopping in such a room is told once per session per room rather
+          than being left to read silence as a clean bill. The census and the rows
           are the `helm web` resident's (stop facts); a reading that is not
           EXACT is one UNKNOWN warn and never a block.
       (c) WHISPER — the contextual continuation lane (_stop_whisper): ONE
@@ -346,10 +411,19 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
           green — the latched-but-unlanded pending set, and, at the BOTTOM,
           the work-offer of the top unowned backlog row to a genuinely idle
           seat — which AUTO-CLAIMS the head instead of offering it when it
-          was dispatched to this very seat and its kind is self-assignable),
+          was dispatched to this very seat and its kind is self-assignable,
+          and never offers a row assigned to another seat),
           once per (signal, level) fingerprint, riding an existing
           block or soft-holding alone; HELM_STOP_GUARD_WHISPER=0 disables;
           fail-closed to nothing.
+      (c1) BLOCK — OWED ROWS (_owed_rung): dispatch rows addressed TO this
+          seat that it still owes and is not working (dispatches.owed_to),
+          oldest first, each with `helm dispatch triage <id>`. An idle seat
+          hears them at EVERY idle turn; the turn is the latch, and the
+          stop_active re-stop above returns before this rung, so it cannot
+          loop. A seat holding a lease on other work, or running a Workflow or
+          background agent (`live_delegation`), hears each owed set once.
+          Skipped under a delivery pause; HELM_STOP_GUARD_OWED=0 disables.
       (c2) WARN — claim-evidence: settled-sounding count/SHA/proof/landed
           claims whose current turn lacks the matching measurement. One
           transcript snapshot binds finding + latch identity; unreadable skips.
@@ -375,7 +449,7 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
     # LOCALLY this is render: the guard composes WARN TEXT and is "WARN-ONLY
     # here, never a block", so refusing would turn a stop-time advisory into
     # the wedged-turn shape the guard exists to avoid. That reading is what
-    # kept `derive_seat` here through a whole review.
+    # kept the derived floor here through a whole review.
     #
     # BUT THE NAME DOES NOT STAY HERE. It is passed to `_stop_whisper`, whose
     # auto-claim rung calls `claim()` — a LEASE, one of the two acts the
@@ -386,7 +460,7 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
     # So the RENDER seat keeps its floor and an ACTOR is resolved separately.
     # A process with no admissible identity still gets every warning; it just
     # cannot reach the actuator two hops down.
-    seat = seat or seat_for_session(session) or derive_seat(session)
+    seat = posture_seat(session, seat)
     from . import actors
     stop_actor, _aerr = actors.resolve_actor(session, cwd, act="auto-claim work")
     # WARN-ONLY here, never a block (a refusal at Stop is the wedged-turn
@@ -401,7 +475,11 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
         "HELM_CHAT_NAME, or `helm chat seat disown %s %.8s`"
         % (dispute[0], str(session), dispute[1], dispute[1], str(session))
     ) if dispute else None
-    delivery_paused = bool(_delivery_pause(seat, session))
+    held = _delivery_pause(seat, session)
+    delivery_paused = bool(held)
+    # THE OWNER'S REST (helm/seat_rest.py) rides the same pause: its line
+    # replaces every beacon demand below, and "" when the seat is not resting.
+    resting = seat_rest.stop_line(seat, held)
     # THE DURABLE RECORD LEARNS WHO IT IS FROM THE RUNG THAT WORKS IT OUT.
     # Re-deriving the seat inside the writer asked the ENVIRONMENT, and the
     # hook process this runs in exports no seat name, so every production
@@ -519,18 +597,24 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
                 # were per-firing boilerplate on a block that fires at EVERY
                 # stop (task 692). Trimmed to the raw count, the read verb, the
                 # catchup verb, and the one caveat that carries the whole point
-                # of the block — a read does not discharge an obligation (the
-                # 2,250-row pileup this rung exists to prevent). The DECISION —
+                # of the block — a read DELIVERS what it prints whole
+                # (helm.pull_delivery), so these rows leave the count, but it
+                # does not answer an obligation. The DECISION —
                 # the pending set, its fingerprint, the once-per-set latch — is
                 # untouched; only the verbosity is. len(pending) stays the
                 # HONEST raw-row count (obligations are rows), not a distinct
                 # count, because no sample list is shown to reconcile against.
+                # THE BULK ACK IS NAMED FIRST. A seat holding rows it already
+                # handled clears them in ONE `helm chat ack <id> <id> …` (one
+                # row per room); the per-row form was the only one on offer
+                # and a seat wrote 31 room rows with it.
                 body = (
                     "[helm stop-guard] %d undelivered message(s) for seat "
-                    "'%s' — `helm chat read` SHOWS them but a read does NOT "
-                    "discharge an obligation; ACT, or park with `helm chat "
-                    "catchup --including-mentions --apply` (WITHOUT --apply it "
-                    "is a DRY RUN that parks nothing)."
+                    "'%s' — handled already? ONE `helm chat ack <id> <id> …` "
+                    "clears them all. Else ACT: `helm chat read` delivers "
+                    "(reading is not acting), or park with `helm chat "
+                    "catchup --including-mentions --apply` (without --apply "
+                    "it parks nothing)."
                     % (len(pending), seat))
                 if latched:
                     blocks.append(body + " This blocks once per pending set "
@@ -548,7 +632,8 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
     timing.done("claims", "beacon", complete="claims" not in budget.yielded)
     beacon = None
     try:  # the ARMED-BEACON gate — fail-open TOTAL (never wedge a stop)
-        beacon = _beacon_block(
+        # A RESTING SEAT OWES NO BEACON (task/3280): the owner turned it off.
+        beacon = None if resting else _beacon_block(
             session, room, seat,
             dispatch_snapshot=lambda: facts.view().owed_pair(seat))
     except projscope.Expired:
@@ -563,13 +648,24 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
     # on any stop where another rung refuses, a seat would otherwise learn
     # nothing about the fact that nothing can wake it — and a refused stop is
     # exactly when a seat is most likely to go idle owing work.
+    #
+    # FOR A LOCAL SEAT WITH ABSENCE PROVEN IT IS A REFUSAL (task/3382), and
+    # the stop carries ONE beacon instruction: when `_beacon_block` has already
+    # refused, its block is that instruction and keeps its latch, so this rung
+    # adds nothing; its latch passes the next fresh stop, and this rung refuses
+    # that one. A paused seat is advised instead (`_rearm_rung`), and a RESTING
+    # one hears that it rests, in place of any beacon line (task/3280).
     try:                 # fail-open TOTAL, like every rung on this path
-        rearm = _rearm_rung(session, seat)
+        rearm, absent = (resting, False) if resting else \
+            _rearm_rung(session, seat, paused=delivery_paused)
     except projscope.Expired:
         raise
     except Exception:
-        rearm = None
-    if rearm:
+        rearm, absent = None, False
+    if rearm and absent:
+        if not beacon:
+            blocks.append(rearm)
+    elif rearm:
         warns.append(rearm)
         seats_stop_seam.survives_refusal(rearm)
     timing.done("beacon", "spiral")
@@ -589,6 +685,19 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
         blocks.append(spiral)
     if spiral_warn:
         warns.append(spiral_warn)
+    # THE PAIR-MELD TURN, timed with the spiral because it is the same
+    # question one step earlier: a round of the task's pair meld whose floor
+    # is this seat's. Latched per set of owed turns; fail-open total.
+    try:
+        pair, pair_warn = _pair_turn_gate(session, room, seat)
+    except projscope.Expired:
+        raise
+    except Exception:
+        pair, pair_warn = None, None
+    if pair:
+        blocks.append(pair)
+    if pair_warn:
+        warns.append(pair_warn)
     timing.done("spiral", "seam")
     # THE UNTESTED-COMPOSITION RUNG. Two green halves on one file, held by two
     # seats, merging cleanly with no arm ever run against the composition —
@@ -658,6 +767,24 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
             w = None
         if w:
             blocks.append(w)   # rides an existing block, or IS the soft hold
+    # THE OWED-ROW RUNG, after the whisper so a lease the auto-claim just took
+    # reads WORKING and the same row is not named twice in one stop. A walled
+    # seat is skipped as the inbox is: a refusal would only buy another turn
+    # its provider refuses. Fail-open TOTAL.
+    if not delivery_paused:
+        try:
+            owed_block, owed_warn = _owed_rung(
+                session, room, seat, facts.view().owed_pair(seat),
+                busy=lambda: _session_holds_claim(session)
+                or live_delegation(session, transcript))
+        except projscope.Expired:
+            raise
+        except Exception:
+            owed_block, owed_warn = None, None
+        if owed_block:
+            blocks.append(owed_block)
+        if owed_warn:
+            warns.append(owed_warn)
     timing.done("whisper", "wiring")
     # THE BUILT-BUT-NOT-WIRED RUNG, LAST OF THE RUNGS THAT CAN BLOCK. Its
     # position and its reserve are `seats_stop_budget`'s to explain; what is
@@ -687,7 +814,8 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
     # start had already delivered both. The argv is worth its bytes ONCE per
     # session; after that the seat has it and needs only the reminder.
     # Same-state latch, the mechanism every other rung here already uses.
-    if not blocks and not pending and not unread:
+    if not blocks and not pending and not unread and not resting \
+            and not _wake_is_pane(seat, session):
         warns.append(_inbox_clean_line(room, seat, session))
     # THE MECHANICAL TAIL (the memory-index cap and the scratch reaper) LEFT
     # THIS LADDER for the resident's periodic job
@@ -701,16 +829,23 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False,
                transcript=None, cwd=None, budget=None, detail=False):
     """Run the ladder while preserving partial findings on ambient expiry.
 
-    `detail` is RENDERING ONLY — `helm chat stop-guard --detail` sets it, and
-    no rung's verdict, read or write depends on it."""
+    `detail` is what `helm chat stop-guard --detail` sets: the lease rung
+    prints every line in its long form and reads and writes no lease memory
+    (see `claims_rung`); no other rung's verdict, read or write depends on it.
+    Without a hook payload the verb does not reach here at all: it reads the
+    lease rung alone for the environment's session (`lease_detail`)."""
     if _off("STOP_GUARD"):
         return [], []
     budget = budget or seats_stop_budget.State()
     try:
         projscope.spend_or_raise("starting stop rung identity")
-        answer = _stop_guard(session=session, room=room, seat=seat,
-                             stop_active=stop_active, transcript=transcript,
-                             cwd=cwd, budget=budget, detail=detail)
+        # ONE WALK OF THE PROCESS TABLE PER STOP, as there is one reading of
+        # the stop facts: every beacon probe on the ladder shares it.
+        with one_walk():
+            answer = _stop_guard(session=session, room=room, seat=seat,
+                                 stop_active=stop_active,
+                                 transcript=transcript, cwd=cwd,
+                                 budget=budget, detail=detail)
     except projscope.Expired:
         # NOT AN END. An expired ladder is the case the durable record exists
         # to catch, so it declares nothing and its last boundary stands as the

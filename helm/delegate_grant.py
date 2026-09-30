@@ -60,6 +60,9 @@ REFUSED = (
     ("dispatch", "verdict"), ("dispatch", "retract"),
     ("dispatch", "hold"), ("dispatch", "release"),
     ("dispatch", "cancel"), ("dispatch", "rebind"), ("dispatch", "retip"),
+    # A FRONT OVER `dispatch verdict` AND `dispatch hold --source-clean`
+    # (task/3382): refused with them, or it is a way around both.
+    ("review", "done"),
     ("lr", "close"), ("lr", "land"), ("lr", "abandon"), ("lr", "retire"),
     ("lr", "expired"),
     ("lr", "discharge"), ("lr", "withdraw"), ("lr", "close-landed"),
@@ -76,12 +79,34 @@ GRANTABLE = tuple(pair for pair in REFUSED if pair not in UNGRANTABLE)
 #: THE SPELLINGS OF A REFUSED VERB THAT WRITE NOTHING, read per invocation by
 #: `writes_nothing`. A dispatch or lr verb given no arguments prints its usage,
 #: and so does one given -h or --help; an lr verb's --dry-run writes nothing.
-#: Only these two groups: `handoff write` given no arguments WRITES.
-USAGE_GROUPS = ("dispatch", "lr")
+#: Only these groups: `handoff write` given no arguments WRITES.
+USAGE_GROUPS = ("dispatch", "lr", "review")
 DRY_RUN_GROUPS = ("lr",)
 #: The lr verbs whose census is the default and whose write takes --apply:
 #: the flag that selects that mode, "" where the verb is always a census.
 CENSUS = {("lr", "expired"): "", ("lr", "retire"): "--off-frontier"}
+
+
+def _review_help(args):
+    """Does `review done` parse this argv as help rather than a write?"""
+    from . import review_done                 # deferred: the front imports dispatch
+    seen = set()
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return False
+        if arg in ("-h", "--help"):
+            return True
+        if arg in review_done.VALUED:
+            if i + 1 >= len(args) or args[i + 1].startswith("--") \
+                    or arg in seen and not review_done.VALUED[arg]:
+                return False
+            seen.add(arg)
+            i += 2
+            continue
+        i += 1
+    return False
 
 
 def writes_nothing(group, verb, args):
@@ -91,7 +116,13 @@ def writes_nothing(group, verb, args):
     not settle one."""
     if group not in USAGE_GROUPS:
         return False
-    if not args or "-h" in args or "--help" in args:
+    if not args:
+        return True
+    # Dispatch and lr recognize the ordinary leading help spelling. Review's
+    # parser also recognizes a later help token, but only when no valued flag
+    # consumed it as data and no bare `--` made it evidence.
+    if args[0] in ("-h", "--help") \
+            or group == "review" and _review_help(args):
         return True
     if group in DRY_RUN_GROUPS and "--dry-run" in args:
         return True

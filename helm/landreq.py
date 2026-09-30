@@ -116,8 +116,8 @@ import threading
 import time
 import unicodedata
 
-from . import (carriageckpt, dispatches, foldcheck, foldcompose, home, pk,
-               projscope, query, vcs)
+from . import (carriageckpt, dispatches, foldcheck, home, pk,
+               projscope, vcs)
 from .seats_common import recipient_matches
 from .store import load as store_load
 from .work import _lanes
@@ -139,6 +139,34 @@ _LAND_BUDGET_S = 3600      # land within 1h of the verdict
 _PUSH_BUDGET_S = 1800      # reach upstream within a further 30m
 LAND_STALL_S = {"READY": _LAND_BUDGET_S,
                 "MERGED_LOCAL": _LAND_BUDGET_S + _PUSH_BUDGET_S}
+# THE INTEGRATOR'S CLOCK ON A SOURCE-CLEAN HOLD (task/2695). A hold
+# `--source-clean` says the review is FINISHED and moves the next move to the
+# integrator's land gate, so the reviewer's stage dwell stops billing — and
+# until this, nothing replaced it: the row named its holder honestly and could
+# never be LATE. It is measured from `hold_ts`, the instant THIS hold began
+# (`owner_gated`'s argument one field over: a ten-day review held one minute
+# ago owes its new holder one minute), and billed to the integrator.
+#
+# NOT THE REVIEWER'S NUMBER, because it is not the reviewer's work. A review
+# turnaround is the row's own `deadline_s` (2700s by default: one read). What
+# the integrator owes after a clean read is a GATE TURNAROUND — take the tip
+# into the next train, run one whole suite on the composed tree, land it, and
+# close the row — so the threshold is the two things that wait is made of,
+# each MEASURED rather than rounded:
+#   * the train cadence: the p90 gap between consecutive `trainNNN:` merges on
+#     trunk, over the 78 gaps before this constant, is 89 minutes (median 25).
+#     A tip held just after a train left waits for the next one; p90 rather
+#     than the median so an ordinary slow evening does not bill anybody;
+#   * one whole-suite gate on that train: train188's receipt ran 893s wall.
+# 89m + 15m = 104 minutes. Measured against the rows that motivated it, the
+# seven source-clean holds task/3053 found already on trunk got there between
+# 6 minutes BEFORE their hold was recorded and 27 minutes after it, so the
+# honest population is well inside it — and what makes a row LATE here is
+# what task/3053 found: a land that shipped the tip and left the row open.
+# If train cadence or suite wall changes materially, re-measure BOTH terms.
+_TRAIN_GAP_P90_S = 89 * 60
+_WHOLE_SUITE_WALL_S = 15 * 60
+SOURCE_CLEAN_GATE_S = _TRAIN_GAP_P90_S + _WHOLE_SUITE_WALL_S
 # REVIEWED is deliberately ABSENT from every threshold table: it is either an
 # undeclared historical verdict OR a declared approval held by tier/gate policy.
 # Neither creates a billable land/author clock until authorization is resolved.
@@ -432,8 +460,6 @@ def approval_authority(row, index=None, epoch=None, repo=None):
 # all index "READY", so rewriting it here would quietly drop the row out of
 # stall accounting and owed-by routing. Enforcement stays in the land door,
 # which owns its own rungs; this is the display saying which one will bite.
-_READY_RUNG_ORDER = ("SELF-REVIEW", "CONTESTED", "STALE-BASE")
-
 # How many trunk commits a READY row's base may lack before the base is called
 # DEAD rather than merely older. The unit is "trunk commits the gate receipt
 # never saw", because that is the thing staleness actually risks: the receipt
@@ -616,6 +642,13 @@ def _ledger_fold():
     second reader. Sharing the fold also means both joins describe ONE ledger
     moment, so they can never disagree about which rows exist.
 
+    THE READ IS STRICT because these joins make absence claims: a malformed
+    complete row may be the first writer or the verdict that contests a tip,
+    so silently skipping it can admit an author's read or erase a contest.
+    `snapshot_and_events` supplies rows, raw event ids and accepted-verdict
+    positions from one strict fold of one ledger prefix; an event id the fold
+    could not open is unreadable evidence too, never an absent row.
+
     A REFUSAL IS NEVER MEMOISED. An unreadable ledger is a fact about this
     moment; caching it would hand a transient failure to every later reader of
     an unchanged file.
@@ -630,11 +663,24 @@ def _ledger_fold():
                 _LEDGER_FOLD_MEMO["verdicts"], None)
     try:
         from . import dispatches
-        rows, verdicts, unavailable = dispatches.snapshot_with_verdicts()
+        rows, events, _taken, verdicts, unavailable = \
+            dispatches.snapshot_and_events()
     except Exception as exc:                                  # noqa: BLE001
         return None, {}, "dispatch ledger unreadable: %s" % exc
     if unavailable:
         return None, {}, str(unavailable)
+    # Strict JSON is not yet a strict projection. A complete, well-shaped event
+    # may still fail to open a row (`_new_state` rejects an orphan transition or
+    # malformed dispatch), and an absence join cannot silently treat that row's
+    # possible author or contest as nonexistent. The board projection guards the
+    # same boundary; this shared authorship/contest fold must fail closed too.
+    unopenable = sorted(rid for rid in events if rid not in rows)
+    if unopenable:
+        return None, {}, (
+            "dispatch ledger unreadable: %d row id(s) have events but no "
+            "openable dispatch (%s%s)"
+            % (len(unopenable), ", ".join(r[:12] for r in unopenable[:3]),
+               ", …" if len(unopenable) > 3 else ""))
     if key is not None:
         _LEDGER_FOLD_MEMO.clear()
         _LEDGER_FOLD_MEMO.update(key=key, rows=rows, verdicts=verdicts)
@@ -783,7 +829,9 @@ def independent_review(lr, index=None, receipts=None):
 
     TWO SOURCES, BOTH NAMED, NEITHER INLINED. The row-local half is
     `self_reviewed` — the sender/recipient comparison that has always been THE
-    shared rule — and the chain half is the ledger join above. A row with NO
+    shared rule — and the chain half is the ledger join above. The row-local
+    half speaks only where the join names no writer (`_unjoined_author`): a
+    sender the join holds and does not name only asked for a read. A row with NO
     WORK IDENTITY AT ALL — neither an id nor a chain root, which is the shape
     of a projection built outside the ledger — joins to nothing and is judged
     by the row-local rule alone, which is why threading this through changes
@@ -802,8 +850,10 @@ def independent_review(lr, index=None, receipts=None):
     longer exists, and an outsider on another chain read other work entirely.
 
     CONSERVATIVE PROVENANCE, SAID OUT LOUD: the contributors are seats the
-    ledger records as having SUBMITTED work into this chain, never a proof of
-    Git authorship — see `chain_contributor_index`."""
+    ledger records as having written code in this chain (`chain_writers`: a
+    builder, a patch author, the seat that first brought, anywhere on the
+    ledger, a tip the chain reads), never a proof of Git authorship — see
+    `chain_contributor_index`."""
     wrote, approved, err = chain_contributors(lr, index=index)
     if err:
         return None, ("UNKNOWN — helm could not read this chain's authorship "
@@ -815,14 +865,16 @@ def independent_review(lr, index=None, receipts=None):
     # THE ROW ITSELF IS EVIDENCE about one author, and the ledger join may not
     # hold it: a projection built outside the ledger joins to nothing, and a
     # sibling APPROVE from the row's OWN author must not be counted as an
-    # outsider read just because the join came back empty. So the roster the
-    # SIBLING SEARCH and the printed sentence use carries the row's author;
-    # the reviewer-is-the-author question stays with `self_reviewed`, the one
-    # named rule, so a caller that disables that rule disables this rung.
-    authors = set(wrote)
-    if str(lr.get("author") or "").strip():
-        authors.add(str(lr.get("author")).strip())
-    if not self_reviewed(lr.get("author"), reviewer) and not any(
+    # outsider read just because the join came back empty. So where the join
+    # names no writer, the roster the SIBLING SEARCH and the printed sentence
+    # use carries the row's author; the reviewer-is-the-author question stays
+    # with `self_reviewed`, the one named rule, so a caller that disables that
+    # rule disables this rung. Where the join names writers it is the whole
+    # answer (`_unjoined_author`, task/3356): the row's sender may only have
+    # asked for this read, which is not writing the lane.
+    author = _unjoined_author(lr.get("author"), wrote)
+    authors = set(wrote) | ({author} if author else set())
+    if not self_reviewed(author, reviewer) and not any(
             _same_seat(reviewer, name) for name in wrote):
         return True, ("independent — %s wrote no round of this chain and "
                       "approved the final tip %s"
@@ -919,7 +971,7 @@ def ready_rung_why(lr, index=None, contest=None, contributors=None):
     — and a reader that must act differently on each (`helm train` excludes
     the first and keeps the others) cannot recover which one from the word.
 
-    Returns one of _READY_RUNG_ORDER, or "UNVERIFIED" when a rung cannot be
+    Returns one of the readiness rung symbols, or "UNVERIFIED" when a rung cannot be
     EVALUATED (receipt absent from the ledger, trunk unreadable). UNVERIFIED is
     a real answer and never a pass: the whole defect being fixed is a word that
     implied more than it had checked, and replacing it with a different
@@ -1404,7 +1456,7 @@ ANCESTOR, NOT_ANCESTOR, UNDETERMINED = "ancestor", "not-ancestor", "undetermined
 # EXACTLY 40 (sha1) or 64 (sha256). The old {40,64} accepted 41..63, which no git
 # object name can ever be — a receipt field that admits impossible values is a
 # validator that has stopped validating.
-_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_SHA = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")      # a turn/receipt hash
 _HEXID = re.compile(r"[0-9a-f]{8,64}\Z")    # a patch-id
 
@@ -2881,15 +2933,16 @@ def _ancestry(gitdir, commit, ref):
 def _batched_ancestry(gitdir, commit, ref):
     """Projection-scoped BATCH ancestry, or None for "ask per pair".
 
-    The `--git-dir` twin of vcs `_batched_ancestry` (same two sets, same
+    The `--git-dir` twin of vcs `_batched_ancestry` (same two questions, same
     tri-state): reachable-from-`ref` answers ANCESTOR, present-but-unreachable
-    answers NOT_ANCESTOR, and a sha in NEITHER set stays UNDETERMINED — the
+    answers NOT_ANCESTOR, and a sha that is NEITHER stays UNDETERMINED — the
     vanished-object case merge-base reports as 128, kept distinct for the same
     reason `_ancestry`'s docstring gives for never folding 128 into "no".
     cProfile 2026-08-07: the per-pair spawns were 140 of `lr list`'s 155
-    seconds; two listings per projection replace them. None on: no open scope,
-    a non-full-sha commit, or either listing unavailable — every exit falls
-    back to the spawn, never to a guess."""
+    seconds; one rev-list per projection plus one batch line per unreachable
+    tip replace them. None on: no open scope, a non-full-sha commit, or either
+    question unanswerable — every exit falls back to the spawn, never to a
+    guess."""
     if not projscope.active():
         return None
     sha = commit.strip().lower()
@@ -2900,12 +2953,13 @@ def _batched_ancestry(gitdir, commit, ref):
         return None
     if sha in reach:
         return ANCESTOR
-    objs = _sha_set(gitdir, ("cat-file", "--batch-check=%(objectname)",
-                             "--batch-all-objects", "--unordered"),
-                    ("lr.objset", gitdir))
-    if objs is None:
+    # ONE QUESTION ABOUT THIS SHA, never a listing of the whole store
+    # (task/3090): `vcs.exists` asks the scope's batch process, which `git -C`
+    # opens on a git directory as readily as on a checkout.
+    present = vcs.exists(gitdir, sha)
+    if present is None:
         return None
-    return NOT_ANCESTOR if sha in objs else UNDETERMINED
+    return NOT_ANCESTOR if present else UNDETERMINED
 
 
 def _sha_set(gitdir, args, key):
@@ -2960,7 +3014,8 @@ def _vanished_proof(gitdir, tip):
     object there is no patch-id to compare, so a landed-under-a-rewrite tip
     is indistinguishable from one that never landed. That residual is bounded
     by the door this feeds, not by this function — `subsumed` independently
-    requires a cross-family APPROVE whose reviewed tip IS proven on trunk, so
+    requires a cross-family (or non-author) APPROVE whose reviewed tip IS
+    proven on trunk, so
     the work being answered is established by the confirmation rather than by
     this absence. A future caller that wants `absent` WITHOUT that corroborating
     clause must not reuse this result as if it carried one.
@@ -3005,7 +3060,8 @@ def _vanished_absence(gitdir, tip):
     corroborating clause — `withdrawn` records "not on trunk" on nothing else —
     would otherwise publish a negative about an object nobody measured.
     `subsumed` is the door `_vanished_proof` was built for, and it carries the
-    clause: a later cross-family APPROVE whose own tip IS proven on trunk.
+    clause: a later cross-family (or non-author) APPROVE whose own tip IS
+    proven on trunk.
     `superseded` asks too, but only to ROUTE a destroyed reviewed object into
     the translated door's destroyed-object arm, which adjudicates it on its
     own rungs and records no absence.
@@ -4192,7 +4248,9 @@ def _lane_family_refs(gitdir, lane, branch, table=None):
     board too, an enumerated list is the second spelling that goes stale on
     the next invented namespace, and interlock law 2 already rules which
     direction to err in — a match only ever REFUSES, so over-matching costs an
-    operator one read of a refusal that names the ref.
+    operator one read of a refusal that names the ref. The one exclusion is
+    the review pins, which `ref_table` drops: a pin is named by a row id and
+    is never a lane.
 
     `table` IS THE SAME READING, BOUGHT ONCE. A sweep asks this question of
     every row on the board and the answer for two rows in one repository comes
@@ -4215,22 +4273,33 @@ def _lane_family_refs(gitdir, lane, branch, table=None):
 
 
 def ref_table(gitdir):
-    """([(refname, objectname)], err) — the repository's WHOLE ref table.
+    """([(refname, objectname)], err) — the repository's WHOLE ref table,
+    less the review pins.
 
     Split out of `_lane_family_refs` so a sweep can buy one read per
     repository and hand it to every row. Same tri-state contract: `err`
     non-None means the table could not be read, which is UNKNOWN and never an
     empty table — "this repository has no refs" and "I could not look" are the
-    two answers a fail-closed probe may never confuse."""
+    two answers a fail-closed probe may never confuse.
+
+    THE PINS ARE DROPPED HERE, ONCE PER READ (task/3642). A review pin is
+    evidence, never a place work lives (`_reaching_ref` states why), and it is
+    named by a row id, never by a lane, so no reader of this table wants one.
+    Each reader still paid for them: every row's lane-family rung stems every
+    ref, and measured on a mirror of helm's repository holding 3,257 pins that
+    rung cost 7.5 ms a row with them and 1.4 ms without, while no row's
+    presence rested on a pin. Two namespaces helm itself defines are left
+    out; every other namespace, including one invented tomorrow, stays in."""
     p = _git(gitdir, "for-each-ref", "--format=%(refname) %(objectname)")
     if p is None or p.returncode != 0:
         return None, ("Git could not enumerate the repository's refs%s"
                       % ((": " + p.stderr.strip()) if p is not None
                          and p.stderr.strip() else ""))
+    pins = (dispatches.REVIEWED_PIN_NS, dispatches.RETIRED_PIN_NS)
     rows = []
     for line in p.stdout.splitlines():
         parts = line.split()
-        if len(parts) != 2:
+        if len(parts) != 2 or parts[0].startswith(pins):
             continue
         rows.append((parts[0], parts[1]))
     return rows, None
@@ -4733,23 +4802,79 @@ def _live_holder(gitdir, sha):
     return hit[0].strip() if hit else None
 
 
+def _unpinned_patterns(refnames):
+    """The fewest `for-each-ref` patterns that select every ref in
+    `refnames` outside the pin namespaces and no ref inside them.
+
+    Each pattern is a whole-component prefix with no glob in it, which git
+    matches "completely or from the beginning up to a slash" on every
+    version: `refs/heads` selects `refs/heads/x` and never `refs/headsx`. A
+    ref contributes its SHORTEST prefix that is not a parent directory of a
+    pin namespace, so `refs/heads/lane/x` gives `refs/heads`, while
+    `refs/helm-retired/lane/x` gives `refs/helm-retired/lane`, because
+    `refs/helm-retired` would select the retired pins again. A ref with no
+    such prefix (`refs/helm-retired/<leaf>`) is its own pattern. A ref name
+    cannot hold `*`, `?`, `[` or a backslash (git check-ref-format), so no
+    prefix can read as a glob."""
+    pins = (dispatches.REVIEWED_PIN_NS, dispatches.RETIRED_PIN_NS)
+    cover = set()
+    for ref in refnames:
+        if ref.startswith(pins):
+            continue
+        parts = ref.split("/")
+        heads = ("/".join(parts[:n]) for n in range(2, len(parts)))
+        cover.add(next((h for h in heads
+                        if not any(ns.startswith(h + "/") for ns in pins)),
+                       ref))
+    return sorted(cover)
+
+
 def _reaching_ref(gitdir, sha):
     """(refname-or-None, err) — one ref this commit is reachable from.
 
-    `--count=1` because the question is existential: the FIRST reaching ref
-    ends the walk, and naming it is what makes the refusal readable. A ref
+    `--count=1` because the question is existential, and naming the first
+    reaching ref in git's own order is what makes the refusal readable. A ref
     table git could not read is `err`, never an empty answer — the difference
     between "nothing retains this commit" and "I could not ask" is the whole
-    difference between ABANDONED and UNCLASSIFIED."""
+    difference between ABANDONED and UNCLASSIFIED.
+
+    A REVIEW PIN IS NOT A PLACE WORK LIVES (task/2383). Every verdict pins
+    the tip it names under `refs/helm-reviewed/` (a close moves it to
+    `refs/helm-retired/reviewed/`) so the evidence survives `git gc`; counting
+    those would keep every reviewed tip retained forever, and no row could
+    ever read abandoned.
+
+    AND THE WALK NEVER VISITS ONE (task/3642). `--contains` with no pattern
+    tests every ref for the commit, so each pin cost every call. Measured on
+    a mirror of helm's repository over twenty off-trunk tips: with 3,257
+    pins the unpatterned walk took a median of about 300 ms a call, and 3,500
+    more pins (`helm lr backfill-review-pins`) took it to about 440 ms; the
+    patterned walk named the same ref for all twenty in 40 to 65 ms. The walk
+    is handed the patterns `_unpinned_patterns` builds from the ref table:
+    every other ref, pins never. This is the route on every git;
+    `for-each-ref --exclude` exists only from git 2.42, measured no faster
+    here, and one route means the tests exercise the call that runs
+    everywhere. The table read costs 5 ms on packed refs (about 20 ms while
+    3,500 new pins are still loose) and is memoised inside a projection,
+    where the lane-family rung has already asked the same question. A
+    repository whose every ref is a pin gets no walk at all: an empty
+    pattern list is not "nothing" to git, it is "every ref"."""
+    rows, err = ref_table(gitdir)
+    if err:
+        return None, ("Git could not list the refs that might reach %s (%s)"
+                      % (sha[:12], err))
+    patterns = _unpinned_patterns(name for name, _obj in rows)
+    if not patterns:
+        return None, None
     p = _git(gitdir, "for-each-ref", "--count=1", "--format=%(refname)",
-             "--contains", sha)
+             "--contains", sha, *patterns)
     if p is None or p.returncode != 0:
         return None, ("Git could not ask which refs reach %s%s"
                       % (sha[:12],
                          (": " + p.stderr.strip()) if p is not None
                          and p.stderr.strip() else ""))
-    hit = (p.stdout or "").strip().splitlines()
-    return (hit[0].strip() if hit else None), None
+    hit = [ref.strip() for ref in (p.stdout or "").splitlines() if ref.strip()]
+    return (hit[0] if hit else None), None
 
 
 def off_frontier_reason(lr, table=None, cache=None):
@@ -5938,6 +6063,19 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
         and not (terminal and closed_at is None)
     threshold = None if retired else _threshold(
         "OPEN" if active_contrary else state, row.get("deadline_s"))
+    # THE SOURCE-CLEAN HOLD'S OWN CLOCK (task/2695), measured from `hold_ts`
+    # and never from stage entry: see SOURCE_CLEAN_GATE_S. An owner-gated hold
+    # cannot also be source-clean (the door refuses the pair and replay drops
+    # the claim), and a retired row owes nobody. An unreadable or future hold
+    # stamp is UNKNOWN — no age, so no alarm — exactly as `dwell_known` treats
+    # an unreadable stage stamp; a row that cannot be measured is not late.
+    source_clean_held = bool(row.get("source_clean_tip")) and not retired \
+        and not row.get("owner_gated")
+    held_at = _epoch(row.get("hold_ts")) if source_clean_held else None
+    hold_age = int(max(0, now - held_at)) \
+        if held_at is not None and held_at <= now + FUTURE_SKEW_S else None
+    if source_clean_held:
+        threshold = SOURCE_CLEAN_GATE_S
     # A land-side stall is only assertable when landing is OBSERVABLE; the
     # review-side states — and CHANGES_REQUESTED, which is the ledger's own
     # record of a FIX verdict — are pure ledger facts and always assertable.
@@ -6008,8 +6146,24 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
     # is how they answered. Two surfaces gave OPPOSITE answers about one row
     # for as long as this was missing -- `dispatch triage` printed HELD naming
     # the integrator's land gate while `lr show` printed AWAITING_REVIEW.
+    #
+    # UNLESS ITS HOLDER RUNG REFUSES (task/3053; the read's finding f for a
+    # hold that records NO HOLDER, the author's ruling 3 in round 4 for a
+    # stamped one). The land closes a source-clean row only on a hold its
+    # RECIPIENT is on record as making and that seat wrote none of the lane,
+    # and `helm train` takes no other as a car — so for a hold that records
+    # nobody, a stranger's hand or a lane author's, the one move that clears
+    # the row is its reviewer's release and re-hold, never the integrator's
+    # close, which refuses it. Billing the integrator would chase the one
+    # seat that cannot pay the debt. ONE PREDICATE CALL (`source_clean_rehold`
+    # asks `source_clean_holder_error` over the memoised read-side join), and
+    # its answer rides on the row below so no surface reads the hold again.
+    rehold = source_clean_rehold(row) \
+        if row.get("source_clean_tip") and not retired \
+        and not active_contrary else None
     owed_by = "nobody" if retired else "integrator" if active_contrary \
-        else "integrator" if row.get("source_clean_tip") \
+        else ("reviewer" if rehold else "integrator") \
+        if row.get("source_clean_tip") \
         else "nobody (undeclared)" if state == "REVIEWED" and polarity is None \
         else "unknown (declared verdict held)" if state == "REVIEWED" \
         else OWED_BY.get(state, "unknown")
@@ -6121,9 +6275,31 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
             # `owed_by` below now names who actually owes it. The integrator's
             # own debt runs from `hold_ts`, which this card already carries,
             # and it is a different clock from stage entry.
-            "stalled": False if retired or row.get("owner_gated")
-            or row.get("source_clean_tip") else bool(
+            #
+            # task/2695: the integrator's clock IS that different clock. The
+            # row goes LATE when its HOLD — not its dispatch, not its stage —
+            # is older than one gate turnaround, and `owed_by` above already
+            # bills the integrator for it — or the reviewer, when the hold
+            # records no holder and only a re-hold can clear it (task/3053).
+            "stalled": False if retired or row.get("owner_gated") else bool(
+                hold_age is not None and hold_age >= SOURCE_CLEAN_GATE_S)
+            if row.get("source_clean_tip") else bool(
                 threshold and dwell >= threshold and assertable),
+            # HOW LONG THE SOURCE-CLEAN HOLD HAS WAITED ON THE INTEGRATOR, in
+            # seconds, or None when the row is not such a hold or its stamp
+            # cannot be read. `dwell_s` stays the stage dwell every other
+            # reader sorts on; this is the clock `stalled` read.
+            "hold_age_s": hold_age,
+            # WHO RECORDED THE HOLD (task/3053) — the hand the source-clean
+            # land door judges, carried so a surface can name it.
+            "hold_actor": row.get("hold_actor"),
+            # THE HOLDER RUNG'S ANSWER AS A DOOR (task/3053 round 4):
+            # {"kind", "why", "door"} when the row's source-clean hold is its
+            # REVIEWER's to re-make — NO HOLDER, a hand not the recipient's, a
+            # LANE AUTHOR's, an unreadable chain — else None. `owed_by` above
+            # was decided on it; `lr list`, `lr show`, the obligation sentence
+            # and the stale sweep print it, and none reads the hold again.
+            "source_clean_rehold": rehold,
             "terminal": terminal,
             "land_state": "NOT_CLAIMED" if delivered_report else
             "UNKNOWN" if abandoned or not observable else
@@ -6193,6 +6369,9 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
             # why it compared repo+evidence and silently ignored the trunk.
             "carried_base": row.get("carried_base"),
             "carried_tip": row.get("carried_tip"),
+            # the reviewed-patch rung's mapping (task/1484): which trunk
+            # commit carries which reviewed cure commit, and their patch id
+            "patch_twins": row.get("patch_twins"),
             "chain_path": row.get("chain_path"),
             "chain_fork_census": row.get("chain_fork_census"),
             "chain_census_cutoff": row.get("chain_census_cutoff"),
@@ -6255,6 +6434,16 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
             # a correctly-accepted verdict look ignored.
             "withdrawing_seat": row.get("withdrawing_seat"),
             "close_actor": row.get("close_actor"),
+            # A LANDED SOURCE-CLEAN HOLD'S TWO HALVES (task/3053), carried for
+            # the reason the chain-proof tuple above is: a proof that survives
+            # the WRITE and is dropped by the READ cannot be shown, and the
+            # ladder's own retry check reads the gate from here.
+            "source_clean_hold_actor": row.get("source_clean_hold_actor"),
+            "source_clean_hold_ts": row.get("source_clean_hold_ts"),
+            "source_clean_gate": row.get("source_clean_gate"),
+            "source_clean_gate_head": row.get("source_clean_gate_head"),
+            "source_clean_gate_tree": row.get("source_clean_gate_tree"),
+            "source_clean_anchor": row.get("source_clean_anchor"),
             "discharged": discharged,
             "superseding_tip": row.get("superseding_tip"),
             "superseding_id": row.get("superseding_id"),
@@ -6331,6 +6520,13 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
     # projection is byte for byte what it was. `lr show` prints it.
     if dispatches.unknown_event_kinds(row):
         out[dispatches.UNKNOWN_KINDS_FIELD] = dispatches.unknown_event_kinds(row)
+    # A MODEL RUN'S ADVISORY READS RIDE THE LOOP THE SAME WAY (task/3081): the
+    # dispatch fold already carries them, this projection dropped them, and
+    # `lr show` read `verdict (none)` over a row holding one. Only a loop
+    # that carries a read carries the key, oldest first as recorded.
+    if row.get("advisory_reads"):
+        out["advisory_reads"] = [dict(r) for r in row["advisory_reads"]
+                                 if isinstance(r, dict)]
     out.update(attest)
     # Stamped AFTER attest so the predicate judges the fields a consumer will
     # actually read; it is a pure function of the row, so JSON consumers get
@@ -6442,7 +6638,7 @@ def _ancestry_append(gitdir, unseen):
 # id in this store would be a key nothing can ever match — while still
 # counting toward a cover that calls itself complete and therefore
 # licenses ABSENT. Only what git actually emits is admitted here.
-_MEASURED_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_MEASURED_ID = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 TRUNK_PATCH_INDEX = "trunk-patch-index.json"   # see _trunk_index_extend
 TRUNK_PID_BACKFILL = 150                  # frontier commits hashed per pass
 _TRUNK_INDEX_MEMO = {}
@@ -8143,6 +8339,23 @@ def project_raw(now=None, selector=None, repo_id=None, scope=None, cache=None):
             lr["foreign_repo"] = src.get("foreign_repo")
         elif src.get("origin_unknown"):
             lr["origin_unknown"] = True
+        # THE READS OF EVERY CANCELLED ROW IT CONTINUES RIDE IT (task/3081),
+        # off the same snapshot: a cancelled or rebound row is no land loop,
+        # so its reads had no page. Only a loop that carries one has the key.
+        carried = dispatches.superseded_reads(current.get(rid), current)
+        if carried:
+            lr["superseded_reads"] = carried
+    # THE TASK EACH LOOP SERVES, by the one join (task/3643), here where the
+    # chain's first row and each repository's lane records are in hand: no
+    # surface re-derives it from the lane label and contradicts the stored
+    # key. `task_why` says why it is UNKNOWN; absent when there is a task.
+    from . import taskkey
+    for rid, key in taskkey.row_tasks(
+            {rid: eligible[rid] for rid in out if rid in eligible},
+            current).items():
+        out[rid]["task"] = key.task
+        if not key.task and key.why != taskkey.NO_TASK:
+            out[rid]["task_why"] = key.why
     return out, current, None
 
 
@@ -8594,7 +8807,31 @@ def _unbill_contained(lr):
 
     IT CLEARS THE FLAG AND NOT THE DWELL. The row still renders, still carries
     how long it has sat, and the time it sat is exactly what makes it worth
-    finding — suppressing that would hide the row rather than re-address it."""
+    finding — suppressing that would hide the row rather than re-address it.
+
+    EXCEPT A SOURCE-CLEAN HOLD (task/2695, task/3053), whose clock is the
+    integrator's and whose debt on trunk IS the ledger's: the land shipped the
+    tip, and the one move left — `close --reason source-clean-landed` — is the
+    integrator's to make. A contained source-clean row is precisely the row
+    task/3053 found sitting open, so clearing its flag here would recreate the
+    invisibility this clock exists to end.
+
+    AND A HOLD THAT RECORDS NO HOLDER KEEPS ITS FLAG TOO, billed where `_lr`
+    already put it: on the REVIEWER, whose release and re-hold is the one move
+    that lets the land close it. The flag and `owed_by` are left exactly as
+    `_lr` wrote them, so this never re-addresses a source-clean debt.
+
+    UNLESS TRUNK CARRIES ONLY A COPY (the author's ruling on the Fable read's
+    open question): a held tip trunk holds by PATCH IDENTITY cannot close
+    source-clean-landed, which proves ancestry alone, so the integrator owns
+    no move on it. The one move left is a verdict from its recipient
+    (`SOURCE_CLEAN_COPY_ON_TRUNK` says so on every surface), so the debt is
+    the reviewer's, and the clock keeps running against them."""
+    if lr.get("source_clean_tip"):
+        if lr.get("trunk_contains_proof") == PROOF_PATCH_EQUIVALENT \
+                and lr.get("owed_by") == "integrator":
+            lr["owed_by"] = "reviewer"
+        return
     lr["stalled"] = False
 
 
@@ -8625,12 +8862,100 @@ def on_main_unverdicted(row):
     main under a live FIX is a contradiction somebody owes, never ledger
     debris.
 
-    It reads three fields every card has carried since the containment mark
-    shipped — `trunk_contains_tip`, `state`, `polarity` — so a projection
-    row, a wire card and an older warm body all answer alike."""
+    A SOURCE-CLEAN HOLD IS NOT NO VERDICT (task/3053, the author's ruling on
+    the seam). Its reviewer read the delta and found nothing, and could not
+    approve only because an approve binds the land gate's token, so a HELD
+    row carrying `source_clean_tip` has no verdict recorded and still is not
+    ledger debris: the landing does not settle it, and its close is owed —
+    the integrator's `foldcheck --apply` when its holder rung passes, its
+    recipient's re-hold when `source_clean_rehold` answers. Folding it onto
+    this line took that debt off both queues while `lr list` billed it, the
+    same reason `scheduler.collapse_class` keeps an owner-gated hold listed.
+    Such a row answers False here, and `source_clean_on_main` is the one
+    sentence every surface prints for it instead.
+
+    It reads four fields — `trunk_contains_tip`, `state` and `polarity`,
+    which every card has carried since the containment mark shipped, and
+    `source_clean_tip`, which the card carries since the exemption (the
+    persisted body's schema moved with it, so a saved body without it is
+    rebuilt rather than read) — so a projection row and a wire card answer
+    alike."""
+    return _contained_unverdicted(row) and not row.get("source_clean_tip")
+
+
+def _contained_unverdicted(row):
+    """Trunk PROVABLY holds this row's work and no verdict is recorded — the
+    half `on_main_unverdicted` and `source_clean_on_main` share, so the two
+    partition exactly the rows the containment mark can speak about."""
     return row.get("trunk_contains_tip") is True \
         and row.get("state") in PRE_VERDICT_STATES \
         and not row.get("polarity")
+
+
+#: THE INTEGRATOR'S CLOSE DOOR FOR A LANDED SOURCE-CLEAN HOLD (task/3053):
+#: foldcheck lists every held source-clean row of the repository against the
+#: land's head and gate, and `--apply` closes each one that qualifies as
+#: `source-clean-landed`.
+SOURCE_CLEAN_CLOSE_DOOR = "helm lr foldcheck <head> --gate gate:<id> --apply"
+
+#: THE ONE CLAUSE for a held source-clean tip that trunk carries only as a
+#: PATCH-IDENTICAL COPY (task/3053, the Fable read's finding on the seam).
+#: `trunk_contains_tip` is True by ancestry OR by patch identity
+#: (`_PROOF_DISCHARGE`), but `source-clean-landed` closes on ancestry alone,
+#: so the close doors REFUSE that row by name — and a sentence naming them
+#: sends the integrator to a door that cannot open. The board
+#: (`source_clean_on_main`) and the stale sweep (`stalebot._source_clean_door`)
+#: both print this, so one row cannot get two answers.
+SOURCE_CLEAN_COPY_ON_TRUNK = (
+    "trunk carries only a patch-identical COPY of it, and "
+    "`source-clean-landed` closes on ancestry alone — no land door closes "
+    "this row; a verdict from its recipient is owed")
+
+
+def source_clean_on_main(row):
+    """The ONE sentence every surface prints for a HELD source-clean row
+    whose work trunk already holds, or None for any other row (task/3053,
+    the author's ruling on the seam).
+
+    `on_main_unverdicted` answers False for such a row, so it is a listed wait
+    on whoever owes its move, and this names that move — the same doors
+    `lr list` and `dispatches._base_label` already hand the two holders:
+
+      * the holder rung passes: "on main · SOURCE-CLEAN close owed by the
+        integrator", with the foldcheck door and the close verb it runs;
+      * `source_clean_rehold` answers (NO HOLDER, a hand not the recipient's,
+        a LANE AUTHOR's): "on main · RE-HOLD owed by @<recipient>", with the
+        re-hold door that rung built. No land can close such a row, so it
+        names no close;
+      * trunk holds the tip only by PATCH IDENTITY (`trunk_contains_proof`,
+        a cherry-picked copy): `SOURCE_CLEAN_COPY_ON_TRUNK`, the stale
+        sweep's own clause. The close proves ancestry alone and refuses a
+        copy by name, so naming its doors here sent the integrator to two
+        that cannot open. The re-hold outranks it, as it does in the sweep.
+
+    `lr list` prints it after its ALREADY ON TRUNK word; the wire card carries
+    it as `source_clean_on_main`, which the pipeline wall, the scheduler row,
+    the waits and the kanban card print verbatim — no surface composes its
+    own copy. It reads only the row's own fields (`source_clean_rehold` is
+    the projection's one answer from the holder rung), so a projection row
+    and a wire card answer alike, and a closed row owes nothing."""
+    if not isinstance(row, dict) or row.get("terminal") \
+            or not row.get("source_clean_tip") \
+            or not _contained_unverdicted(row):
+        return None
+    rehold = row.get("source_clean_rehold")
+    if isinstance(rehold, dict) and rehold:
+        who = str(row.get("reviewer") or row.get("recipient") or "").strip()
+        return "on main · RE-HOLD owed by @%s: %s" % (
+            who or "?", rehold.get("door") or rehold.get("why") or "?")
+    if row.get("trunk_contains_proof") == PROOF_PATCH_EQUIVALENT:
+        return "on main · held source-clean at %s, but %s" % (
+            str(row.get("source_clean_tip"))[:12], SOURCE_CLEAN_COPY_ON_TRUNK)
+    return ("on main · SOURCE-CLEAN close owed by the integrator: `%s`, or "
+            "`helm lr close %s --reason source-clean-landed --gate gate:<id>`,"
+            " gate:<id> being a verified whole-suite receipt on a commit "
+            "containing the tip"
+            % (SOURCE_CLEAN_CLOSE_DOOR, str(row.get("id") or "")[:12]))
 
 
 def _annotate_trunk_containment(out, eligible=None, gitdir=None,
@@ -9717,15 +10042,15 @@ def inflight_rows(rows):
     `_loop_rows` already folds chains; this drops the two kinds that are not
     work — a retirement (carried only by `--all`) and an HONORED row, whose
     verdict was discharged through succession or which IS the confirmation
-    instrument. The browser has partitioned honored out since 2026-08-04
-    (`00-core.js` lrHonored, `live.length + " in flight"`), on the owner's
-    ruling that "superseded, if verified, should just be like another type of
-    closed" — while `helm lr list` counted them IN, so one word named two
-    numbers ACROSS the two surfaces even after the filed bucket was renamed
-    to fix it WITHIN one. The predicate is `honored_display`,
-    the same one every python surface asks and the twin of the browser's
-    `lrHonored`, so the two cannot drift apart again without a parity test
-    failing.
+    instrument. The browser partitioned honored out on the owner's ruling
+    that "superseded, if verified, should just be like another type of
+    closed" — while `helm lr list` counted them IN, so one word named
+    two numbers ACROSS the two surfaces even after the filed bucket was
+    renamed to fix it WITHIN one. The predicate is `honored_display`, the
+    one every python surface asks. Its browser twin (`lrHonored`) was
+    retired with the land board (task/3643): the Work page reads the
+    settlements from the server (`/api/work`), so there is no second copy
+    left to drift.
 
     THE ROWS ARE STILL SHOWN. This is the accounting, not the listing —
     an honored row keeps its SUPERSEDED-CLOSED mark on every surface."""
@@ -9735,16 +10060,15 @@ def inflight_rows(rows):
 
 def filed_line(filed):
     """The strip, one shape on every surface: `helm lr list` prints this
-    string and the card's lrCardHTML mirrors it term for term (pinned against
-    each other in tests), so a number the owner pastes from either surface
-    reads identically on the other."""
+    string, and every surface that prints the strip prints it in these
+    words, so a number the owner pastes from one reads identically on
+    another."""
     # A BUCKET THE BODY DOES NOT CARRY IS SAID, NOT CRASHED AND NOT ZEROED.
     # A WARM body minted by a server older than a bucket has no key for it,
     # and this formatter is on the read path for exactly those: `%(key)d`
     # raised KeyError and took the whole listing down. Rendering 0 would be
     # worse than the crash -- it is a confident claim about a number the
-    # sender never sent. The card's JS already answers "?" for the same case
-    # (FILED_WAS / fterm), so this is the same law on the python surface.
+    # sender never sent. "?" is the answer for a bucket the body lacks.
     def _term(key):
         value = filed.get(key)
         return str(value) if isinstance(value, int) else "?"
@@ -9928,7 +10252,11 @@ _DEBT_ABSORBING = ("LANDED", "SUPERSEDED")
 # `out-of-scope` did NOT — they end the work, so whatever the parent owed is
 # still owed.
 _DEBT_ABSORBING_CLOSE = ("landed", "superseded", "subsumed",
-                         "delivered-report")
+                         "delivered-report",
+                         # a landed source-clean hold (task/3053) is this
+                         # row's own work on trunk, proved by ancestry —
+                         # `landed`'s claim without an APPROVE
+                         "source-clean-landed")
 
 
 def _absorbs_debt(kid):
@@ -10062,7 +10390,7 @@ def _relieved(rid, kids, node):
     (`--all` and `show` kept it, which is exactly how it stayed unnoticed).
     Minting the author's obligation on every FIX makes that successor exist
     every time, so the every-time behaviour is what forced the reading. Same
-    shape as the ABANDONED carve-out in `_successor_owning`: absorbing is a
+    shape as the ABANDONED carve-out: absorbing is a
     property of what the successor DID, never of it merely existing."""
     own = node.get(rid)
     landed_relief_only = bool(own is not None and own.get("contrary"))
@@ -10092,24 +10420,6 @@ def _landed_relief(lr):
                 or lr.get("state") == "LANDED")
 
 
-def _successor_owning(lr, kids):
-    """The successor round that OWNS this row's debt, or None.
-
-    A round superseded by a LIVE sibling is owed by nobody: reworking round 1
-    is meaningless once round 6 exists, so billing round 1's dwell to its
-    author names an obligation no action can discharge. Neither can the close
-    ladder retire it — its `--reason superseded` rung requires THIS row's
-    reviewed change to have physically reached trunk, which is false by
-    construction for a round that was rewritten (measured on 5aa24f98, whose
-    chain head had already LANDED and which the ladder still refused).
-
-    ABANDONED is deliberately NOT debt-absorbing. A successor that was written
-    off carried nothing forward, so the parent keeps whatever it owed — the
-    one direction where staying stalled is the honest answer."""
-    for kid in kids.get(lr["id"], ()):
-        if _absorbs_debt(kid):
-            return kid
-    return None
 
 
 _OWED_SEAT_FIELD = {"author": "author", "reviewer": "reviewer", "builder": "reviewer"}
@@ -13887,7 +14197,7 @@ def annotate_delivered_report(rid, artifact_ref, report_ref, evidence):
 #   3. dispatches._CLOSE_POLARITY        which verdict polarities may use it
 #   4. dispatches._CLOSE_STATE_FIELDS    which proof keys PERSIST (else silent)
 #   5. rowstate._CLOSE_TERMINAL          the word an operator READS
-#   6. cli._VERB_HELP["lr"]              the help text
+#   6. cli_help._VERB_HELP["lr"]         the help text
 #   7. USAGE (this module)               the usage string
 #   8. docs/VERBS.md                     the synopsis AND the prose COUNT
 #
@@ -13937,14 +14247,15 @@ def annotate_delivered_report(rid, artifact_ref, report_ref, evidence):
 CLOSE_CLI_REASONS = ("landed", "superseded", "withdrawn", "out-of-scope",
                      "stranded", "subsumed", "delivered-report", "discharged",
                      "resolved", "carried", "chain-proof", "expired",
-                     "endorsement-moot")
+                     "endorsement-moot", "source-clean-landed")
 
 #: The reasons whose proof is computed IN a named repository against ITS trunk,
 #: so `--repo/--trunk` are the honest way to name them. ONE tuple, because the
 #: refusal message is built from it: a hand-written list beside a membership
 #: test is a second spelling, and it had already gone stale on `chain-proof`.
 REPO_TRUNK_REASONS = ("landed", "stranded", "subsumed", "carried",
-                      "chain-proof", "expired", "endorsement-moot")
+                      "chain-proof", "expired", "endorsement-moot",
+                      "source-clean-landed")
 
 #: Close reasons whose TERMINAL decides the rendered state even for a
 #: FIX/SUPERSEDE row, overriding "verdict intent remains the lifecycle state".
@@ -15360,14 +15671,19 @@ def board_section(now=None):
 USAGE = ("usage: helm lr list [--all] [--all-projects] [--json] [--cold] "
          "| show <id> [--json] |"
          "stalls [--json] | "
-         "foldcheck <tip> [--gate gate:TOKEN] [--repo PATH] [--no-fetch] | "
+         "foldcheck <tip> [--gate gate:TOKEN] [--repo PATH] [--no-fetch] "
+         "[--apply] | "
          "legacy-completion-hints [--json] | "
+         "backfill-hold-actor [<id>...] [--apply] [--json] | "
+         "backfill-review-pins [--apply] [--json] | "
          "land <id> [--json] | compose <id> [<id>...] [--trunk REF] "
          "[--repo PATH] [--bounded-concur] [--dry-run] [--json] | close <id> --reason "
          "landed|superseded|withdrawn|out-of-scope|stranded|subsumed|"
-         "delivered-report|discharged|resolved|carried|chain-proof|expired|endorsement-moot "
+         "delivered-report|discharged|resolved|carried|chain-proof|expired|"
+         "endorsement-moot|source-clean-landed "
          "[--evidence LINE] [--artifact-ref REF] "
          "[--report-ref CHAT_REF] [--tip FULL_SHA] [--repo PATH] [--trunk REF] "
+         "[--gate gate:TOKEN] "
          "[--live | --needs-restart WHAT] "
          "[--compose-manifest PATH --compose-gate gate:ID] [--dry-run] [--json] | "
          "annotate-delivered-report <id> --artifact-ref REF "
@@ -15383,7 +15699,9 @@ USAGE = ("usage: helm lr list [--all] [--all-projects] [--json] [--cold] "
          "retire --off-frontier [--apply] [--all-projects] [--json] | "
          "close-landed <id> --trunk REF "
          "[--repo PATH] [--json] | refs [--repo PATH] [--json] | "
-         "migrate --commit-map PATH [--repo PATH] [--apply] [--json]\n"
+         "migrate --commit-map PATH [--repo PATH] [--apply] [--json] | "
+         "postland [--hours N] [--json] | postland --record <head> "
+         "[--by NAME] [--repo PATH]\n"
          "  list rides the warm projection when a local `helm web` is fresh "
          "(--json included; --cold forces the replay); the same data is "
          "GET /api/lr on that instance, ~26ms warm")
@@ -15572,8 +15890,9 @@ def honored_display(lr):
     through succession (`contrary_discharge` "a"/"b") or which IS the
     succession instrument itself ("c", a confirmation round — rendered as a
     quiet "confirmation", never an alarm) — every python surface that quiets
-    an alarm for these rows asks THIS, and web_ui.html's `lrHonored` is its
-    JS twin (the parity tests pin them equal row for row).
+    an alarm for these rows asks THIS. It is the ONE predicate: its JS twin
+    (`lrHonored`) was retired with the land board (task/3643), and the Work
+    page reads the settlements from the server (`/api/work`).
 
     It exists because the first cut answered the question inline per surface
     and the surfaces immediately disagreed (dispatch 97d8899a): an
@@ -15591,6 +15910,22 @@ def honored_display(lr):
     "unverified" and an absent stamp both answer False, fail-closed."""
     return bool(lr.get("contrary")) \
         and lr.get("contrary_discharge") in ("a", "b", "c")
+
+
+def stall_alarm(lr):
+    """THE one display predicate for the STALLED alarm: the row is past its
+    stage threshold (`stalled`), its verdict was not honored through
+    succession (`honored_display`), and no proved successor carried its work
+    (`succession_state` MOVED). `helm lr list` prints STALLED by it and the
+    one land board marks, counts and filters by it (task/3585), so a row cured
+    on a successor is quiet on both: the board copied the raw flag and alarmed
+    on rows the terminal had already quieted.
+
+    An UNKNOWN succession stays loud, fail-closed: whether a successor carried
+    it cannot be read. DISPLAY ONLY — `stalled`, `_stalled_rows` and stall
+    billing are untouched."""
+    return bool(lr.get("stalled")) and not honored_display(lr) \
+        and lr.get("succession_state") != SUCCESSION_MOVED
 
 
 def ball_holder(lr):
@@ -15771,7 +16106,11 @@ def _unavailable(unavailable):
 # audited references in the file.
 _REF_FIELDS = ("ref", "tip", "reviewed_tip", "original_tip", "superseding_tip",
                "landing_trunk_sha", "retarget_from", "retarget_to",
-               "review_sha", "trunk_sha", "carried_base", "closing_trunk_sha")
+               "review_sha", "trunk_sha", "carried_base", "closing_trunk_sha",
+               # the commit a source-clean land's gate receipt ran on
+               # (task/3053): the half of that terminal's proof a later hand
+               # re-asks "does its history contain the tip" against
+               "source_clean_gate_head")
 _SHA_RE = re.compile(r"\A[0-9a-f]{7,40}\Z")
 _FULL_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
@@ -17137,6 +17476,9 @@ _OWNER_NAMES = (
     ("landreq_close", (
         "_chain_authority", "_chain_authority_anchor", "_chain_children",
         "_chain_end", "_chain_forest", "_chain_key", "_chain_polarity",
+        "_AuthorIndex", "_brings", "_first_bringers", "_fold_author_index",
+        "_fresh_instance_read", "_reads", "_round_tips",
+        "_start_tip", "_tip", "_unjoined_author", "tip_writers",
         "_chain_repo", "_chain_root_index", "_chain_unfinished",
         "_chain_write_authority", "_close_expired_one", "_close_label",
         "_close_ladder_build_landed", "_close_ladder_carried",
@@ -17144,15 +17486,22 @@ _OWNER_NAMES = (
         "_close_ladder_discharged", "_close_ladder_endorsement_moot",
         "_close_ladder_expired",
         "_close_ladder_landed", "_close_ladder_resolved",
+        "_close_ladder_source_clean_landed",
         "_close_ladder_stranded", "_close_ladder_subsumed",
         "_close_ladder_superseded", "_close_ladder_withdrawn",
         "_close_landed_content", "_close_landed_proof",
         "_close_out_of_scope", "_close_repo", "_close_result",
-        "_close_same_tip_siblings", "_close_trunk",
-        "_landed_head_predecessors", "chain_attestation",
+        "_close_same_tip_siblings", "_close_trunk", "_contributor_chains",
+        "_landed_head_predecessors", "_reviewed_patch_twins",
+        "chain_attestation", "chain_authors",
         "chain_contributor_index", "chain_contributors", "chain_credits",
         "chain_fork_census", "chain_frontier_error", "chain_key",
-        "chain_path_intact", "close", "close_landed", "close_routes"
+        "chain_path_intact", "chain_writers", "close", "close_landed",
+        "close_routes",
+        "non_author_error",
+        "SourceCleanRefusal", "source_clean_author_error",
+        "source_clean_car", "source_clean_holder_error",
+        "source_clean_landings", "source_clean_rehold"
     )),
 )
 

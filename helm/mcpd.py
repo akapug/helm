@@ -220,14 +220,13 @@ def mint(seat):
     # makes every INDIVIDUAL write safe and says nothing about the pair.
     # _flocked is helm's own lock and takes a STABLE sibling path, never the
     # atomic-replaced file itself.
-    with seats_common._flocked(path + ".lock") as lock:
+    with seats_common._flocked(path + ".lock", check=True) as lock:
         # REFUSE WITHOUT THE LOCK — mint cannot inherit _flocked's
         # availability-first contract (a second read raised this against the
-        # cure for its own finding, and it was right). _flocked FAILS OPEN by
-        # design: on OSError it yields holding nothing and the body runs
-        # anyway. That is correct for a shared-state mutation, where finishing
-        # matters more than serialising. It is WRONG HERE, because mint issues
-        # a CAPABILITY: a bearer token handed out without exclusive ownership
+        # cure for its own finding, and it was right). `check=True` yields
+        # holding nothing rather than raising, and this mint REFUSES then,
+        # because mint issues a CAPABILITY: a bearer token handed out without
+        # exclusive ownership
         # of the table is a capability we cannot promise to keep.
         #
         # MY FIRST CURE WAS A POST-WRITE READBACK, AND IT IS NOT SUFFICIENT.
@@ -401,16 +400,18 @@ def _tool_chat_read(arguments, seat):
     try:
         # THE CLI'S OWN THREE-STEP, NOT A PARAPHRASE: read returns (rows,
         # total); index_rows numbers the WHOLE room so a reply target means
-        # the same thing on both front-ends; react_prefix supplies the [n]
-        # tag; _fmt renders the line. Reimplementing any of these would make
-        # the two surfaces agree by luck instead of by construction, and the
-        # owner bought this pair AS mutual oracles.
+        # the same thing on both front-ends; read_prefix supplies the [n]
+        # tag and the row's id; _fmt renders the line. Reimplementing any of
+        # these would make the two surfaces agree by luck instead of by
+        # construction, and the owner bought this pair AS mutual oracles.
+        # A run of acks folds into one line here as it does there
+        # (chat.ack_runs): the limit still counts ROWS.
         rows, _total = chat.read(room or "main")
         idx = chat.index_rows(rows)
-        tag = chat.react_prefix(rows)
+        tag = chat.read_prefix(rows)
         shown = rows[-min(limit, 200):]
-        text = "\n".join(tag(rows.index(m)) + chat._fmt(m, idx=idx)
-                          for m in shown)
+        text = "\n".join(chat.run_line(run, tag, idx) for run in chat.ack_runs(
+            enumerate(shown, len(rows) - len(shown))))
     except Exception as e:
         return None, "chat unreadable: %s" % e
     return {"content": [{"type": "text", "text": text}]}, None

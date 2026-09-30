@@ -16,7 +16,8 @@ import sys
 
 from . import chat, eventledger, openflags, pk
 from .seats_common import (ROOM_SCAN_CAP, SCAN_CAP, _BROADCAST, _flocked,
-                           _scrub, _seat_key, _seat_label, recipient_matches)
+                           LockUnavailable, _scrub, _seat_key, _seat_label,
+                           recipient_matches)
 
 
 _CENSUS_FIELD = "delivery_census"
@@ -75,11 +76,6 @@ def _receipt_path(room, row_id):
 
 def _occurrence_dir(room, row_id, occurrence):
     return os.path.join(_receipt_path(room, row_id), _hash(occurrence))
-
-
-def _effect_path(room, row_id, occurrence, recipient, effect):
-    return os.path.join(_occurrence_dir(room, row_id, occurrence),
-                        _hash(recipient, effect) + ".json")
 
 
 def _recipient_id(seat, session, incarnation=None):
@@ -637,8 +633,12 @@ def _broadcast_recipients(row, room):
             # and that is `wake_succeeded`/`turn_executed`, which stay UNKNOWN
             # on their own. Mapping it to UNKNOWN here threw away a physically
             # proven fact to avoid claiming a different one.
+            # A RESTING seat's sink is whatever is physically there: its
+            # rows are held by the rest, not lost (task/3280).
             sink = ({beacons.COVERED: "LIVE", beacons.DEAF: "NONE",
                      beacons.DEAF_IN_EFFECT: "LIVE",
+                     beacons.RESTING: "LIVE" if (wake or {}).get("live")
+                     else "NONE",
                      beacons.VACANT: "VACANT"}.get(verdict, "UNKNOWN"))
         out.append(dict(recipient, current_seat=seat,
                         delivery_paused=bool(pause),
@@ -658,10 +658,21 @@ def receipt_cli(args):
 
 
 def _locate_receipt_row(target):
-    """Freeze DM rename topology across the bounded physical lane census."""
+    """Freeze DM rename topology across the bounded physical lane census.
+
+    A rename-journal lock that cannot be taken is this surface's named
+    refusal, returned as the error its caller prints (task/2520: the lock
+    now raises, and this call sits outside the caller's try, so the raise
+    reached the terminal as a traceback)."""
     from .seats_rename import rename_journal_path
-    with _flocked(rename_journal_path() + ".lock"):
-        return _locate_receipt_row_locked(target)
+    try:
+        with _flocked(rename_journal_path() + ".lock"):
+            return _locate_receipt_row_locked(target)
+    except LockUnavailable as exc:
+        return None, None, None, (
+            "the rename journal lock %s is unavailable (%s), so the DM rename "
+            "topology cannot be held still and no receipt occurrence is "
+            "proven" % (exc.path, exc.why))
 
 
 def _locate_receipt_row_locked(target):

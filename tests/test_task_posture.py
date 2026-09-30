@@ -430,7 +430,12 @@ class DispatchDoorTest(DoorBase):
             "Requires an orca rebuild. " + POSTURE,
             "--ref", "0000000", "--kind", "build", "--new-work"])
         self.assertNotEqual(rc, 0)
-        self.assertNotIn("HORIZON", err)
+        # THE DOOR'S OWN REFUSAL, NOT THE CORRECTED LINE AFTER IT (task/3382):
+        # that line repeats the brief, whose posture clause names HORIZON.
+        refusal = err.split("\ncorrected: ")[0]
+        self.assertTrue(refusal.strip(), err)
+        self.assertNotIn("HORIZON", refusal)
+        self.assertNotIn("carries no posture", err)
 
 
 class TaskAddArgvAndIdentityTest(DoorBase):

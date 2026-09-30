@@ -28,6 +28,17 @@ declares pool providers mints rows for THEM and none for itself. A family that
 declares none is still its own candidate: that is the ordinary case, and the
 only thing such a row could mean.
 
+A GPU ON THE OPERATOR'S OWN BOX IS NOT AN ACCOUNT EITHER. A pool row served
+from his own hardware has no key and no bill, so it mints no row, and a family
+served only from such rows mints none.
+
+WHO IS BILLED IS THE CATALOG'S ONE READING, `seat.billing_accounts`: each
+(account, group) it names is a candidate, the account as its id and the group
+as its vendor. Fleet › credit joins its Families card to the accounts table on
+the same reading (task/3461), so a row this seeder mints is a group that card
+can link; a vendor worked out here a second way was how a fresh home got
+`cursor-bridge` and `opencode-go` rows the card could not match.
+
 A MODEL IS NOT AN ACCOUNT. The catalog also names models it routes to — some of
 them vendor-branded — and a row for each of those would invent subscriptions
 the owner does not hold. Only families and their pool providers become rows.
@@ -71,24 +82,19 @@ def _catalog_families():
         return {}
 
 
-def _vendor(family, spec):
-    """Who is BILLED for this family, in the catalog's own words.
-
-    The catalog spells the vendor three ways because three things are true of
-    different families: `provider` is the upstream service, `auth_type` is the
-    login the family uses, and some families are named after their vendor and
-    carry neither. Reading them in that order is what makes 'kimi' come back as
-    moonshot and 'gemini' as antigravity — the spellings the owner's own list
-    used — instead of the family's internal name."""
-    for key in ("provider", "auth_type"):
-        value = spec.get(key) if isinstance(spec, dict) else None
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return family
+def _billing(family, table):
+    """`seat.billing_accounts` for one family of `table`, or None where it
+    cannot be read — never a raise, `_catalog_families`' law."""
+    try:
+        from . import seat
+        return seat.billing_accounts(family, table)
+    except Exception:                       # noqa: BLE001 — the roster is optional
+        return None
 
 
 def candidates(not_described_for, not_described_not, families=None):
-    """[{row}] — one candidate per declared family and per pool provider.
+    """[{row}] — one candidate per account `seat.billing_accounts` names: a
+    family with no pool, or each pool provider off the operator's own box.
 
     The two placeholder sentences are PASSED IN rather than imported, so this
     module stays a leaf of accounts.py instead of a cycle with it and there is
@@ -119,13 +125,10 @@ def candidates(not_described_for, not_described_not, families=None):
 
     for family in sorted(table):
         spec = table[family] if isinstance(table[family], dict) else {}
-        pool = spec.get("pool_providers")
-        pooled = sorted(pool) if isinstance(pool, dict) and pool else []
-        if not pooled:
-            _add(family, _vendor(family, spec), "the %s seats" % family)
-        for provider in pooled:
-            _add(str(provider), str(provider),
-                 "the %s seats, through their %s pool" % (family, family))
+        reach = ("the %s seats, through their %s pool" % (family, family)
+                 if spec.get("pool_providers") else "the %s seats" % family)
+        for account, vendor in _billing(family, table) or ():
+            _add(account, vendor, reach)
     return rows
 
 

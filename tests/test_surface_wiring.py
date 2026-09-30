@@ -89,23 +89,30 @@ UNIVERSAL_FLAGS = frozenset(("--json", "--help", "--repo", "--seat", "--room",
 ALLOWED_FLAGS = {}
 
 
+def _assigned_dicts(filename):
+    """(name, ast.Dict) for every `NAME = {...}` in one package module."""
+    tree = ast.parse(_read(os.path.join(PKG, filename)))
+    return [(node.targets[0].id, node.value) for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Dict)]
+
+
 def _cli_tables():
-    tree = ast.parse(_read(os.path.join(PKG, "cli.py")))
+    """The dispatch table from cli.py and the verb help table from
+    cli_help.py, where each is written."""
     verb_mod, verb_help = {}, {}
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Assign)
-                and isinstance(node.targets[0], ast.Name)):
-            continue
-        name = node.targets[0].id
-        if name == "VERBS" and isinstance(node.value, ast.Dict):
-            for k, v in zip(node.value.keys, node.value.values):
+    for name, table in _assigned_dicts("cli.py"):
+        if name == "VERBS":
+            for k, v in zip(table.keys, table.values):
                 if isinstance(v, ast.Call) \
                         and getattr(v.func, "id", "") == "_lazy":
                     verb_mod[k.value] = (v.args[0].value, v.args[1].value)
                 elif isinstance(v, ast.Name):
                     verb_mod[k.value] = ("cli", v.id)
-        if name == "_VERB_HELP" and isinstance(node.value, ast.Dict):
-            for k, v in zip(node.value.keys, node.value.values):
+    for name, table in _assigned_dicts("cli_help.py"):
+        if name == "_VERB_HELP":
+            for k, v in zip(table.keys, table.values):
                 if isinstance(v, ast.Constant):
                     verb_help[k.value] = v.value
     return verb_mod, verb_help
@@ -415,11 +422,18 @@ def synopsis_clauses(synopsis, verb, known):
     So the boundary is SEMANTIC: a fragment opens a new clause only when its
     first bareword is a KNOWN ACCEPTED SUBVERB — which the sibling scan in this
     same file already computes. Anything else is alternation and belongs to the
-    clause before it."""
+    clause before it.
+
+    A BRACKET IS GRAMMAR, NEVER PART OF THE NAME. A verb that runs bare
+    brackets the subverb bare runs (`chat [read [--since N|--follow]]|post`,
+    `codex [list]|pool <name>`, `away [off|status]`), so the subverb's token
+    arrives as `[read`, `[list]` or `status]`; read whole, none is a bareword,
+    the clause never opened, and this rung silently stopped checking that
+    subverb's flags."""
     out, cur = {}, None
     for frag in (synopsis or "").split("|"):
         head = None
-        for tok in [t.strip(",") for t in frag.split()[:2]]:
+        for tok in [t.strip(",[]") for t in frag.split()[:2]]:
             if tok == verb:
                 continue
             if BAREWORD.match(tok or ""):
@@ -557,6 +571,37 @@ class FlagDetectorMustHitTest(unittest.TestCase):
         cl = synopsis_clauses(syn, "d", {"claim", "release"})
         self.assertNotIn("--lease", cl["claim"])
         self.assertIn("--lease", cl["release"])
+
+    def test_a_bracketed_subverb_opens_its_clause(self):
+        """A verb that runs bare brackets the subverb bare runs, so its token
+        arrives as `[read`, `[list]` or `status]`. Read whole none is a
+        bareword, no clause opened, and the flag rung silently stopped
+        checking chat read, reflex list and mcpd serve (codex, away and
+        skills had the gap before them). Each bracket shape opens its
+        clause, and the alternation inside the group stays on it."""
+        syn = ("d [read [--since N|--follow]]|post <text> --kind A|B"
+               "|list [--all]")
+        cl = synopsis_clauses(syn, "d", {"read", "post", "list"})
+        self.assertIn("--since", cl["read"])          # `[read` opens
+        self.assertIn("--follow", cl["read"])         # `--follow]]` stays
+        self.assertIn("--kind", cl["post"])
+        self.assertIn("--all", cl["list"])
+        # CONTROL, the other direction: post absorbs nothing of read's.
+        self.assertNotIn("--since", cl["post"])
+        self.assertNotIn("--follow", cl["post"])
+        # `[list]` (one bracketed subverb) and `status]` (the group's last
+        # alternative) open too; `[off` is the first of a bracketed pair.
+        cl = synopsis_clauses("c [list]|pool <name> --x", "c",
+                              {"list", "pool"})
+        self.assertEqual(cl["list"].split(), ["c", "[list]"])
+        self.assertNotIn("--x", cl["list"])
+        cl = synopsis_clauses("a [off|status] --y", "a", {"off", "status"})
+        self.assertEqual(sorted(cl), ["off", "status"])
+        self.assertIn("--y", cl["status"])
+        # CONTROL: a bracketed FLAG group still opens nothing.
+        cl = synopsis_clauses("ship [--apply] [--remote URL] | ship pull",
+                              "ship", {"pull"})
+        self.assertEqual(sorted(cl), ["pull"])
 
 
 class DetectorMustHitTest(unittest.TestCase):
@@ -758,6 +803,44 @@ class FlagClauseRungTest(unittest.TestCase):
             _named_in(clauses.get("cred-follow", ""), "--ensure"),
             "the clause splitter fused cred-follow with doctor: %r"
             % clauses.get("cred-follow"))
+
+    def test_a_bare_running_verbs_bracketed_subverb_has_a_live_clause(self):
+        """The subverb a bare-running verb brackets (`chat [read [--since
+        N|--follow]]`, `reflex [list [--all]]`, `mcpd [serve [--port N]]`,
+        `env [census]`) has a clause of its own on the SHIPPED table through
+        the shipped splitter, and that clause names the flags the entry puts
+        inside the group. Pinned on the live table because the fixture arm
+        above proves the splitter and nothing proves the table: an entry
+        re-spelled `chat [read] [--since N]` would keep the fixture green and
+        move --since out of read's clause. Every subverb named here is one
+        the handler's no-argument branch runs (cmd_chat: `verb = args[0] if
+        args else "read"`; cmd_reflex: `not args or args[0] == "list"`;
+        cmd_mcpd: an empty tail serves; cmd_env: `sub = ... else "census"`)."""
+        verb_mod, verb_help = _cli_tables()
+        expected = {"chat": ("read", ("--since", "--follow")),
+                    "reflex": ("list", ("--all",)),
+                    "mcpd": ("serve", ("--port",)),
+                    "env": ("census", ())}
+        for verb, (sub, flags) in sorted(expected.items()):
+            mod, entry = verb_mod[verb]
+            known = set(accepted_subverbs(_modfiles(mod), entry=entry))
+            self.assertIn(sub, known, "%s: %r is not an accepted subverb of "
+                          "the handler, so no clause can open for it" % (verb, sub))
+            clauses = synopsis_clauses(verb_help[verb], verb, known)
+            self.assertIn(sub, clauses, "%s: the bracketed subverb %r opened "
+                          "no clause; clauses: %s" % (verb, sub, sorted(clauses)))
+            for flag in flags:
+                self.assertTrue(_named_in(clauses[sub], flag),
+                                "%s %s's own clause does not name %s: %r"
+                                % (verb, sub, flag, clauses[sub]))
+        # CONTROL: the clause is CUT, not the whole entry — chat's read
+        # clause holds none of retire-rooms' --idle-days.
+        mod, entry = verb_mod["chat"]
+        clauses = synopsis_clauses(
+            verb_help["chat"], "chat",
+            set(accepted_subverbs(_modfiles(mod), entry=entry)))
+        self.assertFalse(_named_in(clauses["read"], "--idle-days"),
+                         clauses["read"])
 
     def test_no_flag_allowlist_entry_outlives_its_subject(self):  # noqa: VACUOUS_ASSERTION — ALLOWED_FLAGS is empty by design; this fails the moment an entry is added and then cured, which is exactly when a stale ratchet appears
         """Same ratchet guard as the subverb allowlist: an exemption whose

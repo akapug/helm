@@ -234,9 +234,18 @@ def census(root=None):
         return _census(root)
     owner = _OWNER
     hit = next((row for row in _REAL if row[0] is owner), None)
+    # The load recorder's memo protocol (wiring._MEMO_EVENT): a reuse is
+    # charged with the files the census read.
+    key = "nouncensus.%x" % id(owner)
     if hit is None:
-        hit = (owner,) + _census(None)
+        _sys.audit(wiring._MEMO_EVENT, key, "miss")
+        try:
+            hit = (owner,) + _census(None)
+        finally:
+            _sys.audit(wiring._MEMO_EVENT, key, "done")
         _REAL[:] = _REAL[-(_REAL_KEEP - 1):] + [hit]
+    else:
+        _sys.audit(wiring._MEMO_EVENT, key, "hit")
     return ([{k: list(v) if isinstance(v, list) else v for k, v in r.items()}
              for r in hit[1]], [dict(u) for u in hit[2]])
 

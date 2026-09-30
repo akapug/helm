@@ -4,8 +4,8 @@
    the flag colours the burn card always used, tabular numerals. Colour is
    signal only. The row is a GRID so the columns line up down the whole board
    on a desktop, and the same grid re-flows at 680px into the phone row the
-   owner scans: light, name and one count on the first line, the family chips
-   under it. */
+   owner scans: light, name and one count on the first line, the team under
+   it. */
 #onyou{margin:16px 0 0;padding:10px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px}
 #onyouhead{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;font-size:var(--f2)}
 #onyouhead>b{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
@@ -20,15 +20,16 @@
 #bheadline b{font-weight:var(--w-med)}
 #bheadline a.bcap{color:inherit;text-decoration:none}
 #bheadline a.bcap:hover b{text-decoration:underline}
-#bheadline .bfams{display:inline-flex;flex-wrap:wrap;gap:4px 6px;vertical-align:middle}
 #bheadline .balloc{color:var(--sub);font-size:var(--f1)}
-#bhead #dreggstrip{flex:0 1 auto;max-width:100%;font-size:var(--f1)}
 #bhead .chip{padding:4px 10px;font-size:var(--f1)}
 .bmut{color:var(--mut)}
 .bunk{color:var(--warn);font-weight:700}
 .bwarn{color:var(--warn);font-weight:var(--w-med)}
 .bgood{color:var(--ok);font-weight:var(--w-med)}
-#flagcard{margin:10px 0 0}
+#flagcard{margin:14px 0 0;padding:12px 0 4px;background:var(--card);border:1px solid var(--line);border-radius:14px;scroll-margin-top:calc(var(--navh,48px) + 8px)}
+#flagcard .qonetop{padding:0 16px 6px}
+/* the card's header line wraps on a phone rather than pushing credit sideways */
+#flagcard .qonetop .gmeta{white-space:normal}
 #flagoverall{padding:0 16px 10px;font-size:var(--f2)}
 /* its own row class: the sessions view's global `.row` is a four-column grid,
    and a flag row under it laid the colour, the family and the reason on top
@@ -36,20 +37,31 @@
 #flagcard .frow{padding:7px 16px;border-top:1px solid var(--line);font-size:var(--f2)}
 #flagcard .frow .gmeta{white-space:normal}
 #board #controls{margin:12px 0 0}
-#brows{margin:10px 0 0;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+#brows{margin:10px 0 0;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:clip}
+/* AN OPEN PROJECT'S HEAD STICKS (task/3475): its line and its tabs stay
+   under the navigation while the tab scrolls. #brows clips rather than
+   hides its overflow, because overflow:hidden makes a scroll container and
+   a sticky child would then stick inside it and never to the page. */
+.brow.open>.bstick{position:sticky;top:var(--navh,48px);z-index:12;background:var(--card);border-bottom:1px solid var(--line)}
+.bstick>.ptabs{display:flex;flex-wrap:wrap;gap:4px;padding:6px 14px 0 48px;border-top:1px solid var(--line)}
+/* a target INSIDE the open row (the Work tab, 74-work) clears the sticky
+   head too: its height rides --bstickh (publishStickHeight) */
 #brows:empty{display:none}
 .brow{border-top:1px solid var(--line)}
 .brow:first-child{border-top:none}
-.bline{display:grid;grid-template-columns:22px minmax(0,1.1fr) minmax(0,1.3fr) 5.5em minmax(0,1fr) 7.5em 7.5em 6.5em minmax(0,1fr);align-items:center;gap:4px 12px;padding:9px 14px;cursor:pointer}
+.bline{display:grid;grid-template-columns:22px minmax(0,1fr) minmax(0,1.5fr) 11em minmax(0,1fr) 7.5em 6.5em minmax(0,.8fr);align-items:center;gap:4px 12px;padding:9px 14px;cursor:pointer}
 .bline:hover{background:var(--hover)}
 .brow.open{background:color-mix(in srgb,var(--accent) 4%,transparent)}
-.brow.open>.bline{border-bottom:1px solid var(--line)}
+.brow.open .bline{border-bottom:0}
 .blight{display:grid;place-items:center;width:22px;height:22px;padding:0;border:0;border-radius:50%;background:none;cursor:pointer}
 .blight:hover{background:var(--line)}
 .blight:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 .bname{min-width:0;font-weight:700;font-size:var(--f3);letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .brow.unset .bname{color:var(--mut);font-weight:600}
-.bchips{display:flex;flex-wrap:wrap;gap:4px 6px;min-width:0}
+/* the project's team on its line (task/3445): its version and live seats,
+   then the share marks of a binding team */
+.bteam{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;min-width:0;font-size:var(--f1)}
+.bteamv{color:var(--mut);white-space:nowrap}
 /* a family chip: the family's name, tinted by its flag colour (`--fc`). A chip
    with no flag, or whose reading is not current, is drawn with no colour at
    all, dashed or dimmed, so it can never pass for a measured one. */
@@ -57,7 +69,7 @@
 .fchip i{width:7px;height:7px;border-radius:50%;background:var(--fc,var(--sub));flex:none}
 .fchip.fnone{border-style:dashed;color:var(--mut)}
 .fchip.fstale{color:var(--mut);opacity:.8}
-.bcount{text-align:right;white-space:nowrap;font-size:var(--f1);font-variant-numeric:tabular-nums;color:var(--fg)}
+.bcount{text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;font-size:var(--f1);font-variant-numeric:tabular-nums;color:var(--fg)}
 .bwide{min-width:0;font-size:var(--f1);color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
 .bwork{color:var(--fg)}
 .bact{text-align:right}
@@ -72,26 +84,15 @@ a.rbadge:hover{border-color:var(--accent)}
 .rbadge.rwait{border-style:dotted;color:var(--mut)}
 .rrepo{white-space:nowrap}
 .rrepo .rname{color:var(--fg);font-size:var(--f1)}
-/* the kanban: four columns on a desktop, two on a phone, and it spans the
-   open row's text columns rather than being squeezed into one of them */
-.bdetail .dkb{column-span:all;break-inside:avoid}
-.bkb{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:2px 0 10px}
-.bkcol{min-width:0;border:1px solid var(--line);border-radius:9px;background:var(--bg);padding:6px 8px}
-.bkhead{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--sub);margin-bottom:4px}
-.bkcard{font-size:var(--f1);padding:2px 0;overflow-wrap:anywhere}
-.bkcard b{font-weight:var(--w-med)}
-/* a count line stands for many requests, so it is set apart from the cards;
-   the collapsed lines under the columns are quiet, one per class */
-.bkcard.bksum{border-top:1px dashed var(--line);margin-top:2px;padding-top:4px}
-.bkfold{font-size:var(--f1);margin:-4px 0 6px;overflow-wrap:anywhere}
-.bkfold code,.dline.bfold code{font-size:var(--f0)}
-/* the fleet kanban: one group per project, its four columns under its name */
-#fleetkb{margin:0}
-#fleetkb .fkline{font-size:var(--f1);margin:0 0 8px}
-#fleetkb .fkgroup{padding:8px 12px 2px;margin:0 0 10px;background:var(--card);border:1px solid var(--line);border-radius:12px}
-#fleetkb .fkhead{font-size:var(--f2);margin:0 0 6px}
-#walldetail{margin:4px 0 0}
-#walldetail #lrsec{margin:0;border:0;border-top:1px solid var(--line);border-radius:0}
+/* an open project's tabs: one at a time, across the detail's columns */
+.bdetail .ptabs{column-span:all;display:flex;flex-wrap:wrap;gap:4px;margin:0 0 10px;border-bottom:1px solid var(--line)}
+.ptab{padding:6px 12px;border:1px solid transparent;border-bottom:0;border-radius:var(--r-sm) var(--r-sm) 0 0;background:none;color:var(--mut);font:inherit;font-size:var(--f1);font-weight:600;cursor:pointer;margin-bottom:-1px}
+.ptab:hover{color:var(--fg)}
+.ptab.on{color:var(--fg);background:var(--card);border-color:var(--line)}
+.ptab:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+/* a Work tab is the Work page, one column wide across the detail's columns */
+.bdetail .ptabbody[data-tab="work"]{column-span:all}
+#lightf{background:var(--elev);color:var(--fg);border:1px solid var(--line2);border-radius:var(--r-sm);padding:4px 8px;font:inherit;font-size:var(--f1)}
 .bdetail{padding:10px 14px 4px 48px;column-width:320px;column-gap:28px}
 .bdetail .dline{word-break:normal;overflow-wrap:anywhere}
 .bdetail .dline a{color:var(--accent);text-decoration:none}
@@ -100,6 +101,109 @@ a.rbadge:hover{border-color:var(--accent)}
 .bfold>summary:hover{color:var(--fg)}
 .bfold[open]>summary{border-bottom:1px solid var(--line)}
 /* THE PHONE ROW (390px is the design floor): one column, light, name and the
-   one count on the first line, the family chips on the second; every
+   one count on the first line, the team on the second; every
    desktop-only cell is withheld here and stays one tap away in the open row. */
-@media (max-width:680px){.bkb{grid-template-columns:repeat(2,minmax(0,1fr))}#onyou{padding:9px 12px}.bline{grid-template-columns:22px minmax(0,1fr) auto;grid-template-areas:"light name count" ". chips chips";padding:9px 12px}.blight{grid-area:light}.bname{grid-area:name}.bcount{grid-area:count}.bchips{grid-area:chips}.bchips:empty{display:none}.brow .bwide{display:none}.bdetail{padding:8px 12px 2px;column-width:auto}#bheadline{flex-basis:100%}#flagcard>summary{align-items:baseline;flex-wrap:wrap}#flagcard>summary .gmeta{white-space:normal}}
+@media (max-width:680px){#onyou{padding:9px 12px}.bline{grid-template-columns:22px minmax(0,1fr) auto;grid-template-areas:"light name count" ". chips chips";padding:9px 12px}.blight{grid-area:light}.bname{grid-area:name}.bcount{grid-area:count}.bteam{grid-area:chips}.brow .bwide{display:none}.bdetail{padding:8px 12px 2px;column-width:auto}.bstick>.ptabs{padding:6px 12px 0}#bheadline{flex-basis:100%}}
+/* ---------- PROJECT TEAMS (task/3156) ----------
+   The Families card's rows (the head of Fleet › credit) are a STRIP of
+   family chips and one family's SHEET;
+   the open row carries the project's TEAM across every text column. The same
+   tokens as the rest of the board, colour as a dot beside a word and never a
+   fill behind text, and the phone (390px) is the floor. */
+.fstrip{display:flex;flex-wrap:wrap;gap:6px;padding:4px 16px 10px}
+button.fchip.fpick{cursor:pointer;font:inherit;font-size:var(--f0);font-weight:600}
+button.fchip.fpick.on{border-color:var(--accent);background:var(--accent-soft)}
+button.fchip.fpick:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.tsheet{margin:0 16px 12px;padding:12px 14px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--elev)}
+.tfamtop{display:flex;align-items:center;gap:6px 8px;flex-wrap:wrap}
+.tfn{min-width:6em;font-weight:700}
+a.tfn{color:inherit;text-decoration:none}
+a.tfn:hover,a.tfn:focus-visible{color:var(--accent);text-decoration:underline}
+.tcw{display:inline-flex;align-items:center;gap:5px;font-weight:700;font-size:var(--f0);letter-spacing:.04em;white-space:nowrap}
+.tcw::before{content:"";width:9px;height:9px;border-radius:50%;background:var(--cc,var(--sub));flex:none}
+.tnums{font-size:var(--f1);margin-top:6px;color:var(--fg)}
+.tnums b{font-weight:700}
+.twrap{white-space:normal;overflow-wrap:anywhere}
+.tsum{font-size:var(--f1);margin-top:8px}
+.tstack{display:flex;height:22px;border-radius:var(--r);overflow:hidden;border:1px solid var(--line2);margin-top:8px;background:repeating-linear-gradient(45deg,var(--line) 0 6px,transparent 6px 12px)}
+.tstack>span{display:flex;align-items:center;justify-content:center;font-size:var(--f0);font-weight:700;color:var(--bg);white-space:nowrap;overflow:hidden;min-width:0;border-right:1px solid var(--bg)}
+/* the lanes bar: each project's slot share, the lanes it holds drawn inside
+   it from the left, and a segment past its slots ringed in --bad */
+.tslots>span{position:relative}
+.tslots>span>b{position:absolute;left:0;top:0;bottom:0;background:color-mix(in srgb,var(--fg) 34%,transparent)}
+.tslots>span>em{position:relative;font-style:normal}
+.tslots>span.over{box-shadow:inset 0 0 0 2px var(--bad)}
+.tlegend{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px;font-size:var(--f1)}
+.tlegend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.tlegend a.tgo{color:inherit;text-decoration:none}
+.tlegend a.tgo:hover,.tlegend a.tgo:focus-visible{color:var(--accent);text-decoration:underline}
+.tlink{padding:0;border:0;background:none;color:var(--accent);font:inherit;cursor:pointer}
+.tlink:hover,.tlink:focus-visible{text-decoration:underline}
+.tcredits{font-size:var(--f1);margin-top:8px;padding:6px 9px;border-radius:var(--r-sm);background:var(--card);border:1px solid var(--line)}
+.tdeclare{margin-top:8px}
+.tdeclare>summary{font-size:var(--f1);cursor:pointer;color:var(--mut)}
+.trow2{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+.trow2>input{flex:1 1 200px}
+.tsheet input[type=text],.tsheet select,.dteam input[type=text],.dteam select{background:var(--elev);color:var(--fg);border:1px solid var(--line2);border-radius:var(--r-sm);padding:6px 9px;min-width:0;font:inherit}
+.tbtn{background:var(--elev);color:var(--fg);border:1px solid var(--line2);border-radius:var(--r-sm);padding:6px 12px;cursor:pointer;font:inherit}
+.tbtn:hover,.tbtn:focus-visible{border-color:var(--accent)}
+.tbtn.pri{background:var(--accent);border-color:var(--accent);color:var(--bg);font-weight:700}
+.tbtn.pri:disabled{opacity:.45;cursor:not-allowed}
+.tbtn.on{border-color:var(--accent);background:var(--accent-soft)}
+.tmsg{font-size:var(--f1);min-height:1.2em;margin-top:6px;overflow-wrap:anywhere}
+.tmsg.err{color:var(--bad)}
+.bdetail .dteam{column-span:all;break-inside:avoid;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--card)}
+.thead{font-size:var(--f2)}
+.tbanner{border:1px dashed var(--accent);background:var(--accent-soft);border-radius:var(--r);padding:10px;margin-top:8px;font-size:var(--f1)}
+.tbanner .tbtn{margin-top:8px}
+.tsec{border-top:1px solid var(--line);margin-top:12px;padding-top:10px}
+.tsec>h5{margin:0 0 6px;font-size:var(--f0);text-transform:uppercase;letter-spacing:.08em;color:var(--sub);font-weight:700}
+.tsec>h5 code{text-transform:none;letter-spacing:0}
+.tfam{padding:8px 0;border-bottom:1px dashed var(--line)}
+.tfam:last-child{border-bottom:0}
+.tstep{display:inline-flex;align-items:center;border:1px solid var(--line2);border-radius:var(--r-sm);overflow:hidden;margin-left:auto}
+.tstep button{background:var(--elev);color:var(--fg);border:0;width:34px;height:30px;cursor:pointer;font-size:var(--f3)}
+.tstep button:hover,.tstep button:focus-visible{background:var(--hover)}
+.tstep output{min-width:52px;text-align:center;font-weight:700}
+.tbar{position:relative;height:10px;background:var(--line);border-radius:var(--r-pill);margin-top:8px}
+.tbar>b{position:absolute;left:0;top:0;bottom:0;border-radius:var(--r-pill);background:var(--cc,var(--sub))}
+.tbar>u{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--fg);border-radius:1px}
+.tscale{display:flex;justify-content:space-between;font-size:var(--f0);color:var(--sub);margin-top:4px}
+.twhy{font-size:var(--f1);color:var(--mut);margin-top:4px}
+.tmem{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:2px 10px;align-items:center;padding:7px 0;border-bottom:1px solid var(--line)}
+.tst{width:10px;height:10px;border-radius:50%;background:var(--sub)}
+.tst.live{background:var(--ok)}
+.tst.quiet{background:var(--warn)}
+.tst.wanted{background:transparent;border:1.5px dashed var(--accent)}
+.tsn{font-weight:700;font-family:var(--mono);font-size:var(--f1);overflow-wrap:anywhere;min-width:0}
+.tsd{grid-column:2/5;font-size:var(--f1);color:var(--mut)}
+.tmem select{padding:4px 6px}
+.trm{background:transparent;border:1px solid transparent;border-radius:var(--r-sm);width:30px;height:30px;cursor:pointer;color:var(--mut);font-size:1.1rem}
+.trm:hover,.trm:focus-visible{border-color:var(--bad);color:var(--bad)}
+.tmem.gone .tsn{text-decoration:line-through;color:var(--mut)}
+.tbadge{display:inline-block;font-size:var(--f0);border:1px solid var(--line2);border-radius:var(--r-pill);padding:0 7px;margin-left:4px;color:var(--mut);font-weight:600;font-family:inherit}
+.taddrow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.taddrow .tbtn{grid-column:1/3}
+@media (min-width:560px){.taddrow{grid-template-columns:2fr 1fr auto}.taddrow .tbtn{grid-column:auto}}
+ul.tdrift{margin:0;padding-left:18px;font-size:var(--f1)}
+ul.tdrift li{margin:3px 0;overflow-wrap:anywhere}
+.tkinds{display:inline-flex;gap:4px;flex-wrap:wrap}
+.tkinds .tbtn{padding:3px 9px;font-size:var(--f1)}
+.troute{font-size:var(--f1);margin-top:6px}
+.troute>div{padding:3px 0}
+.ttake{font-weight:700}
+.thist{font-size:var(--f1)}
+.thist>div{padding:4px 0;border-bottom:1px dashed var(--line)}
+.tsave{border-top:1px solid var(--line2);margin-top:12px;padding-top:10px}
+.tsave.dirty{position:sticky;bottom:0;background:var(--card);box-shadow:0 -6px 16px rgba(0,0,0,.18)}
+.tdiff{font-size:var(--f1);color:var(--mut);overflow-wrap:anywhere}
+.tsave.dirty .tdiff{color:var(--fg)}
+.tmini{display:inline-flex;align-items:center;gap:5px;padding:1px 8px 1px 6px;border-radius:var(--r-pill);border:1px solid color-mix(in srgb,var(--cc,var(--sub)) 60%,transparent);font-size:var(--f0);font-weight:600;white-space:nowrap}
+.tmini i{width:7px;height:7px;border-radius:50%;background:var(--cc,var(--sub));flex:none}
+.tmini.tprop{border-style:dashed;color:var(--mut)}
+@media (max-width:680px){.tsheet{margin:0 12px 10px;padding:10px 12px}.fstrip{padding:4px 12px 10px}.bdetail .dteam{padding:8px 10px}.tstep{margin-left:0}}
+/* what a Team tab folds (task/3475): the families this project does not use
+   and its absent seats, their count on the fold's face */
+.tfold{margin:6px 0 0}
+.tfold>summary{cursor:pointer;color:var(--mut);font-size:var(--f1);padding:3px 0}
+.tfold>summary:hover{color:var(--fg)}

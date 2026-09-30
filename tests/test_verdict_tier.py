@@ -163,7 +163,7 @@ class RecordedTierTest(DispatchBase):
     def test_reanchored_tier_claim_and_future_or_partial_evidence_deny(self):
         self.policy(["family:claude"])
         verdict = self.record()
-        # `{"v": 3}` IS THE FUTURE-VERSION ARM, and it must name a version
+        # `{"v": 4}` IS THE FUTURE-VERSION ARM, and it must name a version
         # ABOVE the one this writer mints: a version number pinned in a test
         # is a refusal only while it names a shape the reader rejects, and one
         # that catches up to the writer becomes a no-op asserting nothing.
@@ -171,10 +171,11 @@ class RecordedTierTest(DispatchBase):
         # recorded axis is re-derived from the author proof, so a row claiming
         # its family was measured when a roster stamp produced it is DAMAGED,
         # exactly as a row claiming the wrong tier state is.
-        changes = [{"state": "outside"}, {"v": 3}, {"v": True},
+        changes = [{"state": "outside"}, {"v": 4}, {"v": True},
                    {"policy_version": {"version": "0" * 32}},
                    {"family_axis": dispatches.FAMILY_AXIS_MODEL},
-                   {"family_model": "some-other-model"}]
+                   {"family_model": "some-other-model"},
+                   {"approval_rule": "non-author"}]
         for change in changes:
             with self.subTest(change=change):
                 bad = copy.deepcopy(verdict)
@@ -206,7 +207,10 @@ class RecordedTierTest(DispatchBase):
         self.policy(["family:claude"])
         verdict = self.record()
         evidence = verdict["verdict_tier_evidence"]
-        self.assertEqual(evidence["v"], 2)
+        self.assertEqual(evidence["v"], 3)
+        # THE RULE THE RECORDED POLICY GAVE THIS READER: a family-only policy
+        # admits by family, so its same-family reads keep the family rule.
+        self.assertEqual(evidence["approval_rule"], "family")
         # THE FLEET'S OWN AXIS TODAY. A native claude author is a roster stamp,
         # and the verdict now SAYS so rather than leaving a reader to infer it.
         self.assertEqual(evidence["family_axis"], dispatches.FAMILY_AXIS_ROSTER)
@@ -214,11 +218,18 @@ class RecordedTierTest(DispatchBase):
         self.assertNotEqual(evidence["family_axis"],
                             dispatches.FAMILY_AXIS_UNKNOWN)
         self.assert_authorized(verdict)
-        # AND THE OLD SHAPE STILL AUTHORIZES, byte-for-byte as recorded.
+        # AND THE OLD SHAPES STILL AUTHORIZE, byte-for-byte as recorded: v2,
+        # the axis without the rule, and v1, neither.
+        v2 = copy.deepcopy(verdict)
+        del v2["verdict_tier_evidence"]["approval_rule"]
+        v2["verdict_tier_evidence"]["v"] = 2
+        v2["verdict_tier_anchor"] = dispatches._proof_anchor(
+            "verdict-tier-v1", v2["verdict_tier_evidence"])
+        self.assertEqual(dispatches.approval_tier_for_verdict(v2), ("ok", None))
         older = copy.deepcopy(verdict)
         older["verdict_tier_evidence"] = {
             k: v for k, v in evidence.items()
-            if k not in ("family_axis", "family_model")}
+            if k not in ("family_axis", "family_model", "approval_rule")}
         older["verdict_tier_evidence"]["v"] = 1
         older["verdict_tier_anchor"] = dispatches._proof_anchor(
             "verdict-tier-v1", older["verdict_tier_evidence"])

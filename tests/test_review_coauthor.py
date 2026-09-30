@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The review procedure names the REVIEWER as a co-author, on every surface.
+"""The review procedure recognizes both fix modes on every surface.
 
 THE RULING (owner): "these codex models are just as good as claude models and
 should be equal counterparts even if a claude happens to be the integrator, I
@@ -24,6 +24,7 @@ vacuously and reports a sweep that reached nothing. The control is a sentence
 the rewrite put there, so it proves this test read the rewritten file.
 """
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -42,7 +43,7 @@ SURFACES = {
         ("- **Reviewed SHAs are immutable** — fix on top with a new commit; "
          "never amend\n  or rebase a SHA that was posted for review.\n- **The "
          "store is the shared memory**",),
-        "A reviewer of either family PATCHES what it finds",
+        "MELD-DIFF posts the exact fix as a diff",
     ),
     "README.md": (
         ("is better, but because a blind spot is a property of a shared "
@@ -56,7 +57,7 @@ SURFACES = {
     ),
     "docs/VERBS.md": (
         ("A FIX verdict tells an author to cure.",),
-        "the reviewer's own cure, recorded as co-author",
+        "the PATCH reviewer's committed cure, recorded",
     ),
     "helm/lane_discipline.py": (
         ("gate the whole suite -> a cross-family reviewer\nAPPROVEs carrying "
@@ -78,16 +79,16 @@ SURFACES = {
         ("- **Author != reviewer.** A non-trivial change gets a cross-family "
          "refutation before it lands; the\n  refuter looks for the substrate "
          "rule the change violates. A bare \"looks good\" is not review.\n",),
-        "The refuter PATCHES what it finds mechanically",
+        "The refuter follows the row's REVIEW FIX MODE",
     ),
     "agents/claudecode/skills/fix/SKILL.md": (
         ("catches earlier and costs no more.)\n\n## Red flags",),
-        "COMMITS the mechanical cures it finds",
+        "follow the row's REVIEW FIX MODE for a mechanical cure",
     ),
     "agents/claudecode/skills/devops/SKILL.md": (
         ("Bounded findings can be fixed in-pass by the reviewer.",
          "- `reviewer-implements-own-findings` for bounded review fixes."),
-        "credit both authors at close",
+        "Credit the actual authors on close.",
     ),
     "agents/claudecode/skills/fleet-maintenance/SKILL.md": (
         ("fleet's merges on one family's remaining budget.\n\n## 7.",),
@@ -101,7 +102,7 @@ SURFACES = {
     # most 560 bytes, tests/test_hook_budgets.py), not the long form's.
     "helm/saguide.py": (
         (),
-        "A reviewer commits a MECHANICAL cure in its own worktree",
+        "REVIEW FIX MODE: PATCH commits cure off exact tip",
     ),
 }
 
@@ -147,17 +148,38 @@ class EveryTaughtSurfaceCarriesTheCoAuthorProcedureTest(unittest.TestCase):
                     "reviewer-implements-own-findings/SKILL.md")
         self.assertIn("# Reviewer Implements Own Findings", text)
         seen, clauses = 0, ("EITHER model family",
-                       "Branch off the EXACT reviewed tip",
+                       "REVIEW FIX MODE",
+                       "commit the cure off the EXACT reviewed tip",
+                       "git -C <repo> fetch --no-write-fetch-head <scratch>/wt",
                        "do not push",
                        "--patch-tip",
-                       "several authors",
-                       "Design findings go to a meld instead.",
-                       "wrote none of the composed tip")
+                       "MELD-DIFF: do not commit the mechanical cure",
+                       "--no-patch-because",
+                       "the ledger records each author",
+                       "Design findings go to a meld.",
+                       "wrote none of that tip")
         for clause in clauses:
             with self.subTest(clause=clause):
                 self.assertIn(clause, text)
             seen += 1
         self.assertEqual(seen, len(clauses), "the clause sweep did not run")
+
+    def test_public_reference_names_both_cure_modes(self):
+        self.assertIn("PATCH commits it, while MELD-DIFF gives the author an exact diff",
+                      " ".join(read("README.md").split()))
+        verbs = read("docs/VERBS.md")
+        self.assertIn("In MELD-DIFF, the reviewer\n  posts the exact mechanical cure",
+                      verbs)
+        self.assertIn("Only a new eligible round at round 3 or later receives",
+                      verbs)
+        self.assertIn("A review whose original full brief is recoverable",
+                      verbs)
+        help_text = read("helm/cli_help.py")
+        self.assertIn("a recoverable full brief travels with the move",
+                      help_text)
+        self.assertIn("in MELD-DIFF the reviewer posts the exact diff",
+                      help_text)
+        self.assertNotIn("the DM body does NOT travel", help_text)
 
 
 class LandedCloseCreditsEveryAuthorTest(unittest.TestCase):
@@ -226,7 +248,11 @@ class PatchTipImmutableRepositoryProofTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = tmp.name
-        env = {"PATH": os.defpath, "HOME": self.tmp,
+        # The host's git, wherever it keeps it (a build host may keep it
+        # outside os.defpath's /bin:/usr/bin), and nothing else of its PATH.
+        git_dir = os.path.dirname(shutil.which("git") or "/usr/bin/git")
+        env = {"PATH": os.pathsep.join((git_dir, os.defpath)),
+               "HOME": self.tmp,
                "HELM_HOME": os.path.join(self.tmp, "helm"),
                "HELM_ADOPTED_DIR": os.path.join(self.tmp, "adopted"),
                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
@@ -247,7 +273,11 @@ class PatchTipImmutableRepositoryProofTest(unittest.TestCase):
         self.sibling = self.commit(self.base, "other branch")
         self.git("update-ref", "refs/heads/reviewed", self.reviewed)
         self.common = os.path.realpath(os.path.join(self.repo, ".git"))
-        self.row = {"repo_root": self.repo, "repo_id": self.common}
+        # THE ROW NAMES A LANE WITH NO LOCAL BRANCH, the common case: every arm
+        # below that does not make refs/heads/lane/x also proves a missing lane
+        # branch is no refusal.
+        self.row = {"repo_root": self.repo, "repo_id": self.common,
+                    "lane": "x"}
 
     def git(self, *args, cwd=None, check=True):
         return subprocess.run(["git", "-C", cwd or self.repo, *args],
@@ -268,6 +298,27 @@ class PatchTipImmutableRepositoryProofTest(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", self.sibling + "^{commit}")
                          .stdout.strip(), self.sibling)
         self.assertIn("does not descend", self.proof(self.sibling))
+
+    def test_a_cure_committed_in_a_shared_clone_is_proven_once_fetched(self):
+        """The path a reader with no room takes (skill
+        reviewer-implements-own-findings, step 3). A commit made in a `git
+        clone --shared` clone lives in the clone's own object store, so the
+        repo cannot resolve it and the refusal names the fetch. After `git -C
+        <repo> fetch --no-write-fetch-head <clone> <sha>`, which moves no ref
+        and leaves FETCH_HEAD unwritten, the same id is proven."""
+        clone = os.path.join(self.tmp, "reader-clone")
+        self.git("clone", "-q", "--shared", self.repo, clone, cwd=self.tmp)
+        self.git("checkout", "-q", "--detach", self.reviewed, cwd=clone)
+        self.git("commit", "--allow-empty", "-qm", "reader cure", cwd=clone)
+        cure = self.git("rev-parse", "HEAD", cwd=clone).stdout.strip()
+        refs = self.git("for-each-ref").stdout
+        refused = self.proof(cure)
+        self.assertIn("does not resolve to a commit", refused)
+        self.assertIn("fetch --no-write-fetch-head <clone> %s" % cure, refused)
+        self.git("fetch", "-q", "--no-write-fetch-head", clone, cure)
+        self.assertEqual(self.git("for-each-ref").stdout, refs)
+        self.assertFalse(os.path.exists(os.path.join(self.common, "FETCH_HEAD")))
+        self.assertEqual(self.proof(cure), None)
 
     def test_legacy_graft_cannot_make_a_sibling_a_cure(self):
         graft = os.path.join(self.common, "info", "grafts")
@@ -303,6 +354,54 @@ class PatchTipImmutableRepositoryProofTest(unittest.TestCase):
         self.assertEqual(self.git("cat-file", "-t", self.patch).stdout.strip(),
                          "commit")
         self.assertIn("ancestry could not be measured", self.proof())
+
+    def test_the_authors_successor_on_its_own_lane_branch_is_no_patch(self):
+        """Every commit carries the one git identity, so a tip that descends
+        from the reviewed one may be the AUTHOR'S next commit as easily as a
+        reviewer's cure. The lane's own branch holding it says which: a
+        reviewer's cure lives off the lane until the author agrees and
+        fast-forwards. The control is a cure off the same reviewed tip that
+        the lane does not hold, and the same patch before the branch
+        existed."""
+        self.assertEqual(self.proof(), None,
+                         "a lane with no local branch cannot hold the tip")
+        self.git("update-ref", "refs/heads/lane/x", self.patch)
+        refused = self.proof()
+        self.assertIn("that tip is on the lane's own branch", refused)
+        self.assertIn("refs/heads/lane/x", refused)
+        self.assertIn("the author fast-forwards after agreeing", refused)
+        cure = self.commit(self.reviewed, "the reviewer's cure")
+        self.assertEqual(self.proof(cure), None)
+        self.assertIn("that tip is on the lane's own branch",
+                      self.proof(self.reviewed),
+                      "the reviewed tip itself is on the lane, and is no cure")
+
+    def test_a_prefixed_lane_is_the_lanes_own_and_the_send_ref_is_not(self):
+        """A historical row spells its lane `lane/x`: that is still the lane's
+        own branch. The branch the send's ref resolved through (`ref_branch`)
+        is not: a review is sent at a branch its reader then commits its cure
+        on, so that branch holding the tip says nothing about who wrote it."""
+        self.git("update-ref", "refs/heads/lane/x", self.patch)
+        self.assertIn("that tip is on the lane's own branch",
+                      self.proof(row=dict(self.row, lane="lane/x")))
+        self.git("update-ref", "refs/heads/feature", self.patch)
+        sent = dict(self.row, lane="y", ref_branch="refs/heads/feature")
+        self.assertEqual(self.git("merge-base", "--is-ancestor", self.patch,
+                                  "refs/heads/feature").returncode, 0,
+                         "fixture premise: the send's branch holds the cure")
+        self.assertEqual(self.proof(row=sent), None)
+
+    def test_an_unreadable_lane_branch_refuses_unknown(self):  # noqa: VACUOUS_ASSERTION — the None control is the same proof on the same readable lane, and the arm ends on the refusal's exact words and ref name
+        """A lane branch that exists but whose head cannot be read is not a
+        branch that lacks the tip: the proof names what it could not read."""
+        head = self.commit(self.reviewed, "the author's successor")
+        self.git("update-ref", "refs/heads/lane/x", head)
+        self.assertEqual(self.proof(), None,
+                         "the control: a readable lane that lacks the cure")
+        os.unlink(os.path.join(self.common, "objects", head[:2], head[2:]))
+        unknown = self.proof()
+        self.assertIn("could not be read", unknown)
+        self.assertIn("refs/heads/lane/x", unknown)
 
     def test_every_read_in_this_proof_declares_itself_uncached(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control is `assertGreaterEqual(len(declared), 2)` on the SAME list the equality below reads, and it runs FIRST: a spy that observed nothing, or a proof that stopped declaring, cannot reach two declared envs, so `len(declared) == len(seen)` cannot be satisfied by two zeroes
         """THE RULE BEHIND THE ARM ABOVE, asserted where it can be forgotten.

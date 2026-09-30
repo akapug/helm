@@ -37,11 +37,23 @@ works behind one citation.
 
 Row schema (every mutation appends a full SNAPSHOT; last line per id wins):
   {id, ts, title, status: open|in_progress|closed, owner, note, refs,
-   source, origin, closed_reason, last_updated, takeover?}
+   source, origin, closed_reason, last_updated, comments, comment_archives?,
+   takeover?, released?}
+
+``comment_archives`` is present only on a row that outgrew ROW_BUDGET: its
+oldest comments live in content-addressed files (helm/refstore.py) the entries
+name, and `comments_of` reads them back. The list is bounded too: runs of old
+entries fold into index entries whose files name them. See "the row's own
+budget" below.
 
 ``takeover`` is present only on an evidence-bound BUILD continuation. It binds
 one transfer_id, source/successor lineage, exact measured evidence, and both chat
 receipts in the same task snapshot that changes owner.
+
+``released`` is the LAST time the holder handed the row back to the pool
+(`release`): {by, ts, session, pid, ppid, owner_was, status_was, note}. The
+session stays in the store and is dropped on the wire. Every earlier release
+stays in the event history.
 
 TOMBSTONES ARE FIRST-CLASS. 55% of the fleet's citation load points at items
 that were CLOSED before the migration. A tombstone carries the id, the title
@@ -51,13 +63,14 @@ never assigned, and never shown in the open list.
 """
 import calendar
 import json
+import math
 import os
 import re
 import shlex
 import sys
 import time
 
-from . import eventledger, freetext, home
+from . import eventledger, freetext, home, refstore
 # THE DUPLICATE INDEX IS IMPORTED, NEVER RE-SPELLED. The tokenizer and the
 # overlap threshold this module's add door refuses on are the STORE's — one
 # similarity rule for the repo — so retuning it there moves this door too.
@@ -146,7 +159,8 @@ def _owner_placeholder_error(owner):
             "then sees a holder by that name and refuses every ordinary `claim`. "
             "To leave a row unowned pass `--owner ''` or "
             "omit the flag — an open unowned row is what the offer rung "
-            "routes to an idle seat." % (str(owner).strip(),))
+            "routes to an idle seat. A HOLDER hands its own row back with "
+            "`helm task release <id>`." % (str(owner).strip(),))
 
 
 def owner_of(row):
@@ -161,6 +175,17 @@ def owner_of(row):
     code paths that write it."""
     owner = str(row.get("owner") or "").strip()
     return "" if owner.casefold() in _RESERVED_OWNER_WORDS else owner
+
+
+def held_by(row, seat):
+    """True when `seat` HOLDS `row` — the one answer to "is this row mine".
+
+    `list --mine` filters by it and `release` authorizes on it, so the rows a
+    seat sees as its own are exactly the rows it may hand back. CASEFOLDED
+    because seat identity treats Kimi and kimi as one address everywhere else;
+    through `owner_of` because a placeholder word is not a holder."""
+    want = str(seat or "").strip().casefold()
+    return bool(want) and owner_of(row).casefold() == want
 
 
 # A STAND-DOWN IS A STATE, NOT A SENTENCE, AND IT IS DELIBERATELY NOT A STATUS.
@@ -770,7 +795,11 @@ reader can mistake a skip for success: they never pass a rule.
 `expect` is the other rule (task/1738): a caller that judged a row from a
 snapshot passes that row, and the writer skips when the row it holds under
 the lock is no longer the one judged. The same reader contract holds — only
-a caller that passes `expect` can receive a skip."""
+a caller that passes `expect` can receive a skip.
+
+`release()` answers the same way for a row that holds nobody (task/3141):
+there is no hold to hand back, the row was read, and nothing was written. Its
+callers are new with it, so none of them reads a skip as a release."""
 
 
 class RankRule(object):
@@ -1178,7 +1207,7 @@ def _reported_session():
 
 def _row(tid, title, status, owner, note, refs, source, origin, closed_reason,
          project=None, posture_na=None, continues=None, priority=None,
-         reported_session=None):
+         reported_session=None, goal=None, tax=None, tax_cost=None):
     now = time.time()
     # STORAGE DERIVES FROM THE SCHEMA like the doors do: present and explicit
     # from birth for every STORY_FIELDS key (`continues` None = a story of
@@ -1246,13 +1275,115 @@ def _row(tid, title, status, owner, note, refs, source, origin, closed_reason,
         # no seam strategy has nothing to record, and the published row shape
         # stays what it was for every such row.
         row["posture_na"] = str(posture_na).strip()
+    if goal is not None:
+        # THE OWNER'S GOAL RECORD (helm/goals.py), present only on a goal row
+        # — the same only-when-present shape as `takeover` and `posture_na`.
+        row["goal"] = goal
+    # THE FRICTION TAX, only when present too (see TAX_FIELDS): an untaxed
+    # row keeps the shape every older reader already reads.
+    for key, value in (("tax", tax), ("tax_cost", tax_cost)):
+        if value is not None:
+            row[key] = value
     return row
+
+
+def _goal_birth_error(goal, goal_door, status, origin, owner, continues):
+    """Why add() may not file this goal row, or None. A row is born a goal
+    only through the goal door, open, owner-asked, held, and a story root."""
+    from . import goals
+    if not isinstance(goal_door, goals.GoalDoor) or goal_door.act != "add":
+        return ("a goal row is filed only by `helm goal add` — the goal "
+                "record is written by the goal verbs, never by a task door")
+    if not isinstance(goal, dict):
+        return "a goal record must be a mapping, not %s" % type(goal).__name__
+    if status != "open":
+        return "a goal is born open, not %r" % status
+    if origin != "owner":
+        return "a goal is the owner's: it is filed with origin owner"
+    if not str(owner or "").strip():
+        return "a goal names ONE accountable seat as its owner"
+    if continues:
+        return "a goal is a story root: it continues nothing"
+    return None
+
+
+def _goal_guard(prev, fields, row, goal_door):
+    """(err, reopen) for a write that touches a goal row. None when the row is
+    not a goal and nothing here applies.
+
+    THE GOAL RECORD AND THE CLOSE ARE THE GOAL DOOR'S. Every closer in the
+    tree comes through update() — `helm task close`, the resume-turn
+    recovery, takeover, the harness mirror — so this is the one place that
+    can make "a goal closes only on its approved criteria" hold. `report` and
+    `supersede` are the only acts that close, and the row they close must
+    carry the terminal fact itself (`report_ref` or `superseded`), so even
+    the door cannot close a goal that is neither met nor replaced."""
+    had = isinstance(prev.get("goal"), dict)
+    writes = "goal" in fields
+    if not had and not writes:
+        if goal_door is not None:
+            return ("%s is not a goal, so a goal door has nothing to open "
+                    "here" % prev.get("id")), False
+        return None, False
+    from . import goals
+    tid = prev.get("id")
+    if goal_door is not None and not isinstance(goal_door, goals.GoalDoor):
+        return ("goal_door must be the capability helm.goals mints for its "
+                "own verbs, not %s" % type(goal_door).__name__), False
+    act = goal_door.act if goal_door is not None else None
+    if writes and act is None:
+        return ("%s's goal record is written only by the `helm goal` verbs "
+                "— a task door cannot edit what the owner approved" % tid), False
+    if writes and not isinstance(fields["goal"], dict):
+        return ("a goal is never removed from its row — the owner replacing "
+                "it is `helm goal supersede %s --owner-ref <post-id>`" % tid), False
+    if writes and not had and act != "promote":
+        return "%s becomes a goal only through `helm goal add --from`" % tid, False
+    # WHAT A GOAL ROW IS, PINNED HERE AND NOT ONLY BESIDE IT (integrator
+    # decision D3). The incumbent guard below refuses a cleared owner only
+    # because a clear is a change of holder, and it lets through whatever a
+    # custody capability authorizes, including a seat-reassign proof minted
+    # for an empty successor. A goal names ONE accountable seat, the seat its
+    # card answers to and its stall rungs ring, so an update that leaves it
+    # with none is refused whatever door it holds; the doors that CAN move it
+    # are named from their own table, so the sentence cannot outlive them.
+    if "owner" in fields and not owner_of(row):
+        from . import takeover
+        return ("%s is a GOAL, and a goal is never unowned: it names ONE "
+                "accountable seat, the one its criteria card answers to. A "
+                "change of owner names a successor seat through %s"
+                % (tid, "; or ".join(takeover.task_owner_doors(
+                    owner_of(prev))))), False
+    # AND ITS ORIGIN IS THE OWNER'S: he stated it. Agent work that serves the
+    # goal is a child row that continues it, never the goal relabelled.
+    if "origin" in fields and row.get("origin") != "owner":
+        return ("%s is a GOAL the owner stated, so its origin stays owner. "
+                "Agent work toward it is a child row: `helm task add ... "
+                "--continues %s`" % (tid, tid)), False
+    if row.get("continues"):
+        return ("%s is a GOAL and a goal is a story root: its work continues "
+                "it, never the other way round" % tid), False
+    closing = prev.get("status") != "closed" and row.get("status") == "closed"
+    if closing:
+        goal = row.get("goal") or {}
+        if act not in goals.CLOSER_ACTS or not (
+                goal.get("report_ref") or goal.get("superseded")):
+            return goals.REFUSE_CLOSE % (tid, tid, tid, tid), False
+    if prev.get("status") == "closed" and row.get("status") != "closed":
+        if act != "reopen":
+            return ("%s is a closed GOAL. It reopens only when the owner "
+                    "disputes it: `helm goal measure %s <key> --fail <value> "
+                    "--how <command> --ref <his post>`" % (tid, tid)), False
+        if row.get("closed_reason"):
+            return "a reopened goal cannot keep its close reason", False
+        return None, True
+    return None, False
 
 
 def add(title, owner, note=None, refs=None, source=None, tid=None,
         status="open", origin=None, closed_reason=None, path=None,
         project=None, posture_na=None, continues=None, priority=None,
-        force_new=False):
+        force_new=False, goal=None, goal_door=None, tax=None, tax_cost=None):
     """File one task -> (row, error). Exactly one of the pair is None.
 
     `owner` is REQUIRED for live work and refused when blank: a backlog nobody
@@ -1315,6 +1446,11 @@ def add(title, owner, note=None, refs=None, source=None, tid=None,
         return None, ("unknown priority %r (want %s, or omit for UNRANKED — "
                       "unranked means nobody has judged this, which is not the "
                       "same as ranked low)" % (priority, "|".join(PRIORITIES)))
+    # THE FRICTION TAX, checked here so every filer meets it, not only the CLI.
+    _taxes = {"tax": tax, "tax_cost": tax_cost}
+    _bad = _tax_error(_taxes) or _tax_pair_error(_taxes)
+    if _bad:
+        return None, _bad
     # UNOWNED IS NOT UNACCOUNTABLE, AND THE DIFFERENCE IS THE WHOLE BACKLOG.
     #
     # The mandate this ledger was built under said a row "must name an OWNER
@@ -1348,6 +1484,11 @@ def add(title, owner, note=None, refs=None, source=None, tid=None,
         from . import posture
         refused = posture.check("helm task add", title + "\n" + (note or ""),
                                 posture_na=posture_na, owner=origin == "owner")
+        if refused:
+            return None, refused
+    if goal is not None or goal_door is not None:
+        refused = _goal_birth_error(goal, goal_door, status, origin, owner,
+                                    continues)
         if refused:
             return None, refused
 
@@ -1460,9 +1601,12 @@ def add(title, owner, note=None, refs=None, source=None, tid=None,
                    # `_reported_session()` for that contract; a renamed seat
                    # recovers work through the evidence-bound takeover
                    # contract until identity ACQUISITION is bound (task/1918).
-                   reported_session=_reported_session())
-        if not eventledger.append_unlocked(p, row):
-            return None, "task ledger refused the write"
+                   reported_session=_reported_session(), goal=goal,
+                   tax=tax, tax_cost=tax_cost)
+        row, err = _commit(p, row)
+        if err:
+            return None, err
+        _touch_goal_projection(p, existing, row)
     return row, None
 
 
@@ -1509,7 +1653,8 @@ def _door_ask(door):
 
 
 def update(token, path=None, force=False, takeover_auth=None,
-           rank_rule=None, rank_actor=None, expect=None, **fields):
+           rank_rule=None, rank_actor=None, expect=None, goal_door=None,
+           **fields):
     """Append a new full snapshot with `fields` applied -> (row, error).
 
     Event-sourced: the previous row is never rewritten, so a correction stays
@@ -1536,6 +1681,9 @@ def update(token, path=None, force=False, takeover_auth=None,
     the row under the lock is not that row, nothing is written and the answer
     is ``(SKIPPED, reason)``: a sweep that decided "nobody touched this" from
     a snapshot must not close a row a seat claimed a moment later (task/1738).
+
+    ``goal_door`` is the ``goals.GoalDoor`` a `helm goal` verb holds. A goal
+    row's `goal` record, its close and its reopen need one; see _goal_guard.
     """
     tid = normalize_id(token)
     if not tid:
@@ -1564,12 +1712,17 @@ def update(token, path=None, force=False, takeover_auth=None,
     # `project` stays absent from this tuple for the opposite and still-valid
     # reason documented at _row: retro-scoping history is migration work.
     allowed = ("title", "status", "owner", "note", "refs", "source",
-               "origin", "closed_reason", "standdown") + STORY_KEYS
+               "origin", "closed_reason", "standdown", "goal") + STORY_KEYS \
+        + TAX_KEYS
     unknown = [k for k in fields if k not in allowed]
     if unknown:
         return None, "unknown field(s): %s" % ", ".join(sorted(unknown))
     if "status" in fields and fields["status"] not in STATUSES:
         return None, "unknown status %r" % fields["status"]
+    # THE FRICTION TAX, same check as add(); None here is a deliberate clear.
+    _bad = _tax_error(fields)
+    if _bad:
+        return None, _bad
     # VALIDATED AT THE API DOOR, not only at the CLI verb, for the reason the
     # comment below already gives about --continues and --priority: a closed
     # set enforced on one path and open on another is not a closed set, and
@@ -1687,6 +1840,15 @@ def update(token, path=None, force=False, takeover_auth=None,
                     "with helm.actors.resolve_actor()" % (tid, actor_err))
         row = dict(prev)
         row.update(fields)
+        # A CLEARED TAX LEAVES NO KEY, so the row keeps the only-when-present
+        # shape `_row` gives it; and a cost left with no tax has no payback.
+        if any(key in fields for key in TAX_KEYS):
+            for key in TAX_KEYS:
+                if row.get(key) is None:
+                    row.pop(key, None)
+            _bad = _tax_pair_error(row)
+            if _bad:
+                return None, "%s %s" % (tid, _bad)
         # UPDATE ENFORCES WHAT add() AND close() ENFORCE, because a second door
         # into the same row that skips the first door's rules is not a
         # convenience — it is the rule deleted. Measured by an adversarial
@@ -1708,6 +1870,12 @@ def update(token, path=None, force=False, takeover_auth=None,
         if closing and not (row.get("closed_reason") or "").strip():
             return None, ("closing needs a reason — use `close`, or pass "
                           "closed_reason; a silent close is a drop")
+        # A GOAL CLOSES ON ITS APPROVED CRITERIA, NEVER ON A LAND. Here, after
+        # the transition is known and before the resurrection rule, because
+        # the one legal reopen in the ledger is a goal the owner disputed.
+        goal_err, goal_reopen = _goal_guard(prev, fields, row, goal_door)
+        if goal_err:
+            return None, goal_err
         # RESURRECTION IS NOT AN UPDATE, AND --force CANNOT BUY IT (task/345).
         # A live repro: `helm task claim 172` on a CLOSED row returned
         # status=in_progress owner=codex-3 WHILE RETAINING closed_reason — one
@@ -1730,7 +1898,8 @@ def update(token, path=None, force=False, takeover_auth=None,
         # task/294's entire job and the `closing` guard above already records
         # why that distinction matters; this fires only on the transition OUT
         # of closed, never on the resting state.
-        if prev.get("status") == "closed" and row.get("status") != "closed":
+        if prev.get("status") == "closed" and row.get("status") != "closed" \
+                and not goal_reopen:
             return None, (
                 "%s is CLOSED (%s) — a closed row cannot be reopened, and "
                 "forcing does not override it. If the work is genuinely live "
@@ -1878,15 +2047,27 @@ def update(token, path=None, force=False, takeover_auth=None,
                            % (len(shut), incumbent,
                               "; and ".join(d.text for d in shut),
                               "; ".join(d.blocked_by for d in shut)))
+                # CLEARING IS NOT A TRANSFER, AND THE HOLDER HAS A DOOR FOR
+                # IT. Every capability above moves a row to a named seat;
+                # emptying the field is what a holder does to hand its own row
+                # back, and `release` is that act, authorized by being the
+                # holder (task/3141). Named ONLY on a clear: offering release
+                # beside a transfer would read as a second way to move a row,
+                # and it is not one.
+                pool = ("" if wanted else
+                        " If you ARE %s and want it UNOWNED, that is not a "
+                        "transfer: the holder hands it back to the pool with "
+                        "`helm task release %s` (tasks.release)."
+                        % (incumbent, tid))
                 return None, (
                     "%s is held by %s — raw force cannot transfer or clear an "
                     "incumbent; quiet, no reply, and claim age are not "
                     "authorization. %d capabilit%s can: %s. If you ARE %s and "
-                    "want this row elsewhere, %s.%s %s"
+                    "want this row elsewhere, %s.%s %s%s"
                     % (tid, incumbent, len(doors),
                        "y" if len(doors) == 1 else "ies",
                        "; and ".join(doors), incumbent, clause, blocked,
-                       advice))
+                       advice, pool))
             from . import takeover
             proof, auth_err = takeover.authorize_task_mutation(
                 takeover_auth, tid, prev, fields)
@@ -1933,8 +2114,12 @@ def update(token, path=None, force=False, takeover_auth=None,
         if row.get("status") == "in_progress" and not (row.get("owner") or ""):
             return None, ("%s would be in_progress with no owner seat — name "
                           "one with --owner" % tid)
-        if not eventledger.append_unlocked(p, row):
-            return None, "task ledger refused the write"
+        row, err = _commit(p, row)
+        if err:
+            return None, err
+        if isinstance(prev.get("goal"), dict) and owner_of(prev) != owner_of(row):
+            _follow_goal_custody(prev, row)
+        _touch_goal_projection(p, existing, row, prev)
     return row, None
 
 
@@ -1957,6 +2142,213 @@ def close(token, reason, path=None, expect=None):
         return None, "closing a task needs a reason — a silent close is a drop"
     return update(token, path=path, expect=expect, status="closed",
                   closed_reason=reason)
+
+
+# The longest release note, in characters (see release()).
+RELEASE_NOTE_MAX = 2000
+
+
+def release(token, releaser, note=None, path=None):
+    """The HOLDER hands its own row back to the pool -> (row, error), or
+    (SKIPPED, reason) when the row holds nobody and nothing is written.
+
+    THE GAP (task/3141). `update(owner="")` refuses every incumbent change
+    that lacks a takeover proof, INCLUDING the one the incumbent itself asks
+    for, so a seat handed rows for triage could not give them back: measured,
+    40 rows moved off a dead seat stayed nominally held by a steward that was
+    not working them. The owner's model is a person unassigning themselves.
+
+    HOLDER-ONLY, BY THE SAME PREDICATE `list --mine` READS (`held_by`). The
+    caller resolves `releaser` through dispatches.acting_author, the door
+    `--mine` uses, so the rows a seat lists as its own are exactly the rows it
+    may release. A non-holder is REFUSED naming the holder: releasing is not a
+    way to move somebody else's row, and a FILER is not a holder.
+
+    NOT A TRANSFER, AND THAT IS WHY IT CAN BE A VERB. The hand-off designs
+    killed at the incumbent guard moved a row to a NAMED seat on an identity
+    the caller controls. Release names nobody: custody goes to the pool.
+    What the NEXT write names is not this door's to decide, and the next
+    paragraph says what it can name. It is the ruled exception to the
+    task/2026 ruling that no hand-off verb ships before identity is
+    authenticated, and it ships under that ruling's conditions, below.
+
+    THE TWO-STEP RISK IS REAL AND STATED, NOT SOLVED. Identity here is a
+    cost barrier, not a proof: every seat runs as one user, and a process
+    that exports the holder's name (with no session, or with the holder's
+    own) resolves as the holder. Such a process can release the row and then
+    claim it — two ordinary acts that together move custody without the
+    holder. AND THE SECOND ACT CAN NAME ANY SEAT: `claim <id> --owner SEAT`
+    and `update <id> --owner SEAT` put an UNOWNED row on whatever seat they
+    name, and neither resolves who is asking. So the pair is a hand-off to a
+    NAMED seat, the task/2026 harm, in two steps. This door does not close
+    that; it makes the release leg TRACEABLE and the whole move REVERSIBLE
+    instead (the second leg records no actor):
+
+      * THE EVENT RECORDS THE ACTING PROCESS: the seat it resolved as (`by`),
+        the session it declared (`session`, read by `_reported_session` —
+        unauthenticated, recorded for correlation and never an authorization
+        input), and the pids that ran it (`pid`, `ppid`), so a forged release
+        can be traced to a transcript and a process;
+      * AND THE STATE IT REPLACED: `owner_was` (the holder's exact spelling)
+        and `status_was`, so the row is put back through the ordinary update
+        door from the record alone — a released row has no incumbent to
+        guard.
+
+    The session is AUDIT, NOT WIRE: `public_row` drops it, as it drops
+    `reported_session`, because a session id is the bearer that corroborates
+    a declared name and the killed reclaim designs were forged with exactly
+    that.
+
+    A LIVE HOLDER IS NEVER RELEASED BY ANOTHER SEAT, and no liveness read is
+    needed for it: holder-only refuses every other acting seat whether the
+    holder is live or gone, so the refusal cannot depend on a beacon or a
+    beat that might be misread.
+
+    WHEN AUTHENTICATED IDENTITY LANDS, RELEASE AND EVERY DOOR THAT PUTS AN
+    OWNER ON AN UNOWNED ROW (`claim`, `claim --owner`, `update --owner`) BIND
+    TO IT TOGETHER. They are the halves of the risk above; binding one
+    leaves the others as the open door. (`claim` today takes `--owner SEAT`
+    or falls back to `seats.own_name()`, and `update --owner` resolves
+    nobody, both weaker than this door's `acting_author`.)
+
+    OPEN AND UNOWNED, ALWAYS. The ledger refuses an unowned in_progress row,
+    so a release also moves in_progress back to open.
+
+    A CUSTODY CHANGE IS NOT ACTIVITY ON THE WORK — the same rule `update`
+    applies to a reassign: `last_updated` keeps its value and
+    `custody_updated` records the move, so releasing a backlog does not make
+    every released row look freshly worked to the staleness readers.
+    """
+    releaser = str(releaser or "").strip()
+    if not releaser:
+        return None, ("releasing needs the releaser's seat name — a release "
+                      "nobody made cannot be audited")
+    placeholder = _owner_placeholder_error(releaser)
+    if placeholder:
+        return None, placeholder
+    tid = normalize_id(token)
+    if not tid:
+        return None, "unparseable task id %r" % (token,)
+    note = str(note or "").strip() or None
+
+    p = path or ledger_path()
+    with eventledger.locked(p) as held:
+        if not held:
+            return None, "task ledger is not writable — nothing was released"
+        # STRICT, BECAUSE THIS CALLER DECIDES: a malformed row skipped here
+        # would be a custody change made in ignorance of the row's real state.
+        existing, unavailable = eventledger.latest_checked(p, strict=True)
+        if unavailable:
+            return None, "task ledger unreadable (%s)" % unavailable
+        prev = existing.get(tid)
+        if not prev:
+            return None, "%s does not exist" % tid
+        if prev.get("status") == "closed":
+            return None, ("%s is CLOSED (%s) — a closed row holds no live "
+                          "work, so there is nothing to hand back"
+                          % (tid, prev.get("closed_reason")
+                             or "no reason recorded"))
+        holder = owner_of(prev)
+        if not holder:
+            return SKIPPED, ("%s is already UNOWNED (status %s) — there is no "
+                             "hold to release, so nothing was written"
+                             % (tid, prev.get("status") or "unknown"))
+        if not held_by(prev, releaser):
+            return None, ("%s is held by %s, not by %s — only the HOLDER can "
+                          "release a row, and releasing is not a way to move "
+                          "somebody else's. Nothing was written"
+                          % (tid, holder, releaser))
+        # CAPPED, AND REFUSED WHOLE PAST THE CAP — AFTER THE ROW IS JUDGED,
+        # so a missing, closed, unowned or other seat's row gets its own
+        # answer and never "shorten the note" for a release that could not
+        # happen. A release note is a short handback reason that stays on the
+        # row: no door edits or trims it (`claim`, `update`, `comment` and
+        # `close` carry `released` forward, `update` refuses the field, and a
+        # row over its budget sheds comments, never this), and only the row's
+        # NEXT release replaces it, so an unbounded one could pin a row near
+        # the event cap until then. Counted in characters on the text that is
+        # stored, and never cut, because a cut reason reads as a whole one.
+        if note and len(note) > RELEASE_NOTE_MAX:
+            return None, ("the release note is %d characters and a release "
+                          "note may be at most %d: it stays on the row, "
+                          "unedited, until the row's next release replaces "
+                          "it. Nothing was released and nothing was cut. "
+                          "Shorten it (`helm task release %s --note "
+                          "<shorter>`) and put the rest in a comment (`helm "
+                          "task comment %s <text>`)"
+                          % (len(note), RELEASE_NOTE_MAX, tid, tid))
+        now = time.time()
+        row = dict(prev)
+        row["owner"] = None
+        row["status"] = "open"
+        row["released"] = {"by": releaser, "ts": now,
+                           "session": _reported_session(),
+                           "pid": os.getpid(), "ppid": os.getppid(),
+                           "owner_was": prev.get("owner"),
+                           "status_was": prev.get("status"), "note": note}
+        row["custody_updated"] = now
+        if prev.get("last_updated") is None:
+            row["last_updated"] = now
+        # THROUGH THE ONE WRITE DOOR. A bare append refused a row that had
+        # outgrown ROW_BUDGET with a sentence naming no cause, so the row a
+        # holder most needs to hand back (a long-lived one) could not be;
+        # `_commit` moves its oldest comments off first and names the size
+        # and the cap when it still refuses.
+        row, err = _commit(p, row)
+        if err:
+            return None, err
+    return row, None
+
+
+def release_stale(token, reason, expect, path=None):
+    """The task sweep's second-breach unassign -> (row, error), or (SKIPPED,
+    reason) when the row moved since the sweep judged it.
+
+    THE ONE CUSTODY CHANGE A MACHINE MAKES, and it is the release shape, not
+    an owner edit: OPEN and UNOWNED, `released` recording the sweep as the
+    releaser with the holder and status it replaced, so the row goes back
+    through the ordinary claim door and the record alone reverses it. It
+    names nobody new. `expect` is REQUIRED — the row the sweep read — so a
+    seat that commented or claimed in between is never unassigned by a
+    judgement made before it acted (taskhygiene.py, task/3451)."""
+    reason = str(reason or "").strip()
+    if not reason:
+        return None, "an unassign needs its reason — a silent one is a drop"
+    expect_err = _expect_error(expect) if expect is not None else \
+        "release_stale needs the row the sweep judged"
+    if expect_err:
+        return None, expect_err
+    tid = normalize_id(token)
+    if not tid:
+        return None, "unparseable task id %r" % (token,)
+    p = path or ledger_path()
+    with eventledger.locked(p) as held:
+        if not held:
+            return None, "task ledger is not writable — nothing was unassigned"
+        existing, unavailable = eventledger.latest_checked(p, strict=True)
+        if unavailable:
+            return None, "task ledger unreadable (%s)" % unavailable
+        prev = existing.get(tid)
+        if not prev:
+            return None, "%s does not exist" % tid
+        if prev != expect:
+            return SKIPPED, _moved(tid)
+        if prev.get("status") not in OPEN_STATUSES or not owner_of(prev):
+            return SKIPPED, "%s is closed or already unowned" % tid
+        now = time.time()
+        row = dict(prev)
+        row["owner"] = None
+        row["status"] = "open"
+        row["released"] = {"by": "stale-bot", "ts": now, "session": None,
+                           "pid": os.getpid(), "ppid": os.getppid(),
+                           "owner_was": prev.get("owner"),
+                           "status_was": prev.get("status"),
+                           "note": reason[:RELEASE_NOTE_MAX]}
+        row["custody_updated"] = now
+        row, err = _commit(p, row)
+        if err:
+            return None, err
+    return row, None
 
 
 def counts(path=None):
@@ -2005,19 +2397,590 @@ def cited_in(text, path=None):
     return out
 
 
+# ------------------------------------------------------- the row's own budget
+#
+# A TASK ROW LOCKED ITSELF BY ITS OWN HISTORY. Every mutation appends the WHOLE
+# row, comments included, and one ledger event may be at most
+# `eventledger.MAX_EVENT_BYTES`. So a long-lived task grew toward the cap one
+# comment at a time and then stopped taking writes at all: measured on the live
+# ledger, one row reached 65,511 bytes at 35 comments, and its 36th comment —
+# and every update, claim and close after it — was refused with a bare "task
+# ledger refused the write" that named no cause.
+#
+# THE CURE IS THE DISPATCH BRIEF'S, REUSED — NOT A SECOND STORE. Text a row
+# cannot afford is stored WHOLE in `refstore` (the one content-addressed store,
+# first built for dispatch briefs), written and fsynced BEFORE the row that
+# names it; the row carries the digest, the byte length and a summary; and
+# every reader recomputes the digest before it shows anything, saying so out
+# loud when it cannot. Two things move off a row:
+#
+#   * its OLDEST COMMENTS, together, into one archive per spill. The row keeps
+#     the newest comments inline — the ones a reader of the row wants first,
+#     and the newest one ALWAYS, so `last_note` never leaves the row — plus one
+#     `comment_archives` entry per archive, oldest first:
+#       {digest, bytes, count, first_ts, last_ts, by}
+#     `by` lists the archived comments' authors, so "has anyone but the mirror
+#     commented" stays answerable from the row alone (`comment_authors`).
+#   * the TEXT of one comment too big to sit on any row, at birth. Its entry
+#     keeps a bounded copy that says so, plus `text_digest` and `text_bytes`.
+#
+# THE LIST OF ARCHIVES IS BOUNDED TOO. One entry per spill, kept forever,
+# would carry a row that kept spilling back toward the cap. So every
+# ARCHIVE_FANOUT adjacent entries of one level fold into ONE index entry a
+# level up: an `index` file (kind ARCHIVE_INDEX_KIND) names them, content-
+# addressed and fsynced before the row like any archive, and the row keeps
+#       {index: level, digest, bytes, count, first_ts, last_ts, by, archives}
+# where `count` and `by` total the entries it names (so `comment_count` and
+# `comment_authors` still answer from the row alone) and `archives` counts the
+# comment files under it. Levels fall from the oldest entry to the newest and
+# no level holds a full run, so a row carries fewer than ARCHIVE_FANOUT
+# entries per level and its levels grow with the LOGARITHM of its archives.
+# `comments_of` reads through the indexes, proving each file, and returns
+# every comment.
+#
+# A ROW IS NEVER REWRITTEN IN PLACE. The ledger is append-only and the folded
+# latest row is still the whole answer; an archive is only a place the row's
+# older comments now live, reached through the row.
+#
+# ROW_BUDGET: where a write starts moving comments off the row. HALF the cap,
+# so the headroom above it absorbs a field edit or one more comment of any
+# admitted size without an event ever meeting the cap itself.
+ROW_BUDGET = eventledger.MAX_EVENT_BYTES // 2
+# After a spill, the newest comments that fit in this many bytes stay inline.
+# The gap between this and ROW_BUDGET is the hysteresis: an archive holds tens
+# of kilobytes of comments, not one comment per write.
+INLINE_KEEP = ROW_BUDGET // 4
+# One comment whose TEXT costs more than this on the row is stored by
+# reference when it is written, keeping COMMENT_EXCERPT bytes inline.
+COMMENT_TEXT_MAX = ROW_BUDGET // 2
+COMMENT_EXCERPT = 2048
+ARCHIVE_KIND = "task-comments"
+ARCHIVE_INDEX_KIND = "task-comment-index"
+# How many adjacent archive entries of one level fold into one index entry.
+ARCHIVE_FANOUT = 8
+# The openings of the sentences readers print, named ONCE because the writer
+# and the renderers and the arms all test for them.
+COMMENT_REF_MARK = "[helm: COMMENT STORED BY REFERENCE"
+ARCHIVE_BROKEN_MARK = "[helm: ARCHIVED COMMENTS"
+COMMENT_FILE_BROKEN_MARK = "[helm: COMMENT FILE"
+
+
+def _json_bytes(value):
+    """What `value` costs on the ledger line — the writer's own encoding."""
+    return len(json.dumps(value, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8"))
+
+
+def _comment_author(by):
+    """(by, door, err) — who a new comment is recorded as.
+
+    THE OWNER'S NOTE CARRIES HIS DOOR (goal-ledger D1). The web backlog's
+    comment box called `comment(rid, text)` with no author, so every note the
+    owner typed there landed as `by: None` and `helm task show` printed `?`
+    for it. The decision card's door has recorded the owner since task/2997,
+    and a task comment now takes the same capability: an OwnerDoor records
+    `by: "owner"` with the door beside it, minted only in his web handlers.
+
+    A caller-stated owner name is refused, for the ledger's reason: every
+    agent runs as his uid, so a seat passing "owner", or his handle, would
+    write in his voice. Any other name is the seat the caller says it is, as
+    before; None is a comment with no author recorded."""
+    from . import ownerasks
+    if isinstance(by, ownerasks.OwnerDoor):
+        return ownerasks.OWNER, by.door, None
+    if by is not None and not isinstance(by, str):
+        return None, None, ("a comment's author is a seat name or the "
+                            "owner's door, not a %s" % type(by).__name__)
+    # THE LABEL IS THE NAME'S SIBLING: `comment_author` prints his note as
+    # "owner (web)", so a stated author that already reads that way ("owner
+    # (web)", "owner(web)", his handle with a door) would print byte-identical
+    # to his own note. The leading token of a stated author is judged as the
+    # name is; a seat address is one token and never carries a space or "(".
+    # THE NAME RECORDED IS JUDGED TOO: canonicalizing strips a leading "@",
+    # so "@owner" would pass a check on the typed string and be written as
+    # "owner".
+    from . import seats
+    head = re.split(r"[\s(]", str(by or "").strip(), maxsplit=1)[0]
+    seat, bad = seats._canonical_recipient(by) if by else (None, None)
+    if any(ownerasks.is_owner(n) for n in (by, head, seat) if n):
+        return None, None, (
+            "refusing to comment as %r: that is the owner's name, and an agent "
+            "never writes in his voice. %s; a seat's comment records the seat "
+            "(helm task comment <id> <text>)" % (by, ownerasks.OWNER_DOORS))
+    if bad:
+        return None, None, (
+            "refusing to comment as %r: a caller-stated author must be an "
+            "exact seat token, not a display label. Omit it and the acting "
+            "seat is recorded" % by)
+    return (seat.display if seat else None), None, None
+
+
+LEGACY_AUTHOR = "legacy: no author recorded"
+
+
+def comment_author(c):
+    """How one comment's author reads, for every surface that prints it.
+
+    A comment written from D1 on records `door` (None for a seat), so a
+    comment WITHOUT that key was written before this store recorded who wrote
+    a web note: LEGACY, with no author, which is the truth about the 586 such
+    comments on the ledger. They are not rewritten. A later comment with no
+    author says only that no author was recorded."""
+    c = c if isinstance(c, dict) else {}
+    from .seats_common import _seat_label
+    by = _seat_label(c.get("by") or "")
+    if not by:
+        return "no author recorded" if "door" in c else LEGACY_AUTHOR
+    door = _seat_label(c.get("door") or "")
+    return "%s (%s)" % (by, door) if door else by
+
+
+def _comment_entry(text, by, door=None):
+    """(entry, blob) for one new comment. `blob` is the text to store FIRST
+    when the text is too big for the row, else None. `door` is written on
+    every new entry, None included, so a new comment is told apart from a
+    legacy one (`comment_author`)."""
+    entry = {"ts": time.time(), "text": text, "by": by or None, "door": door}
+    if _json_bytes(text) <= COMMENT_TEXT_MAX:
+        return entry, None
+    raw = text.encode("utf-8")
+    kept = raw[:COMMENT_EXCERPT].decode("utf-8", "ignore")
+    entry["text"] = kept + (
+        "\n\n%s — %d of %d UTF-8 bytes are on the task row; the whole text "
+        "is stored by digest, and `helm task show` reads it back.]"
+        % (COMMENT_REF_MARK, len(kept.encode("utf-8")), len(raw)))
+    entry["text_digest"] = refstore.digest(text)
+    entry["text_bytes"] = len(raw)
+    return entry, text
+
+
+def _spill(row):
+    """(row, blobs) — `row` with its OLDEST comments moved into one archive
+    when it has outgrown ROW_BUDGET, and the archive text to store first.
+
+    Returned unchanged (with no blobs) when the row is within budget, when it
+    cannot be encoded at all (the append names that), or when the move would
+    be too small to be worth an archive entry while the row still fits the
+    cap — which is what keeps a row whose bulk is a long NOTE from minting one
+    archive per comment."""
+    payload, _why = eventledger.encode(row)
+    if payload is None or len(payload) <= ROW_BUDGET:
+        return row, []
+    comments = list(row.get("comments") or ())
+    sizes = [_json_bytes(c) for c in comments]
+    keep = 0
+    kept_bytes = 0
+    for n in reversed(sizes):
+        if keep and kept_bytes + n > INLINE_KEEP:
+            break
+        keep += 1
+        kept_bytes += n
+    moved = comments[:len(comments) - keep]
+    if not moved or (sum(sizes[:len(moved)]) < INLINE_KEEP
+                     and len(payload) <= eventledger.MAX_EVENT_BYTES):
+        return row, []
+    blob = json.dumps({"kind": ARCHIVE_KIND, "task": row.get("id"),
+                       "comments": moved},
+                      ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+    stamps = [c.get("ts") for c in moved if isinstance(c, dict)]
+    authors = {c.get("by") for c in moved if isinstance(c, dict)}
+    out = dict(row)
+    out["comments"] = comments[len(moved):]
+    archives, indexes = _fold(row.get("id"), list(
+        row.get("comment_archives") or ()) + [{
+            "digest": refstore.digest(blob),
+            "bytes": len(blob.encode("utf-8")),
+            "count": len(moved),
+            "first_ts": stamps[0] if stamps else None,
+            "last_ts": stamps[-1] if stamps else None,
+            "by": _authors(authors),
+        }])
+    out["comment_archives"] = archives
+    return out, [blob] + indexes
+
+
+def _authors(names):
+    return sorted(names, key=lambda a: (a is None, str(a)))
+
+
+def _archive_level(ref):
+    """0 for a comment archive, its level for an index, None for anything
+    else (never folded, and read as the malformed reference it is)."""
+    if not isinstance(ref, dict):
+        return None
+    level = ref.get("index", 0)
+    return level if isinstance(level, int) and not isinstance(level, bool) \
+        and level >= 0 else None
+
+
+def _archive_count(ref):
+    count = ref.get("count") if isinstance(ref, dict) else None
+    return count if isinstance(count, int) and not isinstance(count, bool) \
+        else 0
+
+
+def _fold(tid, archives):
+    """(archives, index texts): every run of ARCHIVE_FANOUT adjacent entries
+    of one level folded into ONE index entry a level up, oldest run first,
+    until no run is full — the bound on the list. A run is replaced where it
+    stood, so the list keeps its order and every comment its place."""
+    blobs = []
+    while True:
+        level, at = None, None
+        for i in range(len(archives) - ARCHIVE_FANOUT + 1):
+            levels = {_archive_level(a) for a in archives[i:i + ARCHIVE_FANOUT]}
+            if len(levels) == 1 and None not in levels:
+                level, at = levels.pop(), i
+                break
+        if at is None:
+            return archives, blobs
+        run = archives[at:at + ARCHIVE_FANOUT]
+        blob = json.dumps({"kind": ARCHIVE_INDEX_KIND, "task": tid,
+                           "index": level + 1, "archives": run},
+                          ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"))
+        authors = {b for a in run for b in a.get("by") or ()
+                   if b is None or isinstance(b, str)}
+        archives = archives[:at] + [{
+            "index": level + 1,
+            "digest": refstore.digest(blob),
+            "bytes": len(blob.encode("utf-8")),
+            "count": sum(_archive_count(a) for a in run),
+            "archives": sum(archive_files(a) for a in run),
+            "first_ts": run[0].get("first_ts"),
+            "last_ts": run[-1].get("last_ts"),
+            "by": _authors(authors),
+        }] + archives[at + ARCHIVE_FANOUT:]
+        blobs.append(blob)
+
+
+def archive_files(ref):
+    """How many comment files one archive entry stands for: 1 for an
+    archive, the count an index carries for an index."""
+    if _archive_level(ref):
+        files = ref.get("archives")
+        return files if isinstance(files, int) and \
+            not isinstance(files, bool) else 0
+    return 1
+
+
+def _largest_fields(row, top=3):
+    sized = sorted(((_json_bytes(v), k) for k, v in row.items()),
+                   reverse=True)[:top]
+    return ", ".join("%s %d bytes" % (k, n) for n, k in sized)
+
+
+def _ledger_refusal(row, why, payload=None):
+    """The refusal a task door prints — the cause, the row's size and the cap.
+
+    EVERY REFUSAL CARRIES BOTH NUMBERS, whatever the cause. A size refusal
+    must, because the numbers ARE the cause, and it says what to do about
+    them; any other refusal carries them too, because the first thing a
+    reader of "refused" needs to rule out is a row that has outgrown the
+    ledger, and the numbers answer that for free."""
+    if payload is None:
+        payload, _ = eventledger.encode(row)
+    tid = row.get("id") or "the row"
+    if payload is not None and len(payload) > eventledger.MAX_EVENT_BYTES:
+        return (
+            "task ledger refused the write: %s's row is %d bytes and one "
+            "ledger event may be at most %d bytes. Comments move off the row "
+            "by themselves; the other fields do not, and the largest are: %s. "
+            "Shorten the largest (a note: `helm task update %s --note "
+            "<shorter>`), or file a follow-up row that cites this one."
+            % (tid, len(payload), eventledger.MAX_EVENT_BYTES,
+               _largest_fields(row), tid))
+    size = ("is %d bytes" % len(payload)) if payload is not None \
+        else "cannot be encoded"
+    return ("task ledger refused the write: %s (%s's row %s; one ledger "
+            "event may be at most %d bytes)"
+            % (why, tid, size, eventledger.MAX_EVENT_BYTES))
+
+
+def _commit(p, row, blobs=()):
+    """(stored row, None) or (None, refusal) — THE ONE WRITE DOOR for a task
+    row, and the caller holds the ledger lock.
+
+    ORDER IS THE CONTRACT: the row is fitted first (nothing is written for a
+    row that cannot be appended), then every text the row will reference is
+    stored and fsynced, and only then is the row appended. A kill between the
+    last two leaves an unreferenced file and no row — never a row naming a
+    file that is not there."""
+    row, spilled = _spill(row)
+    payload, why = eventledger.encode(row)
+    if why:
+        return None, _ledger_refusal(row, why, payload)
+    for blob in list(blobs) + spilled:
+        _ref, _n, err = refstore.write(blob)
+        if err:
+            return None, _ledger_refusal(row, (
+                "text this row would reference could not be stored under %s "
+                "(%s), so the row was not appended" % (refstore.directory(),
+                                                       err)), payload)
+    ok, why = eventledger.append_unlocked_checked(p, row)
+    if not ok:
+        return None, _ledger_refusal(row, why, payload)
+    return row, None
+
+
+def _follow_goal_custody(prev, row):
+    """CARD CUSTODY FOLLOWS THE GOAL. A committed write that changed a goal
+    row's owner moves the goal's open criteria card to the new accountable
+    seat in the same call, under this writer's lock and before the goal
+    projection is refreshed, so the projection reads the moved card. Every
+    door that changes a task's owner comes through update() (a seat
+    reassignment, a takeover, a claim of a row nobody held), so this one
+    place covers them all. The row has landed and the card move cannot undo
+    it, so a failure is journaled and left visible (`goals.follow_custody`),
+    never raised into the write it follows."""
+    try:
+        from . import goals
+        goals.follow_custody(prev, row)
+    except Exception as e:     # noqa: BLE001 — the row write already landed
+        from . import pk
+        pk.event("goal-custody-lag", str(row.get("id")),
+                 "custody follow raised: %s" % e)
+
+
+def _touch_goal_projection(p, existing, row, prev=None):
+    """Refresh the goal projection when a committed row belongs to a goal's
+    story (the goal itself, or any row whose story root is one), so the Stop
+    path reads goals from one small file instead of folding this ledger.
+
+    UNDER THE CALLER'S LOCK, FROM THE CALLER'S FOLD: `existing` is the whole
+    ledger this writer already read, and `row` the event it just appended,
+    so the refresh costs no second read. A cache must never fail the write
+    it follows, so any trouble leaves the projection stale, and
+    `goals.read_projection` says so from the ledger's appended tail."""
+    touched = False
+    for r in (row, prev):
+        if not isinstance(r, dict):
+            continue
+        if isinstance(r.get("goal"), dict):
+            touched = True
+        parent = r.get("continues")
+        if type(parent) is str and parent:
+            root = _story_root(existing, parent)
+            touched = touched or isinstance(
+                (existing.get(root) or {}).get("goal"), dict)
+    if not touched:
+        return
+    try:
+        from . import goals
+        goals.refresh_projection(known=existing, override=row, tasks_path=p)
+    except Exception:      # noqa: BLE001 — a derived cache never fails its write
+        pass
+
+
+def comment_count(row):
+    """How many comments the row carries, archived ones included."""
+    row = row or {}
+    return len(row.get("comments") or ()) + sum(
+        a["count"] for a in row.get("comment_archives") or ()
+        if isinstance(a, dict) and isinstance(a.get("count"), int)
+        and not isinstance(a.get("count"), bool))
+
+
+def comment_authors(row):
+    """Every author who has commented on the row -> set, archived comments
+    included, answered from the ROW alone (each archive entry lists its
+    authors) so a predicate over authorship never depends on a file read."""
+    row = row or {}
+    out = {c.get("by") for c in row.get("comments") or ()
+           if isinstance(c, dict)}
+    for a in row.get("comment_archives") or ():
+        if isinstance(a, dict):
+            out.update(b for b in a.get("by") or ()
+                       if b is None or isinstance(b, str))
+    return out
+
+
+def _when(ts):
+    got = stamp_epoch(ts)
+    return (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(got))
+            if got is not None else "an unrecorded time")
+
+
+def _archive_problem(tid, ref, label, detail):
+    count = ref.get("count") if isinstance(ref, dict) else None
+    span = ("%s comment%s from %s to %s" % (
+        count, "" if count == 1 else "s", _when(ref.get("first_ts")),
+        _when(ref.get("last_ts")))) if isinstance(count, int) \
+        else "an unknown number of comments"
+    return "%s %s — %s on %s are NOT shown: %s.]" % (
+        ARCHIVE_BROKEN_MARK, label, span, tid, detail)
+
+
+def _proven(tid, ref, kind, noun):
+    """(body, problem) for the file one archive entry names: its digest and
+    length PROVEN, and JSON of `kind` written for this task — or LOUDLY
+    refused, as one problem line standing for every comment the entry
+    counts."""
+    if not isinstance(ref, dict):
+        return None, _archive_problem(tid, {}, "REFERENCE MALFORMED", (
+            "the row carries %r where an archive reference belongs"
+            % (str(ref)[:64],)))
+    text, fault = refstore.read(ref.get("digest"), ref.get("bytes"))
+    path = refstore.path_of(ref.get("digest"))
+    if fault:
+        kind_, detail = fault
+        label, why = {
+            refstore.MALFORMED: ("REFERENCE MALFORMED",
+                                 "the row carries %r where a 32-character "
+                                 "digest belongs" % (detail,)),
+            refstore.MISSING: ("MISSING",
+                               "they were moved off the row into %s and that "
+                               "file could not be read (%s)" % (path, detail)),
+            refstore.MISMATCH: ("DIGEST MISMATCH",
+                                "%s hashes to %s and the row says %s, so that "
+                                "file is NOT the archive this row wrote"
+                                % (path, detail, ref.get("digest"))),
+        }.get(kind_, ("LENGTH MISMATCH", "%s is %s bytes and the row declares "
+                      "%s" % (path, detail, ref.get("bytes"))))
+        return None, _archive_problem(tid, ref, label, why)
+    try:
+        body = json.loads(text)
+    except ValueError as exc:
+        body = exc
+    why = ("it is not JSON" if isinstance(body, ValueError) else
+           "it is not a %s" % noun if not isinstance(body, dict)
+           or body.get("kind") != kind else
+           "it belongs to %s" % body.get("task")
+           if body.get("task") != tid else None)
+    if why:
+        return None, _unproven(tid, ref, why)
+    return body, None
+
+
+def _unproven(tid, ref, why):
+    return _archive_problem(tid, ref, "UNREADABLE", (
+        "%s passes its digest check but %s"
+        % (refstore.path_of(ref.get("digest")), why)))
+
+
+def _archived(tid, ref):
+    """(comments, problem) for one comment archive, PROVEN or LOUDLY
+    refused."""
+    body, problem = _proven(tid, ref, ARCHIVE_KIND, "comment archive")
+    if problem:
+        return [], problem
+    got = body.get("comments")
+    why = ("it is not a comment archive" if not isinstance(got, list) else
+           "it holds %d comments and the row says %s"
+           % (len(got), ref.get("count"))
+           if len(got) != ref.get("count") else None)
+    if why:
+        return [], _unproven(tid, ref, why)
+    return [c for c in got if isinstance(c, dict)], None
+
+
+def _indexed(tid, ref):
+    """(entries, problem) for one index: the archive entries its file names,
+    PROVEN — every one a level below it, together counting what the index
+    says — or LOUDLY refused. The level bound also ends every walk."""
+    body, problem = _proven(tid, ref, ARCHIVE_INDEX_KIND, "comment index")
+    if problem:
+        return [], problem
+    level = _archive_level(ref)
+    got = body.get("archives")
+    why = ("it is not a comment index" if not isinstance(got, list)
+           or body.get("index") != level else
+           "it names an entry that is not a level below %d" % level
+           if any(_archive_level(a) is None or _archive_level(a) >= level
+                  for a in got) else
+           "its entries hold %d comments and the row says %s"
+           % (sum(_archive_count(a) for a in got), ref.get("count"))
+           if sum(_archive_count(a) for a in got) != ref.get("count")
+           else None)
+    if why:
+        return [], _unproven(tid, ref, why)
+    return got, None
+
+
+def _whole(c):
+    """One comment with its text WHOLE, or its bounded copy under a loud
+    line."""
+    if c.get("text_digest") is None:
+        return c
+    text, fault = refstore.read(c.get("text_digest"), c.get("text_bytes"))
+    if fault is None:
+        return dict(c, text=text)
+    kind, detail = fault
+    return dict(c, unreadable=True, text=(
+        "%s %s — this comment's whole text (%s bytes) was stored by digest %s "
+        "and %s. What follows is the row's BOUNDED copy.]\n%s"
+        % (COMMENT_FILE_BROKEN_MARK, kind.upper(), c.get("text_bytes"),
+           c.get("text_digest"),
+           "could not be read (%s)" % detail if kind == refstore.MISSING
+           else "the file found is not that text (%s)" % detail,
+           c.get("text") or "")))
+
+
+def comments_of(row):
+    """Every comment on the row, OLDEST FIRST, archived ones read back.
+
+    THE ONE READER FOR A ROW'S WHOLE COMMENT HISTORY; every surface that
+    renders comments goes through it. Archives come first, in the order they
+    were written, then the inline comments — which is append order, the only
+    order this ledger has. An index entry is read through, in its place, to
+    the archive entries its file names.
+
+    NOTHING IS DROPPED SILENTLY. An archive that is missing, unreadable, or not
+    the one the row wrote becomes ONE entry in its place whose text says so
+    and how many comments it stood for, marked `unreadable`; a by-reference
+    comment whose file fails keeps its bounded copy under the same kind of
+    line. A renderer that prints `text` prints the loss."""
+    row = row or {}
+    tid = row.get("id")
+    out = []
+    todo = list(row.get("comment_archives") or ())
+    while todo:
+        ref = todo.pop(0)
+        if _archive_level(ref):
+            got, problem = _indexed(tid, ref)
+            todo[:0] = got
+        else:
+            got, problem = _archived(tid, ref)
+            out.extend(got)
+        if problem:
+            out.append({"ts": ref.get("first_ts") if isinstance(ref, dict)
+                        else None, "by": None, "text": problem,
+                        "unreadable": True})
+    out.extend(c for c in row.get("comments") or () if isinstance(c, dict))
+    return [_whole(c) for c in out]
+
+
 def comment(token, text, by=None, path=None, expect=None):
     """Append one non-closing note -> (row, error), or (SKIPPED, reason) when
     `expect` is given and the row moved since the caller read it (see update).
 
     Comments live IN the row, appended to `comments[]`, which is the shape
     owner-decisions already uses (ownerasks.py:532-533). One ledger, one read,
-    no join, and no comment that can outlive the task it annotates. The cost is
-    that a row with N comments is O(N) bytes and re-appends whole: bounded, and
-    the same cost the decision queue already accepts.
+    no join, and no comment that can outlive the task it annotates.
+
+    THE ROW STAYS BOUNDED; THE HISTORY DOES NOT. A row re-appends whole, so a
+    row carrying every comment it ever took grew until the ledger refused it
+    and the task stopped taking writes. `_commit` moves the oldest comments
+    into an archive once the row passes ROW_BUDGET, and a single comment too
+    big for any row is stored by reference here (`_comment_entry`); every
+    reader gets the whole history back through `comments_of`.
+
+    `by` is a seat name, None, or the owner's OwnerDoor, and a caller-stated
+    owner name is refused before anything is read (`_comment_author`).
     """
     text = (text or "").strip()
     if not text:
         return None, "an empty comment says nothing — pass the text"
+    by, door, author_err = _comment_author(by)
+    if author_err:
+        return None, author_err
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        return None, ("the comment text is not encodable as UTF-8 (%s), so "
+                      "the ledger could never store it — nothing was written"
+                      % exc)
     tid = normalize_id(token)
     if not tid:
         return None, "unparseable task id %r" % (token,)
@@ -2046,12 +3009,14 @@ def comment(token, text, by=None, path=None, expect=None):
             return None, "%s does not exist" % tid
         if expect is not None and prev != expect:
             return SKIPPED, _moved(tid)
+        entry, blob = _comment_entry(text, by, door)
         row = dict(prev)
-        row["comments"] = list(prev.get("comments") or ()) + [
-            {"ts": time.time(), "text": text, "by": by or None}]
+        row["comments"] = list(prev.get("comments") or ()) + [entry]
         row["last_updated"] = time.time()
-        if not eventledger.append_unlocked(p, row):
-            return None, "task ledger refused the write"
+        row, err = _commit(p, row, blobs=(blob,) if blob else ())
+        if err:
+            return None, err
+        _touch_goal_projection(p, existing, row)
     return row, None
 
 
@@ -2215,6 +3180,29 @@ def public_row(row):
     # so the rename-recovery use the field's own comment describes was never
     # wired to a reader. This removes an exposure, not a feature.
     out.pop("reported_session", None)
+    # THE SAME BEARER, ONE FIELD DEEPER. `release` records the session the
+    # releasing process declared so a forged release can be traced; the store
+    # keeps it and the wire drops it, for the reason above. A copy, never an
+    # edit: `out` shares the nested dict with the caller's row.
+    rel = out.get("released")
+    if isinstance(rel, dict) and "session" in rel:
+        out["released"] = {k: v for k, v in rel.items() if k != "session"}
+    # PAYBACK DAYS, DERIVED BY THE ONE READER and published only when both
+    # halves are set, so a JSON reader never re-derives cost / tax on its own.
+    _payback = tax_of(row)[2]
+    if _payback is not None:
+        out["payback_days"] = _payback
+    # THE WHOLE COMMENT HISTORY IS WHAT THIS SHAPE PUBLISHES. A row whose older
+    # comments were archived carries only the newest inline, so a JSON reader
+    # handed the stored list would read a suffix as the conversation. Every
+    # export goes through this function, so it resolves them here — archived
+    # ones read back and proven, anything unprovable standing as a LOUD entry
+    # in its place — and `comment_archives` rides along as the provenance.
+    # A row that never outgrew its budget is untouched: no file is read.
+    if row.get("comment_archives") or any(
+            isinstance(c, dict) and c.get("text_digest") is not None
+            for c in row.get("comments") or ()):
+        out["comments"] = comments_of(row)
     return out
 
 
@@ -2258,26 +3246,208 @@ STORY_FLAGS = tuple(flag for flag, _key, _coerce in STORY_FIELDS)
 STORY_KEYS = tuple(key for _flag, key, _coerce in STORY_FIELDS)
 
 
+# ---------------------------------------------------------------------------
+# the friction tax — what a row removes, and when it pays back
+# ---------------------------------------------------------------------------
+
+# THE FRICTION TAX (owner-adopted; store premise friction-tax). Every step an
+# agent repeats by hand, every guard workaround, wait, re-read, re-ask or
+# false refusal is a tax paid on every later task that meets it. A row that
+# removes one says so here:
+#
+#   tax       the agent steps (tool calls) per day the work removes: the
+#             steps each time x the times a day. Measured from the ledger,
+#             chat or transcripts, never guessed.
+#   tax_cost  what building the cut costs, in the same steps. Optional.
+#
+# PAYBACK DAYS = tax_cost / tax. A cut that pays back within
+# PAYBACK_AHEAD_DAYS goes ahead of the other rows of its rank: in the board
+# order (`board_key`, so `helm task list` and the board agree) and in the
+# order `helm task triage` takes the rank debt. Rank still wins: a P2 cut
+# never passes a P1.
+#
+# ONLY WHEN PRESENT, like `posture_na` and `goal`. An untaxed row keeps the
+# shape it had, so a reader that predates the field reads every row it read
+# before, and `update()` carries the keys through `dict(prev)` untouched.
+PAYBACK_AHEAD_DAYS = 2.0
+
+
+def _coerce_steps(raw):
+    """(number_or_None, error) from a CLI value. EMPTY IS A DELIBERATE CLEAR.
+    The range (more than zero, finite) is checked at the API door, which
+    both CLI doors reach, so it has one wording."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None, ("%r is not a number — give a count of agent steps, "
+                      "for example 300" % raw)
+    return (int(value) if value.is_integer() else value), None
+
+
+TAX_FIELDS = (
+    ("--tax", "tax", _coerce_steps),
+    ("--tax-cost", "tax_cost", _coerce_steps),
+)
+TAX_FLAGS = tuple(flag for flag, _key, _coerce in TAX_FIELDS)
+TAX_KEYS = tuple(key for _flag, key, _coerce in TAX_FIELDS)
+
+
+def _steps_error(key, value):
+    """Why `value` cannot be stored as `key`, or None. None itself is fine:
+    absent at add(), a deliberate clear at update()."""
+    if value is None:
+        return None
+    # A bool is an int to Python and is never a step count.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ("%s must be a number of steps, not %s"
+                % (key, type(value).__name__))
+    # An int past float range passes the type check and then overflows the
+    # reader's cost / tax, so it is refused here with the other non-finites.
+    try:
+        as_float = float(value)
+    except OverflowError:
+        return ("%s must be a finite number of steps, got an int past the "
+                "float range" % key)
+    if as_float != as_float or as_float in (float("inf"), float("-inf")):
+        return "%s must be a finite number of steps, got %r" % (key, value)
+    if value <= 0:
+        return ("%s must be more than zero steps, got %s — zero or less "
+                "removes nothing, so leave it off instead" % (key, value))
+    return None
+
+
+def _tax_error(values):
+    """The API doors' check over the TAX_KEYS a caller passed, or None."""
+    for key in TAX_KEYS:
+        if key in values:
+            bad = _steps_error(key, values[key])
+            if bad:
+                return bad
+    return None
+
+
+def _tax_pair_error(row):
+    """A build cost with no tax has no payback, so it is refused."""
+    if row.get("tax_cost") is not None and row.get("tax") is None:
+        return ("tax_cost is set with no tax — payback days are cost / tax, "
+                "so a cost alone says nothing. Set the tax too, or clear the "
+                "cost")
+    return None
+
+
+def tax_of(row):
+    """(tax, cost, payback_days) for one row; each is None when absent.
+
+    THE ONE READER. A value no door would store — a string, zero, NaN from a
+    hand-edited ledger — reads as absent rather than raising, so one bad row
+    never takes a listing down. Payback needs both halves."""
+    row = row if isinstance(row, dict) else {}
+    tax, cost = row.get("tax"), row.get("tax_cost")
+    tax = None if _steps_error("tax", tax) else tax
+    cost = None if _steps_error("tax_cost", cost) else cost
+    payback = (cost / float(tax)
+               if tax is not None and cost is not None else None)
+    return tax, cost, payback
+
+
+def fast_tax_cut(row):
+    """True when the row is a tax cut that pays back within
+    PAYBACK_AHEAD_DAYS. An unknown payback is not proven fast."""
+    payback = tax_of(row)[2]
+    return payback is not None and payback <= PAYBACK_AHEAD_DAYS
+
+
+def tax_key(row):
+    """The ordering part for the friction tax: a fast tax cut first, shortest
+    payback first, then every other row. Constant for every row that is not a
+    fast cut, so it leaves their order exactly as it was."""
+    return (0, tax_of(row)[2]) if fast_tax_cut(row) else (1, 0.0)
+
+
+def _steps(n):
+    """300, not 300.0; 2.5 stays 2.5."""
+    return "%d" % n if float(n).is_integer() else "%g" % n
+
+
+def _days(d):
+    """A payback as a reader says it: 1 day, 0.5 days, 12 days.
+
+    ROUNDED UP TO THE TENTH, NEVER TO THE NEAREST. The board compares the
+    exact payback with PAYBACK_AHEAD_DAYS and this prints it, so to the
+    nearest 2.04 days read "payback 2 days" on a row the board kept behind
+    the fast cuts. Up, a shown payback of 2 days or less is a fast cut. The
+    round to 6 places first drops float noise: a cost of 2.1 over a tax of
+    0.3 is 7.000000000000001 days, which is 7 days, not 7.1."""
+    if not math.isfinite(d):
+        return "%s days" % d
+    if d < 0.1:
+        return "under 0.1 days"
+    whole, tenth = divmod(math.ceil(round(d * 10, 6)), 10)
+    text = "%d" % whole if not tenth else "%d.%d" % (whole, tenth)
+    return "%s day%s" % (text, "" if text == "1" else "s")
+
+
+def tax_line(row):
+    """`show`'s line for a taxed row, or None when it carries no tax."""
+    tax, cost, payback = tax_of(row)
+    if tax is None:
+        return None
+    if payback is None:
+        return ("friction tax: %s steps/day; payback UNKNOWN (no build cost "
+                "— set it with --tax-cost N)" % _steps(tax))
+    return ("friction tax: %s steps/day; payback %s (build cost %s steps)"
+            % (_steps(tax), _days(payback), _steps(cost)))
+
+
+def _tax_cell(row):
+    """The short form the ranked listing and the triage preview print."""
+    tax, _cost, payback = tax_of(row)
+    return "%s/day payback %s" % (
+        _steps(tax), _days(payback) if payback is not None else "UNKNOWN")
+
+
+def _by_tax(rows_):
+    """(taxed rows, highest tax first; count of rows with no tax). Ties go to
+    the shorter payback, then the board order."""
+    def key(r):
+        tax, _cost, payback = tax_of(r)
+        return (-tax, float("inf") if payback is None else payback) \
+            + tuple(board_key(r))
+    taxed = sorted((r for r in rows_ if tax_of(r)[0] is not None), key=key)
+    return taxed, len(rows_) - len(taxed)
+
+
 
 USAGE = (
     "usage: helm task add <title...> [--owner SEAT | --mine] [--note N] "
     "[--ref R]... [--id NNN] [--owner-asked] [--posture-na REASON] "
     "[--project NAME] [--force-new] "
-    + " ".join("[%s V]" % f for f in STORY_FLAGS) + "\n"
+    + " ".join("[%s V]" % f for f in STORY_FLAGS) + " "
+    + " ".join("[%s N]" % f for f in TAX_FLAGS) + "\n"
     "       helm task list [--all] [--all-projects] [--project NAME] "
-    "[--mine | --owner SEAT] [--json]\n"
+    "[--mine | --owner SEAT] [--by-tax] [--json]\n"
     "       helm task show <id> [--json]        (id: 263, #263 or task/263)\n"
     "       helm task resolve <token> [--json]  (what does '#263' mean?)\n"
     "       helm task claim <id> [--owner SEAT]\n"
+    "       helm task release <id> [--note TEXT]   (the holder hands "
+    "its row back: OPEN, UNOWNED; the note is at most 2000 characters)\n"
     "       helm task takeover <id> --from-lane L --transfer-id ID "
     "[--superseding]\n"
     "       helm task update <id> [--title T] [--note N] [--owner S] "
     "[--status S] [--origin owner|agent] [--ref R]... "
-    + " ".join("[%s V]" % f for f in STORY_FLAGS)
-    + "   (empty value promotes a row out / unranks it)\n"
+    + " ".join("[%s V]" % f for f in STORY_FLAGS) + " "
+    + " ".join("[%s N]" % f for f in TAX_FLAGS)
+    + "   (empty value promotes a row out / unranks it / clears a tax)\n"
     "       helm task triage [--apply] [--limit N] [--project NAME]"
     "   (rank the UNRANKED open rows)\n"
     "       helm task close <id> <reason...>\n"
+    "       helm task close-candidates [--json]   (rows a train landed "
+    "whole; the stale sweep links them)\n"
+    "       helm task confirm-close <id>   (the owner's one word: close a "
+    "candidate with its land)\n"
     "       helm task comment <id> <text...>\n"
     "       helm task standdown <id> <reason...> [--lift TEXT] [--until 4h|2d|YYYY-MM-DD]\n"
     "       helm task standdown <id> --clear\n"
@@ -2304,6 +3474,13 @@ USAGE = (
     "grammar, only punctuation) cannot be resolved at all, so it is refused as\n"
     "UNKNOWN rather than filed as proven-new; --force-new files it unresolved.\n"
     "\n"
+    "THE FRICTION TAX: `--tax N` is the agent steps per day a row's work\n"
+    "removes (the steps each time x the times a day, measured, never\n"
+    "guessed), and `--tax-cost N` is its build cost in steps. The payback\n"
+    "days are cost / tax. A cut that pays back within 2 days goes ahead of\n"
+    "the other rows of its rank in `list` and `triage`; `list --by-tax`\n"
+    "ranks the taxed rows, highest tax first.\n"
+    "\n"
     "A value that starts with a dash needs the `=` spelling: `--note=-5` and\n"
     "`--note=--force` are taken literally, while `--note -5` is refused as a\n"
     "probable typo. `--` before the title is the same escape for a TITLE that\n"
@@ -2324,7 +3501,7 @@ USAGE = (
 # door below DERIVES from this tuple and none of them names a field again.
 # Adding a third mutable field is one line here.
 _VALUED_FLAGS = ("--owner", "--note", "--id", "--posture-na",
-                 "--ref", PROJECT_FLAG) + STORY_FLAGS
+                 "--ref", PROJECT_FLAG) + STORY_FLAGS + TAX_FLAGS
 _BOOL_FLAGS = ("--mine", "--owner-asked", "--force-new")
 
 
@@ -2465,6 +3642,8 @@ def _cli_error(err):
     # The closed-row invariant remains a separate remedy below.
     if "cannot be reopened" in err:
         return err + " (`helm task add ... --ref <id>`)"
+    if "tax_cost is set with no tax" in err:
+        return err + " (`--tax N`, or `--tax-cost=` to clear the cost)"
     return err
 
 
@@ -2620,15 +3799,33 @@ def last_note(row):
     return notes[-1] if notes else None
 
 
+# THE SWEEP'S RECEIPT PREFIX (helm/taskhygiene.py, task/3451). Every act the
+# task sweep takes on a row — a land linked, an owner pinged, a row unassigned
+# or closed — leaves a comment starting with this, and a receipt is NEVER
+# motion: a bot saying a row is stale must not be what makes it look fresh.
+# Spelled with a slash, not a space: "helm <word>:" is the shape of a command
+# label, and a receipt is not a verb anyone can run.
+SWEEP_RECEIPT_MARK = "[helm/stale-bot:"
+
+
+def is_sweep_receipt(c):
+    """Is comment `c` one of the task sweep's own receipts?"""
+    return isinstance(c, dict) and \
+        str(c.get("text") or "").startswith(SWEEP_RECEIPT_MARK)
+
+
 def noted_epoch(row):
     """When anybody last WROTE on the row: its newest comment, else its filing.
 
     A row nobody has commented on has not been untouched forever — it was
     filed, and that is when its clock started. The fallback is what makes "no
     note in seven days" answerable for a row carrying no notes at all, and that
-    is most of the backlog.
+    is most of the backlog. The sweep's receipts are not writing on the row
+    (`is_sweep_receipt`), so a staleness receipt never resets this clock.
     """
-    note = last_note(row)
+    notes = [c for c in ((row or {}).get("comments") or ())
+             if isinstance(c, dict) and not is_sweep_receipt(c)]
+    note = notes[-1] if notes else None
     got = stamp_epoch(note.get("ts")) if note else None
     return got if got is not None else filed_epoch(row)
 
@@ -2652,10 +3849,15 @@ def board_key(row):
     IT COMPOSES, IT DOES NOT REPLACE. `sort_key` still means the numbering and
     `rank_key` still means rank-then-numbering for every reader of them; this is
     the third question, and a surface that wants it asks for it by name.
+
+    A FAST TAX CUT LEADS ITS RANK (`tax_key`, the friction tax): a row whose
+    cut pays back within PAYBACK_AHEAD_DAYS sorts before the other rows of
+    its rank, shortest payback first. The part is constant for every other
+    row, so their oldest-first order is unchanged.
     """
     filed = filed_epoch(row)
-    head = ((_rank(row), 1, 0.0) if filed is None
-            else (_rank(row), 0, filed))
+    head = ((_rank(row),) + tax_key(row)
+            + ((1, 0.0) if filed is None else (0, filed)))
     return head + tuple(sort_key(row))
 
 
@@ -3044,7 +4246,12 @@ def _story_order(rows_):
             out.append((row, "  " * depth))
             rid = row.get("id")
             if type(rid) is str:
-                for kid in sorted(kids.get(rid, ()), key=_rank, reverse=True):
+                # REVERSED FOR THE STACK, SO THE POP IS BOARD ORDER. Sorting
+                # by rank alone reversed every tie, and siblings of one rank
+                # printed newest first; the whole board key keeps them oldest
+                # first, with a fast tax cut ahead.
+                for kid in sorted(kids.get(rid, ()), key=board_key,
+                                  reverse=True):
                     stack.append((kid, depth + 1))
     for r in rows_:
         if _seen_key(r) not in emitted:
@@ -3092,9 +4299,15 @@ def _fmt(row, indent="", project_col=False):
     # leaves a declared-agent row and an unknown legacy row equally blank.
     rank = row.get("priority")
     rank = rank if rank in PRIORITIES else "  "
-    return "%s%s%s %-2s %-12s %-11s %-16s %s%s" % (
+    # A GOAL ROW SAYS SO, WITH ITS SCORE: the owner's goals must not read as
+    # one more backlog line (helm/goals.py).
+    badge = ""
+    if isinstance(row.get("goal"), dict):
+        from . import goals
+        badge = goals.badge(row) + " "
+    return "%s%s%s %-2s %-12s %-11s %-16s %s%s%s" % (
         indent, mark, origin, rank, row.get("id"), st, owner[:16], proj,
-        (row.get("title") or "")[:96])
+        badge, (row.get("title") or "")[:96])
 
 
 def _free_text(verb, words, what):
@@ -3124,7 +4337,8 @@ def _free_text(verb, words, what):
 
 
 def cmd_task(args):
-    """task add|list|triage|show|resolve|claim|takeover|close|comment."""
+    """task add|list|triage|show|resolve|claim|release|takeover|close|
+    close-candidates|confirm-close|comment."""
     from . import seats
 
     args = list(args or [])
@@ -3293,6 +4507,16 @@ def cmd_task(args):
                 print("helm task: %s %s" % (_flag, _cerr), file=sys.stderr)
                 return 2
         continues, priority = story["continues"], story["priority"]
+        # THE FRICTION TAX, from its own table the same way: raw for the
+        # valueless guard below, coerced for the write.
+        raw_tax, taxes = {}, {}
+        for _flag, _key, _coerce in TAX_FIELDS:
+            raw_tax[_flag] = _take(opts, _flag)
+            taxes[_key], _cerr = _coerce(raw_tax[_flag] or "")
+            if _cerr:
+                print("helm task: %s %s — nothing was filed." % (_flag, _cerr),
+                      file=sys.stderr)
+                return 2
         refs = _take_all(opts, "--ref")
         mine = "--mine" in opts
         if mine:
@@ -3401,6 +4625,8 @@ def cmd_task(args):
                                     ("--ref", refs or None))
                      + tuple((flag, raw_story[flag])
                              for flag, _k, _c in STORY_FIELDS)
+                     + tuple((flag, raw_tax[flag])
+                             for flag, _k, _c in TAX_FIELDS)
                      if f in typed_opts and v is None]
         if valueless:
             print("helm task: %s needs a value that is not another flag — "
@@ -3598,7 +4824,7 @@ def cmd_task(args):
                        origin="owner" if owner_asked else "agent",
                        project=project, posture_na=posture_na,
                        continues=continues, priority=priority,
-                       force_new=force_new)
+                       force_new=force_new, **taxes)
         if err:
             # a posture refusal is printed whole — its three questions ARE
             # the message — where every other refusal takes the one-line form
@@ -3606,6 +4832,8 @@ def cmd_task(args):
                   "helm task: %s" % _cli_error(err), file=sys.stderr)
             return 2
         print("helm task: filed %s — %s" % (row["id"], row["title"]))
+        if tax_line(row):
+            print("  " + tax_line(row))
         # THE DOOR SAYS WHAT IT FILED, AND UNRANKED IS A STATE IT NAMES.
         # The field has existed since the free-text census and nothing has
         # ever said a word about it at creation, which is how 403 of this
@@ -3765,7 +4993,9 @@ def cmd_task(args):
         # the board.
         live = scoped + legacy if legacy_too else scoped
         debt = [r for r in live if r.get("priority") not in PRIORITIES]
-        debt.sort(key=rank_key)
+        # A FAST TAX CUT GOES FIRST (the friction tax), so a bounded pass
+        # ranks the cuts that pay back within two days before other rows.
+        debt.sort(key=lambda r: tax_key(r) + tuple(rank_key(r)))
         asked = [r for r in debt if origin_of(r) == "owner"]
         rest_rows = [r for r in debt if origin_of(r) != "owner"]
         # THE HEADER DESCRIBES THE DEBT, NEVER THE SLICE. `--limit` bounds
@@ -3782,6 +5012,10 @@ def cmd_task(args):
                  "; %d UNSCOPED legacy row(s) unranked and NOT covered — "
                  "they predate the project axis, `--legacy` includes them"
                  % legacy_debt))
+        cuts = sum(1 for r in debt if fast_tax_cut(r))
+        if cuts:
+            print("  %d tax cut(s) that pay back within %s go first"
+                  % (cuts, _days(PAYBACK_AHEAD_DAYS)))
         unranked = debt[:limit] if limit is not None else debt
         if limit is not None and len(debt) > len(unranked):
             print("  --limit %d: this pass covers %d of them"
@@ -3791,9 +5025,11 @@ def cmd_task(args):
             return 0
         if not apply:
             for r in unranked[:20]:
-                print("  %s %-12s %s" % ("P1" if origin_of(r) == "owner"
-                                         else "P2", r.get("id"),
-                                         (r.get("title") or "")[:78]))
+                print("  %s %-12s %s%s" % (
+                    "P1" if origin_of(r) == "owner" else "P2", r.get("id"),
+                    (r.get("title") or "")[:78],
+                    "" if tax_of(r)[0] is None else
+                    "  [tax cut: %s]" % _tax_cell(r)))
             if len(unranked) > 20:
                 print("  ... and %d more" % (len(unranked) - 20))
             # THE ADVERTISED COMMAND IS BUILT FROM THE OPTIONS THIS PREVIEW
@@ -3930,6 +5166,10 @@ def cmd_task(args):
         mine = "--mine" in rest
         if mine:
             rest.remove("--mine")
+        # THE FRICTION TAX RANKING: the taxed rows only, highest tax first.
+        by_tax = "--by-tax" in rest
+        while "--by-tax" in rest:
+            rest.remove("--by-tax")
         # TWO NAMES FOR THE OWNER FILTER CANNOT BOTH BE HONOURED, and picking
         # one silently answers a question the caller did not ask (the same
         # rejection `helm dispatch list` makes for --mine against --to).
@@ -3959,9 +5199,10 @@ def cmd_task(args):
         leftover = sorted(a for a in rest if a.startswith("-"))
         if leftover:
             print("helm task list: unknown option%s %s — accepts --all, "
-                  "--all-projects, --mine, --owner SEAT, --json. REFUSED "
-                  "rather than ignored: an unrecognised filter would print "
-                  "the WHOLE ledger while you believed it was narrowed.\n%s"
+                  "--all-projects, --mine, --owner SEAT, --by-tax, --json. "
+                  "REFUSED rather than ignored: an unrecognised filter would "
+                  "print the WHOLE ledger while you believed it was "
+                  "narrowed.\n%s"
                   % ("" if len(leftover) == 1 else "s", " ".join(leftover),
                      USAGE), file=sys.stderr)
             return 2
@@ -4026,9 +5267,8 @@ def cmd_task(args):
             # ones. CASEFOLDED because seat identity treats Kimi and kimi as
             # ONE address everywhere else (_canonical_recipient casefolds
             # unconditionally); a case-sensitive filter hid a seat's own rows
-            # from it.
-            want = only.casefold()
-            rows_ = [r for r in rows_ if owner_of(r).casefold() == want]
+            # from it. `held_by` is that predicate, shared with `release`.
+            rows_ = [r for r in rows_ if held_by(r, only)]
         # THE PROJECT AXIS (task/974): the default listing is THIS project's
         # rows — scope derived from cwd by the store's own lens — and what it
         # withholds is SAID, never silent: one disclosure line carries the
@@ -4068,6 +5308,16 @@ def cmd_task(args):
                 disclosure = ("%d unscoped legacy row(s), %d row(s) from "
                               "other projects — --all-projects shows them"
                               % (unscoped, foreign))
+        # RANKED BY THE FRICTION TAX, and what it leaves out is SAID: the
+        # untaxed rows are counted, never silently dropped.
+        untaxed_line = None
+        if by_tax:
+            rows_, untaxed = _by_tax(rows_)
+            if untaxed:
+                untaxed_line = ("%d %srow(s) carry no tax and are not shown "
+                                "— set one with `helm task update <id> --tax "
+                                "N --tax-cost N`"
+                                % (untaxed, "" if want_all else "open "))
         if as_js:
             # THROUGH THE ONE OWNER. This path built its own json.dumps and so
             # emitted raw rows while `show` next door was correct — the exact
@@ -4077,21 +5327,35 @@ def cmd_task(args):
                 # stderr, because stdout is a parseable JSON array by
                 # contract and the disclosure must survive without breaking it
                 print("helm task: " + disclosure, file=sys.stderr)
+            if untaxed_line:
+                print("helm task: " + untaxed_line, file=sys.stderr)
             return 0
         if not rows_:
-            print("helm task: no %s tasks%s" % (
-                "" if want_all else "open",
+            print("helm task: no %s%s tasks%s" % (
+                "taxed " if by_tax else "", "" if want_all else "open",
                 " in project '%s'" % scope if scope else ""))
-            if disclosure:
-                print(disclosure)
+            for line in (untaxed_line, disclosure):
+                if line:
+                    print(line)
             return 0
-        # STORY ORDER, NOT LEDGER ORDER. Parents carry their subissues, and
-        # ranked work sorts above unranked — the two fields exist so a reader
-        # can see the SHAPE of the backlog rather than its filing sequence.
-        for r, indent in _story_order(rows_):
-            # labeled per row only in the cross-project view — a scoped
-            # listing is one project by construction and says so in its header
-            print(_fmt(r, indent=indent, project_col=all_projects))
+        if by_tax:
+            # A RANKING, NOT A STORY: highest tax first, the tax and its
+            # payback in front of each row.
+            for r in rows_:
+                print("%-28s %s" % (_tax_cell(r),
+                                    _fmt(r, project_col=all_projects)))
+        else:
+            # STORY ORDER, NOT LEDGER ORDER. Parents carry their subissues,
+            # and ranked work sorts above unranked — the two fields exist so
+            # a reader can see the SHAPE of the backlog rather than its
+            # filing sequence.
+            for r, indent in _story_order(rows_):
+                # labeled per row only in the cross-project view — a scoped
+                # listing is one project by construction and says so in its
+                # header
+                print(_fmt(r, indent=indent, project_col=all_projects))
+        if untaxed_line:
+            print("\n" + untaxed_line)
         if disclosure:
             print("\n" + disclosure)
         # THE FOOTER COUNTS THE POPULATION THE LIST WAS DRAWN FROM — measured
@@ -4145,6 +5409,8 @@ def cmd_task(args):
                       "posture_na"):
             if row.get(field):
                 print("    %-14s %s" % (field, row[field]))
+        if tax_line(row):
+            print("    " + tax_line(row))
         # ORIGIN THROUGH THE NORMALIZER, WITH THE RECORD BESIDE IT.
         # `show` printed the raw field, so 251 rows displayed
         # `corpus-2026-08-05` — a fourth state on a surface whose whole claim
@@ -4185,6 +5451,10 @@ def cmd_task(args):
                                     else "UNKNOWN (recorded: %s)" % raw))
         if row.get("refs"):
             print("    %-14s %s" % ("refs", " ".join(row["refs"])))
+        if isinstance(row.get("goal"), dict):
+            from . import goals
+            for line in goals.task_show_lines(row):
+                print("    " + line)
         proof = row.get("takeover")
         if isinstance(proof, dict) and proof.get("transfer_id"):
             print("    %-14s %s BUILD %s -> %s (%s -> %s)" % (
@@ -4192,9 +5462,48 @@ def cmd_task(args):
                 proof.get("incumbent") or "?", proof.get("successor") or "?",
                 proof.get("source_lane") or "?",
                 proof.get("successor_lane") or "?"))
-        for c in row.get("comments") or ():
-            print("    comment       %s: %s" % (c.get("by") or "?",
-                                                c.get("text")))
+        # THE LAST RELEASE, SAID WITH ITS REASON. The ledger keeps every
+        # release event; the row carries the latest, which is the one a
+        # reader deciding whether to claim it wants.
+        rel = row.get("released")
+        if isinstance(rel, dict) and rel.get("by"):
+            when = rel.get("ts")
+            print("    %-14s by %s%s (was %s)%s" % (
+                "released", rel["by"],
+                time.strftime(" %Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
+                if isinstance(when, (int, float)) and not
+                isinstance(when, bool) else "",
+                rel.get("status_was") or "?",
+                ": %s" % rel["note"] if rel.get("note") else ""))
+        # THE WHOLE HISTORY, THROUGH THE ONE READER. The row carries only its
+        # newest comments once older ones have been archived, so printing
+        # `row["comments"]` would silently show a suffix of the conversation.
+        # `comments_of` reads every archive back, proves each digest, and
+        # stands a LOUD line in the place of anything it could not prove.
+        if row.get("comment_archives"):
+            # FILES, NOT ENTRIES: an index entry stands for every comment
+            # file under it.
+            files = sum(archive_files(a) for a in row["comment_archives"])
+            print("    %-14s %d in all — %d archived off the row in %d "
+                  "file%s, %d on the row" % (
+                      "comments", comment_count(row),
+                      comment_count(row) - len(row.get("comments") or ()),
+                      files, "" if files == 1 else "s",
+                      len(row.get("comments") or ())))
+        unreadable = 0
+        for c in comments_of(row):
+            unreadable += 1 if c.get("unreadable") else 0
+            if c.get("unreadable") and c.get("by") is None:
+                print("    comment       %s" % c.get("text"))
+            else:
+                print("    comment       %s: %s" % (comment_author(c),
+                                                    c.get("text")))
+        if unreadable:
+            print("helm task: %d comment record%s on %s could not be proven "
+                  "and %s marked in place above — the history shown is NOT "
+                  "complete" % (unreadable, "" if unreadable == 1 else "s",
+                                row["id"], "is" if unreadable == 1 else "are"),
+                  file=sys.stderr)
         return 0
 
     if verb == "claim":
@@ -4211,6 +5520,28 @@ def cmd_task(args):
         owner = _take(rest, "--owner") or seats.own_name()
         if not owner:
             print("helm task: no seat name — pass --owner SEAT",
+                  file=sys.stderr)
+            return 2
+        # CONSUME THE FLAGS THIS VERB READS BY MEMBERSHIP. --force and
+        # --owner are tested with `in rest` / _take above and already removed
+        # (or consumed), so a guard that treats any remaining dash-token as
+        # unknown REFUSES THE VERB'S OWN FLAGS — and the refusal text lists
+        # what IS accepted, so a working caller can see the help. Any
+        # leftover token (flag or stray word) is refused.
+        leftover = sorted(a for a in rest if a.startswith("-"))
+        if leftover:
+            print("helm task claim: unknown option%s %s — accepts <id> "
+                  "[--owner SEAT]. REFUSED rather than ignored: an "
+                  "unrecognised flag would claim the row under a flag "
+                  "the caller believed had steered it.\n%s"
+                  % ("" if len(leftover) == 1 else "s", " ".join(leftover),
+                     USAGE), file=sys.stderr)
+            return 2
+        if rest:
+            print("helm task claim: unexpected argument(s) %s — accepts <id> "
+                  "[--owner SEAT]. REFUSED rather than ignored: a stray "
+                  "word would claim the row the caller believed had "
+                  "steered it.\n%s" % (" ".join(rest), USAGE),
                   file=sys.stderr)
             return 2
         # The incumbent refusal lives in update(), not here — a guard on one
@@ -4251,6 +5582,62 @@ def cmd_task(args):
                  proof.get("successor"), proof.get("transfer_id")))
         return 0
 
+    if verb in ("close-candidates", "confirm-close"):
+        # THE LANDED-BUT-NOT-CLOSED DOORS (task/3451). `helm stale sweep
+        # --apply` links a train that named a task to the task as a receipt
+        # comment; these read that list and let the holder close one in a
+        # word. taskhygiene.py owns the rule; this is only its door.
+        from . import cli, taskhygiene
+        rc = project_flag_not_applicable("helm task " + verb, rest)
+        if rc is not None:
+            return rc
+        if verb == "close-candidates":
+            rc = cli.guard_tail("helm task close-candidates", rest,
+                                flags=("--json",))
+            if rc is not None:
+                return rc
+            cands, unavailable = taskhygiene.close_candidates()
+            if "--json" in rest:
+                print(json.dumps({"candidates": cands,
+                                  "unavailable": unavailable},
+                                 indent=1, ensure_ascii=False))
+                return 0
+            for u in unavailable:
+                print("helm task close-candidates: source UNAVAILABLE — %s"
+                      % u, file=sys.stderr)
+            for c in cands:
+                # NO LAND CLOSES A ROW (task/3643): every candidate waits
+                # for its owner's re-read of the whole ask and confirm-close
+                state = ("HELD: " + "; ".join(c["blockers"]) if c["blockers"]
+                         else "%s, %s: waits for confirm-close" % (
+                             c.get("state") or "landed", c["needs_confirm"])
+                         if c.get("needs_confirm")
+                         else "%s: waits for its owner's confirm-close"
+                         % (c.get("state") or "landed"))
+                print("%-10s @%-14s landed %s by %s — %s — %s" % (
+                    c["id"], c["owner"] or UNOWNED_DISPLAY, c["sha"],
+                    c["train"], (c["title"] or "")[:60], state))
+            print("helm task close-candidates: %d candidate(s); confirm one "
+                  "with `helm task confirm-close <id>`" % len(cands))
+            return 0
+        if len(rest) != 1 or rest[0].startswith("-"):
+            print("helm task confirm-close: takes exactly one task id — "
+                  "nothing was closed", file=sys.stderr)
+            return 2
+        from . import dispatches as _d
+        me, ident_err = _d.acting_author("confirm a task close")
+        if not me:
+            print("helm task confirm-close: %s — nothing was closed"
+                  % ident_err, file=sys.stderr)
+            return 2
+        row, err = taskhygiene.confirm_close(rest[0], me)
+        if row is SKIPPED or err:
+            print("helm task confirm-close: REFUSED — %s" % _cli_error(err),
+                  file=sys.stderr)
+            return 2
+        print("helm task: %s closed — %s" % (row["id"], row["closed_reason"]))
+        return 0
+
     if verb == "close":
         rc = project_flag_not_applicable("helm task close", rest)
         if rc is not None:
@@ -4266,6 +5653,57 @@ def cmd_task(args):
             print("helm task: %s" % _cli_error(err), file=sys.stderr)
             return 2
         print("helm task: %s closed — %s" % (row["id"], row["closed_reason"]))
+        return 0
+
+    if verb == "release":
+        # THE HOLDER'S OWN DOOR BACK TO THE POOL (task/3141). One id, one
+        # optional --note, and every other token REFUSES: a release is a
+        # custody write, so a typo must never ride along as a success.
+        rc = project_flag_not_applicable("helm task release", rest)
+        if rc is not None:
+            return rc
+        if not rest or rest[0].startswith("-"):
+            print("helm task release: needs a task id — nothing was "
+                  "released.\n%s" % USAGE, file=sys.stderr)
+            return 2
+        token = rest.pop(0)
+        typed = [t for t in rest if t == "--note" or t.startswith("--note=")]
+        note = _take(rest, "--note")
+        if typed and note is None:
+            print("helm task release: --note needs a value — nothing was "
+                  "released. If the note really starts with a dash, write "
+                  "--note=VALUE.", file=sys.stderr)
+            return 2
+        if len(typed) > 1 or rest:
+            print("helm task release: takes one id and at most one --note "
+                  "(got %s) — nothing was released. Quote a note of several "
+                  "words; release one row per call."
+                  % " ".join(repr(t) for t in (typed[1:] + rest)),
+                  file=sys.stderr)
+            return 2
+        # THE SAME DOOR AS --mine: the rows a seat lists as its own are the
+        # rows it may release, and a disputed or floor identity releases
+        # nothing rather than guessing whose hold this is.
+        from . import dispatches as _d
+        me, ident_err = _d.acting_author("release a task row")
+        if not me:
+            print("helm task release: %s" % ident_err, file=sys.stderr)
+            print("helm task release: NOTHING WAS RELEASED — only the "
+                  "holder may release, so an identity that does not resolve "
+                  "cannot.", file=sys.stderr)
+            return 2
+        row, err = release(token, me, note=note)
+        if row is SKIPPED:
+            print("helm task release: NOTHING RELEASED — %s" % err,
+                  file=sys.stderr)
+            return 1
+        if err:
+            print("helm task release: REFUSED — %s" % _cli_error(err),
+                  file=sys.stderr)
+            return 2
+        print("helm task: %s released by %s — OPEN and UNOWNED, back in the "
+              "claimable pool (was %s)"
+              % (row["id"], me, row["released"]["status_was"]))
         return 0
 
     if verb == "update":
@@ -4304,17 +5742,18 @@ def cmd_task(args):
         pairs = (("--title", "title"), ("--note", "note"),
                  ("--owner", "owner"), ("--status", "status"),
                  ("--origin", "origin")) + tuple(
-                     (flag, key) for flag, key, _c in STORY_FIELDS)
+                     (flag, key) for flag, key, _c in STORY_FIELDS
+                     + TAX_FIELDS)
         for flag, key in pairs:
             val = _take(rest, flag)
             if val is not None:
                 fields[key] = val
-        # EMPTY MEANS PROMOTE OUT / UNRANK, and it is the only spelling that
-        # can: the valueless guard below refuses a BARE `--continues`, so
-        # `--continues=` is how an operator says "this row is its own story
-        # again". Normalizing keeps 263, #263 and task/263 meaning one parent
-        # here exactly as `add` already accepts them.
-        for _flag, _key, _coerce in STORY_FIELDS:
+        # EMPTY MEANS PROMOTE OUT / UNRANK / CLEAR THE TAX, and it is the
+        # only spelling that can: the valueless guard below refuses a BARE
+        # `--continues`, so `--continues=` is how an operator says "this row
+        # is its own story again". Normalizing keeps 263, #263 and task/263
+        # meaning one parent here exactly as `add` already accepts them.
+        for _flag, _key, _coerce in STORY_FIELDS + TAX_FIELDS:
             if _key in fields:
                 fields[_key], _cerr = _coerce(fields[_key])
                 if _cerr:
@@ -4353,7 +5792,7 @@ def cmd_task(args):
             # flags and an operator reading it would conclude they do not exist.
             print("helm task: nothing to change — pass --title, --note, "
                   "--owner, --status, --origin, --ref or %s"
-                  % ", ".join(STORY_FLAGS), file=sys.stderr)
+                  % ", ".join(STORY_FLAGS + TAX_FLAGS), file=sys.stderr)
             return 2
         # A MANUAL RANK IS AN ACT WITH AN ACTOR TOO, and this door is why
         # the requirement could not live in the sweep alone: the integrator's
@@ -4374,6 +5813,8 @@ def cmd_task(args):
               % (row["id"], ", ".join(sorted(fields)),
                  "" if not rank_actor else
                  " (ranked by %s)" % rank_actor.canonical_name))
+        if any(key in fields for key in TAX_KEYS):
+            print("  " + (tax_line(row) or "friction tax: cleared"))
         return 0
 
     if verb == "comment":

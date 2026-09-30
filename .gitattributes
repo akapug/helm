@@ -31,3 +31,10 @@ bin/helm    text eol=lf
 helm/nevertrack.py              helm-bulk=quotes
 tests/test_never_track_bulk.py  helm-bulk=quotes
 tests/test_never_track_hook.py  helm-bulk=quotes
+
+# docs/VERBS.md is SOURCE, the one verb reference, and it has grown past the
+# never-track 1 MiB bulk ceiling on its own prose (1,046,279 bytes at
+# 7d3ae613d02; a 39-line doc addition crossed it). The size is the doc's, not
+# an export's, so the bulk leg is waived for this one path until task/3621
+# splits it into per-family files and deletes this line.
+docs/VERBS.md                   helm-bulk=ok

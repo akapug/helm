@@ -19,6 +19,8 @@ owner actually reads, rather than from a process listing they would have to
 know to run.
 """
 import os
+import shutil
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -28,7 +30,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-drift-", var="HELM_HOME")
 
-from helm import web, web_ui_loader  # noqa: E402
+from helm import web, web_common, web_ui_loader  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -89,17 +91,29 @@ class CodeDriftTest(unittest.TestCase):
         because the .py suffix filter already excludes .pyc. It killed no
         mutation and therefore tested nothing. The skip only does real work
         against a .py file living under __pycache__, so that is what this
-        plants."""
-        cache = os.path.join(REPO, "helm", "__pycache__")
+        plants.
+
+        It plants into a TEMPORARY package (not the real repo tree) because
+        _source_stamp() walks the directory of its own __file__ — so by
+        patching web_common.__file__ the walk targets the temp dir, and the
+        planted .py lives nowhere near the shared helm checkout.
+        """
+        t = tempfile.mkdtemp(prefix="helm-test-drift-pkg-")
+        self.addCleanup(shutil.rmtree, t, True)
+        # A one-line module so _source_stamp() walks this directory.
+        with open(os.path.join(t, "web_common.py"), "w", encoding="utf-8") as f:
+            f.write("# placeholder\n")
+        cache = os.path.join(t, "__pycache__")
         os.makedirs(cache, exist_ok=True)
-        planted = os.path.join(cache, "_drift_probe.py")
-        before = web._source_stamp()
-        with open(planted, "w", encoding="utf-8") as f:
-            f.write("# transient test artifact\n")
-        self.addCleanup(lambda: os.path.exists(planted) and os.remove(planted))
-        os.utime(planted, (time.time() + 3600, time.time() + 3600))
-        self.assertEqual(before, web._source_stamp(),
-                         "a .py under __pycache__ must not move the stamp")
+        with mock.patch.object(web_common, "__file__", os.path.join(t, "web_common.py")):
+            before = web_common._source_stamp()
+            self.assertNotEqual(before, 0.0, "stamp must read the temp module")
+            planted = os.path.join(cache, "_drift_probe.py")
+            with open(planted, "w", encoding="utf-8") as f:
+                f.write("# transient test artifact\n")
+            os.utime(planted, (time.time() + 3600, time.time() + 3600))
+            self.assertEqual(before, web_common._source_stamp(),
+                             "a .py under __pycache__ must not move the stamp")
 
 
 class WhoamiCarriesItTest(unittest.TestCase):

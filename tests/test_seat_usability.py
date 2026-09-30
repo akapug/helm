@@ -791,8 +791,9 @@ class WiredIntoTheRosterSurface(unittest.TestCase):
 
     def test_each_PROXY_row_names_the_model_that_seat_launches_on(self):
         """`instance_models` (seat_catalog) lets one family span two models —
-        codex-4 on gpt-5.6-sol while codex-7 stays gpt-6-astra — and the
-        operator's only way to SEE which seat runs which is this column. The
+        one instance on a declared model while its siblings take the family's
+        — and the operator's only way to SEE which seat runs which is this
+        column. The
         roster is the surface; a catalog nobody can read off the screen sends
         him to the source to answer "what is this seat running?"."""
         rows = _join([_hrow("seat-a"), _hrow("seat-b")])
@@ -1249,7 +1250,7 @@ class TheDispatchGateIsTheConsumer(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(warning is None)
         self.assertTrue("AUTH-UNAVAILABLE" in refusal, refusal)
-        self.assertTrue("force=True" in refusal, refusal)
+        self.assertTrue("--force" in refusal, refusal)
 
     def test_CONTROL_a_USABLE_recipient_is_admitted_with_NO_warning(self):
         """UNCONDITIONAL CONTROL: the same rung admits cleanly, so the refusal
@@ -1420,6 +1421,65 @@ def setUpModule():
     (task/3039; see tests._tmphome.pin_live_seats)."""
     from tests._tmphome import pin_live_seats
     pin_live_seats()
+
+
+class ADeadBridgeRefusesItsSeat(unittest.TestCase):
+    """task/1056: a family that needs a second process (cursor's bridge) is
+    not a seat that can work while that process cannot serve, whatever the
+    proxy says. `seat list` badges the bridge on the proxy column; this rung
+    makes the usability line under that badge, and the dispatch door that
+    reads it, agree."""
+
+    FAMILY = "cursor"  # noqa: SEAT_NAME — the catalog family key and its family seat ARE the subject
+
+    def join(self, sidecar, family=None, calls=None):
+        family = family or self.FAMILY
+
+        def probe(fam):
+            if calls is not None:
+                calls.append(fam)
+            if isinstance(sidecar, Exception):
+                raise sidecar
+            return sidecar
+        return seat_usability.join(
+            health=_health([_hrow(family, family=family)]),
+            upstream=_upstream({family: {"state": "HEALTHY", "dark": False}}),
+            open_recipients=_ledger({}),
+            register=_roster({family: {"runtime_verified": True}}),
+            canonical=_IDENTITY, live_seats=_panes((family,)),
+            beacon_live=_no_beacon, sidecar=probe)[family]
+
+    def test_a_bridge_that_cannot_serve_refuses_the_seat(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a literal seven-state tuple, so every subtest's UNUSABLE assertion executes
+        for state in ("down", "wedged", "unserving", "foreign", "absent",
+                      "unvetted", "stale"):
+            with self.subTest(state=state):
+                row = self.join((state, "the measured why"))
+                self.assertEqual(row["verdict"], seat_usability.UNUSABLE)
+                self.assertEqual(row["refusal"], seat_usability.REFUSE_SIDECAR)
+                self.assertIn("bridge %s" % state, row["reason"])
+                self.assertIn("the measured why", row["reason"])
+                self.assertIn("helm seat doctor --ensure", row["reason"])
+
+    def test_a_serving_bridge_leaves_the_seat_usable(self):  # noqa: VACUOUS_ASSERTION — asserts USABLE and the recorded state, a positive verdict
+        row = self.join(("up", "serving"))
+        self.assertEqual(row["verdict"], seat_usability.USABLE)
+        self.assertEqual(row["sidecar"], "up")
+
+    def test_a_starting_bridge_degrades_and_a_broken_probe_is_unknown(self):
+        row = self.join(("starting", "pid 7 started 3s ago"))
+        self.assertEqual(row["verdict"], seat_usability.DEGRADED)
+        self.assertIn("bridge starting", row["reason"])
+        row = self.join(OSError("probe blew up"))
+        self.assertEqual(row["verdict"], seat_usability.UNKNOWN)
+        self.assertIn("probe blew up", row["unknown"]["sidecar"])
+
+    def test_a_family_without_a_sidecar_is_never_probed(self):  # noqa: VACUOUS_ASSERTION — the USABLE verdict is the unconditional positive control for the empty call list
+        calls = []
+        row = self.join(OSError("must not be called"), family="codex",
+                        calls=calls)
+        self.assertEqual(row["verdict"], seat_usability.USABLE)
+        self.assertEqual(calls, [])
+        self.assertIsNone(row["sidecar"])
 
 
 if __name__ == "__main__":

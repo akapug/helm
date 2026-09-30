@@ -448,15 +448,21 @@ class OwnerReachTest(DecideBase):
         self.assertEqual(req.get_header("Title"), "helm decision")
         self.assertIn("store GC policy", body)
         self.assertIn(row["id"], body)
-        # HE MUST BE ABLE TO ANSWER FROM THE DEVICE THIS ARRIVED ON. The push
-        # names no console: the owner reads ntfy and uses orca mobile, and
-        # helm web binds 127.0.0.1, which on a phone is the phone.
+        # THE PUSH PROMISES NOTHING NO DOOR KEEPS (goal-ledger D2). It said
+        # "reply with the card id and your pick", and no door turns a reply
+        # into a verdict: only the web handlers mint the OwnerDoor. So it
+        # says where a ruling IS recorded, and that a reply is not, and it
+        # still names no URL: helm web binds 127.0.0.1, which on a phone is
+        # the phone.
         self.assertNotIn("helm web", body)
-        self.assertIn("reply", body, "he needs to know HOW to answer")
+        self.assertNotIn("reply with", body, "a reply records nothing yet")
+        self.assertIn("work tab", body, "he needs to know WHERE to answer")
+        self.assertIn("records no verdict", body,
+                      "and that a reply here is not an answer")
         for opt in row["options"]:
             self.assertIn(opt["label"], body, "the choices are the headline")
-            # the KEY travels too — a one-character reply is what a phone can
-            # realistically carry, and _pick_option resolves it
+            # the KEY travels too — the one-character answer a phone verdict
+            # door will carry, and _pick_option already resolves it
             self.assertIn("%s. %s" % (opt["key"], opt["label"]), body)
         # THE ATTENTION BUDGET IS THE POINT, so this is not a style assertion:
         # the context paragraph and the per-option consequences live on the web
@@ -636,6 +642,9 @@ class OwnerReachTest(DecideBase):
         body = urlopen.call_args[0][0].data.decode("utf-8")
         self.assertIn(last["id"], body)
         self.assertIn("store GC policy", body)
+        # the batch promises no reply door either (goal-ledger D2)
+        self.assertNotIn("reply with", body)
+        self.assertIn("work tab", body)
         self.assertTrue(self.ledger_row(last["id"])["owner_pushed_ts"])
         # AND IT GOES QUIET once nothing is owed — otherwise a periodic pass
         # would buzz him every cycle forever, which is the opposite cure.
@@ -994,7 +1003,7 @@ class AuthorshipTest(DecideBase):
         with self.assertRaises(AttributeError):
             door.door = "cli"
 
-    def test_only_the_web_owner_handlers_mint_an_owner_door(self):  # noqa: VACUOUS_ASSERTION — assertEqual against a literal three-site set is exact, so an empty census fails it
+    def test_only_the_web_owner_handlers_mint_an_owner_door(self):  # noqa: VACUOUS_ASSERTION — assertEqual against a literal four-site set is exact, so an empty census fails it
         """THE CENSUS behind "only the web door constructs it": every call to
         owner_door() or OwnerDoor() in production code, found by parsing the
         tree rather than by remembering it."""
@@ -1026,14 +1035,17 @@ class AuthorshipTest(DecideBase):
         # broken probe and never a pass
         # The away card's press handler is the third web door (task/3018):
         # his away flag and his fleet notice are his word, like a verdict.
+        # The task backlog's comment box is the fourth (goal-ledger D1): his
+        # note on a task is his word, recorded with the door it came through.
         want = {("helm/web_core.py", "_api_decisions_verdict", "owner_door"),
                 ("helm/web_core.py", "_api_decisions_comment", "owner_door"),
                 ("helm/web_core.py", "_api_posture_post", "owner_door"),
+                ("helm/web_core.py", "_api_tasks_comment", "owner_door"),
                 ("helm/ownerasks.py", "owner_door", "OwnerDoor")}
         self.assertEqual(sites, want,
                          "an OwnerDoor is the owner's authority on the "
-                         "decision ledger and his away card; only his web "
-                         "handlers mint one")
+                         "decision ledger, his away card and his task notes; "
+                         "only his web handlers mint one")
 
     def test_delivery_relays_the_verdicts_recorded_author(self):
         """deliver_verdict sent every verdict FROM the owner's handle,
@@ -1075,6 +1087,351 @@ class AuthorshipTest(DecideBase):
         # POSITIVE CONTROL on the same door: a seat's return address files
         self.assertIsNotNone(ownerasks.file_decision("t", ctx, opts,
                                                      "builder-1")[0])
+
+
+BODY2 = ("The store holds 400 retired entries; scans now cost 3s per "
+         "resolve.\n"
+         "*! Archive to cold file :: resolves fast; history one file away\n"
+         "* Leave in place :: zero risk; scans stay slow until indexed\n")
+
+
+class RevisionTest(DecideBase):
+    """Goal-ledger L1: a card is REVISED IN PLACE, and a verdict binds to the
+    revision the owner read.
+
+    The owner's words: "i click yes on your well thought out acceptance
+    criteria and/or add comment just like already there". A comment is his
+    "not yet"; the asker answers it by revising THE SAME CARD (a rev number,
+    the thread kept), never by filing a second card that leaves the first one
+    in his queue. And his Yes must never approve text he did not see: a
+    verdict that names an older rev than the card now shows is refused, with
+    the current rev named, and nothing is recorded."""
+
+    def seat(self, name):
+        """This process as the live seat `name`: a declared name AND a
+        harness session the roster binds to it (see AuthorshipTest.seat)."""
+        sid = "sid-%s" % name
+        os.environ["HELM_CHAT_NAME"] = name
+        os.environ["CLAUDE_CODE_SESSION_ID"] = sid
+        seats.write_roster(name, session=sid, cwd=self.tmp)
+
+    def ledger_lines(self):
+        with open(ownerasks.decisions_path(), encoding="utf-8") as f:
+            return f.read().splitlines()
+
+    def card(self, rid):
+        return ownerasks.decision_rows()[rid]
+
+    def body2(self):
+        ctx, opts, err = ownerasks.parse_card_body(BODY2)
+        self.assertIsNone(err)
+        return ctx, opts
+
+    def room_lines(self):
+        with open(chat.room_path("main"), encoding="utf-8") as f:
+            return [json.loads(l)["text"] for l in f]
+
+    def test_a_filed_card_starts_at_rev_one_with_no_revisions(self):
+        row = self.file_card()
+        self.assertEqual((row["rev"], row["revisions"]), (1, []))
+        self.assertEqual(ownerasks.card_rev(self.card(row["id"])), 1)
+
+    def test_the_asker_revises_the_same_card_and_keeps_its_thread(self):
+        rid = self.file_card(asker="builder-7")["id"]
+        _r, problem = ownerasks.comment_decision(
+            rid, "scans got slower since you filed this",
+            by=ownerasks.owner_door("web"))
+        self.assertIsNone(problem)
+        said = self.card(rid)["comments"][-1]
+        self.assertEqual(said["rev"], 1, "a comment records the rev it read")
+        self.seat("builder-7")
+        ctx, opts = self.body2()
+        row, problem = ownerasks.revise_decision(rid, ctx, opts, rev=1)
+        self.assertIsNotNone(row, problem)
+        card = self.card(rid)
+        self.assertEqual(list(ownerasks.decision_rows()), [rid],
+                         "a revision is the same card, never a second one")
+        self.assertEqual((card["rev"], card["status"]), (2, "open"))
+        self.assertIn("3s per resolve", card["context"])
+        self.assertTrue(card["options"][0]["recommended"])
+        self.assertEqual(card["answering_comment_ts"], said["ts"])
+        self.assertEqual(len(card["revisions"]), 1)
+        prior = card["revisions"][0]
+        self.assertEqual(prior["rev"], 1)
+        self.assertIn("2s per resolve", prior["context"])
+        self.assertEqual([o["label"] for o in prior["options"]],
+                         ["Archive to cold file", "Leave in place"])
+        self.assertFalse(prior["options"][0]["recommended"])
+        self.assertEqual([c["text"] for c in card["comments"]],
+                         ["scans got slower since you filed this"],
+                         "the thread rides the revision")
+        # A SECOND REVISION STACKS, OLDEST FIRST, and answers no comment: the
+        # owner said nothing on rev 2.
+        row, problem = ownerasks.revise_decision(
+            rid, ctx + "\nIndexing is a day of work.", opts, rev=2)
+        self.assertIsNotNone(row, problem)
+        card = self.card(rid)
+        self.assertEqual(card["rev"], 3)
+        self.assertEqual([r["rev"] for r in card["revisions"]], [1, 2])
+        self.assertIsNone(card["answering_comment_ts"])
+
+    def test_only_the_asker_revises(self):  # noqa: VACUOUS_ASSERTION — the unchanged ledger is the refusal contract; the asker's revision at the end grows the SAME ledger by one line, the unconditional positive control
+        rid = self.file_card(asker="builder-7")["id"]
+        ctx, opts = self.body2()
+        before = self.ledger_lines()
+        self.seat("builder-2")
+        row, err = ownerasks.revise_decision(rid, ctx, opts)
+        self.assertIsNone(row)
+        self.assertIn("builder-7", err, "the refusal names the asker")
+        self.assertIn("helm decide comment", err, "and what builder-2 can do")
+        row, err = ownerasks.revise_decision(rid, ctx, opts,
+                                             by=ownerasks.owner_door("web"))
+        self.assertIsNone(row)
+        self.assertIn("comment", err, "the owner comments; the asker revises")
+        for forged in ("owner", "builder-7"):
+            row, err = ownerasks.revise_decision(rid, ctx, opts, by=forged)
+            self.assertIsNone(row, forged)
+            self.assertIn("never a caller-stated string", err, forged)
+        self.assertEqual(self.ledger_lines(), before, "nothing was recorded")
+        self.seat("builder-7")
+        row, err = ownerasks.revise_decision(rid, ctx, opts)
+        self.assertIsNotNone(row, err)
+        self.assertEqual(len(self.ledger_lines()), len(before) + 1)
+
+    def test_refs_are_replaced_only_when_a_revision_names_them(self):
+        """A revision that passes `refs` re-points the card (a goal card names
+        the criteria version its body carries); one that passes none keeps
+        them. The replaced refs ride the replaced body on `revisions`."""
+        rid = self.file_card(asker="builder-7")["id"]
+        self.seat("builder-7")
+        ctx, opts = self.body2()
+        row, err = ownerasks.revise_decision(rid, ctx, opts)
+        self.assertIsNotNone(row, err)
+        self.assertEqual(self.card(rid)["refs"], ["lane/store-gc"])
+        row, err = ownerasks.revise_decision(
+            rid, ctx + "\nIndexing is a day of work.", opts,
+            refs=["task/9", " goal-criteria:v2 ", ""])
+        self.assertIsNotNone(row, err)
+        card = self.card(rid)
+        self.assertEqual((card["rev"], card["refs"]),
+                         (3, ["task/9", "goal-criteria:v2"]))
+        self.assertEqual([r["refs"] for r in card["revisions"]],
+                         [["lane/store-gc"], ["lane/store-gc"]])
+
+    def test_a_goal_cards_asker_moves_with_its_goal_and_only_while_open(self):  # noqa: VACUOUS_ASSERTION — the unchanged ledger is the refusal contract; the move in the SAME arm grows it, and its asker and custody event are asserted PRESENT
+        """Custody of a goal's card follows the goal (helm/goals.py): the
+        move comes only through the goal ledger's custody door, only onto a
+        deliverable seat that is not the owner, only for a card that names
+        the goal, and only while the card is open. It is recorded on the
+        card, and the body he reads (its rev) does not move."""
+        from helm import goals
+        ctx, opts, err = ownerasks.parse_card_body(BODY)
+        self.assertIsNone(err)
+        card, problem = ownerasks.file_decision(
+            "goal card", ctx, opts, "builder-7",
+            refs=["task/9", "goal-criteria:v1"])
+        self.assertIsNotNone(card, problem)
+        rid = card["id"]
+        door = goals._door("custody")
+        before = self.ledger_lines()
+        for bad in ((rid, "builder-2", None, "task/9"),
+                    (rid, "builder-2", goals._door("revise"), "task/9"),
+                    (rid, "builder-2", door, "task/10"),
+                    (rid, "owner", door, "task/9"),
+                    (rid, "bad name!", door, "task/9"),
+                    ("feedbeef", "builder-2", door, "task/9")):
+            row, err = ownerasks.move_asker(*bad)
+            self.assertIsNone(row, bad)
+            self.assertTrue(err, bad)
+        self.assertEqual(self.ledger_lines(), before, "nothing was recorded")
+        row, err = ownerasks.move_asker(rid, "builder-2", door, "task/9")
+        self.assertIsNone(err, err)
+        card = self.card(rid)
+        self.assertEqual((card["asker"], card["rev"], card["status"]),
+                         ("builder-2", 1, "open"))
+        self.assertEqual([(c["from"], c["to"], c["goal"])
+                          for c in card["custody"]],
+                         [("builder-7", "builder-2", "task/9")])
+        # already there: no second event
+        row, err = ownerasks.move_asker(rid, "builder-2", door, "task/9")
+        self.assertIsNone(err, err)
+        self.assertEqual(len(self.card(rid)["custody"]), 1)
+        # decided: its asker is the seat the verdict belongs to
+        ruling(rid, "1")
+        decided = self.ledger_lines()
+        row, err = ownerasks.move_asker(rid, "builder-7", door, "task/9")
+        self.assertIsNone(row)
+        self.assertIn("decided", err)
+        self.assertEqual(self.ledger_lines(), decided)
+        self.assertEqual(self.card(rid)["asker"], "builder-2")
+
+    def test_a_decided_card_is_never_revised(self):  # noqa: VACUOUS_ASSERTION — the unchanged ledger is the refusal contract; test_only_the_asker_revises is the positive control on the same verb and seat
+        rid = self.file_card(asker="builder-7")["id"]
+        ruling(rid, "2")
+        before = self.ledger_lines()
+        self.seat("builder-7")
+        ctx, opts = self.body2()
+        row, err = ownerasks.revise_decision(rid, ctx, opts)
+        self.assertIsNone(row)
+        self.assertIn("decided", err)
+        self.assertIn("new card", err, "a changed scope is a new card")
+        self.assertEqual(self.ledger_lines(), before)
+
+    def test_a_stale_or_unchanged_revision_is_refused(self):  # noqa: VACUOUS_ASSERTION — the unchanged ledger is the refusal contract; the first revision in the SAME arm grew that ledger and moved the card to rev 2, the unconditional positive control
+        rid = self.file_card(asker="builder-7")["id"]
+        self.seat("builder-7")
+        ctx, opts = self.body2()
+        row, err = ownerasks.revise_decision(rid, ctx, opts, rev=1)
+        self.assertIsNotNone(row, err)
+        before = self.ledger_lines()
+        row, err = ownerasks.revise_decision(rid, ctx + "\nmore", opts, rev=1)
+        self.assertIsNone(row)
+        self.assertIn("rev 2", err)
+        self.assertIn("rev 1", err)
+        row, err = ownerasks.revise_decision(rid, ctx, opts, rev=2)
+        self.assertIsNone(row)
+        self.assertIn("nothing changed", err)
+        self.assertEqual(self.ledger_lines(), before)
+        self.assertEqual(self.card(rid)["rev"], 2)
+
+    def test_a_verdict_on_an_older_rev_is_refused_naming_the_current_one(self):  # noqa: VACUOUS_ASSERTION — the unchanged ledger and empty lane are the refusal contract; the verdict at rev 2 then grows both, the unconditional positive control
+        rid = self.file_card(asker="builder-7")["id"]
+        self.seat("builder-7")
+        ctx, opts = self.body2()
+        self.assertIsNotNone(ownerasks.revise_decision(rid, ctx, opts)[0])
+        before = self.ledger_lines()
+        door = ownerasks.owner_door("web")
+        row, err = ownerasks.decide(rid, "1", by=door, rev=1)
+        self.assertIsNone(row)
+        self.assertIsInstance(err, ownerasks.StaleRev)
+        self.assertEqual(err.rev, 2)
+        self.assertIn("rev 2", err)
+        self.assertIn("rev 1", err)
+        self.assertIn("reload", err)
+        # A VERDICT THAT NAMES NO REV READ THE CARD AS FILED: rev 1.
+        row, err = ownerasks.decide(rid, "1", by=door)
+        self.assertIsNone(row)
+        self.assertIsInstance(err, ownerasks.StaleRev)
+        self.assertEqual(self.ledger_lines(), before, "nothing was recorded")
+        self.assertEqual(self.card(rid)["status"], "open")
+        self.assertEqual(self.dm_lane("builder-7"), [])
+        row, err = ownerasks.decide(rid, "1", by=door, rev=2)
+        self.assertIsNone(err, err)
+        self.assertEqual((row["verdict"]["rev"], row["status"]), (2, "decided"))
+        _d, err = ownerasks.deliver_verdict(rid)
+        self.assertIsNone(err, err)
+        lane = self.dm_lane("builder-7")
+        self.assertEqual(len(lane), 1)
+        self.assertIn("rev 2", lane[0]["text"], "the asker learns which rev")
+
+    def test_a_card_filed_before_revisions_existed_reads_as_rev_one(self):
+        rid = self.file_card(asker="builder-7")["id"]
+        planted = dict(self.card(rid))
+        del planted["rev"], planted["revisions"]
+        self.assertTrue(ownerasks.eventledger.append(
+            ownerasks.decisions_path(), planted))
+        self.assertEqual(ownerasks.card_rev(self.card(rid)), 1)
+        self.seat("builder-7")
+        ctx, opts = self.body2()
+        row, err = ownerasks.revise_decision(rid, ctx, opts, rev=1)
+        self.assertIsNotNone(row, err)
+        self.assertEqual(self.card(rid)["rev"], 2)
+        self.assertEqual(self.card(rid)["revisions"][0]["rev"], 1)
+
+    def test_an_unreadable_rev_refuses_the_verdict(self):  # noqa: VACUOUS_ASSERTION — the open status is the refusal contract; test_a_verdict_on_an_older_rev... records a verdict through the same door, the positive control
+        rid = self.file_card(asker="builder-7")["id"]
+        for bad in ("two", True, 0):
+            planted = dict(self.card(rid), rev=bad)
+            self.assertTrue(ownerasks.eventledger.append(
+                ownerasks.decisions_path(), planted))
+            self.assertIsNone(ownerasks.card_rev(self.card(rid)), bad)
+            row, err = ownerasks.decide(rid, "1",
+                                        by=ownerasks.owner_door("web"), rev=1)
+            self.assertIsNone(row, bad)
+            self.assertIn("unreadable", err, bad)
+        self.assertEqual(self.card(rid)["status"], "open")
+
+    def test_a_revision_re_pushes_the_owner_and_posts_one_room_line(self):
+        rid = self.file_card(asker="builder-7")["id"]
+        ownerasks.comment_decision(rid, "what does indexing cost?",
+                                   by=ownerasks.owner_door("web"))
+        self.seat("builder-7")
+        ctx, opts = self.body2()
+        with mock.patch.dict(os.environ, {"HELM_NTFY_TOPIC": "helm-fixture"}), \
+                mock.patch("urllib.request.urlopen",
+                           return_value=_Resp()) as urlopen:
+            row, problem = ownerasks.revise_decision(rid, ctx, opts)
+        self.assertIsNotNone(row, problem)
+        self.assertEqual(urlopen.call_count, 1)
+        body = urlopen.call_args[0][0].data.decode("utf-8")
+        self.assertIn("store GC policy", body)
+        self.assertIn("revised after your comment (rev 2)", body)
+        self.assertTrue(self.card(rid)["owner_pushed_ts"])
+        lines = [t for t in self.room_lines()
+                 if "[decision %s] revised" % rid in t]
+        self.assertEqual(len(lines), 1, self.room_lines())
+        self.assertIn("rev 2", lines[0])
+        self.assertIn("after the owner's comment", lines[0])
+        self.assertNotIn("3s per resolve", lines[0],
+                         "the room line never carries the card body")
+
+    def test_a_revision_nobody_pushed_is_not_recorded_as_told(self):
+        with mock.patch.dict(os.environ, {"HELM_NTFY_TOPIC": "helm-fixture"}), \
+                mock.patch("urllib.request.urlopen", return_value=_Resp()):
+            rid = self.file_card(asker="builder-7")["id"]
+        self.assertTrue(self.card(rid)["owner_pushed_ts"],
+                        "control: rev 1 was pushed")
+        self.seat("builder-7")
+        ctx, opts = self.body2()
+        row, problem = ownerasks.revise_decision(rid, ctx, opts)
+        self.assertIsNotNone(row, problem)
+        self.assertIn("HELM_NTFY_TOPIC", problem)
+        self.assertIsNone(self.card(rid)["owner_pushed_ts"],
+                          "rev 2 never reached him, so it is not told")
+        self.assertIn(rid, [r["id"] for r in ownerasks._unreached_open()])
+
+    def test_the_cli_revises_and_show_prints_the_revisions(self):
+        rid = self.file_card(asker="builder-7")["id"]
+        self.seat("builder-7")
+        rc, out, err = self.decide_cli("revise", rid, "--rev", "1",
+                                       stdin=BODY2)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("rev 2", out)
+        rc, out, err = self.decide_cli("show", rid)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("rev 2", out)
+        self.assertIn("3s per resolve", out)
+        self.assertIn("was rev 1", out)
+        self.assertIn("2s per resolve", out, "the prior body is readable")
+        rc, out, err = self.decide_cli("list")
+        self.assertIn("rev 2", out)
+        rc, _o, err = self.decide_cli("revise", rid, "--rev", "1",
+                                      stdin="One more line of context.\n"
+                                      + BODY2)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("rev 2", err)
+        rc, _o, err = self.decide_cli("revise", rid, stdin="")
+        self.assertEqual(rc, 2)
+        self.assertIn("CONTEXT", err)
+        rc, _o, err = self.decide_cli("revise", rid, "--rev", "x",
+                                      stdin=BODY2)
+        self.assertEqual(rc, 2)
+        self.assertIn("--rev", err)
+        rc, _o, err = self.decide_cli("revise")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage: helm decide", err)
+
+    def test_a_digit_like_rev_that_is_no_number_is_the_usage_refusal(self):
+        """`isdigit()` admits "²" and `int()` refuses it: the CLI's --rev
+        check raised a traceback where every other bad value gets rc 2."""
+        rid = self.file_card(asker="builder-7")["id"]
+        self.seat("builder-7")
+        before = self.ledger_lines()
+        rc, _o, err = self.decide_cli("revise", rid, "--rev", "²",
+                                      stdin=BODY2)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("--rev", err)
+        self.assertEqual(self.ledger_lines(), before, "nothing was recorded")
 
 
 if __name__ == "__main__":

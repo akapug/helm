@@ -42,6 +42,8 @@ backslash, or make the literal raw if nothing else in it needs escapes. Then
 assert the CONSUMER still receives the same bytes — silencing the warning by
 changing what the shell sees would be a regression wearing a fix's clothes.
 """
+import contextlib
+import gc
 import os
 import re
 import tokenize
@@ -94,6 +96,39 @@ def _invalid_escapes(path):
     return found
 
 
+@contextlib.contextmanager
+def _collector_off():
+    """The cyclic collector off for one whole-tree pass, and handed back in
+    `finally` as it was found.
+
+    Both tree arms below turn every source file they walk into a token list
+    or an AST, one file at a time, and the allocation bursts of the large
+    files set off collections that traverse what is still alive. The passes
+    free their objects by reference count: a full collection after each one,
+    over 935 files, found 0 unreachable objects (task/3394). Measured on one
+    40-core build node, Python 3.13, two sets of three runs: the module took
+    15.1 to 15.9 s with the collector on throughout and 12.5 to 13.4 s with
+    it off around these two passes; one set with it off for the whole
+    process took 11.7 to 12.0 s.
+
+    THE SAME PATTERN AS tests/test_suite_collection.py `census()`, AND
+    DELIBERATELY NOT A SHARED HELPER: that module copies itself into a
+    synthetic tree and runs discovery there, so it may import nothing from
+    tests/. Measured: with both on one tests/ helper, three of its arms went
+    red on ModuleNotFoundError in the copy. The other slow census modules
+    keep the collector on; off for their whole process saved under 2 s
+    (test_assertion_hygiene 1.9 s on the mean, test_env_hygiene 0.1 s,
+    test_display_launder_tripwire nothing).
+    """
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if collecting:
+            gc.enable()
+
+
 def _planted_defect():
     """A file with one invalid escape, one raw literal, one valid escape.
 
@@ -133,11 +168,13 @@ class EscapeHygieneTest(unittest.TestCase):
 
         findings = []
         scanned = 0
-        for path in list(_sources()) + [probe]:
-            scanned += 1
-            for line, ch in _invalid_escapes(path):
-                findings.append((path, "%s:%d  invalid escape \\%s"
-                                 % (os.path.relpath(path, _ROOT), line, ch)))
+        with _collector_off():
+            for path in list(_sources()) + [probe]:
+                scanned += 1
+                for line, ch in _invalid_escapes(path):
+                    findings.append((path, "%s:%d  invalid escape \\%s"
+                                     % (os.path.relpath(path, _ROOT), line,
+                                        ch)))
 
         planted = [d for p, d in findings if p == probe]
         self.assertEqual(1, len(planted),
@@ -204,15 +241,17 @@ class NoTopLevelRedefinitionTest(unittest.TestCase):
 
     def test_no_module_defines_a_top_level_name_twice(self):
         found, scanned = {}, 0
-        for sub in ("helm", "tests"):
-            for dirpath, _dirs, files in os.walk(os.path.join(_ROOT, sub)):
-                for name in files:
-                    if name.endswith(".py"):
-                        path = os.path.join(dirpath, name)
-                        scanned += 1
-                        dup = _redefined_names(path)
-                        if dup:
-                            found[os.path.relpath(path, _ROOT)] = dup
+        with _collector_off():
+            for sub in ("helm", "tests"):
+                for dirpath, _dirs, files in os.walk(os.path.join(_ROOT,
+                                                                  sub)):
+                    for name in files:
+                        if name.endswith(".py"):
+                            path = os.path.join(dirpath, name)
+                            scanned += 1
+                            dup = _redefined_names(path)
+                            if dup:
+                                found[os.path.relpath(path, _ROOT)] = dup
         # POSITIVE CONTROL on the same walk: an empty `found` from a walk that
         # read nothing would pass too.
         self.assertGreater(scanned, 500, "control: the walk read the tree")

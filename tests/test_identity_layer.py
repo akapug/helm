@@ -1820,9 +1820,12 @@ class UsesClosureTest(unittest.TestCase):
             "beacon and consuming the inbox go through "
             "_beacon_identity_refusal, which resolves an actor when the "
             "caller did not supply a seat."),
-        ("helm/seats_stop_guard.py", "derive_seat", "_stop_guard"): (
+        # MOVED WITH ITS ONE SPELLING (task/3123): the stop ladder and the
+        # bare `--detail` lease read resolve the render seat through this.
+        ("helm/seats_stop_claims.py", "derive_seat", "posture_seat"): (
             "RENDER", "warn text. The ACTUATOR two hops down (autoclaim) "
-            "takes a separately resolved actor, never this name."),
+            "takes a separately resolved actor, never this name, and the "
+            "bare --detail read only renders lease lines with it."),
         ("helm/seats_stop_signals.py", "acting_seat", "_dispatch_candidate"): (
             "RENDER", "whisper text for an overdue dispatch."),
     }
@@ -1840,7 +1843,8 @@ class UsesClosureTest(unittest.TestCase):
                 if rel in self.EXEMPT:
                     continue
                 try:
-                    tree = ast.parse(open(p, encoding="utf-8").read())
+                    with open(p, encoding="utf-8") as fh:
+                        tree = ast.parse(fh.read())
                 except SyntaxError:            # pragma: no cover
                     continue
 
@@ -1927,7 +1931,8 @@ class UsesClosureTest(unittest.TestCase):
                 if rel in exempt:
                     continue
                 try:
-                    tree = ast.parse(open(path, encoding="utf-8").read())
+                    with open(path, encoding="utf-8") as fh:
+                        tree = ast.parse(fh.read())
                 except (SyntaxError, OSError):    # pragma: no cover
                     continue
                 for node in ast.walk(tree):

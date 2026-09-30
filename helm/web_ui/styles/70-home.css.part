@@ -4,105 +4,42 @@
    own law: --ok is a verified fact, --warn/--bad are alarms, everything
    unproven is neutral). Each row is the same shape — label · data · numbers —
    so the eye COMPARES components instead of parsing 90 rows of equal weight
-   (the wall this band replaced; the wall itself lives on, collapsed, below).
+   (the wall this band replaced; the land requests are Work page cards now).
    Every cell distinguishes ZERO from UNREAD: "not read yet" / UNKNOWN are
    words, never a blank or a fabricated 0 — the console's governing finding
    ("helm's claims about itself are not checked") applies to the dashboard
    FIRST, because it is the first thing the owner reads. */
-#dash{margin:16px 0 0;font-size:var(--f1)}
-#dash .dhead{display:flex;align-items:baseline;gap:10px;padding-bottom:3px}
-#dash .dlabel{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
-#dash .dhow{margin-left:auto;color:var(--mut);font-size:var(--f0);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#dash .drow{display:flex;align-items:baseline;gap:10px;padding:5px 0;border-top:1px solid var(--line)}
-#dash .dlab{flex:0 0 52px;font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
-#dash .dval{flex:1 1 auto;min-width:0;display:flex;flex-wrap:wrap;gap:2px 10px;align-items:baseline;color:var(--fg)}
-#dash .dnum{font-variant-numeric:tabular-nums;font-weight:var(--w-med);color:var(--fg)}
-#dash .dmut{color:var(--mut)}
-#dash .dsub{color:var(--sub);font-size:var(--f0)}
-#dash .dok{color:var(--ok);font-weight:var(--w-med)}
-#dash .dwarn{color:var(--warn);font-weight:var(--w-med)}
-#dash .dbad{color:var(--bad);font-weight:var(--w-med)}
+.hsum .dhead{display:flex;align-items:baseline;gap:10px;padding-bottom:3px}
+.hsum .dlabel{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+.hsum .drow{display:flex;align-items:baseline;gap:10px;padding:5px 0;border-top:1px solid var(--line)}
+.hsum .dlab{flex:0 0 52px;font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+.hsum .dval{flex:1 1 auto;min-width:0;display:flex;flex-wrap:wrap;gap:2px 10px;align-items:baseline;color:var(--fg)}
+.hsum .dnum{font-variant-numeric:tabular-nums;font-weight:var(--w-med);color:var(--fg)}
+.hsum .dmut{color:var(--mut)}
+.hsum .dsub{color:var(--sub);font-size:var(--f0)}
+.hsum .dok{color:var(--ok);font-weight:var(--w-med)}
+.hsum .dwarn{color:var(--warn);font-weight:var(--w-med)}
+.hsum .dbad{color:var(--bad);font-weight:var(--w-med)}
 /* UNKNOWN is a STATE, not styling noise: always the word, always --warn, so
    an unread tile can never be skimmed past as a quiet zero. */
-#dash .dunk{color:var(--warn);font-weight:700}
-/* CORRELATED is its own colour and deliberately NOT the ok-green: a
-   receipt's own evidence must never look like a Git verdict. */
-#dash .dcorr{color:var(--sub);font-weight:700}
-/* the pipeline's proportional bar: one strip, four buckets, widths = counts.
-   flex-grow carries the proportion so no math happens at render time. */
-#dash .dbar{display:flex;height:7px;border-radius:2px;overflow:hidden;flex:1 1 160px;min-width:120px;align-self:center;background:color-mix(in srgb,var(--fg) 6%,transparent)}
-#dash .dbar i{display:block;height:100%;min-width:2px}
-#dash .dbar .dmov{background:var(--accent)}
-#dash .dbar .dstl{background:var(--warn)}
-#dash .dbar .dctr{background:var(--bad)}
-#dash .dbar .dhon{background:var(--ok)}
-#dash .dbar .dunm{background:var(--sub)}
-/* recent lands: small multiples — lane · commit · verdict-glyph · age, the
-   same four columns every row, so six rows read as one comparison. */
-#dash .dlands{flex:1 1 100%;display:flex;flex-direction:column}
-#dash .dland{display:flex;gap:8px;align-items:baseline;padding:1px 0;min-width:0}
-#dash .dland .dllane{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#dash .dland code{background:none;color:var(--sub);padding:0;font-size:var(--f0)}
-#dash .dland .dlwit{flex:0 0 auto;font-size:var(--f0)}
-#dash .dland .dlver{flex:0 0 auto;font-size:var(--f0);font-weight:700}
-#dash .dland .dlage{flex:0 0 auto;color:var(--mut);font-size:var(--f0);font-variant-numeric:tabular-nums;min-width:7ch;text-align:right}
-/* A CLOSURE SECOND SHARED WITH ANOTHER LAND. Closure stamps are whole seconds,
-   so two lands closed inside one carry no order the record can answer — the
-   age is marked rather than restyled, it borrows no new colour, and the row's
-   own title says what the mark means. */
-/* a LAND with its earlier rounds folded under it. The summary is deliberately
-   quiet — data-ink goes to the land, not to the disclosure control — and the
-   rounds indent so the eye reads them as evidence FOR the row above rather
-   than as more lands. */
-#dash .dlgroup>details>summary{color:var(--mut);font-size:var(--f0);cursor:pointer;list-style:none;padding-left:2px}
-#dash .dlgroup>details>summary::-webkit-details-marker{display:none}
-#dash .dlgroup>details>summary::before{content:"▸ ";color:var(--mut)}
-#dash .dlgroup>details[open]>summary::before{content:"▾ "}
-#dash .dlgroup>details>.dland{padding-left:12px;opacity:.72}
-/* DISAGREEMENT IS NOT DECORATION. When a land's receipts contradict each other
-   the group opens itself and says so; the border exists so a reader skimming
-   collapsed rows cannot mistake the conflict for a tidy fold. */
-#dash .dlsplit{border-left:2px solid var(--bad,#c33);padding-left:4px}
-#dash .dlsplit>details>summary{color:var(--bad,#c33);font-weight:700}
+.hsum .dunk{color:var(--warn);font-weight:700}
 /* the fleet's seat dots reuse the roster's .rdot colour classes verbatim —
    one presence vocabulary across the whole console, learned once. */
-#dash .dseat{white-space:nowrap;color:var(--fg)}
-#dash .dseat .rdot{margin-right:2px}
+.hsum .dseat{white-space:nowrap;color:var(--fg)}
+.hsum .dseat .rdot{margin-right:2px}
 /* phone (390px is the design floor): the label rides ABOVE its data — which
    needs the row to WRAP; without flex-wrap a 100%-basis label just shoves the
    whole data cell off the right edge (caught on a real 390px render, not by
    any string test — screenshots are part of this band's definition of done). */
-@media (max-width:680px){#dash .drow{flex-wrap:wrap;row-gap:1px}#dash .dlab{flex-basis:100%;padding-bottom:0}#dash .dhow{display:none}}
+@media (max-width:680px){.hsum .drow{flex-wrap:wrap;row-gap:1px}.hsum .dlab{flex-basis:100%;padding-bottom:0}}
 
-/* the band's jump to the pipeline wall (the kanban higher up the Work page —
-   a collapsed copy in the band WAS the duplication the owner objected to) */
-#dash .dslink{color:var(--accent);cursor:pointer;white-space:nowrap}
-#dash .dslink:hover{text-decoration:underline}
-/* THE IN-FLIGHT WALL'S STYLES WENT WITH ITS RENDERERS (owner ruling,
-   task/2355). `.difrow*` and `.difgrp*` styled one line per live loop inside
-   this band; the row came off and the four renderers that drew it were deleted
-   in the same commit, so every selector here had no element left to match.
-   Kept CSS for a deleted element is the same defect as a callerless function:
-   it reads as a surface that still exists.
-
-   The owed-by row that replaced it is names and counts, so it needs a chip and
-   nothing more — `.dowed` below. */
-/* WHO OWES THE NEXT MOVE: one chip per holder, count first so the eye reads
-   the numbers across the row without reading a name. */
-#dash .dowed{flex:0 0 auto;white-space:nowrap;color:var(--fg)}
-#dash .dowed+.dowed::before{content:" · ";color:var(--mut)}
+/* a row's jump to the surface that holds its detail */
+.hsum .dslink{color:var(--accent);cursor:pointer;white-space:nowrap}
+.hsum .dslink:hover{text-decoration:underline}
 /* EVERY CARD NAMES ITS SOURCE READ AND THAT READ'S AGE (the home-card law).
    Muted and on its own line: it is provenance the owner checks when a number
    surprises him, never a number competing with the ones above it. */
-#dash .dcsrc{flex:1 1 100%;color:var(--mut)}
-/* a landed row's task number and gate token — the two identities on the row
-   the owner recognises, so the task is emphasised and the token is not */
-#dash .dland .dltask{flex:0 0 auto;font-size:var(--f0);font-weight:var(--w-med)}
-#dash .dland .dlgate{flex:0 0 auto;font-size:var(--f0);color:var(--sub);font-family:ui-monospace,monospace}
-/* the wall, as the Work page's kanban under the project rows: the card keeps
-   its own chrome, the tier supplies the spacing */
-#tierpipeline{margin:16px 0 0}
-#tierpipeline #lrsec{margin:0}
+.hsum .dcsrc{flex:1 1 100%;color:var(--mut)}
 /* who-signed share meters: one bar per signer, widths COMPARE against the
    busiest signer in the list — data-ink, no legend (the number is beside it) */
 .lmeter{display:inline-block;width:64px;height:5px;border-radius:2px;background:color-mix(in srgb,var(--fg) 8%,transparent);vertical-align:2px}
@@ -128,21 +65,41 @@
 #danswers .dslink{color:var(--accent);cursor:pointer;white-space:nowrap}
 #danswers .dslink:hover{text-decoration:underline}
 @media (max-width:680px){#danswers .darow{flex-wrap:wrap}#danswers .datext{flex:1 1 100%}}
-/* A LANDED ROW HAS SIX CELLS AND FIVE OF THEM REFUSE TO SHRINK. The lane cell
-   ellipsises, and the task, the tip, the gate token, the proof verdict and the
-   age are each flex:0 0 auto with nowrap — so an ordinary short row (lane `ui`,
-   task/2355, an eight-character tip, a twelve-character gate token, the
-   unrecorded-proof verdict) summed past the 390px design floor and pushed the
-   DOCUMENT to 437px wide. A band that drags the whole page into a horizontal
-   scroll is the bug the nav rules above were written to remove, arriving from
-   the other side of the page.
-   The row WRAPS at the phone floor: the lane takes its own line and the
-   identities flow under it, which is the same shape the label rows already use.
-   The age keeps its tabular column but gives up its right rail, because a right
-   rail inside a wrapped row is what reserves width nothing is using. */
-@media (max-width:680px){
-#dash .dland{flex-wrap:wrap;row-gap:1px}
-#dash .dland .dllane{flex:1 1 100%}
-#dash .dland .dlage{min-width:0;text-align:left}
-#dash .dlgroup>details>.dland{padding-left:8px}
-}
+/* ---------- HOME (task/3445 L3) ----------
+   One screen in the owner's browser pane (960 wide and up): the greeting,
+   the on-you strip (only while something waits), then a grid of headline
+   tiles — three columns, the away switch one slim row across them. Below 960
+   two columns, the away switch a tile of its own; a phone stacks them. Each
+   tile is a label that links to its page, then one or two lines. */
+#view-home #hello{margin:14px 0 8px;color:var(--mut);font-size:var(--f2)}
+.hstrip{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;margin:0 0 12px;padding:9px 14px;background:var(--card);border:1px solid color-mix(in srgb,var(--warn) 45%,var(--line));border-radius:12px;cursor:pointer;font-size:var(--f2)}
+.hstrip[hidden]{display:none}
+.hgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.htile{min-width:0;padding:10px 14px 12px;background:var(--card);border:1px solid var(--line);border-radius:12px;cursor:pointer;overflow:hidden}
+.htile:hover,.hstrip:hover{border-color:var(--accent)}
+/* the work tile prints the stage row, word for word: two columns wide (task/3643) */
+.htile.hwide{grid-column:span 2}
+.hlab{display:inline-block;margin:0 0 6px;font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub);text-decoration:none}
+.hlab::after{content:" →"}
+.hstrip .hlab{margin:0}
+.htile:hover .hlab,.hlab:focus-visible{color:var(--accent)}
+.hval{font-size:var(--f1);min-width:0;overflow-wrap:anywhere}
+.hval+.hval{margin-top:4px}
+.hbig{font-size:var(--f3)}
+.hbig b{font-weight:700}
+.hnote{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.htile .dsub{font-size:var(--f1)}
+.hstale{color:var(--mut);font-size:var(--f1)}
+#view-home #posturesec{grid-column:1/-1;margin:0;display:flex;flex-wrap:wrap;align-items:center;gap:2px 16px}
+#view-home #posturesec>*{margin:0}
+#view-home #posturesec .pfold[open]{flex-basis:100%}
+#view-home #danswers{margin:16px 0 0}
+#homenotes{margin:16px 0 0}
+@media (max-width:959px){.hgrid{grid-template-columns:repeat(2,minmax(0,1fr))}#view-home #posturesec{grid-column:auto}}
+@media (max-width:620px){.hgrid{grid-template-columns:minmax(0,1fr)}.htile.hwide{grid-column:auto}}
+#nav a.brand{color:inherit;text-decoration:none;border-radius:var(--r-sm);padding:2px 6px 2px 2px}
+#nav a.brand:hover,#nav a.brand.on{background:var(--card)}
+#nav a.brand:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.hsum{margin:14px 0 0;padding:4px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;font-size:var(--f1)}
+.hsum .drow:first-child{border-top:0}
+#fleetsum{margin:0 0 14px}

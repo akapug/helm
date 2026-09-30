@@ -68,6 +68,9 @@ import time
 import urllib.request
 
 from . import home, pk, upstream_surface
+from . import timerhealth
+
+_SYSTEMD_SPACE = timerhealth._SYSTEMD_SPACE
 
 BOT = "upstream-watch"
 ROOM = "helm"
@@ -503,8 +506,12 @@ def run_claude(prompt, meter, run=None):
         return None, "`claude` is not on PATH (set HELM_UPSTREAM_WATCH_CLAUDE)"
     started = time.monotonic()
     try:
-        p = run(claude_argv(program), input=prompt, capture_output=True, text=True,
-                cwd=_checkout(), env=claude_env(), timeout=_timeout())
+        # UTF-8 BOTH WAYS WHATEVER THE LOCALE (task/3423): an evidence
+        # bundle carries text no Latin-1 or ASCII locale encodes, and claude
+        # reads and writes UTF-8.
+        p = run(claude_argv(program), input=prompt, capture_output=True,
+                encoding="utf-8", errors="replace", cwd=_checkout(),
+                env=claude_env(), timeout=_timeout())
     except subprocess.TimeoutExpired:
         return None, "claude -p did not finish within %ds" % _timeout()
     except OSError as e:
@@ -1008,22 +1015,48 @@ WantedBy=timers.target
 """
 
 
-def timer_units(env=None):
+def _knob_unit(suffix, env):
+    """A knob value as the *unit* (not as a shell env): stripped only over
+    `_SYSTEMD_SPACE = " \t\n\r"` — the exact set systemd 259 strips from a
+    unit value, and the exact set the census (`timerhealth._directives`) reads
+    the installed file back with (task/3441). `str.strip()` would eat every
+    Unicode whitespace char (NBSP, form feed) that systemd keeps; the unit
+    path must use the systemd set, so the install and its census agree.
+    None when absent or empty after that strip."""
+    value = (os.environ if env is None else env).get(
+        "HELM_UPSTREAM_WATCH" + suffix)
+    return None if value is None or not value.strip(_SYSTEMD_SPACE) \
+        else value.strip(_SYSTEMD_SPACE)
+
+
+def timer_units(env=None, inputs=None):
     """-> (service path, service text, timer path, timer text). The service
     carries the claude program and the Claude Code home as absolute paths when
-    the installer names them, because a user unit's PATH is not a shell's."""
+    the installer names them, because a user unit's PATH is not a shell's.
+    Each is written by timerhealth.env_assignment, so a path with a space, a
+    quote, a backslash or a percent sign reaches the service exactly, and one
+    with a control character is left out (task/3423). `inputs` replaces
+    per-install values (timerhealth.unit_values). The knobs are read with
+    `_knob_unit` (systemd's strip), not `_knob` (Python's `str.strip()`): the
+    install must write the value through exactly, so the census — which reads
+    back over `_SYSTEMD_SPACE` — sees it unchanged (task/3441)."""
+    from . import timerhealth
     env = os.environ if env is None else env
-    lines = []
-    program = _knob("_CLAUDE", env=env) or shutil.which("claude")
+    words = []
+    program = _knob_unit("_CLAUDE", env) or shutil.which("claude")
     if program:
-        lines.append("Environment=HELM_UPSTREAM_WATCH_CLAUDE=%s" % os.path.abspath(program))
-    chosen = _knob("_CLAUDE_HOME", env=env)
+        words.append(timerhealth.env_assignment(
+            "HELM_UPSTREAM_WATCH_CLAUDE", os.path.abspath(program)))
+    chosen = _knob_unit("_CLAUDE_HOME", env)
     if chosen:
-        lines.append("Environment=HELM_UPSTREAM_WATCH_CLAUDE_HOME=%s"
-                     % os.path.abspath(os.path.expanduser(chosen)))
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+        words.append(timerhealth.env_assignment(
+            "HELM_UPSTREAM_WATCH_CLAUDE_HOME",
+            os.path.abspath(os.path.expanduser(chosen))))
+    udir = timerhealth.user_unit_dir()
     return (os.path.join(udir, _SERVICE_NAME),
-            _SERVICE % {"env": "".join(line + "\n" for line in lines)},
+            _SERVICE % timerhealth.unit_values(
+                {"env": "".join("Environment=%s\n" % w for w in words if w)},
+                inputs),
             os.path.join(udir, _TIMER_NAME), _TIMER)
 
 
@@ -1033,21 +1066,16 @@ def install_timer():
     if not systemctl:
         return False, "systemctl unavailable; run `helm upstream-watch` from another scheduler"
     spath, service, tpath, timer = timer_units()
-    try:
-        pk.atomic_write(spath, service)
-        pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    for cmd in ([systemctl, "--user", "daemon-reload"],
-                [systemctl, "--user", "enable", "--now", _TIMER_NAME]):
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=SYSTEMCTL_TIMEOUT_S)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            return False, "%s failed: %s" % (" ".join(cmd), e)
-        if r.returncode != 0:
-            return False, "%s failed: %s" % (
-                " ".join(cmd), pk.cut_marked((r.stderr or r.stdout or "").strip(), 200))
+    from . import timerhealth
+    # A failure's output is cut WITH its cut notice (pk.cut_marked): this
+    # installer's own report.
+    error, _unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer)), (_TIMER_NAME,), systemctl,
+        subprocess, timeout=SYSTEMCTL_TIMEOUT_S,
+        clean=lambda r: pk.cut_marked((r.stderr or r.stdout or "").strip(),
+                                      200))
+    if error:
+        return False, error
     return True, "enabled the daily timer %s" % tpath
 
 

@@ -49,10 +49,12 @@ class RewriteBase(unittest.TestCase):
         _git(self.repo, "init", "-q")
         _git(self.repo, "config", "user.email", "old@example.invalid")
         _git(self.repo, "config", "user.name", "old")
-        open(os.path.join(self.repo, "f"), "w").write("one\n")
+        with open(os.path.join(self.repo, "f"), "w") as fh:
+            fh.write("one\n")
         _git(self.repo, "add", "f")
         _git(self.repo, "commit", "-qm", "one")
-        open(os.path.join(self.repo, "f"), "a").write("two\n")
+        with open(os.path.join(self.repo, "f"), "a") as fh:
+            fh.write("two\n")
         _git(self.repo, "add", "f")
         _git(self.repo, "commit", "-qm", "two")
         self.gitdir = os.path.join(self.repo, ".git")
@@ -142,7 +144,8 @@ class ContentIdentityTest(RewriteBase):
 class CommitMapTest(RewriteBase):
     def _map(self, body):
         p = os.path.join(self.repo, "commit-map")
-        open(p, "w").write(body)
+        with open(p, "w") as fh:
+            fh.write(body)
         return p
 
     def test_a_dropped_commit_is_never_applied_as_a_translation(self):
@@ -229,7 +232,8 @@ class CommitMapTest(RewriteBase):
                 self.assertIsNone(err)
                 self.assertEqual(r["written"], 1)
                 self.assertTrue(os.path.exists(r["sidecar"]))
-                rec = json.loads(open(r["sidecar"]).read().splitlines()[0])
+                with open(r["sidecar"], encoding="utf-8") as fh:
+                    rec = json.loads(fh.read().splitlines()[0])
                 self.assertEqual((rec["old"], rec["new"]), (self.old, new))
                 # the ledger row is untouched
                 self.assertEqual(rows["d1"]["reviewed_tip"], self.old,
@@ -295,7 +299,8 @@ class ChainedRewriteTest(SidecarBase):
         _git(self.repo, "config", "user.email", "t@example.invalid")
         _git(self.repo, "config", "user.name", "t")
         for i in ("one", "two", "three"):
-            open(os.path.join(self.repo, "f"), "a").write(i + "\n")
+            with open(os.path.join(self.repo, "f"), "a") as fh:
+                fh.write(i + "\n")
             _git(self.repo, "add", "f")
             _git(self.repo, "commit", "-qm", i)
         self.original = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
@@ -384,8 +389,8 @@ class ChainedRewriteTest(SidecarBase):
         self._migrate(map1, self.original)
         map2, b = self._pass("P2-", "map2")
         self._migrate(map2, self.original)
-        rows = [json.loads(l) for l in
-                open(self.sidecar).read().splitlines() if l.strip()]
+        with open(self.sidecar, encoding="utf-8") as fh:
+            rows = [json.loads(l) for l in fh.read().splitlines() if l.strip()]
         self.assertEqual([r["new"] for r in rows], [a, b],
                          "append-only: the composed row lands last")
         self.assertEqual(landreq.ref_translations()[self.original], b,
@@ -415,7 +420,8 @@ class ChainedRewriteTest(SidecarBase):
             capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         cmap = os.path.join(self.repo, ".git", "filter-repo", "commit-map")
-        raw = [l.split() for l in open(cmap).read().splitlines()]
+        with open(cmap) as fh:
+            raw = [l.split() for l in fh.read().splitlines()]
         self.assertTrue([x for x in raw if len(x) == 2 and x[0] == x[1]],
                         "the fixture must actually contain identity rows")
         m, err = landreq.read_commit_map(cmap)
@@ -432,7 +438,8 @@ class ChainCompositionTest(SidecarBase):
         """A hand-written map against a mocked repo — these cases are about the
         chain, and a real working tree would only add a way to fail."""
         p = os.path.join(self.home, "cm")
-        open(p, "w").write(map_body)
+        with open(p, "w") as fh:
+            fh.write(map_body)
         with mock.patch.object(landreq.dispatches, "_repo_info",
                                return_value={"repo": "/repo",
                                              "repo_id": "/repo/.git"}), \
@@ -558,7 +565,8 @@ class UnchangedCommitMapTest(unittest.TestCase):
         d = tempfile.mkdtemp(prefix="helm-test-cm-")
         try:
             p = os.path.join(d, "cm")
-            open(p, "w").write("old new\n%s %s\n" % ("a" * 40, "a" * 40))
+            with open(p, "w") as fh:
+                fh.write("old new\n%s %s\n" % ("a" * 40, "a" * 40))
             m, err = landreq.read_commit_map(p)
             self.assertIsNone(m)
             self.assertIn("1 unchanged", err)

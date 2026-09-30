@@ -228,14 +228,20 @@ for (const [name, cfg] of Object.entries(CASES)) {
   global.localStorage = {getItem: () => null, setItem() {}};
   global.setTimeout = () => 0;
   global.setInterval = () => 0;
+  // a page change scrolls to the new page's top; geometry is not this
+  // harness's subject
+  global.window = {scrollTo() {}};
   // This harness owns nav reachability, not the independent Dregg lifecycle;
   // stub its public pair just like every other unrelated boot side effect.
   for (const k of ["initQuota", "initStorage", "initSessions", "cfgInit",
                    "srevInit", "odqInit", "initChat", "initRoster",
                    "initLedger", "startDreggPolling", "stopDreggPolling",
-                   "esConnect", "openSession", "goOldSection"]) {
+                   "esConnect", "openSession", "projRoute",
+                   "viewRoute", "initHome", "wkShow", "wkPaint"]) {
     global[k] = () => {};
   }
+  global.projQuery = () => "";
+  global.viewQuery = () => "";
 
   const anySelectedBefore = tabs.some(t => t._on);
   __runBoot();

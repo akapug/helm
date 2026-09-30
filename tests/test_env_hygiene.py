@@ -44,8 +44,20 @@ INTENTIONAL_GLOBAL = {
                           # no arm may read this box's seat memory unasked
                           "HELM_SEAT_PRESSURE",
                           # no arm may change this host's scheduler
-                          "HELM_AUTOCOMPACT_TIMER"},
-    "tests/_tmphome.py": {"HELM_CHAT_ROOM"},
+                          "HELM_AUTOCOMPACT_TIMER", "HELM_GATE_CANARY_TIMER",
+                          "HELM_RELEASE_NIGHTLY_TIMER",
+                          "HELM_CHECKOUT_WATCH_TIMER",
+                          # no arm may read the operator's MCP credentials
+                          # or link his global rules into a fixture seat
+                          "HELM_MCPS_PRIVATE", "HELM_INSTRUCTIONS_CANONICAL",
+                          # every test process posts to an explicit room
+                          "HELM_CHAT_ROOM",
+                          # a suite runs the coordination verbs of the tree
+                          # it tests, never trunk's (helm/trunkroute.py)
+                          "HELM_LANE_COORDINATION",
+                          # no arm, and no child it runs, may reach this
+                          # host's systemd user manager: a dead user bus
+                          "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"},
     "tests/test_configs.py": {"HELM_HOME", "HELM_CONFIG_ROOTS"},
 }
 
@@ -62,10 +74,48 @@ def _env_base(value):
     return getattr(value, "id", "")
 
 
-def assignments(tree):
+def _children(node):
+    """`ast.iter_child_nodes(node)` as a list, in its order.
+
+    THE CENSUS WAS SPENT HERE (task/3397). iter_child_nodes reaches each child
+    through two generator layers and a try per field (`ast.iter_fields`), and
+    the census asked it about every node five times over: iter_child_nodes
+    was 45 of the arm's 106 profiled seconds, against 4.7 s of parsing. The
+    same fields, read in the same order, with no generator between them."""
+    out = []
+    for name in node._fields:
+        value = getattr(node, name, None)
+        if isinstance(value, ast.AST):
+            out.append(value)
+        elif isinstance(value, list):
+            out.extend([v for v in value if isinstance(v, ast.AST)])
+    return out
+
+
+def _walk(tree):
+    """-> (nodes, up): every node of `tree` in `ast.walk`'s order, and for
+    each one the index in `nodes` of the node it was reached from (-1 for
+    `tree` itself).
+
+    ast.walk is breadth first: it yields nodes in the order it queues them,
+    and it queues a node's children, in iter_child_nodes order, when it
+    reaches that node. A list extended while it is iterated is that queue.
+    The ORDER IS PART OF THE ANSWER: `assignments` keeps the FIRST line it
+    meets for a key, so a depth-first walk would name other lines. The census
+    walks each tree once and hands the pair to every fact function; a caller
+    that passes only a tree gets the same pair built for it."""
+    nodes, up = [tree], [-1]
+    for i, node in enumerate(nodes):
+        kids = _children(node)
+        nodes.extend(kids)
+        up.extend([i] * len(kids))
+    return nodes, up
+
+
+def assignments(tree, walked=None):
     """{ENV_NAME: lineno} for every os.environ write in the module."""
     out = {}
-    for node in ast.walk(tree):
+    for node in (_walk(tree) if walked is None else walked)[0]:
         targets = []
         if isinstance(node, ast.Assign):
             targets = node.targets
@@ -146,10 +196,10 @@ def _is_partial(node):
         (isinstance(f, ast.Name) and f.id == "partial")
 
 
-def restorations(tree):
+def restorations(tree, walked=None):
     """Every env name the module mentions in a cleanup-capable position."""
     out = set()
-    for node in ast.walk(tree):
+    for node in (_walk(tree) if walked is None else walked)[0]:
         if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
             out |= {s for s in map(_literal, node.elts) if s}
         if isinstance(node, ast.Dict):
@@ -189,7 +239,8 @@ def restorations(tree):
     return out
 
 
-_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_SCOPES = _FUNCTIONS + (ast.ClassDef, ast.Lambda)
 
 
 def _lifecycle_call(node, name):
@@ -216,18 +267,40 @@ def _stmt_calls(stmt, name):
     return isinstance(stmt, ast.Expr) and _lifecycle_call(stmt.value, name)
 
 
-def _own_nodes(fn):
-    """Every node of fn's own body. A function or class nested in it is
-    scanned as a function of its own, so it is not walked twice."""
-    stack = [c for c in fn.body if not isinstance(c, _SCOPES)]
-    while stack:
-        node = stack.pop()
-        yield node
-        stack.extend(c for c in ast.iter_child_nodes(node)
-                     if not isinstance(c, _SCOPES))
+def _owner(nodes, up, k):
+    """The function whose OWN BODY holds nodes[k], or None.
+
+    Climb to the first enclosing scope. It owns the node only when it is a
+    function and the climb entered it through `body`: a decorator, a default
+    or an annotation is not its body, and a class or a lambda between the
+    node and any function is a scope of its own that no function's body
+    reaches into."""
+    child, j = nodes[k], up[k]
+    while j >= 0 and not isinstance(nodes[j], _SCOPES):
+        child, j = nodes[j], up[j]
+    fn = nodes[j] if j >= 0 else None
+    if isinstance(fn, _FUNCTIONS) and any(s is child for s in fn.body):
+        return fn
+    return None
 
 
-def reentrant_setups(tree):
+def _torn_down_first(nodes, up, k):
+    """Is nodes[k] the call of a statement that directly follows
+    `self.tearDown()` in the same block?"""
+    stmt = nodes[up[k]]
+    if not isinstance(stmt, ast.Expr):
+        return False
+    block_owner = nodes[up[up[k]]]
+    for field in ("body", "orelse", "finalbody"):
+        block = getattr(block_owner, field, None)
+        if isinstance(block, list):
+            for prev, s in zip(block, block[1:]):
+                if s is stmt:
+                    return _stmt_calls(prev, "tearDown")
+    return False
+
+
+def reentrant_setups(tree, walked=None):
     """[(line, function)] for every call that runs THIS instance's setUp
     while its fixture is still live.
 
@@ -241,25 +314,22 @@ def reentrant_setups(tree):
 
     Bound: the instance is recognised by the name `self`. A helper that takes
     it under another name is not seen.
+
+    ONLY THE setUp CALLS ARE CLIMBED (task/3397). This walked the own body
+    of every function in the file to find the few that call setUp, and that
+    walk was 41 of the census's 106 profiled seconds. Each setUp call now
+    climbs to the one function whose own body holds it (`_owner`), and the
+    tearDown pairing is read from the one block that holds its statement.
     """
+    nodes, up = _walk(tree) if walked is None else walked
     hits = []
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                or fn.name == "setUp":
+    for k, call in enumerate(nodes):
+        if not isinstance(call, ast.Call) or not _lifecycle_call(call, "setUp"):
             continue
-        nodes = list(_own_nodes(fn))
-        balanced = set()
-        for owner in [fn] + nodes:
-            for field in ("body", "orelse", "finalbody"):
-                block = getattr(owner, field, None)
-                if not isinstance(block, list):
-                    continue
-                for prev, stmt in zip(block, block[1:]):
-                    if _stmt_calls(stmt, "setUp") \
-                            and _stmt_calls(prev, "tearDown"):
-                        balanced.add(stmt.value)
-        hits += [(n.lineno, fn.name) for n in nodes
-                 if _lifecycle_call(n, "setUp") and n not in balanced]
+        fn = _owner(nodes, up, k)
+        if fn is not None and fn.name != "setUp" \
+                and not _torn_down_first(nodes, up, k):
+            hits.append((call.lineno, fn.name))
     return sorted(hits)
 
 
@@ -300,7 +370,7 @@ _WRITERS = ("add", "send")
 _SETUPS = ("setUp", "setUpClass", "asyncSetUp")
 
 
-def live_seat_facts(tree):
+def live_seat_facts(tree, walked=None):
     """What the live-seat census needs from one module, and nothing else.
 
     `writes`: the module calls `dispatches.add` or `dispatches.send` itself,
@@ -309,7 +379,7 @@ def live_seat_facts(tree):
     its own setUp plants, it defines a test)}. `imports`: {local name:
     (tests module, name or None for the module itself)}."""
     aliases, imports, receivers = {"helm.dispatches"}, {}, set()
-    for node in ast.walk(tree):                  # ONE walk: the census cost
+    for node in (_walk(tree) if walked is None else walked)[0]:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
                 and node.func.attr in _WRITERS:
             receivers.add(_dotted(node.func.value))
@@ -362,7 +432,13 @@ def suite_census():
     tests plus `restorations(tree)` re-walked once per assigned key inside
     the filter below (896 whole-tree walks where 208 suffice; task/3039).
     Only the FACTS are kept: the trees of 459 files would hold about a
-    gigabyte for the rest of the process."""
+    gigabyte for the rest of the process.
+
+    EACH TREE IS WALKED ONCE (task/3397). The four fact functions each ran
+    their own `ast.walk` over the same tree, and the walks, not the parse,
+    had become the cost: 25-26 s on a build node for 541 files, of which the
+    parse is about 4. `_walk` builds the node list once and every fact
+    function reads it."""
     if not _SUITE:
         for name in sorted(os.listdir(_TESTS)):
             if not name.endswith(".py"):
@@ -370,13 +446,14 @@ def suite_census():
             rel = "tests/" + name
             with open(os.path.join(_TESTS, name), encoding="utf-8") as f:
                 tree = ast.parse(f.read(), filename=rel)
-            restored = restorations(tree)
+            walked = _walk(tree)
+            restored = restorations(tree, walked)
             _SUITE.append((rel, {
-                "leaks": {k: ln for k, ln in assignments(tree).items()
+                "leaks": {k: ln for k, ln in assignments(tree, walked).items()
                           if k not in restored
                           and k not in INTENTIONAL_GLOBAL.get(rel, ())},
-                "reentry": reentrant_setups(tree),
-                "live_seats": live_seat_facts(tree)}))
+                "reentry": reentrant_setups(tree, walked),
+                "live_seats": live_seat_facts(tree, walked)}))
     return _SUITE
 
 

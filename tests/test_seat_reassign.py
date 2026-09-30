@@ -46,6 +46,21 @@ class ReassignBase(unittest.TestCase):
         os.environ["HELM_PROC"] = os.path.join(self.tmp, "proc")
         for d in ("helm", "adopted", "chat", "proc"):
             os.makedirs(os.path.join(self.tmp, d), exist_ok=True)
+        # THE CENSUS AND THE `helm who` RUNG READ THE FIXTURE /proc TOO.
+        # HELM_PROC moves only procid's reads: the liveness census every
+        # claims read takes lists session.PROC and the who rung lists
+        # who.PROC, and both default to the node's real /proc. There, every
+        # holdings read walks the whole process table of the node it runs on,
+        # three reads per pid, so the module's cost grows with the node's
+        # process count, and a same-uid claude process on the node can leave
+        # the census incomplete. The fixture /proc is empty, so
+        # the census answers complete with no process in it
+        # (tests/test_stale_claim.py pins the same pair for the same reason).
+        from helm import session as sess_mod, who
+        for mod in (sess_mod, who):
+            pin = mock.patch.object(mod, "PROC", os.environ["HELM_PROC"])
+            pin.start()
+            self.addCleanup(pin.stop)
         # THE ISOLATION IS ASSERTED, NOT ASSUMED. A redirect that silently
         # failed would point every write below at the live fleet, and the
         # arms would still pass.
@@ -56,6 +71,9 @@ class ReassignBase(unittest.TestCase):
         self.assertTrue(seats_common.claims_path().startswith(self.tmp),
                         "the CHAT seam did not take, so .claims.json is the "
                         "LIVE FLEET'S: %s" % seats_common.claims_path())
+        self.assertEqual((sess_mod.PROC, who.PROC),
+                         (os.environ["HELM_PROC"],) * 2,
+                         "the census and the who rung list the fixture /proc")
 
     def tearDown(self):
         for k, v in self.prior.items():
@@ -1183,7 +1201,8 @@ class TheCompositionIsItsOwnClaimTest(ReassignBase):
         for cmd in (("init", "-q"), ("config", "user.email", "t@t"),
                     ("config", "user.name", "t")):
             subprocess.run(("git",) + cmd, cwd=self.repo, capture_output=True)
-        open(os.path.join(self.repo, "a.txt"), "w").write("a\n")
+        with open(os.path.join(self.repo, "a.txt"), "w") as fh:
+            fh.write("a\n")
         subprocess.run(["git", "add", "-A"], cwd=self.repo, capture_output=True)
         subprocess.run(["git", "commit", "-qm", "a"], cwd=self.repo,
                        capture_output=True)

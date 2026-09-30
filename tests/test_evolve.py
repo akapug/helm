@@ -376,12 +376,21 @@ class DriftFeedTest(BehaviorBase):
         self.seed("tierx", conf=0.9)
         drift.report()  # operator baseline snapshot
         self.seed("tierx", conf=0.5)
-        props = self.drift_props()
-        self.assertEqual(len(props), 2)
-        self.assertIn("belief 'tierx' fell below auto-act (0.90 -> 0.50)", props[1][1])
-        self.assertIn(" tierx +0.40 re-confirmed (auto-act fall review)", props[1][2])
-        # snapshot=False law: a second cycle still sees the same drift
-        self.assertEqual(self.drift_props(), props)
+        # ONE CLOCK READING FOR BOTH CYCLES (task/3397). Every minted command
+        # carries pk.now_ts(), a one-second UTC stamp, so two cycles that
+        # straddle a second boundary differ in the stamp alone. Whole-suite
+        # gate c8b9cdb2ac42f0ad failed the equality below on exactly that:
+        # '...05:55:42Z tierx ...' against '...05:55:41Z tierx ...'. The law
+        # under test is the drift the second cycle sees, not the wall clock.
+        with mock.patch.object(pk, "now_ts", return_value=pk.now_ts()):
+            props = self.drift_props()
+            self.assertEqual(len(props), 2)
+            self.assertIn("belief 'tierx' fell below auto-act (0.90 -> 0.50)",
+                          props[1][1])
+            self.assertIn(" tierx +0.40 re-confirmed (auto-act fall review)",
+                          props[1][2])
+            # snapshot=False law: a second cycle still sees the same drift
+            self.assertEqual(self.drift_props(), props)
 
     def test_rise_rides_the_summary_only(self):
         self.seed("riser", conf=0.5)

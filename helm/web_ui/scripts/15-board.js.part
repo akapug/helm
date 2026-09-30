@@ -10,22 +10,23 @@
    READ THE PROJECT FIRST. A project's light is AUTHORIZATION — whether he
    wants spending on it at all — and a family's burn colour is SUPPLY. So the
    light leads every row and the rows sort by it (green, yellow, orange, red,
-   then the projects nobody has set), and the family chips come after the name.
-   Setting a project green is choosing it active.
+   then the projects nobody has set). Supply itself is Fleet › credit's
+   Families card. Setting a project green is choosing it active.
 
-   TWO READS, ONE ROW. The rows are the registry's own project rows, each light
-   the resolver's answer (`/api/registry`); `/api/board` joins onto each one
-   what its seats spend, its running lanes, its open tasks, its week of
-   progress, its repositories, its last land off its own trunk and, for the
-   project the land pipeline projects, its kanban and waits. Every section of
-   that join carries its own read age, and a section past its bound is drawn
-   STALE, never as a number: a board that looked current while its reading had
-   stopped is worse than one that says it does not know.
+   THREE READS, ONE ROW. The rows are the registry's own project rows, each
+   light the resolver's answer (`/api/registry`); `/api/board` joins onto
+   each one what its seats spend, its running lanes, its week of progress,
+   its repositories and its last land off its own trunk; and its work — to
+   do, under way, landed — is the Work page's own count (`/api/work`,
+   task/3643). Every section of that join carries its own read age, and a
+   section past its bound is never drawn as current: a board that looked
+   current while its reading had stopped is worse than one that says it does
+   not know.
 
-   PHONE FIRST. A collapsed row is the light, the name, the family chips and
-   one count; everything else carries `bwide` and is a desktop cell. A tap on
-   the row opens it — its kanban, tasks, waits, lanes, progress and repos; a
-   tap on the light opens it at the setter. */
+   PHONE FIRST. A collapsed row is the light, the name, the team and one
+   count; everything else carries `bwide` and is a desktop cell. A tap on
+   the row opens it — its team, its work, its progress and repos; a tap on
+   the light opens it at the setter. */
 
 /* ---------- ON YOU ----------
    What is waiting on him, from two reads: the decisions door and the land
@@ -38,16 +39,17 @@ function onYouRead(odq, lr) {
     : !odq || odq.unavailable ? "unknown"
     : ((odq.counts || {}).open || 0) + ((odq.counts || {}).undelivered || 0);
   let asks = null, holds = null, askN = null, lrWhy = null, lrWord = "UNKNOWN";
-  let lrStale = false;
+  let lrOld = false;
   const lrRead = lr !== undefined && !(lr && lr.pending);
   if (lrRead) {
     const model = lr && lr.scheduler;
     if (!lr || lr.unavailable) lrWhy = (lr && lr.unavailable) || "the pipeline read failed";
     else if (lr.warming || lr.rebuilding) lrWhy = "the pipeline is still being read";
-    else if (cardStale(lr.read_age_s, 45)) {
-      // the same bound the system band's owner row refuses a stale read at,
-      // with the age beside the word: information, not an error
-      lrStale = true;
+    else if (lrStale(lr)) {
+      // the bound the server names for its own reading (`lrStale`,
+      // task/3632), with the age beside the word on Work (information, not
+      // an error); Home's strip says only "stale"
+      lrOld = true;
       lrWord = typeof lr.read_age_s === "number" ? "STALE, " + lrDur(lr.read_age_s) + " old" : "UNKNOWN";
       lrWhy = typeof lr.read_age_s === "number" ? "" : "the pipeline read is of unknown age";
     }
@@ -63,46 +65,60 @@ function onYouRead(odq, lr) {
   }
   const quiet = dec === 0 && askN === 0 && holds !== null && !holds.length;
   const plural = (n, one, many) => n + " " + (n === 1 ? one : many);
-  let line;
-  if (dec === null && !lrRead) line = '<span class="bmut">not read yet</span>';
-  else if (quiet) line = '<span class="bmut">nothing is waiting on you</span>';
+  // TWO SPELLINGS OF ONE LINE: Work's On-you block gives the reason or the
+  // age; HOME'S STRIP is a headline and says the tiles' one muted word,
+  // "not read" or "stale" (task/3445)
+  const word = w => '<span class="hstale">' + w + "</span>";
+  let line, home;
+  if (dec === null && !lrRead) { line = '<span class="bmut">not read yet</span>'; home = word("not read"); }
+  else if (quiet) line = home = '<span class="bmut">nothing is waiting on you</span>';
   else {
-    const parts = [];
-    if (dec === null) parts.push('<span class="bmut">decisions not read yet</span>');
-    else if (dec === "unknown") parts.push('<span class="bunk">decisions UNKNOWN</span>');
-    else if (dec) parts.push("<b>⚖ " + plural(dec, "decision", "decisions") + "</b>");
-    if (!lrRead) parts.push('<span class="bmut">owner asks not read yet</span>');
-    else if (lrWhy || lrStale) parts.push('<span class="bunk">owner asks ' + esc(lrWord) + "</span>"
-      + (lrWhy ? ' <span class="bmut">— ' + esc(lrWhy) + "</span>" : ""));
+    const parts = [], hparts = [];
+    const both = (l, h) => { parts.push(l); hparts.push(h === undefined ? l : h); };
+    if (dec === null) both('<span class="bmut">decisions not read yet</span>', "decisions " + word("not read"));
+    else if (dec === "unknown") both('<span class="bunk">decisions UNKNOWN</span>', "decisions " + word("not read"));
+    else if (dec) both("<b>⚖ " + plural(dec, "decision", "decisions") + "</b>");
+    if (!lrRead) both('<span class="bmut">owner asks not read yet</span>', "owner asks " + word("not read"));
+    else if (lrWhy || lrOld) both('<span class="bunk">owner asks ' + esc(lrWord) + "</span>"
+      + (lrWhy ? ' <span class="bmut">— ' + esc(lrWhy) + "</span>" : ""),
+      "owner asks " + word(lrOld ? "stale" : "not read"));
     else {
-      if (askN) parts.push("<b>" + plural(askN, "owner ask", "owner asks") + "</b>");
-      if (holds.length) parts.push("<b>" + plural(holds.length, "land request held for you", "land requests held for you") + "</b>");
+      if (askN) both("<b>" + plural(askN, "owner ask", "owner asks") + "</b>");
+      if (holds.length) both("<b>" + plural(holds.length, "land request held for you", "land requests held for you") + "</b>");
     }
     line = parts.join(" · ");
+    home = hparts.join(" · ");
   }
   const row = (r, what) => '<div class="yrow"><span class="yage">'
     + esc(r.age_known ? lrAgo(r.age_s) : "age unknown") + "</span> " + what + " <b>"
     + esc(r.plain_title || r.title || "?") + "</b>" + (r.detail ? ' <span class="bmut">' + esc(r.detail) + "</span>" : "") + "</div>";
   const rows = (asks || []).map(r => row(r, "ask")).concat((holds || []).map(r => row(r, "held")));
-  return {line, quiet, queue: dec === "unknown" || (typeof dec === "number" && dec > 0),
-          asks: rows.length ? rows.join("") + '<div class="yrow"><span class="dslink" data-goscheduler>who waits on whom ↓</span></div>' : ""};
+  return {line, home, quiet, queue: dec === "unknown" || (typeof dec === "number" && dec > 0),
+          asks: rows.length ? rows.join("") + '<div class="yrow"><span class="dslink" data-goscheduler>who has what, on Work →</span></div>' : ""};
 }
 
 const ONYOU = {};                  // the last decisions read and pipeline read
 function onYouShow(patch) {
   Object.assign(ONYOU, patch || {});
+  const got = onYouRead(ONYOU.odq, ONYOU.lr);
+  // HOME'S STRIP (task/3445): the same line, shown only while something
+  // waits on him or cannot be read; its detail is the block below on Work
+  const strip = $("#honyou"), hline = $("#honyouline");
+  if (strip && hline) { hline.innerHTML = got.home; strip.hidden = got.quiet; }
   const line = $("#onyouline"), asks = $("#onyouasks"), queue = $("#odq");
   if (!line || !asks || !queue) return;
-  const got = onYouRead(ONYOU.odq, ONYOU.lr);
   line.innerHTML = got.line;
   asks.innerHTML = got.asks;
   asks.hidden = !got.asks;
   queue.hidden = !got.queue;
   $("#onyou").classList.toggle("quiet", got.quiet);
-  asks.querySelectorAll("[data-goscheduler]").forEach(el => el.onclick = () => goOldSection("scheduler"));
+  asks.querySelectorAll("[data-goscheduler]").forEach(el => el.onclick = () => {
+    WK.main.view = Object.assign(wkDefault(), WK_ENTRY.pipeline, {lens: "list", group: "move"});
+    showView("pipeline");
+  });
 }
 
-/* ---------- the burn flags (moved here from the quota tab) ----------
+/* ---------- the burn flags (the Families card at the head of Fleet › credit) ----------
    READ-ONLY. The watchdog pass folds them; the board renders what it wrote and
    never probes. GREY renders as "not measured" and never as a colour: an
    unknown reading that looked green is the inversion the whole fold exists to
@@ -120,8 +136,13 @@ function flagWhen(at) {
 
 /* THE FLAG CARD, from the board's flags section -> {head, rows}. PURE, so
    tests/test_web_board.py runs this exact source. A section it cannot vouch
-   for draws no colour at all: unread, unmeasured and stale each say so. */
-function flagsHTML(sec) {
+   for draws no colour at all: unread, unmeasured and stale each say so.
+
+   THE ROWS ARE A STRIP AND A SHEET (task/3156): one chip per family, its
+   cause on hover and a tap selects it; under the strip, the selected family's
+   sheet — what lasts, the shares across projects (`d` is the board, for the
+   teams leg), the reset credits in hand and the declare control. */
+function flagsHTML(sec, d) {
   if (!sec) return {head: '<span class="bmut">not read yet</span>', rows: ""};
   if (sec.loading) return {head: '<span class="bmut">still being read</span>', rows: ""};
   if (sec.unavailable)
@@ -129,23 +150,26 @@ function flagsHTML(sec) {
   if (sec.stale)
     return {head: '<span class="bunk">STALE</span> <span class="bmut">— the burn flags were read '
       + esc(lrAgo(sec.age_s)) + ", past their " + esc(lrDur(sec.limit_s) || "?")
-      + " bound, so no colour is drawn; <code>helm burn</code> reads them fresh</span>", rows: ""};
+      + " bound, so no colour is drawn until a fresh reading arrives</span>", rows: ""};
   const ov = sec.overall || {}, fams = sec.families || {};
   const head = '<b style="color:' + (FLAGCOL[ov.colour] || FLAGCOL.GREY) + '">'
     + esc(ov.colour === "GREY" ? "NOT MEASURED" : ov.colour || "?") + "</b> · "
     + (ov.family ? "tightest " + esc(ov.family) + " · " : "")
     + esc(flagWhen(ov.until)) + " · read " + esc(lrAgo(sec.age_s));
-  const rows = Object.keys(fams).sort().map(f => {
+  const keys = Object.keys(fams).sort();
+  const sel = FAM_SEL in fams ? FAM_SEL : ov.family in fams ? ov.family : keys[0];
+  const strip = '<div class="fstrip" role="list">' + keys.map(f => {
     const fl = fams[f] || {};
-    return '<div class="frow"><span style="color:' + (FLAGCOL[fl.colour] || FLAGCOL.GREY)
-      + ';font-weight:600">' + esc(fl.colour === "GREY" ? "not measured" : fl.colour) + "</span> "
-      + "<b>" + esc(f) + "</b>"
-      + (fl.provenance === "owner-declared" ? ' <span class="gmeta">DECLARED by the owner, not measured</span>' : "")
-      + (fl.provenance === "derived" ? ' <span class="gmeta">derived, not a direct reading</span>' : "")
-      + ' <span class="gmeta">' + esc(fl.axis || "no axis") + " · " + esc(flagWhen(fl.expires_at))
-      + '</span><div class="gmeta">' + esc(fl.cause || "") + "</div></div>";
-  }).join("");
-  return {head, rows};
+    return '<button type="button" role="listitem" class="fchip fpick' + (f === sel ? " on" : "")
+      + '" data-fam-sel="' + esc(f) + '" style="--fc:' + (FLAGCOL[fl.colour] || FLAGCOL.GREY) + '" title="'
+      + esc(f + " " + (fl.colour === "GREY" ? "not measured" : fl.colour || "?")
+        + (fl.provenance === "owner-declared" ? " · DECLARED by the owner, not measured" : "")
+        + (fl.provenance === "derived" ? " · derived, not a direct reading" : "")
+        + (fl.money_provenance === "certified-local" ? " · money CERTIFIED by the seat that runs the local hardware, not a vendor measurement" : "")
+        + " · " + (fl.axis || "no axis") + " · changes " + flagWhen(fl.expires_at)
+        + (fl.cause ? " — " + fl.cause : "")) + '"><i></i>' + esc(f) + "</button>";
+  }).join("") + "</div>";
+  return {head, rows: strip + famSheet(sel, fams[sel], d)};
 }
 
 /* ---------- the board ---------- */
@@ -203,9 +227,11 @@ function boardSecWord(sec) {
   if (st === "unread") return "not read yet";
   if (st === "unknown") return "UNKNOWN — " + sec.unavailable;
   if (st === "loading") return "still being read";
+  // with no clock it is stale because nothing measured when it was read,
+  // and no bound is claimed (review 3631, round 3)
   if (st === "stale")
-    return "STALE — read " + lrAgo(sec.age_s)
-      + (sec.limit_s ? ", past its " + lrDur(sec.limit_s) + " bound" : "");
+    return typeof sec.age_s !== "number" ? "STALE — age unknown, no reading time was measured"
+      : "STALE — read " + lrAgo(sec.age_s) + (sec.limit_s ? ", past its " + lrDur(sec.limit_s) + " bound" : "");
   return "read " + lrAgo(sec.age_s);
 }
 
@@ -222,13 +248,16 @@ function boardQuiet(j, d) {
    function the tests run. `shown` is every row the filter admits, folded or
    not: folding hides a row from the eye and from no count. A filter shows
    every match, quiet ones included, so a folded project is always findable. */
-function boardLayout(rows, d, q, retired) {
+function boardLayout(rows, d, q, retired, lit) {
   // a harness name finds the projects it has sessions in, as it always did
   const hit = p => !q || [p.name, p.path, ...Object.keys(p.sessions || {})].join(" ").toLowerCase().includes(q);
-  const shown = boardSort(rows.filter(p => (retired || !p.retired) && hit(p)));
+  // THE LIGHT FILTER (task/3445): one colour, or "unset" for nobody set it
+  const hue = p => !lit || (light(p).authored ? light(p).colour : "unset") === lit;
+  const shown = boardSort(rows.filter(p => (retired || !p.retired) && hit(p) && hue(p)));
   const quiet = p => boardQuiet(d && d.projects ? d.projects[pkey(p)] : undefined, d);
-  return {shown, lead: q ? shown : shown.filter(p => !quiet(p)),
-          quiet: q ? [] : shown.filter(quiet)};
+  const all = q || lit;
+  return {shown, lead: all ? shown : shown.filter(p => !quiet(p)),
+          quiet: all ? [] : shown.filter(quiet)};
 }
 
 /* THE CAPACITY LINE: two plain facts — "21 lanes running · 14 seats able to
@@ -246,7 +275,6 @@ function boardCapacity(d, active) {
     return '<span class="bcap bunk">board UNKNOWN</span> <span class="bmut">— ' + esc(d.unavailable) + "</span>";
   const head = d.headline || {}, lanes = head.lanes || {};
   const seats = boardSec(d, "seats"), sst = boardSecState(seats);
-  const flags = boardSec(d, "flags"), fst = boardSecState(flags);
   const read = sst === "ok" && typeof lanes.running === "number" && typeof lanes.possible === "number";
   const able = n => "<b>" + n + " seat" + (n === 1 ? "" : "s") + " able to work</b>";
   const lanesTxt = sst === "stale"
@@ -274,16 +302,11 @@ function boardCapacity(d, active) {
         + (typeof lanes.seats === "number" && lanes.seats
           ? ' <span class="bmut">(' + lanes.claimed + " claimed, " + lanes.seats + " seat"
             + (lanes.seats === 1 ? "" : "s") + " at work)</span>" : "");
-  // WHERE THE LANES ARE: each project's share, busiest first
-  const shares = !read ? [] : Object.keys(d.projects || {})
-    .map(k => [k, ((d.projects[k] || {}).running || []).length]).filter(x => x[1])
-    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
-    // claims on projects with no row still run: their share, so the shares add up
-    .concat(read && lanes.offboard ? [["other", lanes.offboard]] : []);
-  const alloc = shares.length
-    ? ' <span class="balloc">' + shares.slice(0, 8).map(x => esc(x[0]) + " " + x[1]).join(" · ")
-      + (shares.length > 8 ? " · +" + (shares.length - 8) + " more" : "") + "</span>"
-    : "";
+  // WHERE THE LANES ARE is each project's own line now (task/3445: every
+  // project listed once), so this line names only the lanes on NO project's
+  // line — claims on projects with no row — so the lines still add up
+  const alloc = read && lanes.offboard
+    ? ' <span class="balloc">' + lanes.offboard + " on no project's line</span>" : "";
   const loose = read && Array.isArray(lanes.unscoped) ? lanes.unscoped : [];
   const unscoped = loose.length
     ? ' <span class="bmut" title="' + esc(loose.join(", ") + " — at work in a directory no project"
@@ -297,56 +320,46 @@ function boardCapacity(d, active) {
   const act = typeof active === "number" ? " · " + active + " active" : "";
   const greenTxt = green === null ? '<span class="bunk">green UNKNOWN</span>' + act
     : "<b>" + green + " green" + act + "</b>";
-  const fams = (flags && flags.families) || {};
-  const chips = fst === "loading" ? '<span class="bmut">credit: still being read</span>'
-    : fst === "unknown" || !Object.keys(fams).length
-    ? '<span class="bmut">credit not measured' + (flags && flags.unavailable ? " — " + esc(flags.unavailable) : "") + "</span>"
-    : Object.keys(fams).sort().map(f => boardChip({family: f, colour: (fams[f] || {}).colour,
-        cause: (fams[f] || {}).cause}, fst)).join("");
+  // NO FAMILY CHIP (task/3445): supply is measured once for the whole fleet
+  // and drawn once, at the head of Fleet › credit; this line keeps its counts
   return '<a class="bcap" href="#roster" title="lanes running: live worktree lanes across every project, plus one for each usable seat at work with no lane claimed — a seat running subagents can hold several. seats able to work: up, not paused, not walled and on a family whose credit is not RED, one each. Tap for the seats.">'
-    + lanesTxt + "</a>" + alloc + unscoped + " · " + greenTxt + ' <span class="bfams">' + chips + "</span>";
+    + lanesTxt + "</a>" + alloc + unscoped + " · " + greenTxt;
 }
 
-/* ONE FAMILY CHIP: the family's name on its flag colour, the reason on hover.
-   `state` is the worst of the seats and flags sections; anything but "ok"
-   draws the chip without a colour, and a family the fold mints no flag for
-   says "no flag" rather than borrowing a colour. */
-function boardChip(c, state) {
-  const fam = c.family || "?";
-  const seats = (c.seats || []).length ? " · spent by " + c.seats.join(", ") : "";
-  if (state !== "ok")
-    return '<span class="fchip fstale" title="' + esc(fam + " — burn flags "
-      + (state === "stale" ? "STALE" : state === "unknown" ? "UNKNOWN" : "not read yet") + seats)
-      + '"><i></i>' + esc(fam) + "</span>";
-  if (!c.colour)
-    return '<span class="fchip fnone" title="' + esc(fam + " — no flag: the burn fold mints none for this family, so nothing measures what it can carry" + seats)
-      + '"><i></i>' + esc(fam) + "</span>";
-  const word = c.colour === "GREY" ? "not measured" : c.colour;
-  return '<span class="fchip" style="--fc:' + (FLAGCOL[c.colour] || FLAGCOL.GREY) + '" title="'
-    + esc(fam + " " + word + (c.cause ? " — " + c.cause : "") + seats) + '"><i></i>' + esc(fam) + "</span>";
+/* THE PROJECT'S TEAM, in its line (task/3445): "team v5 · 7/10 live" and
+   the share marks (`teamMini`) of a binding team, "team proposed · 2/3 live",
+   or "no team". The team itself is the project's Team tab; which families
+   its seats spend, and their colours, are there too. A teams leg not read
+   says so and never "no team". */
+function boardTeam(p, j, d) {
+  const st = boardSecState(boardSec(d, "teams"));
+  if (st !== "ok" && st !== "stale")
+    return '<span class="bteam bmut">' + (st === "unknown" ? "team ?" : "team reading…") + "</span>";
+  const t = j && j.team;
+  if (!t) return '<span class="bteam bmut">no team</span>';
+  const mem = ((teamCurrent(pkey(p), j) || {}).members || []).filter(m => !m.gone);
+  return '<span class="bteam"><span class="bteamv">' + (t.authored ? "team v" + esc(t.v) : "team proposed")
+    + " · " + mem.filter(m => m.state === "live").length + "/" + mem.length + " live</span>"
+    + (t.binding ? teamMini(p, j, d) : "") + "</span>";
 }
 
-function boardChips(j, d) {
-  const seats = boardSec(d, "seats"), sst = boardSecState(seats);
-  if (sst === "unread") return '<span class="bchips"></span>';
-  if (sst === "unknown" || sst === "loading")
-    return '<span class="bchips"><span class="fchip fstale" title="' + esc("seats " + boardSecWord(seats))
-      + '"><i></i>' + (sst === "loading" ? "seats reading…" : "seats ?") + "</span></span>";
-  const state = sst !== "ok" ? sst : boardSecState(boardSec(d, "flags"));
-  return '<span class="bchips">' + ((j && j.families) || []).map(c => boardChip(c, state)).join("") + "</span>";
+/* THE ONE COUNT a collapsed row carries (task/3643): its to-do and
+   under-way work, off the Work page's own read (`wkProjectCount` over
+   /api/work), so the row, its Work tab, the nav badge and Home count one set
+   of cards; "reading…" until it is read, "?" when it could not be, and
+   "at least" over a project whose work was not read. */
+function boardCount(key) {
+  return wkProjectCount(WORK && WORK.d, key);
 }
-
-/* THE ONE COUNT a collapsed row carries: open tasks. Zero only when the
-   backlog was read; "?" when it could not be, STALE past its bound. */
-function boardCount(j, d) {
-  const sec = boardSec(d, "tasks"), st = boardSecState(sec);
-  if (st !== "ok")
-    return '<span class="bcount bmut" title="' + esc("open tasks " + boardSecWord(sec)) + '">'
-      + (st === "stale" ? "STALE" : st === "unknown" ? "? open" : "reading…") + "</span>";
-  const t = (j && j.tasks) || {open: 0, in_progress: 0};
-  return '<span class="bcount" title="' + esc(t.open + " open task" + (t.open === 1 ? "" : "s")
-    + (t.in_progress ? ", " + t.in_progress + " in progress" : "") + " · helm task list · "
-    + boardSecWord(sec)) + '">' + t.open + " open</span>";
+/* THE COUNTS AND THE LAST LAND REDRAWN IN PLACE as the work read lands
+   (both read it), without redrawing a row a reader may be typing in. */
+function boardCountsPaint() {
+  document.querySelectorAll("#brows .brow[data-key]").forEach(row => {
+    const c = row.querySelector(".bline .bcount"), land = row.querySelector(".bline .bland");
+    if (c) c.outerHTML = boardCount(row.dataset.key);
+    const p = land && projects.find(x => pkey(x) === row.dataset.key);
+    if (p) land.innerHTML = boardLand(p, BOARD && BOARD.projects ? BOARD.projects[row.dataset.key] : undefined, BOARD);
+  });
 }
 
 /* ONE PROJECT'S RUNNING LANES and the seats working them, off the roster's
@@ -380,33 +393,39 @@ function boardLaneWord(r) {
   return r.kind === "seat" ? (r.seats || []).join(", ") + " at work, no lane claimed"
     : r.lane + " (" + (r.seats || []).join(", ") + ")"
       + (r.landed && r.landed.state === "landed" ? " — landed on main, lease still held"
-        + (r.dirty === true ? ", " + BOARD_DIRTY : "") : "");
+        + (r.dirty === true ? ", " + BOARD_DIRTY : "")
+        : r.on_gate ? " — on the gate" + (r.on_gate.label ? " (" + r.on_gate.label + ")" : "") : "");
 }
 
-/* A WEEK OF PROGRESS: lands on the project's own main (one first-parent
-   commit each), then the backlog's net arrow — tasks opened against tasks
-   closed. Down is good. -> {cell, line}; neither half draws a count it did
-   not read. */
+/* A WEEK OF PROGRESS: the commits on the project's own main (its
+   first-parent commits: a train's merge, a hand merge, a commit made on main
+   itself), then the backlog's net arrow — tasks opened against tasks closed.
+   Down is good. ONE WORD PER NOUN (console walk 4, P1 3): "land" is what
+   helm records, and a project that merges by hand has none, so this count
+   is "commits", never "lands". The trunk is named as the About's newest
+   commit names it (`last_land.ref`: main, master), so a project trunked on
+   master never reads "on main". -> {cell, line}; neither half draws a count
+   it did not read. */
 function boardProgress(j, d) {
   const trunk = boardSec(d, "trunk"), tst = boardSecState(trunk);
   const tasks = boardSec(d, "tasks"), kst = boardSecState(tasks);
-  const pg = (j && j.progress) || {};
-  const lands = tst === "ok" && typeof pg.lands7 === "number" ? pg.lands7 : null;
-  const landTxt = tst === "stale" ? "STALE" : tst === "unknown" ? "lands ?" : tst !== "ok" ? "reading…"
-    : lands === null ? "lands ?" : lands + " land" + (lands === 1 ? "" : "s");
+  const pg = (j && j.progress) || {}, ref = ((j && j.last_land) || {}).ref || "main";
+  const commits = tst === "ok" && typeof pg.lands7 === "number" ? pg.lands7 : null;
+  const commitTxt = tst === "stale" ? "STALE" : tst === "unknown" ? "commits ?" : tst !== "ok" ? "reading…"
+    : commits === null ? "commits ?" : commits + " commit" + (commits === 1 ? "" : "s");
   const flow = kst === "ok" && typeof pg.opened7 === "number" && typeof pg.closed7 === "number";
   const net = flow ? pg.opened7 - pg.closed7 : null;
   const arrow = net === null ? ""
     : ' · <span class="' + (net > 0 ? "bwarn" : "bgood") + '">'
       + (net > 0 ? "↑" + net : net < 0 ? "↓" + -net : "→0") + "</span>";
-  const landLine = lands !== null ? lands + " land" + (lands === 1 ? "" : "s") + " on main"
-    : "lands " + (tst !== "ok" ? boardSecWord(trunk) : "not read here");
+  const commitLine = commits !== null ? commits + " commit" + (commits === 1 ? "" : "s") + " on " + ref
+    : "commits on " + ref + " " + (tst !== "ok" ? boardSecWord(trunk) : "not read here");
   const taskLine = flow ? pg.opened7 + " opened, " + pg.closed7 + " closed — backlog "
       + (net > 0 ? "up " + net : net < 0 ? "down " + -net : "even")
     : "tasks " + boardSecWord(tasks);
-  return {cell: '<span title="the last seven days: lands on this project\'s main, and its tasks opened against closed">'
-      + esc(landTxt) + "</span>" + arrow,
-    line: "this week: " + landLine + " · " + taskLine};
+  return {cell: '<span title="the last seven days: the commits on this project\'s ' + esc(ref) + ', and its tasks opened against closed">'
+      + esc(commitTxt) + "</span>" + arrow,
+    line: "this week: " + commitLine + " · " + taskLine};
 }
 
 /* ONE REPOSITORY'S BADGE. A visibility gh answered links to the repository; an
@@ -456,329 +475,133 @@ function boardRepos(j, named) {
   return badges.join(" ");
 }
 
-/* WHICH KANBAN COLUMN each land-request state belongs in. A state this map
-   does not name is still in flight, so it reads as under review. A request
-   AWAITING_BUILD is building: nothing exists to review until its lane has a
-   tip of its own. */
-const KANBAN_OF = {OPEN: "review", AWAITING_REVIEW: "review", AWAITING_BUILD: "building",
-  REVIEWED: "review", CHANGES_REQUESTED: "building", READY: "gate", MERGED_LOCAL: "gate"};
-
-/* ONE COLLAPSED LINE, in the words every board surface draws it: the count,
-   what the rows are, how old the oldest is, and the command that lists every
-   one of them. The rows themselves are not drawn: they are not live
-   obligations, and the line keeps them one command away. */
-function boardFoldLine(c) {
-  return "<b>" + esc(c.count) + "</b> " + esc(c.label || "")
-    + (typeof c.oldest_age_s === "number" ? ", oldest " + esc(lrDur(c.oldest_age_s)) : "")
-    + " — <code>" + esc(c.command || "") + "</code> lists them";
-}
-
-/* ONE PROJECT'S KANBAN, as data: building, review, gate, landed. Building is
-   its running lanes (a seat at work with no claim is its own card, `@seat`),
-   the lanes ahead of trunk with nothing filed, and the requests sent back for
-   changes. The other three come from the land pipeline: the project this helm
-   serves from its own read, every other project from the all-projects read
-   that runs in the background. A column is an array when it was read, and
-   otherwise says why not — "loading" while that read is under way, "unknown"
-   when it failed, "stale" past its bound — never an empty list. A lane is
-   drawn in the furthest column it reached, so a lane under review is not also
-   drawn as building.
-
-   LANDED IS READ OFF THE WORK, NOT OFF THE PAPERWORK. A land releases no
-   lease and records no verdict for a row reviewed in chat, so two kinds of
-   card that their paperwork would draw as building or review belong in
-   landed: a claimed
-   lane whose own branch is on main (`running[].landed`, the verdict
-   `helm work list` prints) and a request whose work main already holds
-   with no verdict recorded (`lanes.on_main`, the rows `helm lr list` marks
-   ALREADY ON TRUNK). When the landed column itself could not be read,
-   each stays in the column it came from and says LANDED / ON MAIN there. A
-   lane drawn as landed is not also building unless its branch now carries
-   commits main does not have, or could not be read — either may be the next
-   round — or its room is DIRTY (`running[].dirty`, the flag `helm work list`
-   prints beside LANDED): uncommitted work is still in flight, so that lane
-   is drawn in BOTH columns and says so in each, exactly as the CLI prints
-   it and `helm lr foldcheck` keeps it rather than offering its release.
-
-   A REQUEST ON MAIN WITH NO VERDICT IS ONE COUNT LINE, not a card each
-   (task/2381): it is ledger debris nobody moves, and the owner read a column
-   of them as landed lanes. The SERVER decides which (`scheduler.collapse_
-   class`, the one call its waits make too) and counts them (`lanes.on_main`,
-   whose `lanes` stay placed, so a claim on one is not drawn building); the
-   page draws every card it is sent and never re-folds one — a card the
-   server kept listed (a row under a recorded verdict, an owner-gated hold)
-   is a live obligation whatever its containment mark says. Requests the
-   census placed off the live frontier come back as `collapsed` lines, drawn
-   under the columns. */
-function boardKanban(p, j, d) {
-  const lands = boardSec(d, "lands"), fleet = boardSec(d, "fleet");
-  // a scoped read still being read has not named its project yet; the
-  // all-projects read names the same one
-  const scope = (lands && lands.scope) || (fleet && fleet.scope), mine = !!scope && scope === pkey(p);
-  const src = mine ? lands : fleet, st = boardSecState(src);
-  const word = {unread: "loading", loading: "loading", unknown: "unknown", stale: "stale"}[st];
-  const read = st === "ok";
-  const ln = mine ? (j && j.lanes) || {} : {};
-  const pipe = mine ? {loops: ln.loops, landed: j && j.landed, on_main: ln.on_main,
-    collapsed: ln.collapsed} : (j && j.pipeline) || null;
-  const col = got => (!read ? word : pipe ? got : null);
-  const sst = boardSecState(boardSec(d, "seats")), running = sst === "ok";
-  const cols = {building: running || (read && pipe) ? []
-                  : sst === "loading" || st === "loading" ? "loading" : null,
-                review: col([]), gate: col([]),
-                landed: !read ? word : pipe ? (Array.isArray(pipe.landed) ? [] : "unknown") : null};
-  // a lane label with or without its `lane/` branch prefix is one lane
-  const key = s => String(s || "").replace(/^lane\//, "");
-  const run = running ? (j && j.running) || [] : [];
-  const placed = new Set(), fixing = [], onMain = [];
-  const sum = read && pipe && pipe.on_main && typeof pipe.on_main.count === "number"
-    ? {count: pipe.on_main.count, oldest: pipe.on_main.oldest_age_s,
-       label: pipe.on_main.label || "on main with no verdict recorded",
-       command: pipe.on_main.command || "helm lr list"}
-    : {count: 0, oldest: null, label: "on main with no verdict recorded", command: "helm lr list"};
-  const counted = new Set();                         // lanes the on-main line counts
-  if (read && pipe) {
-    ((pipe.on_main && pipe.on_main.lanes) || []).forEach(lane => { placed.add(lane); counted.add(key(lane)); });
-    if (Array.isArray(pipe.collapsed) && pipe.collapsed.length) cols.collapsed = pipe.collapsed;
-    (pipe.loops || []).forEach(c => {
-      const at = KANBAN_OF[c.state] || "review";
-      if (at === "building") fixing.push({lane: c.lane, note: c.state});
-      else if (!cols[at].some(r => r.lane === c.lane)) {     // one card per lane
-        cols[at].push({lane: c.lane, note: c.state});
-        placed.add(c.lane);
-      }
-    });
-    if (Array.isArray(pipe.landed)) cols.landed = pipe.landed.map(r => ({lane: r.lane,
-      note: [r.task, typeof r.age_s === "number" ? lrAgo(r.age_s) : ""].filter(Boolean).join(" · ")}));
-  }
-  const dirty = new Set();
-  run.forEach(r => {
-    if (r.kind === "seat" || !r.landed || r.landed.state !== "landed") return;
-    if (r.dirty === true) dirty.add(key(r.lane));
-    onMain.push({lane: r.lane, from: "building", note: "lease still held · " + (r.landed.proof || "landed")
-      + (r.dirty === true ? " · " + BOARD_DIRTY : "")});
-  });
-  // THE ON-MAIN LINE: one card, the count on it, placed where its cards were
-  const line = sum.count ? {lane: null, summary: sum.count,
-    note: sum.label + (typeof sum.oldest === "number" ? ", oldest " + lrDur(sum.oldest) : "")
-      + " — " + sum.command + " lists them"} : null;
-  if (Array.isArray(cols.landed)) {
-    // one entry per lane: a lane the on-main line already counts is not drawn
-    // again as a lease card beside it
-    const have = new Set(cols.landed.map(r => key(r.lane)).concat([...counted]));
-    // a lane its land request already drew as landed still says its room is dirty
-    cols.landed.forEach(r => { if (dirty.has(key(r.lane))) r.note = [r.note, BOARD_DIRTY].filter(Boolean).join(" · "); });
-    onMain.forEach(r => {
-      if (!have.has(key(r.lane))) { have.add(key(r.lane)); cols.landed.push({lane: r.lane, note: r.note}); }
-    });
-    if (line) cols.landed.push(line);
-    // the fleet-wide lands list is the newest few: none of them here is not
-    // "none landed"
-    if (!mine && !cols.landed.length && src.landed_partial) cols.landed = "partial";
-  } else {
-    onMain.forEach(r => {
-      const at = cols[r.from];
-      if (Array.isArray(at)) at.push({lane: r.lane, note: "LANDED, " + r.note});
-    });
-    if (line && Array.isArray(cols.review)) cols.review.push(Object.assign(line, {note: "ON MAIN, " + line.note}));
-  }
-  if (Array.isArray(cols.building)) {
-    const landed = new Set(Array.isArray(cols.landed)
-      ? cols.landed.filter(r => r.lane).map(r => key(r.lane)) : []);
-    // the cards an unread landed column left in building are already here
-    const seen = new Set(cols.building.map(r => r.lane).concat([...placed]));
-    const add = r => { if (!seen.has(r.lane)) { seen.add(r.lane); cols.building.push(r); } };
-    run.forEach(r => {
-      if (r.kind === "seat") return add({lane: "@" + (r.seats || [])[0], note: "at work, no lane claimed"});
-      const v = r.landed || {};
-      // drawn as landed by its own lease or its land request, and nothing
-      // since: no commits past main (unstarted), or no branch at all (gone).
-      // An unlanded or unread lease stays — it may be the next round — and
-      // so does a landed one whose room is dirty: that work is not on main.
-      if (landed.has(key(r.lane)) && !dirty.has(key(r.lane))
-          && ["landed", "unstarted", "gone"].indexOf(v.state) >= 0) return;
-      add({lane: r.lane, note: [(r.seats || []).join(", "),
-        dirty.has(key(r.lane)) ? "landed on main · " + BOARD_DIRTY : "",
-        v.state === "gone" ? "lease only — no room or branch under it" : ""].filter(Boolean).join(" · ")});
-    });
-    if (mine && read) (ln.building_lanes || []).forEach(lane => add({lane: lane, note: "ahead of main, nothing filed"}));
-    fixing.forEach(add);
-  }
-  return cols;
-}
-
-function boardKanbanHTML(kb) {
-  const said = {loading: '<div class="bkcard bmut">still being read</div>',
-                unknown: '<div class="bkcard bunk">UNKNOWN</div>',
-                stale: '<div class="bkcard bunk">STALE</div>',
-                partial: '<div class="bkcard bmut">none among the newest lands read</div>'};
-  const col = (name, rows) => '<div class="bkcol"><div class="bkhead">' + name
-    + (Array.isArray(rows) ? ' <span class="bmut">' + boardKanbanCount(rows) + "</span>" : "") + "</div>"
-    + (rows === null ? '<div class="bkcard bmut">not read here</div>'
-      : typeof rows === "string" ? said[rows] || said.unknown
-      : !rows.length ? '<div class="bkcard bmut">none</div>'
-      : rows.map(r => r.summary
-        ? '<div class="bkcard bksum"><b>' + esc(r.summary) + "</b> " + '<span class="bmut">' + esc(r.note) + "</span></div>"
-        : '<div class="bkcard"><b>' + esc(r.lane) + "</b>"
-          + (r.note ? ' <span class="bmut">' + esc(r.note) + "</span>" : "") + "</div>").join(""))
-    + "</div>";
-  const folds = Array.isArray(kb.collapsed) ? kb.collapsed : [];
-  return '<div class="bkb">' + col("building", kb.building) + col("review", kb.review)
-    + col("gate", kb.gate) + col("landed", kb.landed) + "</div>"
-    + folds.map(c => '<div class="bkfold bmut">' + boardFoldLine(c) + "</div>").join("");
-}
-
-/* HOW MANY REQUESTS A COLUMN HOLDS: a card is one, a count line is its count. */
-function boardKanbanCount(rows) {
-  return rows.reduce((n, r) => n + (typeof r.summary === "number" ? r.summary : 1), 0);
-}
-
-/* THE FLEET KANBAN: every project with anything in flight or landed, each as
-   its own four columns, busiest first — grouped by project, so nothing is
-   withheld and nothing is a count of rows somewhere else. The same data as
-   the rows' own kanbans, so the two cannot disagree. */
-function fleetKanbanHTML(rows, d) {
-  if (!d) return '<div class="fkline bmut">land requests not read yet</div>';
-  if (d.unavailable)
-    return '<div class="fkline"><span class="bunk">UNKNOWN</span> <span class="bmut">— ' + esc(d.unavailable) + "</span></div>";
-  const n = x => Array.isArray(x) ? boardKanbanCount(x) : 0;
-  const groups = rows.filter(p => !p.retired).map(p => {
-    const kb = boardKanban(p, d.projects ? d.projects[pkey(p)] : undefined, d);
-    return {p, kb, moving: n(kb.building) + n(kb.review) + n(kb.gate), landed: n(kb.landed)};
-  }).filter(g => g.moving || g.landed)
-    .sort((a, b) => b.moving - a.moving || b.landed - a.landed
-      || String(a.p.name || "").localeCompare(String(b.p.name || "")));
-  const fleet = boardSec(d, "fleet"), fst = boardSecState(fleet);
-  const line = fst === "ok"
-    ? '<span class="bmut">every project, grouped · other projects\' land requests ' + esc(boardSecWord(fleet)) + "</span>"
-    : fst === "unknown"
-      ? '<span class="bunk">other projects UNKNOWN</span> <span class="bmut">— ' + esc(fleet.unavailable) + "</span>"
-      : fst === "stale"
-        ? '<span class="bunk">other projects STALE</span> <span class="bmut">— ' + esc(boardSecWord(fleet)) + "</span>"
-        : '<span class="bmut">other projects\' land requests: still being read</span>';
-  return '<div class="fkline">' + line + "</div>"
-    + groups.map(g => '<div class="fkgroup"><div class="fkhead"><b>' + esc(g.p.name) + "</b>"
-      + ' <span class="bmut">' + g.moving + " in flight" + (g.landed ? " · " + g.landed + " landed lately" : "")
-      + "</span></div>"
-      + boardKanbanHTML(g.kb) + "</div>").join("");
-}
-
-/* THE DESKTOP CELLS: running lanes, the week's progress, the last land, the
-   last activity, the repositories. The last land is read off each project's
-   own trunk, so every row has one to say. */
-function boardWide(p, j, d) {
+/* THE LAST LAND CELL. ONE LANDED TIME (walk 2, finding 17): the project
+   that lands by train says "landed" at its newest train's push time, the
+   time the Work page's Landed column and every card's land proof print
+   (`/api/work`); a project that merges by hand has no land record, so its
+   cell says "merged" at its trunk's newest commit, never "landed". The
+   train's project never falls through to "merged by hand": with no train
+   in the day's window it is its last DONE train, else "no land in 24 h". */
+function boardLand(p, j, d) {
   const trunk = boardSec(d, "trunk"), tst = boardSecState(trunk), last = j && j.last_land;
-  const land = tst !== "ok"
+  const trains = WORK && WORK.d && WORK.d.trains, mine = !!trains && trains.project === pkey(p);
+  const tl = mine && trains.last, pushed = mine && ((trains.recent || [])[0]
+    || (tl && tl.state === "DONE" && tl.at ? tl : null));
+  if (mine && !(pushed && pushed.at)) return '<span class="bmut" title="no train landed in the last 24 h">no land in 24 h</span>';
+  const land = pushed && pushed.at
+    ? '<span title="' + esc(pushed.name + (pushed.land ? " · LAND " + pushed.land : "") + " · pushed to the shared code") + '">landed '
+      + esc(lrAgo(Math.max(0, Date.now() / 1e3 - pushed.at))) + "</span>"
+    : tst !== "ok"
     ? '<span class="' + (tst === "stale" || tst === "unknown" ? "bunk" : "bmut") + '" title="'
       + esc("last land " + boardSecWord(trunk)) + '">'
       + (tst === "stale" ? "STALE" : tst === "unknown" ? "land ?" : "reading…") + "</span>"
     : last && typeof last.age_s === "number"
       ? '<span title="' + esc("newest on " + (last.ref || "main") + ": " + (last.sha || "?")
-        + (last.how === "push" ? " · pushed from this checkout" : " · its commit time")) + '">landed '
+        + (last.how === "push" ? " · pushed from this checkout" : " · its commit time")
+        + " · merged by hand, so helm records no land") + '">merged '
         + esc(lrAgo(last.age_s)) + "</span>"
       : '<span class="bmut" title="' + esc((last && last.unavailable) || "no trunk was read for this project")
         + '">not read here</span>';
+  return land;
+}
+/* THE DESKTOP CELLS: running lanes, the last land (`boardLand`), the last
+   activity, the repositories. The week's progress is the project's About
+   tab. */
+function boardWide(p, j, d) {
   /* THE NEWER OF TWO READINGS: the registry's last session, which is only as
      fresh as the last `helm sync`, and the newest beat of a seat on the
      project, which the roster reads live. */
   const at = Math.max(p.last_seen || 0, (j && j.active_at) || 0);
   return '<span class="bwide bwork">' + boardLanes(j, d) + "</span>"
-    + '<span class="bwide bprog">' + boardProgress(j, d).cell + "</span>"
-    + '<span class="bwide bland">' + land + "</span>"
+    + '<span class="bwide bland">' + boardLand(p, j, d) + "</span>"
     + '<span class="bwide bact" title="the newest activity seen here: a seat\'s last beat, or the newest session the registry recorded">'
     + (at ? "active " + esc(ago(at)) : "no activity seen") + "</span>"
     + '<span class="bwide brepo">' + boardRepos(j, false) + "</span>";
 }
 
-/* WHAT WAITS, on the project the land pipeline projects: its LIVE
-   obligations grouped by who holds the next move, then one line per class of
-   what is not listed (task/2381) — rows left over after landing, rows helm
-   cannot place, rows a later round absorbed — each with its count, its
-   oldest age and the command that lists every one. An older server sends no
-   lines, and the section then reads exactly as it did. */
-function boardWaits(p, j, d) {
-  const line = t => "<div class='dline'>" + esc(t) + "</div>";
-  const lands = boardSec(d, "lands"), scope = lands && lands.scope;
-  if (boardSecState(lands) !== "ok") return line("land pipeline " + boardSecWord(lands));
-  if (scope !== pkey(p)) return line("not read here: the land pipeline projects " + scope + " only");
-  const groups = (j && j.waits) || [], folds = (j && j.waits_collapsed) || [];
-  if (!groups.length && !folds.length) return line("nothing is waiting");
-  return (groups.length
-    ? groups.map(g => "<div class='dline'><b>" + esc(g.label) + "</b> · " + esc(g.count)
-        + " waiting · oldest " + esc(lrAgo(g.oldest_age_s)) + "</div>"
-        + (g.rows || []).map(r => line("  " + (r.plain_title || "?") + " · " + (r.stage_class || "?")
-          + " · " + lrAgo(r.age_s))).join("")).join("")
-    : line("no live obligation is waiting"))
-    + folds.map(c => "<div class='dline bfold'>" + boardFoldLine(c) + "</div>").join("");
+/* AN OPEN PROJECT IS TABS, one at a time (task/3445), so an open project is
+   at most a screen: TEAM (the light setter, then the team — `teamParts`),
+   WORK (the Work page locked to this project, task/3643: its Lanes and Tasks
+   tabs were its share of the land board and of the backlog, and they are one
+   page now) and ABOUT (its week, its repositories, what is on file). An old
+   `tab=lanes` or `tab=tasks` address opens WORK at the pipeline or the
+   backlog (`projRoute`). `tab` is PROJ_TAB. */
+const PROJ_TABS = [["team", "Team"], ["work", "Work"], ["about", "About"]];
+/* -> {tabs, body}: the tab strip rides the open row's sticky head with its
+   name (task/3475), and the body scrolls under them. */
+function boardDetail(p, j, d, tab) {
+  const on = PROJ_TABS.some(t => t[0] === tab) ? tab : "team";
+  return {tabs: '<div class="ptabs" role="tablist" aria-label="' + esc(p.name) + '">'
+    + PROJ_TABS.map(t => '<button type="button" role="tab" class="ptab' + (t[0] === on ? " on" : "")
+      + '" aria-selected="' + (t[0] === on) + '" data-ptab="' + t[0] + '">' + t[1] + "</button>").join("")
+    + "</div>",
+    body: '<div class="ptabbody" data-tab="' + on + '">' + projTab(p, j, d, on) + "</div>"};
 }
 
-/* THE OPEN ROW: the setter, then what burns, what is open, who is seated,
-   what waits, and what is on file. */
-function boardDetail(p, j, d) {
+/* ONE TAB'S BODY. */
+function projTab(p, j, d, tab) {
   const line = t => "<div class='dline'>" + esc(t) + "</div>";
   const sec = (h, body) => "<div class='dsec'><h4>" + esc(h) + "</h4>" + body + "</div>";
-  const flags = boardSec(d, "flags"), fst = boardSecState(flags);
-  const seats = boardSec(d, "seats"), sst = boardSecState(seats);
-  const tasks = boardSec(d, "tasks"), tst = boardSecState(tasks);
-  const fams = (j && j.families) || [];
-  const burn = sst !== "ok" ? line("seats " + boardSecWord(seats))
-    : !fams.length ? line("no seat of this project is spending right now")
-    : fams.map(c => {
-      const who = (c.seats || []).join(", ");
-      if (fst !== "ok") return line(c.family + ": burn flags " + boardSecWord(flags) + " · " + who);
-      if (!c.colour) return line(c.family + ": no burn flag — the fold mints none for this family · " + who);
-      const fl = (flags.families || {})[c.family] || {};
-      return "<div class='dline'><b style='color:" + (FLAGCOL[c.colour] || FLAGCOL.GREY) + "'>"
-        + esc(c.colour === "GREY" ? "not measured" : c.colour) + "</b> " + esc(c.family)
-        + " — " + esc(c.cause || "no cause recorded") + " · changes " + esc(flagWhen(fl.expires_at))
-        + " · " + esc(who) + "</div>";
-    }).join("");
-  const t = (j && j.tasks) || {open: 0, top: []};
-  const todo = tst !== "ok" ? line("tasks " + boardSecWord(tasks))
-    : !t.open ? line("no open tasks")
-    : (t.top || []).map(r => "<div class='dline'><b>" + esc(r.id) + "</b> "
-        + (r.priority ? esc(r.priority) + " · " : "") + esc(r.title)
-        + (r.status === "in_progress" ? " <span class='bmut'>· in progress</span>" : "") + "</div>").join("")
-      + (t.open > (t.top || []).length
-        ? "<div class='dline'>+" + (t.open - t.top.length) + " more in the task backlog below</div>" : "");
-  const people = sst !== "ok" ? line("seats " + boardSecWord(seats))
-    : !((j && j.seats) || []).length ? line("nobody is seated on this project")
-    : j.seats.map(s => "<div class='dline'><span class='rdot " + esc(s.presence || "absent") + "'>●</span> <b>"
-        + esc(s.seat) + "</b> · " + esc(s.family || "family unknown") + " · " + esc(s.presence || "?") + "</div>").join("");
-  const waits = boardWaits(p, j, d);
-  const run = (j && j.running) || [];
-  const lanes = sst !== "ok" ? line("lanes " + boardSecWord(seats))
-    : !run.length ? line("no lane is running here")
-    : run.map(r => line(boardLaneWord(r))).join("");
+  if (tab === "team") return lightset(p) + teamSection(p, j, d);
+  if (tab === "work") {
+    wkProjFor(pkey(p));
+    // a card already open (a deep link, or a tab opened again) asks for its
+    // crossings once the tab is in the page: wkHTML is pure and reads none
+    if (WK.proj.view.card && !(WK.proj.ev && WK.proj.ev.key === WK.proj.view.card)) setTimeout(() => wkPaint(WK.proj), 0);
+    return wkHTML(WK.proj);
+  }
   const trunk = boardSec(d, "trunk"), last = j && j.last_land;
-  const landLine = boardSecState(trunk) !== "ok" ? line("last land " + boardSecWord(trunk))
+  const landLine = boardSecState(trunk) !== "ok" ? line("newest on main " + boardSecWord(trunk))
     : last && typeof last.age_s === "number"
-      ? line("last land on " + (last.ref || "main") + " " + (last.sha || "?") + ", " + lrAgo(last.age_s)
+      ? line("newest commit on " + (last.ref || "main") + " " + (last.sha || "?") + ", " + lrAgo(last.age_s)
         + (last.how === "push" ? " (pushed from this checkout)" : " (its commit time)"))
-      : line("last land not read here: " + ((last && last.unavailable) || "no trunk was read"));
-  const file = landLine + (lineageN(p) ? "<span class='lchip'>⑂ lineage</span>" : "")
-    + "<div class='ppath copy' data-copy='" + esc(p.path || "") + "' title='click to copy'>" + esc(p.path || "") + "</div>";
-  return lightset(p) + "<div class='dsec dkb'><h4>kanban</h4>" + boardKanbanHTML(boardKanban(p, j, d)) + "</div>"
-    + sec("open tasks", todo) + sec("waits", waits) + sec("lanes", lanes)
-    + sec("progress", line(boardProgress(j, d).line))
+      : line("newest commit not read here: " + ((last && last.unavailable) || "no trunk was read"));
+  return sec("progress", line(boardProgress(j, d).line))
     + sec("repos", "<div class='dline'>" + boardRepos(j, true) + "</div>")
-    + sec("burn", burn) + sec("seats", people)
-    + sec("on file", file) + "<div class='dwrap'>" + detailPane(p) + "</div>";
+    + sec("on file", landLine + (lineageN(p) ? "<span class='lchip'>⑂ lineage</span>" : "")
+      + "<div class='ppath copy' data-copy='" + esc(p.path || "") + "' title='click to copy'>" + esc(p.path || "") + "</div>")
+    + "<div class='dwrap'>" + detailPane(p) + "</div>";
 }
 
-function boardRowHTML(p, d, open) {
+/* ONE PROJECT, ONCE (task/3445): its line — light, name, team, tasks, and
+   on a desktop its lanes, last land, activity and repositories — and, open,
+   its tabs. `tab` is the open tab (PROJ_TAB). AN OPEN PROJECT'S LINE AND
+   TABS STICK BELOW THE NAVIGATION (task/3475): the helm project's Team tab
+   is 4,443 px tall at 1440 px and 6,426 at 420, and its name and tab strip
+   scrolled away with it; `.bstick` holds both while the body scrolls. */
+function boardRowHTML(p, d, open, tab) {
   const lit = light(p), key = pkey(p);
   const j = d && d.projects ? d.projects[key] : undefined;
-  return '<article class="brow ' + (lit.authored ? esc(lit.colour) : "unset") + (open ? " open" : "")
-    + '" data-key="' + esc(key) + '">'
-    + '<div class="bline">'
+  const line = '<div class="bline">'
     + '<button type="button" class="blight" title="' + esc(lit.colour + " · " + lit.why + " — tap to set")
     + '"><span class="' + esc("dot " + lit.colour + (lit.authored ? " authored" : "")) + '"></span></button>'
     + '<span class="bname">' + esc(p.name) + "</span>"
-    + boardChips(j, d) + boardCount(j, d) + boardWide(p, j, d)
-    + "</div>"
-    + (open ? '<div class="bdetail">' + boardDetail(p, j, d) + "</div>" : "")
+    + boardTeam(p, j, d) + boardCount(key) + boardWide(p, j, d)
+    + "</div>";
+  const det = open ? boardDetail(p, j, d, tab) : null;
+  return '<article class="brow ' + (lit.authored ? esc(lit.colour) : "unset") + (open ? " open" : "")
+    + '" data-key="' + esc(key) + '">'
+    + (det ? '<div class="bstick">' + line + det.tabs + "</div>"
+      + '<div class="bdetail">' + det.body + "</div>" : line)
     + "</article>";
+}
+
+/* THE OPEN ROW'S STICKY HEAD HEIGHT as --bstickh, so a target inside the row
+   (the Work tab's band and drawer) clears the head as well as the nav; 0
+   with no row open. */
+function publishStickHeight() {
+  const s = document.querySelector("#brows .brow.open>.bstick");
+  const h = s ? Math.round(s.getBoundingClientRect().height) : 0;
+  document.documentElement.style.setProperty("--bstickh", h + "px");
+  return h;
+}
+window.addEventListener("resize", () => publishStickHeight());
+
+/* MAY A REDRAW LAND WORK'S OPEN PROJECT AGAIN? Only while Work is shown and
+   the window is exactly where Work's last landing put it: a reader who has
+   scrolled since is never moved. PURE. */
+function boardLandAgain(cur, at, scrollY) {
+  return cur === "work" && !!at && at.v === "work" && Math.round(scrollY || 0) === at.y;
 }
 
 /* "N active" on the lanes line: the projects the scan calls active (its own
@@ -795,13 +618,24 @@ function renderBoard() {
   if (!host) return;
   const q = $("#q").value.trim().toLowerCase();
   const d = BOARD;
-  const lay = boardLayout(projects, d, q, showRetired);
+  const lay = boardLayout(projects, d, q, showRetired, PROJ_LIGHT);
   const vis = lay.shown;
-  const row = p => boardRowHTML(p, d, BOARD_OPEN.has(pkey(p)));
+  const row = p => boardRowHTML(p, d, BOARD_OPEN.has(pkey(p)), PROJ_TAB);
+  /* AN OPEN WORK TAB SURVIVES THE MINUTE'S REDRAW: its drawer, its menus,
+     a comment being written and the search caret are the reader's, so the
+     live component moves into the redrawn row rather than being drawn again
+     from its read. */
+  const tasks = host.querySelector('.wk[data-wk="proj"]'), typing = document.activeElement;
+  const tasksKey = tasks && tasks.closest(".brow") ? tasks.closest(".brow").dataset.key : null;
   host.innerHTML = lay.lead.map(row).join("")
     + (lay.quiet.length ? '<details class="bfold"' + (BOARD_FOLD ? " open" : "")
       + ' title="no activity, no open task and no light set in thirty days"><summary>'
       + "quiet (" + lay.quiet.length + ")</summary>" + lay.quiet.map(row).join("") + "</details>" : "");
+  const redrawn = host.querySelector('.wk[data-wk="proj"]');
+  if (tasks && redrawn && redrawn.closest(".brow").dataset.key === tasksKey) {
+    redrawn.replaceWith(tasks);
+    if (typing && tasks.contains(typing) && typing.focus) typing.focus();
+  }
   const fold = host.querySelector(".bfold");
   if (fold) fold.addEventListener("toggle", () => { BOARD_FOLD = fold.open; });
   const retired = projects.filter(p => p.retired).length;
@@ -810,11 +644,22 @@ function renderBoard() {
   $("#count").textContent = vis.length === projects.length ? vis.length + " projects" : vis.length + " of " + projects.length;
   $("#empty").classList.toggle("show", !projects.length);
   $("#bheadline").innerHTML = boardCapacity(d, boardActive(projects));
-  const fk = $("#fleetkb");
-  if (fk) fk.innerHTML = fleetKanbanHTML(projects, d);
-  const f = flagsHTML(boardSec(d, "flags"));
-  $("#flagoverall").innerHTML = f.head;
-  $("#flagrows").innerHTML = f.rows;
+  famRender();
+  // the accounts table's group headers name the families each vendor serves
+  if ($("#view-quota").classList.contains("on")) renderAccts();
+  // THE OPEN PROJECT'S ABOUT TAB asks the detail door for what is on file
+  const open = [...BOARD_OPEN][0], orow = open && host.querySelector('.brow[data-key="' + CSS.escape(open) + '"]');
+  const op = open && projects.find(x => pkey(x) === open);
+  if (orow && op && PROJ_TAB === "about") loadDetail(orow, op);
+  publishStickHeight();
+  // A LINK TO AN OPEN PROJECT LANDS ON IT (task/3475): #work/projects?open=
+  // helm&tab=team landed at scrollY 0 with the project 1,720 px down,
+  // because its row is drawn by a read that arrives after the page is shown.
+  // The row lands when it is drawn, and again as the page above it grows,
+  // for as long as the window is where the last landing left it.
+  if (orow && boardLandAgain(showView.cur, goTarget.at, window.scrollY)) goTarget("work", orow);
+  projHash();
+  homeRender();
 }
 
 /* Open or close one row in place. A tap on the light always opens, and puts
@@ -826,17 +671,121 @@ function boardToggle(row, atLight) {
   const p = projects.find(x => pkey(x) === key);
   if (!p) return;
   const open = atLight || !BOARD_OPEN.has(key);
-  if (open) BOARD_OPEN.add(key); else BOARD_OPEN.delete(key);
-  row.outerHTML = boardRowHTML(p, BOARD, open);
+  // ONE PROJECT OPEN AT A TIME (task/3445), and the URL holds it; a tap on
+  // the light opens it at the Team tab, where the setter is
+  const other = [...BOARD_OPEN].some(k => k !== key);
+  BOARD_OPEN.clear();
+  if (open) BOARD_OPEN.add(key);
+  if (atLight) PROJ_TAB = "team";
+  if (other) renderBoard();
+  else row.outerHTML = boardRowHTML(p, BOARD, open, PROJ_TAB);
+  // the in-place swap opens or closes a sticky head: publish it now, or a
+  // pager scrolled inside this row still clears a head of 0 (P2-3)
+  publishStickHeight();
+  projHash();
   const fresh = document.querySelector('.brow[data-key="' + CSS.escape(key) + '"]');
   if (!open || !fresh) return;
-  loadDetail(fresh, p);
+  if (other) fresh.scrollIntoView({block: "nearest"});
+  if (PROJ_TAB === "about") loadDetail(fresh, p);
   if (atLight) {
     const why = fresh.querySelector(".lightwhy");
     if (why) why.focus();
   }
 }
 
+/* THE PROJECTS SECTION'S STATE IN THE URL (task/3445):
+   #work/projects?q=&light=&open=helm&tab=team, so a link opens a project at
+   a tab. `projQuery` writes it from the page, `projRoute` reads it back. */
+let PROJ_TAB = "team";
+let PROJ_LIGHT = "";
+const PROJ_LIGHTS = ["green", "yellow", "orange", "red", "unset"];
+function projQuery() {
+  const s = new URLSearchParams(), q = (($("#q") || {}).value || "").trim(), open = [...BOARD_OPEN][0];
+  if (q) s.set("q", q);
+  if (PROJ_LIGHT) s.set("light", PROJ_LIGHT);
+  if (open) { s.set("open", open); s.set("tab", PROJ_TAB); }
+  // AN OPEN WORK TAB'S VIEW rides along, its search as `wq` (this page's
+  // `q` is the project filter's) and its drawer as `card`
+  if (open && PROJ_TAB === "work" && WK.proj.key === open)
+    new URLSearchParams(wkQuery(WK.proj.view, "flow", WK.proj.lock, "wq").slice(1)).forEach((v, k) => s.set(k, v));
+  const t = s.toString().replace(/%2C/g, ",");
+  return t ? "?" + t : "";
+}
+function projRoute(query) {
+  const s = new URLSearchParams(query || ""), tab = s.get("tab");
+  if ($("#q")) $("#q").value = s.get("q") || "";
+  PROJ_LIGHT = PROJ_LIGHTS.indexOf(s.get("light")) >= 0 ? s.get("light") : "";
+  if ($("#lightf")) $("#lightf").value = PROJ_LIGHT;
+  BOARD_OPEN.clear();
+  if (s.get("open")) BOARD_OPEN.add(s.get("open"));
+  // THE OLD LANES AND TASKS TABS open the Work tab at the pipeline and at
+  // the backlog (task/3643)
+  const old = {lanes: WK_ENTRY.pipeline, tasks: Object.assign({}, WK_ENTRY.backlog, {q: s.get("tq") || ""})}[tab];
+  PROJ_TAB = old ? "work" : PROJ_TABS.some(t => t[0] === tab) ? tab : "team";
+  if (s.get("open") && PROJ_TAB === "work") wkProjFor(s.get("open"), Object.assign(wkParse(query, "wq"), old || {}));
+  renderBoard();
+}
+function projHash() {
+  viewHashSync("work");
+}
+/* THE FAMILY CREDIT'S OWN STATE after its "?" (task/3445): the family its
+   sheet shows (#quota?family=grok). A query names what it names and nothing
+   else; an unknown or empty one is the page's default. */
+function famQuery() {
+  return FAM_SEL ? "?" + new URLSearchParams({family: FAM_SEL}).toString() : "";
+}
+function famRoute(query) {
+  FAM_SEL = new URLSearchParams(query || "").get("family") || null;
+  famRender();
+  // A FAMILY LINK LANDS ON ITS CARD, below the sticky nav, however far down
+  // the page it was followed from was scrolled (after the page is shown)
+  if (FAM_SEL) setTimeout(() => { const c = $("#flagcard"); if (c) c.scrollIntoView({block: "start"}); }, 0);
+}
+/* ONE READER AND ONE ROUTER over every view's query, so showView, the boot
+   and a followed link all hand a view the same state (Fleet › models' model
+   or seat, #models?model= and #models?seat=, is task/3448's). */
+function viewQuery(v) {
+  return v === "work" ? projQuery() : pageOf(v) === "flow" ? wkQuery(WK.main.view, v, null, "q")
+    : v === "quota" ? famQuery() : v === "models" ? modelsQuery() : "";
+}
+function viewRoute(v, query) {
+  if (pageOf(v) === "flow") wkRoute(v, query);
+  else if (v === "work") projRoute(query);
+  else if (v === "quota") famRoute(query);
+  else if (v === "models") modelsRoute(query);
+}
+/* the address bar follows a pick made on the page, while that page is shown */
+function viewHashSync(v) {
+  if (showView.cur !== v) return;
+  const h = "#" + viewHash(v) + viewQuery(v);
+  if (location.hash !== h) history.replaceState(null, "", h);
+}
+
+/* A TAB PICKED on the open project. The strip sticks, so a pick made deep
+   inside a long tab swaps the body under a window that stays there: whether
+   the row's top was under the nav is read BEFORE the swap, and then the
+   fresh row lands, its new tab starting just below the head (task/3475). */
+function projTabSwap(t) {
+  const row = t.closest(".brow"), key = row && row.dataset.key;
+  const p = key && projects.find(x => pkey(x) === key);
+  if (!p) return;
+  const stuck = row.getBoundingClientRect().top < (publishNavHeight() || 0);
+  PROJ_TAB = t.dataset.ptab;
+  row.outerHTML = boardRowHTML(p, BOARD, true, PROJ_TAB);
+  projHash();
+  const fresh = document.querySelector('.brow[data-key="' + CSS.escape(key) + '"]');
+  if (fresh && PROJ_TAB === "about") loadDetail(fresh, p);
+  publishStickHeight();
+  if (fresh && stuck) goTarget("work", fresh);
+}
+
+/* A TAB of the open project. (A Work tab's controls are the Work page's own,
+   wired in 52-work.) */
+document.addEventListener("click", ev => {
+  const t = ev.target.closest("[data-ptab]");
+  if (t) projTabSwap(t);
+});
+$("#lightf").addEventListener("change", ev => { PROJ_LIGHT = ev.target.value; renderBoard(); });
 /* WHEN TO ASK AGAIN, in ms, or null: soon while any section is still being
    read, backing off from BOARD_RETRY_MS, and never once the wait would reach
    the minute's own read. */
@@ -846,9 +795,13 @@ function boardRetryMs(d, tries) {
   return Object.keys(secs).some(k => secs[k] && secs[k].loading) && wait < BOARD_POLL_MS ? wait : null;
 }
 
-/* is the Work page on screen: both the minute's read and the quick one ask */
+/* is a page that draws the board on screen — Work's projects, Home, or
+   Fleet › credit's Families card: the quick read asks only then, and the
+   minute's read runs on any page (the work reader reads the board) */
 function boardShown() {
-  return $("#view-work").classList.contains("on") && !document.hidden;
+  return ($("#view-work").classList.contains("on")
+    || $("#view-home").classList.contains("on")
+    || $("#view-quota").classList.contains("on")) && !document.hidden;
 }
 
 /* A failed read is drawn as UNKNOWN, never as the last board: the sections'
@@ -875,4 +828,7 @@ async function boardReload() {
 loadBoard();
 setInterval(() => {
   if (boardShown()) boardReload();
+  // THE WORK READER READS THE BOARD (task/3643), and the nav badge it feeds
+  // has to reach him from any page: the minute's read runs on every page
+  else if (!document.hidden) loadBoard();
 }, BOARD_POLL_MS);

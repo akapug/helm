@@ -168,9 +168,30 @@ stays and its TRIAGE row names the lane, tip, age and git committer identity (sh
 costs a sidebar row; false-dead destroys work. There is no patch-id guess and no
 force-delete path.
 
+Ancestry is necessary and not sufficient. A branch minted at the trunk is an
+ancestor of it before its first commit, exactly as a merged lane is, so a
+room whose branch never carried a commit of its own (its reflog says so, or
+cannot say otherwise) is UNSTARTED: it is kept while its HEAD reflog says the
+room moved inside the last 24 hours, or when that age cannot be read, and
+retires as an abandoned claim after that. A commit of the branch's own is
+read from its own reflog, or from the room's HEAD reflog since the room last
+checked that branch out: in a REUSED room, a commit the room wrote under an
+earlier branch never makes a new branch at the trunk read as landed, and can
+only keep the room. Nothing retires while a commit the
+branch's reflog or the room's HEAD reflog records the lane writing, and that no
+ref holds, is off the trunk: every such commit is judged (one reset away, one
+made on a detached HEAD before a checkout back, one a reflog still names after
+its creation line expired), because removing the room and deleting the branch
+delete the only records of it. A reflog git answers as empty but whose file it
+could not read whole keeps the room.
+
 The full removal proof is re-read at enact time: no live lease, no meaningful
 cwd occupant, **no Orca pane bound to the room**, no out-of-band lock, attached
-branch unchanged since scan, clean working tree, and branch still landed. Dirty
+branch unchanged since scan, clean working tree, branch still landed, and an
+unstarted room still past its grace. The last read before `git worktree
+remove` compares the room's HEAD and HEAD reflog with a reading taken before
+those checks, and a room that moved in between is SKIPPED; what remains is the
+one spawn between that read and git deleting the directory. Dirty
 rooms are rescue-committed to their own branch and then **kept**, because the
 rescue commit itself is unlanded. Detached or mid-operation rooms remain
 manual-only.

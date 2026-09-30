@@ -15,6 +15,12 @@ WHAT THESE PIN, one class per claim the module makes:
            and DOWN ("use it") when it is long and an account will strand —
            never to RED on a projection, never to GREEN past an unread
            account;
+  CREDITS  each held reset credit valued by the reset clock: a Pro one on
+           the horizon account adds nothing before the horizon, one on an
+           account resetting past it counts a fresh week, a Team one counts
+           its week wherever its reset lies (a workspace credits-depleted
+           wall included), and an unknown weight or balance is UNKNOWN,
+           never 0;
   WALL     one chat line and one phone push per wall, never twice, with a
            failed channel retried alone.
 
@@ -44,9 +50,11 @@ WEEK = 7 * 86400
 
 
 def brow(email, pct, reset_at, plan="pro", account_id=None, user_id="user",
-         file=None, five=12.0, state=None):
+         file=None, five=12.0, state=None, credits=0, reached=None):
     """One budget row in `codexbudget.probe_record`'s shape. `pct` None is an
-    account the probe could not read."""
+    account the probe could not read. `credits` is the HELD reset-credit
+    count the usage body carried (None: the body carried no balance), and
+    `reached` the vendor's reached-type."""
     account_id = account_id or "acct-" + email.split("@")[0]
     user_id = None if user_id is None else user_id + "-" + email.split("@")[0]
     file = file or "codex-%s.json" % email.split("@")[0]
@@ -63,7 +71,9 @@ def brow(email, pct, reset_at, plan="pro", account_id=None, user_id="user",
             "plan": plan, "file": file, "files": [file],
             "state": state or ("exhausted" if pct >= 100 else "ok"),
             "status": "blocked" if pct >= 100 else "allowed",
-            "reached_type": None, "longest_pct": pct, "windows": windows}
+            "reached_type": reached, "longest_pct": pct, "windows": windows,
+            "reset_credits": (None if credits is None else
+                              {"available": credits, "applicable": 0})}
 
 
 def event(email, at, tokens, seat="seat-a", family="codex"):
@@ -91,7 +101,9 @@ def world(specs, now=NOW, hours=6.0, step=900.0):
                              plan=s.get("plan", "pro"),
                              account_id=s.get("account_id"),
                              user_id=s.get("user_id", "user"),
-                             file=s.get("file")))
+                             file=s.get("file"),
+                             credits=s.get("credits", 0),
+                             reached=s.get("reached")))
         lines.append(codexpace.history_line(rows, t))
         t += step
     tick = 300.0
@@ -363,6 +375,220 @@ class RunwayTest(unittest.TestCase):
         self.assertEqual(reading["fleet"]["state"], "measured")
 
 
+def _day(hours):
+    """The weekday the cause names for an instant `hours` after NOW, taken
+    the way a reader's clock takes it."""
+    import time
+    return time.strftime("%A", time.localtime(NOW + hours * HOUR))
+
+
+#: A Pro account walled on a RATE LIMIT whose reset lies past SHORT's 100h
+#: horizon; it carries no ledger tokens, so it borrows the Pro weight.
+LATE_PRO = {"email": "pro-z@example.com", "start": 100, "rate": 0.0,
+            "reset_h": 160, "plan": "pro", "reached": "rate_limit_reached",
+            "credits": 1}
+
+
+class CreditTest(unittest.TestCase):
+    """THE RESET CLOCK (the owner's law): a credit spent on an account whose
+    natural reset is h hours away gives a fresh week now and moves that
+    reset to 168h out. Against the horizon that decides, per credit, whether
+    the runway may count it."""
+
+    @staticmethod
+    def read(specs, requests=True):
+        lines, reqs = world(specs)
+        return codexpace.read(lines, reqs if requests is True else requests,
+                              NOW)
+
+    @staticmethod
+    def one(reading, kind):
+        per = [p for p in reading["fleet"]["credits"]["per"]
+               if p["kind"] == kind]
+        assert len(per) == 1, reading["fleet"]["credits"]
+        return per[0]
+
+    def test_a_credit_on_the_horizon_account_adds_no_supply_before_it(self):  # noqa: VACUOUS_ASSERTION — the zero value is the reset-clock law; held/usable counts, the week in tokens, its worth in hours and the cause sentence are exact positives on the same reading
+        reading = self.read([dict(SHORT[0], credits=1), SHORT[1]])
+        fleet, credits = reading["fleet"], reading["fleet"]["credits"]
+        self.assertEqual((credits["held"], credits["usable"]), (1, 1))
+        self.assertEqual(credits["value_tokens"], 0.0,
+                         "spending it first forfeits the horizon refill")
+        self.assertEqual(credits["runway_h"], fleet["runway_h"])
+        credit = self.one(reading, "horizon")
+        self.assertEqual(credit["value_tokens"], 0.0)
+        # its week: 25M tokens per percent (50M/h over 2%/h) -> 2.5B, which
+        # the fleet's 62M/h burns in ~40h
+        self.assertAlmostEqual(credit["week_tokens"] / 2.5e9, 1.0, delta=0.05)
+        self.assertAlmostEqual(credit["worth_h"], 40.3, delta=3.0)
+        self.assertEqual(reading["verdict"], burnflags.RUNWAY_SHORT)
+        self.assertIn("runway 13h is under", reading["cause"])
+        self.assertIn("+1 Pro reset credit held: it cannot help before %s's "
+                      "reset without forfeiting it; worth ~%s after"
+                      % (_day(100), codexpace._hours(credit["worth_h"])),
+                      reading["cause"])
+        self.assertNotIn("@", reading["cause"])
+
+    def test_a_credit_on_a_pro_account_resetting_past_the_horizon_counts(self):  # noqa: VACUOUS_ASSERTION — the counted value, the runway with it and the cause are pinned to the built world, and the three-credit control flips the verdict
+        reading = self.read(SHORT + [LATE_PRO])
+        credits = reading["fleet"]["credits"]
+        credit = self.one(reading, "counted")
+        self.assertIs(credit["usable"], True)
+        self.assertAlmostEqual(credit["value_tokens"] / 2.5e9, 1.0, delta=0.05)
+        self.assertEqual(credits["value_tokens"], credit["value_tokens"])
+        # 0.8B of supply + 2.5B from the credit over 62M/h
+        self.assertAlmostEqual(credits["runway_h"], 53.0, delta=4.0)
+        self.assertAlmostEqual(reading["fleet"]["runway_h"], 13.0, delta=2.0)
+        self.assertEqual(reading["verdict"], burnflags.RUNWAY_SHORT)
+        self.assertIn("(13h of supply + ", reading["cause"])
+        self.assertIn("from 1 reset credit)", reading["cause"])
+        self.assertIn("counted: its account resets after %s's reset (%s)"
+                      % (_day(100), _day(160)), reading["cause"])
+        # THE CONTROL that the credit is what moved it: three of them lift
+        # the runway past the horizon, and the same world reads even
+        reading = self.read(SHORT + [dict(LATE_PRO, credits=3)])
+        self.assertGreater(reading["fleet"]["credits"]["runway_h"], 100.0)
+        self.assertEqual(reading["verdict"], burnflags.RUNWAY_EVEN)
+        self.assertIn("+3 Pro reset credits held, each: counted",
+                      reading["cause"])
+
+    def test_credits_on_one_account_are_sequenced_before_the_horizon(self):
+        late = dict(LATE_PRO, credits=4)
+        reading = self.read(SHORT + [late])
+        credits = reading["fleet"]["credits"]
+        counted = [p for p in credits["per"] if p["value_tokens"]]
+        self.assertEqual(len(counted), 3,
+                         "the fourth week cannot be redeemed until after the "
+                         "100h horizon")
+        self.assertAlmostEqual(credits["value_tokens"] /
+                               counted[0]["week_tokens"], 3.0, delta=0.01)
+
+    def test_a_credit_on_a_workspace_credits_depleted_wall_counts(self):  # noqa: VACUOUS_ASSERTION — held/usable counts, the Team week in tokens, the verdict and the cause sentence are exact positives on the same reading
+        """A reset is measured to lift the workspace walls, so a Team credit
+        held there counts its Team week before the horizon."""
+        depleted = {"email": "team-w@example.com", "start": 100, "rate": 0.0,
+                    "reset_h": 150, "plan": "team", "credits": 1,
+                    "reached": "workspace_owner_credits_depleted"}
+        reading = self.read(SHORT + [depleted])
+        credits = reading["fleet"]["credits"]
+        self.assertEqual((credits["held"], credits["usable"]), (1, 1))
+        credit = self.one(reading, "counted")
+        self.assertIs(credit["usable"], True)
+        # the Team weight: 12M/h over 10%/h -> 1.2M a percent, 120M a week
+        self.assertAlmostEqual(credit["value_tokens"] / 1.2e8, 1.0, delta=0.05)
+        self.assertEqual(credits["value_tokens"], credit["value_tokens"])
+        self.assertEqual(reading["verdict"], burnflags.RUNWAY_SHORT)
+        self.assertIn("+1 Team reset credit held: counted: spent once its "
+                      "account is empty it adds a Team week, ~%s, before the "
+                      "horizon" % codexpace._hours(credit["worth_h"]),
+                      reading["cause"])
+
+    def test_a_team_credit_counts_even_when_its_reset_comes_first(self):  # noqa: VACUOUS_ASSERTION — the Team week counted is an exact positive; the Pro control's zero is the reset-clock law, pinned beside its horizon and its sentence
+        """THE OWNER'S RULING ON SMALLER ACCOUNTS: a Team week is spent again
+        in well under a day, so the clock a reset moves costs little and the
+        credit counts wherever its own reset lies. A Pro credit in the same
+        place adds nothing before the horizon."""
+        early_team = {"email": "team-e@example.com", "start": 100,
+                      "rate": 0.0, "reset_h": 40, "plan": "team",
+                      "credits": 1, "reached": "rate_limit_reached"}
+        reading = self.read(SHORT + [early_team])
+        credit = self.one(reading, "counted")
+        self.assertEqual(credit["plan"], "team")
+        self.assertAlmostEqual(credit["value_tokens"] / 1.2e8, 1.0, delta=0.05)
+        # THE CONTROL: the same place on a Pro account adds nothing before
+        # the horizon, because spending it first forfeits its own reset —
+        # which, being the soonest Pro reset, IS the horizon
+        early_pro = dict(early_team, email="pro-e@example.com", plan="pro")
+        reading = self.read(SHORT + [early_pro])
+        self.assertAlmostEqual(reading["fleet"]["horizon_h"], 40.0, delta=0.01)
+        credit = self.one(reading, "horizon")
+        self.assertEqual(credit["value_tokens"], 0.0)
+        self.assertIn("without forfeiting it;", credit["why"])
+
+    def test_an_unknown_weight_is_an_unknown_credit_and_never_0(self):  # noqa: VACUOUS_ASSERTION — None is the unknown-never-0 law; the unknown count, the verdict and the cause are exact positives, and the weighted control counts the same credit
+        """A credit that would land supply before the horizon, on an account
+        with no tokens-per-percent weight: its worth is UNKNOWN, and a short
+        runway beside it is a floor that proves no shortage."""
+        lonely = {"email": "team-q@example.com", "start": 100, "rate": 0.0,
+                  "reset_h": 150, "plan": "team", "credits": 1,
+                  "reached": "rate_limit_reached"}
+        reading = self.read([SHORT[0], lonely])
+        credits = reading["fleet"]["credits"]
+        credit = self.one(reading, "unknown")
+        self.assertIsNone(credit["value_tokens"], "unknown, never 0")
+        self.assertIsNone(credit["week_tokens"])
+        self.assertIsNone(credit["worth_h"])
+        self.assertEqual(credits["unknown"], 1)
+        self.assertLess(reading["fleet"]["runway_h"], 100.0)
+        self.assertEqual(reading["verdict"], burnflags.RUNWAY_UNKNOWN)
+        self.assertIn("shortage is not proven", reading["cause"])
+        self.assertIn("no tokens-per-percent weight", reading["cause"])
+        # THE CONTROL: a measured Team account lends the plan's weight, the
+        # credit is counted, and the same world reads short again
+        reading = self.read([SHORT[0], SHORT[1], lonely])
+        self.assertEqual(self.one(reading, "counted")["usable"], True)
+        self.assertEqual(reading["verdict"], burnflags.RUNWAY_SHORT)
+
+    def test_an_unknown_fleet_rate_leaves_a_credits_worth_unknown(self):  # noqa: VACUOUS_ASSERTION — None is the unknown-never-0 law; the credit's kind and the sentence saying its worth is unknown are exact positives on the same reading
+        """No ledger tokens: no weight and no rate. The credit's worth is
+        unknown and SAID so; it is never rendered as 0h."""
+        reading = self.read([dict(SHORT[0], credits=1), SHORT[1]],
+                            requests=[])
+        credit = self.one(reading, "horizon")
+        self.assertIsNone(credit["worth_h"])
+        self.assertIsNone(credit["week_tokens"])
+        self.assertIn("worth an unknown amount after", credit["why"])
+        self.assertNotIn(" 0h", credit["why"])
+        self.assertIsNone(reading["fleet"]["credits"]["runway_h"])
+
+    def test_an_unread_balance_is_unknown_never_0(self):  # noqa: VACUOUS_ASSERTION — the unread list, the unknown count, both verdicts and both cause sentences are exact positives; the absent credit sentence is the zero-balance control
+        reading = self.read([SHORT[0], dict(SHORT[1], credits=None)])
+        credits = reading["fleet"]["credits"]
+        self.assertEqual(credits["unread"], ["t…@example.com"])
+        self.assertEqual(credits["unknown"], 1,
+                         "a Team account resetting past the horizon could "
+                         "hold a credit that lands supply before it")
+        self.assertEqual(reading["verdict"], burnflags.RUNWAY_UNKNOWN)
+        self.assertIn("reset-credit balance unread on 1 Team account",
+                      reading["cause"])
+        # an unread balance on the HORIZON account cannot add supply before
+        # the horizon whatever it holds, so the shortage stands
+        reading = self.read([dict(SHORT[0], credits=None), SHORT[1]])
+        self.assertEqual(reading["fleet"]["credits"]["unknown"], 0)
+        self.assertEqual(reading["verdict"], burnflags.RUNWAY_SHORT)
+        self.assertIn("reset-credit balance unread on 1 Pro account",
+                      reading["cause"])
+        # THE CONTROL: both balances read as zero is the plain short runway,
+        # with no credit sentence at all
+        reading = self.read(SHORT)
+        self.assertEqual(reading["verdict"], burnflags.RUNWAY_SHORT)
+        self.assertNotIn("credit", reading["cause"])
+
+    def test_the_history_carries_the_counts_and_nothing_else(self):
+        row = brow("pro-a@example.com", 40.0, NOW + 90 * HOUR, credits=2)
+        row["reset_credits"]["profile_image_url"] = "https://x.example/p.png"
+        entry, = codexpace.history_line([row], NOW)["accounts"]
+        self.assertEqual(entry["reset_credits"],
+                         {"available": 2, "applicable": 0})
+        for junk in ({"available": True}, {"available": "1"}, "2", None,
+                     {"available": -1}):
+            row["reset_credits"] = junk
+            entry, = codexpace.history_line([row], NOW)["accounts"]
+            self.assertIsNone(entry["reset_credits"], junk)
+
+    def test_the_fold_carries_the_credit_numbers_and_no_account(self):
+        reading = self.read(SHORT + [LATE_PRO])
+        fold = codexpace.fold_input(reading)
+        self.assertEqual(fold["credits"]["held"], 1)
+        self.assertEqual(fold["credits"]["usable"], 1)
+        self.assertAlmostEqual(fold["credits"]["runway_h"], 53.0, delta=4.0)
+        self.assertNotIn("@", json.dumps(fold))
+        self.assertNotIn("per", fold["credits"])
+        text = "\n".join(codexpace.render(reading))
+        self.assertIn("reset credits: 1 held, 1 usable", text)
+        self.assertIn("p…@example.com", text)
+
+
 class FoldStepTest(unittest.TestCase):
     """THROUGH THE TABLE-DRIVEN FOLD: the runway is a fold INPUT, and the
     step is a row of `_RUNWAY_STEP_TABLE`, not a second fold."""
@@ -554,6 +780,10 @@ class PassTest(unittest.TestCase):
         self.assertEqual(len(reading["accounts"]), 2)
         self.assertEqual(codexpace.cached_fold_input(now=NOW + 900)["verdict"],
                          second["verdict"])
+        # THE SAME LEDGER READ WRITES THE PER-SEAT BURN (task/3156)
+        burn = codexpace.cached_seat_burn(now=NOW + 900)
+        self.assertEqual(burn["ts"], NOW + 900)
+        self.assertEqual(burn["window_s"], codexpace.SEAT_BURN_WINDOW_S)
 
     def test_a_pass_that_did_not_read_the_pool_writes_nothing(self):
         self.assertIsNone(codexpace.watch_pass(None, now=NOW))
@@ -579,6 +809,62 @@ class PassTest(unittest.TestCase):
                                return_value=({}, None)):
             payload = proxywatch._burn_flags_pass(rep)
         self.assertEqual(payload["readers"]["runway"], ["codex"])
+
+
+class SeatBurnTest(unittest.TestCase):
+    """task/3156: the ledger reader generalized to every proxy family, summed
+    per seat for a project's bill — and the codex reader is unchanged."""
+
+    def reqs(self):
+        return [event("a@example.com", NOW - 1 * HOUR, 3e6, seat="seat-a"),
+                event("a@example.com", NOW - 2 * HOUR, 3e6, seat="seat-a"),
+                event("b@example.com", NOW - 1 * HOUR, 1.5e6, seat="seat-b"),
+                # another family on the same ledger
+                event("k@example.com", NOW - 1 * HOUR, 6e6, seat="seat-c",
+                      family="kimi"),
+                # outside the three-hour window
+                event("a@example.com", NOW - 4 * HOUR, 90e6, seat="seat-a"),
+                # a failed request spends nothing
+                dict(event("a@example.com", NOW - 1 * HOUR, 90e6,
+                           seat="seat-a"), failed=True)]
+
+    def test_every_family_and_every_seat_is_summed_per_hour(self):
+        got = codexpace.seat_burn(self.reqs(), NOW)
+        self.assertEqual(got["window_s"], 3 * HOUR)
+        self.assertEqual(sorted(got["families"]), ["codex", "kimi"])
+        codex = got["families"]["codex"]
+        self.assertAlmostEqual(codex["seats"]["seat-a"], 2e6)      # 6M / 3h
+        self.assertAlmostEqual(codex["seats"]["seat-b"], 0.5e6)
+        self.assertAlmostEqual(codex["per_hour"], 2.5e6)
+        self.assertAlmostEqual(got["families"]["kimi"]["seats"]["seat-c"], 2e6)
+        self.assertNotIn("@", json.dumps(got))
+
+    def test_the_codex_reader_is_unchanged(self):
+        """The pace and the wall events still see codex and nothing else."""
+        led = codexpace._Ledger(self.reqs())
+        self.assertEqual({r[4] for r in led.rows}, {"codex"})
+        self.assertEqual(led.seats(NOW - 3 * HOUR, NOW),
+                         [("seat-a", 0.8), ("seat-b", 0.2)])
+        # CONTROL: the every-family reader holds the other family's rows
+        every = codexpace._Ledger(self.reqs(), family=None)
+        self.assertEqual({r[4] for r in every.rows}, {"codex", "kimi"})
+
+    def test_an_unreadable_ledger_is_not_a_zero(self):
+        got = codexpace.seat_burn(None, NOW)
+        self.assertEqual(got["families"], {})
+        self.assertIn("could not be read", got["why"])
+
+    def test_the_snapshot_round_trips_and_ages_out(self):
+        tmp = tempfile.mkdtemp(prefix="helm-test-seat-burn-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "seat-burn.json")
+        self.assertIsNone(codexpace.cached_seat_burn(now=NOW, path=path))
+        self.assertTrue(codexpace.write_seat_burn(
+            codexpace.seat_burn(self.reqs(), NOW), path=path))
+        got = codexpace.cached_seat_burn(now=NOW + 60, path=path)
+        self.assertAlmostEqual(got["families"]["codex"]["per_hour"], 2.5e6)
+        self.assertIsNone(codexpace.cached_seat_burn(
+            now=NOW + burnflags.max_age_s() + 1, path=path))
 
 
 class SurfaceTest(unittest.TestCase):
@@ -609,6 +895,15 @@ class SurfaceTest(unittest.TestCase):
         self.assertEqual(len(runway), 1, out)
         self.assertIn("runway 13h", runway[0])
         self.assertIn("short", runway[0])
+
+    def test_helm_burn_says_what_the_held_credits_are_worth(self):
+        lines, requests = world([dict(SHORT[0], credits=1), SHORT[1]])
+        codexpace.write_snapshot(codexpace.read(lines, requests, NOW))
+        with mock.patch("time.time", return_value=NOW + 60):
+            _rc, out, _err = self.run_burn([])
+        runway, = [l for l in out.splitlines() if "codex runway" in l]
+        self.assertIn("+1 Pro reset credit held: it cannot help before", runway)
+        self.assertIn("worth ~", runway)
 
     def test_the_runway_verb_reads_live_and_refuses_junk(self):
         rc, _out, err = self.run_burn(["runway", "--bogus"])

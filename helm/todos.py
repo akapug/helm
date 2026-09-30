@@ -47,7 +47,6 @@ import stat as statmod
 import sys
 import tempfile
 import time
-import unicodedata
 
 from . import fsops, home, openflags, pk
 
@@ -159,14 +158,13 @@ def _apply_task(items, tool, tin, resp):
 # ── digest ──────────────────────────────────────────────────────────────────
 
 def _scrub(s):
-    """seats._scrub's reader-side label defense, local copy (importing seats
-    here would cycle): strip C0/C1 controls, format chars (incl. bidi
-    overrides), line/paragraph separators — a todo whose text carries
-    \\x1b[2J must not reshape the terminal `helm chat seats` prints its
-    task cell into. Capture's whitespace-collapse does NOT strip these
-    (str.split() only splits on whitespace), so the read seam must."""
-    return "".join(ch for ch in s if ch == "\t"
-                   or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
+    """seats._scrub's reader-side label defense (pk.launder): strip C0/C1
+    controls, format chars (incl. bidi overrides), line/paragraph separators
+    — a todo whose text carries \\x1b[2J must not reshape the terminal
+    `helm chat seats` prints its task cell into. Capture's whitespace-collapse
+    does NOT strip these (str.split() only splits on whitespace), so the read
+    seam must."""
+    return pk.launder(s)
 
 
 def _clip(s, cap):

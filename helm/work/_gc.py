@@ -2,6 +2,7 @@
 the rescue commit, housekeeping (scan/enact/orphans), and the room board.
 Moved verbatim from the pre-split helm/work.py.
 """
+import contextlib
 import os
 import re
 import signal
@@ -79,6 +80,24 @@ def _merge_state(root, branch):
 
 RETIRABLE = (vcs.ANCESTOR, vcs.PATCH_EQUIVALENT)
 
+# A SWEEP'S STATE, NEVER A `_merge_state` ANSWER: the branch sits at the trunk
+# and no commit of its own is proven, so ancestry is true of it vacuously —
+# nothing of it is missing from the trunk because there is nothing of it. Not
+# in RETIRABLE, so every door that asks membership keeps the room. Only
+# `_sweep_state` returns it.
+UNSTARTED = "unstarted"
+
+# HOW LONG A SWEEP LEAVES A ROOM WHOSE BRANCH HAS NO COMMIT OF ITS OWN.
+# A builder mints its room at the trunk and commits minutes or hours later; a
+# workflow builder holds no lease, no lock, and no cwd between shell calls, so
+# in that window the room's age is the only sign anybody is coming back.
+# 24h is longer than a session-limit reset (5h) plus the longest single
+# builder run, so a paused builder resumes on its floor; it is short enough
+# that the hourly sweep still clears an abandoned claim within a day. An
+# unstarted room holds nothing the trunk lacks, so keeping one longer costs a
+# sidebar row, never work.
+_UNSTARTED_GRACE_S = 24 * 3600
+
 
 def _proof_word(state):
     """The AUDIT phrase for one landedness state, in ONE line.
@@ -97,6 +116,8 @@ def _proof_word(state):
         vcs.NOT_ANCESTOR: "NOT landed by ancestry or patch identity",
         vcs.UNKNOWN: "landedness UNKNOWN (unreadable object, a commit `git "
                      "cherry` cannot speak for, or a range past the cap)",
+        UNSTARTED: "UNSTARTED (the branch sits at the trunk and no commit of "
+                   "its own is proven — an empty branch is not a landed one)",
     }.get(state, "landedness UNKNOWN")
 
 
@@ -110,10 +131,401 @@ def _merged(root, branch):
     return _merge_state(root, branch) in RETIRABLE
 
 
+_REFLOG_STAMP = re.compile(r"@\{(\d+)\}$")
+
+
+def _room_moved_ago(path, now=None):
+    """(seconds, None) since the room at `path` last moved its HEAD, or
+    (None, why) when that cannot be read.
+
+    GIT'S OWN CLOCK, NOT A FILE'S. `worktree add` writes the room's HEAD reflog
+    when it mints the room, and every checkout, switch, commit, reset and
+    rebase in it appends a line, so the newest line is the latest moment
+    somebody put this room on something. When the room's own HEAD log is gone
+    git answers from the branch HEAD names, which is still git's clock. An
+    empty or unreadable log is None, never "old": age is what licenses an
+    abandoned-room removal, so it must be read, not assumed."""
+    rc, out, err = vcs.backend(path).text(
+        path, "reflog", "show", "--date=unix", "--format=%gd", "-n", "1",
+        "HEAD")
+    m = _REFLOG_STAMP.search(out) if rc == 0 and out else None
+    if not m:
+        return None, (err or ("its HEAD reflog is empty" if rc == 0 else
+                              "its HEAD reflog is unreadable (rc %s)" % rc))
+    return (time.time() if now is None else now) - int(m.group(1)), None
+
+
+# THE BOUNDS A REFLOG READ STOPS AT. Each one, hit, answers UNKNOWN (keep),
+# never a partial verdict. Each sits far above what this repository's reflogs
+# hold when measured (task/3436): at most 30 commits one lane branch's reflog
+# records the lane writing, 98 in one worktree's HEAD reflog, and 7 separate
+# lines of work only a reflog holds under one lane.
+_AUTHORED_CAP = 2048
+_REFLOG_ONLY_CAP = 4096
+_DROPPED_HEADS_CAP = 32
+
+
+def _reflog_rows(v, cwd, ref):
+    """([(sha, action)] newest first, None) — git's reflog of `ref`, asked in
+    `cwd` — or (None, why) when it cannot be read whole.
+
+    GIT CANNOT SAY A REFLOG IS UNREADABLE. Measured (git 2.53): a reflog file
+    that is a directory, is mode 000, or holds a line git cannot parse all
+    answer rc 0 with no line for it, exactly as an expired reflog answers. So
+    the file git read (`rev-parse --git-path logs/<ref>`) is read too: when it
+    exists it must be a readable regular file whose lines are one per entry
+    git parsed, or a commit only that file records could be the one nobody
+    read. A line whose new sha is all zeros is not an entry git keeps — the
+    rename's delete half, `<old> 0000…`, which an in-room `git branch -m`
+    writes and `reflog show` omits — so it does not count (task/3436 round 3).
+    An absent file is an absent reflog (or a reftable repository, which keeps
+    no such file), and git's answer stands. Measured on this repository: 573
+    branch reflogs and 248 room HEAD reflogs, every count equal."""
+    rc, out, err = v.text(cwd, "reflog", "show", "--format=%H %gs", ref)
+    if rc != 0:
+        return None, "git reflog failed (rc %s: %s)" % (
+            rc, (err or "no error text")[:120])
+    rows = [(sha, what) for sha, _sp, what in
+            (line.partition(" ") for line in out.splitlines()) if sha]
+    rc, where, err = v.text(cwd, "rev-parse", "--git-path", "logs/" + ref)
+    if rc != 0 or not where:
+        return None, "its file could not be located (rc %s: %s)" % (
+            rc, (err or "no error text")[:120])
+    where = os.path.join(cwd, where)
+    try:
+        with open(where, "rb") as f:
+            lines = 0
+            for line in f:
+                if not line.strip():
+                    continue
+                parts = line.partition(b"\t")[0].split()
+                if len(parts) >= 2 and parts[1] in (b"0" * 40, b"0" * 64):
+                    continue  # the rename's delete half: git keeps no row
+                lines += 1
+    except FileNotFoundError:
+        return rows, None
+    except OSError as exc:
+        return None, "%s cannot be read (%s)" % (where, exc.strerror or exc)
+    if lines != len(rows):
+        return None, "git parsed %d of the %d lines in %s" % (
+            len(rows), lines, where)
+    return rows, None
+
+
+def _written(rows):
+    """Every sha a reflog records its owner WRITING (`_OWN_COMMIT`), newest
+    first, once each. (Not `_authored`, the lane-range reader below.)"""
+    return list(dict.fromkeys(sha for sha, what in rows
+                              if what.startswith(_OWN_COMMIT)))
+
+
+def _reflog_only(root, where):
+    """(state, why, landed) for the commits in `where` ({sha: the reflog that
+    records it}, newest first) that NO REF reaches — the ones only a reflog
+    holds, which deleting that reflog deletes.
+
+    state None: every one of them is on the trunk by patch identity (or there
+    are none), and `landed` lists them. NOT_ANCESTOR: one is on neither a ref
+    nor the trunk, and `why` names it and the reflog it lives in. UNKNOWN: a
+    read failed or a bound was hit, and `why` says which.
+
+    A COMMIT A REF REACHES IS NOT ASKED ABOUT, because no deletion here
+    touches it: every other branch, tag, remote ref and retired tip survives,
+    and what the swept branch's own tip reaches is covered by the tip's proof
+    (ancestry: it is on the trunk; patch identity: the tip is preserved at
+    `refs/helm-retired/` first). `rev-list <authored> --not --glob=*` lists
+    exactly the rest in one read. `--glob=*` and not `--all`, because `--all`
+    also counts every room's HEAD, and a DETACHED HEAD is not a ref that
+    survives: removing its room deletes it (measured: a commit only a
+    detached room's HEAD holds reads reachable under `--all`, reflog-only
+    under `--glob=*`).
+
+    ONE COMMIT STANDS FOR EVERY COMMIT IT REACHES. Patch identity is asked of
+    the range `trunk..<commit>`, which holds every reflog-only commit under
+    it, so only the tips of the reflog-only set (`merge-base --independent`)
+    are asked, newest first, and the first that is not on the trunk ends the
+    read."""
+    if not where:
+        return None, None, []
+    if len(where) > _AUTHORED_CAP:
+        return vcs.UNKNOWN, ("the reflogs record %d authored commits, more "
+                             "than the %d a sweep reads"
+                             % (len(where), _AUTHORED_CAP)), []
+    v = vcs.backend(root)
+    rc, out, err = v.text(root, "rev-list",
+                          "--max-count=%d" % (_REFLOG_ONLY_CAP + 1),
+                          *where, "--not", "--glob=*")
+    listed = out.split() if rc == 0 else []
+    if rc != 0 or len(listed) > _REFLOG_ONLY_CAP:
+        return vcs.UNKNOWN, ("which of the %d commits the reflogs record a "
+                             "ref still holds could not be read (%s)"
+                             % (len(where), "git rev-list rc %s: %s" % (
+                                 rc, (err or "")[:120]) if rc else
+                             "more than %d unreachable commits"
+                             % _REFLOG_ONLY_CAP)), []
+    listed = set(listed)
+    only = [sha for sha in where if sha in listed]
+    heads = only
+    if len(only) > 1:
+        rc, out, err = v.text(root, "merge-base", "--independent", *only)
+        tops = set(out.split()) if rc == 0 else set()
+        heads = [sha for sha in only if sha in tops]
+        if rc != 0 or not heads or len(heads) != len(tops):
+            return vcs.UNKNOWN, ("the %d commits only the reflogs hold could "
+                                 "not be reduced to their tips (git "
+                                 "merge-base rc %s)" % (len(only), rc)), []
+    if len(heads) > _DROPPED_HEADS_CAP:
+        return vcs.UNKNOWN, ("%d separate lines of work live only in the "
+                             "reflogs, more than the %d a sweep asks the "
+                             "trunk about" % (len(heads), _DROPPED_HEADS_CAP)), []
+    for sha in heads:
+        state = _merge_state(root, sha)
+        if state in RETIRABLE:
+            continue
+        said = ("it wrote %s, which no branch, tag or room holds: only %s "
+                "records it, and deleting that loses it" % (sha[:12], where[sha]))
+        if state == vcs.NOT_ANCESTOR:
+            return state, "%s — and it is not on the trunk" % said, []
+        return vcs.UNKNOWN, "%s — and %s" % (said, _proof_word(state)), []
+    return None, ("every commit it wrote that only a reflog holds (%d: %s) "
+                  "is on the trunk by patch identity"
+                  % (len(only), ", ".join(s[:12] for s in only[:3])
+                     + (", ..." if len(only) > 3 else ""))
+                  if only else None), only
+
+
+def _on_trunk(root, shas):
+    """True when a commit in `shas` is on the trunk by ancestry, False when
+    none is, None when that could not be read."""
+    if not shas:
+        return False
+    rc, out, _e = vcs.backend(root).text(
+        root, "rev-list", "--max-count=%d" % (_REFLOG_ONLY_CAP + 1), *shas,
+        "--not", _trunk(root))
+    listed = set(out.split()) if rc == 0 else None
+    if listed is None or len(listed) > _REFLOG_ONLY_CAP:
+        return None
+    return any(sha not in listed for sha in shas)
+
+
+def _sweep_state(root, path, branch, now=None):
+    """(state, why) — the landedness an AUTONOMOUS sweep may spend on the room
+    at `path` holding `branch`. A state in RETIRABLE retires the room and the
+    branch; anything else keeps both. `why` is the sentence the row prints, or
+    None when `_proof_word(state)` already says it all.
+
+    ANCESTRY CANNOT TELL A LANDED LANE FROM ONE MINTED A MINUTE AGO. A builder
+    mints `lane/x` AT the trunk, so until its first commit the branch is an
+    ancestor of the trunk exactly as a merged lane is, and `_merge_state`
+    truthfully says ANCESTOR. Measured from helm-gc.service's journal: the
+    hourly sweep printed "lease-less + clean + LANDED by ancestry", removed a
+    builder's room minutes after `worktree add -b ... origin/main`, and
+    deleted its branch — the builder had not committed yet (task/3428). The
+    lane board already refused that reading (`lanes_landed` says UNSTARTED);
+    the two sweeps that REMOVE rooms never asked.
+
+    SO ANCESTRY RETIRES A ROOM ONLY WITH PROOF OF WORK OR PROOF OF AGE. Proof
+    of work is a commit the lane WROTE that is on the trunk, as the branch's
+    OWN reflog records it: the reflog of a branch the room merely moved onto
+    records the branch's birth, not a commit an EARLIER branch wrote, so a
+    room that committed on one branch, saw it land, and was moved onto a
+    recreated one is not thereby proving the new branch's work (task/3436
+    round 3) — a REUSED room's older HEAD history is another branch's (round
+    2, F5), and it may only keep. If the branch's own reflog shows a landed
+    commit, the lane landed and this is today's removal, word for word. If it
+    wrote nothing — or its reflog cannot say — the room retires only once
+    git's own clock (`_room_moved_ago`) proves nobody has moved it for
+    `_UNSTARTED_GRACE_S`; a young room, or one whose age cannot be read, is
+    UNSTARTED and kept. An old abandoned claim is still tidied, on purpose: it
+    holds nothing the trunk lacks.
+
+    NOTHING RETIRES WHILE A COMMIT ONLY ITS REFLOGS HOLD IS OFF THE TRUNK
+    (task/3436). Removing the room deletes its HEAD reflog and deleting the
+    branch deletes the branch's, so every commit either reflog RECORDS is
+    judged (`_reflog_only`), not one: its new sha is read from every reflog
+    line, whatever the line's action, because a commit a rebase resolved into
+    and recorded only as `rebase (continue)` is as lost by the removal as a
+    commit the lane `commit`ed was. A lane that landed one commit and reset
+    another away, a detached commit made in the room before a checkout back to
+    the landed branch, and a reflog whose creation line has expired are each
+    kept while any such commit is off the trunk, whatever the tip's proof and
+    whatever the age. A reflog git reads but the file says it could not read
+    whole keeps too (`_reflog_rows`).
+
+    PATCH IDENTITY needs commits in the range, so it is proof of work already.
+    `release_lane` asks with `path` None for the branch, and `_room_state` for
+    the room: the holder's request replaces the age grace, never this rule.
+
+    `path` None IS A BRANCH NO ROOM STANDS ON (envtidy's orphan pass). The
+    grace protects a room's floor, and there is none, so an unstarted branch
+    reads as its ancestry says; deleting it deletes no commit. The reflog-only
+    rule applies unchanged, because the branch's reflog is still the only
+    place such a commit lives."""
+    state = _merge_state(root, branch)
+    if state not in RETIRABLE:
+        return state, None
+    v = vcs.backend(root)
+    logs = [(root, "refs/heads/" + branch, "the reflog of " + branch)]
+    if path:
+        logs.append((path, "HEAD", "the room's HEAD reflog"))
+    read, where, mine = {}, {}, set()
+    for cwd, ref, label in logs:
+        rows, blind = _reflog_rows(v, cwd, ref)
+        if rows is None:
+            return vcs.UNKNOWN, ("%s cannot be read whole (%s), so a commit "
+                                 "only it records cannot be ruled out"
+                                 % (label, blind))
+        read[ref] = rows
+        for sha, _what in rows:
+            if sha:
+                where.setdefault(sha, label)
+        if ref != "HEAD":
+            mine.update(_written(rows))
+    # `where`: every sha either reflog records, whatever its action — a
+    # commit any reflog holds is kept, because deleting that reflog deletes
+    # it. `mine`: only the branch's own reflog — proof of this branch's work
+    # comes from the reflog the branch owns; the room's HEAD reflog records
+    # whatever the room committed under whatever it held (task/3436 round 3).
+    dropped, why, landed = _reflog_only(root, where)
+    if dropped is not None:
+        return dropped, why
+    ours = [sha for sha in where if sha in mine]
+    if state == vcs.PATCH_EQUIVALENT or set(ours) & set(landed) \
+            or _on_trunk(root, ours):
+        return state, why
+    if path is None:
+        return state, None
+    own = read["refs/heads/" + branch]
+    nothing = not ours and any(w.startswith(_BOOKKEEPING[0]) for _s, w in own) \
+        and all(w.startswith(_BOOKKEEPING) or w.endswith(_FAST_FORWARD)
+                for _s, w in own)
+    authored = ("its reflog shows nothing authored" if nothing else
+                "no commit its reflogs record it writing is on the trunk, and "
+                "a ref holds each one" if ours else
+                "its reflog cannot say whether it authored anything")
+    older = len(where) - len(ours)
+    if older:
+        authored += (" (the room's HEAD reflog also records %d commit%s the "
+                     "room did not write on this branch, which may keep the "
+                     "room but prove nothing about it)"
+                     % (older, "" if older == 1 else "s"))
+    head = "%s: %s" % (_proof_word(UNSTARTED), authored)
+    ago, blind = _room_moved_ago(path, now)
+    if ago is None:
+        return UNSTARTED, ("%s, and the room's age could not be read (%s), so "
+                           "no sweep may call it abandoned" % (head, blind))
+    if ago < _UNSTARTED_GRACE_S:
+        return UNSTARTED, ("%s, and its room last moved %s ago, inside the %s "
+                           "grace a sweep gives a room before its first "
+                           "commit" % (head, _age_word(ago),
+                                       _age_word(_UNSTARTED_GRACE_S)))
+    return state, ("%s, and its room has not moved for %s, past the %s grace "
+                   "— an abandoned claim" % (head, _age_word(ago),
+                                             _age_word(_UNSTARTED_GRACE_S)))
+
+
+def _room_state(root, path, keep=()):
+    """(state, why) — may the ROOM at `path` be removed? state None: yes.
+
+    For a door that removes a room without deleting the branch through the
+    same verdict (`release_lane`; envtidy's rescue path, whose rescue commit
+    makes the branch read unlanded). Removing the room deletes only its HEAD
+    reflog, so the question is `_sweep_state`'s rule over the commits that
+    reflog alone records: a commit the reflog of a branch in `keep` also
+    records is that branch's to answer for, because the branch is either
+    kept, reflog and all, or deleted only on `_sweep_state`'s own proof that
+    every such commit is on the trunk. A HEAD reflog that cannot be read whole
+    keeps the room."""
+    v = vcs.backend(root)
+    rows, blind = _reflog_rows(v, path, "HEAD")
+    if rows is None:
+        return vcs.UNKNOWN, ("the room's HEAD reflog cannot be read whole (%s), "
+                             "so a commit only it records cannot be ruled out"
+                             % blind)
+    recorded = set()
+    for branch in keep:
+        brows, _blind = _reflog_rows(v, root, "refs/heads/" + branch)
+        recorded.update(_written(brows or ()))
+    state, why, _landed = _reflog_only(root, {
+        sha: "the room's HEAD reflog" for sha in _written(rows)
+        if sha not in recorded})
+    return state, why
+
+
+def _room_fingerprint(path):
+    """What the room at `path` has checked out and every line of its HEAD
+    reflog, or None when either cannot be read: the state a removal re-reads
+    to prove nothing moved in the room after its verdict. Every commit,
+    checkout, reset and detach appends a HEAD reflog line, so a detour made
+    and undone after the verdict (detach, commit, check the branch out again)
+    changes the fingerprint while leaving HEAD exactly where it was."""
+    v = vcs.backend(path)
+    rc, head, _e = v.text(path, "rev-parse", "HEAD", "--symbolic-full-name",
+                          "HEAD")
+    rows, _blind = _reflog_rows(v, path, "HEAD") if rc == 0 else (None, None)
+    return None if rows is None else (head, tuple(rows))
+
+
+def _moved_since(path, fingerprint):
+    """The reason the room at `path` cannot be removed on a verdict taken at
+    `fingerprint` (from `_room_fingerprint` before that verdict), or None.
+
+    THE LAST READ BEFORE `git worktree remove`, and it is not atomic with it:
+    git has no compare-and-remove for a worktree. What it closes is the window
+    from before the verdict's own reads to this line (task/3436 F4: a detour
+    made after the verdict was removed with the room). What remains is the
+    time between this read and git deleting the directory, one spawn; a
+    commit made in that window is made in a room being deleted."""
+    now = _room_fingerprint(path)
+    if fingerprint is None or now is None:
+        return ("the room's HEAD or HEAD reflog could not be read before the "
+                "removal, so no verdict can be bound to it")
+    if now != fingerprint:
+        return ("the room's HEAD or HEAD reflog moved after the verdict (%d "
+                "reflog lines then, %d now) — the room moved under the "
+                "removal" % (len(fingerprint[1]), len(now[1])))
+    return None
+
+
 RETIRED_NS = "refs/helm-retired/"
 
 
-def _delete_lane_branch(root, branch, state=None):
+def _unleased(resource_name, act, held=None):
+    """(act's answer, None), or (None, why) — run `act(held)` under THE claims
+    lock (`seats_common._claim_flocked`, the lock every lease is taken
+    under), and only while `resource_name` holds no live lease.
+
+    THE LANE BRANCH'S RETIREMENT IS SERIALIZED WITH ITS CLAIM (task/3643).
+    `helm work claim` takes its lease under this lock BEFORE it re-cuts
+    `lane/<lane>` or records the lane's task (`_claims.claim`), so a
+    retirement that holds this lock and sees no lease finishes its ref delete
+    and config cleanup before any new claim of the name can start, and one
+    that sees a lease leaves the branch alone. gc's room removal runs its
+    destructive acts and last check as one such `act` (`_remove_room`).
+
+    THE LOCK IS NOT RE-ENTRANT, so a section hands it down instead of taking
+    it twice: `act` receives the held lock as a context that takes nothing
+    (`contextlib.nullcontext(lock)`), and a caller already inside a section
+    passes that as `held`, so this runs the lease check under the section's
+    lock and takes no second one. No state records who holds it. A lock that
+    cannot be taken, or a claims ledger that cannot be read, runs nothing and
+    says why. Nothing is written to the ledger here."""
+    from .. import seats_claims, seats_common
+    with held or seats_common._claim_flocked(create_dir=True) as lock:
+        if lock.f is None:
+            return None, seats_claims._lock_unavailable()
+        try:
+            row = seats_common._sweep(
+                seats_claims._claims_read(True)).get(resource_name)
+        except OSError as exc:
+            return None, str(exc)
+        if row:
+            return None, "%s is held by %s (a live lease)" % (
+                resource_name, row.get("holder"))
+        return act(contextlib.nullcontext(lock)), None
+
+
+def _delete_lane_branch(root, branch, state=None, why=None, held=None):
     """THE branch-retirement actuator: [lines], one per outcome, always naming
     the proof. Every caller that deletes a lane branch comes through here.
 
@@ -143,14 +555,32 @@ def _delete_lane_branch(root, branch, state=None):
     a PRECONDITION of the forced delete, never a courtesy after it.
 
     Re-reads the state unless handed one, so a caller cannot spend a stale
-    scan verdict on a branch that moved."""
-    state = _merge_state(root, branch) if state is None else state
+    scan verdict on a branch that moved. The re-read is `_sweep_state` for a
+    branch with no room (`path` None), never ancestry alone: deleting the
+    branch deletes its reflog, and a commit the lane wrote that only that
+    reflog records keeps the branch until it is on the trunk (task/3436).
+    `why` is the sentence that came with a handed state, printed on a KEPT
+    line in place of the bare proof word. `held` is the claims lock of a
+    section that calls this from inside it (see `_unleased`)."""
+    if state is None:
+        state, why = _sweep_state(root, None, branch)
     v = vcs.backend(root)
     if state not in RETIRABLE:
-        return ["KEPT branch %s — %s" % (branch, _proof_word(state))]
+        return ["KEPT branch %s — %s" % (branch, why or _proof_word(state))]
+    # THE DELETE IS SERIALIZED WITH THE LANE'S CLAIM (task/3643): it runs
+    # under the claims lock and only while the lane holds no live lease
+    # (`_unleased`), because a claim that re-cut the name between
+    # a ref delete and its config cleanup lost its task record, and a lane
+    # named task-N then joined the literal, wrong task.
+    held_by = resource(root, branch[len("lane/"):]
+                       if branch.startswith("lane/") else branch)
     if state == vcs.ANCESTOR:
         # Reachability already vouches: the tip is ON the trunk after this.
-        rc, _out, err = v.delete_branch(root, branch)
+        got, refused = _unleased(
+            held_by, lambda _held: v.delete_branch(root, branch), held=held)
+        if refused:
+            return ["KEPT branch %s — %s" % (branch, refused)]
+        rc, _out, err = got
         if rc == 0:
             return ["deleted branch %s — %s" % (branch, _proof_word(state))]
         return ["KEPT branch %s (safe -d refused: %s)" %
@@ -178,7 +608,13 @@ def _delete_lane_branch(root, branch, state=None):
     # advanced after the read-back on line above had its NEW tip deleted while
     # the ref preserved the OLD one — the commits in between survived nowhere.
     # `expect` makes this a compare-and-delete: it refuses the moved branch.
-    rc, _out, err = v.delete_branch(root, branch, force=True, expect=sha)
+    got, refused = _unleased(
+        held_by, lambda _held: v.delete_branch(root, branch, force=True,
+                                               expect=sha), held=held)
+    if refused:
+        return ["KEPT branch %s — %s; its tip %s is also preserved at %s"
+                % (branch, refused, sha[:12], keep_ref)]
+    rc, _out, err = got
     if rc != 0:
         return ["KEPT branch %s — the forced delete was REFUSED (%s). If the "
                 "branch moved after %s was preserved, that refusal is the "
@@ -186,8 +622,9 @@ def _delete_lane_branch(root, branch, state=None):
                 "next pass re-reads it" %
                 (branch, (err or "unknown error").strip()[:160], sha[:12])]
     return ["retired branch %s — %s; tip %s PRESERVED at %s — restore: "
-            "git branch %s %s"
-            % (branch, _proof_word(state), sha[:12], keep_ref, branch, sha)]
+            "git branch %s %s%s"
+            % (branch, _proof_word(state), sha[:12], keep_ref, branch, sha,
+               "; %s" % err.strip() if (err or "").strip() else "")]
 
 
 def _age_word(seconds):
@@ -658,6 +1095,36 @@ def _current_branch(path):
                   or "git could not read this room's HEAD (rc %s)" % rc)
 
 
+def _moved_under_scan(path, judged):
+    """The reason a room no longer holds the branch it was judged on, or None.
+
+    EVERY REMOVER RE-READS THIS IMMEDIATELY BEFORE IT REMOVES. A room on a
+    branch when it was judged can detach and commit before the removal; the
+    branch it was judged on still reads landed, so a removal on that judgement
+    orphans the new commit. `gc_enact`, envtidy's worktree sweep and
+    `release_lane` all ask here, so a scan-time answer never authorizes a
+    removal on its own (task/3125).
+
+    Unreadable is not detached: `_current_branch` keeps the two apart, and the
+    sentence does too, so nobody is sent looking for a detach that never
+    happened.
+
+    A ROOM JUDGED ON NO BRANCH IS NEVER UNMOVED. By equality a room on no
+    branch at scan and on no branch now has not moved, and this answered None
+    for it, which at this gate means go ahead. No remover passes None with a
+    removal today, because each gates on a branch first; the gate refuses on
+    its own so the next caller cannot inherit the hole."""
+    if judged is None:
+        return ("no branch was judged at scan (the room read as DETACHED or "
+                "unreadable), so no scan answer licenses this removal")
+    cur, blind = _current_branch(path)
+    if cur == judged and not blind:
+        return None
+    now = cur or ("UNREADABLE (%s)" % blind if blind else "DETACHED")
+    return ("was on %s at scan, now %s — the room moved under the scan"
+            % (judged, now))
+
+
 def _operation_state(path):
     """Name of the git operation in progress, or None.
 
@@ -678,6 +1145,34 @@ def _operation_state(path):
         except OSError:
             return "unreadable-gitdir"
     return None
+
+
+def _manual_only(path, branch, blind=None):
+    """(why, head) when no remover may take this room without a human, else
+    None. `branch` is what the ROOM has checked out (None when detached);
+    `blind` is `_current_branch`'s reason when that could not be read.
+
+    ONE ANSWER FOR EVERY DOOR THAT REMOVES A ROOM. An attached branch gives
+    Git a lossless authority (`branch -d`); a detached or mid-operation room
+    has no equivalent, because its HEAD reflog goes with the worktree. gc_scan
+    asked this inline and release never asked it, so release removed rooms on
+    the LEASE branch's proof while the room held something else (task/3125).
+
+    A room whose HEAD cannot be read is manual-only too, and says so in its
+    own words rather than as DETACHED."""
+    if blind:
+        return ("HEAD UNREADABLE (%s) — helm cannot tell what this room "
+                "holds, so it is never auto-reaped. Inspect and remove by "
+                "hand" % blind), None
+    op = _operation_state(path)
+    if branch is not None and not op:
+        return None
+    head = _head(path)
+    return ("DETACHED%s — helm cannot prove removing this room is lossless "
+            "(no branch for `-d` to protect), so it is never auto-reaped. "
+            "Inspect and remove by hand: HEAD %s"
+            % ((" + mid-%s" % op) if op else "",
+               (head or "unreadable")[:12])), head
 
 
 # A room written to seconds ago is not abandoned work. The window is
@@ -1086,16 +1581,10 @@ def gc_scan(root, registered=None):
             # "Clean" answers only whether uncommitted bytes exist. An attached
             # branch gives Git a lossless authority (`branch -d`); a detached or
             # mid-operation room has no equivalent and remains manual-only.
-            op = _operation_state(w["path"])
-            if branch is None or op:
-                head = _head(w["path"])
-                r.update(verdict="keep", manual_only=True, head=head,
-                         why=("DETACHED%s — helm cannot prove removing this "
-                              "room is lossless (no branch for `-d` to protect), "
-                              "so it is never auto-reaped. Inspect and remove by "
-                              "hand: HEAD %s"
-                              % ((" + mid-%s" % op) if op else "",
-                                 (head or "unreadable")[:12])))
+            manual = _manual_only(w["path"], branch)
+            if manual:
+                r.update(verdict="keep", manual_only=True, head=manual[1],
+                         why=manual[0])
             else:
                 dirty = _dirty(w["path"])
                 if dirty:
@@ -1116,17 +1605,24 @@ def gc_scan(root, registered=None):
                     # FOUR states, not two. Landed-as-itself and landed-as-
                     # content both retire and SAY WHICH; UNKNOWN is not a clean
                     # negative and can never authorize deleting room or branch.
-                    anc = _merge_state(root, branch)
+                    # UNSTARTED is a room nobody has committed in yet: kept,
+                    # and not triage — there is no work in it to integrate.
+                    anc, said = _sweep_state(root, w["path"], branch)
                     if anc in RETIRABLE:
                         r.update(verdict="remove", proof=anc,
                                  why="lease-less + clean + %s — remove room + "
-                                     "delete branch" % _proof_word(anc)
+                                     "delete branch" % (said or _proof_word(anc))
                                      + (" after stopping disposable Orca shell pid(s) %s"
                                         % ",".join(disposable) if disposable else ""))
+                    elif anc == UNSTARTED:
+                        r.update(verdict="keep", proof=anc,
+                                 why="lease-less + clean + " + said)
                     else:
                         r.update(verdict="triage", proof=anc,
-                                 why=_branch_triage(root, lane, branch,
-                                                    state=anc))
+                                 why=_branch_triage(
+                                     root, lane, branch,
+                                     state=None if said else anc)
+                                 + ("; " + said if said else ""))
         rows.append(r)
     return rows
 
@@ -1137,7 +1633,6 @@ def gc_enact(root, row):
     Triage rows are report-only. Every destructive premise is re-read."""
     if row["verdict"] in ("keep", "triage"):
         return []
-    v = vcs.backend(root)
     if row["verdict"] == "rescue":
         blocked = _removal_blocker(root, row["path"], row["lane"],
                                    stale_lease_ok=True)
@@ -1159,12 +1654,63 @@ def gc_enact(root, row):
 
     # ASK FIRST WITH THE PANE DEFERRED, so a room blocked for some OTHER reason
     # never costs a pane close. Nothing is waived here: the unrelaxed call
-    # below is the one that authorizes the delete.
+    # in `_remove_room` is the one that authorizes the delete.
     blocked = _removal_blocker(root, row["path"], row["lane"],
                                stale_lease_ok=True, disposable_ok=True,
                                panes_ok=True)
     if blocked:
         return ["SKIPPED %s (%s) — kept" % (row["path"], blocked)]
+    # WHAT THE ROOM HOLDS NOW, read before any premise below is re-read, so a
+    # removal can prove nothing moved in the room after its verdict: the last
+    # read before `git worktree remove` compares against this (task/3436 F4).
+    seen = _room_fingerprint(row["path"])
+    # Re-prove the exact scan premise. Current branch identity alone is not
+    # enough: the branch can advance after scan, or the tree can become dirty.
+    moved = _moved_under_scan(row["path"], row.get("branch"))
+    if moved:
+        return ["SKIPPED %s (%s) — kept" % (row["path"], moved)]
+    if _dirty(row["path"]):
+        return EnactResult(
+            ["SKIPPED %s (became DIRTY after scan) — kept for triage"
+             % row["path"]], reclassified=True)
+    branch = row.get("branch")
+    # THE SAME QUESTION THE SCAN ASKED, asked fresh: a room judged old and
+    # unstarted can be switched or committed in before this line, and a
+    # scan-time age never licenses the removal on its own.
+    anc, said = (_sweep_state(root, row["path"], branch) if branch
+                 else (vcs.UNKNOWN, None))
+    if anc == UNSTARTED:
+        return ["SKIPPED %s (%s) — kept" % (row["path"], said)]
+    if anc not in RETIRABLE:
+        facts = _branch_triage(root, row["lane"], branch or "HEAD",
+                               state=None if said else anc) \
+            + ("; " + said if said else "")
+        changed = ("landedness became UNKNOWN after scan" if anc == vcs.UNKNOWN
+                   else "branch became unlanded after scan")
+        return EnactResult(
+            ["SKIPPED %s (%s) — %s" % (row["path"], changed, facts)],
+            reclassified=True)
+
+    # ONE SECTION FROM THE FIRST DESTRUCTIVE ACT TO THE BRANCH (task/3643).
+    # Everything above only reads. Checked, then acted on outside the claims
+    # lock, a claim could lease the lane in between, find the room still
+    # registered and reuse it, and this call then removed the room that claim
+    # points at; and a section that could not start (the lock held too long,
+    # the ledger unreadable) skipped a room whose pane and shell were already
+    # gone. `_unleased` takes THE claims lock and reads the lease first, so
+    # every destructive act — pane close, shell stop, room removal, branch
+    # retirement — runs after that check passes, and a skip does none.
+    got, refused = _unleased(
+        resource(root, row["lane"]),
+        lambda held: _remove_room(root, row, seen, anc, said, held))
+    if refused:
+        return ["SKIPPED %s (%s) — kept" % (row["path"], refused)]
+    return got
+
+
+def _remove_room(root, row, seen, anc, said, held):
+    """[lines]: gc_enact's destructive acts and the last check before the
+    removal — run only inside `_unleased`, whose claims lock is `held`."""
     # PANE BEFORE SHELL, and both before any removal. The pane is the object
     # the owner SEES; hanging up the shell first would leave a live pane on a
     # room we are about to delete, which is the 2026-07-30 incident in the
@@ -1186,43 +1732,19 @@ def gc_enact(root, row):
                                stale_lease_ok=True)
     if blocked:
         return lines + ["SKIPPED %s (%s) — kept" % (row["path"], blocked)]
-
-    # Re-prove the exact scan premise. Current branch identity alone is not
-    # enough: the branch can advance after scan, or the tree can become dirty.
-    cur, cur_blind = _current_branch(row["path"])
-    if cur != row.get("branch"):
-        # This caller already fails CLOSED on both states — a None never
-        # equals a named branch, so the room is kept either way. What it got
-        # wrong was the SENTENCE: it reported DETACHED for a room whose HEAD
-        # it simply could not read, sending the reader to look for a detach
-        # that never happened.
-        now = cur or ("UNREADABLE (%s)" % cur_blind if cur_blind else "DETACHED")
-        return lines + [
-            "SKIPPED %s (was on %s at scan, now %s — the room moved under "
-            "the scan) — kept" % (row["path"], row.get("branch"), now)]
-    if _dirty(row["path"]):
-        return EnactResult(
-            lines + ["SKIPPED %s (became DIRTY after scan) — kept for triage"
-                     % row["path"]], reclassified=True)
-    branch = row.get("branch")
-    anc = _merge_state(root, branch) if branch else vcs.UNKNOWN
-    if anc not in RETIRABLE:
-        facts = _branch_triage(root, row["lane"], branch or "HEAD", state=anc)
-        changed = ("landedness became UNKNOWN after scan" if anc == vcs.UNKNOWN
-                   else "branch became unlanded after scan")
-        return EnactResult(
-            lines + ["SKIPPED %s (%s) — %s" % (row["path"], changed, facts)],
-            reclassified=True)
-
+    v = vcs.backend(root)
     v.unlock_worktree(root, row["path"])            # stale lease tag, if any
+    moved = _moved_since(row["path"], seen)
+    if moved:
+        return lines + ["SKIPPED %s (%s) — kept" % (row["path"], moved)]
     rc, _out, err = v.remove_worktree(root, row["path"])
     if rc != 0:
         return lines + ["SKIPPED %s (%s)" % (row["path"], err)]
-    lines.append("removed " + row["path"])
     # The branch delete carries the FRESH state (`anc`), never the scan's — and
     # it names which of the two proofs retired the lane, so the decision is
     # auditable after the fact instead of an unexplained disappearance.
-    return lines + _delete_lane_branch(root, row["branch"], anc)
+    return lines + ["removed " + row["path"]] + _delete_lane_branch(
+        root, row["branch"], anc, said, held=held)
 
 
 def gc_orphans(path=None):
@@ -1701,7 +2223,9 @@ _SEAM_CODE = re.compile(
 # property, and leaving them is how round four happens: the next reader finds a
 # ready-made vocabulary for "a well-formed trailer" and rewires it. A discharge
 # is a receipt bound to the composed tree; there is no shape a seat can type.
-_SEAM_OID = re.compile(r"[0-9a-f]{40,64}")
+# A FULL tree oid, 40 hex (sha1) or 64 (sha256) and nothing between: the
+# span 40 to 64 also admitted 41 to 63, which names no object (task/3437).
+_SEAM_OID = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
 def _own_commits(v, root, trunk, branch, cache):

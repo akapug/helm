@@ -32,8 +32,9 @@ so none of this is advice:
     The seat's TMPDIR is routed too (launch_tmpdir), and it is the one target
     that is DISK unconditionally: its contents are unbounded AND unattributable,
     so no reaper can ever take them back off a RAM mount.
-  * REAP (gc/auto_gc) — dead-session scratch, on an EXISTING hook (the Stop
-    hook's silent-mechanical leg), never a new service. The hard part is NOT
+  * REAP (gc/auto_gc) — dead-session scratch, on an EXISTING leg (the
+    resident mechanical leg, stopfacts_resident.mechanical), never a new
+    service. The hard part is NOT
     being overbearing, so the laws are:
       - LIVENESS BEFORE AGE. A tree is reapable only when its session id is
         referenced by NO live same-uid process AND no live cwd sits inside it.
@@ -235,13 +236,28 @@ TIER2_KEEP = ("tasks",)
 #     units keep the ordinary host-pressure ttl.
 #   * RELIEF — biggest first, and a slice's units stop being picked once the
 #     picks already project it under seatceiling.CLEAR_FRACTION.
-# The reading is taken by ANY pass — another seat's Stop hook or a sweep —
-# because the throttled seat never reaches its own. SEAT_THROTTLE_S bounds how
-# often the automatic leg pays for it, fleet-wide.
+# The reading is taken by ANY pass — the resident mechanical leg
+# (stopfacts_resident.mechanical) or a sweep — because the throttled seat can
+# do nothing for itself. SEAT_THROTTLE_S bounds how often the automatic leg
+# pays for it, fleet-wide.
 PRESSURE_UNIT_FLOOR = 32 * MB
 PRESSURE_TOP_CAP = 5        # biggest units a pass names per pressured slice
 SEAT_THROTTLE_S = 60        # minimum gap between automatic seat-plane reads
+# A gap this long between two throttled-and-stalled readings of one spell
+# BREAKS the rescue's run: no reading showed the throttle held across it. The
+# automatic leg reads every one to two minutes, so one missed read still
+# keeps a run; an hour with the leg down does not.
+RUN_GAP_S = 3 * SEAT_THROTTLE_S
 WAKE_BOT = "scratch-gc"     # the author a pressure wake is posted as
+# A spell still open this long reaches the owner's phone, once (notify.py).
+# A spell whose wake reached NO seat proven able to act escalates at once.
+PHONE_ENV = "HELM_SEAT_PRESSURE_PHONE_S"
+PHONE_S = 600
+# The steward: the seat a wake prefers when it must reach one beyond the lead
+# and the integrator. Named by this variable, else the one rostered seat whose
+# name ends STEWARD_SUFFIX; a name that does not resolve names nobody.
+STEWARD_ENV = "HELM_STEWARD_SEAT"
+STEWARD_SUFFIX = "-steward"
 
 # ── an OPAQUE process: what it is allowed to prove ──────────────────────────
 # A same-uid process whose /proc the kernel refuses to describe gives the tier
@@ -2908,12 +2924,17 @@ def _touch_stamp():
 
 
 def auto_gc(now=None):
-    """The automatic leg — called from the Stop hook's silent-mechanical lane
-    (an EXISTING hook; helm adds no service). Returns the summary line or None.
+    """The automatic leg — called from the resident mechanical leg
+    (`stopfacts_resident.mechanical`, once a minute from the console `helm
+    web`; helm adds no service). Returns the summary line or None.
     Ordinary janitor failures never raise and nothing prints; ambient-budget
     Expired propagates so the guard reports incomplete coverage instead of
-    treating unfinished work as clean. The audit trail is pk.event plus doctor's
-    last-pass row. Kill-switch: HELM_SCRATCH_GC=0.
+    treating unfinished work as clean. A pressure survey, reap pass,
+    seat-plane read or `spells` pass that raises is named in the returned
+    line and in one pk.event, with its exception class, so None always means
+    a pass that had nothing to report. The audit trail is pk.event plus
+    doctor's last-pass row.
+    Kill-switch: HELM_SCRATCH_GC=0.
 
     NOT OVERBEARING, in three layers: (1) PRESSURE-GATED on every plane — at
     rest (every mount under WARN_PCT, the host's own memory under its
@@ -2925,9 +2946,11 @@ def auto_gc(now=None):
 
     A PRESSING SEAT OVERRIDES THE HOURLY THROTTLE, because the seat it is
     about cannot run this leg itself: a process stalled in its slice's
-    over-high throttle never reaches its own Stop hook. Any other seat's stop
-    reads every slice, reaps the pressured seat's big unheld scratch, and
-    wakes the people who can act — once per spell (`spells`)."""
+    over-high throttle can do nothing for itself. This leg reads every
+    slice, reaps the pressured seat's big unheld scratch, wakes the seats that
+    can act once per spell, ends a runaway child once the throttle holds, and
+    reaches the owner's phone once when the spell outlives PHONE_S
+    (`spells`)."""
     now = time.time() if now is None else now
     if _off("SCRATCH_GC"):
         return None
@@ -2937,14 +2960,16 @@ def auto_gc(now=None):
     projscope.spend_or_raise("checking scratch gc schedule")
     if not due and not seat_due:
         return None
-    plane = None
+    plane, failed = None, []
     if seat_due:
         try:
             plane = seat_plane()
         except projscope.Expired:
             raise
-        except Exception:
-            plane = None              # the other planes still run
+        except Exception as exc:      # the other planes still run
+            failed.append(_leg_failed(
+                "seat plane", exc, "no seat's slice was read, so the memory "
+                "rescue and owner escalation did not run"))
         _touch_seat_stamp()
     # THE PASS IS OWED ONLY WHEN THERE IS SCRATCH TO ESCALATE. A pressing
     # slice whose sessions own no live tree (a non-claude seat, or a census
@@ -2960,14 +2985,34 @@ def auto_gc(now=None):
             spells(plane, rep, now)
         except projscope.Expired:
             raise
-        except Exception:
-            pass
-    return line
+        except Exception as exc:
+            failed.append(_leg_failed(
+                "spells", exc, "the memory rescue and owner escalation did "
+                "not run"))
+    return "; ".join([line] + failed if line else failed) or None
+
+
+def _leg_failed(what, exc, consequence):
+    """One line and one pk.event for a step of the automatic leg that raised
+    (the pressure survey, the reap pass, the seat-plane read or `spells`),
+    naming the exception class: the leg's answer carries it, so a failed
+    read or rescue never reads as a pass with nothing to do."""
+    text = "helm scratch: %s FAILED (%s) — %s" % (
+        what, exc.__class__.__name__, consequence)
+    pk.event("scratch", "auto-gc", text)
+    return text
 
 
 def _auto_pass(now, due, pressing, plane):
-    """(summary-or-None, report-or-None) — the gated pass itself. Fail-open:
-    an ordinary janitor failure answers (None, None); Expired propagates."""
+    """(line-or-None, report-or-None) — the gated pass itself. Fail-open: an
+    ordinary janitor failure never raises and never gates a stop; Expired
+    propagates.
+
+    A FAILED READ IS NAMED, NEVER None. A survey or a reap pass that raises
+    answers (the `_leg_failed` line naming its exception class, None). It
+    answered (None, None), the same value as a pass at rest, and the
+    resident renders None as "idle": a survey that read nothing reported a
+    quiet, healthy minute."""
     if not due and not pressing:
         return None, None
     host = None
@@ -2983,15 +3028,17 @@ def _auto_pass(now, due, pressing, plane):
             return None, None         # at rest: a survey, and nothing else
     except projscope.Expired:
         raise
-    except Exception:
-        return None, None
+    except Exception as exc:
+        return _leg_failed("pressure survey", exc, "the pressure reading "
+                           "did not finish, so nothing was reaped"), None
     projscope.spend_or_raise("running scratch gc pass")
     try:
         rep = gc(apply=True, now=now, rows=rows, host=host, seats=plane)
     except projscope.Expired:
         raise
-    except Exception:
-        return None, None             # fail-open: a janitor never gates a stop
+    except Exception as exc:          # fail-open: a janitor never gates a stop
+        return _leg_failed("gc pass", exc, "the reap pass did not finish, so "
+                           "the hourly throttle was not stamped"), None
     projscope.spend_or_raise("stamping completed scratch gc pass")
     _touch_stamp()                    # only a completed pass earns the throttle
     return (summary(rep) if rep["reaped"] or rep["tier2_reaped"] else None,
@@ -3031,17 +3078,28 @@ def _touch_seat_stamp():
 # ---------------------------------------------------------------------------
 
 def seat_plane(proc_dir=None, root=None, census=None, sleep=None):
-    """{slices, sessions, slice_seats, trouble} — every seat's own slice, read
+    """{slices, sessions, slice_seats, ...} — every seat's own slice, read
     NOW, and the sessions whose scratch that reading escalates.
 
-      slices       {slice-path: seatceiling.Pressure}, every seat slice with a
-                   live process in it
-      sessions     {session-id: Pressure} for each session of a PRESSING slice
-                   (THROTTLED or NEAR) — the key live scratch trees are named by
-      slice_seats  {slice-path: seat name} for the named seats among them
-      trouble      why the fleet could not be read — the slices are UNKNOWN
-      unmapped     why a pressing slice could not be tied to its sessions —
-                   the slices are known, nothing escalates, the wake still goes
+      slices          {slice-path: seatceiling.Pressure}, every seat slice
+                      with a live process in it
+      sessions        {session-id: Pressure} for each session of a PRESSING
+                      slice (THROTTLED or NEAR) — the key live scratch trees
+                      are named by
+      slice_seats     {slice-path: seat name} for the named seats among them
+      slice_sessions  {slice-path: [session-id]} of each pressing slice's
+                      top-level agents, which the wake resolves against the
+                      roster when the census names no seat
+      loads           {slice-path: seatrescue.Load} for each pressing slice:
+                      what holds its memory, which names the cure
+      agents          frozenset of the census's agent pids, None when the
+                      census failed
+      proc, root      the trees this reading was taken of, which the rescue
+                      re-reads before it acts
+      trouble         why the fleet could not be read — the slices are UNKNOWN
+      unmapped        why a pressing slice could not be tied to its sessions —
+                      the slices are known, nothing escalates, the wake still
+                      goes
 
     THE SESSION IS THE CENSUS'S WORD. The slice comes from each process's own
     cgroup line and the session from session._proc_claude_census, the one sid
@@ -3051,11 +3109,14 @@ def seat_plane(proc_dir=None, root=None, census=None, sleep=None):
     fleet costs one /proc walk and three small reads per slice."""
     from . import seatceiling
     projscope.spend_or_raise("reading seat memory pressure")
-    readings, trouble = seatceiling.fleet_pressure(
-        root=root or seatceiling.CGROUP_ROOT, proc=proc_dir or PROC,
-        sleep=sleep)
+    root = root or seatceiling.CGROUP_ROOT
+    proc_dir = proc_dir or PROC
+    readings, trouble = seatceiling.fleet_pressure(root=root, proc=proc_dir,
+                                                   sleep=sleep)
     plane = {"slices": readings, "sessions": {}, "slice_seats": {},
-             "trouble": trouble, "unmapped": None}
+             "slice_sessions": {}, "loads": {}, "agents": None,
+             "proc": proc_dir, "root": root, "trouble": trouble,
+             "unmapped": None}
     pressing = {path: r for path, r in readings.items()
                 if seatceiling.pressing(r)}
     if not pressing:
@@ -3067,9 +3128,14 @@ def seat_plane(proc_dir=None, root=None, census=None, sleep=None):
     if census.get("listing_failed"):
         plane["unmapped"] = ("the seat census failed, so no session could be "
                              "tied to a pressing slice — nothing escalates")
+        plane["loads"] = {path: _load(r, None, proc_dir)
+                          for path, r in pressing.items()}
         return plane
+    rows = census.get("rows") or ()
+    plane["agents"] = frozenset(row["pid"] for row in rows
+                                if isinstance(row.get("pid"), int))
     by_pid = {pid: r for r in pressing.values() for pid in r.pids}
-    for row in census.get("rows") or ():
+    for row in rows:
         r = by_pid.get(row.get("pid"))
         if r is None:
             continue
@@ -3079,28 +3145,74 @@ def seat_plane(proc_dir=None, root=None, census=None, sleep=None):
         sid = row.get("session")
         if isinstance(sid, str) and _UUID_RE.match(sid):
             plane["sessions"][sid] = r
+            if not row.get("child"):
+                plane["slice_sessions"].setdefault(r.slice, []).append(sid)
+    plane["loads"] = {path: _load(r, plane["agents"], proc_dir)
+                      for path, r in pressing.items()}
     return plane
+
+
+def _load(r, agents, proc_dir):
+    """seatrescue.load, FAIL-OPEN: a load read that raises is a Load that
+    names why, never a plane that did not come back — the wake it feeds must
+    still go."""
+    from . import seatrescue
+    try:
+        return seatrescue.load(r, agents, proc_dir)
+    except projscope.Expired:
+        raise
+    except Exception as exc:          # noqa: BLE001 — the wake still goes
+        return seatrescue.Load(None, None, (), None, None,
+                               "the load read failed (%s)"
+                               % exc.__class__.__name__)
 
 
 def _spells_path():
     return os.path.join(cache_root(), "seat-pressure-spells.json")
 
 
-def spells(plane, rep=None, now=None, post=None, roster=None):
+def phone_after_s():
+    """HELM_SEAT_PRESSURE_PHONE_S as whole seconds; a value that is not a
+    non-negative integer is the default."""
+    raw = (os.environ.get(PHONE_ENV) or "").strip()
+    return int(raw) if raw.isdigit() else PHONE_S
+
+
+def spells(plane, rep=None, now=None, post=None, roster=None, phone=None,
+           kill=None, sleep=None):
     """[(slice, room, mentions)] woken by THIS call — once per SPELL.
 
     A spell OPENS the first time a seat's slice reads THROTTLED or NEAR and
     CLOSES on a reading seatceiling.cleared() accepts, or when the slice is
-    gone. Its opening wakes the seat's lead and the integrator, with the
-    slice's numbers and its biggest scratch; a pass inside the spell wakes
-    nobody. The latch is a small file in the helm cache, rewritten under an
-    flock so two seats' Stop hooks cannot both open one spell.
+    gone. The latch is a small file in the helm cache, rewritten under an
+    flock so two passes cannot both open one spell. Its LIFE, in order:
 
-    AN UNDELIVERED WAKE DOES NOT LATCH — the next read retries it — because a
-    latch that marches past a failed post has dropped the one message the
-    spell was for. A plane read with trouble changes nothing: UNKNOWN neither
-    opens nor closes a spell. `post` and `roster` are injectable seams; the
-    defaults are chat.post and the roster file."""
+      open      the audience is resolved ONCE (`_audience`: the one roster
+                read per spell) and kept on the spell, and ONE wake posts:
+                the slice's numbers, its biggest scratch, and the cure for
+                what actually holds its memory (seatrescue.cure_line).
+                AN UNDELIVERED WAKE STAYS OWED and the next read retries it.
+      hold      each read keeps when the unbroken run of throttled-and-
+                stalled readings began; a reading that is not both ends it,
+                pressing or not, and so does a gap past RUN_GAP_S.
+      rescue    once that run outlives HELM_SEAT_RESCUE_GRACE_S and a child
+                of the seat is the load, seatrescue ends that child — once
+                per spell — and one line says what was ended and why. A
+                signal that did not end it is said once and tried again.
+      escalate  a spell still open after PHONE_S reaches the owner's phone,
+                ONCE, through notify.py — batched into one push per pass —
+                and at once when the wake reached no seat proven able to
+                act (`_wake_targets`). It
+                does not wait on the wake: an alarm about the fleet must not
+                depend on the fleet's chat being reachable. With no phone
+                configured, the room is told so instead, once.
+      close     the entry is dropped; a later spell starts over.
+
+    A plane read with trouble changes nothing: UNKNOWN neither opens nor
+    closes a spell. `post`, `roster`, `phone` (anything with notify's
+    configured() and owner_push()), `kill` and `sleep` are injectable seams;
+    the defaults are chat.post, the roster file, helm.notify, a pidfd signal
+    and time.sleep."""
     import fcntl
     import json
     from . import seatceiling
@@ -3112,7 +3224,8 @@ def spells(plane, rep=None, now=None, post=None, roster=None):
     if not os.path.exists(path) and not _pressing(plane):
         return []
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    woke = []
+    post = _poster(post)
+    woke, due = [], []
     with open(path + ".lock", "a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
@@ -3125,17 +3238,55 @@ def spells(plane, rep=None, now=None, post=None, roster=None):
         by_name = {os.path.basename(sl): r for sl, r in readings.items()}
         for name in list(state):
             r = by_name.get(name)
-            if r is None or seatceiling.cleared(r):
+            if r is None or seatceiling.cleared(r) \
+                    or not isinstance(state[name], dict):
                 del state[name]
         for sl, r in sorted(readings.items()):
             name = os.path.basename(sl)
-            if not seatceiling.pressing(r) or name in state:
+            spell = state.get(name)
+            if spell is None:
+                if not seatceiling.pressing(r):
+                    continue
+                seat, mentions, room, able = _audience(sl, plane, roster)
+                spell = state[name] = {"since": now, "word": r.word,
+                                       "seat": seat, "mentions": mentions,
+                                       "room": room, "able": able,
+                                       "owed": True}
+            # THE RUN IS KEPT ON EVERY READING OF AN OPEN SPELL, before the
+            # pressing filter: a HIGH, HIGH-UNREAD or calm-but-not-cleared
+            # reading is not both halves of the throttle either, and a gap
+            # past RUN_GAP_S with no reading proves nothing held across it.
+            if r.word == seatceiling.THROTTLED and r.stalled:
+                last = spell.get("stalled_at")
+                known = isinstance(last, (int, float)) \
+                    and not isinstance(last, bool)
+                if not known or now - last > RUN_GAP_S:
+                    # Legacy spells have `throttled` but no last observation.
+                    # That is no proof an old run held: start it now.
+                    spell["throttled"] = now
+                else:
+                    spell.setdefault("throttled", now)
+                spell["stalled_at"] = now
+            else:
+                spell.pop("throttled", None)
+            if not seatceiling.pressing(r):
                 continue
-            got = _wake(sl, r, plane, rep, post, roster)
-            if got is None:
-                continue              # undelivered: the next read retries it
-            state[name] = {"since": now, "word": r.word}
-            woke.append(got)
+            if spell.get("owed"):
+                got = _wake(sl, r, plane, rep, post, audience=(
+                    spell.get("seat"), spell.get("mentions") or [],
+                    spell.get("room") or "main",
+                    spell.get("able") if isinstance(spell.get("able"), bool)
+                    else None))
+                if got is not None:
+                    spell.pop("owed", None)
+                    woke.append(got)
+            _rescue_pass(sl, r, plane, spell, now, post, kill, sleep)
+            able = spell.get("able")
+            if not spell.get("escalated") and (
+                    able is False
+                    or now - spell.get("since", now) >= phone_after_s()):
+                due.append((sl, r, spell))
+        _escalate(due, now, post, phone)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(state, fh, sort_keys=True)
@@ -3143,21 +3294,168 @@ def spells(plane, rep=None, now=None, post=None, roster=None):
     return woke
 
 
-def _wake(sl, r, plane, rep, post=None, roster=None):
-    """Post ONE wake for a spell that just opened -> (slice, room, mentions),
-    or None when it could not be delivered."""
+def _poster(post):
+    """The post seam, or chat.post as the pressure bot."""
+    if post is not None:
+        return post
+    from . import chat
+
+    def default(text, room):
+        return chat.post(text, room=room, who=WAKE_BOT, sign=False)
+    return default
+
+
+def _deliver(post, text, room):
+    """Did this post land? A raise or a row with no id is undelivered."""
+    try:
+        written = post(text, room)
+    except Exception:                 # noqa: BLE001 — retried or journaled
+        return False
+    return isinstance(written, dict) and bool(written.get("id"))
+
+
+def _who(seat, sl):
+    """How a post names the pressed seat: `@seat` when it is inert, else the
+    slice's basename."""
+    from . import seats_common
+    return ("@%s" % seat if _inert_seat(seat, seats_common)
+            else os.path.basename(sl))
+
+
+def _rescue_pass(sl, r, plane, spell, now, post, kill=None, sleep=None):
+    """End this slice's runaway child when every gate holds — once per spell —
+    and post the line that says what was ended and why. A refusal is kept on
+    the spell (`held`) so the phone line can name it. A signal that did NOT
+    end the child spends nothing: it is held, said once in the room as COULD
+    NOT END, and the next reading tries again."""
+    from . import pk, seatceiling, seatrescue
+    if spell.get("rescue"):
+        return
+    try:
+        done, why = seatrescue.rescue(
+            r, (plane.get("loads") or {}).get(sl), spell.get("throttled"),
+            now, plane.get("proc") or PROC,
+            plane.get("root") or seatceiling.CGROUP_ROOT, plane.get("agents"),
+            kill=kill, sleep=sleep)
+    except projscope.Expired:
+        raise
+    except Exception as exc:          # noqa: BLE001 — the spell book is kept
+        done, why = None, "the rescue failed (%s)" % exc.__class__.__name__
+    if done is None:
+        spell["held"] = why
+        return
+    if not done.get("ended"):
+        spell["held"] = "pid %d, %s" % (done["pid"], done["how"])
+        if spell.get("unended"):
+            return
+        spell["unended"] = done["pid"]
+        text = seatrescue.unended_line(done, sl, _who(spell.get("seat"), sl))
+    else:
+        spell["rescue"] = done
+        spell.pop("held", None)
+        text = seatrescue.ended_line(done, sl, _who(spell.get("seat"), sl))
+    pk.event("scratch", "seat-rescue", text)
+    mentions = spell.get("mentions") or []
+    _deliver(post, text + ("\n" + " ".join("@" + m for m in mentions)
+                           if mentions else ""),
+             spell.get("room") or "main")
+
+
+def _escalate(due, now, post, phone=None):
+    """ONE phone push for every spell due this pass (notify.py: batch before
+    you call), or, with no phone configured, one line in each spell's room
+    saying the alarm reaches nobody else. A push or post that fails stays
+    owed; the next read retries it."""
+    from . import seatceiling
+    if not due:
+        return
+    if phone is None:
+        from . import notify as phone
+    lines = []
+    for sl, r, spell in due:
+        mins = int((now - spell.get("since", now)) // 60)
+        what = (("ended pid %d (%s)" % (spell["rescue"]["pid"],
+                                        spell["rescue"]["how"]))
+                if spell.get("rescue") else
+                "nothing ended: %s" % (spell.get("held") or "no rescue ran"))
+        lines.append("%s %s at %s of memory.high for %dm, %s; %s" % (
+            _who(spell.get("seat"), sl), r.word,
+            seatceiling._pct(r.current, r.high), mins,
+            "no seat able to act was reached"
+            if spell.get("able") is False else "the wake went unanswered",
+            what))
+    try:
+        on = phone.configured()
+        pushed = on and phone.owner_push(
+            "Seat memory spell still open:\n" + "\n".join(lines),
+            title="helm: a seat's memory is wedged",
+            receipt=("scratch.pressure_push_failed", "seat-memory"))
+    except Exception:                 # noqa: BLE001 — owed, retried next read
+        return
+    if on:
+        if pushed:
+            for _sl, _r, spell in due:
+                spell["escalated"] = now
+        return
+    for (sl, r, spell), line in zip(due, lines):
+        mentions = spell.get("mentions") or []
+        text = ("[helm scratch] still open: %s. No phone is configured "
+                "(HELM_NTFY_TOPIC or Telegram), so this alarm reaches only "
+                "this room.%s" % (line, "\n" + " ".join(
+                    "@" + m for m in mentions) if mentions else ""))
+        if _deliver(post, text, spell.get("room") or "main"):
+            spell["escalated"] = now
+
+
+def _audience(sl, plane, roster=None):
+    """(seat, [mention], room, able) for a spell — THE ONE ROSTER READ a spell
+    pays, taken when it opens and kept on it for every later post. `able` is
+    whether a mention is PROVEN able to act (`_wake_targets`)."""
     from . import seatceiling, seats_common, seats_integrator
-    seat = (plane.get("slice_seats") or {}).get(sl)
     try:
         rows = seats_common.roster() if roster is None else roster
     except Exception:                 # noqa: BLE001 — the integrator then
         rows = {}                     # resolves as unknown and is said so
-    mentions, room = _wake_targets(seat, rows or {}, seats_common,
-                                   seats_integrator)
-    who = ("@%s" % seat if _inert_seat(seat, seats_common)
-           else os.path.basename(sl))
+    rows = rows if isinstance(rows, dict) else {}
+    seat = _slice_seat(sl, plane, rows, seats_common)
+    hot = set()
+    for other, r in (plane.get("slices") or {}).items():
+        if seatceiling.pressing(r):
+            hot.add(os.path.basename(other))
+            name = _slice_seat(other, plane, rows, seats_common)
+            if name:
+                hot.add(name)
+    mentions, room, able = _wake_targets(seat, rows, seats_common,
+                                         seats_integrator, hot)
+    return seat, mentions, room, able
+
+
+def _slice_seat(sl, plane, rows, seats_common):
+    """The seat a slice belongs to, or None. The census's HELM_CHAT_NAME
+    first; else the ONE roster seat whose recorded sessions hold one of the
+    slice's top-level agent sessions. A pid-named slice (a seat launched
+    before it had a name) is the case the second rung exists for."""
+    name = (plane.get("slice_seats") or {}).get(sl)
+    if _inert_seat(name, seats_common):
+        return name
+    sids = set((plane.get("slice_sessions") or {}).get(sl) or ())
+    if not sids:
+        return None
+    owners = {seat for seat, row in rows.items()
+              if isinstance(row, dict) and _inert_seat(seat, seats_common)
+              and sids & set([row.get("session")]
+                             + list(row.get("sessions") or []))}
+    return owners.pop() if len(owners) == 1 else None
+
+
+def _wake(sl, r, plane, rep, post=None, roster=None, audience=None):
+    """Post ONE wake for a spell -> (slice, room, mentions), or None when it
+    could not be delivered. `audience` is the spell's kept (seat, mentions,
+    room, able); without it the roster is read here."""
+    from . import seatceiling, seatrescue
+    seat, mentions, room, able = audience or _audience(sl, plane, roster)
     lines = ["[helm scratch] %s memory cgroup is %s"
-             % (who, seatceiling.pressure_line(r))]
+             % (_who(seat, sl), seatceiling.pressure_line(r))]
     top = pressure_top(rep or {}, sl)
     if top:
         lines.append("Biggest scratch of its sessions: " + "; ".join(
@@ -3168,22 +3466,13 @@ def _wake(sl, r, plane, rep, post=None, roster=None):
         lines.append("None of its sessions' scratch sits on a RAM mount this "
                      "pass could size, so reaping cannot relieve it — the "
                      "memory is elsewhere in the slice.")
-    lines.append("A throttled seat still reads alive on every liveness "
-                 "surface. The no-restart cure is a larger memory.high on "
-                 "that slice: helm store get "
-                 "prior:a-throttled-seat-is-alive-beaconed-and-useless")
+    lines.append(seatrescue.cure_line(r, (plane.get("loads") or {}).get(sl)))
     if mentions:
         lines.append(" ".join("@" + m for m in mentions))
-    if post is None:
-        from . import chat
-
-        def post(text, room):
-            return chat.post(text, room=room, who=WAKE_BOT, sign=False)
-    try:
-        written = post("\n".join(lines), room)
-    except Exception:                 # noqa: BLE001 — retried next read
-        return None
-    if not isinstance(written, dict) or not written.get("id"):
+    if able is False:
+        lines.append("No seat able to act resolved, so this goes to the "
+                     "owner's phone now.")
+    if not _deliver(_poster(post), "\n".join(lines), room):
         return None
     return (sl, room, mentions)
 
@@ -3196,39 +3485,113 @@ def _inert_seat(name, seats_common):
         and bool(seats_common._SEAT_TOKEN.fullmatch(name))
 
 
-def _wake_targets(seat, rows, seats_common, seats_integrator):
-    """([mention], room) for a spell's wake.
+def _wake_targets(seat, rows, seats_common, seats_integrator, hot=()):
+    """([mention], room, able) for a spell's wake: THE SEATS THAT CAN ACT,
+    and whether one of them is PROVEN able to.
 
-    THE INTEGRATOR is resolved from the roster, never spelled. THE LEAD is
-    the freshest seated peer homed in the same team room whose own tree is a
-    checkout rather than a lane room — the seat that owns the room's work.
-    The all-hands room names no lead, so a seat homed there wakes the
-    integrator alone. The post lands in the seat's home room, or `main`."""
-    from .seats_report import presence_of
-    from .seats_roster import last_seen
+    THE PRESSED SEAT CANNOT, so it is never in the list, whatever role it
+    holds. THE INTEGRATOR is resolved from the roster, never spelled. THE
+    LEAD is the freshest present peer homed in the same team room whose own
+    tree is a checkout rather than a lane room, and whose own slice is not
+    pressing; the all-hands room names no lead. The post lands in the seat's
+    home room, or `main`.
+
+    A BACKUP IS ADDED whenever those two may not be able to act: the pressed
+    seat is unnamed (it may BE the integrator), it is the integrator, no lead
+    resolved, or the integrator is unresolved or pressing itself. The backup
+    is a present seat outside the list whose own slice is not pressing
+    (`hot` holds the pressing slices' basenames and seat names), the steward
+    first when the roster has one, else the freshest. The composition this
+    closes: the one alarm about a wedged integrator addressed only that
+    integrator."""
+    from . import seatceiling
     integrator, _why = seats_integrator.integrator_seat(snapshot=rows)
     row = rows.get(seat) if seat else None
     room = (row or {}).get("home_room") if isinstance(row, dict) else None
     room = room if _inert_seat(room, seats_common) else "main"
+
+    def cold(name):
+        return name not in hot and seatceiling.seat_slice_name(name) not in hot
+
     lead = None
     if room != "main":
         best = None
         for name, r in rows.items():
             if name in (seat, integrator) or not isinstance(r, dict) \
-                    or not _inert_seat(name, seats_common):
+                    or not _inert_seat(name, seats_common) or not cold(name):
                 continue
             cwd = r.get("cwd")
             if r.get("home_room") != room or not isinstance(cwd, str) \
                     or "-wt/" in cwd:
                 continue
-            seen = last_seen(name, r)
-            if presence_of(seen) == "absent":
+            seen = _present(name, r)
+            if seen is None:
                 continue
-            if best is None or (seen or 0) > best[0]:
-                best = (seen or 0, name)
+            if best is None or seen > best[0]:
+                best = (seen, name)
         lead = best[1] if best else None
-    return [m for m in (lead, integrator)
-            if m and _inert_seat(m, seats_common)], room
+    able = integrator if integrator and integrator != seat \
+        and cold(integrator) else None
+    backup = None
+    if seat is None or lead is None or able is None:
+        backup = _backup_seat(rows, {seat, lead, integrator}, cold,
+                              seats_common)
+    mentions = [m for m in (lead, integrator, backup)
+                if m and m != seat and _inert_seat(m, seats_common)]
+    # A MENTION IS NOT A SEAT REACHED. The lead and the backup are chosen
+    # present and cold; the integrator is mentioned whatever its state, so it
+    # counts only when it is named apart from the pressed seat, present, and
+    # cold. None of them proven is the spell that rings the phone at once.
+    # An unnamed slice may itself belong to the chosen backup; with no distinct
+    # identity proof that backup is still useful to mention, but cannot prove
+    # the wake reached somebody other than the pressed seat.
+    proven = {lead}
+    if seat is not None:
+        proven.add(backup)
+    irow = rows.get(able) if able else None
+    if seat is not None and isinstance(irow, dict) \
+            and _present(able, irow) is not None:
+        proven.add(able)
+    return mentions, room, any(m in proven for m in mentions)
+
+
+def _present(name, row):
+    """The seat's last-seen time when it is present, else None."""
+    from .seats_report import presence_of
+    from .seats_roster import last_seen
+    seen = last_seen(name, row)
+    return None if presence_of(seen) == "absent" else (seen or 0)
+
+
+def _backup_seat(rows, exclude, cold, seats_common):
+    """The seat a wake adds when the lead and the integrator may not act: a
+    present, rostered, inert seat outside `exclude` whose own slice is not
+    pressing — the steward first, else the freshest (ties by name)."""
+    steward = _steward_seat(rows, seats_common)
+    picks = []
+    for name, r in rows.items():
+        if name in exclude or not isinstance(r, dict) \
+                or not _inert_seat(name, seats_common) or not cold(name):
+            continue
+        seen = _present(name, r)
+        if seen is not None:
+            picks.append((name != steward, -seen, name))
+    return min(picks)[2] if picks else None
+
+
+def _steward_seat(rows, seats_common):
+    """The steward, or None — NEVER a guess. HELM_STEWARD_SEAT names it and
+    must resolve in the roster (a name that does not is a typo, not a request
+    for a substitute); unset, the one rostered seat whose name ends
+    STEWARD_SUFFIX, and two of them name nobody."""
+    want = (os.environ.get(STEWARD_ENV) or "").strip()
+    if want:
+        return want if isinstance(rows.get(want), dict) \
+            and _inert_seat(want, seats_common) else None
+    live = [n for n in rows if isinstance(n, str)
+            and n.endswith(STEWARD_SUFFIX) and isinstance(rows[n], dict)
+            and _inert_seat(n, seats_common)]
+    return live[0] if len(live) == 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -3606,10 +3969,14 @@ def _print_seat_plane(rep):
         print("  seat memory: %d seat slice%s read, none THROTTLED or NEAR "
               "its memory.high" % (len(readings), "s"[:len(readings) != 1]))
         return
+    from . import seatrescue
     for r in hot:
         seat = (plane.get("slice_seats") or {}).get(r.slice)
         print("  seat memory: %s%s" % ("@%s " % seat if seat else "",
                                        seatceiling.pressure_line(r)))
+        if seatceiling.pressing(r):
+            print("    %s" % seatrescue.cure_line(
+                r, (plane.get("loads") or {}).get(r.slice)))
         for path, size, capped, verdict in pressure_top(rep, r.slice):
             print("    %9s  %s  (%s)" % ((">=" if capped else "") +
                                          _human(size), path, verdict))

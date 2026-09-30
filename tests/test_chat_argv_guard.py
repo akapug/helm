@@ -533,7 +533,9 @@ class HookPlumbingTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("evidence would be mangled", out)
         self.assertIn("evidence=$(cat <<'EOF'", out)
-        self.assertIn('--fix "$evidence"', out)
+        self.assertIn('--fix --finding-count N --prior-relation RELATION', out)
+        self.assertIn('"$evidence"', out)
+        self.assertIn('--patch-tip or --no-patch-because', out)
         self.assertNotIn("git commit -F", out)
 
     def test_a_clean_bash_call_passes(self):
@@ -637,17 +639,22 @@ class SpecWiringTest(unittest.TestCase):
         from helm import hooks
         return next(s for s in hooks.SPECS if s["name"] == "argv-guard")
 
-    def test_it_is_a_GATE_on_PreToolUse_matching_Bash_Monitor_Write_Edit_and_Agent(self):
+    def test_it_is_a_GATE_on_PreToolUse_matching_Bash_Monitor_Write_Edit_NotebookEdit_and_Agent(self):
         """Monitor joined Bash for task/2542: a subagent arms the seat's
         beacon with a Monitor call, and a Bash-only matcher never ran the
         guard for one. Write and Edit joined for task/2566: a workflow file
         lands through the Write tool, which a Bash|Monitor group never
         showed to any helm hook. Agent joined for the agent-model rung: a
         group that does not name it never shows an Agent call to the guard,
-        so the refusal would exist in code and fire nowhere."""
+        so the refusal would exist in code and fire nowhere. NotebookEdit
+        joined for task/3301: the file-tool branch already reads
+        notebook_path, and Claude Code never routes the tool unless the
+        matcher names it."""
         s = self.spec()
         self.assertEqual(s["event"], "PreToolUse")
-        self.assertEqual(s["matcher"], "Bash|Monitor|Write|Edit|Agent")
+        self.assertEqual(
+            s["matcher"], "Bash|Monitor|Write|Edit|NotebookEdit|Agent")
+        self.assertIn("NotebookEdit", s["matcher"].split("|"))
         self.assertIn("Agent", s["matcher"].split("|"))
         self.assertTrue(s.get("gate"),
                         "without gate=True the rc-2 block is swallowed by "
@@ -762,7 +769,10 @@ class AgentModelRungTest(unittest.TestCase):
     def test_an_agent_prompt_is_never_read_as_a_shell_command(self):
         """The Agent rung stands alone: a prompt is prose for a subagent, so
         text that every Bash rung refuses passes when it is an Agent's
-        prompt, from the main thread and from a subagent alike."""
+        prompt, from the main thread and from a subagent alike: the main
+        thread's passes, and a subagent's meets only the nested-spawn refusal
+        (task/1775), never a Bash rung's cure."""
+        from helm import actors
         texts = ('helm chat post "never run `git clean`"',
                  "gh " + "workflow" + " run ci.yml",
                  "helm chat " + "wait --seat s1 " + "--fol" + "low")
@@ -779,11 +789,16 @@ class AgentModelRungTest(unittest.TestCase):
                 rc, _o, err = self.guard({"command": text}, tool="Bash",
                                          agent_id="a1b2")
                 self.assertEqual(rc, 2, err)
-                for agent_id in (None, "a1b2"):
-                    rc, out, err = self.guard(
-                        self.agent_input(prompt=text, command=text),
-                        agent_id=agent_id)
-                    self.assertEqual((rc, out, err), (0, "", ""))
+                rc, out, err = self.guard(
+                    self.agent_input(prompt=text, command=text))
+                self.assertEqual((rc, out, err), (0, "", ""))
+                rc, out, err = self.guard(
+                    self.agent_input(prompt=text, command=text),
+                    agent_id="a1b2")
+                self.assertEqual((rc, out), (2, ""), err)
+                self.assertEqual(
+                    err.strip(), "[helm argv-guard] BLOCKED: "
+                    + actors.sidechain_spawn_refusal())
 
     def test_a_model_key_on_another_tool_is_judged_by_that_tools_rungs(self):  # noqa: VACUOUS_ASSERTION — the git-commit arm is an unconditional rc-2 refusal from the same hook entry naming its Bash cure, so each absence is that entry declining on its own input
         """A `model` key means something only on an Agent call. A Bash call
@@ -846,15 +861,18 @@ class AgentModelRungTest(unittest.TestCase):
 
 
 class NestedSpawnRungTest(unittest.TestCase):
-    """task/2971: the argv-guard is the WRONG seam for the
-    nested-spawn reflex, and says nothing at a subagent's Agent call.
+    """task/1775: a subagent's Agent call is REFUSED, mechanically.
 
-    PreToolUse additionalContext reaches the model on its NEXT step, after
-    the Agent call it rode has already run, so a steer said here arrives one
-    spawn late by construction. The steer rides SubagentStart instead
-    (helm/saguide.py, tests/test_saguide.py), which the harness hands to the
-    subagent before its first step; the denial of the call itself is
-    task/1775's.
+    Measured on another project: a bounded implementation subagent spawned
+    and re-spawned eight to ten nested review agents through coordinator stop
+    messages; TaskStop killed them and the spawner minted more. Advice does
+    not bind under load, so the rung is a deny, not a steer: a payload
+    carrying agent_id (actors.sidechain_agent, the SIDECHAIN_RULE signal) on
+    an Agent call exits 2 and names the contract and the cure.
+
+    The nested-spawn REFLEX still rides SubagentStart (task/2971,
+    helm/saguide.py): a PreToolUse line reaches the model after its call has
+    run, so this rung says nothing advisory, on either thread.
 
     Each arm gets its own home, so the reflex store never leaks between arms
     or into the module's shared home."""
@@ -864,7 +882,8 @@ class NestedSpawnRungTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-nested-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        prior = {k: _os.environ.get(k) for k in ("HELM_HOME", "HELM_CHAT_DIR")}
+        prior = {k: _os.environ.get(k)
+                 for k in ("HELM_HOME", "HELM_CHAT_DIR", "HELM_CLAUDE_DIR")}
 
         def restore():
             for k, v in prior.items():
@@ -874,6 +893,7 @@ class NestedSpawnRungTest(unittest.TestCase):
                     _os.environ[k] = v
         self.addCleanup(restore)
         _os.environ["HELM_HOME"] = _os.path.join(self.tmp, "helm")
+        _os.environ["HELM_CLAUDE_DIR"] = _os.path.join(self.tmp, "claude")
         _os.environ.pop("HELM_CHAT_DIR", None)
         _os.makedirs(chat.chat_dir(), exist_ok=True)
 
@@ -889,14 +909,40 @@ class NestedSpawnRungTest(unittest.TestCase):
                         "subagent_type": "general-purpose"}, **tool_input),
             agent_id=agent_id)
 
-    def test_a_subagents_agent_call_says_nothing(self):
+    def test_a_main_thread_agent_call_passes_and_says_nothing(self):
         from helm import reflex
         self.plant()
         # CONTROL: the reflex is live and renders, so the silence below is
         # the seam declining and not an empty store.
         self.assertEqual(reflex.spawn_steers(),
                          [("subagent-fanout", "REFLEX: " + self.STEER)])
-        for agent_id in ("afixture01", None):
+        self.assertEqual(self.guard(agent_id=None), (0, "", ""))
+
+    def test_a_subagents_agent_call_is_refused_with_the_contract_and_cure(self):
+        self.plant()
+        rc, out, err = self.guard(agent_id="afixture01")
+        self.assertEqual(rc, 2, err)
+        self.assertEqual(out, "")                   # no advisory envelope
+        self.assertIn("[helm argv-guard] BLOCKED: Agent called from a "
+                      "subagent", err)
+        self.assertIn("bounded", err)               # the contract
+        self.assertIn("your parent", err)           # the cure
+        self.assertIn("agent()", err)               # the Workflow's own door
+        self.assertNotIn(self.STEER, err)           # the reflex stays put
+        # A build-shaped prompt is refused the same way: the steer below is
+        # the main thread's, and a refused call never carries advice.
+        rc, out, err = self.guard(agent_id="afixture01",
+                                  prompt="implement it and commit")
+        self.assertEqual(rc, 2, err)
+        self.assertEqual(out, "")
+
+    def test_an_unreadable_agent_id_is_not_a_sidechain(self):
+        """actors.sidechain_agent: missing evidence is not evidence, so an
+        empty or non-string agent_id takes the main thread's path (exit 0),
+        the fail-open law this handler keeps for every unreadable payload."""
+        rc, _out, err = self.guard(agent_id="afixture01")
+        self.assertEqual(rc, 2, err)                        # control
+        for agent_id in ("", "   ", 5, ["a"]):
             with self.subTest(agent_id=agent_id):
                 self.assertEqual(self.guard(agent_id=agent_id), (0, "", ""))
 
@@ -906,6 +952,149 @@ class NestedSpawnRungTest(unittest.TestCase):
         self.assertEqual(rc, 2, err)
         self.assertEqual(out, "")
         self.assertIn("model='opus'", err)
+        self.assertNotIn("from a subagent", err)
+
+    def test_the_moment_row_is_live(self):
+        from helm import moments
+        row = moments.BY_ID["act.spawn.nested"]
+        self.assertEqual(row.status, moments.LIVE)
+        self.assertIn("argv-guard", row.form)
+
+
+def _write_transcript(root, session, model, stamp="2026-09-29T10:00:00.000Z"):
+    """One harness-shaped main transcript whose newest turn ran `model`,
+    under `<root>/projects/<proj>/<session>.jsonl`; returns its path."""
+    directory = _os.path.join(root, "projects", "proj")
+    _os.makedirs(directory, exist_ok=True)
+    path = _os.path.join(directory, "%s.jsonl" % session)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(
+            {"type": "assistant", "sessionId": session, "timestamp": stamp,
+             "message": {"role": "assistant", "model": model}}) + "\n")
+    return path
+
+
+class FableBuildSteerTest(unittest.TestCase):
+    """task/2574: a Fable seat that hands BUILD work to the Agent tool is
+    told, on the pass path, that the subagent runs as Fable and the build
+    belongs in an opus Workflow. A steer, never a refusal: exit 0 and one
+    line in the PreToolUse envelope, latched once per session.
+
+    The seat's model is read the way the approval tier reads a native
+    seat's: native_turn.native_turn_model on the payload's session, from the
+    transcript the payload names (routing: the newest turn). Nothing new
+    reads the catalog."""
+
+    SESSION = "sess-fable-build-0001"
+    BUILD = "Claim the lane, implement the cure, commit it and run fab test."
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-fablebuild-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        prior = {k: _os.environ.get(k)
+                 for k in ("HELM_HOME", "HELM_CHAT_DIR", "HELM_CLAUDE_DIR")}
+
+        def restore():
+            for k, v in prior.items():
+                if v is None:
+                    _os.environ.pop(k, None)
+                else:
+                    _os.environ[k] = v
+        self.addCleanup(restore)
+        _os.environ["HELM_HOME"] = _os.path.join(self.tmp, "helm")
+        # The default root must never be the operator's ~/.claude.
+        _os.environ["HELM_CLAUDE_DIR"] = _os.path.join(self.tmp, "default")
+        _os.environ.pop("HELM_CHAT_DIR", None)
+        _os.makedirs(chat.chat_dir(), exist_ok=True)
+        self.root = _os.path.join(self.tmp, "claude")
+
+    def guard(self, prompt, model="claude-fable-1", session=None,
+              agent_id=None, tool_input=None):
+        session = session or self.SESSION
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Agent",
+                   "session_id": session, "cwd": "/tmp/repo",
+                   "tool_input": tool_input if tool_input is not None else {
+                       "description": "a delegated slice", "prompt": prompt,
+                       "subagent_type": "general-purpose"}}
+        if model is not None:
+            payload["transcript_path"] = _write_transcript(
+                self.root, session, model)
+        if agent_id is not None:
+            payload["agent_id"] = agent_id
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = chat.cmd_argv_guard([])
+        return rc, out.getvalue(), err.getvalue()
+
+    def context(self, out):
+        doc = json.loads(out)
+        hso = doc["hookSpecificOutput"]
+        self.assertEqual(hso["hookEventName"], "PreToolUse")
+        return hso["additionalContext"]
+
+    def test_a_fable_seats_build_delegation_is_steered_to_an_opus_workflow(self):
+        rc, out, err = self.guard(self.BUILD)
+        self.assertEqual(rc, 0, err)
+        line = self.context(out)
+        self.assertTrue(line.startswith("[helm steer] "), line)
+        self.assertIn("fable", line)
+        self.assertIn("Workflow", line)
+        self.assertIn("model: 'opus'", line)
+        self.assertIn(chat.FABLE_BUILD_PREMISE, line)
+        # LATCHED once per session, like every pass-path steer.
+        self.assertEqual(self.guard(self.BUILD), (0, "", ""))
+
+    def test_each_build_word_trips_it_alone(self):
+        for n, prompt in enumerate((
+                "helm work claim the lane", "commit the change",
+                "write the cure", "implement the reader",
+                "write the RED arms first", "then fab test the modules")):
+            with self.subTest(prompt=prompt):
+                rc, out, err = self.guard(prompt, session="sess-word-%04d" % n)
+                self.assertEqual(rc, 0, err)
+                self.assertIn("opus", self.context(out))
+
+    def test_a_fable_seats_read_only_delegation_gets_nothing(self):
+        rc, out, err = self.guard(self.BUILD, session="sess-control-0001")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(out)                                # control
+        self.assertEqual(self.guard("Read helm/chat.py and report what the "
+                                    "argv-guard refuses."), (0, "", ""))
+
+    def test_another_models_seat_gets_nothing(self):
+        rc, out, _err = self.guard(self.BUILD, session="sess-control-0002")
+        self.assertTrue(out)                                # control
+        for n, model in enumerate(("claude-opus-5-5", "claude-sonnet-5",
+                                   "gpt-5.5")):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    self.guard(self.BUILD, model=model,
+                               session="sess-other-%04d" % n), (0, "", ""))
+
+    def test_an_unread_model_is_no_steer(self):
+        """No transcript, or none the reader can place: the model is not
+        known, and an unknown model is never read as Fable."""
+        self.assertEqual(self.guard(self.BUILD, model=None), (0, "", ""))
+
+    def test_a_subagent_is_refused_before_any_steer(self):
+        rc, out, err = self.guard(self.BUILD, agent_id="afixture02")
+        self.assertEqual(rc, 2, err)
+        self.assertEqual(out, "")
+        self.assertIn("from a subagent", err)
+
+    def test_a_malformed_prompt_fails_open_and_quiet(self):
+        rc, out, _err = self.guard(self.BUILD, session="sess-control-0003")
+        self.assertTrue(out)                                # control
+        for n, tool_input in enumerate((
+                {"prompt": 5}, {"prompt": ["commit"]}, {"prompt": None},
+                {"description": "commit"}, ["prompt", "commit"],
+                "prompt=commit")):
+            with self.subTest(tool_input=tool_input):
+                self.assertEqual(
+                    self.guard(None, tool_input=tool_input,
+                               session="sess-bad-%04d" % n), (0, "", ""))
 
 
 class GitHubActionsRungTest(unittest.TestCase):
@@ -992,13 +1181,351 @@ class GitHubActionsRungTest(unittest.TestCase):
     def test_the_incident_command_is_refused_with_the_rule_and_the_override(self):  # noqa: VACUOUS_ASSERTION — assert_refused runs first and unconditionally on the same hook output (rc 2 plus four required substrings), so an empty observable fails there before any allow control is reached
         out = self.assert_refused(
             "gh api -X PUT repos/o/r/actions/permissions -F enabled=true")
-        self.assertIn("/actions at character", out)
+        self.assertIn("repos/*/*/actions at character", out)
         self.assertIn("ci-runs-on-the-local-fabric-never-github-actions", out)
         self.assertIn("local fabric", out)
         # WHERE the override must stand is the load-bearing half — anywhere
         # else in the command grants nothing — so the arm pins that the
         # refusal still SAYS where, not the capitals it once said it in.
         self.assertIn("first in the command", out)
+
+    def test_the_GitHub_REST_shape_matrix_refuses_only_GitHub(self):  # noqa: VACUOUS_ASSERTION — every fixed matrix member is asserted through the shipped hook, followed by explicit same-surface allow controls
+        refused = (
+            "gh api -X PUT repos/o/r/actions/permissions",
+            "gh api repos/o/r/actions/runs/123/rerun -X POST",
+            "gh api orgs/o/actions/permissions -X PUT",
+            "curl -X POST https://api.github.com/repos/o/r/actions/"
+            "workflows/1/dispatches",
+            "curl -X POST https://ghe.example.com/api/v3/repos/o/r/actions/"
+            "runs/1/rerun",
+            "gh api repositories/123/actions/permissions -X PUT",
+            "gh api enterprises/acme/actions/permissions -X PUT",
+            "gh api -X PUT repos/$O/$R/actions/permissions",
+            "gh api -X PUT repos/o/r/act$(echo ions)/permissions",
+            'gh api -X PUT "repos/${O}/${R}"/actions/permissions',
+            "printf x > .github/actions/build/action.yml",
+            "cp action.yml .github/actions/build/action.yml",
+            "cat > .github/actions/build/action.yml <<'EOF'\nname: x\nEOF",
+        )
+        for command in refused:
+            with self.subTest(command=command):
+                self.assert_refused(command)
+
+        allowed = (
+            "gh api repos/o/r/actions/runs",
+            "curl -X POST https://api.digitalocean.com/v2/droplets/42/actions "
+            "-d '{\"type\":\"snapshot\"}'",
+            "curl https://api.digitalocean.com/v2/actions/99",
+            'helm chat post "the guard fires on /actions in prose"',
+            'python3 -c "print(\'/actions\')"',
+        )
+        for command in allowed:
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+        self.assert_allowed(
+            self.OVERRIDE
+            + " gh api -X PUT repos/o/r/actions/permissions")
+
+    def test_an_owner_slot_takes_every_spelling_GitHub_routes(self):  # noqa: VACUOUS_ASSERTION — every member asserts rc 2 through the shipped hook, then explicit rc 0 allow controls on the same surface
+        """The owner slots of the shaped REST rows (task/3312 review). A slot
+        of name characters admitted the incident act eleven ways, each one
+        refused on the trunk this lane started from: gh's `:owner`
+        placeholder (gh 2.46 expands it), a percent-encoded owner (GitHub
+        decodes it: 401, not 404), ONE value holding owner and repository,
+        substitutions standing whole in a slot (the expansion reading
+        deletes them and leaves the slot empty), parameter operators, and
+        `organizations/<id>`, the numeric alias GitHub's pagination uses."""
+        for command in (
+                "gh api -X PUT repos/:owner/:repo/actions/permissions",
+                "curl -X PUT https://api.github.com/repos/%6F/r/actions/"
+                "permissions",
+                "gh api -X PUT repos/$GITHUB_REPOSITORY/actions/permissions",
+                "gh api -X PUT repos/$(gh repo view --json nameWithOwner -q "
+                ".nameWithOwner)/actions/permissions",
+                "gh api -X PUT repos/$(whoami)/r/actions/permissions",
+                "gh api -X PUT repos/`whoami`/r/actions/permissions",
+                "gh api -X PUT repos/o/$(basename $PWD)/actions/permissions",
+                "gh api -X PUT repos/${O:-o}/r/actions/permissions",
+                "gh api -X PUT repos/o/${R%.git}/actions/permissions",
+                "gh api -X PUT orgs/$(cat org.txt)/actions/permissions",
+                "gh api -X PUT repos/$O/$R/act${x}ions/permissions",
+                "gh api -X PUT organizations/9919/actions/permissions"):
+            with self.subTest(command=command):
+                self.assert_refused(command)
+        # THE SAME SPELLINGS WHERE ONLY THE SHAPE CAN ANSWER. Every arm above
+        # also names GitHub (`gh api`, or the API host), so since the
+        # integrator's ruling a bare-segment row refuses each of them whatever
+        # the owner slot reads: with the slot narrowed back to name
+        # characters and no expanded alternative, all twelve stayed refused
+        # (measured on the task/3312 re-read). A client that is not gh, under
+        # an API base from a runtime value, is the command where the shape
+        # alone decides, and each of these is a real act there (Octokit
+        # fills `{owner}` itself and names no host). So each must be refused
+        # AS a shaped row.
+        for command in (
+                'curl -X PUT "$BASE/repos/%6F/r/actions/permissions"',
+                'curl -X PUT "$BASE/repos/$GITHUB_REPOSITORY/actions/'
+                'permissions"',
+                'curl -X PUT "$BASE/repos/$(gh repo view --json nameWithOwner '
+                '-q .nameWithOwner)/actions/permissions"',
+                'curl -X PUT "$BASE/repos/$(whoami)/r/actions/permissions"',
+                'curl -X PUT "$BASE/repos/`whoami`/r/actions/permissions"',
+                'curl -X PUT "$BASE/repos/o/$(basename $PWD)/actions/'
+                'permissions"',
+                'curl -X PUT "$BASE/repos/${O:-o}/r/actions/permissions"',
+                'curl -X PUT "$BASE/repos/o/${R%.git}/actions/permissions"',
+                'curl -X PUT "$BASE/orgs/$(cat org.txt)/actions/permissions"',
+                'curl -X PUT "$BASE/repos/$O/$R/act${x}ions/permissions"',
+                'curl -X PUT "$BASE/rep${x}os/o/r/actions/permissions"',
+                "node -e \"o.request('PUT /repos/{owner}/{repo}/actions/"
+                "permissions')\""):
+            with self.subTest(command=command):
+                self.assertIn("/*/actions at character",
+                              self.assert_refused(command))
+        # CONTROLS: a literal single segment is a repository named
+        # `actions` and no shape takes it, and DigitalOcean's runtime ids
+        # stay DigitalOcean's. (Through `gh api` the same repository path is
+        # refused by the bare-segment row the integrator's ruling added:
+        # gh talks to GitHub alone, so that row does not ask which segment.)
+        self.assert_refused("gh api -X PATCH repos/o/actions -f description=x")
+        for command in (
+                "curl -X PATCH https://git.example.com/repos/o/actions",
+                "curl -X POST https://api.digitalocean.com/v2/droplets/$ID/"
+                "actions",
+                "curl -X POST https://api.digitalocean.com/v2/droplets/"
+                "$(cat id)/actions"):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+
+    def test_the_bare_segment_is_GitHubs_where_the_command_names_GitHub(self):  # noqa: VACUOUS_ASSERTION — every refuse member asserts rc 2 through the shipped hook, every allow member rc 0, and the named-row set is compared whole, so an unreadable table fails
+        """task/3312, the integrator's ruling. A runtime value can supply the
+        WHOLE owner root, and then no shaped row stands. gh talks to no other
+        host, so the bare segment in a `gh api` call that is not a read is
+        GitHub's; and so is the bare segment in a command that names
+        GitHub's API host or a GHE `/api/v3` base. Those rows carry NO
+        anchor, because the host beside a token variable is an ordinary
+        read, and they count in every body an anchored row does.
+
+        THE RESIDUAL, pinned so it cannot quietly grow or be forgotten: a
+        client that is not gh, whose whole root is a runtime value, in a
+        command that names no GitHub host, passes — its text is the
+        DigitalOcean act this lane exists to allow."""
+        # the behaviour first and in subtests, so the arms still run and
+        # redden where the table has no such rows
+        for command in (
+                'gh api -X PUT "$P/actions/permissions" -F enabled=true',
+                'gh api -X PUT "$(gh repo view --json url -q .url)/actions/'
+                'permissions"',
+                'API=https://api.github.com/repos/o/r; curl -X PUT '
+                '"$API/actions/permissions"',
+                'API=https://ghe.example.com/api/v3/repos/o/r; curl -X PUT '
+                '"$API/actions/permissions"',
+                'GHE=https://ghe.example.com/api/v3; curl -X PUT '
+                '"$GHE/$R/actions/permissions"',
+                'wget --method=PUT "https://api.github.com/$R/actions/'
+                'permissions"',
+                # a body whose program the rung does not know: these rows
+                # are not the ordinary words that body forgives
+                "docker exec -i box sh <<'EOF'\n"
+                'gh api -X PUT "$P/actions/permissions"\nEOF'):
+            with self.subTest(command=command):
+                self.assert_refused(command)
+        for command in (
+                "curl -X POST https://api.digitalocean.com/v2/droplets/42/"
+                "actions -d '{\"type\":\"snapshot\"}'",
+                "curl https://api.digitalocean.com/v2/actions/99",
+                'curl -X POST "$DO_API/droplets/$ID/actions"',
+                'helm chat post "the guard fires on /actions in prose"',
+                "helm chat post 'gh api -X PUT \"$P/actions/permissions\" is "
+                "refused now'",
+                "python3 -c \"print('/actions')\"",
+                "ls src/actions/user.js",
+                "gh api repos/o/r/actions/runs",
+                'gh api "$P/actions/runs"',
+                'gh api --method GET "$P/actions/runs" --jq .total_count',
+                'curl -H "Authorization: token $T" https://api.github.com/user',
+                "cat <<'EOF' > notes.md\n"
+                'gh api -X PUT "$P/actions/permissions"\nEOF',
+                self.OVERRIDE + ' gh api -X PUT "$P/actions/permissions"',
+                # THE RESIDUAL
+                'curl -X PUT "$API/actions/permissions"'):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+        self.assertIn("gh api /actions at character 0", self.hook(
+            "Bash", command='gh api -X PUT "$P/actions/permissions"')[1])
+        self.assertEqual(sorted(getattr(chat, "_GITHUB_NAMED_ROWS", ())),
+                         [".ghe.com /actions", "/api/v3 /actions",
+                          "api.github.com /actions", "gh api /actions"])
+        for spelling, pieces, _says in chat._ACTIONS_ROWS:
+            if spelling in chat._GITHUB_NAMED_ROWS:
+                self.assertFalse(any(a for _t, _m, a in pieces), spelling)
+
+    def test_a_piece_the_text_holds_clearly_claims_no_ambiguous_span(self):  # noqa: VACUOUS_ASSERTION — every refuse member asserts rc 2 through the shipped hook and names its row, the allow control asserts rc 0, and the filter is asserted directly on span stand-ins in both directions after its existence is asserted
+        """A cross-model read of task/3312, its one BLOCKING finding. The
+        rows that name GitHub put `/actions` beside a piece that begins with
+        `a`, and the mark may FINISH a piece: `/a<mark>` is `/actions`, and
+        its `a<mark>` is `api`. The row rule drops a span two pieces of one
+        row can read, so the incident act with a runtime root and the noun
+        assembled around an expansion that ends the word — `gh api -X PUT
+        "$P/a$(echo ctions)/permissions"` — lost its `/actions` hit to the
+        `api` the mark could also spell, and no anchor stood behind the row:
+        the lane admitted it, and the trunk it started from refused it.
+
+        THE CURE: a piece the text holds CLEARLY (`api` typed after `gh`)
+        claims no ambiguous span (`_clear_pieces`). One ambiguous word with
+        no clear hit for either piece is still neither (task/2855, its
+        witness pinned by test_ONE_SPAN_is_never_TWO_PIECES_of_a_row)."""
+        for command, row in (
+                ('gh api -X PUT "$P/a$(echo ctions)/permissions"',
+                 "gh api /actions"),
+                ('gh api -X PUT "$P/a$X/permissions" -F enabled=true',
+                 "gh api /actions"),
+                ('gh api -X PUT "$P/a`echo ctions`/permissions"',
+                 "gh api /actions"),
+                ('curl -X PUT "https://api.github.com/$ROOT/a$(echo ctions)/'
+                 'permissions"', "api.github.com /actions"),
+                ('GHE=https://ghe.example.com/api/v3; curl -X PUT '
+                 '"$GHE/$R/a$(echo ctions)/permissions"',
+                 "/api/v3 /actions")):
+            with self.subTest(command=command):
+                self.assertIn(row + " at character",
+                              self.assert_refused(command))
+        # the same spelling of the DigitalOcean act names no GitHub: allowed
+        self.assert_allowed(
+            'curl -X POST "$DO_API/droplets/$ID/a$(echo ctions)"')
+        # the filter itself: a settled piece frees its ambiguous span, an
+        # unsettled one keeps claiming it, and one span is never two pieces
+        clear = getattr(chat, "_clear_pieces", None)
+        self.assertIsNotNone(clear, "no filter settles a piece the text "
+                             "holds clearly")
+
+        def spans(*bounds):
+            return [self._Span(s, e) for s, e in bounds]
+
+        def bounds(kept):
+            return [[(h._s, h._e) for h in hits] for hits in kept]
+        self.assertEqual(bounds(clear([spans((0, 3)), spans((0, 3))])),
+                         [[], []])
+        self.assertEqual(bounds(clear([spans((0, 3), (10, 12)),
+                                       spans((0, 3))])),
+                         [[(10, 12)], [(0, 3)]])
+        self.assertEqual(bounds(clear([spans((0, 3)), spans((0, 3)),
+                                       spans((20, 21))])),
+                         [[], [], [(20, 21)]])
+        self.assertEqual(bounds(clear([spans((0, 3), (10, 12)),
+                                       spans((0, 3)), spans((1, 2))])),
+                         [[(10, 12)], [], []])
+
+    # THE THREE SHAPES the same cross-model read measured refused at the lane
+    # AND on its trunk: the rows that name GitHub are word SETS over the
+    # whole invocation text, as every row is, so a GitHub word anywhere on
+    # the line stands beside a segment anywhere else on it
+    NAMED_ROW_SETS = (
+        ("gh api user --jq .login; git mv src/actions src/handlers",
+         "gh api /actions"),
+        ('gh pr list; curl -X POST "$API/droplets/$ID/actions"',
+         "gh api /actions"),
+        ('curl -H "Authorization: token $T" https://api.github.com/user; '
+         'curl -X POST "$DO/droplets/1/actions"', "api.github.com /actions"))
+
+    def test_a_row_that_names_GitHub_is_a_set_and_the_docs_say_so(self):  # noqa: VACUOUS_ASSERTION — every member asserts rc 2 through the shipped hook and names its row before either document is read, and each document assertion is an unconditional assertIn on text read from disk
+        """A cross-model read of task/3312, finding 2. The docs said the
+        bare segment is refused "in a `gh api` call that is not a read, and
+        in a command that names `api.github.com`", which reads as a phrase
+        about ONE call. The rows are sets: a gh api READ elsewhere on the
+        line (its arguments are cut, the words `gh` and `api` stay), a `gh`
+        command beside a DigitalOcean act whose root variable is spelled
+        `$API`, and a token read of the API host beside a DigitalOcean act
+        are each refused. Trunk refused all three too, so this is not a
+        regression; it is the residual stated smaller than it is. The arm
+        pins both halves: the rung refuses each shape, and docs/HOOKS.md
+        spells each one where it states the rule, and CHANGELOG.md states
+        the rule as a set."""
+        for command, row in self.NAMED_ROW_SETS:
+            with self.subTest(command=command):
+                self.assertIn(row + " at character",
+                              self.assert_refused(command))
+        root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        with open(_os.path.join(root, "docs", "HOOKS.md"),
+                  encoding="utf-8") as fh:
+            hooks = fh.read()
+        with open(_os.path.join(root, "CHANGELOG.md"),
+                  encoding="utf-8") as fh:
+            changelog = " ".join(fh.read().split())
+        for command, _row in self.NAMED_ROW_SETS:
+            with self.subTest(document="docs/HOOKS.md", command=command):
+                self.assertIn("`%s`" % command, hooks)
+        self.assertIn("a set of words over the WHOLE command", changelog)
+
+    def test_a_host_under_GHE_com_names_GitHub(self):  # noqa: VACUOUS_ASSERTION — every refuse member asserts rc 2 through the shipped hook and names the row, every allow member rc 0
+        """A cross-model read of task/3312, finding 3. GitHub Enterprise
+        Cloud with data residency serves its REST API at
+        `api.<subdomain>.ghe.com`, and every host under `ghe.com` is
+        GitHub's, so a command that names one names GitHub exactly as one
+        naming `api.github.com` does. The lane refused such a host only
+        where a literal owner root stood after it; with a runtime root it
+        passed, and the trunk it started from refused it.
+
+        THE PIECE BEGINS AT A LABEL DOT, typed, or stands as a bounded bare
+        value elsewhere in the same command: `DOMAIN=ghe.com` followed by an
+        `api.octo.$DOMAIN` host names GitHub even though the expansion reading
+        leaves only a dot and a mark. `ghe.example.com` (a GHE Server name,
+        whose API is its `/api/v3` base), `api.notghe.com` and
+        `api.octo.ghe.company.io` are not that domain and pass beside a
+        DigitalOcean-shaped act, and an expansion right after a dot with no
+        bare domain value (`snap.$EXT`) is not the domain either."""
+        for command in (
+                'curl -X PUT "https://api.octo.ghe.com/$ROOT/actions/'
+                'permissions"',
+                'API=https://api.octo.ghe.com/repos/o/r; curl -X PUT '
+                '"$API/actions/permissions"',
+                'curl -X PUT "https://api.$SUB.ghe.com/$ROOT/actions/'
+                'permissions"',
+                'DOMAIN=ghe.com; curl -X PUT '
+                '"https://api.octo.$DOMAIN/$ROOT/actions/permissions"',
+                'DOMAIN=GHE.COM; curl -X PUT '
+                '"https://api.octo.${DOMAIN}/$ROOT/actions/permissions"',
+                'DOMAIN=ghe.com; curl -X PUT '
+                '"https://api.octo.$(printf %s "$DOMAIN")/$ROOT/actions/'
+                'permissions"',
+                'curl -X PUT "https://api.octo.ghe.com/$ROOT/a$(echo ctions)/'
+                'permissions"'):
+            with self.subTest(command=command):
+                self.assertIn(".ghe.com /actions at character",
+                              self.assert_refused(command))
+        for command in (
+                'curl -X POST "https://ghe.example.com/hooks/$ID/actions"',
+                'curl -X POST "https://api.notghe.com/$ID/actions"',
+                'curl -X POST "https://api.octo.ghe.company.io/$ID/actions"',
+                'DOMAIN=notghe.com; curl -X POST '
+                '"https://api.digitalocean.com/v2/droplets/$ID/actions"',
+                'DOMAIN=ghe.company.io; curl -X POST '
+                '"https://api.digitalocean.com/v2/droplets/$ID/actions"',
+                'curl -X POST "$DO_API/droplets/$ID/actions" -o snap.$EXT',
+                'curl -H "Authorization: token $T" '
+                "https://api.octo.ghe.com/user"):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+
+    def test_the_read_only_audits_of_task_3358_pass(self):  # noqa: VACUOUS_ASSERTION — every member asserts rc 0 through the shipped hook
+        """task/3358 (from simbi): the reads that CHECK compliance with
+        ci-runs-on-the-local-fabric-never-github-actions must pass — a
+        search for `runs-on` over the workflow files, and a GET of the
+        repository's self-hosted runners. The first is a read of the
+        workflow directory (task/2973); the second a gh api GET, cut as
+        data before the table is asked, whatever REST shape its path has."""
+        for command in (
+                "git grep -n runs-on -- .github/workflows",
+                "git grep -n 'runs-on:' -- '.github/workflows/*.yml' "
+                "| grep -v self-hosted",
+                "rg -n runs-on .github/workflows",
+                "gh api repos/simbi-inc/simbi/actions/runners",
+                "gh api repos/o/r/actions/runners --jq "
+                "'.runners[] | {name, status}'",
+                'gh api "repos/$REPO/actions/runners" --jq .total_count',
+                "gh api --method GET orgs/o/actions/runners"):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
 
     # the commands the table rows are measured through; the coverage arm
     # below reads the SHIPPED table and fails if a row no arm reaches is
@@ -1019,8 +1546,14 @@ class GitHubActionsRungTest(unittest.TestCase):
              "gh api -X POST repos/a/b/actions/jobs/5/rerun",
              "gh api --method PATCH repos/a/b/actions",
              "gh api -XPUT orgs/akapug/actions/permissions",
+             "gh api -X PUT enterprises/acme/actions/permissions",
+             "gh api -X PUT repositories/123/actions/permissions",
+             "gh api -X PUT organizations/9919/actions/permissions",
              "gh api -X POST repos/o/r/dispatches -f event_type=deploy",
              "curl -X PUT https://api.github.com/repos/o/r/actions/permissions",
+             "curl -X PUT https://ghe.example.com/api/v3/repos/o/r/actions/"
+             "permissions",
+             'curl -X PUT "https://api.octo.ghe.com/$R/actions/permissions"',
              "touch .github/workflows/ci.yml",
              "tee .github/workflows/ci.yml < x.yml",
              "touch .github/./workflows/x.yml",
@@ -1069,9 +1602,9 @@ class GitHubActionsRungTest(unittest.TestCase):
         two different commands."""
         table = [spelling for spelling, _pieces, _says in chat._ACTIONS_ROWS]
         self.assertTrue(table, "the shipped table has no rows to cover")
-        covered = [row for row in table
-                   if any(all(piece in cmd.casefold()
-                              for piece in row.split(" "))
+        covered = [row for row, pieces, _says in chat._ACTIONS_ROWS
+                   if any(chat._row_stands(
+                              pieces, chat._readings(cmd), window=False)
                           for cmd in self.TABLE)]
         self.assertEqual(covered, table)
 
@@ -1093,13 +1626,17 @@ class GitHubActionsRungTest(unittest.TestCase):
         for command, row, phrase in (
                 (self.ENABLE + " ci.yml", self.VERB, "enables GitHub Actions"),
                 ("gh workflow run ci.yml", "workflow run", "runs a workflow"),
-                (self.RERUN + " 7", "run rerun", "runs a workflow"),
+                # the row names the GitHub head since task/3696
+                (self.RERUN + " 7", "gh run rerun", "runs a workflow"),
                 ("touch %s/ci.yml" % self.WORKFLOWS, self.DIRECTORY,
                  "workflow directory"),
-                ("gh api -X PUT repos/a/b/actions/permissions", "/actions",
-                 "Actions REST API")):
+                ("gh api -X PUT repos/a/b/actions/permissions",
+                 "repos/*/*/actions", "Actions REST API")):
             out = self.assert_refused(command)
-            at = min(command.index(piece) for piece in row.split(" "))
+            pieces = next(pieces for spelling, pieces, _says
+                          in chat._ACTIONS_ROWS if spelling == row)
+            at = min(matcher.search(command).start()
+                     for _text, matcher, _anchor in pieces)
             self.assertIn("%s at character %d of the folded command"
                           % (row, at), out)
             self.assertIn(phrase, out)
@@ -1167,8 +1704,9 @@ class GitHubActionsRungTest(unittest.TestCase):
         delimiter is spelled.
 
         WHERE IT IS DATA, it passes (task/2973, the integrator's ruling): the
-        same bodies handed to `cat` or `grep`, and the same act as a quoted
-        argument to `printf`, are text a program reads and runs none of. The
+        same bodies handed to `cat` or `grep` (an unquoted body's text too,
+        task/3064), and the same act as a quoted argument to `printf`, are
+        text a program reads and runs none of. The
         two lists stand side by side so a reader sees the boundary."""
         act = self.ENABLE + " ci.yml"
         for cmd in (
@@ -1180,12 +1718,13 @@ class GitHubActionsRungTest(unittest.TestCase):
                 # a dashed delimiter whose prefix is an identifier, then a
                 # shell's body
                 "cat <<DATA-END\nhello\nDATA-END\nbash <<'EOF'\n" + act + "\nEOF",
-                # a delimiter that never arrives: the rest is an unquoted body
-                "cat <<NOPE\n" + act + "\ncat <<'EOF'\nhello\nEOF",
+                # a delimiter that never arrives: the rest is an unquoted
+                # body, and its substitution runs
+                "cat <<NOPE\n$(" + act + ")\ncat <<'EOF'\nhello\nEOF",
                 # the delimiter word forms bash accepts, under a shell
                 "bash <<\\EOF\n" + act + "\nEOF",
                 'bash <<"E"OF\n' + act + "\nEOF",
-                "cat <<E-O_F.1\n" + act + "\nE-O_F.1",
+                "bash <<E-O_F.1\n" + act + "\nE-O_F.1",
                 # an fd spelled with and without a quote
                 "bash -s <<'EOF' 2 < /dev/null\n" + act + "\nEOF",
                 'bash -s <<\'EOF\' ""2</dev/null\n' + act + "\nEOF",
@@ -1220,7 +1759,11 @@ class GitHubActionsRungTest(unittest.TestCase):
                 'cat <<"E"OF\n' + act + "\nEOF",
                 "# Don't execute the example.\ncat <<'EOF'\n" + act + "\nEOF",
                 "grep -v bash <<'EOF'\n" + act + "\nEOF",
-                "printf '%s\\n' bash -c '" + act + "'"):
+                "printf '%s\\n' bash -c '" + act + "'",
+                # an UNQUOTED body's text is data to cat too (task/3064):
+                # bash reads the whole rest as NOPE's document
+                "cat <<NOPE\n" + act + "\ncat <<'EOF'\nhello\nEOF",
+                "cat <<E-O_F.1\n" + act + "\nE-O_F.1"):
             self.assert_allowed(cmd)
 
     def test_the_fold_is_read_both_ways_where_one_reading_cannot_serve(self):  # noqa: VACUOUS_ASSERTION — the first line is an unconditional refusal control through assert_refused (rc 2 plus four required substrings) on the same hook entry, and every allow arm asserts rc == 0, the allow VALUE
@@ -1574,6 +2117,25 @@ class GitHubActionsRungTest(unittest.TestCase):
                     "curl -o out $URL && gh $X download 5"):
             self.assert_allowed(cmd)
 
+    def test_a_ROW_in_DATA_does_not_lift_an_EXECUTED_anchor(self):  # noqa: VACUOUS_ASSERTION — every refusing arm runs assert_refused unconditionally (rc 2 plus four required substrings) on the same hook entry, and each allow control is the same data with the executed anchor removed
+        """A ROW THE CUT REMOVED IS NOT A REASON TO DROP WHAT THE CUT KEPT
+        (review of task/3247's argv-guard commit). Cutting data first and
+        then answering None whenever the cut text held only an ANCHOR while
+        the raw command held a ROW let any row written as data — an echo
+        argument, a commit message — lift the scoped refusal of an anchor
+        the shell RUNS beside an expansion. The row in the data says nothing
+        about the anchor outside it."""
+        data = "'%s 1'" % self.RERUN
+        for cmd in ("gh workflow $V ci.yml; echo %s" % data,
+                    "git commit -m %s && gh workflow $V ci.yml" % data,
+                    "git commit -m %s && gh workflow "
+                    "$(git log -1 --format=%%s)" % data):
+            self.assertIn("beside an unresolved expansion",
+                          self.assert_refused(cmd))
+        # CONTROL: the same data with no executed anchor stays allowed
+        for cmd in ("echo %s" % data, "git commit -m %s" % data):
+            self.assert_allowed(cmd)
+
     def test_the_ANCHOR_flag_is_the_tables_own_and_the_rule_reads_it(self):  # noqa: VACUOUS_ASSERTION — every assertion is unconditional over a table asserted non-empty first, and each piece is driven through the shipped hook in both directions
         """DERIVED FROM THE SHIPPED TABLE, never transcribed. The scoped
         rule's population is the `+` flags in `_ACTIONS_TOKENS`, so this arm
@@ -1593,10 +2155,10 @@ class GitHubActionsRungTest(unittest.TestCase):
         scoped rule at all — `run watch`, `run cancel` and `run download` are
         two ordinary English words each.
 
-        A ONE-PIECE ROW ANSWERS THROUGH THE ROW RULE — `/actions` and
-        `/dispatches` are whole rows on their own and refuse with no
-        expansion needed — so its flag decides nothing, which this arm shows
-        by asserting it refuses either way."""
+        A ONE-PIECE ROW ANSWERS THROUGH THE ROW RULE — the shaped REST paths,
+        the composite-action directory and `/dispatches` are whole rows on
+        their own and refuse with no expansion needed — so their flags decide
+        nothing, which this arm shows by asserting they refuse either way."""
         flags = {}
         for _spelling, pieces, _says in chat._ACTIONS_ROWS:
             for text, _matcher, anchor in pieces:
@@ -1604,20 +2166,31 @@ class GitHubActionsRungTest(unittest.TestCase):
         self.assertTrue(flags, "the shipped table has no pieces")
         self.assertEqual(
             sorted(p for p, on in flags.items() if on),
-            [".github", "/actions", "/dispatches", "rerun", "workflow"])
+            [".github", ".github/actions", "/dispatches",
+             "enterprises/*/actions", "organizations/*/actions",
+             "orgs/*/actions", "repos/*/*/actions",
+             "repositories/*/actions", "rerun", "workflow"])
         for spelling, pieces, _says in chat._ACTIONS_ROWS:
             self.assertLessEqual(
                 len([1 for _t, _m, anchor in pieces if anchor]), 1, spelling)
+        samples = {
+            "repos/*/*/actions": "repos/o/r/actions",
+            "orgs/*/actions": "orgs/o/actions",
+            "organizations/*/actions": "organizations/9919/actions",
+            "enterprises/*/actions": "enterprises/e/actions",
+            "repositories/*/actions": "repositories/123/actions",
+        }
         for _spelling, pieces, _says in chat._ACTIONS_ROWS:
             alone = len(pieces) == 1
             for text, _matcher, anchor in pieces:
-                witness = "echo %s $VALUE" % text
+                sample = samples.get(text, text)
+                witness = "echo %s $VALUE" % sample
                 if anchor or alone:
                     self.assertIn("BLOCKED", self.assert_refused(witness))
                 else:
                     self.assert_allowed(witness)
                 # and with NO expansion, only a one-piece row answers
-                mention = "echo %s is local" % text
+                mention = "echo %s is local" % sample
                 if alone:
                     self.assert_refused(mention)
                 else:
@@ -1973,14 +2546,15 @@ class GitHubActionsRungTest(unittest.TestCase):
 
     def test_the_repository_dispatch_trigger_is_refused(self):  # noqa: VACUOUS_ASSERTION — the first line is an unconditional refusal control through assert_refused (rc 2 plus four required substrings) on the same hook entry, and every arm below asserts rc 2 or rc 0, the allow VALUE
         """`repos/<o>/<r>/dispatches` is the documented door that starts a
-        run from outside and spells no `/actions` segment — it fires
+        run from outside and spells no Actions REST owner path — it fires
         wherever a workflow subscribes to `on: repository_dispatch`. It is
         the same class as the Actions API spelling the table had not learned,
         and it is closed the same way: one more row.
 
         The controls are the spelling that WAS covered (the workflow
-        dispatch path, which carries `/actions`) and helm's own `dispatch`
-        verb, which is not this row: the piece carries its leading slash."""
+        dispatch path, which carries the repository-owned REST shape) and
+        helm's own `dispatch` verb, which is not this row: the piece carries
+        its leading slash."""
         self.assertIn("/actions", self.assert_refused(
             "gh api repos/a/b/actions/workflows/ci.yml/dispatches -f ref=main"))
         for cmd in ("gh api -X POST repos/o/r/dispatches -f event_type=deploy",
@@ -2403,8 +2977,11 @@ class GitHubActionsRungTest(unittest.TestCase):
         `python3 - <<'EOF'` executes that body), so a body holding BOTH an
         anchor and an expansion is still a row; the command line beside a
         document is its own region and is read exactly as a command with no
-        document is; and an UNQUOTED body substitutes, so it belongs to the
-        executed text and never to a region of its own.
+        document is; and an UNQUOTED body substitutes, so what is read of it
+        belongs to the executed text and never to a region of its own: the
+        whole body under a program that is not a sink (`sort` here), and its
+        `$(…)` and backtick spans under a sink, whose prose and `$V` are only
+        what the sink is handed (task/3064).
 
         The refusal names the anchor of the region that decided — never an
         earlier anchor standing inert in a document."""
@@ -2432,14 +3009,21 @@ class GitHubActionsRungTest(unittest.TestCase):
                           self.assert_refused(cmd))
         # an UNQUOTED body is the executed text, alone, beside the line, and
         # beside a quoted document that splits the command into regions
-        for cmd in ("cat <<EOF\ngh workflow $V\nEOF",
-                    "echo the workflow is local; cat <<EOF\n$V\nEOF",
-                    "cat <<EOF\n$V\nEOF\necho the workflow is local",
-                    "cat <<'A'\nhello\nA\ncat <<EOF\ngh workflow $V\nEOF",
+        for cmd in ("sort <<EOF\ngh workflow $V\nEOF",
+                    "echo the workflow is local; sort <<EOF\n$V\nEOF",
+                    "sort <<EOF\n$V\nEOF\necho the workflow is local",
+                    "cat <<'A'\nhello\nA\nsort <<EOF\ngh workflow $V\nEOF",
                     "echo the workflow is local; cat <<'A'\nhello\nA\n"
-                    "cat <<EOF\n$V\nEOF"):
+                    "sort <<EOF\n$V\nEOF",
+                    # under a SINK only the live spans stay, and there
+                    "cat <<EOF\n$(gh workflow $V)\nEOF",
+                    "echo the workflow is local; cat <<EOF\n`echo $V`\nEOF"):
             self.assertIn("beside an unresolved expansion",
                           self.assert_refused(cmd))
+        # …and a sink's `$V` and prose are the text it is handed
+        for cmd in ("cat <<EOF\ngh workflow $V\nEOF",
+                    "echo the workflow is local; cat <<EOF\n$V\nEOF"):
+            self.assert_allowed(cmd)
 
     def test_a_piece_is_a_WHOLE_WORD_and_never_part_of_a_longer_one(self):  # noqa: VACUOUS_ASSERTION — each allow arm stands beside the refusal of the same row spelled as whole words in the same shape, so a rung that answered nothing fails on the refusing half
         """THE FILING SAID THE NOUN MATCHED INSIDE `trunk`. It does not, and
@@ -2478,6 +3062,9 @@ class GitHubActionsRungTest(unittest.TestCase):
     # the re-execute row, and a Python raw-string regex holding a backtick
     # pair: the SHAPE of both commands a seat filed in task/2855
     RERUN_ROW = "run re" + "run"
+    # the table's spelling of that row: it names the GitHub head too, because
+    # its two words are English (task/3696)
+    RERUN_SPELLING = "gh " + RERUN_ROW
     TICK_REGEXES = ('cited = re.findall(r"`+([^`\\n]{8,})`+", f)',
                     'bt = re.compile(r"`+([^`\\n]{3,}|d)")')
 
@@ -2505,30 +3092,37 @@ class GitHubActionsRungTest(unittest.TestCase):
         expansion in one region, so the text is still refused where a shell
         reads it — by the scoped rule, which names the anchor and not a row
         the text never held. Written to a FILE through `cat`, the body is
-        data (task/2973) and passes. Taking the anchor away too needs the mark to demand more
-        than one typed letter, and that was measured and not built: it
-        admits `gh run r$(echo erun) 1` and six more real invocations.
+        data (task/2973) and passes. The scoped rule now demands more of the
+        anchor than its first letter (task/3696, `chat._SCOPED_ANCHORS`),
+        and `r<mark>n` is two typed letters, so it still refuses here. The
+        ROW rule keeps the one-letter reading, which is why `gh run r$(echo
+        erun) 1` is still the row.
+
+        The witness names the GitHub head, which the row needs since
+        task/3696, so what keeps the row from standing is the shared span
+        and nothing else.
 
         THE ACTS SPELLED AROUND THE MARK ARE ALL STILL REFUSED, which is what
         this rule may never give up: the row where its pieces stand apart,
         and the scoped rule where one expansion supplies both."""
         row = next(p for spelling, p, _says in chat._ACTIONS_ROWS
-                   if spelling == self.RERUN_ROW)
+                   if spelling == self.RERUN_SPELLING)
         for regex in self.TICK_REGEXES:
-            written = "cat > $SP/t.py <<'PY'\nimport re\n%s\nPY" % regex
+            written = "cat > $SP/t.py <<'PY'\nimport re  # gh\n%s\nPY" % regex
             self.assert_allowed(written)
             witness = written.replace("cat > $SP/t.py", "bash")
             readings = chat._readings(witness)
             self.assertEqual(
                 [bool(matcher.search(readings)) for _t, matcher, _a in row]
                 + [chat._row_stands(row, readings)],
-                [True, True, False], readings)
+                [True, True, True, False], readings)
             out = self.assert_refused(witness)
             self.assertIn("re" + "run at character", out)
             self.assertIn("beside an unresolved expansion", out)
             self.assertNotIn(self.RERUN_ROW + " at character", out)
         # the MUST-HITS, each still named by its row
-        for act, named in (("gh %s 123" % self.RERUN_ROW, self.RERUN_ROW),
+        for act, named in (("gh %s 123" % self.RERUN_ROW,
+                            self.RERUN_SPELLING),
                            ("gh workflow run ci.yml", "workflow run"),
                            ("gh workflow enable x", self.VERB),
                            ("bash <<'EOF'\ngh workflow run ci.yml\nEOF",
@@ -2611,9 +3205,11 @@ class GitHubActionsRungTest(unittest.TestCase):
         a python body that builds a gh Actions argv in its own source is data
         and passes, and so does a script written by `cat` and run by path in
         a later command. `echo '<act>' | bash`, `find -exec gh`, `parallel
-        gh`, a wrapper script handed the words as argv, and a make variable
+        gh`, a wrapper script handed the act as argv, and a make variable
         are all still refused, because each hands the words to a program
-        that runs them or spells them unquoted."""
+        that runs them or spells them unquoted. A wrapper handed only `run`
+        and `rerun`, with no gh word in the text, passes since task/3696
+        (`tests.test_argv_english_3696`)."""
         run_tail = "then %s the controlled A/B." % self.RUN_NOUN
         # (3) an anchorless row in a quoted body a shell does not run
         self.assert_allowed(
@@ -2624,8 +3220,17 @@ class GitHubActionsRungTest(unittest.TestCase):
                "re%s; it does not %s here'''\nPY"
                % (self.RUN_NOUN, self.RUN_NOUN))
         self.assert_allowed(doc)
-        self.assertIn(self.RERUN_ROW + " at character", self.assert_refused(
-            doc.replace("python3 -", "bash")))
+        # …and with the GitHub head in it, which is what keeps this arm a
+        # pin on the python body being data since task/3696: the bare two
+        # words pass wherever they stand, and this one refuses under a shell
+        self.assert_allowed(doc.replace("the Q5", "the gh"))
+        # the same prose where a shell runs it passes too since task/3696:
+        # two English words are not the row, which names the GitHub head;
+        # naming it there makes the refusing twin
+        self.assert_allowed(doc.replace("python3 -", "bash"))
+        self.assertIn(self.RERUN_SPELLING + " at character",
+                      self.assert_refused(doc.replace(
+                          "python3 -", "bash").replace("the Q5", "the gh")))
         # (5) a read-only search whose pattern is the rung's own wording
         search = 'git grep -n -E "runs a workflow|workflow list" -- helm/'
         self.assert_allowed(search)
@@ -2634,14 +3239,21 @@ class GitHubActionsRungTest(unittest.TestCase):
         self.assert_allowed(
             "helm task comment task/2855 \"refused as 'workflow run' and "
             "'workflow list'\"")
-        # the integrator's minimal case: the two words alone in a document
+        # the integrator's minimal case: the two words alone in a document,
+        # which since task/3696 are not the row even where a shell reads
+        # them; the act names gh, and a shell's body refuses it
         body = "<<'EOF'\n%s\nEOF" % self.RERUN_ROW
         self.assert_allowed("cat " + body)
         self.assert_allowed("helm chat post --room R " + body)
-        self.assert_refused("sh " + body)
+        self.assert_allowed("sh " + body)
+        act_body = "<<'EOF'\ngh %s 1\nEOF" % self.RERUN_ROW
+        self.assert_allowed("cat " + act_body)
+        self.assert_allowed("helm chat post --room R " + act_body)
+        self.assert_refused("sh " + act_body)
         for act in ("echo 'gh %s 1' | bash" % self.RERUN_ROW,
                     "find . -name x -exec gh %s 1 \\;" % self.RERUN_ROW,
                     "parallel gh %s ::: 1 2" % self.RERUN_ROW,
+                    "./wrap gh %s 1" % self.RERUN_ROW,
                     "make CMD='gh %s 1'" % self.RERUN_ROW):
             self.assert_refused(act)
 
@@ -2677,6 +3289,8 @@ class GitHubActionsRungTest(unittest.TestCase):
     # its verb, in English — and the four sinks as their opener lines take
     # them. Built at runtime, like every other spelling in this file.
     SINK_BODY = "we never %s ci.yml here; the fabric runs CI" % ENABLE
+    # …and the same act where an UNQUOTED body RUNS it (task/3064)
+    LIVE_BODY = "we never `%s ci.yml` here; the fabric runs CI" % ENABLE
     SINKS = ("helm chat post --room R",
              "helm dispatch send --to lane --kind review",
              "helm asks add --needs x",
@@ -2726,10 +3340,11 @@ class GitHubActionsRungTest(unittest.TestCase):
         data. The reader follows bash, so it names the program the line
         actually runs.
 
-        WHAT KEEPS THE BODY READ: a pipe into a shell, an unquoted tag (its
-        body substitutes), a program named by a `$CMD` the text does not
-        settle, and a name the recording set does not trust — `helm post
-        chat`, `./helm`, `~/bin/helm`."""
+        WHAT KEEPS THE BODY READ: a pipe into a shell, the `$(…)` and
+        backtick spans of an unquoted body (they RUN; its prose is the sink's
+        data like a quoted body's, task/3064), a program named by a `$CMD`
+        the text does not settle, and a name the recording set does not
+        trust — `helm post chat`, `./helm`, `~/bin/helm`."""
         for sink in self.SINKS:
             rest = sink.split(" ", 1)[1]
             # a substitution in an argument leaves the body data for THIS
@@ -2740,8 +3355,11 @@ class GitHubActionsRungTest(unittest.TestCase):
                 with self.subTest(actions_rung=line):
                     self.assertIsNone(chat.github_actions_refusal(
                         command=self.doc(line)))
+                    unquoted = line.replace("<<'EOF'", "<<EOF")
+                    self.assertIsNone(chat.github_actions_refusal(
+                        command=self.doc(unquoted)))
                     self.assertIsNotNone(chat.github_actions_refusal(
-                        command=self.doc(line.replace("<<'EOF'", "<<EOF"))))
+                        command=self.doc(unquoted, body=self.LIVE_BODY)))
             for line in (sink + " <<'EOF' | tail -2",
                          sink + " <<'EOF' && true",
                          "true; " + sink + " <<'EOF'",
@@ -2752,14 +3370,18 @@ class GitHubActionsRungTest(unittest.TestCase):
                          "A=1 " + sink + " <<'EOF'",
                          "timeout 60 " + sink + " <<'EOF'",
                          "command " + sink + " <<'EOF'",
-                         sink + " --note " + self.VERB.split()[0] + " <<'EOF'"):
+                         sink + " --note " + self.VERB.split()[0] + " <<'EOF'",
+                         sink + " <<EOF"):
                 with self.subTest(admitted=line):
                     self.assert_allowed(self.doc(line))
             for line in (sink + " <<'EOF' | bash",
-                         sink + " <<EOF",
+                         sink + " <<EOF | bash",
                          "$CMD " + rest + " <<'EOF'"):
                 with self.subTest(refused=line):
                     self.assert_refused(self.doc(line))
+            with self.subTest(live_span=sink):
+                self.assert_refused(self.doc(sink + " <<EOF",
+                                             body=self.LIVE_BODY))
             with self.subTest(second_heredoc=sink):
                 self.assert_allowed("%s <<'EOF' 3<<'B'\n%s\nEOF\nhi\nB"
                                     % (sink, self.SINK_BODY))
@@ -2889,13 +3511,16 @@ class GitHubActionsRungTest(unittest.TestCase):
         rc, out = self.hook("Monitor", command=incident, until="x")
         self.assertEqual(rc, 2, out)
         self.assertIn(self.RULE, out)
-        self.assertIn("/actions at character", out)
+        self.assertIn("repos/*/*/actions at character", out)
         rc, out = self.hook("Monitor", command=self.ENABLE + " ci.yml")
         self.assertEqual(rc, 2, out)
         # CONTROLS: a Monitor that names nothing, and the same grant
         rc, out = self.hook("Monitor", command="gh pr list")
         self.assertEqual(rc, 0, out)
-        rc, out = self.hook("Monitor", command="helm chat wait --seat s --follow")
+        # at the cap, as the harness sends it: under it is task/3404's rung
+        from helm.seats_advice import BEACON_TIMEOUT_MS
+        rc, out = self.hook("Monitor", command="helm chat wait --seat s --follow",
+                            timeout_ms=BEACON_TIMEOUT_MS)
         self.assertEqual(rc, 0, out)         # no agent_id: the sidechain rung is silent
         rc, out = self.hook("Monitor", command="HELM_ALLOW_GITHUB_ACTIONS=1 " + incident)
         self.assertEqual(rc, 0, out)
@@ -2940,15 +3565,15 @@ class GitHubActionsRungTest(unittest.TestCase):
                          ".github/x/../workflows/x.yml",
                          "%s/../ISSUE_TEMPLATE/bug.md" % self.WORKFLOWS,
                          ".github/actions/build/entrypoint.sh",
-                         ".GITHUB/WORKFLOWS/ci.yml",
-                         "src/store/actions/user.js"):
+                         ".GITHUB/WORKFLOWS/ci.yml"):
                 rc, out = self.hook(tool, file_path=path, old_string="a",
                                     new_string="b")
                 self.assertEqual(rc, 2, (tool, path, out))
                 self.assertIn(path, out)
             for path in (".github/ISSUE_TEMPLATE/bug.md", ".github/CODEOWNERS",
                          "docs/github/workflows.md", "src/workflows/a.py",
-                         "docs/notes.md", "tests/test_chat_argv_guard.py"):
+                         "src/store/actions/user.js", "docs/notes.md",
+                         "tests/test_chat_argv_guard.py"):
                 rc, out = self.hook(tool, file_path=path, content="x")
                 self.assertEqual(rc, 0, (tool, path, out))
         # the act the file door admitted, through the door that refused it:
@@ -3347,6 +3972,174 @@ class SharedDataPredicateTest(unittest.TestCase):
                 "pgrep -f \"$(%s)\"" % self.ENABLE):
             with self.subTest(command=command):
                 self.assertIsNotNone(self.refused(command), command)
+
+
+class UnquotedSinkBodyTest(unittest.TestCase):
+    """task/3064: AN UNQUOTED BODY A SINK READS IS DATA LESS WHAT RUNS IN IT.
+
+    The Actions rung refused `cat > brief.txt <<EOF` (unquoted, carrying `$T`
+    expansions) whose review prose said `run` and, more than a hundred
+    characters on, `rerun`, then `helm dispatch send ... < brief.txt`: no gh
+    and no workflow verb anywhere. Bash expands an unquoted body before the
+    program reads it, so its `$(…)`, `$((…))` and backtick spans RUN and the
+    rest is only the text the program is handed. The shared cut
+    (`chat._cut_data`, the one the Actions, owner-posture and delegate
+    authority rungs read) keeps those spans of a body a sink reads and cuts
+    the rest; a body python, a shell, an evaluator or an unknown program
+    reads, or one bash reads differently from the walker, stays whole.
+
+    The spellings are built at runtime, so this FILE holds no whole one."""
+
+    RERUN = "gh " + "run" + " rerun"
+    ENABLE = "gh " + "workflow" + " enable" + " ci.yml"
+    VERDICT = "helm " + "dispatch" + " verdict"
+    MINT = "owner" + "_door"
+    # the incident's body: the two words far apart in prose, and expansions
+    PROSE = ("the gate verb run by the lane is the one to trust here, and it\n"
+             "was measured at $T on the tip; it refuses a %s on a tree that\n"
+             "moved since, so a second gate names ${TIP} and nothing else"
+             % ("re" + "run"))
+
+    def hook(self, command):
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                   "session_id": "sess-3064", "cwd": "/tmp/repo",
+                   "tool_use_id": "toolu_3064",
+                   "tool_input": {"command": command}}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = chat.cmd_argv_guard([])
+        return rc, out.getvalue() + err.getvalue()
+
+    def actions(self, command):
+        return chat.github_actions_refusal(command=command)
+
+    def test_the_incident_brief_to_cat_passes_the_hook(self):  # noqa: VACUOUS_ASSERTION — the same body fed to bash is asserted refused (rc 2, BLOCKED) on the same hook entry before the brief is asserted to pass
+        send = "helm dispatch send r lane --ref T --kind review < brief.txt"
+        rc, out = self.hook("bash <<EOF\n%s\nEOF" % self.PROSE)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("BLOCKED", out)
+        for command in ("cat > brief.txt <<EOF\n%s\nEOF\n%s" % (self.PROSE, send),
+                        "tee brief.txt <<EOF >/dev/null\n%s\nEOF\n%s"
+                        % (self.PROSE, send),
+                        "helm dispatch send r lane --kind review <<EOF\n%s\nEOF"
+                        % self.PROSE):
+            with self.subTest(command=command):
+                rc, out = self.hook(command)
+                self.assertEqual(rc, 0, out)
+                self.assertNotIn("BLOCKED", out)
+
+    def test_the_surface_by_state_table(self):  # noqa: VACUOUS_ASSERTION — every allow row stands beside a refusal of the same body or the same act in the same function
+        act = self.RERUN + " 1"
+        allowed = (
+            "cat > brief.txt <<EOF\n%s\nEOF" % self.PROSE,
+            "tee brief.txt <<EOF\n%s\nEOF" % self.PROSE,
+            "cat > b <<'EOF'\n%s\n$(%s)\nEOF" % (self.PROSE, act),
+            "helm dispatch send r lane --kind review <<EOF\n%s\nEOF"
+            % self.PROSE,
+            "git commit -q -F - <<EOF\n%s\nEOF" % self.PROSE,
+            # bash reads `\$(` in an unquoted body as the letters
+            "cat > b <<EOF\n\\$(%s)\nEOF" % act,
+        )
+        refused = (
+            # what RUNS in a sink's body stays, however it is spelled there
+            "cat > b <<EOF\nnote $(%s)\nEOF" % act,
+            "cat > b <<EOF\nnote `%s`\nEOF" % act,
+            "tee b <<EOF\n${X:-$(%s)}\nEOF" % act,
+            "cat > b <<EOF\n'$(%s)'\nEOF" % act,
+            "cat > b <<EOF\n$(echo ')' ; %s)\nEOF" % act,
+            "cat > b <<EOF\n$(%s\n1)\nEOF" % self.RERUN,
+            "cat > b <<EOF\n$((1+$(%s)))\nEOF" % act,
+            "cat > b <<EOF\na\\\\$(%s)\nEOF" % act,
+            "helm dispatch send r lane <<EOF\n%s\n$(%s)\nEOF"
+            % (self.PROSE, act),
+            # a body a program RUNS stays whole, prose and all
+            "bash <<EOF\n%s\nEOF" % self.PROSE,
+            "sh -s <<EOF\n%s\nEOF" % self.PROSE,
+            "python3 - <<EOF\n%s\nEOF" % self.PROSE,
+            "cat <<EOF | bash\n%s\nEOF" % self.PROSE,
+            "cat <<EOF | tee x | sh\n%s\nEOF" % self.PROSE,
+            "eval \"$(cat <<EOF\n%s\nEOF\n)\"" % self.PROSE,
+            "source /dev/stdin <<EOF\n%s\nEOF" % self.PROSE,
+            "sort <<EOF\n%s\nEOF" % self.PROSE,
+            # and the act itself, with no heredoc at all
+            act,
+        )
+        for command in allowed:
+            with self.subTest(allowed=command):
+                self.assertIsNone(self.actions(command))
+        for command in refused:
+            with self.subTest(refused=command):
+                self.assertIsNotNone(self.actions(command))
+
+    def test_where_bash_reads_the_body_differently_it_is_read_whole(self):  # noqa: VACUOUS_ASSERTION — each refusal stands beside the same body under the same sink with the difference removed, asserted to pass
+        """MEASURED WITH BASH 5.3: in an unquoted body a trailing backslash
+        joins the next line on BEFORE bash looks for the delimiter, so `E\\`
+        then `OF` ends the body at `EOF` and the line after it RUNS, while
+        the walker, which compares raw lines, still calls it body. A body
+        with a backslash-ended line, a span that does not close, and a span
+        that opens a heredoc of its own are each read whole."""
+        act = self.RERUN + " 1"
+        self.assertIsNone(self.actions("cat > b <<EOF\nE\nOF\n%s\nEOF"
+                                       % self.PROSE))
+        for command in ("cat > b <<EOF\nE\\\nOF\n%s\nEOF" % act,
+                        # the row names gh since task/3696
+                        "cat > b <<EOF\ngh run it \\\nand %s\nEOF"
+                        % ("re" + "run"),
+                        "cat > b <<EOF\n$(%s\nEOF" % act,
+                        "cat > b <<EOF\n$(cat <<X\n%s\nX\n)\nEOF" % act):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.actions(command))
+
+    def test_a_command_that_runs_the_file_it_writes_reads_the_body_whole(self):  # noqa: VACUOUS_ASSERTION — the written script is asserted to pass unrun before each run of it is asserted refused
+        write = "cat > s.sh <<EOF\n%s 1\nEOF" % self.RERUN
+        self.assertIsNone(self.actions(write))
+        self.assertIsNone(self.actions(write + "\ncat s.sh"))
+        for run in ("bash s.sh", "./s.sh", "sh ./s.sh"):
+            with self.subTest(run=run):
+                self.assertIsNotNone(self.actions(write + "\n" + run))
+
+    def test_an_assignment_by_expansion_reads_the_whole_command(self):  # noqa: VACUOUS_ASSERTION — the same text with a non-assigning expansion is asserted to pass first
+        """`${EDITOR:=…}` and `${PATH=…}` set a name that picks a program as
+        the shell expands them, which the word check (`NAME=…`) never read;
+        the cut makes such a body data, so a command spelling one is read
+        whole — on the command line too."""
+        for safe in ("cat > b <<EOF\n${EDITOR:-vi}\n%s\nEOF" % self.PROSE,
+                     "echo \"${EDITOR:-vi} %s\"" % self.ENABLE):
+            self.assertIsNone(self.actions(safe), safe)
+            for op in (":=", "="):
+                with self.subTest(op=op, command=safe):
+                    self.assertIsNotNone(self.actions(
+                        safe.replace("${EDITOR:-", "${EDITOR" + op)))
+        self.assertIsNotNone(self.actions(
+            "cat > b <<EOF\n${PATH:=/tmp}\n%s\nEOF" % self.PROSE))
+
+    def test_the_other_two_rungs_read_the_same_cut(self):  # noqa: VACUOUS_ASSERTION — each rung's allow stands beside that rung's refusal of the same sink with the act in a live span
+        """The owner-posture and delegate authority rungs cut with the same
+        predicate, so a sink's unquoted prose naming their act passes and a
+        span that runs it is refused."""
+        about = "cat > brief.txt <<EOF\nfile %s $ROW when done\nEOF" % self.VERDICT
+        self.assertEqual(chat.sidechain_authority_verbs(about), ())
+        self.assertEqual(chat.sidechain_authority_verbs(
+            "cat > brief.txt <<EOF\nfile $(%s d-1 T --approve)\nEOF"
+            % self.VERDICT), ("dispatch verdict",))
+        self.assertEqual(chat.sidechain_authority_verbs(
+            "python3 - <<EOF\nfile %s $ROW\nEOF" % self.VERDICT),
+            ("dispatch verdict",))
+        note = "cat > notes.md <<EOF\nnever call ownerasks.%s( from a seat\nEOF" \
+            % self.MINT
+        self.assertIsNone(chat.owner_posture_forge_refusal(command=note))
+        self.assertEqual(chat.owner_posture_forge_refusal(
+            command="cat > notes.md <<EOF\n$(python3 -c 'from helm.ownerasks "
+            "import %s; %s(\"web\")')\nEOF" % (self.MINT, self.MINT)),
+            ("mint", None))
+
+    def test_a_defect_in_the_live_span_reader_reads_the_body_whole(self):  # noqa: VACUOUS_ASSERTION — the brief is asserted to pass before the reader is broken
+        brief = "cat > brief.txt <<EOF\n%s\nEOF" % self.PROSE
+        self.assertIsNone(self.actions(brief))
+        with mock.patch.object(chat, "_live_body",
+                               side_effect=RuntimeError("defect")):
+            self.assertIsNotNone(self.actions(brief))
 
 
 class SteerRungTest(unittest.TestCase):
@@ -3854,7 +4647,15 @@ class SidechainBeaconArmGuardTest(unittest.TestCase):
         self.addCleanup(env.stop)
 
     def guard(self, command, agent_id="a1b2", tool="Monitor", **tool_input):
-        """(rc, stdout+stderr) of the installed PreToolUse hook verb."""
+        """(rc, stdout+stderr) of the installed PreToolUse hook verb.
+
+        A Monitor carries timeout_ms at the cap unless the arm says
+        otherwise, as the harness sends one: a main-thread beacon under it
+        meets the beacon-timeout rung (task/3404, tests/
+        test_argv_beacon_timeout.py), which is not what these arms read."""
+        if tool == "Monitor":
+            from helm.seats_advice import BEACON_TIMEOUT_MS
+            tool_input.setdefault("timeout_ms", BEACON_TIMEOUT_MS)
         payload = {"hook_event_name": "PreToolUse", "tool_name": tool,
                    "session_id": "sess-main", "cwd": "/tmp/repo",
                    "tool_use_id": "toolu_1",
@@ -4344,11 +5145,12 @@ class HookEntryBudgetTest(unittest.TestCase):
         loads nothing the Bash rungs use: an Agent call now pays for this
         hook on every delegation, so its admit path must stay a key lookup.
         The subagent arm carries agent_id, which is the key the sidechain
-        rung's lazy import turns on for Bash and Monitor."""
+        rung's lazy import turns on: since task/1775 it is refused, and its
+        refusal is the one thing it loads (helm.actors, two small modules)."""
         for tool_input, agent_id, expect in (
                 ({"prompt": "p", "model": "haiku"}, None, 2),
                 ({"prompt": "p"}, None, 0),
-                ({"prompt": "p", "model": ""}, "a1b2", 0)):
+                ({"prompt": "p", "model": ""}, "a1b2", 2)):
             payload = {"tool_name": "Agent", "session_id": "budget-arm",
                        "tool_input": tool_input}
             if agent_id:
@@ -4358,16 +5160,21 @@ class HookEntryBudgetTest(unittest.TestCase):
                 self.assertEqual(rc, expect, err[-600:])
                 self.assertIn("helm.chat", mods)
                 if expect == 2:
-                    self.assertIn("Agent called with model='haiku'", err)
+                    self.assertIn("Agent called with model='haiku'"
+                                  if agent_id is None
+                                  else "Agent called from a subagent", err)
                 for heavy in ("helm.seats", "helm.actors", "helm.web",
                               "helm.gate", "helm.meld", "helm.seat"):
+                    if heavy == "helm.actors" and agent_id:
+                        continue
                     self.assertNotIn(heavy, mods,
                                      heavy + " is on the Agent hook path")
 
     def test_an_agent_call_reads_no_reflex_even_from_a_subagent(self):  # noqa: VACUOUS_ASSERTION — each subTest asserts rc 0 and helm.chat PRESENT in the same module set the absences read, so an empty probe fails
         """task/2971: the nested-spawn steer moved to SubagentStart, so the
-        Agent rung is a key lookup again for EVERY caller, a subagent's
-        included: no reflex store read, no steer."""
+        Agent rung reads no reflex for EVERY caller: the main thread's call
+        passes on a key lookup, and a subagent's is refused (task/1775) with
+        no reflex store read and no steer."""
         from helm import reflex
         path = reflex.write({"id": "probe-fanout", "signal": "nested-spawn",
                              "steer": "probe steer: do the bounded work"})
@@ -4379,12 +5186,14 @@ class HookEntryBudgetTest(unittest.TestCase):
                 payload["agent_id"] = agent_id
             with self.subTest(agent_id=agent_id):
                 rc, mods, err = self.run_hook(json.dumps(payload))
-                self.assertEqual(rc, 0, err[-600:])
+                self.assertEqual(rc, 2 if agent_id else 0, err[-600:])
                 self.assertIn("helm.chat", mods)            # control
                 self.assertNotIn("probe steer", err)
                 for heavy in ("helm.reflex", "helm.store", "helm.seats",
                               "helm.actors", "helm.web", "helm.gate",
                               "helm.meld", "helm.seat", "helm.inject"):
+                    if heavy == "helm.actors" and agent_id:
+                        continue
                     self.assertNotIn(heavy, mods,
                                      heavy + " is on the Agent hook path")
 
@@ -4511,9 +5320,32 @@ class OwnerDoorPostGuardTest(unittest.TestCase):
                 + " HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\n\\r\\n'"
                 + " | nc 127.0.0.1 7433",
                 "git grep -n " + self.VERDICT + " helm/",
-                "curl -s -X POST " + self.BASE + "/api/tasks/comment -d '{}'",
-                "helm decide comment abc 'a seat adds to the card'"):
+                "curl -s " + self.BASE + "/api/" + "task/notes?id=task/1",
+                "git grep -n " + self.TASK_COMMENT + " helm/",
+                "helm decide comment abc 'a seat adds to the card'",
+                "helm task comment 263 'a seat adds to the task'"):
             self.assert_allowed(cmd)
+
+    # -- goal-ledger D1: THE TASK BACKLOG'S COMMENT BOX IS HIS DOOR TOO. It now
+    # records "owner" through the OwnerDoor, so an agent posting there would
+    # write in his voice; before D1 it recorded nobody, which is why this path
+    # sat in the allowed list above.
+    TASK_COMMENT = "/api/" + "tasks/comment"
+
+    def test_a_post_to_the_task_comment_door_is_refused(self):  # noqa: VACUOUS_ASSERTION — every subTest asserts rc 2 plus the refusal text through the shipped hook; test_reads_and_other_doors_pass is the positive control on the same hook
+        for cmd in (
+                "curl -s -X POST " + self.BASE + self.TASK_COMMENT
+                + " -d '{\"id\":\"task/1\",\"text\":\"x\"}'",
+                "curl --json '{}' http://localhost:7433" + self.TASK_COMMENT,
+                "python3 -c 'import urllib.request as u; u.urlopen(u.Request(\""
+                + self.BASE + self.TASK_COMMENT + "\", data=b\"{}\"))'"):
+            with self.subTest(command=cmd):
+                rc, out = self.hook("Bash", cmd)
+                self.assertEqual(rc, 2, (cmd, out))
+                self.assertIn("[helm argv-guard] BLOCKED", out, cmd)
+                self.assertIn("owner task-comment door", out, cmd)
+                self.assertIn("web queue", out, "the refusal names his doors")
+                self.assertIn("helm task comment", out, "and what a seat does")
 
     # -- task/3027: THE EVIDENCE OF A SEND IS READ IN THE CURL CALL THAT NAMES
     # THE DOOR. The rung read method words over the whole command, so a GET
@@ -4849,6 +5681,108 @@ class OwnerPostureForgeGuardTest(unittest.TestCase):
                 "python3 -m unittest tests.test_ownernotice"):
             with self.subTest(cmd=cmd):
                 self.assert_allowed(cmd)
+
+
+class GitHubActionsQuotedDataTest(unittest.TestCase):
+    """task/3464, the ARGV GUARD'S GITHUB-ACTIONS RUNG read as a DOOR:
+    a gh/act verb word inside a QUOTED ARGUMENT or a heredoc BODY is
+    data, not a command. A shell hands the span to the program as bytes;
+    it is a command only where the program's own shell runs it —
+    `bash <<EOF`, `node <<'EOF'`, a command substitution.
+
+    THE TWO MEASURED FALSE REFUSALS. (1) a seat's append to a local
+    log — the workflow word in the double-quoted
+    argument beside `$(date)`, refused "beside an unresolved
+    expansion"; (2) a `helm dispatch send` brief whose body quoted the
+    words, refused "runs a workflow". The cure: the verb token must
+    stand in COMMAND POSITION of some simple command — first word after
+    the assignments, a pipe, &&, ||, ; or a subshell opener — never
+    inside a quoted argument or a heredoc body. Mechanically it is the
+    existing data cut reaching one class further, not a second parser:
+    a printing program's quoted argument that holds a quoted blank AND
+    an executable span is cut to `_` when none of the spans, folded through
+    the fold the rung already owns, spells a row or an anchor — so the
+    prose stops being read as a bare word, while a span that itself runs
+    an act keeps the argument code.
+
+    EVERY ARM MEASURED AT THE BASE (664e29b49fd6) BEFORE THIS COMMIT:
+    arms 1 and 6 are refused there (the RED); arm 2 and the command-
+    position controls 3, 4, 5 are already read correctly, and these
+    pins are what the cure must NOT lift — a bare act, an assignment-
+    prefixed rerun and a piped act stay refused, and a body a SHELL
+    reads is still its script.
+
+    A self-contained class: it borrows the rung's drive machinery by
+    reference rather than subclassing, so this file's ~61 existing arms
+    run once, under their own class, and are not re-run here."""
+
+    hook = GitHubActionsRungTest.hook
+    assert_refused = GitHubActionsRungTest.assert_refused
+    assert_allowed = GitHubActionsRungTest.assert_allowed
+    RULE = GitHubActionsRungTest.RULE
+    PREMISE = GitHubActionsRungTest.PREMISE
+    OVERRIDE = GitHubActionsRungTest.OVERRIDE
+
+    QUOTED_ACT = 'echo "gh %s run is disabled here: $(date)"' % (
+        "work" + "flow")
+
+    def test_a_noun_in_a_quoted_argument_beside_an_expansion_is_data(self):  # noqa: VACUOUS_ASSERTION — the unconditional assert_refused of the bare act runs first on the same hook entry (rc 2 plus four required substrings), so an empty observable fails there before the allow is reached
+        """(1), the RED. A seat's measured specimen: an append to a local
+        log whose double-quoted argument holds the noun beside `$(date)`. The base
+        reads the quote-stripped word as an anchor beside the expansion and
+        refuses it; the cure reads the quoted argument as the data `echo`
+        prints."""
+        self.assert_refused("gh " + "workflow" + " run ci.yml --ref $BR")
+        self.assert_allowed(
+            'echo "- $(date -u +%H:%MZ) #1157 staging '
+            + "work" + "flow"
+            + ' wf_12345678-aa running ..." >> /tmp/landing-queue.md')
+
+    def test_a_whole_act_inside_a_quoted_argument_is_data(self):  # noqa: VACUOUS_ASSERTION — the unconditional assert_refused of the bare act runs first on the same hook entry, so an empty observable fails there before the allow is reached
+        """(6), the RED. The act spelled WHOLE inside the double-quoted
+        argument of a printing program: the base reads the quote-stripped
+        row as a bare act and refuses it; the cure reads the quoted
+        argument as data."""
+        self.assert_refused("gh " + "workflow" + " run ci.yml --ref $BR")
+        self.assert_allowed(self.QUOTED_ACT)
+
+    def test_a_verb_in_command_position_is_still_the_command(self):  # noqa: VACUOUS_ASSERTION — every arm asserts rc 2 or rc 0 unconditionally on the same shipped hook entry, and a refusing twin stands beside each allow
+        # (3) the bare act
+        self.assert_refused("gh " + "workflow" + " run ci.yml --ref $BR")
+        # (4) past the assignment prefix
+        self.assert_refused("X=1 gh " + "run" + " re" + "run $ID")
+        # (5) past the pipe
+        self.assert_refused("echo x | gh " + "work" + "flow"
+                            + " enable ci.yml")
+
+    def test_a_quoted_heredoc_body_is_data_but_a_shell_body_is_not(self):  # noqa: VACUOUS_ASSERTION — the unconditional assert_refused of the bash body runs first on the same hook entry, so an empty observable fails there before the allow arms are reached
+        act = "gh " + "workflow" + " run ci.yml --ref $BR"
+        # (2) a quoted-tag body a printing program reads: data
+        self.assert_allowed("cat <<'EOF'\n" + act + "\nEOF")
+        # the same body a SHELL reads is its script: still refused
+        self.assert_refused("bash <<'EOF'\n" + act + "\nEOF")
+
+    def test_a_quoted_argument_is_cut_but_a_span_running_an_act_is_kept(self):  # noqa: VACUOUS_ASSERTION — the unconditional assert_refused of the bare act runs first on the same hook entry (rc 2 plus four required substrings), so an empty observable fails there before the allow is reached
+        """The cure's BOUNDARY, pinned against the class it must not open.
+        A quoted argument of a printing program is cut to data — but only
+        when the executable SPANS it holds run nothing act-like. A span
+        that itself spells an act is the program the shell runs before the
+        printer ever sees a word, and it stays code: the argument is cut
+        around it, not through it."""
+        # (1) a span that runs nothing — the prose is data
+        self.assert_refused("gh " + "workflow" + " run ci.yml --ref $BR")
+        self.assert_allowed('echo "- $(date -u +%H:%MZ) staging '
+                            + "work" + "flow"
+                            + ' wf_1 running ..." >> /tmp/q.md')
+        # a span that runs the act — the prose still goes, the span stays
+        self.assert_refused('echo "see $(gh ' + "work" + "flow"
+                            + ' run ci.yml)"')
+        self.assert_refused('echo "see $(gh ' + "work" + "flow"
+                            + ' $V)"')
+        # the act in the prose, no span: already data at the base, and the
+        # cut must not move it either way
+        self.assert_allowed('echo "gh ' + "work" + "flow"
+                            + ' run is disabled here: $(date)"')
 
 
 if __name__ == "__main__":

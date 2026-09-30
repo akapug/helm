@@ -17,6 +17,7 @@ never walls without one; and one wall earns one room line, whatever the number
 of observers.
 """
 import datetime
+import json
 import os
 import sys
 import tempfile
@@ -52,16 +53,75 @@ def _epoch(stamp):
 
 
 def _row(stamp, code, message=None, path="/v1/messages?beta=true",
-         origin="local"):
+         origin="local", etype="rate_limit_error"):
     """One proxy.log request row in the fork's shape."""
     head = ('[%s] [abcdef12] [warn ] [gin_logger.go:159] %d |            2ms '
             '|       127.0.0.1 | POST    "%s"' % (stamp, code, path))
     if message is None:
         return head
-    body = ('{"type":"error","error":{"type":"rate_limit_error",'
-            '"message":"%s"}}' % message).replace('"', '\\"')
+    body = ('{"type":"error","error":{"type":"%s",'
+            '"message":"%s"}}' % (etype, message)).replace('"', '\\"')
     return '%s | refusal_origin_v1=%s | response_body="%s"' % (
         head, origin, body)
+
+
+def _upstream(stamp, code, message, etype):
+    """An upstream refusal row: the fork cannot tell who wrote it
+    (origin unknown), and the error type is the vendor's own."""
+    return _row(stamp, code, message, origin="unknown", etype=etype)
+
+
+def _stamp(epoch):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+#: Moonshot's own refusals, copied from the kimi seat's proxy.log (the 5-hour
+#: one is the measured wall this module pins; the other two are its other
+#: spellings).
+MOONSHOT_5H = ("You've reached your 5-hour usage limit. Your quota will reset "
+               "when the current 5-hour window ends. To continue now, purchase "
+               "extra usage or upgrade your plan: "
+               "https://www.kimi.com/membership/subscription?tab=quota")
+MOONSHOT_WEEK = ("You've reached your weekly (7-day) usage limit. Your quota "
+                 "will reset when the current 7-day window ends. To continue "
+                 "now, purchase extra usage or upgrade your plan: "
+                 "https://www.kimi.com/membership/subscription?tab=quota")
+MOONSHOT_CYCLE = ("You've reached your usage limit for this billing cycle. "
+                  "Your quota will be refreshed in the next cycle. To continue "
+                  "now, purchase extra usage or upgrade your plan: "
+                  "https://www.kimi.com/code/#pricing")
+MOONSHOT_AUTH = ("The API Key appears to be invalid or may have expired. "
+                 "Please verify your credentials and try again.")
+GO_5H = ("5-hour usage limit reached. Resets in 2hr 30min. To continue using "
+         "this model now, enable usage from your available balance: "
+         "https://opencode.ai/workspace/wrk_X/go")
+#: The measured kimi seat: one dead key, one live key on a spent window. The
+#: proxy renewed a cooldown of a few minutes on every retry.
+DONE = "2026-09-25 04:17:56"
+RENEWALS = (("2026-09-25 04:18:05", "4m13s"), ("2026-09-25 04:32:05", "2m5s"),
+            ("2026-09-25 04:43:15", "1m1s"))
+
+
+def _kimi_pool(reset):
+    return ("no available credential for kimi-k3 via provider "
+            "openai-compatible-moonshot: 1 cooling down (reset in %s), "
+            "1 unavailable" % reset)
+
+
+def _renewal(stamp, reset, message=MOONSHOT_5H):
+    """One retry inside the vendor window, as measured: the dead key's 401,
+    Moonshot's 403 on the live key, and the proxy's cooldown three seconds
+    later."""
+    at = _epoch(stamp)
+    return [_upstream(_stamp(at - 2), 401, MOONSHOT_AUTH,
+                      "invalid_authentication_error"),
+            _upstream(stamp, 403, message, "access_terminated_error"),
+            _row(_stamp(at + 3), 429, _kimi_pool(reset))]
+
+
+def _inside(stamp):
+    """A clock inside the cooldown the renewal at ``stamp`` started."""
+    return _epoch(stamp) + 13
 
 
 def _family_by_name():
@@ -148,6 +208,45 @@ class LogWallTest(_Home):
                                        now=wall["expires_at"] + 1)
         self.assertIsNone(gone)
         self.assertIn("expired", why)
+
+    def test_a_cooldown_an_EMPTY_BALANCE_caused_names_no_timed_reset(self):  # noqa: VACUOUS_ASSERTION — the plain control and the room_line positive run unconditionally before the loop
+        """MEASURED on ds4pro: the upstream answered 402 Insufficient Balance,
+        the pool cooled its credential for a fixed day, and every surface
+        said "reset at <tomorrow>" as if the wall would lift by itself."""
+        pool = "no available credential for ds4-pro: 1 cooling down (reset in 23h59m10s)"
+        upstream = _row("2026-09-16 03:30:00", 402,
+                        "Insufficient Balance (request_id: 33b86a8b)",
+                        origin="unknown")
+        at = _epoch(STAMP)
+        # control first: the same pool refusal with no upstream cause keeps
+        # the ordinary reset sentence
+        self.write_log(_row(STAMP, 429, pool))
+        plain, _ = poolwall.seat_wall(SEAT, family=FAMILY, now=at + 60)
+        self.assertNotIn("cause", plain)
+        self.assertIn("reset at", poolwall.hold_reason(plain))
+        self.write_log(upstream, _row(STAMP, 429, pool))
+        wall, err = poolwall.seat_wall(SEAT, family=FAMILY, now=at + 60)
+        self.assertIsNone(err)
+        self.assertEqual((wall["cause"]["code"], wall["cause"]["vendor"]),
+                         (402, "deepseek"))
+        self.assertIn("NO timed reset", poolwall.room_line(wall))  # unconditional
+        for text in (poolwall.hold_reason(wall), poolwall.room_line(wall),
+                     poolwall.blocked_on(wall)):
+            self.assertIn("NO timed reset", text)
+            self.assertIn("top-up", text)
+            self.assertNotIn("reset at", text)
+        # a completed request between the balance refusal and the cooldown
+        # means the balance was fine then: not this wall's cause
+        self.write_log(upstream, _row("2026-09-16 03:31:00", 200),
+                       _row(STAMP, 429, pool))
+        later, _ = poolwall.seat_wall(SEAT, family=FAMILY, now=at + 60)
+        self.assertNotIn("cause", later)
+        # a LOCAL refusal carrying the same words is the proxy talking, not
+        # the vendor, and is never a cause
+        self.write_log(_row("2026-09-16 03:30:00", 402, "Insufficient Balance"),
+                       _row(STAMP, 429, pool))
+        local, _ = poolwall.seat_wall(SEAT, family=FAMILY, now=at + 60)
+        self.assertNotIn("cause", local)
 
     def test_a_completed_request_after_the_refusal_is_recovery(self):
         self.write_log(_row(STAMP, 429, MESSAGE))
@@ -312,6 +411,30 @@ class PaneAnchorTest(_Home):
         self.assertEqual(poolwall.pane_anchor(FAMILY, SEAT)(LINE), OBSERVED)
 
 
+def _liveness(now, snapshot=({}, None), pane="❯\n  ⏵⏵ bypass permissions on"):
+    """The seat's liveness row under a pinned clock, with ``pane`` as what the
+    registered pane reads back."""
+    rec = {"seat": SEAT, "harness": "orca", "handle": "term_x",
+           "worktree": "/w", "room": "helm", "ts": "T", "session": "sid"}
+    ad = mock.Mock()
+    ad.read.return_value = pane
+    real = seat._wall_in_force
+    pinned = datetime.datetime.fromtimestamp(now)
+    with mock.patch.object(seat, "_spawn_record", return_value=rec), \
+            mock.patch.object(seat, "_seat_family",
+                              return_value=(FAMILY, None)), \
+            mock.patch.object(seat, "_resolve_registered_pane",
+                              return_value=(ad, "term_x", "")), \
+            mock.patch("time.time", return_value=now), \
+            mock.patch.object(
+                seat_lifecycle, "_wall_in_force",
+                lambda line, now=pinned, observed=None: real(
+                    line, now, observed)), \
+            mock.patch("helm.proxywatch.upstream_snapshot",
+                       return_value=snapshot):
+        return seat.seat_liveness(SEAT)
+
+
 class DeliveryPauseDoorTest(_Home):
     """`proxywatch.delivery_pause` is the door every wake path obeys: beacon
     delivery, mention keystrokes, resume-turn's injection and nudge, the stop
@@ -380,19 +503,7 @@ class DeliveryPauseDoorTest(_Home):
         self.assertIn("could not be read", held)
 
     def _liveness(self, now, snapshot=({}, None)):
-        rec = {"seat": SEAT, "harness": "orca", "handle": "term_x",
-               "worktree": "/w", "room": "helm", "ts": "T", "session": "sid"}
-        ad = mock.Mock()
-        ad.read.return_value = "❯\n  ⏵⏵ bypass permissions on"
-        with mock.patch.object(seat, "_spawn_record", return_value=rec), \
-                mock.patch.object(seat, "_seat_family",
-                                  return_value=(FAMILY, None)), \
-                mock.patch.object(seat, "_resolve_registered_pane",
-                                  return_value=(ad, "term_x", "")), \
-                mock.patch("time.time", return_value=now), \
-                mock.patch("helm.proxywatch.upstream_snapshot",
-                           return_value=snapshot):
-            return seat.seat_liveness(SEAT)
+        return _liveness(now, snapshot)
 
     def test_the_liveness_row_renders_BLOCKED_ON_QUOTA_with_the_reset(self):
         row = self._liveness(self.at + 60)
@@ -461,6 +572,241 @@ class OneLinePerWallTest(_Home):
         self.assertIsNone(poolwall.announce(SEAT, now=self.at + 60,
                                             post=posted.append))
         self.assertEqual(len(posted), 1)
+
+
+class VendorCauseTest(unittest.TestCase):
+    """Which upstream refusals say the vendor's quota is spent. The bodies
+    are the vendors' own, read from the seats' proxy logs."""
+
+    def cause(self, code, message, etype, origin="unknown"):
+        body = json.dumps({"type": "error",
+                           "error": {"type": etype, "message": message}})
+        return poolwall._vendor_cause(code, body, origin, 1.0)
+
+    def test_the_measured_refusals_that_name_a_spent_window_or_balance(self):
+        grok = ('{"code":"personal-team-blocked:spending-limit","error":"You '
+                'have run out of credits or need a Grok subscription."}')
+        self.assertEqual(self.cause(403, "access_terminated_error",
+                                    MOONSHOT_5H)["window"], "5-hour")
+        for code, etype, message, want in (
+                (403, "access_terminated_error", MOONSHOT_5H,
+                 ("window", "5-hour", None)),
+                (403, "access_terminated_error", MOONSHOT_WEEK,
+                 ("window", "weekly", None)),
+                (403, "access_terminated_error", MOONSHOT_CYCLE,
+                 ("window", "billing cycle", None)),
+                (429, "usage_limit_reached", "The usage limit has been reached",
+                 ("window", None, None)),
+                (429, "rate_limit_error",
+                 "Resource has been exhausted (e.g. check quota).",
+                 ("window", None, None)),
+                (429, "GoUsageLimitError", GO_5H,
+                 ("window", "5-hour", "opencode-go")),
+                (402, "unknown_error", "Insufficient Balance",
+                 ("balance", None, "deepseek")),
+                (403, "permission_error", grok, ("balance", None, None))):
+            got = self.cause(code, message, etype)
+            self.assertIsNotNone(got, message)
+            self.assertEqual((got["kind"], got["window"], got["vendor"]), want,
+                             message)
+            self.assertEqual((got["code"], got["observed_at"]), (code, 1.0))
+
+    def test_a_rate_limit_a_dead_key_or_the_proxy_itself_is_no_cause(self):
+        self.assertIsNotNone(self.cause(403, "access_terminated_error",
+                                        MOONSHOT_5H))              # control
+        for code, etype, message, origin in (
+                (401, "invalid_authentication_error", MOONSHOT_AUTH, "unknown"),
+                (429, "rate_limit_error",
+                 "Rate limit exceeded: free-models-per-min.", "unknown"),
+                (429, "engine_overloaded_error",
+                 "The engine is currently overloaded, please try again later",
+                 "unknown"),
+                (500, "api_error", "context canceled", "unknown"),
+                (403, "access_terminated_error", MOONSHOT_5H, "local"),
+                (429, "rate_limit_error", _kimi_pool("4m13s"), "local")):
+            self.assertIsNone(self.cause(code, message, etype, origin),
+                              (code, message, origin))
+
+
+class VendorEpisodeTest(_Home):
+    """THE DEFECT, measured on the kimi seat: Moonshot refused its only live
+    key on the 5-hour window, the proxy cooled that key for a few minutes per
+    retry, and #helm got a poolwall line per renewal, each "reset at <a few
+    minutes away>". A vendor-caused wall is one line per refusal episode."""
+
+    def setUp(self):
+        super().setUp()
+        self.family = _family_by_name()
+        self.family.start()
+        self.addCleanup(self.family.stop)
+
+    def test_renewed_cooldowns_inside_one_vendor_window_post_ONE_line(self):
+        rows, lines, expiries = [_row(DONE, 200)], [], set()
+        for stamp, reset in RENEWALS:
+            rows += _renewal(stamp, reset)
+            self.write_log(*rows)
+            wall, why = poolwall.seat_wall(SEAT, family=FAMILY,
+                                           now=_inside(stamp))
+            self.assertIsNotNone(wall, why)
+            expiries.add(wall["expires_at"])
+            lines += poolwall.announcements([SEAT], now=_inside(stamp))
+        # three renewals, three cooldown instants, one wall
+        self.assertEqual(len(expiries), 3)
+        self.assertEqual(len(lines), 1, [body for _, body in lines])
+
+    def test_a_completed_request_ends_the_episode_and_the_next_earns_a_line(self):
+        first = [_row(DONE, 200)] + _renewal(*RENEWALS[0])
+        self.write_log(*first)
+        lines = poolwall.announcements([SEAT], now=_inside(RENEWALS[0][0]))
+        second = first + [_row("2026-09-25 04:30:00", 200)] + \
+            _renewal(*RENEWALS[1])
+        self.write_log(*second)
+        lines += poolwall.announcements([SEAT], now=_inside(RENEWALS[1][0]))
+        # a renewal inside the second episode is still that episode
+        self.write_log(*second + _renewal(*RENEWALS[2]))
+        lines += poolwall.announcements([SEAT], now=_inside(RENEWALS[2][0]))
+        self.assertEqual(len(lines), 2, [body for _, body in lines])
+        self.assertIn(poolwall.iso(_epoch(RENEWALS[0][0])), lines[0][1])
+        self.assertIn(poolwall.iso(_epoch(RENEWALS[1][0])), lines[1][1])
+
+    def test_the_words_name_the_vendor_window_not_the_proxy_cooldown(self):  # noqa: VACUOUS_ASSERTION — the plain-cooldown control asserting "reset at" runs unconditionally before the loop
+        now = _inside(RENEWALS[0][0])
+        # control: the same cooldown with no vendor refusal behind it keeps
+        # the proxy's reset sentence, so its absence below is not vacuous
+        self.write_log(_row(DONE, 200), _renewal(*RENEWALS[0])[-1])
+        plain, _ = poolwall.seat_wall(SEAT, family=FAMILY, now=now)
+        self.assertIn("reset at", poolwall.room_line(plain))
+        self.write_log(_row(DONE, 200), *_renewal(*RENEWALS[0]))
+        wall, _ = poolwall.seat_wall(SEAT, family=FAMILY, now=now)
+        cooldown = poolwall.iso(wall["expires_at"])
+        began = poolwall.iso(_epoch(RENEWALS[0][0]))
+        for text in (poolwall.hold_reason(wall), poolwall.room_line(wall),
+                     poolwall.blocked_on(wall)):
+            self.assertNotIn("reset at", text)
+            self.assertIn("the upstream (moonshot) refused on its 5-hour usage "
+                          "window at %s" % began, text)
+            self.assertIn("until the vendor's window resets", text)
+            # the proxy's instant is named as the proxy's, never as the end
+            self.assertIn("the current one ends at %s" % cooldown, text)
+        # the hold is unchanged: it is the proxy's cooldown, and lifts with it
+        self.assertEqual(poolwall.pause(wall, now)["until"], cooldown)
+        self.assertIsNone(poolwall.seat_wall(
+            SEAT, family=FAMILY, now=wall["expires_at"] + 1)[0])
+        # a vendor that states no window is not given one
+        self.write_log(_row(DONE, 200),
+                       _upstream(RENEWALS[0][0], 429,
+                                 "The usage limit has been reached",
+                                 "usage_limit_reached"),
+                       _row(_stamp(_epoch(RENEWALS[0][0]) + 3), 429,
+                            "no available credential for gpt-5.6-sol via "
+                            "provider codex: 1 cooling down (reset in 2m)"))
+        quiet, _ = poolwall.seat_wall(SEAT, family=FAMILY, now=now)
+        text = poolwall.room_line(quiet)
+        self.assertNotIn("reset at", text)
+        self.assertIn("the upstream (codex) refused on a usage quota whose "
+                      "window it did not state", text)
+
+    def test_CONTROL_a_cooldown_with_no_vendor_cause_keeps_its_instant(self):  # noqa: VACUOUS_ASSERTION — the loop runs twice by construction and the unconditional count of two lines after it is the positive
+        """The dead key's 401 is an upstream refusal, not a spent quota: the
+        cooldown behind it has no vendor cause, and each new instant is a new
+        wall, exactly as before."""
+        rows, lines = [_row(DONE, 200)], []
+        for stamp, reset in RENEWALS[:2]:
+            at = _epoch(stamp)
+            rows += [_upstream(stamp, 401, MOONSHOT_AUTH,
+                               "invalid_authentication_error"),
+                     _row(_stamp(at + 3), 429, _kimi_pool(reset))]
+            self.write_log(*rows)
+            wall, _ = poolwall.seat_wall(SEAT, family=FAMILY, now=at + 13)
+            self.assertNotIn("cause", wall)
+            self.assertIn("reset at %s" % poolwall.iso(wall["expires_at"]),
+                          poolwall.room_line(wall))
+            lines += poolwall.announcements([SEAT], now=at + 13)
+            lines += poolwall.announcements([SEAT], now=at + 20)   # same wall
+        self.assertEqual(len(lines), 2)
+
+    def test_an_old_ledger_row_neither_crashes_nor_silences_an_episode(self):
+        self.write_log(_row(DONE, 200), *_renewal(*RENEWALS[0]))
+        now = _inside(RENEWALS[0][0])
+        wall, _ = poolwall.seat_wall(SEAT, family=FAMILY, now=now)
+        path = poolwall._ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        def ledger(row):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({SEAT: row}, f)
+        # the pre-episode row for THIS very cooldown instant: one line, since
+        # it records no episode, then the row written in its place holds it
+        old = {"expires_at": wall["expires_at"], "announced_at": now - 5,
+               "model": "kimi-k3", "count": 1}
+        ledger(old)
+        self.assertEqual(len(poolwall.announcements([SEAT], now=now)), 1)
+        self.assertEqual(poolwall.announcements([SEAT], now=now), [])
+        for row in ({"expires_at": "x", "episode": "x"},
+                    {"episode": {"vendor": "moonshot", "kind": "window",
+                                 "first_at": "x"}}, "x"):
+            ledger(row)
+            self.assertEqual(len(poolwall.announcements([SEAT], now=now)), 1,
+                             row)
+            self.assertEqual(poolwall.announcements([SEAT], now=now), [], row)
+        # CONTROL: the old row still names a wall with no vendor cause
+        self.write_log(_row(DONE, 200),
+                       _row(_stamp(_epoch(RENEWALS[0][0]) + 3), 429,
+                            _kimi_pool("4m13s")))
+        plain, _ = poolwall.seat_wall(SEAT, family=FAMILY, now=now)
+        self.assertNotIn("cause", plain)
+        ledger(dict(old, expires_at=plain["expires_at"]))
+        self.assertEqual(poolwall.announcements([SEAT], now=now), [])
+
+    def test_a_tail_that_begins_inside_the_episode_is_the_same_episode(self):
+        """The log is read as a bounded tail, and a vendor window outlasts
+        it: once the completed request and the first refusal have rolled
+        out, the earliest visible refusal is not the episode's start."""
+        self.write_log(_row(DONE, 200), *_renewal(*RENEWALS[0]))
+        lines = poolwall.announcements([SEAT], now=_inside(RENEWALS[0][0]))
+        late = _renewal(*RENEWALS[2])
+        self.write_log(*late)
+        lines += poolwall.announcements([SEAT], now=_inside(RENEWALS[2][0]))
+        self.assertEqual(len(lines), 1)
+        # control: the same rows after a completed request are a new episode
+        self.write_log(_row("2026-09-25 04:40:00", 200), *late)
+        lines += poolwall.announcements([SEAT], now=_inside(RENEWALS[2][0]))
+        self.assertEqual(len(lines), 2)
+
+    def test_the_episode_is_its_first_refusal_whichever_vendor_speaks_now(self):
+        """A pool of two vendors (DeepSeek direct beside opencode-go): the
+        nearest cause flips between them, and the wall must not."""
+        def pool(reset):
+            return ("no available credential for ds4-pro: 2 cooling down "
+                    "(reset in %s)" % reset)
+        rows = [_row(DONE, 200),
+                _upstream(RENEWALS[0][0], 402, "Insufficient Balance",
+                          "unknown_error"),
+                _row(_stamp(_epoch(RENEWALS[0][0]) + 3), 429, pool("4m13s"))]
+        self.write_log(*rows)
+        lines = poolwall.announcements([SEAT], now=_inside(RENEWALS[0][0]))
+        rows += [_upstream(RENEWALS[1][0], 429, GO_5H, "GoUsageLimitError"),
+                 _row(_stamp(_epoch(RENEWALS[1][0]) + 3), 429, pool("2m5s"))]
+        self.write_log(*rows)
+        now = _inside(RENEWALS[1][0])
+        wall, _ = poolwall.seat_wall(SEAT, family=FAMILY, now=now)
+        self.assertEqual((wall["cause"]["vendor"], wall["cause"]["kind"],
+                          wall["cause"]["window"]),
+                         ("opencode-go", "window", "5-hour"))
+        self.assertIn("opencode-go", poolwall.room_line(wall))
+        lines += poolwall.announcements([SEAT], now=now)
+        self.assertEqual(len(lines), 1)
+
+    def test_the_liveness_row_off_the_pane_names_the_vendor_window(self):
+        """The pane carries the proxy's refusal with ITS cooldown clause; the
+        liveness row read off it must not call that clause the wall's end."""
+        self.write_log(_row(DONE, 200), *_renewal(*RENEWALS[0]))
+        pane = ("  ⎿ \xa0API Error: Request rejected (429) · "
+                + _kimi_pool("4m13s") + "\n" + COMPOSER)
+        row = _liveness(_inside(RENEWALS[0][0]), pane=pane)
+        self.assertEqual(row["state"], "BLOCKED_ON_QUOTA")
+        self.assertNotIn("reset at", row["blocked_on"])
+        self.assertIn("5-hour usage window", row["blocked_on"])
 
 
 if __name__ == "__main__":

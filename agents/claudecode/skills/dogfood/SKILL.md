@@ -25,7 +25,9 @@ it and the result is recorded.
 2. **Watch three friction classes.**
    - **bit**: it misbehaved on real input. Fix now and add a guard/test.
    - **fought**: it worked but pushed you toward a workaround. Improve the
-     ergonomics or file a task with evidence.
+     ergonomics or file a task with evidence, and put its friction tax on
+     it (steps x times per day); a fix that pays back within about 2 days
+     goes ahead of new features.
    - **surprised**: it revealed a premise. Capture it in the right layer.
 3. **Fold back immediately.** Bugs become fixes plus regression guards. Ergonomic
    issues become tasks or refinements. Durable lessons go through `/learn`.

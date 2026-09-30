@@ -68,8 +68,8 @@ would read as "usable", which is the founding defect restated.
 
 VERDICT PRECEDENCE, and the order is the argument:
 
-  1. a MEASURED refusal (pane GONE, provider wall, starved/hung turn) wins
-     over an unreadable sibling field — the answer is already known, and
+  1. a MEASURED refusal (an operator's `helm seat down`, pane GONE, provider
+     wall, starved/hung turn) wins over an unreadable sibling field — the answer is already known, and
      downgrading it to UNKNOWN because some OTHER field would not read hides
      a fact helm actually holds.
   2. otherwise ANY unreadable input that could have changed the answer makes
@@ -104,7 +104,8 @@ this typed answer, and `line()` is a consumer of it like any other:
                        None  — UNKNOWN, helm could not tell
         holding        int, or None when the ledger would not read
         refusal        the measured-refusal rung that decided an UNUSABLE
-                       verdict (pane | reachable | upstream | turn), else None
+                       verdict (down | pane | sidecar | reachable | upstream
+                       | turn | toolless), else None
         refusals       every rung that refuses, in ladder order; a caller
                        that routes by KIND of refusal reads this, never the
                        reason prose (`deaf_only` is the shared predicate)
@@ -393,6 +394,140 @@ def _read_reachable(entry, now, name=None, probe=None):
     return True, None, state
 
 
+def burn_family(row):
+    """The burn-flag family a roster seat spends, or None.
+
+    THE SAME TWO DOORS ROUTING READS. A self-verified launch family first,
+    translated from the harness word (`claude`) to the credential word the
+    flags use (`anthropic`) through `route.FROM_ALIASES`, which already holds
+    that mapping; then `seat.family_for`, which parses a numbered seat name
+    and reads the spawn register. Unverified runtime is display evidence, not
+    authority, so it is never believed.
+
+    The web board and the signing-liveness read below both ask this, so a
+    seat's family has one answer on every surface that colours it."""
+    from . import route
+    row = row if isinstance(row, dict) else {}
+    runtime = row.get("runtime") if isinstance(row.get("runtime"), dict) \
+        else {}
+    if row.get("runtime_verified") is True:
+        spelled = str(runtime.get("family") or "").lower()
+        if spelled:
+            return route.FROM_ALIASES.get(spelled, spelled)
+    try:
+        from . import seat
+        family, err = seat.family_for(str(row.get("seat") or ""))
+    except Exception:          # noqa: BLE001 — a chip, not a verdict
+        return None
+    # THE NAME DOOR ANSWERS THE HARNESS WORD TOO (`<project>-claude` ->
+    # `claude`), so it is translated the same way: read raw, a RED anthropic
+    # flag would miss the seat and count it able to work.
+    return None if err or not family \
+        else route.FROM_ALIASES.get(str(family).lower(), family)
+
+
+def _dark(dark, why, since=None, seat=None):
+    return {"dark": dark, "why": why, "since": since, "seat": seat}
+
+
+def signing_dark(name, now=None, register=None, probe=None, flag=None):
+    """{dark, why, since, seat} — is the seat behind one SIGNING PROFILE dark?
+
+    A signing failure recorded by a seat that has since gone dark is that
+    seat's history, not a fleet-wide degradation: nothing will post a signed
+    turn from it until it comes back. The chat transport status asks this to
+    scope such a failure to its seat instead of reporting the whole fleet
+    DEGRADED (the measured case: one dark seat's record read as fleet-wide
+    DEGRADED for 19 hours while the node answered).
+
+      dark True   the roster names this seat, its presence beat is ABSENT, and
+                  either the attendance register reads DEAF re-proven by a
+                  live beacon probe (no live beacon now), or its family's burn
+                  flag is RED.
+      dark False  the seat beats now, or a live beacon answers for it.
+      dark None   helm could not tell: no roster row by that name (a service
+                  label, a retired profile), an unreadable roster, or an
+                  unproven register with no RED flag. A caller must NOT scope
+                  on None; an unproven seat's failure stays loud.
+
+    `since` is the seat's last presence beat (epoch), the last time it was
+    seen alive, or None when no beat was ever recorded.
+
+    RE-IMPLEMENTS NOTHING: presence is `seats.presence_of(seats.last_seen())`,
+    the beacon answer is `_read_reachable` (the register re-proven by the
+    strict probe the actuator pays), the family is `burn_family` and its
+    colour is `burnflags.family_flag`. `register`, `probe` and `flag` are the
+    seams for the roster, the beacon probe and the flag read."""
+    now = time.time() if now is None else float(now)
+    name = str(name or "")
+    reg, err = _read_roster(register)
+    if err:
+        return _dark(None, err)
+    seat = next((k for k in reg if isinstance(k, str)
+                 and k.casefold() == name.casefold()), None)
+    row = reg.get(seat) if seat is not None else None
+    if not isinstance(row, dict):
+        return _dark(None, "%r is not a roster seat, so its liveness cannot "
+                           "be read" % name)
+    from . import seats
+    try:
+        seen = seats.last_seen(seat, row)
+        presence = seats.presence_of(seen)
+    except Exception as e:                  # noqa: BLE001
+        return _dark(None, "the presence read failed (%s)"
+                     % e.__class__.__name__, seat=seat)
+    seen = seen if isinstance(seen, (int, float)) else None
+    if presence != "absent":
+        return _dark(False, "%s beat %s ago" % (
+            presence, _fmt_age(max(0.0, now - seen)) if seen else "?"),
+            seen, seat)
+    reachable, why, _state = _read_reachable(row, now, name=seat,
+                                             probe=probe)
+    fam = burn_family(dict(row, seat=seat))
+    fl = None
+    if fam:
+        try:
+            if flag is not None:
+                fl = flag(fam)
+            else:
+                from . import burnflags
+                fl = burnflags.family_flag(fam)
+        except Exception:                   # noqa: BLE001 — unread, not RED
+            fl = None
+    red = isinstance(fl, dict) and fl.get("colour") == "RED"
+    red_why = ("family %s is RED (%s)" % (fam, fl.get("cause") or
+                                          "no cause recorded")) if red else ""
+    if reachable is False:
+        return _dark(True, "; ".join(w for w in (
+            why or "no live beacon: helm cannot wake this seat", red_why)
+            if w), seen, seat)
+    if red:
+        return _dark(True, red_why, seen, seat)
+    if reachable is True:
+        return _dark(False, why or "a live beacon answers", seen, seat)
+    return _dark(None, why or "no attendance verdict proves it either way",
+                 seen, seat)
+
+
+def _read_sidecar(family, probe=None):
+    """(state, why) for a family's sidecar, (None, None) when it declares
+    none, ("unreadable", why) when the probe itself broke. `probe` is the
+    test seam; production reads helm/seat_sidecar.py's verdict."""
+    from . import seat
+    if not (seat.FAMILIES.get(family) or {}).get("sidecar"):
+        return None, None
+    try:
+        if probe is None:
+            from . import seat_sidecar
+            state, why, _pid = seat_sidecar.verdict(family)
+        else:
+            state, why = probe(family)[:2]
+    except Exception as exc:                # noqa: BLE001 — a join never raises
+        return "unreadable", "the sidecar probe raised %s: %s" % (
+            exc.__class__.__name__, exc)
+    return state, why
+
+
 def _recipient(name, canonical=None):
     """(ledger recipient, error) for one seat name — the SAME resolution
     proxywatch's own fuse applies before counting a seat's open rows, so the
@@ -415,7 +550,7 @@ def _recipient(name, canonical=None):
 
 def _seat_row(name, hrow, herr, up, uperr, holding, holderr, reg, regerr,
               canonical=None, panes=None, panes_blind=None, now=None,
-              beacon_live=None):
+              beacon_live=None, sidecar=None):
     """One seat's joined row. `unknown` maps FIELD -> why it could not read;
     an empty `unknown` is the only thing that lets a verdict be USABLE."""
     row = {"seat": name, "family": None, "turn_state": None,
@@ -425,7 +560,19 @@ def _seat_row(name, hrow, herr, up, uperr, holding, holderr, reg, regerr,
            "reachable": None, "reachable_why": None,
            "reachable_state": None, "refusal": None, "refusals": (),
            "runtime_unreadable": None, "scope": "proxy",
+           "sidecar": None, "sidecar_why": None,
+           "desired_down": None, "toolless": None, "rest": None,
            "holding_scope": "measured", "unknown": {}}
+
+    # --- (0) the owner's rest (helm/seat_rest.py) ----------------------------
+    # ONE FILE PER SEAT, READ ON EVERY JOIN: a seat the owner paused is not a
+    # seat the router, the reviewer bench or the dispatch door may hand work
+    # to. A record that cannot be read refuses as well, and says UNKNOWN, not
+    # RESTING (see that module for why each side of that choice).
+    from . import seat_rest
+    held = seat_rest.pause(name, now=now)
+    if held:
+        row["rest"] = {"state": held["state"], "reason": held["reason"]}
 
     # --- (2) proxywatch: turn state, semantic age, pane liveness -----------
     if herr:
@@ -459,6 +606,12 @@ def _seat_row(name, hrow, herr, up, uperr, holding, holderr, reg, regerr,
                                or "proxywatch's minted-seat census does not "
                                   "cover %r — no proxy, so no turn age and no "
                                   "provider wall exist for it" % name)
+        # A PROXY SEAT AN OPERATOR STOOD DOWN rides this same no-verdict row
+        # (proxywatch does not probe it), and it is NOT a native seat: its
+        # proxy is off on purpose, so no live pane makes it able to take work.
+        # The record rides the row and is a measured refusal of its own.
+        if isinstance((hrow or {}).get("down"), dict):
+            row["desired_down"] = hrow["down"]
         if panes_blind:
             row["unknown"]["pane"] = panes_blind
         else:
@@ -469,6 +622,10 @@ def _seat_row(name, hrow, herr, up, uperr, holding, holderr, reg, regerr,
         row["turn_evidence"] = hrow.get("turn_evidence")
         row["semantic_age_s"] = hrow.get("transcript_age_s")
         row["pane"] = hrow.get("pane_live")
+        # A MEASURED reading off the same health row (task/3533): the log
+        # shows the model answering turn after turn with no tool call.
+        from . import proxywatch
+        row["toolless"] = proxywatch.toolless_reading(hrow)
         if row["turn_state"] is None:
             row["unknown"]["turn"] = "proxywatch recorded no turn verdict"
         if row["semantic_age_s"] is None:
@@ -504,6 +661,21 @@ def _seat_row(name, hrow, herr, up, uperr, holding, holderr, reg, regerr,
                 row["upstream"] = rec["state"]
                 row["upstream_since"] = rec.get("since")
                 row["upstream_dark"] = rec.get("dark") is True
+
+    # --- (2b) the family's second process, measured (task/1056) ------------
+    # A PROXY IN FRONT OF A DEAD BRIDGE IS NOT A SEAT THAT CAN WORK, and every
+    # rung above reads the proxy. `seat list` badges the bridge on the proxy
+    # column; without this rung the usability line under that badge said
+    # USABLE and the dispatch door routed work to it. Only a family that
+    # declares a sidecar, and only its family seat (the sidecar is
+    # family-level), pays the one loopback probe.
+    if row["scope"] != "pane-only" and row["family"] \
+            and name == row["family"]:
+        state, why = _read_sidecar(row["family"], sidecar)
+        if state == "unreadable":
+            row["unknown"]["sidecar"] = why
+        else:
+            row["sidecar"], row["sidecar_why"] = state, why
 
     # --- (3) the dispatch/lr ledger ----------------------------------------
     # NOT-ASKED IS NOT UNKNOWN, and the difference is the whole reason the
@@ -592,15 +764,17 @@ def _read_panes(live_seats=None):
 
 def join(seats=None, health=None, upstream=None, open_recipients=None,
          register=None, canonical=None, health_seats=None, now=None,
-         live_seats=None, need_holding=True, beacon_live=None):
+         live_seats=None, need_holding=True, beacon_live=None, sidecar=None):
     """{seat name: typed row} — FOUR reads total, whatever the fleet size.
 
     See the module docstring for the row contract. The four readers run ONCE
     each here and every seat is derived from those same four results, so N
-    seats never cost N ledger folds or N process censuses. The ONE per-seat
-    cost is `_read_reachable`'s live beacon probe, and it is paid only for a
-    seat whose register says DEAF: the price of not refusing a seat on a
-    verdict that stopped being true (task/3055). `beacon_live` is its seam.
+    seats never cost N ledger folds or N process censuses. The per-seat
+    costs are two: `_read_reachable`'s live beacon probe, paid only for a
+    seat whose register says DEAF (the price of not refusing a seat on a
+    verdict that stopped being true, task/3055; `beacon_live` is its seam),
+    and one open of the seat's own rest record, which is absent for every
+    seat the owner never rested (helm/seat_rest.py).
 
     `seats` widens the result to names the CALLER renders that proxywatch does
     not watch (they come back UNKNOWN, which is the honest answer and also
@@ -626,7 +800,7 @@ def join(seats=None, health=None, upstream=None, open_recipients=None,
                         holderr, reg, regerr, canonical=canonical,
                         panes=panes,
                         panes_blind=panes_blind or panes_blind_by_seat.get(n),
-                        now=now, beacon_live=beacon_live)
+                        now=now, beacon_live=beacon_live, sidecar=sidecar)
         # THE VERDICT RIDES THE ROW. A caller that has to remember to call a
         # second function to find out what the row MEANS is a caller that will
         # eventually not, and every such caller would then have its own idea
@@ -1180,11 +1354,26 @@ def verdict(row):
     return state, why
 
 
-#: The four MEASURED-REFUSAL rungs, in the ladder's own order. Each is
+#: The seven MEASURED-REFUSAL rungs, in the ladder's own order. Each is
 #: exactly one of the UNUSABLE returns in `_verdict_core`, which reads its
-#: branches off `_refusals` so the two cannot name different rungs.
-REFUSE_PANE, REFUSE_REACHABLE, REFUSE_UPSTREAM, REFUSE_TURN = (
-    "pane", "reachable", "upstream", "turn")
+#: branches off `_refusals` so the two cannot name different rungs. REST and
+#: DOWN come first: the owner's `helm seat rest` (helm/seat_rest.py) and an
+#: operator's `helm seat down` (helm/seat_down.py) are the refusals whose
+#: repair is a decision rather than a fix, and every rung below them is a
+#: measured state of the seat's plumbing, not an intent.
+REFUSE_REST = "rest"
+REFUSE_DOWN = "down"
+REFUSE_PANE, REFUSE_SIDECAR, REFUSE_REACHABLE, REFUSE_UPSTREAM, REFUSE_TURN = (
+    "pane", "sidecar", "reachable", "upstream", "turn")
+#: A seat whose model answers every turn and calls no tool (task/3533): the
+#: pane is live, the vendor answers and the turn completes, so no rung above
+#: refuses it, and it takes an obligation it cannot work.
+REFUSE_TOOLLESS = "toolless"
+#: The sidecar states that refuse work: each is a measured "cannot serve",
+#: or (unvetted, stale) a build nobody vetted, on disk or in the process. A STARTING bridge degrades instead;
+#: see seat_sidecar for the ladder.
+_SIDECAR_REFUSING = ("down", "wedged", "unserving", "foreign", "absent",
+                     "unvetted", "stale")
 
 
 def _refusals(row):
@@ -1193,10 +1382,14 @@ def _refusals(row):
     if not row:
         return ()
     return tuple(rung for rung, hit in (
+        (REFUSE_REST, isinstance(row.get("rest"), dict)),
+        (REFUSE_DOWN, isinstance(row.get("desired_down"), dict)),
         (REFUSE_PANE, row.get("pane") is False),
+        (REFUSE_SIDECAR, row.get("sidecar") in _SIDECAR_REFUSING),
         (REFUSE_REACHABLE, row.get("reachable") is False),
         (REFUSE_UPSTREAM, bool(row.get("upstream_dark"))),
-        (REFUSE_TURN, row.get("turn_state") in _TURN_UNUSABLE)) if hit)
+        (REFUSE_TURN, row.get("turn_state") in _TURN_UNUSABLE),
+        (REFUSE_TOOLLESS, bool(row.get("toolless")))) if hit)
 
 
 def deaf_only(row):
@@ -1227,11 +1420,11 @@ def _verdict_core(row):
     # Measured on the live fleet the first time this rendered: codex came out
     # "DEGRADED turn=ok last=0h56m - no completed turn in 0h56m" — a line that
     # contradicts itself in eight characters. `turn_state` subtracts the HOST
-    # SUSPEND GAP from the age before comparing it to HANG_S (a suspend adds
-    # the same delta to every seat at once and would invent a fleet-wide
-    # hang), while the row carries the RAW WALL age. Comparing that raw age to
-    # HANG_S here was a SECOND, DIFFERENT staleness rule wearing the first
-    # one's name.
+    # SUSPEND INSIDE THE SEAT'S WINDOW from the age before comparing it to
+    # HANG_S (a suspend adds the same delta to every seat at once and would
+    # invent a fleet-wide hang), while the row carries the RAW WALL age.
+    # Comparing that raw age to HANG_S here was a SECOND, DIFFERENT staleness
+    # rule wearing the first one's name.
     #
     # `ok` is the ladder saying a turn completed inside the window; `off` is
     # the ladder declining to ask because nothing is running. Every other
@@ -1242,6 +1435,18 @@ def _verdict_core(row):
         measured.append("no completed turn in %s" % _fmt_age(age))
 
     # 1 — a MEASURED refusal outranks an unreadable sibling field.
+    if REFUSE_REST in refusals:
+        from . import seat_rest
+        rest = row["rest"]
+        return UNUSABLE, "; ".join(
+            [rest["reason"]] + ([seat_rest.end_hint(row.get("seat"))]
+                                if rest["state"] == seat_rest.STATE else [])
+            + measured)
+    if REFUSE_DOWN in refusals:
+        from . import seat_down
+        return UNUSABLE, "proxy %s — %s" % (
+            seat_down.describe(row["desired_down"]),
+            seat_down.resume_hint(row.get("seat")))
     if REFUSE_PANE in refusals:
         # THE REPAIR MUST MATCH THE SEAT CLASS. `helm seat spawn` mints a
         # PROXY seat; prescribing it for a native claude pane would hand the
@@ -1270,6 +1475,11 @@ def _verdict_core(row):
         return UNUSABLE, "; ".join(
             ["pane GONE — no live process holds this seat (%s)"
              % (repair % row.get("seat"))] + wall + measured)
+    if REFUSE_SIDECAR in refusals:
+        return UNUSABLE, "; ".join(
+            ["bridge %s — %s (`helm seat doctor --ensure` restarts a dead or "
+             "wedged one)" % (row.get("sidecar"), row.get("sidecar_why"))]
+            + measured)
     if REFUSE_REACHABLE in refusals:
         # AFTER THE PANE RUNG ON PURPOSE. A seat whose pane is GONE is also
         # unreachable, and `helm seat spawn` re-arms the beacon as part of
@@ -1305,6 +1515,11 @@ def _verdict_core(row):
         return UNUSABLE, "; ".join(
             ["turn=%s: %s" % (turn, row.get("turn_evidence")
                               or "proxywatch recorded no evidence")] + measured)
+    if REFUSE_TOOLLESS in refusals:
+        from . import proxywatch
+        return UNUSABLE, "; ".join(
+            [proxywatch.toolless_text(row.get("seat"), row["toolless"])]
+            + measured)
 
     # 2 — anything unreadable that could have changed the answer.
     if turn in _TURN_UNKNOWN:
@@ -1326,6 +1541,8 @@ def _verdict_core(row):
             and row.get("reachable_state") == _WAKING:
         measured.append("%s; a row sent now is delivered when it re-arms"
                         % (row.get("reachable_why") or _WAKING))
+    if row.get("sidecar") == "starting":
+        measured.append("bridge starting — %s" % row.get("sidecar_why"))
     if turn in _TURN_IMPAIRED:
         measured.append("turn=%s: %s" % (turn, row.get("turn_evidence")
                                          or "proxywatch recorded no evidence"))

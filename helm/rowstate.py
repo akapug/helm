@@ -26,9 +26,7 @@ state below is backed by POSITIVE evidence, carried in `Derivation.evidence` so
 a reader can check the derivation instead of trusting it.
 """
 
-import calendar
 import re
-import time
 
 from .verdicts import WORK_POLARITIES
 
@@ -47,7 +45,7 @@ UNSTARTED = "UNSTARTED"     # branch exists, nothing past the merge-base
 BUILDING = "BUILDING"       # commits exist, no receipt binds the head's tree
 BUILT = "BUILT"             # closed delivered-report: the artifact WAS delivery
 GATED = "GATED"             # a receipt binds the head commit's EXACT tree
-APPROVED = "APPROVED"       # GATED + a cross-family approve on that exact tip
+APPROVED = "APPROVED"       # GATED + a cross-family (or non-author) approve on that tip
 REVIEWING = "REVIEWING"     # an open review row: the obligation is a verdict
 REVIEWED = "REVIEWED"       # the verdict is recorded; it authorized no landing
 LANDED = "LANDED"           # trunk carries the work (ancestry, content, or id)
@@ -57,11 +55,6 @@ UNKNOWN = "UNKNOWN"         # the artifacts do not answer — never a claim
 
 STATES = (UNSTARTED, BUILDING, BUILT, GATED, APPROVED, REVIEWING, REVIEWED,
           LANDED, SUPERSEDED, CANCELLED, UNKNOWN)
-
-# Ordered most-resolved first. A row is reported at the furthest stage its
-# artifacts positively support, and `derive` walks this order exactly once.
-RESOLVED_ORDER = (LANDED, CANCELLED, BUILT, REVIEWED, SUPERSEDED, APPROVED,
-                  GATED, REVIEWING, BUILDING, UNSTARTED, UNKNOWN)
 
 _HEX = re.compile(r"[0-9a-f]{8,64}\Z")
 
@@ -246,6 +239,19 @@ _CLOSE_TERMINAL = {
     # CANCELLED — `expired`'s word — would be the opposite error: it asserts
     # the work never arrived, and here it demonstrably did.
     "endorsement-moot": SUPERSEDED,
+    # `source-clean-landed` IS LANDED, AND BY THE SENTENCE THAT KEPT THE
+    # THREE ROWS ABOVE IT OFF THAT WORD (task/3053). "LANDED is a claim about
+    # THIS row's work at HEAD" under THIS row's authority — and here both are
+    # this row's: the tip is the one ITS recipient read clean, the door
+    # proved THAT tip an ancestor of trunk (never a patch-identical copy),
+    # and the gate that vouched ran a tree containing it. `discharged`,
+    # `chain-proof` and `endorsement-moot` read SUPERSEDED because the
+    # authority was somebody else's; this one's is the row's own review.
+    #
+    # IT IS NOT AN APPROVE AND DOES NOT READ AS ONE. The terminal says the
+    # work landed; the row's polarity stays None, so every surface that asks
+    # "who approved this" still answers nobody, which is true.
+    "source-clean-landed": LANDED,
 }
 
 # TERMINALITY IS NOT ALWAYS A STATUS, and `_lifecycle` only read statuses and
@@ -829,7 +835,9 @@ def _gated(world, tip):
 # ----------------------------------------------------------------- approval
 
 def _approved(row, world, tip, receipt_id):
-    """A CROSS-FAMILY approve bound to this EXACT tip. -> (evidence, why-not).
+    """A CROSS-FAMILY approve bound to this EXACT tip, or a NON-AUTHOR one
+    (`world.non_author`: a seat the recorded tier admitted by its model, that
+    wrote none of the work). -> (evidence, why-not).
 
     THREE RULES, each of which was once broken in production.
 
@@ -878,17 +886,25 @@ def _approved(row, world, tip, receipt_id):
             refusals.append("the approve by @%s cannot be counted — no "
                             "verified family evidence for that seat" % seat)
             continue
-        if not author_families:
-            refusals.append("no verified family evidence for the author of "
-                            "lane %s, so cross-family cannot be established"
-                            % lane)
-            continue
-        if set(fams) & author_families:
-            continue
-        if unknown_author:
-            refusals.append("an author of lane %s has no family evidence, so "
-                            "a cross-family claim would be a guess" % lane)
-            continue
+        # THE NON-AUTHOR RULE (the owner's ruling that Opus seats are in the
+        # upper tier). An approve whose recorded tier admitted its reader by
+        # its model, from a seat that wrote none of the work, is independent
+        # by SEAT, so the authors' families do not decide it. `rowworld`
+        # measured which approvals those are; every other approve keeps the
+        # family rule below.
+        if approval.get("id") not in (world.non_author or ()):
+            if not author_families:
+                refusals.append("no verified family evidence for the author "
+                                "of lane %s, so cross-family cannot be "
+                                "established" % lane)
+                continue
+            if set(fams) & author_families:
+                continue
+            if unknown_author:
+                refusals.append("an author of lane %s has no family evidence, "
+                                "so a cross-family claim would be a guess"
+                                % lane)
+                continue
         gate = _hex(approval.get("gate"))
         if not gate:
             refusals.append("the approve by @%s carries no gate token" % seat)

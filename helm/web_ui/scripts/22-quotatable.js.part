@@ -31,6 +31,14 @@ const QFAM_FIRST = ["anthropic", "codex"];
    filter this table has: the all/claude/codex chips asked the same question
    one row further from the answer. */
 let QFOLD = {};
+/* the account groups the table last drew, which the Families card's "billed
+   to … accounts" links into; null until the table has drawn, empty when it
+   drew no rows */
+let QUOTA_GROUPS = null;
+/* THE ACCOUNT COUNT THE TABLE LAST DREW (acctCensus), which the nav and Home
+   print; null until both of the table's reads have landed, or when either
+   could not be read — never a zero for a count nobody took. */
+let ACCT_CENSUS = null;
 
 /* ONE ROW PER SUBSCRIPTION, AND THAT IS THE OWNER'S RULING FOR THIS SURFACE:
    "i dont understand why the accounts we pay for [aren't handled] by making it
@@ -157,6 +165,52 @@ function quotaAliasOrder(group) {
   });
 }
 
+/* ── ONE COUNT OF ACCOUNTS (task/3635) ─────────────────────────────────────
+   Counted by three readers — the credential homes, these rows, the declared
+   records — "accounts" is three numbers under one noun with no scope named.
+
+   THE ROWS OF THIS TABLE ARE THE COUNT. A row is one paid subscription with
+   its declared and measured halves joined (quotaRows), so a login reached
+   through two homes and the default pointer at it is ONE, and a subscription
+   nothing measures is still one. The family groups are the same rows split,
+   so they add up to it by construction; the nav, Home and the line over the
+   table print it with its scope in words. PURE. */
+function acctCensus(rows) {
+  return {total: rows.length,
+          measured: rows.filter(r => r.cred).length,
+          /* A ROW HE DECLARED FREE IS AN ACCOUNT, NEVER A PAID ONE: every
+             other row is one he pays for, or one nobody has said is free.
+             FREE IS THE SERVER'S ANSWER for the whole subscription
+             (accounts.billed_free, the declared totals' rule), carried on
+             each record, so a spare record cannot make the two disagree. */
+          free: rows.filter(r => r.decl && r.decl.billed_free).length,
+          walled: rows.filter(r => acctTier(r) === ATIER.WALLED).length,
+          login: rows.filter(r => r.cred && acctNeedsLogin(r.cred)).length,
+          fams: quotaFamilies(rows).map(([f, rs]) => [f, rs.length])};
+}
+function acctNoun(n) { return n === 1 ? "account" : "accounts"; }
+/* the count with its scope, in the words every surface uses for it: paid
+   and free by what he declared, measured and declared-only by what helm
+   reads */
+function acctCensusWords(c) {
+  return c.total + " " + acctNoun(c.total) + " (" + (c.total - c.free) + " paid, "
+    + c.free + " free): " + c.measured + " measured by helm, "
+    + (c.total - c.measured) + " declared by you and not measured";
+}
+/* DRAW THE COUNT where it is read: the line over this table, the nav, and
+   (through ACCT_CENSUS) Home. `read` is renderAccts' own "both reads landed
+   and both could be read"; short of that nothing is drawn, never a number. */
+function acctCountRender(rows, read) {
+  const c = ACCT_CENSUS = read ? acctCensus(rows) : null;
+  NAV_ACC = c && c.total ? statCell(c.total, acctNoun(c.total) + (c.free ? " · " + c.free + " free" : " · all paid"),
+                                    acctCensusWords(c)) : "";
+  const el = $("#qonecount");
+  if (el) el.textContent = c ? acctCensusWords(c) : "";
+  renderNav();
+  // Home's tile reads ACCT_CENSUS; draw it now rather than on its next tick
+  if (typeof homeRender === "function") homeRender();
+}
+
 function quotaFamilies(rows) {
   const by = {};
   for (const r of rows) (by[r.fam] = by[r.fam] || []).push(r);
@@ -195,7 +249,25 @@ function quotaDeclCells(r) {
 
 /* the signal colour for a remaining-%: green healthy -> amber -> low. */
 function pctCol(pct) { return pct == null ? "var(--mut)" : pct >= 50 ? "var(--ok)" : pct >= 20 ? "var(--warn)" : "var(--bad)"; }
-const LOGIN_CMDS = {anthropic: h => `CLAUDE_CONFIG_DIR=${h} claude /login`, codex: h => `CODEX_HOME=${h} codex login --device-auth`};
+/* WHAT A STATE WITH A REPAIR SAYS TO HIM, AND WHO DOES IT (task/3735): the
+   fact and the doer, never a command. The id cell's hover and the attention
+   strip's pills read these same sentences, so the two cannot drift apart. */
+const CRED_SAID = {
+  due: "helm's copy of its token is due for refresh; an agent renews it, and no login is needed",
+  login: "needs signing in again: an agent can start the login for you, and you approve it in the browser",
+  unproven: "no pool file matches this member, so its budget is UNKNOWN until an agent pools that member's own credential",
+  drifted: "an agent repairs the home",
+};
+/* WHERE A LOGIN IS THE FIX (task/3634): a token whose refresh chain is spent
+   (expired-token), or one the vendor refused or that is not there at all.
+   Never a spent allowance — a login does not refill one — and never a due
+   token helm's own refresh renews. A provider with no login of its own names
+   none. -> true where this row needs signing in again. PURE. */
+function acctNeedsLogin(c) {
+  const refused = c.state === "api-error" && /^(needs_reauth|no-credentials)\b/.test(String(c.status || ""));
+  return (c.provider === "anthropic" || c.provider === "codex")
+    && (c.state === "expired-token" || refused);
+}
 function latestGauges(acct) {
   const out = {}, when = {};
   for (const r of HIST) {
@@ -248,6 +320,10 @@ function quotaResetCell(c, G) {
     if (t && t > now && (soonest === null || t < soonest)) soonest = t;
   }
   if (!soonest && c.resets_at_ms && c.resets_at_ms > now) soonest = c.resets_at_ms;
+  // A SPENT ROW'S ROOM COMES BACK WHEN ITS WALL LIFTS, the time its state word
+  // says (task/3634) — not an unspent window's sooner reset, and a dash when
+  // the wall's reset is unknown, as the chip says
+  if (c.state === "exhausted") soonest = acctBackAt(c);
   const win = c.windows_left != null && c.windows_per_week != null
     ? c.windows_left.toFixed(1) + "/" + c.windows_per_week.toFixed(1) + " windows" : "";
   const wv = c.windows_verdict && c.windows_verdict !== "ok" ? c.windows_verdict : "";
@@ -259,13 +335,31 @@ function quotaResetCell(c, G) {
 
 /* ── identity ──────────────────────────────────────────────────────────────
    The colour dot binds the row to its line in the big chart and to its
-   sparkline; the state is a word, and a state with a repair carries the
-   repair as a click-to-copy the owner runs himself (logins are human-only).
-   A row with no measurement is named by its DECLARED id, which is the only
-   name it has. A codex Team member whose workspace IS pooled, with no pool
-   file proven to be it (`member_unproven`, task/2981), is measured, not
-   missing: its word says so and its repair is `helm codex pool`, never a
-   login. */
+   sparkline; the state is a word, and a state with a repair says the fact
+   and who does it in its hover (CRED_SAID). A row with no measurement is
+   named by its DECLARED id, which is the only name it has. A codex Team
+   member whose workspace IS pooled, with no pool file proven to be it
+   (`member_unproven`, task/2981), is measured, not missing: its word says so,
+   and its repair is an agent pooling that member's own credential, never a
+   login.
+
+   A CLAUDE ROW'S NAME IS METADATA and says so in text (task/2636): it is the
+   account a home's `.claude.json` names, which an account switch rewrites.
+   Its homes are listed under it, each with its token lineage (acctHomeLines),
+   in place of the one-home "home:" word a codex row keeps.
+
+   A REPAIR IS A PLAIN SENTENCE, NEVER A COMMAND (task/3735). task/3634 made
+   the state a copy-paste terminal step that said so ("a copied step is a
+   terminal step"); that contradicted the owner's newer rule that the console
+   never tells him to run a command, because he does not use a terminal, and
+   asked about this page he ruled: "make them plain sentences".
+   So the row states the fact and who fixes it — an agent renews a due token,
+   pools an unproven member, repairs a drifted home — and there is nothing to
+   copy. A LOGIN STAYS HIS ACT: it is named only where a login is the fix
+   (acctNeedsLogin), as the account needing signing in again, which an agent
+   can start for him and he approves in the browser. A SPENT allowance has no
+   repair: signing in again does not refill it, so its word is "spent" and
+   when it comes back (acctBackAt). */
 function quotaIdCell(r) {
   const c = r.cred;
   if (!c) {
@@ -273,9 +367,11 @@ function quotaIdCell(r) {
       + `${esc(r.decl ? r.decl.id : "?")}</div>`
       + `<div class="acct-line2"><span class="rst">declared by you</span></div></th>`;
   }
-  const fix = c.state === "due-refresh" ? "helm keepalive --apply"
-    : c.member_unproven ? "helm codex pool " + (c.home_name || "<home>")
-    : (LOGIN_CMDS[c.provider] || (x => ""))(c.home);
+  const flags = [c.name_lies ? `drifted: metadata says ${c.identity || "?"}, named ${c.home_name || "?"}; ${CRED_SAID.drifted}` : "",
+                 c.duplicate_homes ? c.duplicate_homes.length + " homes" : "",
+                 c.login_unknown ? "login unknown: " + c.login_unknown : ""].filter(Boolean).join(", ");
+  const login = acctNeedsLogin(c);
+  const back = c.state === "exhausted" ? acctBackAt(c) : null;
   /* THE WORD IS THE WHOLE SURFACE OF THE DISTINCTION. `unknown` belongs to a
      provider that ANSWERED and had no state to give; a provider helm could not
      read gets its own word and says what that means, because the two look
@@ -283,11 +379,18 @@ function quotaIdCell(r) {
   const st = c.quota_unreadable
     ? `<span class="st-unknown" title="helm could not read this account's quota windows just now — these numbers are UNKNOWN, not zero">unreadable</span>`
     : c.member_unproven
-    ? `<span class="st-unknown stfix" data-fix="${esc(fix)}" title="no pool file matches this member; UNKNOWN until you run: ${esc(fix)}">member unproven</span>`
+    ? `<span class="st-unknown" title="${esc(CRED_SAID.unproven)}">member unproven</span>`
     : c.state === "ok" ? `<span class="st-ok">ok</span>`
-    : `<span class="st-${c.state} stfix" data-fix="${esc(fix)}" title="click to copy the fix (you run it yourself): ${esc(fix)}">${esc(c.state)}</span>`;
-  const flags = [c.name_lies ? `drifted: holds ${c.identity || "?"}, named ${c.home_name || "?"} (helm cred heal)` : "",
-                 c.duplicate_homes ? c.duplicate_homes.length + " homes" : ""].filter(Boolean).join(", ");
+    : c.state === "exhausted"
+    ? `<span class="st-exhausted" title="its allowance is spent${back ? " until " + esc(new Date(back).toLocaleString([], {weekday: "short", hour: "numeric", minute: "2-digit"})) : ""}; signing in again does not refill it">spent · ${back ? "back in " + esc(fmtIn(back)) : "reset time unknown"}</span>`
+    : c.state === "due-refresh"
+    ? `<span class="st-due-refresh" title="${esc(CRED_SAID.due)}">due-refresh · no login needed</span>`
+    : login
+    ? `<span class="st-${esc(c.state)}" title="this account ${esc(CRED_SAID.login)}">${esc(c.state)} · needs signing in again</span>`
+    : `<span class="st-${esc(c.state)}">${esc(c.state)}</span>`;
+  const claude = c.provider === "anthropic";
+  const md = claude && c.identity && String(c.name).split("#")[0] === c.identity
+    ? `<span class="qmd" title="the account this home's .claude.json names; an account switch rewrites it, so the token lineage under it says whether the token agrees">metadata:</span>` : "";
   /* THE OTHER HOMES ON THIS ONE BILL, named as what they are. He was shown
      them as separate accounts and could not place them; the fix is not to hide
      them — he still has to know a second home exists when a login goes
@@ -296,14 +399,58 @@ function quotaIdCell(r) {
     ? `<span class="qalias" title="${esc(r.aliases.map(x => x.home_name || x.name).join(", "))}">`
       + `+${r.aliases.length} more home${r.aliases.length === 1 ? "" : "s"} on this account</span>`
     : "";
-  const meta = [esc((c.tier || c.provider).replace("Max 20x", "Max 20×")), st,
-                "home: " + esc(c.home_name || "?")]
-    .concat(alias ? [alias] : [])
+  const meta = [esc((c.tier || c.provider).replace("Max 20x", "Max 20×")), st]
+    .concat(claude ? [] : ["home: " + esc(c.home_name || "?")].concat(alias ? [alias] : []))
     .concat(flags ? [`<span class="flagchip" title="${esc(flags)}">${esc(short(flags, 28))}</span>`] : [])
     .join('<span class="sep">·</span>');
   return `<th class="qid"><div class="acct-name"><span class="adot" style="background:${acol(c.name)}"></span>`
-    + `${esc(c.name)}${c.active ? '<span class="live" title="a live agent is on this account right now"></span>' : ""}</div>`
-    + `<div class="acct-line2">${meta}</div></th>`;
+    + `${md}${esc(c.name)}${c.active ? '<span class="live" title="a live agent is on this account right now"></span>' : ""}</div>`
+    + `<div class="acct-line2">${meta}</div>${acctHomeLines(r)}</th>`;
+}
+
+/* ── TOKEN LINEAGE, ON EVERY CLAUDE HOME (task/2636) ──────────────────────
+   Each home on a claude row says which accounts earlier censuses saw its
+   TOKEN family live under, beside the metadata the row is named by — the
+   verdict `helm cred list` prints, from the one reader (cred.token_lineage):
+   MATCH, MISMATCH, AMBIGUOUS or UNKNOWN. ALL FOUR ARE DRAWN AS TEXT, on a
+   phone as on a desk. An UNKNOWN drawn as nothing reads as a pass, and a
+   hover title is not text a phone can reach, so UNKNOWN is drawn unlike
+   MATCH and carries its reason in plain words. */
+const LIN_SAID = {MATCH: "token lineage MATCH", MISMATCH: "token lineage MISMATCH",
+                  AMBIGUOUS: "token lineage AMBIGUOUS", UNKNOWN: "token lineage UNKNOWN"};
+/* why a lineage is not a MATCH, in his words; "" for a MATCH. PURE. */
+function linSaid(lin) {
+  const seen = (lin.accounts || []).join(" and ");
+  if (lin.state === "MISMATCH") return "the token was seen under " + seen + ", while the metadata says " + (lin.metadata || "nothing");
+  if (lin.state === "AMBIGUOUS") return "the token was seen under " + seen;
+  return lin.state === "UNKNOWN" ? linWhy(lin.reason) : "";
+}
+/* the reader's reason for an UNKNOWN, in plain words; a reason it has no
+   words for is quoted as the reader gave it. PURE. */
+function linWhy(reason) {
+  const r = String(reason || "");
+  return /moved during the read/.test(r) ? "the login changed while helm was reading it; the next read settles it"
+    : /^no \.credentials/.test(r) ? "this home holds no login"
+    : /carries no refresh token/.test(r) ? "its login holds no refresh token, so helm cannot trace whose token it is"
+    : /never recorded/.test(r) ? "helm has not yet seen this token under any account"
+    : /^metadata unreadable/.test(r) ? "the account its metadata names could not be read"
+    : /^\.credentials\.json unreadable/.test(r) ? "helm could not read its login file"
+    : /unreadable/.test(r) ? "helm could not read which accounts its token was seen under"
+    : r || "helm gave no reason";
+}
+/* one line per claude home on the row — the row's own and every alias —
+   naming the home and its token lineage. A codex row draws none. */
+function acctHomeLines(r) {
+  const c = r.cred;
+  if (!c || c.provider !== "anthropic") return "";
+  return `<div class="acct-homes">` + [c].concat(r.aliases || []).map(h => {
+    const lin = h.token_lineage, st = lin && LIN_SAID[lin.state] ? lin.state : "UNREAD";
+    const why = lin ? linSaid(lin) : "helm did not read this home's token";
+    return `<div class="qhome">home <b>${esc(h.home_name || "?")}</b>`
+      + (/^\(default-/.test(h.name) ? " (the default home)" : "")
+      + ` · <span class="lin lin-${st}">${esc(LIN_SAID[st] || "token lineage not read")}</span>`
+      + (why ? `<span class="linwhy"> — ${esc(why)}</span>` : "") + `</div>`;
+  }).join("") + `</div>`;
 }
 
 function quotaRowHTML(r, extras) {
@@ -343,6 +490,11 @@ function acctTier(r) {
   /* NOTHING MEASURES IT AT ALL: a prepaid balance, a seatless subscription, a
      login only Orca can see. Unknown, which is not empty. */
   if (!c) return ATIER.UNMEASURED;
+  /* A SPENT ALLOWANCE IS A WALL WHATEVER ELSE THE ROW SAYS (task/3634). A
+     claude account whose weekly window is spent keeps a full session window,
+     so its headroom reads 100, and a live agent on it outranks everything
+     below — which put spent accounts under "use these". */
+  if (c.state === "exhausted") return ATIER.WALLED;
   if (c.active || c.headroom > 0) return ATIER.USABLE;
   // A NULL HEADROOM IS THE ABSENCE OF A READING, never a reading of zero — the
   // difference between "we could not ask" and "it said none left", and the
@@ -361,17 +513,39 @@ function acctResetAt(r) {
   const g = (G["7d"] && G["7d"].reset) || null;
   return c.resets_at_ms || g || null;
 }
+/* WHEN A SPENT ACCOUNT COMES BACK: the latest future reset among its spent
+   windows (it is back when every wall has lifted). The row's own reset
+   stands in ONLY when it is the wall's: `resets_at_ms` is the provider's
+   primary window, and it is spent only when the row's headroom is gone —
+   a claude account walled on its weekly window keeps a full session window
+   whose sooner reset is not when it comes back. null = UNKNOWN, which the
+   chip says and the walled band sorts last; never a borrowed reset. */
+function acctBackAt(c) {
+  const G = latestGauges(c.name), now = Date.now();
+  let at = null;
+  for (const l in G) {
+    const g = G[l];
+    if (g.rem < 0.2 && g.reset && g.reset > now && (at === null || g.reset > at)) at = g.reset;
+  }
+  const own = c.headroom != null && c.headroom <= 0 && c.resets_at_ms > now;
+  return at || (own ? c.resets_at_ms : null);
+}
 function acctRowName(r) {
   return String((r.cred && r.cred.name) || (r.decl && r.decl.id) || "").toLowerCase();
 }
+/* A WALLED ROW IS BACK WHEN ITS SPENT WINDOW RESETS — the time its chip and
+   its reset cell say (acctBackAt) — never at the reset of a window it has
+   not spent or one already past. A walled row whose back-in time is unknown
+   says so and sorts after every walled row whose time is known. */
 function acctDefaultSort(rows) {
   const FAR = 8.64e15;   // a row with no known reset sorts last among equals
   const room = r => (r.cred && r.cred.headroom != null) ? r.cred.headroom : -1;
   const live = r => !!(r.cred && r.cred.active);
+  const back = r => (r.cred && acctBackAt(r.cred)) || FAR;
   return [...rows].sort((a, b) => {
     const ta = acctTier(a), tb = acctTier(b);
     if (ta !== tb) return ta - tb;
-    if (ta === ATIER.WALLED) return (acctResetAt(a) || FAR) - (acctResetAt(b) || FAR);
+    if (ta === ATIER.WALLED) return back(a) - back(b);
     if (ta === ATIER.UNMEASURED) return acctRowName(a) < acctRowName(b) ? -1 : 1;
     if (live(b) !== live(a)) return live(b) ? 1 : -1;
     if (room(b) !== room(a)) return room(b) - room(a);
@@ -389,7 +563,7 @@ function acctDefaultSort(rows) {
 const ATIER_SAID = [
   ["use these", "a live agent on it first, then most left, then the one that resets soonest"],
   ["helm is not measuring these", "a due token or an account with no quota to read — neither means empty"],
-  ["walled until they reset", "soonest first"],
+  ["walled until they reset", "spent, soonest back first; signing in again does not refill them"],
 ];
 function acctTierRow(tier, span) {
   const said = ATIER_SAID[tier];
@@ -398,15 +572,39 @@ function acctTierRow(tier, span) {
 }
 
 /* ── the family group ─────────────────────────────────────────────────────
-   One rule across the table, carrying the family's name and how many accounts
-   are under it. Clicking it folds the family away. */
-function quotaFamHeadHTML(fam, rows, span) {
-  const folded = !!QFOLD[fam];
+   One rule across the table, carrying the name of the vendor that bills these
+   accounts, the MODEL FAMILIES it serves in their burn colours (the Families
+   card's words, task/3445: every family whose billing groups include it), and
+   how many accounts are under it. Clicking it folds the group away. */
+function quotaFamHeadHTML(fam, rows, span, flags) {
+  const folded = !!QFOLD[fam], fams = (flags && flags.families) || {};
+  const serves = quotaServes(fam, flags);
   return `<tr class="qfam${folded ? " qfolded" : ""}" data-fam="${esc(fam)}">`
     + `<th colspan="${span}"><span class="qfamcaret">${folded ? "▸" : "▾"}</span>`
     + `<span class="qfamname">${esc(fam)}</span>`
+    + (serves.length ? `<span class="qfamserves">serves ` + serves.map(f => {
+        const c = (fams[f] || {}).colour;
+        return `<span class="fchip" style="--fc:${FLAGCOL[c] || FLAGCOL.GREY}" title="${esc(f + " " + (c === "GREY" ? "not measured" : c || "no flag"))}"><i></i>${esc(f)}</span>`;
+      }).join(" ") + `</span>` : "")
     + `<span class="qfamn">${rows.length} account${rows.length === 1 ? "" : "s"}</span>`
     + `</th></tr>`;
+}
+/* THE MODEL FAMILIES AN ACCOUNT GROUP SERVES: those whose billing groups
+   (the seat catalog's one reading, sent on the flag as `bills`) include this
+   group. No name fallback: a family named like a group but billed elsewhere
+   is not its. `flags` is the board's flags section, or null when it cannot be
+   drawn. PURE. */
+function quotaServes(vendor, flags) {
+  const fams = (flags && flags.families) || {};
+  return Object.keys(fams).sort().filter(f => ((fams[f] || {}).bills || []).includes(vendor));
+}
+/* THE FAMILIES CARD'S "billed to … accounts ↓": unfold that group and bring
+   it into view, or say that no account on this page carries the name. */
+function quotaGoFam(vendor) {
+  if (QFOLD[vendor]) { QFOLD[vendor] = false; renderAccts(); }
+  const row = document.querySelector('#qonebody tr.qfam[data-fam="' + CSS.escape(vendor) + '"]');
+  if (row) row.scrollIntoView({block: "start"});
+  else toast("no account on this page is billed as " + vendor);
 }
 
 /* ── the table ─────────────────────────────────────────────────────────────
@@ -428,9 +626,30 @@ function renderAccts() {
   const span = 6 + extras.length;
   head.innerHTML = quotaHeadHTML(extras);
   const rows = quotaRows();
-  if (!rows.length) { body.innerHTML = ""; quotaRenderAge(); return; }
-  body.innerHTML = quotaFamilies(rows).map(([fam, rs]) => {
-    const head = quotaFamHeadHTML(fam, rs, span);
+  /* THE GROUPS ANSWER THE FAMILIES CARD only once both reads have landed
+     AND both could be read: drawn from the measured rows alone they would
+     name every declared-only group absent while the inventory is loading,
+     and a source that could not be read stays unread — its groups are
+     unknown, never absent, with rows on the table or without. */
+  const read = CREDS_READ && DECL_READ && !CREDS_UNREADABLE && !DECL.unreadable;
+  // THE COUNT IS THESE ROWS (task/3635): the nav, Home and the line above
+  acctCountRender(rows, read);
+  if (!rows.length) {
+    body.innerHTML = "";
+    quotaRenderAge();
+    /* READ AND EMPTY is not "not read yet": the sheet's billed line says no
+       accounts are declared. Zero rows from a source that could not be read
+       is not "you have no accounts". */
+    QUOTA_GROUPS = read ? new Set() : null;
+    if (typeof famRender === "function") famRender();
+    return;
+  }
+  const flags = typeof BOARD === "undefined" ? null : boardSec(BOARD, "flags");
+  const served = boardSecState(flags) === "ok" ? flags : null;
+  const groups = quotaFamilies(rows);
+  QUOTA_GROUPS = read ? new Set(groups.map(g => g[0])) : null;
+  body.innerHTML = groups.map(([fam, rs]) => {
+    const head = quotaFamHeadHTML(fam, rs, span, served);
     if (QFOLD[fam]) return head;
     /* WITHIN THE FAMILY, WORTH-USING FIRST, and the band says so. The family
        rule answers "whose account is this"; the tier band answers the question
@@ -445,6 +664,8 @@ function renderAccts() {
   }).join("");
   quotaBind();
   quotaRenderAge();
+  // the Families card's "billed to" links can answer now
+  if (typeof famRender === "function") famRender();
 }
 
 /* THE PAGE'S ONE AGE LINE. Every number in this table comes from the same
@@ -462,9 +683,10 @@ function quotaRenderAge() {
 }
 
 /* ── what a click means ────────────────────────────────────────────────────
-   A family header folds its family. A state word copies its repair. A
-   "+ describe" opens the form on that account and does NOT select the row.
-   Anything else on a measured row selects it for resumes. */
+   A family header folds its family. A "+ describe" opens the form on that
+   account and does NOT select the row. Anything else on a measured row
+   selects it for resumes. A state word copies nothing: it names no command
+   (task/3735), so its hover says the fact and who fixes it. */
 function quotaBind() {
   const body = $("#qonebody");
   if (!body || !body.querySelectorAll) return;
@@ -473,12 +695,6 @@ function quotaBind() {
   });
   body.querySelectorAll(".qrow").forEach(tr => {
     tr.onclick = e => {
-      const fx = e.target.closest(".stfix");
-      if (fx) {
-        navigator.clipboard.writeText(fx.dataset.fix);
-        toast("copied login fix (run it yourself — logins are human-only): " + fx.dataset.fix, 5000);
-        return;
-      }
       const dc = e.target.closest("[data-declare]");
       if (dc) { declOpenFor(dc.dataset.declare); return; }
       if (!tr.dataset.p) return;

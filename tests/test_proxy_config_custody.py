@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Task/1967: existing proxy config and listener incarnation custody."""
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -14,10 +15,12 @@ from unittest import mock
 
 from tests._tmphome import pin_suite_guard
 from helm import autocompact
+from helm import offpeak
 from helm import seat
 from helm import seat_health
 from helm import seat_paths
 from helm import seat_proxy
+from helm import seat_launch_assets as sla
 
 # THE POOL FAMILY'S OWN ROUTE, ASKED OF THE CATALOG. The two arms below plant
 # "the config helm would generate today" for this family and then assert what
@@ -38,6 +41,8 @@ from helm import seat_proxy
 POOL_FAMILY = "ds4pro"  # noqa: SEAT_NAME — the FAMILY key, never a seat
 POOL_ROUTE = seat.proxy_routes(POOL_FAMILY)[0]
 POOL_PORT = seat.FAMILIES[POOL_FAMILY]["port"]
+PEAK = datetime.datetime(2026, 9, 28, 1, 30,
+                         tzinfo=datetime.timezone.utc).timestamp()
 
 
 class FakeProcess:
@@ -53,6 +58,8 @@ class FakeProcess:
 
 class ProxyConfigCustodyTest(unittest.TestCase):
     def setUp(self):
+        from tests._two_route_catalog import pin_off_peak
+        pin_off_peak(self)            # the gate's clock is not these arms' subject
         self.tmp = tempfile.mkdtemp(prefix="helm-test-proxy-custody-")
         self.prior = {name: os.environ.get(name) for name in
                       ("HELM_HOME", "HELM_PROXY_BIN", "HELM_SUITE_GUARD")}
@@ -296,10 +303,13 @@ class ProxyConfigCustodyTest(unittest.TestCase):
         frontmatter ids, the codex family's `subagent_tiers` table makes that
         alias drift, and the alias sentence wins the one line -- which is the
         round-one red, a fixture that predated the tier table rather than a
-        reporter defect."""
+        reporter defect. The model is READ from the catalog for the same
+        reason: TODAY's output is the family model's, and a rotation of that
+        model (the owner's ruling put codex on gpt-6.1-sol) is not this arm's
+        subject."""
         text = seat._config_yaml(
-            8317, "/auth", "token", channel="codex", model="gpt-6-astra",
-            family="codex")
+            8317, "/auth", "token", channel="codex",
+            model=seat.FAMILIES["codex"]["model"], family="codex")
         # THE CONTROL, and it is the arm's whole premise: the UNMUTATED base is
         # already the desired state, so every line below is attributable to the
         # one byte this arm changes. Blast radius: this control reads only this
@@ -330,10 +340,11 @@ class ProxyConfigCustodyTest(unittest.TestCase):
         plans as changed, the rendered desired state carries the meter, and
         the doctor line names the seat. Control: the unmutated output is
         already the desired state (changed False, no drift line), so the
-        one edit is the whole cause."""
+        one edit is the whole cause. The model is the catalog's family model,
+        read rather than typed, so the control is today's desired state."""
         text = seat._config_yaml(
-            8317, "/auth", "token", channel="codex", model="gpt-6-astra",
-            family="codex")
+            8317, "/auth", "token", channel="codex",
+            model=seat.FAMILIES["codex"]["model"], family="codex")
         path = self.write_config("codex", text)
         plan = seat.proxy_config_plan(path, "codex", "codex")
         self.assertFalse(plan["changed"])
@@ -431,6 +442,20 @@ class ProxyConfigCustodyTest(unittest.TestCase):
         owned = {"pid": 4242, "identity": "proc:old", "launch": launch}
         seat._write_private(os.path.join(seat._proxy_home("kimi"), "proxy.pid"),
                             "4242 proc:old %s\n" % seat._encode_launch_inputs(launch))
+        return path, owned
+
+    def running_open_ds4pro(self):
+        route = seat.proxy_routes(POOL_FAMILY)[0]
+        path = self.write_config(
+            POOL_FAMILY, seat._config_yaml_key(
+                POOL_PORT, "inbound", route["provider"], route["base_url"],
+                route["alias"], "outbound", route["upstream_model"]))
+        launch = seat._proxy_launch_inputs(path, self.binary)
+        owned = {"pid": 4242, "identity": "proc:old", "launch": launch}
+        seat._write_private(os.path.join(seat._proxy_home(POOL_FAMILY),
+                                         "proxy.pid"),
+                            "4242 proc:old %s\n" %
+                            seat._encode_launch_inputs(launch))
         return path, owned
 
     def test_proxy_binary_ready_uses_supported_help_contract(self):
@@ -536,6 +561,27 @@ class ProxyConfigCustodyTest(unittest.TestCase):
             rc = seat_health._doctor([])
         self.assertEqual(rc, 1)
         self.assertIn("required -config flag", out.getvalue())
+
+    def test_peak_close_stops_the_paid_listener_even_without_a_replacement_binary(self):
+        path, owned = self.running_open_ds4pro()
+        stopped = mock.Mock(return_value=(True, None))
+        with mock.patch.object(offpeak, "now", return_value=PEAK), \
+                mock.patch.object(seat, "_running_pid_rec", return_value=owned), \
+                mock.patch.object(seat_proxy, "_proxy_binary_ready",
+                                  return_value=(False, "missing")), \
+                mock.patch.object(seat_proxy, "_stop_owned_proxy", stopped), \
+                mock.patch.object(seat_proxy, "_launch_proxy_process") as launch, \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = seat._up(POOL_FAMILY, quiet=True)
+        self.assertEqual(rc, 1)
+        stopped.assert_called_once_with(POOL_FAMILY, POOL_FAMILY, owned)
+        launch.assert_not_called()
+        with open(path, encoding="utf-8") as f:
+            closed = f.read()
+        self.assertTrue(sla._provider_disabled(
+            dict(sla._provider_sections(dict(
+                sla._top_blocks(closed)[1])["openai-compatibility"])[1])[
+                    POOL_ROUTE["provider"]]))
 
     def test_missing_replacement_binary_leaves_stale_config_and_listener_intact(self):
         path, owned = self.stale_running_kimi()
@@ -718,6 +764,59 @@ class ProxyConfigCustodyTest(unittest.TestCase):
             self.assertEqual(f.read(), before)
         self.assertEqual(popen.call_count, 2)
         self.assertEqual(seat._proxy_pid_record("kimi")["identity"], "proc:new")
+
+    def test_peak_close_adopts_then_restarts_an_unrecorded_paid_listener(self):
+        path, owned = self.running_open_ds4pro()
+        process = FakeProcess()
+        with mock.patch.object(offpeak, "now", return_value=PEAK), \
+                mock.patch.object(seat, "_running_pid_rec",
+                                  side_effect=(None, owned)), \
+                mock.patch.object(seat, "_port_open",
+                                  side_effect=(True, False)), \
+                mock.patch.object(seat_proxy, "_adopt_or_refuse_port",
+                                  return_value=0) as adopt, \
+                mock.patch.object(seat_proxy, "_proxy_binary_ready",
+                                  return_value=(True, None)), \
+                mock.patch.object(seat_proxy, "_stop_owned_proxy",
+                                  return_value=(True, None)) as stop, \
+                mock.patch.object(seat_proxy, "_launch_proxy_process",
+                                  return_value=(process, None)) as launch, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(seat._up(POOL_FAMILY, quiet=True), 0)
+        adopt.assert_called_once()
+        stop.assert_called_once_with(POOL_FAMILY, POOL_FAMILY, owned)
+        launch.assert_called_once()
+        with open(path, encoding="utf-8") as f:
+            self.assertIn(offpeak.MARK, f.read())
+
+    def test_failed_peak_replacement_never_restores_the_open_paid_config(self):
+        path, owned = self.running_open_ds4pro()
+        restored = FakeProcess()
+        with mock.patch.object(offpeak, "now", return_value=PEAK), \
+                mock.patch.object(seat, "_running_pid_rec", return_value=owned), \
+                mock.patch.object(seat_proxy, "_proxy_binary_ready",
+                                  return_value=(True, None)), \
+                mock.patch.object(seat, "_pid_alive", return_value=True), \
+                mock.patch.object(seat, "_pid_identity",
+                                  side_effect=("proc:old", "proc:new")), \
+                mock.patch.object(seat.os, "pidfd_open", return_value=99), \
+                mock.patch.object(seat_proxy.os, "close"), \
+                mock.patch.object(seat_proxy, "_pidfd_exited",
+                                  side_effect=(False, True)), \
+                mock.patch.object(seat.signal, "pidfd_send_signal"), \
+                mock.patch.object(seat, "_port_open",
+                                  side_effect=(False, True, True)), \
+                mock.patch.object(seat.subprocess, "Popen",
+                                  side_effect=(OSError("injected exec failure"),
+                                               restored)) as popen, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(seat._up(POOL_FAMILY, quiet=True), 1)
+        with open(path, encoding="utf-8") as f:
+            closed = f.read()
+        self.assertIn(offpeak.MARK, closed)
+        self.assertNotEqual(closed, offpeak.apply_gate(
+            closed, POOL_FAMILY, at=PEAK, closed=()))
+        self.assertEqual(popen.call_count, 2)
 
     def test_digest_change_restarts_and_records_new_launch_inputs(self):
         path, owned = self.stale_running_kimi()

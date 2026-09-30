@@ -36,6 +36,8 @@ from .seat_catalog import (
     SCHEMA_UNSAFE_TOOLS,
     SPAWN_DENIED_TOOLS,
     PROXY_MODES,
+    billing_accounts,
+    billing_groups,
     denied_tools,
     family_catalogued_models,
     family_route_aliases,
@@ -68,7 +70,12 @@ _USAGE = """usage: helm seat <verb> [args]
   add <family> [--auth-from <path>]   mint the seat (translate cred read-only)
                [--key-from <path>]    proxy-key families: .env-style key file
                [--room R]             override the project-derived chat room
-  up <family> | down <family>         start/stop the seat's local proxy
+  up <seat> | down <seat> [--reason R]  start/stop the seat's local proxy.
+                                      down RECORDS desired-down first (who,
+                                      when, why) so doctor --ensure, the
+                                      reboot sweep and proxywatch leave the
+                                      seat down; up, resume <seat> and spawn
+                                      clear it (helm/seat_down.py)
   launch <family> [--model M] [--room R] [--multi]  print the exact launch line (never runs it)
                                       --multi: mixed-model fleet — DROP the
                                       CLAUDE_CODE_SUBAGENT_MODEL pin (it blunt-pins
@@ -77,16 +84,16 @@ _USAGE = """usage: helm seat <verb> [args]
                                       CC's built-in frontmatter ids to a model the
                                       family serves: its launch model, or — where
                                       the family declares subagent_tiers — a model
-                                      PER ID (codex: opus/fable -> gpt-6-astra,
-                                      sonnet/haiku -> gpt-5.6-sol, so one pane
-                                      bursts into sol workers + astra checkers)
+                                      PER ID (codex: sonnet/haiku -> gpt-6.1-sol,
+                                      opus/fable follow the pane, which is
+                                      gpt-6.1-sol on every codex seat)
                                       A proxy seat launches WITHOUT Skill and
                                       Agent(fork) (the deny set) and WITH
                                       Workflow, capped: the line exports
                                       CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS=4
                                       and a workflow agent's model lands on
                                       the seat's own tier through that alias
-                                      block (a sol seat never reaches astra)
+                                      block (gpt-6.1-sol on every codex seat)
   spawn <seat> [--room R] [--cwd DIR] [--model M]
                [--role worker|lead] [--replace] [--print]  SELF-ONBOARDING
                                       spawn. <seat> is <family>, <family>-N, or
@@ -133,30 +140,49 @@ _USAGE = """usage: helm seat <verb> [args]
                                       DEFAULT cwd = the seat's OWN home worktree
                                       <repo>-wt/seats/<seat> (create-or-reuse),
                                       never the shared checkout; --cwd overrides
-  rehome <seat> --home H [--model M]  move a LIVE seat onto a named credhome
-         [--apply]                    in one verb: prove the home's token is
+  rehome <seat> --home H|default      move a LIVE seat onto a named credhome
+         [--model M] [--apply]        in one verb: prove the home's token is
                                       live or syncable from Orca (a home whose
                                       refresh chain has EXPIRED is refused with
                                       the login remedy, because `helm launch`
                                       would start the session on the stale
-                                      token), resolve the seat's CURRENT roster
-                                      session and its pane from process
+                                      token), resolve the session the pane's
+                                      process holds NOW (its presence record;
+                                      the CURRENT roster session when none
+                                      answers) and its pane from process
                                       evidence, /exit the pane in ONE wake
                                       (never a signal — a killed session loses
                                       the transcript flush the relaunch
                                       resumes), wait for the process to be
                                       PROVEN gone, type `helm launch --seat S
                                       --home H -- --model M --resume SID` into
-                                      that same pane, then verify the pane, the
-                                      roster register and the inbox beacon and
-                                      record one ledger row. Dry-run without
-                                      --apply, and the dry run IS the plan: it
-                                      prints the exact launch line
+                                      that same pane (--session-id SID for a
+                                      session with no transcript yet, which
+                                      claude cannot resume), then verify the
+                                      pane, the roster register and the inbox
+                                      beacon and record one ledger row.
+                                      Dry-run without --apply, and the dry run
+                                      IS the plan: it prints the exact launch
+                                      line. `--home default` (a reserved
+                                      word, never a path) moves a seat pinned
+                                      to a named credhome onto the
+                                      Orca-synced default home, relaunching
+                                      under `env -u CLAUDE_CONFIG_DIR`; every
+                                      rehome keeps the old permission mode
+                                      and DMs the seat what the exit stopped
   where <seat> [--json]               resolve a spawned seat: harness,
                                       handle/pid, worktree, room, liveness.
                                       Falls through to an ORCA-ADOPTED pane
                                       (one the metaharness launched, which has
                                       no spawn register) and labels which it is
+  rest <seat> --because W [--until T] the OWNER PAUSE: the seat is RESTING —
+  rest <seat> --end [--because W]     up, beacon deliberately off, woken by
+                                      nothing but an explicit resume (IDLE:
+                                      armed; DEAF: missing by accident). The
+                                      owner's words are required; the seat
+                                      itself or the integrator records them
+                                      (helm/seat_rest.py). --until takes an
+                                      ISO instant or NNs/NNm/NNh/NNd
   reassign <seat-or-session> --to <seat>   move EVERY holding of a dead or
         [--reason R] [--force]        renamed seat in ONE verb and ONE ledger
         [--apply] [--json]            event: open/held dispatch rows (both the
@@ -178,6 +204,19 @@ _USAGE = """usage: helm seat <verb> [args]
                                       answers to — never on absence, because
                                       absence is the normal state of the
                                       evidence the morning after a reboot
+  hold [--json] | hold <seat> --reason R [--until task/N|TIME]
+        | hold <seat> --clear --reason R
+                                      an OPERATOR HOLD: the dispatch door
+                                      refuses the seat new work, naming the
+                                      hold and a seat to use instead, until
+                                      --clear, or its --until: task/N lands
+                                      (its task row closes as landed) or TIME
+                                      (ISO UTC, or Nm/Nh/Nd) passes; never on
+                                      the seat's activity. A drop storm
+                                      refuses the same way, and --clear
+                                      clears it too. Bare: every refused seat
+                                      and why, and the --force past them
+                                      (helm/seat_hold.py)
   panes [--json]                      every metaharness pane GROUPED BY
                                       PROVENANCE: helm-spawned vs orca-adopted
                                       vs unowned — they support different verbs,
@@ -199,6 +238,19 @@ _USAGE = """usage: helm seat <verb> [args]
                                       MALFORMED (a record that is not a list
                                       of strings) is listed, blocks every
                                       write, and exits 1.
+  remint <seat>|--all [--apply] [--follow-catalog|--keep-persisted]
+                                      re-mint launch.sh (and the proxy config)
+                                      to what a fresh mint writes now: the
+                                      catalog's model, or the seat's explicit
+                                      --model choice. Dry run by default, and
+                                      the dry run IS the plan (each differing
+                                      field, old -> new); --apply writes it.
+                                      Never starts or stops a process. A model
+                                      spawn.json persisted before its source
+                                      was recorded is kept and reported
+                                      "persisted, source unknown":
+                                      --follow-catalog records it as the
+                                      default, --keep-persisted as a choice
   retitle [--apply] [--json]          assert every namable pane's TAB TITLE as
                                       the SEAT NAME exactly as the fleet board
                                       shows it and nothing else, so a tab strip
@@ -231,7 +283,13 @@ _USAGE = """usage: helm seat <verb> [args]
                                       visible to orca; never migrates a live seat
   resume <seat> [--cwd DIR] [--role worker|lead] [--force]
                                       relaunch the seat's pane via the metaharness
-                                      (freshest launch.sh + --resume/--continue),
+                                      (freshest launch.sh + --resume of the
+                                      session its LIVE process holds, read from
+                                      that process's presence record — a /clear
+                                      moves it before any transcript does — and
+                                      --session-id when it has no transcript
+                                      yet; with no live process the newest
+                                      transcript, else --continue),
                                       preserving its recorded role unless overridden,
                                       then re-arm its WAKE PATH (the inbox beacon
                                       is a per-session Monitor — a restart kills
@@ -250,12 +308,17 @@ _USAGE = """usage: helm seat <verb> [args]
                                       seat's context%%, inject /compact at the
                                       threshold BEFORE the 100%% hang (latched;
                                       --install-timer for the cadence)
-  unblock [--seat S] [--dry-run]      answer only Claude Code's built-in
-          [--quiet] [--json]          plan-execution prompt on an agent seat.
-                                      Human permission dialogs, owner panes,
-                                      unreadable or gated plans, and prompts
-                                      that change before the locked send are
-                                      surfaced without a keystroke
+  unblock [--seat S] [--dry-run]      answer Claude Code's built-in
+          [--quiet] [--json]          plan-execution prompt on an agent seat
+                                      (owner panes, unreadable or gated plans
+                                      and prompts that change before the
+                                      locked send are surfaced without a
+                                      keystroke); without --seat also run the
+                                      prompt-stall watch, which answers a
+                                      stalled memory-write or routine tool
+                                      permission itself and pages the owner
+                                      only for his named exceptions or a
+                                      freeze (HELM_PROMPT_ANSWER=0 disarms)
   boot-brief [--rearm]                expand the short exact-visible first turn
                                       into this seat's full onboarding/restart
                                       brief from its own process environment
@@ -270,9 +333,17 @@ _USAGE = """usage: helm seat <verb> [args]
                                       inspect or append measured rename facts;
                                       disowned/decommissioned always refuse
   list | status                       seats, proxy liveness, cred expiry
-  doctor                              binary + cred + seat health, read-only
-  doctor --ensure [--json|--quiet]    supervise: respawn any dead/wedged proxy;
-                                      CPU canary flags a THRASHING backend;
+  doctor                              binary + cred + seat health, read-only;
+                                      a launch.sh that differs from a fresh
+                                      mint reads DRIFT and fails it
+  doctor --ensure [--json|--quiet]    supervise: respawn any dead/wedged proxy,
+                                      and first the bridge a family routes
+                                      through (row <family>/bridge; a bridge
+                                      answering non-2xx is reported, not
+                                      restarted); a desired-down seat reads
+                                      DOWN and is never respawned (it never
+                                      moves rc); CPU canary flags a
+                                      THRASHING backend;
                                       --quiet prints only non-healthy rows plus
                                       a periodic heartbeat; rc 2 on UNKNOWN.
                                       Each pass also runs the cred-follow rung
@@ -498,6 +569,7 @@ from .seat_lifecycle import (
     _seat_lifecycle_lock,
     _seat_lifecycle_lock_released,
     _spawn_record,
+    _spawn_record_read,
     _persisted_model,
     _pane_live,
     _prove_spawned_pane,

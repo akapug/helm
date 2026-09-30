@@ -1,13 +1,14 @@
-"""helm hooks run <EVENT> — ONE interpreter spawn per hook event.
+"""helm hooks run <EVENT> — every in-process handler for one event, one spawn.
 
-WHY THIS EXISTS (task/630). Every tool call this fleet makes paid one full
-interpreter spawn PER HOOK, not per event. PostToolUse alone ran `helm record`
-and `helm chat deliver` as two separate processes on all 11851 tool calls in a
-measured day. The floor for a helm invocation is ~47ms here (~28ms bare python3
-spawn + ~20ms `import helm.cli`) before a handler does any work at all, so the
-second spawn bought nothing but the spawn. Merging N handlers into one process
-recovers (N-1) floors per event, for every seat on this box — the hooks are
-installed fleet-wide, so this is not a helm-only saving.
+`run_event` runs each handler `event_specs` resolves for EVENT inside a single
+interpreter, in registry order, and folds their exit codes into the event's.
+`dispatch_specs` is the one read-only view of every hook spec helm declares.
+This module writes no settings: installers keep one native entry per spec, and
+the one installed merged entry, the PostToolUse record+deliver pair
+(`hooks run PostToolUse --installed --hook-json`), runs in helm/posttoolrun.py
+through this module's `run_one`, `_alarm` and `_Timeout`. Each helm spawn pays
+an interpreter start and `import helm.cli` before a handler does any work, so
+every handler that shares a spawn saves that floor.
 
 THE HANDLERS ARE NOT REIMPLEMENTED HERE. Each one is invoked through
 `cli.main(argv)` — helm's own verb dispatcher, the exact entry the standalone
@@ -264,8 +265,7 @@ def event_specs(event, tool_name=None, specs=None):
         # Bash-only guard against an unknown tool would be a new behaviour.
         # A named matcher may list tools the way Claude Code reads it
         # ("Bash|Monitor"), each an exact name: string equality would silently
-        # stop the guard for every tool it lists. The whole matcher still
-        # resolves too, because settings_block asks with the matcher in hand.
+        # stop the guard for every tool it lists.
         if m not in (None, "*"):
             if tool_name is None or tool_name not in (m, *m.split("|")):
                 continue
@@ -300,6 +300,17 @@ from .hookoutcome import ANSWERED, SKIPPED, UNCHECKED    # noqa: F401
 #: it costs this hot path nothing to name here. It is shared with the POSIX-sh
 #: `124)` arm that speaks when this process has been killed outright.
 from . import hookalarm
+
+
+def _stall_clause():
+    """seatceiling.stall_clause, or "" when the reading itself raised: the
+    timeout path is fail-open and its line must still print. Imported here
+    and nowhere above, so only a timeout pays for it."""
+    try:
+        from . import seatceiling
+        return seatceiling.stall_clause()
+    except Exception:                             # noqa: BLE001 — see above
+        return ""
 
 
 def _count_refusal(spec, payload):
@@ -465,10 +476,15 @@ def _run_one(spec, payload, argv=None, outcome=None, left=None):
         # prints nothing and is counted, and the next line that speaks carries
         # the arrears — `hookalarm` holds both halves and the sh ladder in
         # `hooks.spec_command` writes the same files.
+        # THE CAUSE RIDES THE LINE (task/3714): the fleet's stall as the
+        # kernel counted it at this timeout, or UNKNOWN and why. When
+        # agents.slice itself stalls, every seat's handlers time out
+        # together, and a line that says only TIMED OUT hides that.
+        clause = _stall_clause()
         said = hookalarm.line(
             "handler-%s" % name,
-            "[helm %s] TIMED OUT at %gs — this event is UNCHECKED"
-            % (name, budget))
+            "[helm %s] TIMED OUT at %gs — this event is UNCHECKED%s"
+            % (name, budget, clause))
         if said:
             sys.stderr.write(said + "\n")
         if outcome is not None:
@@ -479,7 +495,7 @@ def _run_one(spec, payload, argv=None, outcome=None, left=None):
             # which happened. This branch knows exactly which, and the fact was
             # already being recorded one line above under a different token —
             # so the reporting gap was never a measurement gap.
-            outcome["why"] = "handler timed out after %gs" % budget
+            outcome["why"] = "handler timed out after %gs%s" % (budget, clause)
         return 0
     except SystemExit as e:                       # a handler that calls sys.exit
         # AN ANSWER, NOT A FAIL-OPEN: the handler chose this code. An
@@ -670,78 +686,3 @@ def run_event(event, payload=None, tool_name=None, specs=None):
             os.environ.pop("HELM_NO_TREE_WARNING", None)
         else:
             os.environ["HELM_NO_TREE_WARNING"] = prior
-
-
-def dispatch_command(event, specs):
-    """The ONE hook command that replaces every in-process handler for `event`.
-
-    THE TIMEOUT IS THE SUM of the handlers' budgets, not the max. Each handler
-    is still cut at its OWN budget inside the process (SIGALRM per call). This
-    dispatcher serializes its members; separate native hook entries may run in
-    parallel, so declaration order does not establish their live scheduling.
-    Using the max here would let a slow-but-legal first member spend its
-    sibling's budget. Combining members removes duplicate interpreter startup
-    structurally; live wall-time savings require paired event measurements.
-
-    THE GATE LADDER IS REUSED VERBATIM from hooks.spec_command by handing it a
-    SYNTHETIC spec: an event whose handlers include any gate must carry the
-    same rc ladder, and rewriting that text here would be a second copy of the
-    fleet's only enforcement layer, free to drift from the original.
-    """
-    from . import hooks
-    total = sum(int(sp.get("timeout") or 0) for sp in specs) or hooks.TIMEOUT_S
-    gate = any(sp.get("gate") for sp in specs)
-    synthetic = {"name": "dispatch-%s" % event, "event": event,
-                 "args": "hooks run %s --hook-json" % event,
-                 "timeout": total}
-    if gate:
-        synthetic["gate"] = True
-    return hooks.spec_command(synthetic)
-
-
-def event_matcher(specs):
-    """The matcher the merged entry must carry for `specs`.
-
-    NOT always "*". PreToolUse's only in-process handler is Bash-matched, and
-    widening it to "*" would fire a helm spawn on EVERY Read, Edit and Glob —
-    adding cost on a lane whose entire purpose is removing it. So a named
-    matcher is preserved when every handler shares it, and only widens to "*"
-    when some handler genuinely applies to all tools.
-    """
-    named = {sp.get("matcher") for sp in specs}
-    if len(named) == 1:
-        only = next(iter(named))
-        if only not in (None, "*"):
-            return only
-    return "*"
-
-
-def settings_block():
-    """{event: (matcher, command, [handler names])} — the merged wiring,
-    derived from the registry.
-
-    Emitted rather than hand-written because a settings block typed by hand is
-    a second source of truth for what fires, and this lane exists because there
-    were already three. EXTERNAL specs are absent by construction (they are not
-    in the registry), so the operator keeps their own entries — this says what
-    helm can merge, never what the whole file should be.
-    """
-    events = []
-    for spec in dispatch_specs():
-        ev = spec.get("event")
-        if ev and ev not in events:
-            events.append(ev)
-    out = {}
-    for ev in events:
-        # Resolve with the event's own matcher in hand: a Bash-only event needs
-        # its named tool to resolve at all.
-        probe = tuple(sp for sp in dispatch_specs()
-                      if sp.get("event") == ev and not sp.get("external"))
-        if not probe:
-            continue
-        matcher = event_matcher(probe)
-        sp = event_specs(ev, tool_name=None if matcher == "*" else matcher)
-        if not sp:
-            continue
-        out[ev] = (matcher, dispatch_command(ev, sp), [x["name"] for x in sp])
-    return out

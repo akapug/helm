@@ -431,10 +431,14 @@ def _council_reach(session, cwd, persist=True):
             "v": 1, "ts": pk.now_ts(),
             "offered": (offered + [fp])[-COUNCIL_OFFER_CAP:]})
     d_peer = chat._dsan(peer)
-    line = ("REFLEX: %d async rounds with %s in #%s — this is a council: "
-            "converge live instead (helm chat council invite %s <topic> "
-            "--wait; bounded blocking beats ping-pong). Fires once per "
-            "streak." % (min(mine, len(names) - mine), d_peer, room, d_peer))
+    # `meld invite` IS THE VERB THAT RUNS. The line named `council invite
+    # <topic> --wait`, which opens the room and then refuses without --tip or
+    # --question and never waits, so the one command it printed failed
+    # partway; a two-party convergence is a meld.
+    line = ("REFLEX: %d async rounds with %s in #%s — converge live instead: "
+            "helm chat meld invite %s \"<topic>\" (bounded blocking beats "
+            "ping-pong). Fires once per streak."
+            % (min(mine, len(names) - mine), d_peer, room, d_peer))
     if _is_review_streak(suffix):
         # THE CURE RIDES THE DETECTOR (integrator ruling 2026-07-24). The
         # premise that names this cure was keyed on its own CONCLUSION —
@@ -448,7 +452,9 @@ def _council_reach(session, cwd, persist=True):
         # are the wrong tool for a condition we can simply observe.
         line += (" And 3+ rounds on ONE artifact usually means PER-CASE "
                  "handling — the next case is always outside the set you "
-                 "enumerated, so consider whole-object validation plus an "
+                 "enumerated, so agree the BAR in that meld (the blocking "
+                 "harms, the falsifier classes, each finding's disposition, "
+                 "the tip) and consider whole-object validation plus an "
                  "honest refusal instead of a fifth patch.")
     return line, COUNCIL_WHISPER_ID
 
@@ -686,6 +692,16 @@ def _rerank(prompt, jit_all, route_ids, project, session):
         return jit_all, rel
     except Exception:                       # noqa: BLE001 — never a blocked turn
         return jit_all, None
+
+
+def _classify_shadow(substance, jit, cwd):
+    """The injection trim's shadow (`classify.inject_shadow`) over a COPY of
+    the delivered jit lane, or None. Never raises: a shadow is telemetry."""
+    try:
+        from .. import classify
+        return classify.inject_shadow(substance, list(jit), cwd)
+    except Exception:                       # noqa: BLE001 — never a blocked turn
+        return None
 
 
 #: Where the turn under construction is, for the soft deadline's row: the
@@ -1135,6 +1151,24 @@ def _gather_admitted(text, project=None, session=None, compare=None, cwd=None,
         steers.append(reach[0])
         reflex_ids.append(reach[1])
         mutations["council"] = (session, cwd)
+    # THE FIVE-HOUR PACE (pace5h): a Claude seat whose own account's 5h window
+    # is WATCH or TIGHT hears it once per state change in this context. The
+    # key it heard rides the seen-state, so a compaction or /clear re-arms it
+    # like every other line the seat lost. Words only: the turn runs on.
+    pace = None
+    if policy.state_reflex and seen is not None:
+        try:
+            from .. import claudepace
+            pace = claudepace.steer(context, seen.get(claudepace.SEEN_KEY),
+                                    now=now)
+        except Exception:
+            pace = None
+    if pace:
+        from .. import claudepace
+        steers.append(_cap_steer(pace[0]))
+        reflex_ids.append(claudepace.STEER_ID)
+        seen[claudepace.SEEN_KEY] = pace[1]
+        mutations["seen"] = (session, seen)
     # THE REFLEX LANE'S REPEAT FILTER, over the WHOLE lane and not per source:
     # a coinage nudge and a reflex steer are the same sentence to a reader, and
     # a filter applied per source cannot see that. It runs LAST because it
@@ -1247,6 +1281,15 @@ def _gather_admitted(text, project=None, session=None, compare=None, cwd=None,
         row["suppressed_reflex"] = repeated
     if jit_why:
         row["jit_why"] = jit_why  # escape vs first-delivery, the dedup's proof
+    # THE CLASSIFIER'S SHADOW (helm/classify.py): what a classifier would
+    # say of each delivered jit line, logged on this row beside them. It
+    # reads `sections` after they are final and writes only the row, so no
+    # delivered byte depends on it; a host that set no backend pays one
+    # small settings read.
+    _stage("classify-shadow")
+    shadow = _classify_shadow(match, jit, cwd)
+    if shadow:
+        row["classify_shadow"] = shadow
     if rel:
         # THE RE-RANK'S TURN KEY: the per-turn score cache and the relevance
         # ledger are keyed by it, so a late score joins this row afterwards.

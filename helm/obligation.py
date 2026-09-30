@@ -141,6 +141,27 @@ def _what(lr, role, age_s=None):
     aged = ""
     if isinstance(age_s, (int, float)) and age_s > 0:
         aged = " — waiting %s" % _fmt_age(age_s)
+    # A SOURCE-CLEAN HOLD'S REVIEW IS FINISHED (task/3053), so neither of its
+    # two debts is "waiting on your review" or "open and unrouted". When the
+    # holder rung refuses the hold — NO HOLDER, a hand that is not the
+    # recipient's, a LANE AUTHOR's (the author's ruling 3, round 4) — `owed_by`
+    # bills the reviewer for the one move no land can make, the re-hold, and
+    # the projection carries that door (`source_clean_rehold`), read here
+    # rather than re-derived; otherwise the integrator owes the train and the
+    # close.
+    clean = str(lr.get("source_clean_tip") or "")
+    rehold = lr.get("source_clean_rehold") if clean else None
+    if rehold and role == "reviewer":
+        return ("your source-clean hold at %s cannot be closed by any land "
+                "until it is re-held: %s — lane %s%s"
+                % (clean[:12], rehold.get("why") or rehold.get("door"), lane,
+                   aged))
+    if clean and role == "integrator":
+        return ("this lane was read clean at %s and holds no approve: it "
+                "rides the next `helm train` as a source-clean car, and after "
+                "the gate and the land `helm lr foldcheck <head> --gate "
+                "gate:<id> --apply` closes it — lane %s%s"
+                % (clean[:12], lane, aged))
     if role == "author":
         return ("a reviewer handed this lane back: read the verdict, fix the "
                 "findings, re-gate and re-dispatch — lane %s%s"
@@ -365,7 +386,122 @@ def _live(row):
     return str((row or {}).get("status") or "") != "cancelled"
 
 
-def unanswered_fixes(rows=None, unavailable=None):
+# THE TRUNK A REVIEWER'S CURE IS READ AGAINST: the remote-tracking ref, never
+# a local branch, because the question is whether the cure reached the SHARED
+# trunk. A repository that does not carry it answers UNKNOWN, which keeps the
+# FIX listed.
+_PATCH_TRUNK_REF = "refs/remotes/origin/main"
+
+
+def _patch_on_trunk(repo_id, sha):
+    """True / False / None — is `sha` an ancestor of its repository's trunk?
+
+    `dispatches._tip_on_trunk` ASKS IT, the writer side's own tri-state probe
+    for the discharged door, rather than a second ancestry reader here. The
+    one thing added is the identity guard `_root_for_repo` states: a relative
+    or NUL-bearing repo_id is refused, because git would resolve a relative
+    one against the PROCESS CWD and answer about whichever repository the
+    caller happens to stand in."""
+    if not isinstance(repo_id, str) or "\0" in repo_id \
+            or not os.path.isabs(repo_id.strip()):
+        return None
+    from . import dispatches
+    return dispatches._tip_on_trunk(repo_id.strip(), _PATCH_TRUNK_REF, sha)
+
+
+def _patch_identity_on_trunk(repo_id, reviewed, patch):
+    """True / False / None — is every commit the reviewer's cure added
+    (`reviewed..patch`) on its repository's trunk under ANOTHER object id?
+
+    A REBASED OR CHERRY-PICKED LAND IS INVISIBLE TO ANCESTRY (task/3357
+    remainder). Measured 22:53Z: two FIX rows kept billing their author while
+    neither patch tip was an ancestor of trunk and every cure commit had a
+    patch-identical twin there. (Their ledger ids are in
+    tests/test_obligation.py; they are rows, not commits, so a fresh clone
+    cannot resolve them here.)
+
+    `vcs.landed_state` ASKS IT, the instrument `dispatches._held_landing_note`
+    already spends with the checkout `_root_for_repo` verifies, so the belts
+    come with it: a merge in the range, an empty commit (whose patch id
+    matches every other empty commit), a whitespace-only twin, a range over
+    the cap and an empty range all answer UNKNOWN. `limit=reviewed` is what
+    makes it the CURE's question and not the lane's: both specimens' lanes
+    landed their own commits REWORKED (3 of 6 and 3 of 14 read '+'), so the
+    whole-lane question keeps them billed for work the FIX never asked for."""
+    root = _root_for_repo(repo_id)
+    if not root:
+        return None
+    from . import vcs
+    state = vcs.backend(root).landed_state(root, patch, _PATCH_TRUNK_REF,
+                                           limit=reviewed)
+    if state in (vcs.ANCESTOR, vcs.PATCH_EQUIVALENT):
+        return True
+    return False if state == vcs.NOT_ANCESTOR else None
+
+
+def _asked(reader, *args):
+    """One reader's answer, where a raise is UNKNOWN. A READER THAT RAISED
+    COULD NOT LOOK, and UNKNOWN keeps the debt: the collapse is written here,
+    on purpose."""
+    try:
+        return reader(*args)
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def _cure_landed(row, on_trunk, asked, by_identity=None, identified=None):
+    """Is this FIX answered because the cure its reviewer committed LANDED?
+
+    ONLY A CURE THAT CAN ANSWER THE WHOLE FIX IS ASKED ABOUT, and each refusal
+    below costs no git call. A patch is a full sha that differs from the
+    reviewed tip: the verdict door proves a patch DESCENDS from the reviewed
+    tip, and a commit descends from itself, so a "patch" equal to the reviewed
+    tip names no cure — and reading it as one would retire the contrary debt
+    of a FIX whose defective tip landed anyway. A DESIGN finding recorded
+    beside the patch is answered by no commit; it belongs to a meld, which is
+    the line `review_door`'s all-mechanical rule draws (a patch, no design
+    finding, no reason for having no cure). A row naming no repository cannot
+    be placed.
+
+    `asked` is the pass's memo, keyed (repo_id, patch): one question per
+    distinct pair however many rows name it. ONLY A MEASURED YES ANSWERS —
+    `is True`, so a reader that says no, cannot say, returns some other
+    truthy value or raises leaves the FIX listed.
+
+    PATCH IDENTITY IS ASKED ONLY AFTER ANCESTRY MEASURED A NO (`is False`),
+    for a cure that landed rebased. An ancestry that cannot say is a blind
+    reader, not an absence, and a second instrument must not overrule it. Its
+    question is the RANGE `reviewed..patch`, so a reviewed tip that is not a
+    full sha asks nothing, and `identified` is keyed (repo_id, reviewed,
+    patch): one question per distinct range per pass. The same patch named
+    under two reviewed tips is two questions, because the two ranges can
+    answer differently."""
+    from . import dispatches
+    patch = str(row.get("patch_tip") or "").strip().lower()
+    reviewed = str(row.get("reviewed_tip") or row.get("ref") or "")
+    reviewed = reviewed.strip().lower()
+    if not dispatches._FULL_TIP.fullmatch(patch) or patch == reviewed \
+            or row.get("design_findings") or row.get("no_patch_because"):
+        return False
+    repo = row.get("repo_id")
+    if not isinstance(repo, str) or not repo.strip():
+        return False
+    key = (repo, patch)
+    if key not in asked:
+        asked[key] = _asked(on_trunk, repo, patch)
+    if asked[key] is True:
+        return True
+    if asked[key] is not False or by_identity is None \
+            or not dispatches._FULL_TIP.fullmatch(reviewed):
+        return False
+    key = (repo, reviewed, patch)
+    if key not in identified:
+        identified[key] = _asked(by_identity, repo, reviewed, patch)
+    return identified[key] is True
+
+
+def unanswered_fixes(rows=None, unavailable=None, on_trunk=None,
+                     by_identity=None):
     """(items, forks, unavailable) — the lanes sitting CURED BUT UNREVIEWED.
 
     THE HOLE THIS FILLS, measured on the live estate the night it was written:
@@ -376,11 +512,52 @@ def unanswered_fixes(rows=None, unavailable=None):
     instead, because re-gating is the one action the tooling makes obvious.
     Four lanes were found BY HAND. The ledger held 88 rows across 57 lanes.
 
-    IT IS PURE LEDGER SHAPE — no git, no worktree, no tip comparison. A FIX
+    IT IS LEDGER SHAPE PLUS ONE GIT QUESTION, and it reads no worktree. A FIX
     row that NO LIVE ROW SUPERSEDES is unanswered, whether the author has
     cured and not re-dispatched or not cured at all. Those two want the same
     next action from the same person, so splitting them would need a tip read
     per lane and would buy nothing.
+
+    THE ONE QUESTION IS WHETHER THE REVIEWER'S OWN CURE LANDED (task/3357),
+    and only git can answer it. A reviewer who commits the cure names it as
+    the FIX's `patch_tip`; once the lane lands with it, the ledger may hold
+    nothing that continues the FIX. Measured: seven FIX rows whose carrying
+    source-clean holds were cancelled as moot after their lanes landed, DMed
+    hourly by owed-bot, four of them with the reviewer's patch tip already an
+    ancestor of origin/main. No close door takes such a row: `lr close
+    --reason carried` refuses an ancestor tip, `resolved` wants a later
+    verdict, and `close-landed` never takes a FIX. A FIX whose OWN patch tip
+    is an ancestor of its repository's trunk is therefore ANSWERED: the cure
+    it asked for landed.
+
+    `on_trunk(repo_id, sha)` is that reader, injectable so the arms need no
+    repository: True / False / None. The default, `_patch_on_trunk`, asks
+    `refs/remotes/origin/main` in the row's own repository. It FAILS CLOSED:
+    no, cannot say (git error, unknown or relative repository, a sha that does
+    not resolve, a trunk that does not read) and a raise all keep the FIX
+    listed. It is asked LAST — only for a FIX every ledger exclusion let
+    through, and only when `_cure_landed` finds a patch that could answer it —
+    and once per distinct (repo_id, patch_tip) in a pass, so a pass costs at
+    most one `merge-base --is-ancestor` per distinct cure still listed.
+    MEASURED on the live ledger at cure time: 28 FIX rows listed, 19 of them
+    asked about, one spawn each (a few milliseconds apiece), 9 answered. The memo
+    dies with the pass, because trunk moves.
+
+    `by_identity(repo_id, reviewed, patch)` IS THE SECOND READER, for a cure
+    that landed REBASED or cherry-picked, which ancestry reports absent with
+    perfect honesty. It is asked only after `on_trunk` measured a NO, never
+    after an UNKNOWN, and only a True from it answers. The default,
+    `_patch_identity_on_trunk`, asks whether every commit in `reviewed..patch`
+    has a patch-identical twin on the same trunk, and fails closed the same
+    way: a git error, an empty range, a merge, an empty commit or one commit
+    without a twin keep the FIX listed. One question per distinct (repo_id,
+    reviewed, patch) per pass. MEASURED on the live ledger at cure time,
+    GIT_TRACE over `helm owed --rows --json` with a warm fold: 7 identity
+    questions, 4 FIX rows answered (the two specimens and two more of the
+    same class), git spawns 40 -> 108 and wall 0.8 s -> 2.8 s. The verbatim
+    belt's trunk read is 1.55 s of that, path-limited; unlimited it was
+    7.45 s. An answered row is asked again every pass, so the cost grows with
+    the rows it answers.
 
     AN UNREADABLE LEDGER IS UNKNOWN, NEVER EMPTY. Returning [] on a failed
     read would publish "nothing is owed" from the one moment we cannot see,
@@ -409,6 +586,10 @@ def unanswered_fixes(rows=None, unavailable=None):
         return [], [], unavailable
     if rows is None:
         return [], [], "no dispatch rows were supplied and none were read"
+    on_trunk = _patch_on_trunk if on_trunk is None else on_trunk
+    by_identity = _patch_identity_on_trunk if by_identity is None \
+        else by_identity
+    landed, identified = {}, {}
     all_rows = list(rows.values() if hasattr(rows, "values") else rows)
     by_id = {str(r.get("id")): r for r in all_rows}
     kids = {}
@@ -446,10 +627,22 @@ def unanswered_fixes(rows=None, unavailable=None):
     # So the rule is one line: a row is ANSWERED when something CARRIES it.
     # Writing my own version of this was the same mistake as writing a second
     # staleness layer beside clearspan, one floor down.
+    #
+    # ...THROUGH `answered_by`, WHICH IS `carrier`'S WALK ASKED THIS MODULE'S
+    # QUESTION. `carrier` reads a terminal CONCUR as a DEAD END, correctly
+    # for the open frontier, where it authorises no landing. This pass asked
+    # `carrier` and so changed with it, and it should not have: the debt here
+    # is a cure nobody reviewed, and a standing CONCUR on a continuation is
+    # that review. Measured 2026-09-25T15:28Z on task/3099's review chain: its
+    # second FIX was DMed as unanswered while the row continuing it held a
+    # CONCUR on the exact patch tip (the specimen arm in
+    # tests/test_obligation.py). A retracted, withdrawn, cancelled or expired
+    # concur still answers nothing, and neither does one on the FIX's own
+    # uncured tip; `answered_by` names both rules.
     index = dispatches._successor_index(rows)
     cycles = dispatches._cycle_components(index)
     answered = {str(r.get("id")) for r in all_rows
-                if dispatches.carrier(r, rows, index, cycles) is not None}
+                if dispatches.answered_by(r, rows, index, cycles) is not None}
     # A BRANCH IS ALIVE IF IT TOOK THE OBLIGATION OR SOMETHING BELOW IT DID —
     # asked through the same authority, so a rebind's cancelled head reads as
     # the pass-through it is instead of a dead branch.
@@ -624,6 +817,16 @@ def unanswered_fixes(rows=None, unavailable=None):
             continue
         if polarity != "fix":
             continue
+        # A FIX WHOSE OWN CURE LANDED IS ANSWERED, and this is the one test
+        # here that asks git, so it sits AFTER every ledger answer rather than
+        # beside `landreq._retired_by`: a retired, carried or forked row, a
+        # SUPERSEDE and an undeclared verdict cost no call. SUPERSEDE is
+        # deliberately out of it: it was never billed here, and its remedy is
+        # a replacement, not a cure this pass could watch land. Not `carrier`'s
+        # job either — nothing on the ledger carries these rows; the land is
+        # the answer, and only the object store records it.
+        if _cure_landed(r, on_trunk, landed, by_identity, identified):
+            continue
         items.append({
             "kind": UNANSWERED_FIX,
             "row": rid,
@@ -662,14 +865,28 @@ def unanswered_fixes(rows=None, unavailable=None):
                      "--reason withdrawn --evidence \"<you accept the verdict, "
                      "and where the refutation is recorded>\"` retires this "
                      "row without minting a review over nothing. A reviewer "
-                     "you cannot reach is NEVER the reason to wait: another "
-                     "family reads it in a fresh context (the openrouter "
-                     "seat is always one), or Fable does through a one-agent "
-                     "Workflow — never Sonnet or Haiku — and `helm dispatch verdict "
-                     "... --reviewer-model M --reviewer-run RUN` records "
-                     "that read on the row as ADVISORY — the row stays owed "
-                     "until helm can verify the run"
-                     % (rid[:12], rid[:12]))})
+                     "you cannot reach NEVER leaves the lane with no reader: "
+                     "a fresh-context Opus read is the default (the Agent "
+                     "tool from an Opus seat) and a full review leg on a "
+                     "REVERSIBLE lane; a lane that touches %s needs %s. "
+                     "`helm reviewers %s` names who can take it now; when "
+                     "none can, %s. %s. %s. "
+                     "`helm dispatch verdict ... "
+                     "--reviewer-model M --reviewer-run RUN` records another "
+                     "family's read, or Fable's on Claude work, on the row as "
+                     "ADVISORY, and an Opus read is recorded as "
+                     "`fresh-context run <id>` on a door lane as on a "
+                     "REVERSIBLE one, whatever model the author ran, when "
+                     "its run record, which helm checks on disk, holds "
+                     "every bound, as recorded (unattested); it authorizes "
+                     "no land or close by itself, but its CONCUR at the "
+                     "row's tip also records the source-clean hold it "
+                     "carries, so the row is owed only the land gate "
+                     "(task/3658); any other read leaves the row owed"
+                     % (rid[:12], rid[:12], dispatches.REVIEW_DOORS,
+                        dispatches.APPROVAL_TIER_READERS, rid[:12],
+                        dispatches.DOOR_READ_PARKS, dispatches.FABLE_MAX_QC,
+                        dispatches.NEVER_REVIEWS_SENTENCE))})
     items.sort(key=lambda i: str(i.get("owed_since") or ""))
     return items, forks, None
 
@@ -753,9 +970,10 @@ def cmd_owed(args):
         items = [i for i in items if i.get("owed_seat") == seat]
     rows = items if "--rows" in args else unanswered_lanes(items)
     # THE TIP IS CONSULTED ONLY FOR THE ROWS WE ARE ABOUT TO PRINT. One git
-    # call per listed lane, never per ledger row: the derivation above is pure
-    # ledger shape and stays that way, and a burn-down of sixty lanes must not
-    # cost sixty git spawns to answer "is anything owed".
+    # call per listed lane, never per ledger row: the derivation above asks
+    # git only whether a reviewer's named cure landed, once per distinct cure
+    # it still lists, and a burn-down of sixty lanes must not cost sixty more
+    # git spawns to answer "is anything owed".
     # ONE ROOT PER ROW, DERIVED FROM THE ROW. A single cwd-derived root over
     # a GLOBAL ledger places every foreign row inside THIS checkout — 14
     # live rows name another project, CLIProxyAPI, a proxy fork and a tmp
@@ -841,7 +1059,8 @@ def cmd_owed(args):
         # THE FOURTH LINE, and it answers the question the other three assume
         # away: "and if nobody can review it?" (task/2948).
         from . import dispatches
-        print("  no reviewer reachable -> never a reason to wait. "
+        print("  no reviewer reachable -> take the ladder, never a wait on "
+              "nobody. "
               + dispatches.review_fallback_text())
     if undeclared:
         # SEPARATE AND NEVER SILENT. These are verdicts that recorded no

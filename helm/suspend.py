@@ -46,8 +46,10 @@ def suspended_seconds():
     """Seconds this boot has spent suspended, or None when unreadable.
 
     ONE READER OF THIS FACT LIVES IN THE TREE ALREADY and this defers to it:
-    `proxywatch.host_suspend_gap_s`, which reports the gap for turn-state
-    liveness and already owns the None-means-cannot-tell rule (a zero here
+    `proxywatch.host_suspend_gap_s`, which, asked for no window, reports the
+    since-boot total (turn-state liveness asks it for the suspend inside one
+    seat's window instead) and already owns the None-means-cannot-tell rule
+    (a zero here
     would read every unreadable host as never-suspended). Two spellings of
     one clock reading is how they drift."""
     return proxywatch.host_suspend_gap_s()
@@ -98,11 +100,19 @@ def detect(now=None, threshold_s=RESUME_THRESHOLD_S, reader=suspended_seconds):
 
 
 def _live_proxies():
-    """(family, seat) for every minted proxy that has a running pid."""
-    from . import seat_health
+    """(family, seat) for every minted proxy that has a running pid.
+
+    A seat an operator stood down is not the sweep's to bounce even when its
+    proxy is somehow still running: the sweep restarts what the supervisor
+    keeps up, and `doctor --ensure` reports that proxy as a contradiction of
+    the record instead (helm/seat_down.py). The bounce itself neither writes
+    nor clears the record — it calls `_down`/`_up`, never the operator's
+    verb."""
+    from . import seat_down, seat_health
     out = []
     for family, seat in seat_health._minted_seats():
-        if seat_health._running_pid(family, seat):
+        if seat_health._running_pid(family, seat) \
+                and not seat_down.read(family, seat)[0]:
             out.append((family, seat))
     return out
 

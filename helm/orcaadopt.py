@@ -345,7 +345,7 @@ def _read_candidate(pid, entry):
     raw, verdict = read(os.path.join(procid.proc_root(), str(pid), "comm"))
     if verdict is not ROW:
         return None, verdict
-    ident = procid.is_claude(pid, raw)
+    ident = procid.is_seat_process(pid, raw)
     if ident is None:
         # comm is shaped like a versioned launch and the kernel would not let
         # us read the exe that would settle it. That is NOT-PERMITTED-TO-LOOK,
@@ -368,7 +368,7 @@ def _read_candidate(pid, entry):
     raw, verdict = read(os.path.join(procid.proc_root(), str(pid), "comm"))
     if verdict is not ROW:
         return None, verdict
-    if procid.is_claude(pid, raw) is not True:
+    if procid.is_seat_process(pid, raw) is not True:
         # Two incompatible answers about one number. helm cannot say which
         # process it is looking at, so it says so — never the silent "not this
         # seat" a bare skip would mean. `is not True` because the tri-state's
@@ -388,6 +388,9 @@ def _read_candidate(pid, entry):
     # a pid the gate above already identified, or this second opinion becomes
     # narrower than the first and turns into the sole reason a proven-claude
     # pane is dropped.
+    # A node argv is not a seat. A ugrep of the Claude binary still
+    # has exe_is_claude True; it never reaches this line, because the
+    # seat gate above already refused it, and so does a node child.
     if not argv or not (argv[0].endswith("claude")
                         or procid.exe_is_claude(pid) is not False):
         return None, ABSENT
@@ -2034,6 +2037,122 @@ def newest_session_row(seat, sids=None):
     return max(hits, key=lambda r: r.get("mt") or 0), None
 
 
+def _transcript_home(path):
+    """The config home a claude transcript sits in (<home>/projects/<slug>/
+    <sid>.jsonl), else None. A proxy seat's projects/ is a REAL directory, so
+    for its sessions this names the seat's own config home."""
+    up = os.path.dirname(os.path.dirname(path or ""))
+    return os.path.dirname(up) if os.path.basename(up) == "projects" else None
+
+
+def proxy_launch(seat, row, home=None):
+    """(launch, refusal) — how the session in `row` must be resumed when its
+    config home sits in the PROXY SEAT TREE.
+
+    ORCA ADOPTION WRITES NO FAMILY. The register it leaves beside a proxy seat
+    carries no `family` and no `project`, so nothing here reads the family from
+    it, and the native resume `sessions.resume_exec` builds for a claude row is
+    exactly wrong for such a seat: it UNSETS ANTHROPIC_BASE_URL and the token,
+    passes no model, and the pane comes up "Not logged in". So the family comes
+    from what the seat IS:
+
+      the tree     the session's config home (the credential home the resume
+                   would pin, and the one its transcript sits in) is
+                   <seats>/<family>/claude or <seats>/<family>/instances/
+                   <label>/claude, which names the family and the storage label
+                   (`beacons.seat_of_config_dir`, the estate's one reader);
+      the lineage  `_launch_identity(label)` says whose storage that is, so a
+                   renamed storage label resolves to the seat it is now, and a
+                   label that is no storage of THIS seat is refused;
+      the script   the seat's own launch.sh (`seat_remint.launch_fields`) must
+                   carry HELM_MODEL_BACKEND=proxy, this family, a proxy URL,
+                   the token-file read `_token_export` writes, a --model and
+                   this seat's name.
+
+    THREE ANSWERS. (None, None): neither home is in the seat tree, a native
+    session, resumed exactly as before. ({family, storage, launch_sh, model},
+    None): resume THROUGH launch_sh with the model it records, which is what
+    sets the proxy URL, reads the token file and names the family. (None, why):
+    the tree holds the session and one of the reads above failed. A refusal is
+    never softened into the native resume, because that is the pane that
+    cannot log in.
+    """
+    from . import pk, seat as seat_mod
+    from .beacons import seat_of_config_dir
+    from .seat_launch_assets import _launch_identity
+    from .seat_remint import launch_fields
+    root = os.path.realpath(seat_mod.seats_root())
+    homes = sorted({os.path.realpath(h) for h in
+                    (home, _transcript_home(row.get("p"))) if h})
+    tree = [h for h in homes if h.startswith(root + os.sep)]
+    if not tree:
+        return None, None
+    tail = ("; a native claude resume would start it with no proxy URL, no "
+            "token file and no model, so nothing was spawned")
+    if len(homes) > 1:
+        return None, ("its credential home and its transcript's config home "
+                      "disagree (%s), and at least one is a proxy seat's, so "
+                      "which seat it belongs to cannot be read"
+                      % " vs ".join(homes)) + tail
+    cfg = tree[0]
+    family = os.path.relpath(cfg, root).split(os.sep)[0]
+    storage = seat_of_config_dir(cfg, root)
+    if not storage:
+        return None, ("its config home %s sits in the proxy seat tree but is "
+                      "no seat's config home (<family>/claude or <family>/"
+                      "instances/<label>/claude), so the seat's family cannot "
+                      "be read" % cfg) + tail
+    if family not in seat_mod.FAMILIES:
+        return None, ("its config home %s sits in the proxy seat tree under "
+                      "%r, which names no proxy family, so the seat's family "
+                      "cannot be read" % (cfg, family)) + tail
+    where = "its session's config home %s is the %s proxy seat %s's" % (
+        cfg, family, storage)
+    why = seat_mod._seat_surface_error(family, storage)
+    if why:
+        return None, "%s, but %s" % (where, why) + tail
+    owner, why = _launch_identity(storage)
+    if why:
+        return None, ("%s, and whose seat that storage is cannot be proven: "
+                      "%s" % (where, why)) + tail
+    if str(owner).casefold() != str(seat).casefold():
+        return None, ("%s, and the roster names that storage %s, not %s: no "
+                      "rename lineage ties it to this seat, so its launch "
+                      "script would start another seat" % (where, owner, seat)
+                      ) + tail
+    launch_sh = os.path.join(seat_mod._instance_dir(family, storage),
+                             "launch.sh")
+    try:
+        with pk.open_regular(launch_sh, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return None, "%s, but its launch script %s does not exist" % (
+            where, launch_sh) + tail
+    except (OSError, ValueError) as e:
+        return None, "%s, but its launch script %s could not be read (%s)" % (
+            where, launch_sh, e.__class__.__name__) + tail
+    fields = launch_fields(text) or {}
+    env = fields.get("env") or {}
+    named = env.get("HELM_CHAT_NAME")
+    wants = ((env.get("HELM_MODEL_BACKEND") == "proxy",
+              "HELM_MODEL_BACKEND=proxy"),
+             (env.get("HELM_MODEL_FAMILY") == family,
+              "HELM_MODEL_FAMILY=" + family),
+             (bool(env.get("ANTHROPIC_BASE_URL")), "proxy URL"),
+             (seat_mod._token_export(family, storage) in text,
+              "read of its token file"),
+             (bool(fields.get("model")), "--model"),
+             (str(named or "").casefold() == str(seat).casefold(),
+              "HELM_CHAT_NAME=%s (it launches as %s)"
+              % (seat, named or "no seat name")))
+    missing = [what for ok, what in wants if not ok]
+    if missing:
+        return None, "%s, but its launch script %s carries no %s" % (
+            where, launch_sh, ", no ".join(missing)) + tail
+    return {"family": family, "storage": storage, "launch_sh": launch_sh,
+            "model": fields["model"]}, None
+
+
 def resume(seat, adapter=None, force=False, note=None, title=None,
            skip_permissions=False, session=None):
     """(rc, lines) — relaunch an orca-adopted seat's pane from its transcript.
@@ -2053,6 +2172,11 @@ def resume(seat, adapter=None, force=False, note=None, title=None,
     and `kick_resumed` rather than reimplementing a second launcher, and carries
     HELM_CHAT_NAME so the pane comes back AS the seat instead of as an anonymous
     pane that no longer answers to its name.
+
+    A session whose config home is a PROXY seat's resumes through that seat's
+    own launch.sh with the model it records, or is refused before anything is
+    spawned (`proxy_launch`); only a session outside the seat tree takes the
+    native claude resume.
     """
     lines = []
     state, evidence = seat_liveness(seat)
@@ -2082,26 +2206,36 @@ def resume(seat, adapter=None, force=False, note=None, title=None,
             lines.append("helm seat: refusing to resume %s — %s" % (seat, w))
         return 1, lines
     home = sessions.credhome_for(row["i"]) if row.get("h") == "claude" else None
+    launch, refusal = (proxy_launch(seat, row, home)
+                       if row.get("h") == "claude" else (None, None))
+    if refusal:
+        lines.append("helm seat: refusing to resume %s — %s" % (seat, refusal))
+        return 1, lines
+    if launch:
+        home = None                 # the launch script pins its own home
     if adapter is None:
         adapter = harness.detect()
     if adapter is None:
         lines.append("helm seat: " + harness.RECOMMENDATION)
-        lines.append("  manual paste: "
-                     + sessions.resume_command(row, home=home))
+        lines.append("  manual paste: " + sessions.resume_command(
+            row, home=home, launch=launch))
         return 1, lines
     try:
         path, handle, name = sessions.spawn_resume(
             row, title=title or seat, home=home,
             skip_permissions=skip_permissions,
-            env={"HELM_CHAT_NAME": seat})
+            env={"HELM_CHAT_NAME": seat}, launch=launch)
     except harness.HarnessError as e:
         lines.append("helm seat: %s resume via %s failed: %s"
                      % (seat, getattr(adapter, "name", "?"), e))
-        lines.append("  manual paste: "
-                     + sessions.resume_command(row, home=home))
+        lines.append("  manual paste: " + sessions.resume_command(
+            row, home=home, launch=launch))
         return 1, lines
-    lines.append("helm seat: resumed %s (orca-adopted) via %s — pane %s, "
-                 "session %s…" % (seat, name, handle, row["i"][:8]))
+    kind = ("orca-adopted, %s proxy seat %s" % (launch["family"],
+                                                launch["storage"])
+            if launch else "orca-adopted")
+    lines.append("helm seat: resumed %s (%s) via %s — pane %s, "
+                 "session %s…" % (seat, kind, name, handle, row["i"][:8]))
     kicked = sessions.kick_resumed(adapter, handle, note=note)
     lines.append("  kick: %s" % ("delivered — the seat has its resume brief "
                                  "(beacon re-arm rides it)"
@@ -2112,6 +2246,10 @@ def resume(seat, adapter=None, force=False, note=None, title=None,
                                  "Speak to it by hand; this resume is NOT "
                                  "complete (row #153)"))
     lines.append("  script: %s" % path)
+    if launch:
+        lines.append("  launch: %s --model %s (the seat's own launch script: "
+                     "its proxy URL, token file and model)"
+                     % (launch["launch_sh"], launch["model"]))
     lines.append("  cwd   : %s" % (row.get("cwd") or "?"))
     # A restart that cannot restore the wake path must refuse to report
     # itself complete: a deaf seat reads exactly like an idle one from

@@ -154,14 +154,14 @@ Arrival = collections.namedtuple("Arrival", (
     "fingerprint", "first_context"))
 
 _EVENT = re.compile(r"<event>(.*?)(?:</event>|\Z)", re.S)
-_RESULT = re.compile(r"<result>(.*?)(?:</result>|\Z)", re.S)
 _STATUS = re.compile(r"<status>\s*([a-z_-]+)\s*</status>")
 _EXIT = re.compile(r"\(exit code (\d+)\)")
 # helm's wake head, seats_delivery.deliver_any:
 #   [helm chat #room → seat @ts] author: text (+N waiting — helm chat read ...)
 _WAKE = re.compile(r"^\[helm chat(?: reaction)?(?: dm| #\S+)? → [^\]@]*?"
                    r"(?: @(\S+?))?\]\s*([^:\s]{1,80}):")
-_WAITING = re.compile(r"\(\+\d+ waiting — helm chat read")
+# "+0 waiting" is the beacon doorbell's one-row ring: nothing else is waiting.
+_WAITING = re.compile(r"\(\+[1-9]\d* waiting — helm chat read")
 _FIXED = re.compile(r"^(?:\[helm chat\] |\[Monitor expired after "
                     r"|\[\d+ events? suppressed — )")
 _FRAME = "[Subagent hand-back]"
@@ -341,8 +341,11 @@ ROUTES = (
           "merge-base age, installed build, one whole gate", "planned: lane 4"),
     Route("act.spawn", "act", "PreToolUse", None,
           "brief in the row; model ruling", "planned: lane 4"),
-    Route("act.spawn.nested", "act", "PreToolUse", None, "deny",
-          "planned: task/1775"),
+    # LIVE WITH NO ARRIVAL DETECTOR, like stop.beacon-missing below: the
+    # hook code that detects it is named in its form (task/1775).
+    Route("act.spawn.nested", "act", "PreToolUse", None,
+          "deny a subagent's Agent call (the argv-guard's nested-spawn rung)",
+          LIVE),
     Route("act.commit.body", "act", "PreToolUse", None, "deny",
           "planned: lane 5"),
     Route("act.pkill-f", "act", "PreToolUse", None,
@@ -375,8 +378,15 @@ ROUTES = (
           "one continuation per context", "planned: lane 6"),
     Route("stop.wrapup-open", "stop", "Stop", None,
           "one continuation per context", "planned: lane 6"),
+    # LIVE WITH NO ARRIVAL DETECTOR: a live row of another family names, in
+    # its form, the hook code that detects it. Here that is the stop guard's
+    # own rung, in the Stop hook (task/3382). arrival.monitor-expired
+    # stays: it rides the expiry that STARTS a turn, and this refuses the
+    # stop that would otherwise idle deaf after a mid-turn one.
     Route("stop.beacon-missing", "stop", "Stop", None,
-          "re-arm, then retire arrival.monitor-expired", "planned: lane 6"),
+          "a LOCAL seat's unarmed stop is refused once per fresh stop "
+          "(seats_stop_guard._rearm_rung); arrival.monitor-expired stays",
+          LIVE),
     Route("jit", "long-tail", "UserPromptSubmit", None,
           "keyword candidates by arrival slots", LIVE),
 )
@@ -414,7 +424,7 @@ _SIG_AUTHOR = re.compile(r"\[helm chat[^\]]*\]\s*([^:\s]+):")
 
 def _sig_machine(p):
     names = _SIG_AUTHOR.findall(p)
-    return bool(names) and "waiting —" not in p \
+    return bool(names) and not re.search(r"\+[1-9]\d* waiting —", p) \
         and all(n in MACHINE_AUTHORS for n in names) \
         and "[Monitor expired after " not in p
 
@@ -624,31 +634,89 @@ def _on_alarm(_signum, _frame):
     raise Deadline()
 
 
+#: What an armed deadline replaced, put back by `disarm_deadline`: at most one
+#: record, (the SIGALRM handler, the outer timer's (seconds left, interval),
+#: the `_now()` it was suspended at).
+_REPLACED = []
+
+#: The re-arm for an outer timer whose time ran out under the deadline: the
+#: smallest positive value, since 0 would stop it.
+_AT_ONCE = 1e-6
+
+
+def _now():
+    return time.monotonic()
+
+
 def arm_deadline(seconds=None):
     """Arm the soft deadline measured from PROCESS START; True when armed.
 
     A hook process is born for its turn, so its age IS the turn's wall time
     under the wrapper's `timeout`. A process already older than the deadline
     is not a hook (a test runner, an embedding) and is left alone, as is one
-    whose age cannot be read, and a caller that already holds an interval
-    timer keeps it (never stolen)."""
+    whose age cannot be read, and so is a deadline already armed.
+
+    AN OUTER TIMER IS NESTED, NEVER STOLEN. ITIMER_REAL is one timer per
+    process, and `hookrun` arms it with the handler's budget before it runs
+    inject in-process. An outer timer that fires first keeps sole charge: the
+    arm refuses and records nothing, so the disarm leaves it running. One
+    that fires later is suspended under the deadline, and the arm records
+    the time it had left and the handler it replaced; `disarm_deadline` puts
+    both back. The outer is suspended before the handler is replaced, so it
+    never fires into the deadline's handler, and the time recorded is the one
+    that suspending swap returned."""
     budget = DEADLINE_S if seconds is None else seconds
     try:
         wall = process_wall_ms()
         if wall is None or wall / 1000.0 >= budget:
             return False
-        if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+        if signal.getsignal(signal.SIGALRM) is _on_alarm:
             return False
-        signal.signal(signal.SIGALRM, _on_alarm)
-        signal.setitimer(signal.ITIMER_REAL, budget - wall / 1000.0)
+        _REPLACED.clear()        # its handler was replaced since: not ours
+        left = budget - wall / 1000.0
+        outer = signal.getitimer(signal.ITIMER_REAL)
+        if 0 < outer[0] <= left:
+            return False
+        outer = signal.setitimer(signal.ITIMER_REAL, 0)
+        try:
+            prior = signal.signal(signal.SIGALRM, _on_alarm)
+        except ValueError:       # off the main thread: nothing replaced
+            if outer[0]:
+                signal.setitimer(signal.ITIMER_REAL, *outer)
+            return False
+        _REPLACED.append((prior, outer, _now()))
+        signal.setitimer(signal.ITIMER_REAL, left)
         return True
     except (ValueError, OSError, AttributeError):
         return False
 
 
 def disarm_deadline():
+    """Stop the deadline and put back what its arm replaced: the handler,
+    then the outer timer with the time it had left less the time since, so
+    an outer budget that ran out meanwhile fires at once. With no record
+    (the arm refused, or this is a second disarm) nothing is touched and an
+    outer budget keeps running.
+
+    The deadline stops before the handler moves, so it never fires into the
+    outer handler, and the outer re-arms only after its handler is back. The
+    record is forgotten only then: a disarm that cannot put the handler back
+    (off the main thread `signal.signal` raises) keeps it, with the outer
+    still owed, so the next disarm still can."""
+    if not _REPLACED:
+        return
+    prior, (outer, interval), at = _REPLACED[0]
     try:
+        if signal.getsignal(signal.SIGALRM) is not _on_alarm:
+            _REPLACED.clear()    # its handler was replaced since: not ours
+            return
         signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM,
+                      prior if prior is not None else signal.SIG_DFL)
+        _REPLACED.clear()
+        if outer:
+            signal.setitimer(signal.ITIMER_REAL,
+                             max(outer - (_now() - at), _AT_ONCE), interval)
     except (ValueError, OSError, AttributeError):
         pass
 

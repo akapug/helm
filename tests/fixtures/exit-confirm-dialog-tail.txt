@@ -1,0 +1,9 @@
+   The following will stop when you exit:
+   monitor · example-seat inbox beacon
+   shell · D=/tmp/example/scratch/tmpdir-overflow/t…
+   shell · W=/tmp/example/worktrees/lane-a…
+   shell · helm task comment 1234 "Second live instance, 23:…
+   ❯ 1. Exit and stop tasks
+     2. Move to background and exit
+     3. Stay
+   Enter to confirm · Esc to cancel

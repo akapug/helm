@@ -13,7 +13,7 @@ service.
 
 Start here, because it is the posture a fresh clone is in and the posture it
 stays in: **helm attests entirely by itself, with stdlib only.** There is no
-meld binary, no bundled service, and no network dependency. Capture writes the
+external binary, no bundled service, and no network dependency. Capture writes the
 premise to the typed store AND appends a native attestation record; both land
 offline. A dregg node, if one happens to be reachable, is an *optional external
 checkpoint* — never required, and never allowed to *prevent* capture: it is a

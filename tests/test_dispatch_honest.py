@@ -75,6 +75,24 @@ EXEMPT = {
                "target refuses with rc 1 (not-found), never runs a default",
         "branches": {},
     },
+    ("teams_cli", "cmd_team"): {
+        "rc": 1,
+        "why": "args[0] is the documented positional <project> (`helm team "
+               "[<project>]`); an unknown word is an unknown project and "
+               "refuses with rc 1 (not-found), never runs a default",
+        "branches": {
+            "set": {"argv": ["set", "helm", "--expect", "0", "--reason", "r",
+                             "--apply", "--bogus", "--help"],
+                    "never": "teams.write"},
+            "seed": {"argv": ["seed", "--apply", "--bogus", "--help"],
+                     "never": "teams.seed"},
+            "history": {"argv": ["history", "helm", "--bogus", "--help"],
+                        "never": "teams.history"},
+            "capacity": {"argv": ["capacity", "qwen27", "4", "--reason", "r",
+                                  "--apply", "--bogus", "--help"],
+                         "never": "teams.set_capacity"},
+        },
+    },
 }
 
 

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Arms for /api/owed — the owner's burn-down surface (task/955).
 
-THE REASON THESE ARMS INJECT A FAKE `helm.obligation`: on this trunk the module
-does not exist, so a suite that only called the endpoint would exercise ONLY the
-unavailable branch and report itself green having never rendered a single row.
-That is the vacuous pass this codebase keeps paying for — the arm must drive the
-POPULATED path too, and the only honest way to do that before the source lands
-is to supply one.
+THE REASON THESE ARMS INJECT A FAKE `helm.obligation`: the real module folds
+the live dispatch ledger, so a suite that only called the endpoint would render
+whatever that ledger holds, or only the unavailable branch. The arms must drive
+the POPULATED path, the empty path and each failure on purpose, and a fake that
+matches the real module's contract is how they do that.
 """
 import inspect
 import os
@@ -18,6 +17,10 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# THE FACADE FIRST, as on every route: importing helm.web fans its names out
+# into web_cache. Left to a test's first request, that fan-out happened inside
+# the test module's own run, and web_cache gained a dozen names mid-module.
+from helm import web  # noqa: E402,F401
 from helm import web_cache, web_owed  # noqa: E402
 
 # THE CACHE KEY THIS ENDPOINT OWNS. /api/owed is served through
@@ -162,6 +165,49 @@ class _Installed:
         return False
 
 
+class _ImportRaises:
+    """Make `from . import <name>` inside helm raise ImportError for a block:
+    the shape an import failure inside the module, or one it imports, takes.
+    A meta-path finder whose loader raises, with the cached module and the
+    package attribute set aside and restored on exit."""
+
+    def __init__(self, name):
+        self.name, self.full = name, "helm." + name
+
+    def find_spec(self, fullname, path=None, target=None):
+        import importlib.util
+        return (importlib.util.spec_from_loader(fullname, self)
+                if fullname == self.full else None)
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise ImportError("cannot import name 'gone' from 'helm.pk'")
+
+    def __enter__(self):
+        import helm
+        self.pkg = helm
+        self.prev = sys.modules.pop(self.full, None)
+        self.had_attr = hasattr(helm, self.name)
+        self.prev_attr = getattr(helm, self.name, None)
+        if self.had_attr:
+            delattr(helm, self.name)
+        sys.meta_path.insert(0, self)
+        return self
+
+    def __exit__(self, *exc):
+        sys.meta_path.remove(self)
+        sys.modules.pop(self.full, None)
+        if self.prev is not None:
+            sys.modules[self.full] = self.prev
+        if self.had_attr:
+            setattr(self.pkg, self.name, self.prev_attr)
+        elif hasattr(self.pkg, self.name):
+            delattr(self.pkg, self.name)
+        return False
+
+
 # THE REPOSITORY THE CURED FIXTURES LIVE IN. One literal, referenced by both
 # _entry's default and CuredBucketTest._REPO, because the endpoint now DECIDES
 # results on repo_id — a fixture whose entry disagreed with its snapshot would
@@ -200,41 +246,16 @@ class OwedSurfaceTest(unittest.TestCase):
         self.assertEqual(out["rows"][0]["lane"], "lane-x")
         self.assertEqual(out["rows"][0]["seat"], "a-seat")
 
-    def test_an_ABSENT_module_is_UNAVAILABLE_not_an_empty_backlog(self):
-        """The land-order state. This is the branch that runs on real trunk
-        today, and the distinction it protects is the whole point: an owner
-        who reads 'nothing owed' when the answer is 'cannot look' stops
-        burning down a backlog that is still there."""
-        import helm
-        had = "helm.obligation" in sys.modules
-        prev = sys.modules.pop("helm.obligation", None)
-        # THE PACKAGE ATTRIBUTE TOO — correct hygiene, but it does NOT make
-        # this branch reachable and an earlier version of this comment claimed
-        # it did. `from . import obligation` RE-IMPORTS FROM DISK when the
-        # attribute is missing, so on any tree carrying helm/obligation.py the
-        # import succeeds and this arm SKIPS. Measured: the gate's skipped
-        # count went 17 -> 18 the moment the module landed.
-        #
-        # The branch is defensive code with no reachable arm here. It stays
-        # because it costs nothing and answers correctly if the module ever
-        # goes missing — but it is NOT tested, and saying so is the point.
-        had_attr = hasattr(helm, "obligation")
-        prev_attr = getattr(helm, "obligation", None)
-        if had_attr:
-            del helm.obligation
-        try:
+    def test_an_import_failure_is_named_never_reported_as_not_landed(self):
+        """helm.obligation is on trunk, so an ImportError from importing it is
+        a real failure inside the module or below it. The burn-down says it
+        is unavailable and names the exception class; it never claims the
+        module has not landed."""
+        with _ImportRaises("obligation"):
             out = web_owed._owed_build()
-        finally:
-            if had:
-                sys.modules["helm.obligation"] = prev
-            if had_attr:
-                helm.obligation = prev_attr
-        # If obligation IS importable in this tree the branch cannot be
-        # reached, and saying so is honest where skipping silently is not.
-        if not out.get("unavailable"):
-            self.skipTest("helm.obligation is importable here; the "
-                          "absent-module branch is unreachable in this tree")
-        self.assertIn("not on this trunk", out["why"])
+        self.assertTrue(out["unavailable"])
+        self.assertIn("ImportError", out["why"])
+        self.assertNotIn("not on this trunk", out["why"])
         self.assertEqual(out.get("rows", []), [])
 
     def test_an_UNREADABLE_ledger_is_UNAVAILABLE_not_an_empty_backlog(self):
@@ -528,6 +549,34 @@ class CuredBucketTest(unittest.TestCase):
             out = web_owed._owed_build()
         self.assertTrue(out["cured"]["unavailable"])
         self.assertIn("did not open", out["cured"]["why"])
+
+    def test_a_RAISING_cured_walk_is_UNAVAILABLE_naming_its_exception_class(self):
+        """A raise inside the cured walk is UNAVAILABLE with the exception
+        class in `why`. A KeyError's str is only its key: without the class
+        the line reads as a bare 'repo_id', which names no failure."""
+        from unittest import mock
+        a, b, c3 = self._patch()
+        with a, b, c3, mock.patch.object(web_owed, "_cured_rows",
+                                         side_effect=KeyError("repo_id")):
+            out = web_owed._owed_build()
+        c = out["cured"]
+        self.assertTrue(c["unavailable"])
+        self.assertIn("KeyError", c["why"])
+        self.assertIn("repo_id", c["why"])
+
+    def test_a_RAISING_body_is_UNAVAILABLE_naming_its_exception_class(self):
+        """A raise ABOVE `_owed_body`'s own try (the cured block runs before
+        it) lands in `_owed_build`'s catch; that body names the class too,
+        in both halves."""
+        from unittest import mock
+        a, b, c3 = self._patch()
+        with a, b, c3, mock.patch.object(web_owed, "_owed_body",
+                                         side_effect=KeyError("rows")):
+            out = web_owed._owed_build()
+        self.assertTrue(out["unavailable"])
+        self.assertIn("KeyError", out["why"])
+        self.assertTrue(out["cured"]["unavailable"])
+        self.assertIn("KeyError", out["cured"]["why"])
 
     def test_a_GENUINELY_EMPTY_cured_bucket_is_EMPTY_not_unavailable(self):
         # POSITIVE CONTROL FIRST on the same observable: one entry renders.
@@ -1118,26 +1167,6 @@ class BurnDownIsServedStaleTest(_FreshBurnDown):
         self.assertIsNone(body.get("read_age_s"),
                           "a body that was never read carries an age")
 
-    def test_THE_COLD_WAIT_FITS_INSIDE_THE_CARDS_FETCH_DEADLINE(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control is the must-hit `len(found) == 1`: the card's deadline is READ off the page and its absence fails the arm before any comparison
-        """THE TWO NUMBERS ARE ONE DECISION AND THEY LIVE IN TWO FILES. A cold
-        wait longer than the deadline aborts the very fetch it exists to let
-        finish, and the card prints the timeout again with a warming body
-        sitting unread behind it."""
-        import re
-        from helm import web_ui_loader
-        found = re.findall(r'j\("/api/owed",\s*(\d+)\)',
-                           web_ui_loader.read_text())
-        # THE MUST-HIT. A renamed helper or a moved literal would leave this
-        # arm comparing against nothing and passing.
-        self.assertEqual(len(found), 1,
-                         "the burn-down's fetch deadline could not be read "
-                         "off the page at all: %r" % (found,))
-        deadline_s = int(found[0]) / 1000.0
-        self.assertLess(web_owed._OWED_COLD_WAIT_S, deadline_s,
-                        "the cold wait (%ss) outlives the card's fetch "
-                        "deadline (%ss)" % (web_owed._OWED_COLD_WAIT_S,
-                                            deadline_s))
-
     def test_THE_FLOOR_OUTLASTS_A_BUILD_and_the_caps_are_ordered(self):
         """WHY THESE NUMBERS ARE THESE NUMBERS, as relations rather than as
         prose that cannot go red.
@@ -1367,9 +1396,11 @@ class ColdWaitIsSizedAgainstTheBuildTest(unittest.TestCase):
 
     A WAIT SHORTER THAN ITS OWN FILL IS THE TTL TRAP ONE STATE EARLIER — the
     same shape as a 46s /api/ready under a 30s ttl and a 6s roster build under
-    a 2.5s one. Both sides of the sandwich are pinned: this arm holds the
-    floor, `test_THE_COLD_WAIT_FITS_INSIDE_THE_CARDS_FETCH_DEADLINE` holds the
-    ceiling, and between them the number cannot drift back to a guess."""
+    a 2.5s one. This arm holds the floor. The ceiling was the burn-down
+    card's own fetch deadline, and that card and its warming retry were
+    retired with the pipeline page (task/3643): no page reads /api/owed any
+    more (the Work page reads /api/work, where an unanswered fix is a card in
+    Building), and the agents' tools keep the route."""
 
     def test_the_cold_wait_outlasts_the_build_it_exists_to_wait_for(self):
         self.assertGreater(
@@ -1379,23 +1410,82 @@ class ColdWaitIsSizedAgainstTheBuildTest(unittest.TestCase):
             "placeholder" % (web_owed._OWED_COLD_WAIT_S,
                              _MEASURED_COLD_BUILD_S))
 
-    def test_the_card_RE_ASKS_after_warming_instead_of_waiting_a_full_poll(self):  # noqa: VACUOUS_ASSERTION — the unconditional must-hit is `assertIn("obdWarming", page)`: the warming renderer is read off the same page text before any retry claim is made
-        """THE PROMISE THE PLACEHOLDER MAKES. `obdWarming` tells the owner
-        "this card refreshes itself when it is" — and the only thing that
-        refreshed it was the 45-SECOND timer, so a build finishing at ten
-        seconds sat unread for another thirty-five. The retry is what makes
-        that sentence true, and it is bounded so a build that never succeeds
-        reaches him as a failure rather than as a spinner."""
-        from helm import web_ui_loader
-        page = web_ui_loader.read_text()
-        # THE MUST-HIT, unconditional and on the same observable: the warming
-        # renderer itself must be on this page, or the arm below is searching
-        # a page that never had the feature and passing on its absence.
-        self.assertIn("obdWarming", page,
-                      "the burn-down's warming renderer is not on the "
-                      "assembled page at all, so this arm reads nothing")
-        self.assertIn("OBD_WARM_TRIES", page,
-                      "a warming answer is never re-asked, so the card waits "
-                      "a full 45s poll for a body that already landed")
-        self.assertIn("d.warming && OBD_WARM_TRIES", page,
-                      "the retry does not key off the warming answer")
+
+def _drop_swr_key(key):
+    """Every web_cache table a `_cached_swr` call for `key` can write, emptied of it: a cold call
+    also writes `_qcold` (and a build `_qfresh`/`_qverified`), and the gateslice leak audit names any
+    key left behind (task/3304)."""
+    for cache in (web_cache._qstate, web_cache._qinflight, web_cache._qthreads,
+                  web_cache._qcold, web_cache._qfresh, web_cache._qverified):
+        cache.pop(key, None)
+    web_cache._qrestored.discard(key)
+
+
+class DrainSwrTest(unittest.TestCase):
+    """A test that kicks a `_cached_swr` rebuild owes the drain in its
+    tearDown: without it the daemon worker leaks, and its late `_qstate` write
+    corrupts the next module's fixtures (task/3304 — the finder reads every
+    module CLEAN alone, then test_web_lr ERRORs in the whole suite behind
+    threads it did not start)."""
+
+    def test_drain_swr_joins_a_rebuild_worker_it_started(self):  # noqa: VACUOUS_ASSERTION — the worker's liveness before the drain is the unconditional control; the join after it is the claim
+        from unittest import mock
+        started = threading.Event()
+        release = threading.Event()
+        key = "drain-probe"
+
+        def slow_build():
+            started.set()
+            release.wait(30)
+            return {"rows": [], "total": 0}
+
+        _drop_swr_key(key)
+        try:
+            web_cache._cached_swr(key, 0, 0, slow_build,
+                                  cold_body={"warming": True}, cold_wait=0.2,
+                                  fingerprint=lambda: key, unchanged_max=60)
+            self.assertTrue(started.wait(5), "the rebuild never started")
+            worker = web_cache._qthreads.get(key)
+            self.assertIsNotNone(worker, "the rebuild worker was not tracked")
+            self.assertTrue(worker.is_alive(),
+                            "the worker finished before the drain could be "
+                            "measured")
+            release.set()
+            web_cache.drain_swr()
+            self.assertFalse(worker.is_alive(),
+                             "drain_swr() left the rebuild worker alive, so it "
+                             "can write _qstate into the next module's fixtures")
+        finally:
+            release.set()
+            web_cache.drain_swr()
+            _drop_swr_key(key)
+
+    def test_an_unstarted_worker_is_not_left_in_qthreads(self):  # noqa: VACUOUS_ASSERTION — the raised start is the control that the spawn path fired; the empty _qthreads after the refusal is the claim
+        """A start() that raises BEFORE the OS thread launches must not leave
+        an unstarted worker in `_qthreads`, or `drain_swr`'s join on it raises
+        "cannot join thread before it is started" (a worker tracked but never launched)."""
+        from unittest import mock
+        key = "drain-unstarted"
+
+        def boom(*args, **kwargs):
+            # A zero-arg stand-in would be a bug here: a bound `worker.start()`
+            # always passes `self`, so a zero-arg mock cannot stand for the
+            # spawn-failure this probe wants to model. The signature must eat
+            # the receiver to keep the probe's real assertion (start refused)
+            # the thing that surfaces.
+            raise RuntimeError("start refused")
+
+        _drop_swr_key(key)
+        try:
+            with mock.patch.object(threading.Thread, "start", boom):
+                with self.assertRaises(RuntimeError):
+                    web_cache._cached_swr(
+                        key, 0, 0, lambda: {"rows": []},
+                        cold_body={"warming": True}, cold_wait=0.2,
+                        fingerprint=lambda: key, unchanged_max=60)
+            self.assertNotIn(key, web_cache._qthreads,
+                             "an unstarted worker was left tracked; drain_swr "
+                             "would raise on join")
+            web_cache.drain_swr()   # must not raise
+        finally:
+            _drop_swr_key(key)

@@ -12,7 +12,7 @@
   "sa-always-fable": "PLACEHOLDER statement for edge source sa-always-fable",
   "model-ratings-owner-strict-order-2026-08-03-r2": "PLACEHOLDER statement for edge source model-ratings-owner-strict-order",
   "opus-implementation-legs-run-as-workflows-from-a-fable-seat": "PLACEHOLDER statement for edge source opus-implementation-legs",
-  "fable-reviews-are-high-stakes-only-not-the-default": "PLACEHOLDER statement for edge source fable-reviews-are-high-stakes-only",
+  "opus55-is-the-default-fable-is-the-crossmodel-reviewer-of-last-resort": "PLACEHOLDER statement for edge source opus55-is-the-default",
   "fable-is-the-orchestrator-not-the-subagent-opus-two-to-one": "PLACEHOLDER statement for edge source fable-is-the-orchestrator",
   "fable-via-workflow-not-agent-tool": "PLACEHOLDER statement for edge source fable-via-workflow-not-agent-tool",
   "liveness-is-not-routing-authority": "PLACEHOLDER statement for edge source liveness-is-not-routing-authority",
@@ -33,6 +33,7 @@
   "prior-ds4pro-for-bulk-extraction": "PLACEHOLDER statement for edge source prior-ds4pro-for-bulk-extraction",
   "cheap-diverse-models-council-to-max-quality": "PLACEHOLDER statement for edge source cheap-diverse-models-council",
   "workflow-runway-check-before-fanout": "PLACEHOLDER statement for edge source runway-check-before-fanout",
-  "usage-routing-by-family-budget": "PLACEHOLDER statement for edge source usage-routing-by-family-budget"
+  "usage-routing-by-family-budget": "PLACEHOLDER statement for edge source usage-routing-by-family-budget",
+  "project-shares-ration-a-short-family": "PLACEHOLDER statement for edge source project-shares-ration-a-short-family"
  }
 }

@@ -108,6 +108,24 @@ def never_track_set():
     return dict(local, **NEVER_TRACK)
 
 
+def loose_note(path):
+    """A note naming a private list any group or other permission reaches,
+    else None.
+
+    THE LIST STILL LOADS. These files feed a guard, and refusing a loose one
+    would switch the guard off, which is the wrong direction to fail; the
+    exposure is the file's own, so it is named on every scan until fixed."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return None
+    if not mode & 0o077:
+        return None
+    return ("note: %s carries group or other permissions (mode %o) and it "
+            "lists what this guard keeps private; chmod 600 it"
+            % (path, mode & 0o777))
+
+
 def load_private_needles():
     """The private identifiers to keep out of the tree, from OUTSIDE the tree:
     $HELM_PRIVATE_NEEDLES, else <real home>/.helm/_global/private-needles.txt,
@@ -787,6 +805,10 @@ def scan_staged(root):
     needles, needles_path = load_private_needles()
     never_track = never_track_set()
     violations, notes = [], []
+    for private in (needles_path, load_local_never_track()[1]):
+        loose = loose_note(private)
+        if loose:
+            notes.append(loose)
     addresses_by_file = {}
     # MEASURED ONCE FOR THE WHOLE SCAN: every added-ness question below is
     # asked against this set, never against HEAD alone. `staged_paths` stays a

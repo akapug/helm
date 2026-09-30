@@ -23,16 +23,24 @@ WHAT THESE ARMS PIN, one class per build item:
 Every class leads with a positive control on the same observable its
 absences are read against.
 """
+import hashlib
 import json
 import os
 import pathlib
+import threading
 import unittest
 from unittest import mock
 
-from helm import dispatches, landreq, landreq_close, rowstate, seats
-from helm import seats_integrator
+from helm import chat, dispatches, landreq, landreq_close, meld, rowstate, seats
+from helm import review_door, seats_integrator
 from tests import test_dispatches as td
 from tests._verdict import native_author
+from tests._tmphome import pin_live_seats
+
+
+def setUpModule():
+    pin_live_seats()
+
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 READ = {"reason": "the verdict was minted by a delegate outside its brief",
@@ -106,10 +114,11 @@ class RetractBase(td.DispatchBase):
 
     def retract(self, rid, seat=None, **kw):
         args = dict(READ, **kw)
+        notify = args.pop("notify", False)
         with _as(seat or self.REVIEWER):
             return dispatches.retract(rid, args.pop("reason"),
                                       args.pop("reads"), args.pop("basis"),
-                                      notify=False, **args)
+                                      notify=notify, **args)
 
 
 def _event(state, **over):
@@ -125,6 +134,45 @@ def _event(state, **over):
              "retract_proof_version": 1}
     event.update(over)
     return {k: v for k, v in event.items() if v is not None}
+
+
+class ModeMetricsRetractionTest(RetractBase):
+    """The trial reads the real ledger fold, not projected fixture slices."""
+
+    def test_retracted_fix_loses_its_cure_in_one_accepted_snapshot(self):
+        row = self.add(recipient=self.REVIEWER, ref=self.side, kind="review")
+        self.forge_open(row["id"], review_mode="MELD-DIFF")
+        before, _events, accepted, _verdicts, unavailable = \
+            dispatches.snapshot_and_events()
+        self.assertIsNone(unavailable)
+        self.assertEqual(before[row["id"]]["review_mode"], "MELD-DIFF")
+        self.assertEqual(accepted[row["id"]][0]["event"], "dispatch")
+        out, why = dispatches.mark_verdict(
+            row["id"], row["tip"], "needs a cure", "fix", basis="measured",
+            finding_count=1, prior_relation="new",
+            no_patch_because="MELD-DIFF: author applies the cure")
+        self.assertIsNone(why, why)
+        before, _events, accepted, _verdicts, unavailable = \
+            dispatches.snapshot_and_events()
+        self.assertIsNone(unavailable)
+        chain = before[row["id"]]["chain_root"]
+        measured = {r["chain"]: r for r in review_door.mode_metrics(
+            before, accepted)["chains"]}[chain]
+        self.assertEqual((measured["mode"], measured["active_review_rounds"],
+                          measured["cure_cycles"]), ("MELD-DIFF", 1, 1))
+        self.assertEqual(accepted[row["id"]][-1]["event"], "verdict")
+
+        self.retract(row["id"], reads="fix")
+        after, _events, accepted, _verdicts, unavailable = \
+            dispatches.snapshot_and_events()
+        self.assertIsNone(unavailable)
+        self.assertIs(after[row["id"]]["verdict_retracted"], True)
+        self.assertEqual([e["event"] for e in accepted[row["id"]][-2:]],
+                         ["verdict", "verdict-retract"])
+        measured = {r["chain"]: r for r in review_door.mode_metrics(
+            after, accepted)["chains"]}[chain]
+        self.assertEqual((measured["active_review_rounds"],
+                          measured["cure_cycles"]), (0, 0))
 
 
 class ReducerFoldsARetractionTest(RetractBase):
@@ -317,8 +365,45 @@ class TheCliTest(RetractBase):
 class ReissueTest(RetractBase):
     """C4. The successor is written first and never outlives a failed call."""
 
+    def test_reissued_review_inherits_whole_brief_and_guidance_only_once(self):
+        original = "reader needs the whole brief: " + ("facts " * 1100).strip()
+        with mock.patch.object(dispatches, "_verified_family",
+                               return_value="codex"):
+            row, why, _sent = dispatches.send(
+                self.REVIEWER, "reissue-guidance", original, self.side,
+                repo=self.repo, kind="review", new_work=True)
+        self.assertIsNotNone(row, why)
+        self.assertEqual(row["review_mode"], "PATCH")
+        pre_guidance = dispatches.brief_of(row)[0].removesuffix(
+            "\n\n" + dispatches.REVIEW_MODE_LINES["PATCH"])
+        self.assertEqual(row["message_hash"], hashlib.blake2b(
+            pre_guidance.encode("utf-8"), digest_size=16).hexdigest())
+        self.assertIn(original, dispatches.brief_of(row)[0])
+        verdict, why = dispatches.mark_verdict(
+            row["id"], row["tip"], "needs work", "fix")
+        self.assertIsNone(why, why)
+        with mock.patch.object(dispatches, "_verified_family",
+                               return_value="codex"):
+            out, why = self.retract(verdict["id"], reissue=True)
+        self.assertIsNone(why, why)
+        child = self.state(out["retract_successor"])
+        full = dispatches.brief_of(child)[0]
+        self.assertTrue(full.startswith(original + "\n\n"))
+        self.assertEqual(full.count("REVIEW FIX MODE:"), 1)
+        self.assertEqual(child["review_mode"], "PATCH")
+        self.assertEqual(child["message_hash"], row["message_hash"])
+        with mock.patch.object(dispatches, "_verified_family",
+                               return_value="codex"):
+            again, why = self.retract(verdict["id"], reissue=True)
+        self.assertIsNone(why, why)
+        self.assertEqual(again["reissued"]["id"], child["id"])
+        self.assertEqual(dispatches.brief_of(self.state(child["id"]))[0], full)
+
     def test_reissue_mints_the_successor_for_the_same_reviewer_and_tip(self):  # noqa: VACUOUS_ASSERTION — every assertion is a positive equality on the minted successor
         row = self.verdicted("fix")
+        opened = review_door.open_pair_round(row)
+        self.assertEqual(opened["round"], 1)
+        room = opened["room"]
         out, why = self.retract(row["id"], reissue=True)
         self.assertIsNone(why, why)
         kid = self.state(out["retract_successor"])
@@ -332,6 +417,295 @@ class ReissueTest(RetractBase):
         self.assertEqual(kid["sender"], row["sender"])
         self.assertEqual(kid.get("acted_by"), self.REVIEWER)
         self.assertEqual(self.state(row["id"])["retract_successor"], kid["id"])
+        seeds = meld.seeds(chat.read(room)[0])
+        self.assertEqual(len(seeds), 2)
+        self.assertIn("row %s at %s" % (kid["id"][:12], kid["tip"][:12]),
+                      seeds[-1][2])
+        self.assertIn(" | round 2 | ", seeds[-1][2])
+
+    def test_an_identical_retry_repairs_a_crash_after_durable_retraction(self):  # noqa: VACUOUS_ASSERTION — the durable parent and child are asserted before the retry proves each missing side effect once
+        row = self.verdicted("fix")
+        record = dispatches._record_retract
+
+        def crash_after_record(*args, **kwargs):
+            out, why = record(*args, **kwargs)
+            self.assertIsNone(why, why)
+            self.assertTrue(out["verdict_retracted"])
+            raise RuntimeError("fixture crash after durable retraction")
+
+        with mock.patch.object(dispatches, "_record_retract",
+                               side_effect=crash_after_record):
+            with self.assertRaisesRegex(RuntimeError, "after durable"):
+                self.retract(row["id"], reissue=True, notify=True)
+        parent = self.state(row["id"])
+        kid_id = parent["retract_successor"]
+        kid = self.state(kid_id)
+        room = review_door.pair_room(kid, dispatches.snapshot()[0])[0]
+        self.assertEqual(meld.seeds(chat.read(room)[0]), [])
+        prefix = "@%s %s:" % (kid["recipient"], kid_id[:12])
+        self.assertEqual([m for m in chat.read("main")[0]
+                          if str(m.get("text") or "").startswith(prefix)], [])
+
+        gate = threading.Barrier(3)
+        replies, errors = [], []
+        # BOTH RETRIES READ MAIN BEFORE EITHER POSTS. Left to the scheduler,
+        # the first thread posted before the second read, and a keyless post
+        # passed this arm (measured). Each read now waits for the other, so
+        # only the chat key can keep the second post from a second mention.
+        real_read = dispatches._existing_public_notification
+        read_gate = threading.Barrier(2, timeout=10)
+        reads = []
+
+        def read_then_wait(new):
+            found = real_read(new)
+            reads.append(found)
+            read_gate.wait()
+            return found
+
+        def retry():
+            gate.wait()
+            try:
+                replies.append(dispatches.retract(
+                    row["id"], READ["reason"], READ["reads"], READ["basis"],
+                    reissue=True, notify=True))
+            except Exception as exc:                         # noqa: BLE001
+                errors.append(exc)
+
+        with _as(self.REVIEWER), mock.patch.object(
+                dispatches, "_existing_public_notification",
+                side_effect=read_then_wait):
+            threads = [threading.Thread(target=retry) for _i in range(2)]
+            for thread in threads:
+                thread.start()
+            gate.wait()
+            for thread in threads:
+                thread.join(15)
+        self.assertFalse(errors)
+        self.assertFalse([t for t in threads if t.is_alive()])
+        self.assertEqual(reads, [(None, None), (None, None)])
+        for out, why in replies:
+            self.assertIsNone(why, why)
+            self.assertEqual(out["retract_successor"], kid_id)
+            self.assertEqual(out["reissued"]["id"], kid_id)
+        self.assertEqual(len(meld.seeds(chat.read(room)[0])), 1)
+        mentions = [m for m in chat.read("main")[0]
+                    if str(m.get("text") or "").startswith(prefix)]
+        self.assertEqual(len(mentions), 1)
+        live = self.state(kid_id)
+        self.assertEqual(live["delivery"], "observed")
+        self.assertEqual(live["delivery_ref"], mentions[0]["id"])
+
+        again, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(why, why)
+        self.assertEqual(again["reissued"]["id"], kid_id)
+        self.assertEqual(len(meld.seeds(chat.read(room)[0])), 1)
+        self.assertEqual(len([m for m in chat.read("main")[0]
+                              if str(m.get("text") or "").startswith(prefix)]), 1)
+
+    def test_retry_reconciles_a_posted_notice_before_delivery_was_stamped(self):  # noqa: VACUOUS_ASSERTION — the real notice and seed are positive controls before their nonduplication is asserted
+        row = self.verdicted("fix")
+        real_mark = dispatches._mark_delivered
+        calls = {"n": 0}
+
+        def crash_once(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("fixture crash before delivery stamp")
+            return real_mark(*args, **kwargs)
+
+        with mock.patch.object(dispatches, "_mark_delivered",
+                               side_effect=crash_once):
+            with self.assertRaisesRegex(RuntimeError, "before delivery"):
+                self.retract(row["id"], reissue=True, notify=True)
+            parent = self.state(row["id"])
+            kid = self.state(parent["retract_successor"])
+            room = review_door.pair_room(kid, dispatches.snapshot()[0])[0]
+            prefix = "@%s %s:" % (kid["recipient"], kid["id"][:12])
+            self.assertEqual(len(meld.seeds(chat.read(room)[0])), 1)
+            self.assertEqual(len([m for m in chat.read("main")[0]
+                                  if str(m.get("text") or "").startswith(prefix)]), 1)
+            self.assertEqual(kid["delivery"], "needs-confirmation")
+            out, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(why, why)
+        self.assertEqual(out["reissued"]["delivery"], "observed")
+        self.assertEqual(len(meld.seeds(chat.read(room)[0])), 1)
+        self.assertEqual(len([m for m in chat.read("main")[0]
+                              if str(m.get("text") or "").startswith(prefix)]), 1)
+
+    def test_retry_reconciles_a_notice_that_posted_before_notify_raised(self):  # noqa: VACUOUS_ASSERTION — the real mention and failure receipt are asserted before retry converts that exact row id into delivery evidence
+        row = self.verdicted("fix")
+        real_post = chat.post
+
+        def post_then_raise(text, *args, **kwargs):
+            out = real_post(text, *args, **kwargs)
+            if kwargs.get("room") == "main" and str(text).startswith("@"):
+                raise RuntimeError("fixture transport raised after append")
+            return out
+
+        with mock.patch.object(chat, "post", side_effect=post_then_raise):
+            out, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(why, why)
+        kid = self.state(out["retract_successor"])
+        prefix = "@%s %s:" % (kid["recipient"], kid["id"][:12])
+        mentions = [m for m in chat.read("main")[0]
+                    if str(m.get("text") or "").startswith(prefix)]
+        self.assertEqual(len(mentions), 1)
+        self.assertIsNotNone(dispatches._notify_failed_for(kid["id"]))
+        self.assertEqual(kid["delivery"], "needs-confirmation")
+
+        again, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(why, why)
+        self.assertEqual(again["reissued"]["delivery"], "observed")
+        self.assertEqual(again["reissued"]["delivery_ref"], mentions[0]["id"])
+        self.assertEqual(len([m for m in chat.read("main")[0]
+                              if str(m.get("text") or "").startswith(prefix)]), 1)
+
+    def test_a_keyed_failure_before_append_is_retried_safely(self):  # noqa: VACUOUS_ASSERTION — the first pass's keyed receipt and empty main are positive controls before the retry must append and stamp exactly one mention
+        row = self.verdicted("fix")
+        real_post = chat.post
+        failed = {"once": False}
+
+        def fail_once(text, *args, **kwargs):
+            if kwargs.get("room") == "main" and str(text).startswith("@") \
+                    and not failed["once"]:
+                failed["once"] = True
+                raise OSError("fixture room lock timeout before append")
+            return real_post(text, *args, **kwargs)
+
+        with mock.patch.object(chat, "post", side_effect=fail_once):
+            first, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(why, why)
+        kid_id = first["retract_successor"]
+        receipt = dispatches._notify_failed_for(kid_id)
+        self.assertEqual(receipt.get("chat_event_id"),
+                         "dispatch-handoff:" + kid_id)
+        prefix = "@%s %s:" % (first["reissued"]["recipient"], kid_id[:12])
+        self.assertEqual([m for m in chat.read("main")[0]
+                          if str(m.get("text") or "").startswith(prefix)], [])
+
+        again, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(why, why)
+        mentions = [m for m in chat.read("main")[0]
+                    if str(m.get("text") or "").startswith(prefix)]
+        self.assertEqual(len(mentions), 1)
+        self.assertEqual(again["reissued"]["delivery"], "observed")
+        self.assertEqual(again["reissued"]["delivery_ref"], mentions[0]["id"])
+
+    def test_a_snapshot_fault_receipt_allows_a_later_keyed_handoff(self):  # noqa: VACUOUS_ASSERTION — the typed failure receipt and empty first pass are positive controls before the retry must append and stamp one mention
+        row = self.verdicted("fix")
+        first, why = self.retract(row["id"], reissue=True, notify=False)
+        self.assertIsNone(why, why)
+        kid_id = first["retract_successor"]
+        kid = self.state(kid_id)
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=({}, "fixture snapshot unreadable")):
+            dispatches._finish_reissue(kid, self.REVIEWER, True)
+        receipt = dispatches._notify_failed_for(kid_id)
+        self.assertEqual(receipt.get("chat_event_id"),
+                         "dispatch-handoff:" + kid_id)
+        prefix = "@%s %s:" % (kid["recipient"], kid_id[:12])
+        self.assertEqual([m for m in chat.read("main")[0]
+                          if str(m.get("text") or "").startswith(prefix)], [])
+
+        again, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(why, why)
+        mentions = [m for m in chat.read("main")[0]
+                    if str(m.get("text") or "").startswith(prefix)]
+        self.assertEqual(len(mentions), 1)
+        self.assertEqual(again["reissued"]["delivery"], "observed")
+
+    def test_a_main_read_fault_receipt_allows_a_later_keyed_handoff(self):  # noqa: VACUOUS_ASSERTION — the typed read-fault receipt and empty first pass are positive controls before the retry must append and stamp one mention
+        row = self.verdicted("fix")
+        first, why = self.retract(row["id"], reissue=True, notify=False)
+        self.assertIsNone(why, why)
+        kid_id = first["retract_successor"]
+        kid = self.state(kid_id)
+        with mock.patch.object(dispatches, "_existing_public_notification",
+                               return_value=(None, "fixture main unreadable")):
+            dispatches._finish_reissue(kid, self.REVIEWER, True)
+        receipt = dispatches._notify_failed_for(kid_id)
+        self.assertEqual(receipt.get("chat_event_id"),
+                         "dispatch-handoff:" + kid_id)
+        prefix = "@%s %s:" % (kid["recipient"], kid_id[:12])
+        self.assertEqual([m for m in chat.read("main")[0]
+                          if str(m.get("text") or "").startswith(prefix)], [])
+
+        again, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(why, why)
+        mentions = [m for m in chat.read("main")[0]
+                    if str(m.get("text") or "").startswith(prefix)]
+        self.assertEqual(len(mentions), 1)
+        self.assertEqual(again["reissued"]["delivery"], "observed")
+
+    def test_an_unkeyed_failure_receipt_never_reposts(self):  # noqa: VACUOUS_ASSERTION — the successor and legacy receipt are positive controls; the empty main proves the retry stayed fail-closed rather than guessing whether an old unkeyed mention rotated away
+        row = self.verdicted("fix")
+        first, why = self.retract(row["id"], reissue=True, notify=False)
+        self.assertIsNone(why, why)
+        kid_id = first["retract_successor"]
+        dispatches._record_notify_failed(kid_id, "legacy unkeyed failure")
+        self.assertNotIn("chat_event_id",
+                         dispatches._notify_failed_for(kid_id))
+
+        again, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(why, why)
+        prefix = "@%s %s:" % (again["reissued"]["recipient"], kid_id[:12])
+        self.assertEqual([m for m in chat.read("main")[0]
+                          if str(m.get("text") or "").startswith(prefix)], [])
+        self.assertEqual(again["reissued"]["delivery"], "needs-confirmation")
+
+    def test_two_hand_offs_that_both_read_main_first_post_one_mention(self):
+        # Both calls see no mention on main and no delivery stamp, which is
+        # what two racing retries see; the chat key is all that stays.
+        row = self.verdicted("fix")
+        with mock.patch.object(dispatches, "_existing_public_notification",
+                               return_value=(None, None)), \
+                mock.patch.object(dispatches, "_mark_delivered",
+                                  return_value=(None, "fixture: stamp lost")):
+            first, why = self.retract(row["id"], reissue=True, notify=True)
+            self.assertIsNone(why, why)
+            self.assertTrue(first["verdict_retracted"])
+            again, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(why, why)
+        kid_id = first["retract_successor"]
+        self.assertEqual(again["reissued"]["id"], kid_id)
+        prefix = "@%s %s:" % (first["reissued"]["recipient"], kid_id[:12])
+        self.assertEqual(len([m for m in chat.read("main")[0]
+                              if str(m.get("text") or "").startswith(prefix)]), 1)
+
+    def test_a_retry_over_a_retired_successor_finishes_nothing(self):  # noqa: VACUOUS_ASSERTION — the refusal naming retirement is asserted first; the empty round and main are the contract, and the crash-repair test above is their positive control
+        row = self.verdicted("fix")
+        record = dispatches._record_retract
+
+        def crash_after_record(*args, **kwargs):
+            out, why = record(*args, **kwargs)
+            self.assertIsNone(why, why)
+            raise RuntimeError("fixture crash after durable retraction")
+
+        with mock.patch.object(dispatches, "_record_retract",
+                               side_effect=crash_after_record):
+            with self.assertRaisesRegex(RuntimeError, "after durable"):
+                self.retract(row["id"], reissue=True, notify=True)
+        kid_id = self.state(row["id"])["retract_successor"]
+        kid = self.state(kid_id)
+        room = review_door.pair_room(kid, dispatches.snapshot()[0])[0]
+        prefix = "@%s %s:" % (kid["recipient"], kid_id[:12])
+        real = dispatches.snapshot
+
+        def retired():
+            current, unavailable = real()
+            current = dict(current)
+            current[kid_id] = dict(current[kid_id], retired_admin=True,
+                                   retire_reason="repo-unreadable",
+                                   retire_ts="2026-09-25T00:00:00Z")
+            return current, unavailable
+
+        with mock.patch.object(dispatches, "snapshot", side_effect=retired):
+            out, why = self.retract(row["id"], reissue=True, notify=True)
+        self.assertIsNone(out)
+        self.assertIn("administratively retired", why)
+        self.assertEqual(meld.seeds(chat.read(room)[0]), [])
+        self.assertEqual([m for m in chat.read("main")[0]
+                          if str(m.get("text") or "").startswith(prefix)], [])
 
     def test_a_refused_successor_leaves_no_retraction(self):
         row = self.verdicted("fix")
@@ -344,7 +718,7 @@ class ReissueTest(RetractBase):
         self.assertEqual(len(self.events(row["id"])), before)
         self.assertEqual(self.state(row["id"])["polarity"], "fix")
 
-    def test_a_retraction_that_fails_after_the_mint_disowns_the_successor(self):
+    def test_a_retraction_that_fails_after_the_mint_disowns_the_successor(self):  # noqa: VACUOUS_ASSERTION — minted child count/status control the absent seed; # noqa: ORPHANED_MOCK — helper reaches dispatches.retract beyond the local graph
         row = self.verdicted("fix")
         before = set(dispatches.snapshot()[0])
         with mock.patch.object(dispatches, "_record_retract",
@@ -355,7 +729,10 @@ class ReissueTest(RetractBase):
         minted = set(dispatches.snapshot()[0]) - before
         self.assertEqual(len(minted), 1, "the successor was never minted, so "
                          "this arm proves nothing about its cleanup")
-        self.assertEqual(self.state(minted.pop())["status"], "cancelled")
+        kid = self.state(minted.pop())
+        self.assertEqual(kid["status"], "cancelled")
+        room = review_door.pair_room(kid, dispatches.snapshot()[0])[0]
+        self.assertEqual(meld.seeds(chat.read(room)[0]), [])
         self.assertEqual(self.state(row["id"])["polarity"], "fix")
 
     def test_successor_links_only_a_row_that_supersedes_this_one(self):  # noqa: VACUOUS_ASSERTION — the linking retraction is asserted to succeed and to record the successor

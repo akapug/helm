@@ -26,17 +26,20 @@ $ ./bin/helm gate audits -- <test modules>   # the tree-wide audits plus yours, 
   graph (a doc, a script) every tree-wide audit and the tests that name the
   file. The audits import nothing they judge, so a Python change's selection
   does not reliably include them. The whole suite
-  (`python3 -m unittest discover -s tests`) is the land gate: serial, on the
-  exact tree that lands. In helm's own tree `helm gate run` refuses a whole
+  (`python3 -m unittest discover -s tests`) is the land gate: one whole suite
+  on the exact tree that lands, sliced while the gate canary stands and
+  serial otherwise. In helm's own tree `helm gate run` refuses a whole
   suite in a lane room (`--lane-suite --why TEXT` is the counted escape),
   refuses a second one on a tree that already has a green receipt, and runs a
   red tree again only with `--again`. The full process, and what each receipt
   authorizes: [How a change is tested](CONTRIBUTING.md#how-a-change-is-tested).
-- **Only a serial whole-suite receipt authorizes a land.** A whole suite with
-  no mode flag in a lane-level room (a peek, a seat's home, a harness
-  worktree, or a lane room admitted by `--lane-suite`) runs as parallel slices
-  (receipt v10). It binds a lane tip and a review's APPROVE and never a land;
-  every land road runs serial. A focused receipt (v6) binds a cure-round
+- **A serial whole-suite receipt always authorizes a land; a sliced one (v10)
+  authorizes one only while the gate canary stands.** A whole suite with no
+  mode flag in a lane-level room (a peek, a seat's home, a harness worktree,
+  or a lane room admitted by `--lane-suite`) runs as parallel slices. It
+  binds a lane tip and a review's APPROVE, and a land only while the canary
+  stands; the land gate itself runs sliced under the canary and serial
+  otherwise. A focused receipt (v6) binds a cure-round
   verdict only. `helm gate equiv` and a standalone `helm/gateshard.py` run are
   diagnostic: their results cannot mint or bind landing authority.
 - **Where tests run.** A host with a local-suite guard (the fleet's hub is
@@ -80,7 +83,7 @@ Full text and rationale live in [CONTRIBUTING.md](CONTRIBUTING.md). In one breat
 
 | path | what |
 |---|---|
-| `bin/helm` | the entry script (resolves through symlinks; the whole install is a PATH symlink) |
+| `bin/helm` | the entry script (resolves through symlinks; the whole install is a PATH symlink). A coordination verb (`dispatch`, `chat`, `work`, …) runs trunk helm from any tree; `HELM_LANE_COORDINATION=1` runs this tree's own ([ENVIRONMENT](docs/ENVIRONMENT.md#which-helm-runs)) |
 | `helm/` | the package — `cli.py` is the lazy dispatcher, per-verb modules beside it; `inject/`, `store/`, `work/`, chat, seats, `vcs.py`, … |
 | `tests/` | the `unittest` suite |
 | `docs/` | [VERBS.md](docs/VERBS.md) is the authoritative verb reference; plus ARCHITECTURE · CONCEPTS · ENVIRONMENT · HOOKS · WEB · ATTESTATION · EVOLUTION |
@@ -88,10 +91,21 @@ Full text and rationale live in [CONTRIBUTING.md](CONTRIBUTING.md). In one breat
 
 ## Working style
 
+- **Friction is a tax, and a cut that pays back fast goes first.** A step
+  repeated by hand, a workaround of a hook or guard, a wait, a re-read or a
+  false refusal is paid again by every later task that meets it. Name it when
+  you meet it, and put its size on the task: steps (or minutes) times how
+  often it happens per day, counted, never guessed (`helm friction` counts
+  guard refusals; the chat and transcripts show the rest, counted from a
+  bounded sample or through `fab`, never a scan of every transcript on the
+  shared machine). A fix that removes
+  it is a tax cut. One that pays back its build cost within about two days
+  goes ahead of new features; report the tax it removed when it lands
+  ([Choosing what to work on](CONTRIBUTING.md#choosing-what-to-work-on)).
 - **Small diffs; match the surrounding idiom** and comment density. Read the
   neighbours before you write — code here should read as if one hand wrote it.
 - **Adding a verb**: a `cmd_<name>` module, registered in `cli.py`'s `VERBS`
-  via `_lazy`, a `_VERB_HELP` one-liner, an entry in
+  via `_lazy`, a `_VERB_HELP` entry in `helm/cli_help.py`, an entry in
   [docs/VERBS.md](docs/VERBS.md), and a test. The dispatcher help and VERBS.md
   must never disagree — a verb without a doc entry is a bug this repo learned by
   audit.
@@ -106,6 +120,13 @@ Full text and rationale live in [CONTRIBUTING.md](CONTRIBUTING.md). In one breat
   public quality at all times; the pre-commit guard enforces the staged set
   and the devops skill carries the scrub ladder for anything already in
   history.
+- **Releasing** is one command, a dry run unless you pass `--publish`:
+  `python3 scripts/release/release.py <version>`. It fast-forwards the public
+  main by one commit (the trunk tree minus `scripts/release/omit.txt`), tags
+  it and creates the GitHub release. Its reports under the work directory
+  (`~/.helm/releases/<version>/` by default) are for the owner to read before
+  `--publish`; they hold private values, so never commit or paste them. See
+  CONTRIBUTING.md, "Releasing".
 
 ## If you are a seat in a helm fleet
 
@@ -120,22 +141,35 @@ You additionally have the coordination physics, and they are not optional:
   every family can plan, implement, and review. Keep detailed exchanges in that
   task's meld and send only decisions, blockers, and artifact pointers to the
   fleet room.
-- **The cross-family review gate** — the load-bearing rule: the author's model
-  family may not be the reviewer's. A blind spot is a property of a shared
-  frame, so a different family catches what same-family review nods through.
-  Every family is an equal counterpart here, including when a Claude seat holds
-  the integrator chair.
-- **A reviewer of either family PATCHES what it finds** — a MECHANICAL defect
-  is cured by whoever found it: commit it in your own worktree on a branch off
-  the exact tip you reviewed, do not push, and name the tip on the verdict
-  (`helm dispatch verdict <id> <tip> --fix --patch-tip <sha>`). The lane owner
-  or integrator rebases the lane onto that tip or cherry-picks it. A DESIGN
-  finding goes to a meld instead, because a design disagreement settled by one
-  side's patch is the disagreement unrecorded.
+- **The independent review gate** — the load-bearing rule: a review counts
+  when the reader is a different seat on a fresh session that holds none of
+  the author's working context (a fresh-context subagent or Workflow run
+  counts as its own reader, the author's own included, when it began after
+  the tip was committed and wrote none of the lane; a run that built the
+  lane never counts). A blind spot is a property of a shared frame, so a different model,
+  and a different model family, are preferred and rank readers first, but
+  neither is required. Every family is an equal counterpart here, including
+  when a Claude seat holds the integrator chair.
+- **A reviewer of either family fixes what it finds in the row's REVIEW FIX
+  MODE.** For a MECHANICAL defect, PATCH commits off the exact reviewed tip in
+  their own room or a `git clone --shared` clone whose commit is fetched into
+  the repo (skill reviewer-implements-own-findings, step 3; never `git
+  worktree add` or a branch in the shared checkout), does not push, and names
+  that tip with `--fix --patch-tip <sha>`; the lane owner or integrator adopts
+  it. MELD-DIFF posts the exact fix as a diff in the pair meld and records
+  `--fix --diff-handoff ROOM/MSGID --no-patch-because <reason>` without a
+  reviewer patch tip. The typed, validated message receipt (not the reason
+  prose) and send/add proof that the first advancing direct child actually
+  applies that diff let it count as cure confirmation rather than a new round
+  or T1 design nudge. An unrelated direct child remains an ordinary round. A missing or invalid receipt, including on historical FIXes,
+  proves no cure: `--no-patch-because` alone remains an ordinary round and T1
+  design nudge. A DESIGN finding goes to a meld instead: one side's patch
+  cannot settle a disagreement.
 - **A lane may carry several authors** — the ledger records each, and
-  `helm lr close --reason landed` credits every one the chain names. What keeps
-  the families independent is that the COMPOSED TIP is re-read once by a reader
-  who wrote none of it, before the land gate — never a rule that one family may
+  `helm lr close --reason landed` credits every one the chain names. Agreement
+  on a mechanical cure suffices for a reversible lane; a SAFETY DOOR or
+  non-mechanical cure owes one re-read of the COMPOSED TIP by a reader who
+  wrote none of it before the land gate — never a rule that one family may
   only look.
 - **READY means an OUTSIDER approved the final tip** — and helm checks it. A
   chain contributor is any seat the ledger records as an author on any round of
@@ -160,16 +194,36 @@ You additionally have the coordination physics, and they are not optional:
   lands. A CONCUR is not a way around it: it endorses and authorizes nothing.
 - **Agree on the exact composed tip before shipping** — both counterparts must
   agree that no further patch is needed. Record any remaining disagreement in
-  the task meld. Consensus does not replace independent composed-tip review,
-  changed-surface checks, or the canonical land gate; a later patch requires
-  renewed agreement and review of its affected surfaces. The integrator ships
-  after those obligations and the existing release authority requirements hold.
+  the task meld. A SAFETY DOOR or non-mechanical cure still owes independent
+  composed-tip review; every lane owes changed-surface checks and the canonical
+  land gate. A later patch requires renewed agreement and review of its
+  affected surfaces. The integrator ships after those obligations and the
+  existing release authority requirements hold.
 - **Reviewed SHAs are immutable** — fix on top with a new commit; never amend
   or rebase a SHA that was posted for review. That holds for a reviewer's own
   cure too: it is a new commit off the reviewed tip, never a rewrite of it.
 - **The store is the shared memory** — `helm store resolve "<the symptom in
   your own words>"` before treating any failure as novel; `/learn` captures a
   lesson so it fires for the next agent instead of being relearned.
+
+### How a helm team is shaped
+
+This is the shape helm's own fleet runs by. No code enforces it; the verbs
+below assume it. Name the seats as you like, but keep the separations.
+
+- **One front door for the owner, separate from the integrator.** The owner
+  talks to one seat that answers for the whole fleet. It routes, summarizes
+  and asks; it builds and lands nothing, so the owner's questions never wait
+  behind a land.
+- **One integrator per project.** It lands reviewed work onto trunk (with
+  `helm train auto` doing the mechanics), keeps trunk green and owns the
+  release.
+- **Each project lead answers the owner for its project.** A lead is the
+  owner's direct line for that codebase; the front door does not relay it.
+- **One written home for each kind of knowledge.** Rules and lessons live in
+  the store (`helm store`), work lives in tasks (`helm task`), and where a
+  seat left off lives in its handoff (`helm handoff`). A fact written in two
+  homes drifts; one written in none is relearned.
 
 The full first-10-minutes walkthrough is
 [docs/NEW_AGENT_GUIDE.md](docs/NEW_AGENT_GUIDE.md).

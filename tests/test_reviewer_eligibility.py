@@ -77,13 +77,24 @@ def _families(**answers):
     return lambda seat: answers.get(seat, ({"family-x"}, None))
 
 
+def _models(**answers):
+    """seat -> resolved model; `model-x` is a model no rung classifies."""
+    return lambda seat: answers.get(seat, "model-x")
+
+
+def _contexts(**answers):
+    """seat -> context percent; 10 is cool under any threshold."""
+    return lambda seat: answers.get(seat, 10.0)
+
+
 def _seams(**over):
     base = {"get": _get(ROW), "project_for_cwd": lambda _cwd: "proj",
             "register": lambda: _register("seat-a", "seat-b"),
             "join": _join(), "chain_contributors": lambda lr: (set(), (), None),
             "cached_flags": lambda: ({}, None),
             "approval_tier": _tier(), "identity_families": _families(),
-            "liveness": _liveness()}
+            "liveness": _liveness(), "runtime_model": _models(),
+            "context": _contexts()}
     base.update(over)
     return base
 
@@ -184,6 +195,27 @@ class ChainConjunct(unittest.TestCase):
         row = _by_seat(report, "seat-b")
         self.assertEqual(row["conjunct"], re_.CHAIN)
         self.assertIn("seat-b", row["reason"])
+
+    def test_a_sender_that_only_asked_for_the_read_is_eligible(self):
+        """The contributor join is the authority: where it names a builder,
+        the row sender may be only the dispatcher or relay that asked for the
+        read and is therefore independent. With no joined writer, the same
+        sender remains the conservative row-local author."""
+        register = lambda: _register("seat-a", "seat-author", "seat-builder")
+        report, err = re_.eligibility("row-1", seams=_seams(
+            register=register,
+            chain_contributors=lambda lr: ({"seat-builder"}, (), None)))
+        self.assertIsNone(err)
+        self.assertIn("seat-author", report["eligible"])
+        self.assertEqual(_by_seat(report, "seat-builder")["conjunct"],
+                         re_.CHAIN)
+
+        report, err = re_.eligibility("row-1", seams=_seams(
+            register=register,
+            chain_contributors=lambda lr: (set(), (), None)))
+        self.assertIsNone(err)
+        self.assertEqual(_by_seat(report, "seat-author")["conjunct"],
+                         re_.CHAIN)
 
     def test_an_unreadable_chain_never_becomes_an_empty_author_set(self):
         """An empty set says "nobody wrote this chain", which would make every
@@ -395,6 +427,76 @@ class BudgetConjunct(unittest.TestCase):
         self.assertIn(re_.BUDGET, conjuncts)
 
 
+class CertifiedLocalBudgetIsNotMeasured(unittest.TestCase):
+    """A certified local family reads GREEN on the burn flags, and that GREEN
+    is an attestation by the seat that runs the hardware, never a
+    measurement: the budget conjunct answers UNKNOWN for it, exactly as for
+    the GREY it replaces, so its seat never lists as every conjunct MEASURED.
+
+    THE FLAG IS THE ONE PRODUCTION WRITES: the producer certifies, the posting
+    pass folds and writes the snapshot, and the rung reads it back through
+    `burnflags.cached_flags`."""
+
+    def setUp(self):
+        import os
+        import shutil
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-re-local-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        envp = unittest.mock.patch.dict(
+            os.environ, {"HELM_HOME": os.path.join(self.tmp, "helm"),
+                         "HELM_CACHE_DIR": os.path.join(self.tmp, "cache")})
+        envp.start()
+        self.addCleanup(envp.stop)
+        # seat-a is the OPERATOR SEAT of every local family, named by this
+        # host's local names as production reads them, and SID is its session
+        # on the roster: the one certifier the fold honours
+        from helm import home, localnames
+        from tests._tmphome import corroborate
+        os.makedirs(home.global_dir(), exist_ok=True)
+        with open(os.path.join(home.global_dir(), localnames.CONFIG), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"local-operator-seat": "seat-a"}, fh)
+        localnames._cache["stat"] = None
+        self.addCleanup(corroborate("seat-a", self.SID))
+
+    #: seat-a's harness session, in the shape the harness mints one
+    SID = "4e71e700-0000-4000-8000-000000000001"
+
+    def test_a_certified_green_is_unknown_on_budget_and_never_measured(self):  # noqa: VACUOUS_ASSERTION — seat-a on the same report is asserted measured all the way through
+        from helm import burnflags, proxywatch
+        family = "qwenlocal"  # noqa: SEAT_NAME — a catalog FAMILY key, the local family this arm is about
+        ok, err = burnflags.certify_local(family, 8200, by="seat-a",
+                                          session=self.SID, now=940)
+        self.assertTrue(ok, err)
+        report = {"ts": 1000, "seats": [], "upstream": {},
+                  "proxy_runtime": {}}
+        with unittest.mock.patch.object(burnflags, "usage_history",
+                                        return_value=[]):
+            self.assertIsNotNone(proxywatch._burn_flags_pass(report))
+
+        def cached():
+            return burnflags.cached_flags(now=1000)
+        flag = cached()[0][family]
+        self.assertEqual((flag["colour"], flag["money_provenance"]),
+                         (burnflags.GREEN, burnflags.CERTIFIED_LOCAL))
+        got, err = re_.eligibility("row-1", seams=_seams(
+            join=_join(**{"seat-b": {"family": family}}),
+            identity_families=_families(**{"seat-b": ({family}, None)}),
+            cached_flags=cached))
+        self.assertIsNone(err)
+        # A LOCAL MODEL READS AS INPUT (landing refactor item 5): the seat
+        # lists under INPUT before its budget is asked, and never approves.
+        # The budget rung still answers the certification as UNKNOWN.
+        self.assertEqual(_by_seat(got, "seat-b")["state"], re_.INPUT_ONLY)
+        self.assertNotIn("seat-b", got["measured_eligible"])
+        state, why = re_._rung_budget("seat-b", family, cached()[0], None)
+        self.assertEqual(state, "unknown")
+        self.assertIn("CERTIFIED", why)
+        # CONTROL: seat-a on the same report is measured all the way through
+        self.assertIn("seat-a", got["measured_eligible"])
+
+
 class PaneAndIdleConjuncts(unittest.TestCase):
     def test_a_mid_turn_seat_is_excluded_as_BUSY_not_as_broken(self):
         """The reader has to tell WAIT from REPAIR. A busy seat needs nothing
@@ -561,6 +663,111 @@ class LadderOrderAndScope(unittest.TestCase):
         row = _by_seat(report, "seat-b")
         self.assertEqual(row["family"], "codex")
         self.assertEqual(row["conjunct"], re_.BUDGET)
+
+
+class NoLaneWaitsWhileAQualifiedReaderIsIdle(unittest.TestCase):
+    """Landing refactor item 5. The queue a seat already holds leads the
+    rank, context pressure follows, and the pane only then: tonight one
+    reader held seven door-read rows while qualified readers sat idle.
+    Input-only models never approve, and recorded chain authors never read."""
+
+    def test_H2_a_LIVE_seat_holding_nothing_outranks_an_IDLE_one_holding_7(self):
+        live = _liveness(**{"seat-b": "LIVE"})
+        report, err = re_.eligibility("row-1", seams=_seams(
+            join=_join(**{"seat-a": {"holding": 7}}), liveness=live))
+        self.assertIsNone(err)
+        self.assertEqual(report["eligible"], ["seat-b", "seat-a"])
+        # CONTROL: at equal queues the IDLE pane leads again
+        report, err = re_.eligibility("row-1", seams=_seams(join=_join(
+            **{"seat-a": {"holding": 7}, "seat-b": {"holding": 7}}),
+            liveness=live))
+        self.assertEqual(report["eligible"], ["seat-a", "seat-b"])
+
+    def test_M8_an_unreadable_holding_or_context_is_a_middle_bucket(self):
+        """Never 0: an unread count sorts behind a measured 0 or 1 and ahead
+        of a measured pile, and it is never an idle reader."""
+        from helm import autocompact
+        reg = _register("seat-a", "seat-b", "seat-c")
+        report, err = re_.eligibility("row-1", seams=_seams(
+            register=lambda: reg, join=_join(
+                **{"seat-a": {"holding": None}, "seat-c": {"holding": 3}})))
+        self.assertIsNone(err)
+        self.assertEqual(report["eligible"], ["seat-b", "seat-a", "seat-c"])
+        self.assertEqual(re_.idle_readers("row-1", report=report),
+                         (["seat-b"], None))
+        hot = autocompact.threshold_pct()
+        report, err = re_.eligibility("row-1", seams=_seams(
+            register=lambda: reg,
+            context=_contexts(**{"seat-a": hot, "seat-b": None})))
+        self.assertEqual(report["eligible"], ["seat-c", "seat-b", "seat-a"])
+        # CONTROL: one point under the threshold is cool, and names decide
+        report, err = re_.eligibility("row-1", seams=_seams(
+            register=lambda: reg, context=_contexts(**{"seat-a": hot - 1})))
+        self.assertEqual(report["eligible"], ["seat-a", "seat-b", "seat-c"])
+
+    def test_M1_chain_authors_never_rank_while_a_relay_sender_does(self):
+        seams = _seams(register=lambda: _register(
+            "seat-a", "seat-b", "seat-author", "seat-chain"),
+            chain_contributors=lambda lr: ({"seat-chain"}, (), None))
+        report, err = re_.eligibility("row-1", seams=seams)
+        self.assertIsNone(err)
+        self.assertEqual(report["eligible"],
+                         ["seat-a", "seat-author", "seat-b"])
+        self.assertEqual(_by_seat(report, "seat-chain")["conjunct"], re_.CHAIN)
+        self.assertEqual(re_.idle_readers("row-1", seams=seams),
+                         (["seat-a", "seat-author", "seat-b"], None))
+
+    def test_M2_input_only_models_list_under_INPUT_and_never_approve(self):
+        seams = _seams(register=lambda: _register(
+            "seat-a", "seat-b", "seat-c", "seat-d"), runtime_model=_models(**{
+                "seat-a": "gpt-6-astra", "seat-b": "gemini-3.8-flash-high",
+                "seat-c": "gpt-5.3-codex-spark",
+                "seat-d": "qwen27"}))  # noqa: SEAT_NAME — a local model id, the subject
+        report, err = re_.eligibility("row-1", seams=seams)
+        self.assertIsNone(err)
+        self.assertEqual(report["eligible"], ["seat-a"])     # must-hit control
+        for name in ("seat-b", "seat-c", "seat-d"):
+            row = _by_seat(report, name)
+            self.assertEqual((row["state"], row["conjunct"]),
+                             (re_.INPUT_ONLY, re_.INPUT))
+        self.assertEqual(re_.idle_readers("row-1", report=report),
+                         (["seat-a"], None))
+        text = "\n".join(re_.render(report))
+        self.assertIn("INPUT (3)", text)
+        self.assertIn("seat-c", text)
+
+    def test_M9_sonnet_and_haiku_never_approve_and_list_under_INPUT(self):
+        """Owner: "Sonnet and Haiku never review anything"."""
+        report, err = re_.eligibility("row-1", seams=_seams(
+            register=lambda: _register("seat-a", "seat-b", "seat-c"),
+            runtime_model=_models(**{"seat-a": "claude-opus-5-5",
+                                     "seat-b": "claude-sonnet-5",
+                                     "seat-c": "claude-haiku-4-5"})))
+        self.assertIsNone(err)
+        self.assertEqual(report["eligible"], ["seat-a"])     # control: Opus
+        self.assertEqual(report["input"], ["seat-b", "seat-c"])
+        self.assertEqual(re_.idle_readers("row-1", report=report),
+                         (["seat-a"], None))
+
+    def test_an_unreadable_model_is_a_caveat_never_an_exclusion(self):
+        report, err = re_.eligibility("row-1", seams=_seams(
+            runtime_model=_models(**{"seat-b": None}),
+            join=_join(**{"seat-b": {"family": "codex"}})))
+        self.assertIsNone(err)
+        self.assertEqual(report["eligible"], ["seat-a", "seat-b"])
+        self.assertIn("UNREADABLE", dict(_by_seat(report, "seat-b")["notes"])
+                      .get(re_.INPUT, ""))
+        self.assertEqual(dict(_by_seat(report, "seat-a")["notes"]), {})
+
+    def test_M4_with_every_reader_piled_the_least_loaded_is_named(self):
+        report, err = re_.eligibility("row-1", seams=_seams(join=_join(
+            **{"seat-a": {"holding": 5}, "seat-b": {"holding": 2}})))
+        self.assertIsNone(err)
+        self.assertEqual(report["eligible"], ["seat-b", "seat-a"])
+        self.assertEqual(re_.idle_readers("row-1", report=report), ([], None))
+        text = "\n".join(re_.render(report))
+        self.assertIn("NOBODY IDLE", text)
+        self.assertIn("least-loaded is seat-b", text)
 
 
 class TheVerb(unittest.TestCase):
@@ -774,5 +981,109 @@ class AntigravityGroupSeatsAreFindingsOnlyTest(unittest.TestCase):
             self.assertIn("findings", why)
 
 
+class LocalFamiliesAreFindingsOnlyTest(unittest.TestCase):
+    """The two LOCAL families can READ but cannot CLOSE. docs/VERBS.md says
+    this of each of them, and this arm is the measurement behind it.
+
+    The policy is derived from the shipped tier, the same way the antigravity
+    arm above derives it. That class is not subclassed, because a subclass
+    would run its arms a second time under this name."""
+
+    def _state(self, family):
+        from helm import route, verdict_tier
+        policy = {"id": "tier-under-test", "class": "certain",
+                  "_policy_confidence_valid": True,
+                  "_policy_source_valid": True,
+                  "policy_kind": "approval-tier",
+                  "policy_reason": "independent final approval",
+                  "policy_members": ["family:%s" % f
+                                     for f in route.APPROVAL_TIER]}
+        return verdict_tier.evaluate(policy, "seat-a", {family})
+
+    def test_an_approve_from_either_local_family_is_recorded_outside(self):
+        """TWO CONTROLS. A tier family's approve IS authorizing under this
+        policy, so "outside" below is about the families. And each family
+        is a real catalog key, because an unknown family ALSO resolves
+        outside, which would make a misspelling pass here."""
+        from helm import route, seat
+        self.assertEqual(self._state(route.APPROVAL_TIER[0]), ("ok", None))
+        for family in ("qwen27", "qwenlocal", "bonsai"):  # noqa: SEAT_NAME — catalog FAMILY keys, and which families are outside the tier IS this arm's subject
+            self.assertIn(family, seat.FAMILIES)
+            state, why = self._state(family)
+            self.assertEqual(state, "outside", family)
+            self.assertIn("outside the recorded approval tier", why or "")
+
+
+class ReadModelMomentTest(unittest.TestCase):
+    """`read_model` carries a RECORDED read's moment to the model resolver
+    (task/3508): a hold or a verdict is judged on the model in force when it
+    was recorded, never the seat's newest turn. Routing asks with no moment,
+    and a seam that takes the seat alone still serves it."""
+
+    def test_a_recorded_moment_reaches_the_resolver(self):
+        asked = []
+
+        def resolver(seat, at=None):
+            asked.append((seat, at))
+            return "claude-sonnet-5" if at else "claude-opus-5-5"
+
+        self.assertEqual(re_.read_model("seat-a", resolver,
+                                        at="2026-09-28T06:55:00Z"),
+                         "claude-sonnet-5")
+        self.assertEqual(re_.read_model("seat-a", resolver),
+                         "claude-opus-5-5")
+        self.assertEqual(asked, [("seat-a", "2026-09-28T06:55:00Z"),
+                                 ("seat-a", None)])
+        # A one-argument seam (every routing caller's) is asked as before.
+        self.assertEqual(re_.read_model("seat-a", lambda seat: "model-x"),
+                         "model-x")
+
+    def test_the_default_resolver_is_asked_with_the_moment(self):
+        asked = []
+
+        def resolver(seat, at=None):
+            asked.append((seat, at))
+            return "claude-opus-5-5"
+
+        with unittest.mock.patch.object(dispatches, "_runtime_model",
+                                        resolver):
+            self.assertEqual(re_.read_model("seat-a", at=1790500000.0),
+                             "claude-opus-5-5")
+        self.assertEqual(asked, [("seat-a", 1790500000.0)])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnUnprovenWindowIsUnknownContext(unittest.TestCase):
+    """task/3534: a percentage of an ASSUMED window is not a context reading.
+    The seat's context is UNKNOWN, it takes the unknown middle bucket
+    (neither the cool rank nor the hot one), and the seat's line says why."""
+
+    def test_read_context_answers_window_unproven(self):
+        with unittest.mock.patch("helm.autocompact.read", return_value={
+                "status": "window-unproven", "pct": 85.0}):
+            self.assertEqual(re_.read_context("seat-a"), "window unproven")
+        # CONTROL: a declared window's measured row answers its percentage
+        with unittest.mock.patch("helm.autocompact.read", return_value={
+                "status": "ok", "pct": 85.0}):
+            self.assertEqual(re_.read_context("seat-a"), 85.0)
+
+    def test_the_ranking_treats_it_as_unknown_and_says_so(self):
+        hot = 95.0
+        report, err = re_.eligibility("row-1", seams=_seams(
+            register=lambda: _register("seat-a", "seat-b", "seat-c"),
+            context=_contexts(**{"seat-a": hot, "seat-b": "window unproven",
+                                 "seat-c": 10.0})))
+        self.assertIsNone(err)
+        # cool first, the unknown one in the middle, the hot one last
+        self.assertEqual(report["eligible"], ["seat-c", "seat-b", "seat-a"])
+        row = _by_seat(report, "seat-b")
+        self.assertIsNone(row["context_pct"])
+        self.assertEqual(row["context_unknown"], "window unproven")
+        line = next(ln for ln in re_.render(report) if "seat-b" in ln)
+        self.assertIn("ctx=UNKNOWN (window unproven)", line)
+        # CONTROL on the same render: a measured seat prints its percentage
+        line = next(ln for ln in re_.render(report) if "seat-c" in ln)
+        self.assertIn("ctx=10%", line)

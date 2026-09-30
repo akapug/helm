@@ -13,13 +13,18 @@ dregg-cave.service) — the no-daemons law stays intact. Data-dir lives on
 tmpfs (/dev/shm/helm-chat-node): messages exist only in RAM.
 
 Provisioning contract (probed live against the binary, 2026-07-19):
-  - a fresh node boots LOCKED and UNHEALTHY (no blocks yet);
+  - a fresh node boots LOCKED. The fee-loop build also boots UNHEALTHY (no
+    blocks yet); the rebased build answers /status healthy:true while still
+    locked, so HEALTHY NEVER MEANS PROVISIONED — the
+    lock is read from GET /api/node/identity's `unlocked` (lock_state);
   - POST /api/cipherclerk/unlock {"passphrase"} — first unlock SETS the
-    passphrase, unlocks /turns/submit, returns the bearer token;
+    passphrase, unlocks /turns/submit, returns the bearer token. A locked
+    node refuses /turns/submit with a bare 403 before executing anything;
   - one faucet turn (POST /api/faucet) commits the first block -> healthy,
     which the client binary's health gate demands;
   - the bearer token goes stale on reboot (tmpfs dies); chat's send path
-    re-unlocks with the STORED passphrase (see chat._revive).
+    re-unlocks with the STORED passphrase (see chat._revive) when a join
+    fails or /turns/submit answers 401/403.
 
 State: <helm-home>/_global/.state/chat-node.json (0600) {url, passphrase,
 token, binary} — provisioning config written at `node up` time (binary is
@@ -54,6 +59,11 @@ GOSSIP_PORT = 18898
 # is sized for the slow build, and it costs a failing fast one nothing: the
 # wait ends the moment the unit's process exits (wait_boot), so a refusal is
 # still reported within seconds, never after the full wait.
+# THE CLOCK STARTS WHEN THE NODE PROCESS DOES. The genesis mint or successor
+# ceremony runs before it, in the unit's prepare step (ExecStartPre), and on a
+# laptop the ceremony plus the boot takes ~673 s: a wall-clock 600 s runs out
+# before provision(). wait_boot does not count time in the prepare step;
+# systemd's TimeoutStartSec (START_TIMEOUT_S) is that step's bound.
 HEALTH_WAIT_S = 600
 BOOT_WAIT_ENV = "CHAT_NODE_BOOT_WAIT_S"   # HELM_ (or MELD_) prefixed
 BOOT_TICK_S = 30                          # one progress line per tick
@@ -616,7 +626,8 @@ def mints_genesis(binary):
     cannot answer: a fee-loop build then keeps its genesis-less identity."""
     try:
         p = subprocess.run([binary, "genesis", "--help"], capture_output=True,
-                           text=True, timeout=PROBE_TIMEOUT_S)
+                           encoding="utf-8", errors="replace",
+                           timeout=PROBE_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return p.returncode == 0 and "--reuse-validator-keys-from" in p.stdout
@@ -625,8 +636,8 @@ def mints_genesis(binary):
 def _run_mint(argv):
     """(ok, reason) for one mint subprocess (init or the ceremony)."""
     try:
-        p = subprocess.run(argv, capture_output=True, text=True,
-                           timeout=MINT_TIMEOUT_S)
+        p = subprocess.run(argv, capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=MINT_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, "%s failed: %s" % (argv[1], e)
     if p.returncode != 0:
@@ -983,7 +994,8 @@ def _prepare_locked(data_dir, binary):
 
 
 def unit_path():
-    return os.path.join(os.path.expanduser("~"), ".config", "systemd", "user", UNIT)
+    from . import timerhealth
+    return os.path.join(timerhealth.user_unit_dir(), UNIT)
 
 
 # WHERE THE MACHINE DECLARES ITS CONSENSUS POSTURE, and not knowing about it is
@@ -999,112 +1011,381 @@ def unit_path():
 # operator, and it carried no Environment= lines at all, so it hit the gate and
 # restart-looped while helm reported a timeout.
 #
-# So: MIRROR the operator's existing declaration, never mint one. If they have
-# declared nothing, we write nothing and dregg's refusal stands — helm must not
-# be the layer that quietly opts a node out of verification. This module's
-# docstring already claimed "precedent: the team node's dregg-cave.service"; it
-# mirrored the unit and missed the drop-in, which is where the precedent lived.
+# So: MIRROR the operator's existing declaration, never mint one. If the team
+# node runs without it, we write each loosening flag EMPTY and dregg's refusal
+# stands — helm must not be the layer that quietly opts a node out of
+# verification, and writing nothing would let our node inherit a bypass the
+# user manager exports. This module's docstring already claimed "precedent:
+# the team node's dregg-cave.service"; it mirrored the unit and missed the
+# drop-in, which is where the precedent lived. The mirror reads that
+# declaration from the running team node's own environment, never from unit
+# text (running_posture, task/3432).
 PEER_UNIT = "dregg-cave.service"
 
 
 def _dropin_dir(unit):
-    return os.path.join(os.path.expanduser("~"), ".config", "systemd", "user",
-                        unit + ".d")
+    from . import timerhealth
+    return os.path.join(timerhealth.user_unit_dir(), unit + ".d")
 
 
-def declared_posture(unit=PEER_UNIT):
-    """[(source_path, "DREGG_X=1")] — DREGG_* Environment= lines the operator
-    declared for `unit`, read from its systemd drop-ins.
+# THE PEER'S POSTURE IS WHAT ITS RUNNING MAIN PROCESS WAS STARTED WITH
+# (task/3432 round 2), read from the kernel, never rebuilt from its unit.
+# Every earlier reader rebuilt the peer's environment from what systemd
+# reports about the unit: drop-in text (shlex, then a copy of systemd's
+# grammar), its Environment= as `systemctl show` computed it (task/3423),
+# then its EnvironmentFile= and PAMName= too. Each rebuild missed a source
+# systemd applies when it starts the unit, and a codex gap check found more
+# (a newline in an env file's path, a file changed after the read, an
+# ExecStart= wrapper). The one account of what the peer runs with is its
+# main process's environment, /proc/<pid>/environ. So the mirror asks
+# systemd two things, through timerhealth's runner in the user manager both
+# units run under: whether it loaded the unit, and its main PID. The
+# properties print in systemd's GetAll order, not the order of the -p words
+# (measured, 259: LoadState before MainPID); MainPID is 0 when the unit is
+# not running.
+POSTURE_PROPS = ("LoadState", "MainPID")
+POSTURE_SOURCE = "the running %s (its main process's environment)"
+# Where the kernel shows a process: its environ and its control group. A
+# name, so an arm can plant a /proc of its own.
+PROC = "/proc"
+# THE OPERATOR'S POSTURE IS MIRRORED, AND NOTHING ELSE (task/3423). The
+# filter was the DREGG_ prefix, and dregg names its secrets that way too
+# (DREGG_ADMIN_TOKEN, DREGG_PG_DSN, DREGG_ROOT_KEY and more), so a peer's
+# token mirrored into a second file on disk. These are the flags dregg's own
+# startup gates read, in emberian/dregg's source: the boot refusal's escape
+# hatch (node/src/lib.rs:2218), the unaudited-PQ bypass
+# (dregg-pq/src/audit.rs:98, read at :111), and the switch that revokes that
+# bypass (dregg-pq/src/audit.rs:104, read at :126, applied at :166-171).
+#
+# THE TWO THAT LOOSEN ARE WRITTEN ON EVERY `up` (task/3432 round 2). Our
+# unit inherits the user manager's environment (systemd.exec(5): the
+# manager's own environment comes first, and Environment= overrides it), so
+# a mirror that wrote nothing let a DREGG_ALLOW_UNAUDITED_PQ=1 the manager
+# exports reach our node while the peer ran without it. Each is written as
+# the value the running peer has, else EMPTY, which each of dregg's gates
+# that reads it takes as refusal: the escape hatch is on only for 1, true,
+# TRUE, on or ON (node/src/lib.rs:4048, node/src/blocklace_sync.rs:3895), the
+# PQ bypass only for "1" (dregg-pq/src/audit.rs:111). DREGG_REQUIRE_LEAN only
+# tightens (audit.rs:123-128, blocklace_sync.rs:3940), so it is written when
+# the peer runs with it and never blanked: one the manager exports still
+# reaches our node. One set, read by the reader and the writer.
+LOOSENING = ("DREGG_ALLOW_UNVERIFIED_CONSENSUS", "DREGG_ALLOW_UNAUDITED_PQ")
+TIGHTENING = ("DREGG_REQUIRE_LEAN",)
+POSTURE_NAMES = frozenset(LOOSENING + TIGHTENING)
+# WHY NOTHING WAS PROVEN, in fixed words: the reader echoes nothing systemctl
+# printed or the peer's environment holds, so neither can put its own text
+# in `up`'s output.
+POSTURE_WHY = {
+    "unrun": "systemctl could not be run",
+    "refused": "systemctl show exited non-zero",
+    "unparsed": "systemctl show printed what this reader cannot parse",
+    "absent": "systemd has no unit by that name",
+    "unloaded": "systemd did not load it (its LoadState is not `loaded`)",
+    "stopped": "it is not running (systemd names no main process, or the "
+               "one it named has exited)",
+    "stranger": "the process systemd names as its main process is not shown "
+                "to be it (not this user's, or not in its control group)",
+    "unreadable": "its main process's environment cannot be read here",
+    "twice": "its main process's environment sets a posture flag twice",
+    "unwritable": "a posture flag's value holds a control character or "
+                  "bytes that are not UTF-8, which no Environment= line helm "
+                  "writes carries exactly",
+}
 
-    Only DREGG_-prefixed names are mirrored. A drop-in can hold anything, and
-    copying arbitrary Environment= lines into a second unit would propagate
-    unrelated (possibly secret-bearing) values into another file on disk. The
-    consensus posture flags are what gate startup, so they are what we carry.
 
-    PARSED PER ASSIGNMENT, NOT PER LINE, and the first version got this wrong in
-    a way a live run reproduced. systemd's Environment= takes N whitespace-
-    separated, optionally-quoted assignments on ONE line, so
+def _posture(assignment):
+    """Whether `assignment`, NAME=value or a bare NAME, names a posture
+    flag (POSTURE_NAMES)."""
+    return assignment.partition("=")[0] in POSTURE_NAMES
 
-        Environment=DREGG_ALLOW_UNVERIFIED_CONSENSUS=1 AWS_SECRET_ACCESS_KEY=x
 
-    is two assignments. Checking `whole_string.startswith("DREGG_")` accepted
-    that line and mirrored it WHOLE — writing the secret into a second 0600 file
-    on disk, which is precisely the leak the filter exists to prevent. A filter
-    that validates the first token of an N-token grammar is not a filter. shlex
-    gives the same quote-aware splitting systemd does.
-    """
-    import shlex
-    found = []
-    d = _dropin_dir(unit)
+def _of_unit(cgroup, unit):
+    """Whether `cgroup`, the bytes of /proc/<pid>/cgroup, puts the process
+    in `unit` of this user's manager: its one cgroup v2 record ("0::" and a
+    path) runs through user@<uid>.service, then slices alone, then `unit`,
+    whose own sub-cgroups may follow. Anything else is not shown to be the
+    unit's, including a v1-only or doubled record and a deleted group (the
+    kernel appends " (deleted)")."""
+    paths = [ln[3:] for ln in cgroup.split(b"\n") if ln.startswith(b"0::")]
+    if len(paths) != 1:
+        return False
+    parts = paths[0].split(b"/")
+    manager = b"user@%d.service" % os.getuid()
+    if manager not in parts:
+        return False
+    rest = parts[parts.index(manager) + 1:]
+    while rest and rest[0].endswith(b".slice"):
+        rest = rest[1:]
+    return rest[:1] == [unit.encode()]
+
+
+def _environ_of(pid, unit):
+    """(the bytes /proc/<pid>/environ holds, None), or (None, the POSTURE_WHY
+    key) when `pid` is not shown to be `unit`'s process of this user.
+
+    ONE PROCESS FOR EVERY READ: /proc/<pid> is opened once, and its owner,
+    control group and environment are all read through that descriptor,
+    which the kernel binds to the process and not to the number. A process
+    that exits after the open cannot hand its number's next owner to a later
+    read; that read fails. An empty environ is what the kernel shows for a
+    process that is exiting, so it is unreadable, not "no flag"."""
     try:
-        names = sorted(n for n in os.listdir(d) if n.endswith(".conf"))
+        fd = os.open(os.path.join(PROC, str(pid)), os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return None, "stopped"
     except OSError:
-        return found
-    for n in names:
-        p = os.path.join(d, n)
+        return None, "unreadable"
+
+    def read(name):
+        with open(name, "rb", opener=lambda p, f: os.open(p, f, dir_fd=fd)) as fh:
+            return fh.read()
+    try:
+        if os.fstat(fd).st_uid != os.getuid():
+            return None, "stranger"
         try:
-            with open(p, encoding="utf-8", errors="replace") as f:
-                lines = f.read().splitlines()
+            if not _of_unit(read("cgroup"), unit):
+                return None, "stranger"
         except OSError:
+            return None, "stranger"
+        try:
+            env = read("environ")
+        except OSError:
+            return None, "unreadable"
+    finally:
+        os.close(fd)
+    return (env, None) if env else (None, "unreadable")
+
+
+def running_posture(unit=PEER_UNIT, run=None):
+    """([(source, "DREGG_X=value")], why) — the posture flags
+    (POSTURE_NAMES) the running `unit`'s main process was started with, and
+    None; or no assignment and the POSTURE_WHY sentence saying why nothing
+    was proven. `run` is timerhealth's systemctl runner unless a caller
+    names another.
+
+    FAIL CLOSED. Nothing is proven when systemctl is missing or refuses,
+    prints what the reader cannot parse exactly, has not loaded the unit, or
+    names no main process; when the process is not shown to be the unit's
+    (_of_unit: this user's, in the unit's control group); when its
+    environment cannot be read, names a flag twice, or holds a flag's value
+    no line helm writes carries exactly. write_posture_dropin then writes
+    the loosening flags EMPTY, so an unproven peer never leaves our node the
+    manager's bypass.
+
+    Only the posture flags are kept. The environment holds whatever the peer
+    was started with, dregg's own tokens and keys among its DREGG_ names: an
+    entry whose name is no posture flag is dropped as it is read, and never
+    kept, printed or put into a reason. An entry is the bytes between two
+    NULs, and its name what stands before its first "=", as getenv(3)
+    matches it.
+
+    TWO KNOWN LIMITS. It is the environment the main process was started
+    with: a peer whose MainPID is a shell wrapper that forks dregg holds the
+    wrapper's environment, not the child's, and a variable the process sets
+    or removes after it starts is not in it. And it is the peer as it runs
+    when `up` asks: a posture the operator changes takes effect for our node
+    at the next `up` after the peer restarts with it."""
+    from . import timerhealth
+    argv = ["show", unit]
+    for prop in POSTURE_PROPS:
+        argv += ["-p", prop]
+    rc, out = (run or timerhealth._systemctl)(argv)
+    if rc is None:
+        return [], POSTURE_WHY["unrun"]
+    if rc:
+        return [], POSTURE_WHY["refused"]
+    lines = out.split("\n")
+    props = {}
+    for line in lines[:-1] if lines[-1] == "" else [""]:
+        key, sep, value = line.partition("=")
+        if not sep or key not in POSTURE_PROPS or key in props:
+            return [], POSTURE_WHY["unparsed"]
+        props[key] = value
+    if len(props) != len(POSTURE_PROPS) \
+            or not re.fullmatch(r"[0-9]+", props["MainPID"]):
+        return [], POSTURE_WHY["unparsed"]
+    if props["LoadState"] != "loaded":
+        return [], POSTURE_WHY["absent" if props["LoadState"] == "not-found"
+                               else "unloaded"]
+    pid = int(props["MainPID"])
+    if not pid:
+        return [], POSTURE_WHY["stopped"]
+    env, why = _environ_of(pid, unit)
+    if why:
+        return [], POSTURE_WHY[why]
+    names = {n.encode("ascii"): n for n in POSTURE_NAMES}
+    found = {}
+    for entry in env.split(b"\0"):
+        name, sep, value = entry.partition(b"=")
+        if not sep or name not in names:
             continue
-        for ln in lines:
-            ln = ln.strip()
-            if not ln.startswith("Environment="):
-                continue
-            try:
-                parts = shlex.split(ln.split("=", 1)[1].strip())
-            except ValueError:      # unbalanced quotes: parse nothing, mirror
-                continue            # nothing — never guess at a malformed line
-            for assign in parts:
-                name, sep, _val = assign.partition("=")
-                if sep and name.startswith("DREGG_"):
-                    found.append((p, assign))
-    return found
+        if names[name] in found:
+            return [], POSTURE_WHY["twice"]
+        try:
+            found[names[name]] = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return [], POSTURE_WHY["unwritable"]
+    if not all(timerhealth.env_assignment(n, v) for n, v in found.items()):
+        return [], POSTURE_WHY["unwritable"]
+    return [(POSTURE_SOURCE % unit, "%s=%s" % nv) for nv in found.items()], None
 
 
 def write_posture_dropin(posture, unit=UNIT):
-    """Mirror `posture` into <unit>.d/10-helm-posture.conf.
+    """Write <unit>.d/10-helm-posture.conf from `posture`, the
+    [(source, "DREGG_X=value")] running_posture proved, and return its path.
 
-    Returns the path written, the path REMOVED (as a withdrawal), or None when
-    there was nothing to do.
+    WRITTEN ON EVERY `up`, NEVER DELETED (task/3432 round 2). Each LOOSENING
+    flag is set to the value `posture` carries, or EMPTY, which dregg reads
+    as refusal: a flag the peer runs without, or every one when nothing was
+    proven. A TIGHTENING flag is written only when `posture` carries it. An
+    earlier writer deleted this file when the grant was withdrawn and wrote
+    nothing when none was declared, and our unit, which inherits the user
+    manager's environment, then took whatever bypass the manager exports.
+    Empty is the one value that both withdraws a grant and keeps the
+    manager's out.
 
-    EMPTY POSTURE HAS TWO MEANINGS and conflating them was a real hole, found
-    and reproduced live. "Never declared" must write nothing — dregg's
-    refusal is the correct outcome. "WITHDRAWN", where the operator deleted the
-    declaration we previously mirrored, must CLEAR the mirror: otherwise our
-    copy keeps granting the opt-out after the grant was rescinded, and the node
-    goes on running unverified on an authority that no longer exists. The
-    difference between the two is simply whether our mirror is already on disk.
-
-    The first version returned None for both, so a withdrawal silently left the
-    stale grant in place — and the comment written INTO the file promised
-    "remove the source declaration and this file becomes empty on the next node
-    up", which the code did not do. A false guarantee in a generated file is
-    worse than no comment: it is the thing a future reader checks INSTEAD of the
-    code. Both the behaviour and the sentence are fixed here.
-    """
+    Only a posture flag is written, whoever built the list (task/3423): a
+    DREGG_ name that is none, a token or a key, never reaches this file. Each
+    value is written through env_assignment, so our unit sets exactly the
+    value the peer runs with (quoted where systemd would split or drop it,
+    its "%" doubled so nothing expands twice). A list naming a flag twice,
+    or holding a value no line carries exactly (a control character), is a
+    guess at what the peer meant: every loosening flag is written empty and
+    no tightening is written from it."""
+    from . import timerhealth
     d = _dropin_dir(unit)
     p = os.path.join(d, "10-helm-posture.conf")
-    if not posture:
-        if os.path.exists(p):
-            os.remove(p)            # WITHDRAWN — the grant must not outlive it
-            return p
-        return None                 # never declared — correct to write nothing
-    os.makedirs(d, exist_ok=True)
-    srcs = sorted({src for src, _ in posture})
-    body = ["# Written by `helm chat node up`. MIRRORED, not decided here:",
-            "# these are the operator's own consensus-posture declarations for",
-            "# %s, copied so the same binary can start for chat." % PEER_UNIT,
-            "# Source: " + ", ".join(srcs),
-            "# Withdraw the source declaration and the next `node up` DELETES",
-            "# this file — helm never mints a verification opt-out, and never",
-            "# outlives one.",
+    kept = [(src, a.split("=", 1)) for src, a in posture
+            if "=" in a and _posture(a)]
+    values = dict(nv for _src, nv in kept)
+    if len(values) != len(kept) or not all(
+            timerhealth.env_assignment(n, v) for n, v in values.items()):
+        kept, values = [], {}
+    lines = [(n, values.get(n, "")) for n in LOOSENING]
+    lines += [(n, values[n]) for n in TIGHTENING if n in values]
+    srcs = sorted({src for src, _nv in kept})
+    body = ["# Written by `helm chat node up` on every run, never deleted.",
+            "# MIRRORED, not decided here: each flag below is the value the",
+            "# running %s was started with, and a DREGG_ALLOW_ flag it" % PEER_UNIT,
+            "# runs without, or every one when that could not be proven, is",
+            "# set EMPTY, which dregg reads as refusal. Our unit would",
+            "# otherwise inherit the user manager's environment. helm never",
+            "# mints a verification opt-out, and never outlives one.",
+            "# Source: " + (", ".join(srcs) or "nothing proven"),
             "[Service]"]
-    body += ["Environment=" + a for _src, a in posture]
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    body += ["Environment=" + timerhealth.env_assignment(n, v)
+             for n, v in lines]
+    os.makedirs(d, exist_ok=True)
+    # REPLACED WHOLE: a torn write would leave a file without its Environment=
+    # lines, which is the inheritance this file exists to stop.
+    tmp = p + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    # UTF-8, which is what systemd reads a unit file as: a value is the
+    # peer's own, and the locale's encoding need not carry it.
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("\n".join(body) + "\n")
+    os.replace(tmp, p)
     return p
+
+
+# THE NODE YIELDS THE CPU TO THE OWNER'S PANES. Measured on the owner's 8-core
+# laptop while his typing lagged in his terminal panes: load 38.7, CPU pressure
+# some=55-63%, and this node at 303% CPU proving signed chat turns. A runtime
+# CPUWeight=20 plus renice +10 brought pressure to 32% within a minute, and the
+# next restart would have dropped both. Proofs attach AFTER a turn commits,
+# asynchronously, so proving is background work: a lower priority delays when a
+# proof lands, never whether or when a turn is delivered. So the priority is
+# decided here and `up` writes it every run, like the posture beside it.
+#
+# CPUWeight is the unit's cgroup share against its siblings, each weighted 100
+# by default, and it is work-conserving: an idle machine still gives the node
+# every core, and only a contended one hands it 20 for every 100 a sibling
+# gets. Nice orders the node's threads where no cpu controller weighs the unit
+# (a user manager not delegated one), and set at exec it is inherited by every
+# thread the node spawns — which a later `renice` of the PID is not, since
+# Linux nice is per thread.
+#
+# NO IOWeight, deliberately. The data dir is tmpfs (DATA_DIR), so the node's
+# store writes never reach a block device and a block-IO weight has nothing of
+# the node's to weigh; and stock systemd's user@.service delegates pids, memory
+# and cpu to the user manager, not io, so a user unit's IOWeight is inert.
+PRIORITY_DROPIN = "20-helm-priority.conf"
+CPU_WEIGHT = 20     # systemd weighs each sibling 100: the panes come first
+NICE = 10           # the order where no weight applies; helm's background units
+                    # (log-flush, proxy-fork-watch) run at the same nice
+PRIORITY = (("CPUWeight", CPU_WEIGHT), ("Nice", NICE))
+
+
+def write_priority_dropin(unit=UNIT):
+    """Write <unit>.d/20-helm-priority.conf (0600). The path when its bytes
+    or mode changed, None when it was already exactly this.
+
+    WRITTEN WHOLE EVERY TIME, so a hand edit or a loosened mode is put back
+    by the next `up`; an operator who wants other values says so in a
+    drop-in that sorts later, which systemd applies over this one."""
+    d = _dropin_dir(unit)
+    p = os.path.join(d, PRIORITY_DROPIN)
+    want = "\n".join([
+        "# Written by `helm chat node up`, every run: edits here are replaced.",
+        "# The owner's interactive panes outrank this node's background proving.",
+        "# Proofs attach asynchronously after a turn commits, so this delays",
+        "# proofs, never delivery. No IOWeight: the data dir is tmpfs.",
+        "[Service]"] + ["%s=%d" % kv for kv in PRIORITY]) + "\n"
+    try:
+        with open(p, encoding="utf-8") as f:
+            same = (f.read() == want
+                    and os.fstat(f.fileno()).st_mode & 0o777 == 0o600)
+    except OSError:
+        same = False
+    if same:
+        return None
+    os.makedirs(d, exist_ok=True)
+    tmp = p + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(want)
+    os.replace(tmp, p)
+    return p
+
+
+def priority_line(unit=UNIT):
+    """(yields, line) — the CPUWeight and Nice systemd holds for `unit` and
+    the nice its main process runs at, against PRIORITY. None when systemd
+    does not describe the unit.
+
+    TWO GAPS, TWO CURES. A unit without the values needs `up`, which writes
+    the drop-in and reloads systemd, and a reload re-applies a running
+    unit's cgroup settings, so the weight reaches the live node. Nice is set
+    at exec: a process started before the drop-in keeps its old nice until
+    its next start, and `up` adds no restart to say otherwise."""
+    keys = [k for k, _v in PRIORITY]
+    rc, out = _systemctl("show", unit,
+                         "--property=" + ",".join(keys + ["MainPID"]))
+    kv = dict(ln.split("=", 1) for ln in (out or "").splitlines() if "=" in ln)
+    if rc != 0 or any(k not in kv for k in keys):
+        return None
+    pid = int(kv["MainPID"]) if kv.get("MainPID", "").isdigit() else 0
+    running = None
+    if pid:                 # never 0: getpriority reads PID 0 as the CALLER
+        try:
+            running = os.getpriority(os.PRIO_PROCESS, pid)
+        except OSError:     # it exited between the two reads
+            pass
+    have = ", ".join("%s %s" % (k, kv[k] if kv[k].lstrip("-").isdigit()
+                                else "unset") for k in keys)
+    have += ", main process nice %s" % ("-" if running is None else running)
+    if any(kv[k] != str(v) for k, v in PRIORITY):
+        return False, ("does NOT yield the CPU to interactive work — %s; %s "
+                       "sets %s. Fix: helm chat node up" % (
+                           have, PRIORITY_DROPIN,
+                           " ".join("%s=%d" % pair for pair in PRIORITY)))
+    if running not in (None, NICE):
+        return False, ("yields the CPU by weight, not yet by nice — %s: the "
+                       "process predates %s and takes Nice=%d at its next "
+                       "start" % (have, PRIORITY_DROPIN, NICE))
+    return True, "yields the CPU to interactive work — " + have
 
 
 def last_failure(unit=UNIT, lines=40, invocation=None):
@@ -1137,9 +1418,13 @@ def last_failure(unit=UNIT, lines=40, invocation=None):
              if invocation and _INVOCATION.fullmatch(invocation)
              else ["-u", unit])
     try:
+        # UTF-8 WHATEVER THE LOCALE, as journalctl prints it (task/3423):
+        # dregg's refusal carries an em dash, and a byte that is not UTF-8
+        # is replaced, never raised, since the line is relayed for reading.
         p = subprocess.run(["journalctl", "--user"] + scope + [
                             "-n", str(lines), "--no-pager", "-o", "cat"],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return None
     hits = [ln for ln in (_ANSI.sub("", raw).strip()
@@ -1455,17 +1740,68 @@ def _systemctl(*args):
     """(rc, out+err) — systemd absent degrades to a loud reason, no traceback."""
     try:
         p = subprocess.run(["systemctl", "--user"] + list(args),
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=30)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, "systemctl unavailable: %s" % exc
     return p.returncode, (p.stdout + p.stderr).strip()
 
 
-def unlock(url, passphrase):
+# dregg's unlock limiter: `passphrase_limiter = RateLimiter::new(5, 60)` in
+# node/src/api.rs of both the fee-loop and the rebased build, keyed on the
+# client IP — and every helm seat on this host is the one loopback client.
+UNLOCK_ATTEMPTS_PER_MINUTE = 5
+
+# A REVIVE THE NODE REFUSED HOLDS EVERY SEAT'S REVIVE THIS LONG
+# (chat.unlock_backoff). The limiter's window is fixed: 60 s from the
+# attempt that opened it. So a backoff of 60 s after a refusal outlasts the
+# window that refusal was counted in, and the operator's `up` meets a fresh
+# budget.
+UNLOCK_BACKOFF_S = 60
+# The node's DEFINITE refusals of an unlock, each as the one word the backoff
+# marker records: sending the same stored passphrase again can only spend the
+# limiter. dregg answers a wrong passphrase with HTTP 200 and success false
+# (post_cclerk_unlock: `invalid passphrase`), which is UNLOCK_REJECTED. No
+# answer at all, and any other status, is not a refusal.
+UNLOCK_REFUSALS = {401: "unauthorized", 403: "forbidden", 429: "rate_limited"}
+UNLOCK_REJECTED = "rejected"
+
+
+def unlock(url, passphrase, diag=None):
     """POST the unlock (first unlock SETS the passphrase). Returns (token,
-    None) or (None, reason)."""
-    r = cell.post_json(url + "/api/cipherclerk/unlock", {"passphrase": passphrase})
+    None) or (None, reason). `diag`, when a dict is passed, gets `refused`,
+    the word for a definite refusal (UNLOCK_REFUSALS, UNLOCK_REJECTED), which
+    chat._revive records as its backoff; it stays unset for anything else.
+
+    AN HTTP STATUS IS A REASON, NOT "UNREACHABLE". chat._revive runs this for
+    every send the node refused at its door, so a stored passphrase the node
+    rejects spends the node's unlock limiter (UNLOCK_ATTEMPTS_PER_MINUTE, per
+    client IP, which is every seat here) in six refused sends, and the next
+    unlock — a seat's revive, or the operator's `helm chat node up`, the cure
+    every LOCKED line names — is answered 429 by a node whose API is up.
+    Reading that as `unreachable` sends the operator to check whether the
+    node runs, the one check that comes back fine (the drop cell.anchor names
+    for its 401). A 429 gets the limiter's own terms; any other status is
+    named; only no answer at all is `unreachable`."""
+    http = {}
+    r = cell.post_json(url + "/api/cipherclerk/unlock", {"passphrase": passphrase},
+                       diag=http)
+    refused = (UNLOCK_REJECTED if isinstance(r, dict) and r.get("success") is not True
+               else UNLOCK_REFUSALS.get(http.get("status")))
+    if diag is not None and refused:
+        diag["refused"] = refused
     if not isinstance(r, dict):
+        status = http.get("status")
+        if status == 429:
+            # Short: this rides inside a send_failed reason beside the door
+            # text and the signer's line, under chat.REASON_CAP.
+            return None, ("unlock rate-limited at %s (HTTP 429: the node admits "
+                          "%d unlock attempts per client per minute, and every "
+                          "seat here is one client)"
+                          % (url, UNLOCK_ATTEMPTS_PER_MINUTE))
+        if status is not None:
+            return None, "unlock refused by the node at %s with HTTP %s" % (
+                url, status)
         return None, "unlock unreachable at %s" % url
     if r.get("success") is not True:
         return None, "unlock refused: %s" % (r.get("error") or "success was not true")
@@ -1473,6 +1809,47 @@ def unlock(url, passphrase):
     if not isinstance(token, str):
         return None, "unlock accepted without a string bearer_token"
     return token, None
+
+
+LOCKED_CURE = ("`helm chat node up` completes provision (it unlocks with the "
+               "stored passphrase and stores the token)")
+
+
+def lock_state(url):
+    """Is the node's cipherclerk unlocked, in the node's own words?
+    {state: "unlocked" | "locked" | "unknown", reason}.
+
+    HEALTHY IS NOT PROVISIONED. The rebased node answers /status healthy:true
+    while it is locked, and refuses every signed turn with a bare 403 before
+    it executes anything (an `up` killed before provision() leaves it that
+    way). So no health reading can stand in for this one: the answer
+    is GET /api/node/identity's `unlocked`, and only a boolean counts. No
+    answer, a non-object, a missing field or a non-boolean stand-in is
+    UNKNOWN, which is never unlocked."""
+    ident = cell.get_json(url + "/api/node/identity", timeout=3)
+    if not isinstance(ident, dict):
+        return {"state": "unknown", "reason": "GET %s/api/node/identity gave "
+                "no JSON object" % url}
+    if not isinstance(ident.get("unlocked"), bool):
+        return {"state": "unknown", "reason": "GET %s/api/node/identity has "
+                "no boolean `unlocked`" % url}
+    return {"state": "unlocked" if ident["unlocked"] else "locked",
+            "reason": None}
+
+
+def locked_line(url, reading):
+    """The one operator line for a lock reading that is not `unlocked`, or
+    None. `helm chat node status` and `helm doctor` both print it, so the two
+    can never disagree."""
+    if reading["state"] == "locked":
+        return ("LOCKED at %s — its API answers and /status can read healthy, "
+                "but its cipherclerk is locked, so it refuses every signed "
+                "turn (HTTP 403) before executing it; cure: %s"
+                % (url, LOCKED_CURE))
+    if reading["state"] == "unknown":
+        return ("lock state UNKNOWN at %s — %s; unknown is not unlocked"
+                % (url, reading["reason"]))
+    return None
 
 
 def bootstrap_cell_hex():
@@ -1560,15 +1937,17 @@ def record_faucet_shortfall(cell_hex, need, have):
     # THE HIGH WATER MARK BELONGS TO ONE NODE AND ONE SEASON. Keeping the
     # largest need forever, across node identities and cost models, made a
     # rebuilt room read DRY at a balance its own turns never needed: the record
-    # is bound to the node it was observed at and expires, so a stale season
-    # cannot outlive the node that produced it.
-    same = (prior.get("cell") == cell_hex
-            and prior.get("node") == node_identity())
+    # is bound to the node AND THE CHAIN it was observed at and expires, so a
+    # stale season cannot outlive the node that produced it. A stamp of None
+    # (the chain could not be stated) is written as it is and never qualifies.
+    stamp = node_identity()
+    same = (stamp is not None and prior.get("cell") == cell_hex
+            and prior.get("node") == stamp)
     if same and isinstance(prior.get("need"), int) and not _stale_shortfall(prior):
         need = max(need, prior["need"])
     os.makedirs(os.path.dirname(path), exist_ok=True)
     pk.write_json(path, {"cell": cell_hex, "need": need, "have": int(have),
-                         "node": node_identity(), "at": pk.now_ts()})
+                         "node": stamp, "at": pk.now_ts()})
 
 
 SHORTFALL_TTL_S = 7 * 24 * 3600   # one week: long enough to span a quiet room
@@ -1583,12 +1962,82 @@ def _stale_shortfall(rec):
     return (time.time() - at) > SHORTFALL_TTL_S
 
 
-def node_identity(url=None):
-    """This node's own identity, so a recorded observation can say WHICH node
-    it was made at. The url is the identity helm can always read; a rebuilt
-    cave at the same url is separated by the faucet cell it resolves to."""
+# THE URL NAMES A PORT, NOT A CHAIN. A stamp of the url alone lets a fresh
+# record from an old chain qualify for a new chain re-genesised at the same
+# url. Its cell is no cell there, so the record outranks the new chain's own
+# faucet, the faucet reads UNKNOWN, and every seat's grant fails. So the
+# stamp names the CHAIN as well as the url.
+#
+# WHICH FIELD NAMES THE CHAIN, measured against the live node: /status
+# `public_key` and /api/membership `federation_id` + `self.key` are the node's
+# validator identity, and the successor ceremony KEEPS it by design (the
+# binary's own `genesis --help`: "preserving the hybrid committee and
+# therefore the federation id while a distinct genesis ... [is] minted";
+# _check_minted refuses a ceremony that re-keys). No endpoint serves the
+# genesis itself (/api/genesis, /api/chain, /api/info: 404). So no node-served
+# field separates a key-keeping re-genesis, and for the LOCAL unit the chain
+# is the digest of the genesis.json it runs — its consensus clock alone
+# differs on every mint. Where there is no local descriptor (a remote node, or
+# a genesis-less fee-loop build) the node-served committee is the best
+# statement there is: it separates a fresh committee, and a fee-loop node's
+# all-zero federation id from a genesis node's, but never a ceremony.
+MEMBERSHIP_PATH = "/api/membership"
+
+
+def _local_genesis(data_dir=None):
+    """(bytes, parsed) of the local unit's genesis.json, or (None, None) when
+    there is none, it is too large to be a descriptor, or it does not parse
+    to an object. DATA_DIR is read at call time."""
+    path = os.path.join(data_dir or DATA_DIR, GENESIS_FILE)
+    try:
+        if os.path.getsize(path) > DESCRIPTOR_MAX_BYTES:
+            return None, None
+        with open(path, "rb") as f:
+            blob = f.read()
+        g = json.loads(blob.decode("utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    return (blob, g) if isinstance(g, dict) else (None, None)
+
+
+def served_chain(url):
+    """The committee the node at `url` says it runs, from /api/membership, as
+    `federation:<id16>/key:<own key16>`, or None when it cannot say."""
+    r = cell.get_json(url + MEMBERSHIP_PATH, timeout=4)
+    r = r if isinstance(r, dict) else {}
+    me = r.get("self") if isinstance(r.get("self"), dict) else {}
+    fid, key = r.get("federation_id"), me.get("key")
+    if not all(_hexish(v) and len(v) == 64 for v in (fid, key)):
+        return None
+    return "federation:%s/key:%s" % (fid[:16].lower(), key[:16].lower())
+
+
+def chain_identity(url=None):
+    """WHICH CHAIN the node at `url` runs, or None when nothing can say.
+
+    The local unit's own descriptor first (`genesis:<sha256 of its
+    genesis.json, 16 hex>`), because it is the only statement that changes
+    with every re-genesis. It answers only for default_url(), the port of the
+    unit whose data dir it reads — the binding the local faucet sources use.
+    Otherwise the committee the node serves (served_chain)."""
     from . import chat
-    return (url or chat.node_url() or default_url()).rstrip("/")
+    target = (url or chat.node_url() or default_url()).rstrip("/")
+    if target == default_url():
+        blob, _g = _local_genesis()
+        if blob is not None:
+            return "genesis:" + hashlib.sha256(blob).hexdigest()[:16]
+    return served_chain(target)
+
+
+def node_identity(url=None):
+    """This node's identity: its url AND the chain it runs, `<url>#<chain>`,
+    so a recorded observation can say WHICH node on WHICH chain it was made
+    at. None when the chain cannot be stated: an observation that cannot name
+    its chain qualifies for no chain, and two unknowns are never one chain."""
+    from . import chat
+    target = (url or chat.node_url() or default_url()).rstrip("/")
+    chain = chain_identity(target)
+    return "%s#%s" % (target, chain) if chain else None
 
 
 def faucet_shortfall():
@@ -1601,20 +2050,28 @@ def faucet_shortfall():
 
 
 def current_shortfall(url=None):
-    """The recorded shortfall IF it describes this node and this season, else
-    {}. One door, so every consumer answers the identity question the same
-    way: a record observed at another node, or older than SHORTFALL_TTL_S,
-    describes neither this faucet's requirement nor its cell."""
+    """The recorded shortfall IF it describes this node, this chain and this
+    season, else {}. One door, so every consumer answers the identity
+    question the same way: a record observed at another node, on an older
+    chain at the same url, or older than SHORTFALL_TTL_S, describes neither
+    this faucet's requirement nor its cell."""
     rec = faucet_shortfall()
     # ABSENCE IS NOT PROVENANCE, and admitting a missing stamp as a wildcard
     # was the same mistake one field in: a record written before the stamp
     # existed carries no claim about WHICH node refused, so after a url change
     # it qualified for a node it had never described. The stamp must MATCH the
-    # target; absent, null and mismatched are all unqualified. That retires
-    # every pre-stamp record rather than trusting it, which is fail-closed and
-    # deliberate — an unqualified record leaves the floor and the cell to a
-    # source that can say which node it is about.
-    if rec.get("node") != node_identity(url) or _stale_shortfall(rec):
+    # target's node_identity; absent, null and mismatched are all unqualified,
+    # and so is a stamp that names the url without a chain (every record
+    # written before the chain was part of the stamp), and any record at all
+    # when the target's chain cannot be stated. That retires those records
+    # rather than trusting them, which is fail-closed and deliberate — an
+    # unqualified record leaves the floor and the cell to a source that can
+    # say which node and chain it is about. The identity is read only for a
+    # stamped, in-season record, so no record means no read of the node.
+    if not rec.get("node") or _stale_shortfall(rec):
+        return {}
+    here = node_identity(url)
+    if here is None or rec["node"] != here:
         return {}
     return rec
 
@@ -1640,15 +2097,44 @@ def read_fee_well(text):
     return m[-1].lower() if m else None
 
 
-def _fee_well_from_journal():
-    """The node states its fee well ONCE, at boot, in its own log line.
+def descriptor_fee_well(data_dir=None):
+    """The faucet cell as the local unit's OWN CHAIN DESCRIPTOR names it: the
+    `fee_well` of the genesis.json in its data dir, or None.
 
-    There is no read endpoint for it, so this is the only source that does not
-    need an incident to have happened first."""
+    ONLY A GENESIS HELM PATCHED NAMES THE FAUCET THERE. A minted genesis
+    carries a fee well of its own (a deterministic cell that fees flow into
+    and grants never come out of); patch_genesis replaces it with the faucet
+    cell and, in the same atomic write, sets coordination_fee_exempt. So the
+    marker is what says this fee_well is the faucet — an unpatched genesis
+    (the real minted fixture has no such key) answers None here rather than
+    naming a cell the faucet never pays out of. No key file is read."""
+    _blob, g = _local_genesis(data_dir)
+    if not g or g.get(GENESIS_PATCH_EXEMPT[0]) is not GENESIS_PATCH_EXEMPT[1]:
+        return None
+    well = g.get("fee_well")
+    return well.lower() if _hexish(well) else None
+
+
+def _fee_well_from_journal():
+    """The fee well a genesis-less (fee-loop) node states ONCE, at boot, in
+    its own "fee loop" log line — read from the unit's CURRENT run only.
+
+    The unit's journal holds every run it ever had, and a node re-genesised
+    at the same port keeps the old runs' lines. A rebased node prints no
+    "fee loop" line (measured on the live unit), so an unscoped read returns
+    the previous chain's fee well from an older boot. So the read is scoped
+    to the running invocation (_SYSTEMD_INVOCATION_ID, as last_failure
+    scopes its own), and a unit that is not active has no current run: None,
+    never an older run's line."""
+    st = unit_state()
+    if not st or st["active"] != "active" or not st["invocation"]:
+        return None
     try:
-        p = subprocess.run(["journalctl", "--user", "-u", UNIT, "--no-pager",
-                            "-g", "fee loop", "-n", "20"],
-                           capture_output=True, text=True, timeout=20)
+        p = subprocess.run(["journalctl", "--user",
+                            "_SYSTEMD_INVOCATION_ID=" + st["invocation"],
+                            "--no-pager", "-g", "fee loop", "-n", "20"],
+                           capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if p.returncode != 0:
@@ -1677,30 +2163,34 @@ def faucet_cell_prefix(url=None):
         context this host is configured for. It is not proof for every URL a
         caller might pass, so it is scoped to the configured target and
         contributes nothing to an explicitly-named foreign one.
-      * THE RECORD carries the node it was observed at, so it qualifies for
-        exactly that node.
-      * THE JOURNAL is the local systemd unit's own boot line, so it is
-        definitionally about whatever node THIS HOST runs.
+      * THE RECORD carries the node AND THE CHAIN it was observed at
+        (node_identity), so it qualifies for exactly that node on that chain;
+        a record from an older chain at the same url does not.
+      * THE LOCAL SOURCES are the local systemd unit's own statements, so
+        they are definitionally about whatever node THIS HOST runs: first the
+        chain descriptor in its data dir (descriptor_fee_well, the patched
+        genesis.json's fee_well), then — for a genesis-less build — the
+        "fee loop" boot line of its CURRENT run (_fee_well_from_journal).
 
-    THE JOURNAL IS ADMITTED ONLY AGAINST THE ONE BINDING THIS SOURCE CAN
+    THE LOCAL SOURCES ARE ADMITTED ONLY AGAINST THE ONE BINDING THEY CAN
     JUSTIFY, and "configured" is NOT that binding. `chat.node_url()` takes
     HELM_CHAT_NODE_URL first, which may name a REMOTE node, and otherwise the
     node-state url — which `provision()` writes from whatever url its CALLER
-    passed, so it carries no locality contract either. Admitting the journal
-    for "the configured target" would therefore re-open exactly the
-    wrong-target lookup this door exists to close, one layer in.
+    passed, so it carries no locality contract either. Admitting them for
+    "the configured target" would therefore re-open exactly the wrong-target
+    lookup this door exists to close, one layer in.
     What CAN be justified is `default_url()`: it is helm's own constant for
-    the port of the unit whose journal this reads (UNIT, PORT), so when the
-    target IS that address, the source and the question are about the same
-    node by construction. Any other target — remote, migrated, or merely
-    unprovable — does not consume the journal at all. That is fail-closed and
-    deliberately narrower than the previous behaviour; a node-migrated
-    deployment reading a non-default url now needs a target-stamped record or
-    the operator override, and gets UNKNOWN rather than another node's cell.
+    the port of the unit whose data dir and journal these read (UNIT, PORT,
+    DATA_DIR), so when the target IS that address, the source and the
+    question are about the same node by construction. Any other target —
+    remote, migrated, or merely unprovable — consumes neither. That is
+    fail-closed and deliberately narrow; a node-migrated deployment reading a
+    non-default url needs a target-stamped record or the operator override,
+    and gets UNKNOWN rather than another node's cell.
 
     (prefix, disqualified) — `disqualified` is True only when a source was
     REFUSED for target reasons AND nothing eligible answered, so a refused
-    override or journal can never veto a qualifying record."""
+    override or local source can never veto a qualifying record."""
     target = (url or configured_url()).rstrip("/")
     disqualified = False
 
@@ -1713,15 +2203,15 @@ def faucet_cell_prefix(url=None):
             return told.lower(), False
         disqualified = True
 
-    # The record names its own node, so it is asked for the target directly
-    # and outranks nothing it does not describe.
+    # The record names its own node and chain, so it is asked for the target
+    # directly and outranks nothing it does not describe.
     seen = current_shortfall(target).get("cell")
     if _hexish(seen):
         return seen.lower(), False
 
     if target != default_url():
         return "", True
-    well = _fee_well_from_journal()
+    well = descriptor_fee_well() or _fee_well_from_journal()
     return (well or ""), (disqualified and not well)
 
 
@@ -1770,15 +2260,17 @@ def faucet_state(url=None):
                    "node (%s), " % configured_url() \
                 if _hexish(home.env("CHAT_FAUCET_CELL")) else ""
             out["reason"] = (
-                "no source describes node %s: no recorded refusal names it, "
-                "%sand the unit journal describes the local node (%s) — helm "
-                "will not resolve another node's cell here"
+                "no source describes node %s: no recorded refusal names it "
+                "on the chain it runs now, %sand the unit's genesis and "
+                "journal describe the local node (%s) — helm will not "
+                "resolve another node's cell here"
                 % (url, told, default_url()))
         else:
             out["reason"] = (
                 "helm has never observed this node's faucet cell — no "
-                "HELM_CHAT_FAUCET_CELL, no recorded refusal, and no "
-                "fee_well line in the unit journal")
+                "HELM_CHAT_FAUCET_CELL, no recorded refusal from the chain it "
+                "runs now, no patched fee_well in the unit's genesis.json, "
+                "and no fee_well line in its current run's journal")
         return out
     cid = resolve_cell_id(url, prefix)
     if not cid:
@@ -1880,7 +2372,7 @@ def faucet_watch(url=None, reading=None, may_open=True, post=None,
     path = faucet_low_path()
     if not fa["low"] and not os.path.exists(path):
         return None
-    key = "%s %s" % (node_identity(url), (fa.get("cell") or "")[:16])
+    key = _spell_key(url, fa.get("cell"))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path + ".lock", "a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1902,12 +2394,22 @@ def faucet_watch(url=None, reading=None, may_open=True, post=None,
     return woke
 
 
+def _spell_key(url, cell_id):
+    """The latch key of one low spell: node, chain and cell. A chain helm
+    cannot state keys as `<url>#?` — never the bare url a pre-chain latch
+    used, so a spell from an older chain at the same url stays its own."""
+    from . import chat
+    target = (url or chat.node_url() or default_url()).rstrip("/")
+    return "%s %s" % (node_identity(target) or target + "#?",
+                      (cell_id or "")[:16])
+
+
 def low_spell(url=None, cell_id=None):
-    """The open spell for this node and cell, or {} — what a reader prints to
-    say the wake already went out."""
+    """The open spell for this node, chain and cell, or {} — what a reader
+    prints to say the wake already went out."""
     rec = pk.read_json(faucet_low_path(), {})
     rec = rec if isinstance(rec, dict) else {}
-    got = rec.get("%s %s" % (node_identity(url), (cell_id or "")[:16]))
+    got = rec.get(_spell_key(url, cell_id))
     return got if isinstance(got, dict) else {}
 
 
@@ -2476,17 +2978,29 @@ def provision(url, passphrase=None):
     """Unlock + bootstrap a reachable node; persist {url, passphrase, token}
     0600. Returns (state-dict, None) or (None, reason). Idempotent — a stored
     passphrase re-unlocks the same node across restarts AND re-sets itself on
-    a fresh tmpfs after reboot."""
+    a fresh tmpfs after reboot.
+
+    THE RAM TOKEN IS WRITTEN TOO. chat prefers /dev/shm's token over the
+    state's (chat._node_token), so a provision that stored only the state's
+    would leave a stale RAM one in charge, and every send would earn a 401.
+    After a provision the two can never differ.
+
+    THE OPERATOR'S UNLOCK IGNORES THE SEATS' BACKOFF (chat.unlock_backoff).
+    `up` is the cure every LOCKED line names, so it always runs; and an
+    unlock the node accepts ends the backoff, because its cause is gone."""
+    from . import chat
     st = state()
     passphrase = passphrase or st.get("passphrase") or secrets.token_hex(16)
     token, err = unlock(url, passphrase)
     if err:
         return None, err
+    chat.clear_unlock_backoff()
     healthy, err = ensure_healthy_result(url)
     if not healthy:
         return None, "node reachable but never produced a block: %s" % err
     st.update({"url": url, "passphrase": passphrase, "token": token})
     write_state(st)
+    chat.store_node_token(token)
     return st, None
 
 
@@ -2598,19 +3112,35 @@ def wait_boot(url, unit=None, seconds=None, say=None):
     start has begun. A stopped state reads as an exit only once this start
     has been seen (the unit active, or a new InvocationID), or after
     START_GRACE_S; a start still queued past the grace does read as exited,
-    which is the bound on this rule. (`up` also runs `reset-failed` first.)"""
+    which is the bound on this rule. (`up` also runs `reset-failed` first.)
+
+    THE WAIT COUNTS ONLY WHILE THE NODE PROCESS RUNS (_clock_runs). A queued
+    start and the prepare step — where a genesis mint or the successor
+    ceremony runs, measured at most of a 673 s `up` — are not the node booting,
+    and systemd bounds them itself (START_GRACE_S, START_TIMEOUT_S). The wall
+    clock is still capped at `seconds` + START_TIMEOUT_S, so a unit that never
+    leaves its prepare step cannot hold the wait open forever."""
     seconds = boot_wait_s() if seconds is None else seconds
-    start = time.time()
+    # MONOTONIC, NOT THE WALL CLOCK. Every reading here is an interval, and a
+    # wall clock that jumps (NTP, a resume, an operator's `date`) stretched
+    # the wait by the jump or spent it at once. The wall-clock cap is still
+    # the real time elapsed since the wait began, now immune to the jump.
+    start = time.monotonic()
     first = unit_state(unit) if unit else None
     restarts0 = first["restarts"] if first else 0
     inv0 = first["invocation"] if first else ""
     idle = ("inactive", "failed")
     started = bool(first) and first["active"] not in idle
+    ticking = not unit or _clock_runs(first, started)
+    spent, last = 0.0, start
     next_look, next_say = start, start + BOOT_TICK_S
     while True:
         if isinstance(cell.get_json(url + "/api/receipts", timeout=2), list):
-            return "up", time.time() - start
-        now = time.time()
+            return "up", time.monotonic() - start
+        now = time.monotonic()
+        if ticking:
+            spent += now - last
+        last = now
         if unit and now >= next_look:
             st = unit_state(unit)
             started = started or bool(st) and (
@@ -2621,13 +3151,27 @@ def wait_boot(url, unit=None, seconds=None, say=None):
                 return "exited", st
             if hung_diagnosis(st):
                 return "hung", st
+            ticking = _clock_runs(st, started)
             next_look = now + 2
-        if now - start >= seconds:
+        if spent >= seconds:
+            return "initializing", spent
+        if now - start >= seconds + START_TIMEOUT_S:
             return "initializing", now - start
         if say and now >= next_say:
-            say("still initializing verified runtime (%ds)" % (now - start))
+            say("still initializing verified runtime (%ds)" % spent if ticking
+                else "the prepare step is still running (%ds) — a genesis "
+                     "mint or successor ceremony; the boot wait starts when "
+                     "the node process does" % (now - start))
             next_say += BOOT_TICK_S
         time.sleep(0.5)
+
+
+def _clock_runs(st, started):
+    """Does `up`'s boot wait count this moment? Only while the node PROCESS
+    runs: not while this start is still queued, and not in the prepare step
+    (`start-pre`). A unit systemctl cannot describe counts, so a host without
+    systemd waits exactly as long as it always did."""
+    return not st or (started and not _gone(st) and st["sub"] != "start-pre")
 
 
 def wait_api(url, seconds=None):
@@ -2686,12 +3230,37 @@ def _up(args):
     print("helm chat node: " + chat._safe_reason(
         "runs %s (%s); recorded, so a later bare `up` keeps this binary"
         % (b, BIN_SOURCES[res["source"]])))
-    posture = declared_posture()
-    dropin = write_posture_dropin(posture)
-    if dropin:
-        print("helm chat node: mirrored %d posture flag%s from %s into %s" % (
-            len(posture), "s"[:len(posture) != 1], PEER_UNIT,
-            os.path.basename(dropin)))
+    # A daemon-reload BEFORE reading posture so pending unit changes the
+    # operator wrote are applied first; `up` would otherwise read a stale
+    # peer environment and the first `up` sees NeedDaemonReload=yes on its
+    # own unit.  A second reload AFTER writing drop-ins so the mirror takes
+    # effect in the start that follows.  The unit never restarts itself.
+    rc, out = _systemctl("daemon-reload")
+    if rc:
+        print("helm chat node: systemctl daemon-reload failed: %s" % out,
+              file=sys.stderr)
+        return 1
+    # THE READER'S REASON KEEPS ITS OWN NAME: the refusal relay below names
+    # the journal's line `why`, and says this one again (task/3423). The
+    # drop-in is written every run (write_posture_dropin), and `up` names
+    # each loosening flag it set empty.
+    posture, unproven = running_posture()
+    dropin = os.path.basename(write_posture_dropin(posture))
+    mirrored = {a.partition("=")[0] for _src, a in posture}
+    blank = [n for n in LOOSENING if n not in mirrored]
+    print("helm chat node: %s; %s %s" % (
+        "no posture proven for %s: %s" % (PEER_UNIT, unproven) if unproven
+        else "mirrored %d posture flag%s from the running %s" % (
+            len(posture), "s"[:len(posture) != 1], PEER_UNIT) if posture
+        else "the running %s runs with no posture flag" % PEER_UNIT,
+        dropin, "sets %s empty, which dregg reads as refusal"
+        % " and ".join(blank) if blank else "written"))
+    # THE PRIORITY RIDES THE SECOND RELOAD. Written before the reload below,
+    # which is what loads it; `up` restarts nothing it did not before.
+    if write_priority_dropin():
+        print("helm chat node: %s (0600) written: %s — the owner's panes "
+              "outrank background proving" % (PRIORITY_DROPIN, " ".join(
+                  "%s=%d" % pair for pair in PRIORITY)))
     # NO makedirs HERE. Pre-creating the data dir is exactly what defeats the
     # prepare step: `dregg-cave-node init` no-ops on an existing-but-empty dir
     # and still exits 0, so the unit would start a KEYLESS cave with every exit
@@ -2714,7 +3283,9 @@ def _up(args):
     wait = boot_wait_s()
     print("helm chat node: waiting up to %ds for the API at %s — initializing "
           "verified runtime (a rebased node's Lean init takes about 150 s; the "
-          "wait ends at once if the node exits)" % (wait, url))
+          "wait ends at once if the node exits, and its clock starts when the "
+          "node process does, after any genesis mint or successor ceremony)"
+          % (wait, url))
     outcome, what = wait_boot(url, unit=UNIT, seconds=wait,
                               say=lambda t: print("helm chat node: " + t))
     if outcome == "hung":
@@ -2747,11 +3318,17 @@ def _up(args):
             cure = refusal_remedy(why)
             if cure:
                 msg += "\n  cure: " + cure
-            if not posture and "DREGG_ALLOW" in why:
-                msg += ("\n  no DREGG_* posture is declared for %s, so nothing was "
-                        "mirrored. helm will not opt a node out of verification on "
-                        "your behalf — declare it for the team node (or rebuild the "
-                        "binary against the Lean archive) and re-run." % PEER_UNIT)
+            if blank and "DREGG_ALLOW" in why:
+                msg += "\n  " + (
+                    "no posture was proven for %s: %s" % (PEER_UNIT, unproven)
+                    if unproven else "the running %s does not run with %s"
+                    % (PEER_UNIT, " or ".join(blank))) + (
+                    ", so %s set empty here. helm will not opt a node out of "
+                    "verification on your behalf: our node runs with what "
+                    "the team node runs with, so declare it there and start "
+                    "or restart that node (or rebuild the binary against the "
+                    "Lean archive), then re-run."
+                    % ("it is" if len(blank) == 1 else "both are"))
         else:
             msg += " (journalctl --user -u %s)" % UNIT
         print(msg, file=sys.stderr)
@@ -2810,6 +3387,10 @@ def _status(args):
     from . import chat
     rc, out = _systemctl("is-active", UNIT)
     print("helm chat node: unit %s (%s)" % (UNIT, out or "unknown"))
+    pri = priority_line()
+    if pri:
+        print("helm chat node: " + pri[1],
+              file=sys.stdout if pri[0] else sys.stderr)
     # WHICH BINARY, AND WHY THAT ONE. The same line doctor prints; a refused
     # record fails status, since the `up` this surface recommends would refuse.
     report = binary_report()
@@ -2819,17 +3400,25 @@ def _status(args):
     refused = bool(report) and report[0] == "fail"
     url = chat.node_url() or default_url()
     transport = chat.transport_status()
-    if transport.get("mode") == "degraded":
+    if transport.get("mode") in ("degraded", "unknown"):
         print("helm chat node: " + chat.transport_failure_summary(transport),
               file=sys.stderr)
     elif transport.get("mode") == "ready":
         print("helm chat node: signing " + chat.transport_label(transport))
+    for line in transport.get("scoped") or ():
+        print("helm chat node: signing scoped: " + line)
     head = cell.get_json(url + "/api/receipts", timeout=3)
     if head is None:
         print("helm chat node: " + unreachable_line(url))
         return 1
     print("helm chat node: API LIVE at %s — chain head %s" % (
         url, head[0].get("chain_index") if head else "(no receipts yet)"))
+    # A LIVE API IS NOT AN UNLOCKED NODE. A locked node answers every read
+    # here and refuses every signed turn, so status fails on it.
+    lock = lock_state(url)
+    said = locked_line(url, lock)
+    if said:
+        print("helm chat node: " + said, file=sys.stderr)
     # THE SOURCE BEFORE THE SINKS. Every balance below is funded out of one
     # cell, so a list of twenty zeroes means nothing until this line says
     # whether the pool that refills them holds anything.
@@ -2904,7 +3493,8 @@ def _status(args):
     else:
         print("helm chat node: identity snapshotted (%s) — survives a reboot"
               % ", ".join(ident["saved"]))
-    return 1 if transport.get("mode") == "degraded" or refused else 0
+    return 1 if (transport.get("mode") in ("degraded", "unknown") or refused
+                 or lock["state"] == "locked") else 0
 
 
 def _prepare(args):
@@ -2954,14 +3544,16 @@ PREPARE_FAILED = "helm chat node prepare: FAILED — "
 # written down here, and a description with no handler will not run.
 _VERBS = (
     ("up", lambda a: _up(a),
-     "write the unit if missing (0600), record its binary, start, wait for\n"
+     "write the unit and its drop-ins (0600; the priority that yields the\n"
+     "           CPU to interactive work), record its binary, start, wait for\n"
      "           health, unlock + bootstrap the chain, store the node "
      "credential (0600), snapshot identity"),
     ("down", lambda a: _down(a),
      "stop the unit (the RAM room evaporates — flush first: "
      "helm chat log-flush)"),
     ("status", lambda a: _status(a),
-     "unit + node health + chain head + joined-cell balances + identity"),
+     "unit + CPU priority + node health + chain head + joined-cell "
+     "balances + identity"),
     ("prepare", lambda a: _prepare(a),
      "ExecStartPre [--data-dir D] [--bin B]: restore the chain descriptor\n"
      "           into the tmpfs cave, or mint one (keeping a snapshotted key)\n"

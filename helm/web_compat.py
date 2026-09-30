@@ -21,7 +21,8 @@ _OWNER_NAMES = (
         'REGISTRY_DETAIL_ROUTE', '_project_on_the_wire',
         '_project_detail_on_the_wire', '_api_project_detail',
         '_api_registry',
-        '_api_projects_state', '_api_friction', '_api_friction_dial',
+        '_api_projects_state', '_forget_teams_leg', '_api_projects_team',
+        '_api_friction', '_api_friction_dial',
         '_POSTURE_SAID', '_api_posture', '_api_posture_post',
         '_api_store',
         '_api_store_review', '_api_store_confirm', '_api_store_reject',
@@ -31,7 +32,7 @@ _OWNER_NAMES = (
         '_api_decisions_verdict', '_api_decisions_deliver',
         '_api_decisions_comment', '_api_whoami',
         'SESSION_KEYS', 'SESSION_CAP', '_api_sessions', '_READY_TTL_S',
-        '_api_ready',
+        '_api_ready', '_api_backlog',
     )),
     ('web_configs', (
         '_api_configs', '_api_config_injection', '_api_inject_pack',
@@ -52,10 +53,11 @@ _OWNER_NAMES = (
     ('web_quota', (
         '_catalog_rows', '_claude_home_identity', '_norm', 'get_creds',
         'get_history', '_probe_epoch', 'get_burn', '_alloc_models',
-        'get_allocations', 'get_flags', '_api_flags',
+        'get_allocations', 'get_flags', '_api_flags', 'DECLARE_FOR_S',
+        '_api_burn_declare',
         'HISTORY_WIRE_KEYS', 'HISTORY_GAUGE_WIRE_KEYS',
         '_history_on_the_wire',
-        '_api_creds', '_api_history', '_api_burn', '_measured_accounts',
+        '_api_creds', '_api_models', '_api_history', '_api_burn', '_measured_accounts',
         '_api_allocate', '_api_quota_status', '_api_accounts',
         '_api_accounts_post',
     )),
@@ -121,7 +123,7 @@ _OWNER_NAMES = (
         '_api_owed',
     )),
     ('web_board', (
-        '_api_board',
+        '_api_board', '_api_work',
     )),
 )
 EXPORTS = {}

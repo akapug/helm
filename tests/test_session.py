@@ -921,6 +921,291 @@ class ExpertsTest(SessionBase):
         self.assertIn("context pack", out)
         self.assertNotIn("no hit in the expert's own transcript", out)
 
+    def test_upsert_expert_mints_new_entry(self):
+        """a new sid mints {domain, registered, last_refreshed, note,
+        handoff, subdomains}; registered and last_refreshed are stamped with
+        now, and the file lands on _global."""
+        # unsorted, repeated and empty on the way in: an already-sorted
+        # input would pass whether or not the mint branch sorts
+        session.upsert_expert("aaaa1111-alpha", "fabric", "/a.md",
+                              ["bravo", "alpha", "bravo", ""])
+        e = session._experts()["aaaa1111-alpha"]
+        self.assertEqual(e["domain"], "fabric")
+        self.assertEqual(e["handoff"], "/a.md")
+        self.assertEqual(e["note"], "")
+        self.assertEqual(e["subdomains"], ["alpha", "bravo"])  # sorted, unique
+        self.assertIn("registered", e)
+        self.assertIn("last_refreshed", e)
+        self.assertTrue(os.path.exists(session._experts_path()))
+
+    def test_upsert_expert_refreshes_existing_entry(self):
+        """an existing sid keeps domain, registered and note; it stamps
+        last_refreshed, updates handoff and MERGES (and sorts) subdomains."""
+        past = "2026-01-01T00:00:00Z"
+        session._write_experts({
+            "aaaa1111-alpha": {"domain": "fabric", "registered": past,
+                             "last_refreshed": past, "note": "hello",
+                             "handoff": "/old", "subdomains": ["alpha"]}})
+        session.upsert_expert("aaaa1111-alpha", "fabric", "/new", ["bravo"])
+        e = session._experts()["aaaa1111-alpha"]
+        self.assertEqual(e["domain"], "fabric")            # kept
+        self.assertEqual(e["registered"], past)             # kept
+        self.assertEqual(e["note"], "hello")               # kept
+        self.assertEqual(e["handoff"], "/new")              # updated
+        self.assertEqual(e["subdomains"], ["alpha", "bravo"])  # merged, sorted
+        self.assertNotEqual(e["last_refreshed"], past)      # re-stamped
+
+    def test_retire_hides_entry_from_list(self):
+        """--retire marks {retired: now, successor: None} and the plain
+        list no longer shows the entry (retired entries are history, not
+        live experts)."""
+        self._reg(sid="aaaa1111", domain="x")
+        self._reg(sid="bbbb2222", domain="y")
+        rc, out, _ = run(session.cmd_experts, [])
+        self.assertEqual(rc, 0)
+        self.assertIn("aaaa1111", out)  # live before retire
+        rc, out, err = run(session.cmd_experts, ["--retire", "aaaa1111"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("retired aaaa1111", out)
+        e = session._experts()["aaaa1111"]
+        self.assertTrue(e["retired"] is not None)
+        self.assertIsNone(e.get("successor"))
+        rc, out, _ = run(session.cmd_experts, [])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("aaaa1111", out)  # hidden after retire
+        self.assertIn("bbbb2222", out)     # the other stays
+
+    def test_retire_to_registers_successor_with_same_domain(self):
+        """--retire A --to B marks A retired with successor B and, if B
+        is not already registered, registers B with A's domain."""
+        self._reg(sid="aaaa1111", domain="x")
+        with mock.patch.object(session, "_resolve_sid",
+                               return_value=("bb2222", None)):
+            rc, out, err = run(session.cmd_experts,
+                               ["--retire", "aaaa1111", "--to", "bb2222"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("retired aaaa1111 (-> bb2222)", out)
+        a = session._experts()["aaaa1111"]
+        self.assertIsNotNone(a["retired"])
+        self.assertEqual(a["successor"], "bb2222")
+        self.assertIn("bb2222", session._experts())
+        self.assertEqual(session._experts()["bb2222"]["domain"], "x")  # A's domain
+
+    def test_retire_unknown_sid_exits_1(self):
+        """retiring a sid that is not in the registry prints one stderr
+        line and exits 1."""
+        rc, out, err = run(session.cmd_experts, ["--retire", "ghost999"])
+        self.assertEqual(rc, 1)
+        self.assertIn("ghost999", err)
+        self.assertEqual(out, "")
+
+    def test_ask_skips_retired_expert(self):
+        """helm session ask routes only to LIVE experts: a retired entry
+        for the domain does not win the routing (the ask ladder's candidate
+        set drops retired rows before the freshest pick)."""
+        # the RETIRED entry is the FRESHER one, so the freshest pick would
+        # choose it if the retired filter were missing (registering both in
+        # the same second only catches that by dict order)
+        session._write_experts({
+            "live1234": {"domain": "x", "registered": "2026-01-01T00:00:00Z",
+                         "last_refreshed": "2026-01-01T00:00:00Z", "note": ""},
+            "deadaaaa": {"domain": "x", "registered": "2026-01-02T00:00:00Z",
+                         "last_refreshed": "2026-01-02T00:00:00Z", "note": ""}})
+        rc, out, _ = run(session.cmd_experts, ["--retire", "deadaaaa"])
+        self.assertEqual(rc, 0, out + repr(_))
+        with mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_session_cwd", return_value="/work"), \
+             self.cv_ok("pack-hits"):
+            rc, out, _ = run(session.cmd_ask, ["x", "q"])
+        self.assertEqual(rc, 0)
+        self.assertIn("live1234", out)
+        self.assertNotIn("deadaaaa", out)
+
+    def _one_live_one_retired(self):
+        session._write_experts({
+            "aaaa1111-full": {"domain": "x", "registered": "t",
+                              "last_refreshed": "t", "note": ""},
+            "cccc3333-full": {"domain": "x", "registered": "t",
+                              "last_refreshed": "t", "note": "",
+                              "retired": "2026-01-01T00:00:00Z"}})
+        with open(session._experts_path()) as f:
+            return f.read()
+
+    def _registry_text(self):
+        with open(session._experts_path()) as f:
+            return f.read()
+
+    def test_retire_to_itself_or_a_retired_sid_is_refused(self):
+        """a successor that is the retiring expert, or is itself retired,
+        would leave the domain with NO live expert while exit 0 claims a
+        hand-over: refused, registry unchanged."""
+        before = self._one_live_one_retired()
+        for to in ("aaaa1111-full", "cccc3333-full"):
+            with mock.patch.object(session, "_resolve_sid",
+                                   return_value=(to, None)):
+                rc, out, err = run(session.cmd_experts,
+                                   ["--retire", "aaaa1111", "--to", to[:8]])
+            self.assertEqual(rc, 1, (to, out, err))
+            self.assertIn(to[:12], err)
+            self.assertEqual(self._registry_text(), before)
+
+    def test_retire_to_resolves_the_successor_session(self):
+        """--to takes a session prefix and stores the FULL sid (a raw prefix
+        key is an expert `ask` can neither grep nor resume); an unresolvable
+        --to is refused before anything is written."""
+        before = self._one_live_one_retired()
+        with mock.patch.object(session, "_resolve_sid",
+                               return_value=(None, "no session id starts with 'zz'")):
+            rc, _o, err = run(session.cmd_experts,
+                              ["--retire", "aaaa1111", "--to", "zz"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no session id starts with 'zz'", err)
+        self.assertEqual(self._registry_text(), before)
+        with mock.patch.object(session, "_resolve_sid",
+                               return_value=("dddd4444-full", None)):
+            rc, _o, err = run(session.cmd_experts,
+                              ["--retire", "aaaa1111", "--to", "dddd"])
+        self.assertEqual(rc, 0, err)
+        ex = session._experts()
+        self.assertEqual(ex["aaaa1111-full"]["successor"], "dddd4444-full")
+        self.assertNotIn("dddd", ex)
+        self.assertEqual(ex["dddd4444-full"]["domain"], "x")
+
+    def test_retire_to_without_a_value_is_usage(self):
+        """`--to` with nothing after it is a usage error, never a silent
+        retire with no successor."""
+        before = self._one_live_one_retired()
+        rc, _o, err = run(session.cmd_experts, ["--retire", "aaaa1111", "--to"])
+        self.assertEqual(rc, 2)
+        self.assertIn("usage", err)
+        self.assertEqual(self._registry_text(), before)
+
+    def test_retire_keeps_the_first_retired_stamp(self):
+        """retiring an already-retired entry keeps when it was retired."""
+        self._one_live_one_retired()
+        rc, _o, err = run(session.cmd_experts, ["--retire", "cccc3333"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(session._experts()["cccc3333-full"]["retired"],
+                         "2026-01-01T00:00:00Z")
+
+    def test_upsert_without_sid_writes_nothing(self):
+        session.upsert_expert("", "proj", "/p.md", [])
+        session.upsert_expert(None, "proj", "/p.md", [])
+        self.assertFalse(os.path.exists(session._experts_path()))
+
+    def _ask(self, domain):
+        with mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_session_cwd", return_value="/work"), \
+             self.cv_ok("pack-hits"):
+            return run(session.cmd_ask, [domain, "q"])
+
+    def test_ask_offers_only_claude_experts(self):
+        """the ladder ends in `claude --resume <sid>`, so ask never routes
+        to a codex or unknown-harness entry, even the freshest; an entry with
+        no harness field came from --register (Claude-only) and is offered."""
+        session._write_experts({
+            "claude01-full": {"domain": "x", "registered": "2026-01-01T00:00:00Z",
+                              "last_refreshed": "2026-01-01T00:00:00Z",
+                              "note": "", "harness": "claude"},
+            "codex001-full": {"domain": "x", "registered": "2026-01-03T00:00:00Z",
+                              "last_refreshed": "2026-01-03T00:00:00Z",
+                              "note": "", "harness": "codex"},
+            "unknown1-full": {"domain": "x", "registered": "2026-01-02T00:00:00Z",
+                              "last_refreshed": "2026-01-02T00:00:00Z",
+                              "note": "", "harness": "unknown"},
+            "proxy001-full": {"domain": "x", "registered": "2026-01-04T00:00:00Z",
+                              "last_refreshed": "2026-01-04T00:00:00Z",
+                              "note": "", "harness": "claude-proxy"},
+            "legacy01-full": {"domain": "y", "registered": "2026-01-01T00:00:00Z",
+                              "last_refreshed": "2026-01-01T00:00:00Z",
+                              "note": ""}})
+        rc, out, _ = self._ask("x")
+        self.assertEqual(rc, 0)
+        self.assertIn("claude01-ful", out)
+        self.assertNotIn("codex001", out)
+        self.assertNotIn("unknown1", out)
+        self.assertNotIn("proxy001", out)       # claude-code on a proxy seat
+        rc, out, _ = self._ask("y")
+        self.assertIn("legacy01-ful", out)       # pre-harness --register entry
+        # a domain with ONLY non-Claude experts prints no resume line for them
+        ex = session._experts()
+        del ex["claude01-full"]
+        session._write_experts(ex)
+        rc, out, _ = self._ask("x")
+        self.assertIn("no expert for domain 'x'", out)
+        self.assertIn("3 non-Claude expert(s)", out)
+        self.assertNotIn("--resume", out)
+
+    def test_register_and_successor_record_claude_harness(self):
+        """--register and --retire --to resolve Claude sessions only, so the
+        entries they mint say so."""
+        self._reg(sid="aaaa1111-full", domain="x")
+        self.assertEqual(session._experts()["aaaa1111-full"]["harness"], "claude")
+        with mock.patch.object(session, "_resolve_sid",
+                               return_value=("bbbb2222-full", None)):
+            rc, _o, err = run(session.cmd_experts,
+                              ["--retire", "aaaa1111", "--to", "bbbb"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(session._experts()["bbbb2222-full"]["harness"], "claude")
+
+    def test_list_shows_refresh_date_beside_age(self):
+        """the list prints the refresh DATE next to the age, so an expert who
+        last wrote a given date is date-stamp visible, not just a relative
+        age that drifts as the wall clock moves (a relative age alone can't
+        pin the wall-clock reference of the stored instant)."""
+        session._write_experts({
+            "aaa111": {"domain": "x", "registered": "2026-01-01T10:00:00Z",
+                       "last_refreshed": "2026-01-01T10:00:00Z", "note": "",
+                       "seat": "seat-a"},
+        })
+        rc, out, _ = run(session.cmd_experts, [])
+        self.assertEqual(rc, 0)
+        self.assertIn("2026-01-01", out)
+        self.assertIn("refreshed", out)
+        # the relative age and the absolute date both land on the same line
+        lines = [l for l in out.splitlines() if "aaa111" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("2026-01-01", lines[0])
+
+    def test_list_keeps_only_freshest_per_seat_domain(self):
+        """per (seat, domain) the list keeps only the FRESHEST row: two sids
+        of the same seat in the same domain are the same expert seen twice,
+        so they collapse to one — the newer sid wins. A different seat or a
+        different domain is a DIFFERENT key and still lists on its own."""
+        session._write_experts({
+            "aaa111-old": {"domain": "x", "registered": "2026-01-01T00:00:00Z",
+                           "last_refreshed": "2026-01-01T00:00:00Z", "note": "",
+                           "seat": "seat-a"},
+            "bbb222-new": {"domain": "x", "registered": "2026-01-02T00:00:00Z",
+                           "last_refreshed": "2026-01-02T00:00:00Z", "note": "",
+                           "seat": "seat-a"},
+            "ccc333": {"domain": "x", "registered": "2026-01-01T00:00:00Z",
+                       "last_refreshed": "2026-01-01T00:00:00Z", "note": "",
+                       "seat": "seat-b"},   # same domain, DIFFERENT seat
+            "ddd444": {"domain": "y", "registered": "2026-01-01T00:00:00Z",
+                       "last_refreshed": "2026-01-01T00:00:00Z", "note": "",
+                       "seat": "seat-a"},   # same seat, DIFFERENT domain
+            # two SEATLESS entries in one domain (--register, a --to
+            # successor) are two experts, never one collapsed row
+            "eee555": {"domain": "x", "registered": "2026-01-01T00:00:00Z",
+                       "last_refreshed": "2026-01-01T00:00:00Z", "note": ""},
+            "fff666": {"domain": "x", "registered": "2026-01-02T00:00:00Z",
+                       "last_refreshed": "2026-01-02T00:00:00Z", "note": ""},
+        })
+        rc, out, _ = run(session.cmd_experts, [])
+        self.assertEqual(rc, 0)
+        # (seat-a, x) collapses to the newer bbb222-new; the older aaa111-old
+        # disappears
+        self.assertIn("bbb222-new", out)
+        self.assertNotIn("aaa111", out)
+        # distinct (seat, domain) keys each still show
+        self.assertIn("ccc333", out)
+        self.assertIn("ddd444", out)
+        self.assertIn("eee555", out)
+        self.assertIn("fff666", out)
+        # exactly five experts (aaa111-old folded into bbb222-new)
+        self.assertIn("helm session experts (5):", out)
+
 
 class CliWiringTest(unittest.TestCase):
     def test_verb_registered_and_dispatch_clean(self):

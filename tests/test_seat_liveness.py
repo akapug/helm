@@ -527,6 +527,74 @@ class UpstreamWallCompositionTest(unittest.TestCase):
         self.assertNotIn("liveness IDLE", out.getvalue())
 
 
+    def test_a_WALLED_row_carries_its_since_and_its_detail(self):
+        """A production record always carries the canary's detail. The row
+        names the wall's detail AND when the wall began; neither replaces
+        the other."""
+        rec = {"state": "RATE-LIMITED", "dark": True,
+               "since": "2026-08-04T11:06:51Z",
+               "detail": "HTTP 429 then HTTP 429 (3s apart)"}
+        row, _ = self.liveness(({"codex": dict(rec, seats={"codex": rec})},
+                                None))
+        self.assertEqual(row["state"], "WALLED")
+        self.assertIn("since 2026-08-04T11:06:51Z", row["blocked_on"])
+        self.assertIn("HTTP 429 then HTTP 429 (3s apart)", row["blocked_on"])
+
+    def test_an_AUTH_401_seat_walls_while_its_family_is_not_dark(self):
+        """One proxy's credential failing is that seat's wall even while its
+        siblings answer; any other dark state still needs the family dark
+        (the healthy-sibling arm above pins that for a cooldown)."""
+        def snap(state):
+            return ({"codex": {"state": "UNKNOWN", "dark": False, "seats": {
+                "codex": {"state": state, "dark": True,
+                          "since": "2026-09-25T22:45:26Z",
+                          "detail": "port 8317: 10 requests failed on "
+                                    "upstream auth"},
+                "seat-b": {"state": "HEALTHY", "dark": False}}}}, None)
+        auth, _ = self.liveness(snap("AUTH-401"))
+        self.assertEqual(auth["state"], "WALLED")
+        self.assertIn("AUTH-401", auth["blocked_on"])
+        self.assertIn("port 8317", auth["blocked_on"])
+        rate, _ = self.liveness(snap("RATE-LIMITED"))
+        self.assertEqual(rate["state"], "IDLE")
+
+    def test_the_incident_reads_WALLED_and_stranded_on_auth_end_to_end(self):
+        """task/3199 through every hop: the proxy log's 10 unmarked 401s over
+        four minutes -> log_observation -> upstream_health (no canary could
+        say) -> seat liveness WALLED -> idle-dispatch: not a live pane, and
+        stranded on auth."""
+        import shutil
+        import tempfile
+        import time
+        from helm import idle_dispatch
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        body = json.dumps(json.dumps({"type": "error", "error": {
+            "type": "authentication_error",
+            "message": "Incorrect API key provided"}}))
+        path = os.path.join(d, "proxy.log")
+        with open(path, "w") as f:
+            for i in range(10):
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(
+                    time.time() - 300 + i * 26))
+                f.write('[%s] [a2f8ba2a] [warn ] [gin_logger.go:95] 401 |'
+                        '       10.206s |       127.0.0.1 | POST    '
+                        '"/v1/messages?beta=true" | refusal_origin_v1=unknown'
+                        ' | response_body=%s\n' % (ts, body))
+        observed = proxywatch.log_observation(path)
+        self.assertEqual(observed["auth_failed"], 10)
+        up = proxywatch.upstream_health(
+            [{"seat": "codex", "family": "codex", "port": 8317,
+              "probe": None, "error": None,
+              "log_auth_failed": observed["auth_failed"]}],
+            now=time.time(), prior={})
+        row, _ = self.liveness((up, None))
+        self.assertEqual(row["state"], "WALLED")
+        self.assertIn("AUTH-401", row["blocked_on"])
+        self.assertEqual(idle_dispatch._live_pane("codex", row), "")
+        self.assertIn("stranded on auth",
+                      idle_dispatch._provider_wall("codex", row))
+
 class LivenessLifecycleTest(unittest.TestCase):
     """Every non-answer is an HONEST UNKNOWN, not a guess — the lifecycle walk
     the lane brief demanded: no record, headless, read-failed, stale handle."""
@@ -1591,3 +1659,226 @@ class ARepeatedWallIsStillAWallTest(unittest.TestCase):
         with mock.patch.object(seat_lifecycle, "_LIVENESS_STATES", ()):
             with self.assertRaisesRegex(RuntimeError, "empty table"):
                 seat_lifecycle._is_wall_line("usage balance exhausted")
+
+
+# THE DEAD-TURN FIXTURES. Each is the viewport a Claude-Code-over-proxy seat
+# shows after its last request failed: the error entry, the turn-landed row,
+# the input box and the footer. The error bodies carry no credential shape.
+_FOOTER = ("────────────────────────────────\n❯ \n"
+           "────────────────────────────────\n"
+           "  ⏵⏵ bypass permissions on · ← for agents")
+_DIED_401 = ("● Bash(helm chat read)\n"
+             "  ⎿  3 rows\n"
+             "● API Error: 401 {\"type\":\"error\",\"error\":{\"type\":"
+             "\"authentication_error\",\"message\":\"Incorrect API key "
+             "provided\"}}\n"
+             "✻ Worked for 2s\n" + _FOOTER)
+
+
+class DeadTurnOverHealthyProxyTest(unittest.TestCase):
+    """A TURN THAT DIED ON AN UPSTREAM ERROR, OVER A PROXY THAT HAS READ HEALTHY
+    SINCE T, IS A SEAT ONE PROMPT WAKES (task/3217).
+
+    The pane is IDLE, and that stays true: the composer is empty and no turn
+    is in flight. What IDLE cannot say is that the turn ENDED on the error and
+    that nothing will start another one, because the seat's beacon ended with
+    that turn. The row carries that fact beside the state, from the pane tail
+    and the seat's own proxywatch record. A proxy that still refuses keeps its
+    WALLED reading, and a pane whose newest entry is anything but the error
+    carries no dead turn."""
+
+    def liveness(self, tail, seat_state="HEALTHY", dark=False, snapshot=None):
+        rec = {"seat": "seat-a", "harness": "orca", "handle": "term_x",
+               "worktree": "/w", "room": "helm", "ts": "T"}
+        ad = mock.Mock()
+        ad.read.return_value = tail
+        if snapshot is None:
+            record = {"state": seat_state, "dark": dark, "since": "T0",
+                      "detail": "fixture"}
+            snapshot = ({"fam-a": dict(record, seats={"seat-a": record})},
+                        None)
+        with mock.patch.object(seat, "_spawn_record", return_value=rec), \
+             mock.patch.object(seat, "_seat_family",
+                               return_value=("fam-a", None)), \
+             mock.patch.object(seat, "_resolve_registered_pane",
+                               return_value=(ad, "term_x", "")), \
+             mock.patch("helm.proxywatch.upstream_snapshot",
+                        return_value=snapshot):
+            return seat.seat_liveness("seat-a")
+
+    def test_a_401_over_a_healthy_proxy_carries_the_dead_turn(self):
+        row = self.liveness(_DIED_401)
+        self.assertEqual(row["state"], "IDLE")
+        self.assertEqual(row.get("turn_died"),
+                         {"error": "API Error: 401", "upstream": "HEALTHY",
+                          "since": "T0"})
+
+    def test_every_upstream_error_shape_is_a_dead_turn(self):  # noqa: VACUOUS_ASSERTION — equality to the non-empty expected list is the positive control on every case
+        """Auth, rate, server and transport failures are all cured by a proxy
+        that answers again. The label is a classification, never the pane's
+        bytes: a viewport is raw external content."""
+        cases = (("● API Error: 529 {\"type\":\"overloaded_error\"}",
+                  "API Error: 529"),
+                 ("● API Error: Request rejected (429) · slow down",
+                  "API Error: 429"),
+                 ("● API Error: Connection error.",
+                  "API Error: connection error"),
+                 ("  ⎿  API Error: Request timed out.",
+                  "API Error: timed out"),
+                 ("● Connection lost mid-response",
+                  "Connection lost mid-response"))
+        got = []
+        for line, _want in cases:
+            row = self.liveness("● Read(notes.md)\n  ⎿  12 lines\n%s\n%s"
+                                % (line, _FOOTER))
+            got.append((row["state"], (row.get("turn_died") or {}).get("error")))
+        self.assertEqual(got, [("IDLE", want) for _line, want in cases])
+
+    def test_a_turn_in_flight_is_not_a_dead_turn(self):
+        control = self.liveness(_DIED_401)
+        self.assertIn("turn_died", control)
+        running = self.liveness(_DIED_401.replace(
+            "← for agents", "esc to interrupt"))
+        self.assertEqual(running["state"], "RUNNING")
+        self.assertNotIn("turn_died", running)
+
+    def test_a_proxy_still_refusing_keeps_its_wall_and_no_dead_turn(self):
+        """task/3199's reading owns a proxy that still refuses: stranded on
+        auth, never 'wake with one prompt'."""
+        control = self.liveness(_DIED_401)
+        self.assertIn("turn_died", control)
+        auth = self.liveness(_DIED_401, seat_state="AUTH-401", dark=True)
+        self.assertEqual(auth["state"], "WALLED")
+        self.assertIn("AUTH-401", auth["blocked_on"])
+        self.assertNotIn("turn_died", auth)
+        rate = self.liveness(_DIED_401, seat_state="RATE-LIMITED", dark=True)
+        self.assertEqual(rate["state"], "WALLED")
+        self.assertIn("RATE-LIMITED", rate["blocked_on"])
+        self.assertNotIn("turn_died", rate)
+
+    def test_a_proxy_that_has_not_read_HEALTHY_says_nothing_about_recovery(self):
+        """UNKNOWN is not healthy, and a stale or unreadable record is not a
+        record. Neither may mint 'proxy healthy since T'."""
+        control = self.liveness(_DIED_401)
+        self.assertIn("turn_died", control)
+        unknown = self.liveness(_DIED_401, seat_state="UNKNOWN")
+        stale = self.liveness(_DIED_401, snapshot=(
+            None, "proxywatch state is 90m old, bar 40m"))
+        self.assertEqual(unknown["state"], "IDLE")
+        self.assertEqual(stale["state"], "IDLE")
+        self.assertNotIn("turn_died", unknown)
+        self.assertNotIn("turn_died", stale)
+
+    def test_HEALTHY_without_when_does_not_mint_recovery(self):  # noqa: VACUOUS_ASSERTION — the normal HEALTHY control mints the field before both malformed records must omit it
+        """A state name without its episode timestamp proves no recovery edge.
+        Legacy and partially-written records may still pass the shared reader;
+        neither may become the stronger 'healthy since T' act predicate."""
+        self.assertIn("turn_died", self.liveness(_DIED_401))
+        for since in (None, ""):
+            record = {"state": "HEALTHY", "dark": False,
+                      "detail": "fixture"}
+            if since is not None:
+                record["since"] = since
+            snapshot = ({"fam-a": dict(
+                record, seats={"seat-a": record})}, None)
+            with self.subTest(since=since):
+                row = self.liveness(_DIED_401, snapshot=snapshot)
+                self.assertEqual(row["state"], "IDLE")
+                self.assertNotIn("turn_died", row)
+
+    def test_an_idle_pane_with_no_error_line_is_not_a_dead_turn(self):
+        control = self.liveness(_DIED_401)
+        self.assertIn("turn_died", control)
+        row = self.liveness("● Done — the lane is landed.\n✻ Worked for 9s\n"
+                            + _FOOTER)
+        self.assertEqual(row["state"], "IDLE")
+        self.assertNotIn("turn_died", row)
+
+    def test_an_error_the_seat_worked_past_is_history(self):
+        """Position, as every other rung here reads it: an entry newer than
+        the error is proof the turn loop ran after it."""
+        control = self.liveness(_DIED_401)
+        self.assertIn("turn_died", control)
+        worked = _DIED_401.replace(
+            "✻ Worked for 2s\n",
+            "● Retried; the review is posted.\n✻ Worked for 40s\n")
+        row = self.liveness(worked)
+        self.assertEqual(row["state"], "IDLE")
+        self.assertNotIn("turn_died", row)
+
+    def test_a_request_shaped_400_is_not_a_dead_turn(self):  # noqa: VACUOUS_ASSERTION — the 401 control on the same helper is unconditional, and each case asserts it reached the IDLE leaf before its absence
+        """A 400 is the request, not the upstream: the same prompt fails the
+        same way, and a context overflow belongs to autocompact."""
+        control = self.liveness(_DIED_401)
+        self.assertIn("turn_died", control)
+        for line in ("● API Error: 400 prompt is too long: context exceeds "
+                     "maximum",
+                     "● API Error: 400 Invalid schema for function 'Artifact'",
+                     "● API Error: Request was aborted."):
+            with self.subTest(line=line):
+                row = self.liveness(_DIED_401.replace(
+                    _DIED_401.splitlines()[2], line))
+                self.assertEqual(row["state"], "IDLE")
+                self.assertNotIn("turn_died", row)
+
+    def test_the_reading_names_the_wake_verb_only_with_no_live_beacon(self):
+        """The sentence every consumer prints, composed once. The beacon is
+        the caller's measurement: a live one means an @mention wakes the
+        seat, and an unmeasured one proves nothing."""
+        row = self.liveness(_DIED_401)
+        text = seat_lifecycle.dead_turn_reading(row, beacon_none=True)
+        for part in ("turn died on upstream error (API Error: 401)",
+                     "proxy healthy since T0", "wake with one prompt",
+                     "`helm seat resume-turn --nudge --seat seat-a`"):
+            self.assertIn(part, text)
+        self.assertNotIn("reassign", text.lower())
+        self.assertEqual(
+            [seat_lifecycle.dead_turn_reading(row, beacon_none=b)
+             for b in (False, None)], ["", ""])
+        idle = self.liveness("● Done.\n" + _FOOTER)
+        self.assertEqual(
+            seat_lifecycle.dead_turn_reading(idle, beacon_none=True), "")
+
+    def test_a_log_opened_auth_wall_that_ends_reads_UNKNOWN_not_a_dead_turn(self):
+        """task/3199's proxy-log rung opens an AUTH-401 wall on a seat no
+        canary can measure and ends it when its log evidence ends. That end
+        reads UNKNOWN, and UNKNOWN is not recovery: a seat whose turn died
+        sends nothing, so a quiet log says nothing about the key. The wall
+        reads stranded on auth, its end reads plain IDLE, and only a canary's
+        HEALTHY reads 'healthy since T'. Three passes through the REAL
+        `upstream_health`, each composed on the record the last one wrote."""
+        import time
+        blind = (("UNKNOWN", "proxy port, token, or model unavailable",
+                  None), None, "NO-REPRESENTATIVE")
+        healthy = (("HEALTHY", "HTTP 200", 5), None, "VERIFIED")
+
+        def watch_pass(prior, auth_failed, canary):
+            census = {"seat": "seat-a", "family": "fam-a", "port": 8599,
+                      "probe": "healthy", "error": None,
+                      "log_auth_failed": auth_failed}
+            with mock.patch.object(proxywatch, "_seat_canary_observation",
+                                   return_value=canary):
+                return proxywatch.upstream_health([census], now=time.time(),
+                                                  prior=prior)
+
+        opened = watch_pass({}, 10, blind)
+        ended = watch_pass({"upstream": opened}, None, blind)
+        answered = watch_pass({"upstream": ended}, None, healthy)
+        record = {name: up["fam-a"]["seats"]["seat-a"]
+                  for name, up in (("opened", opened), ("ended", ended),
+                                   ("answered", answered))}
+        self.assertEqual(record["opened"].get("measured_by"), "proxy-log")
+        self.assertEqual([record[k]["state"] for k in
+                          ("opened", "ended", "answered")],
+                         ["AUTH-401", "UNKNOWN", "HEALTHY"])
+        walled = self.liveness(_DIED_401, snapshot=(opened, None))
+        self.assertEqual(walled["state"], "WALLED")
+        self.assertIn("AUTH-401", walled["blocked_on"])
+        self.assertNotIn("turn_died", walled)
+        quiet = self.liveness(_DIED_401, snapshot=(ended, None))
+        self.assertEqual(quiet["state"], "IDLE")
+        self.assertNotIn("turn_died", quiet)
+        woke = self.liveness(_DIED_401, snapshot=(answered, None))
+        self.assertEqual(woke.get("turn_died"),
+                         {"error": "API Error: 401", "upstream": "HEALTHY",
+                          "since": record["answered"]["since"]})

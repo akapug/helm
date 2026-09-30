@@ -277,6 +277,27 @@ class TestComposerRuntime(unittest.TestCase):
         self.assertTrue(self.out["clear_ledger_empty"],
                         "the emptied box left its stale ledger entry in place")
 
+    # -- goal-ledger L1: the verdict binds to the rev the card was drawn at ---
+    def test_the_verdict_carries_the_rev_its_card_was_drawn_at(self):
+        self.assertTrue(self.out["rev_line"],
+                        "a card revised after his comment does not say so")
+        self.assertEqual(self.out["rev_url"], "/api/decisions/verdict")
+        self.assertEqual(self.out["rev_sent"], 2,
+                         "the Yes left the page without the rev he read")
+        self.assertEqual(self.out["rev_comment"], "yes, and index it")
+        self.assertFalse(self.out["rev1_line"],
+                         "an unrevised card claims a revision")
+
+    def test_a_stale_rev_refusal_redraws_the_card_and_keeps_his_words(self):
+        self.assertTrue(self.out["stale_refetched"],
+                        "a stale-rev refusal left the old rev on screen")
+        self.assertTrue(self.out["stale_redrawn_at"],
+                        "the redraw does not show the current rev")
+        self.assertEqual(self.out["stale_kept_comment"], "yes, and index it",
+                         "the redraw ate the comment that rode the verdict")
+        self.assertFalse(self.out["plain_fail_refetched"],
+                         "control: any other failure must not refetch")
+
     # -- the original three scenes, now odqInit-driven -----------------------
     def test_typing_holds_the_redraw_and_says_so(self):  # noqa: VACUOUS_ASSERTION — the zero here is a finding because test_control_a proves the same instrument sees a redraw
         self.assertEqual(self.out["typing_sets"], 0,

@@ -182,7 +182,8 @@ def _throttle(pid, start, root=None, proc=None):
 
 
 def _census():
-    """({pid: row}, census_failed, who_failed, census_partial) straight from
+    """({pid: row}, census_failed, who_failed, census_partial,
+    excluded_by_seat) straight from
     session._proc_claude_census() — the ONE sid truth owner (record/argv/who/
     cwd rungs, generation recheck, canonical config root, bracketed environ).
     Fleet never re-derives any of it. census_failed means the /proc
@@ -190,10 +191,12 @@ def _census():
     proven-empty estate. who_failed means the who rung was never probed.
     census_partial means a mandatory per-pid probe failed before the pid's
     comm could prove or refute claude: the row count is a FLOOR ('at least
-    N'), never a certified estate total."""
+    N'), never a certified estate total. excluded_by_seat maps a seat name
+    to how many non-agent processes carried it and were not counted."""
     c = session._proc_claude_census()
     return ({r["pid"]: r for r in c["rows"]}, c["listing_failed"],
-            c["who_failed"], c["census_partial"])
+            c["who_failed"], c["census_partial"],
+            c.get("excluded_by_seat") or {})
 
 
 def _generation_intact(pid, start):
@@ -821,7 +824,11 @@ def _seat_for(sid, env, roster, roster_err):
 
 
 def rows():
-    census, census_failed, who_failed, census_partial = _census()
+    census_result = _census()
+    census, census_failed, who_failed, census_partial = census_result[:4]
+    # A caller that stubs the four-tuple (every fleet-rows fixture) has no
+    # exclusion tally. Missing is empty, never an error.
+    excluded_by_seat = census_result[4] if len(census_result) > 4 else {}
     # the daemon scan runs AFTER the census bracket: a daemon that started
     # between the two scans — whose freshly-spawned claude IS censused — is
     # then in the set, so the ppid walk can never pass through the missing
@@ -979,7 +986,8 @@ def rows():
         # code. A throttle failure that reaches only the printed sentence
         # lets `--json` carry an unavailable throttle line beside rc 0, which
         # launders a failed read into a successful shell verdict.
-        "throttle_partial": any(not r.get("throttle_known") for r in out)}
+        "throttle_partial": any(not r.get("throttle_known") for r in out),
+        "excluded_by_seat": excluded_by_seat}
 
 
 
@@ -1150,6 +1158,14 @@ def cmd_fleet(args):
     print("helm fleet — %s live claude process(es), %s orca daemon(s)%s%s"
           % (process_count, daemon_count, partial,
              _generation_verdict(gens, gens_unknown)))
+    # An orphan that inherited a seat name stays visible. Hiding it is how
+    # fleet and rehome treated a ugrep as the seat; the count is what the
+    # reaper reads later.
+    for name in sorted(flags.get("excluded_by_seat") or {}):
+        n = flags["excluded_by_seat"][name]
+        print("%d non-agent %s carrying seat name %s %s not counted"
+              % (n, "process" if n == 1 else "processes", name,
+                 "was" if n == 1 else "were"))
     # LEVELS EVERY ROW SHARES ARE REPORTED ONCE, NOT PER ROW. A cgroup above
     # the per-process leaves has ONE counter that every descendant inherits,
     # so printing it on all 60 rows repeats a single fact sixty times and

@@ -6,7 +6,7 @@ between seats and ALL THREE refuse the dead-seat case, each for a reason that
 is correct for its own question (surveyed 2026-08-27, file:line verified):
 
   `dispatch rebind`   demands MEASURED STARVATION or context exhaustion
-                      (dispatches.py, `_recipient_evidence`). Death is
+                      (dispatches_rebind.py, `_recipient_evidence`). Death is
                       neither: a seat with no process is not starved.
   `task takeover`     demands the incumbent's pane be LIVE (takeover.py,
                       "proxywatch did not measure the incumbent pane LIVE —
@@ -329,7 +329,8 @@ def _rebind_rung(to, reason):
     canon, err = dispatches._recipient_operand(to)
     if err:
         return err
-    ok, why = dispatches._validate_recipient_rostered(canon, False)
+    ok, why = dispatches._validate_recipient_rostered(canon, False,
+                                                      door="rebind")
     if not ok:
         return why
     ok, why, _warning = dispatches._validate_recipient_usable(canon, False)

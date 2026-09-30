@@ -20,8 +20,11 @@ with it.
 """
 import atexit
 import contextlib
+import importlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -55,16 +58,11 @@ def home(prefix="helm-test-home-", var="HELM_HOME"):
 # value untouched.
 home(prefix="helm-test-cfgroots-", var="HELM_CONFIG_ROOTS")
 
-# EXPLICIT ROOM FOR EVERY TEST PROCESS: chat.post's room default now DERIVES
-# (env seam, then cwd project) instead of hardcoding "main" — the 2026-07-29
-# room-partition class fix. A test process's cwd is the REPO, so a bare
-# default-relying post would derive the repo's room and 60 hermetic tests
-# asserting #main would fail for a reason unrelated to what they test. Tests
-# therefore declare their room EXPLICITLY through the same env seam every
-# launched seat uses (launch.sh sets HELM_CHAT_ROOM) — the old behavior, now
-# stated instead of accidental. Tests OF the derivation itself mock
-# _default_post_room and are untouched by this.
-os.environ.setdefault("HELM_CHAT_ROOM", "main")
+# THE EXPLICIT TEST ROOM (HELM_CHAT_ROOM=main) is planted by tests/__init__,
+# which every runner imports before any test module: planted here, at this
+# module's first import, it appeared in the middle of whichever test module
+# imported this one first, and the slice runner's leak audit named that
+# module for it.
 
 
 def helm_tree(case, repo):
@@ -170,6 +168,50 @@ def repo_from_template(key, build, dest):
     path, facts = _TEMPLATES[key]
     shutil.copytree(path, dest, symlinks=True)
     return dict(facts)
+
+
+def copy_live_tree(src, dest):
+    """Copy `src`, a directory of the LIVE checkout (`helm/`, `tests/`,
+    `bin/`), to `dest`, which must not exist. Bytecode is not copied, and a
+    file that is gone by the time its turn comes is skipped.
+
+    OTHER WORKERS WRITE INTO THE CHECKOUT WHILE IT IS COPIED. A sliced suite
+    runs many workers against one tree, and every import writes bytecode into
+    it: importlib writes `__pycache__/<mod>.cpython-313.pyc.<id>` and renames
+    it over `<mod>.cpython-313.pyc`. A bare `shutil.copytree` lists the
+    directory, another worker's rename lands, the copy of the listed name
+    raises, and copytree raises `shutil.Error` for it at the end. The whole
+    suite gate 72deeacb13c8264a (16 workers) errored
+    SameCommitIsSilentTest.test_an_unreadable_head_says_it_could_not_compare
+    in setUp that way, on
+    `helm/configs/__pycache__/_cli.cpython-313.pyc.125941355178352`; the arm
+    passes alone.
+
+    TWO CURES, because they close different files. `__pycache__` and `*.pyc`
+    are not copied at all: no fixture needs bytecode, and a fixture that
+    commits it carries whichever modules this process happened to import
+    first. Any OTHER file that is listed and then gone (a tool's atomic-write
+    temp beside a source file) is skipped instead of failing the copy: it was
+    a transient, and the file it was renamed over is copied under its own
+    name. Only a missing source file is skipped; every other error still
+    fails the copy.
+
+    A tree a test built itself is not live, and is copied with a plain
+    `shutil.copytree`, as `repo_from_template` does."""
+    shutil.copytree(src, dest,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                    copy_function=_copy_if_present)
+
+
+def _copy_if_present(src, dest):
+    """`shutil.copy2`, except that a source file which no longer exists is
+    skipped: the copy function of `copy_live_tree`."""
+    try:
+        return shutil.copy2(src, dest)
+    except FileNotFoundError:
+        if os.path.lexists(src):
+            raise
+        return dest
 
 
 def own_env(case, key, value):
@@ -725,3 +767,110 @@ def pin_admission_code(proc, ledger):
             "    return _pin_preflight(*args, **kwargs)\n"
             "_pin_gate._scratch_preflight = _pin_pre\n"
             % (proc, ledger, ledger, healthy_tmp("")))
+
+
+class FakeUserSystemd(object):
+    """What `fake_user_systemd` built: where the units land and what ran."""
+
+    def __init__(self, home, systemctl, log):
+        self.home = home
+        self.unit_dir = home and os.path.join(home, ".config", "systemd",
+                                              "user")
+        self.systemctl = systemctl
+        self.log = log
+
+    def calls(self):
+        """[argv after the program] for every systemctl run, in order."""
+        try:
+            with open(self.log, encoding="utf-8") as fh:
+                lines = fh.read().split("\n")
+        except FileNotFoundError:
+            return []
+        return [line.split("\0")[:-1] for line in lines if line]
+
+
+def fake_user_systemd(case, rc=0, home=True, stderr=""):
+    """THE SEAM a test installs a user timer through (task/3306).
+
+    Every helm timer installer writes its units under
+    `timerhealth.user_unit_dir()`, ~/.config/systemd/user unless
+    HELM_USER_UNIT_DIR names another (task/3307), and runs the `systemctl` it
+    finds on PATH. So this moves HOME into a temp dir, points
+    HELM_USER_UNIT_DIR at that home's unit directory, and puts a recording
+    `systemctl` first on PATH, for the rest of the case: the installer's real
+    code runs, its units land in `unit_dir`, and `calls()` answers what it
+    asked systemd to do. The fake lives under the suite root, which is how
+    tests/__init__.py tells it from the host's systemctl, which it refuses. A
+    child the case spawns inherits all three, so a verb run as a subprocess
+    is faked the same way. `rc` is the exit status every call answers, and
+    `stderr` the text every call prints there.
+
+    `home=False` fakes systemctl alone, for a READER of systemd state (the
+    doctor's rungs) whose other checks read the real HOME's layout: nothing
+    is written, and every question gets the fake's answer.
+    """
+    from unittest import mock
+    root = tempfile.mkdtemp(prefix="helm-test-systemd-")
+    case.addCleanup(shutil.rmtree, root, True)
+    home_dir = os.path.join(root, "home") if home else None
+    bindir = os.path.join(root, "bin")
+    os.makedirs(bindir)
+    env = {"PATH": bindir + os.pathsep + os.environ.get("PATH", os.defpath)}
+    if home_dir:
+        os.makedirs(home_dir)
+        env["HOME"] = home_dir
+        env["HELM_USER_UNIT_DIR"] = os.path.join(home_dir, ".config",
+                                                 "systemd", "user")
+    log = os.path.join(root, "systemctl.calls")
+    path = os.path.join(bindir, "systemctl")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\n"
+                 "{ printf '%%s\\0' \"$@\"; printf '\\n'; } >> %s\n"
+                 "printf '%%s' %s >&2\n"
+                 "exit %d\n" % (shlex.quote(log), shlex.quote(stderr), rc))
+    os.chmod(path, 0o755)
+    if home_dir:
+        import_home_freezers()
+    patch = mock.patch.dict(os.environ, env)
+    patch.start()
+    case.addCleanup(patch.stop)
+    return FakeUserSystemd(home_dir, path, log)
+
+
+#: A module-scope assignment that reads the home directory: the shape of a
+#: helm module that freezes HOME the moment it is first imported.
+_HOME_AT_IMPORT = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*\s*=.*expanduser\(\s*[\"']~", re.M)
+
+
+def home_freezers(root=None):
+    """[module name] for every helm module that captures HOME at import."""
+    root = root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    names = []
+    for d, _dirs, files in os.walk(os.path.join(root, "helm")):
+        for f in sorted(files):
+            if not f.endswith(".py"):
+                continue
+            path = os.path.join(d, f)
+            with open(path, encoding="utf-8") as fh:
+                if not _HOME_AT_IMPORT.search(fh.read()):
+                    continue
+            rel = os.path.relpath(path, root)[:-len(".py")]
+            names.append(rel.replace(os.sep, ".").removesuffix(".__init__"))
+    return sorted(names)
+
+
+def import_home_freezers():
+    """Import every HOME-freezing helm module BEFORE a seam moves HOME.
+
+    fake_user_systemd moves HOME for the rest of a case, so a helm module
+    first imported inside that window freezes the FAKE home into its module
+    constants for every later case in the worker: a lite mint then names
+    <suite root>/tmp/helm-test-systemd-*/home/.claude/CLAUDE.md, and only in
+    the slice orders that put such a case before test_seat, so a lane that
+    merely adds modules can turn it red. Importing the freezers first makes each capture
+    the process's own HOME whatever order the slices run in. They are found
+    by scanning the source, not listed, so a freezer is covered the day it
+    lands."""
+    for name in home_freezers():
+        importlib.import_module(name)

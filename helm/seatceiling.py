@@ -537,7 +537,7 @@ def seat_slice_name(seat):
     return "agents-%s.slice" % re.sub(r"[^A-Za-z0-9_]", "_", str(seat or ""))
 
 
-def slice_members(root=CGROUP_ROOT, proc="/proc"):
+def slice_members(root=CGROUP_ROOT, proc="/proc", strict=False):
     """({slice-path: [pid]}, trouble) — every same-uid process that sits under
     a seat slice, grouped by that slice. ONE /proc walk, one small read per
     process.
@@ -546,7 +546,10 @@ def slice_members(root=CGROUP_ROOT, proc="/proc"):
     line, so a pid-named slice, a renamed seat and a slice nobody listed are
     all found the same way. `trouble` is set when the walk could not be
     completed, and the caller must then treat the fleet as UNKNOWN rather
-    than calm."""
+    than calm. With `strict`, a same-uid process whose live directory exists
+    but whose cgroup fact is missing or unreadable fails the whole walk: a
+    safety decision may not omit a possible agent. The fleet display keeps
+    the race-tolerant default."""
     try:
         me = os.getuid()
         names = [n for n in os.listdir(proc) if n.isdigit()]
@@ -564,10 +567,19 @@ def slice_members(root=CGROUP_ROOT, proc="/proc"):
         try:
             if os.stat(pdir).st_uid != me:
                 continue
-        except OSError:
+        except FileNotFoundError:
             continue                 # exited between the listing and the stat
+        except OSError as exc:
+            if strict:
+                return {}, "pid %s's process facts would not read (%s)" % (
+                    n, exc.__class__.__name__)
+            continue
         raw = _read(os.path.join(pdir, "cgroup"))
         if raw is None or raw is ABSENT:
+            if not os.path.isdir(pdir):
+                continue             # exited between the stat and the read
+            if strict:
+                return {}, "pid %s's cgroup would not read" % n
             continue
         rel = seat_slice_of(_unified(raw))
         if rel is None:
@@ -816,3 +828,212 @@ def pressure_cells(p):
     # unreadable shmem must never reach a reader as a measured 0.
     return {"mem_pressure": p.word, "mem_pressure_text": pressure_line(p),
             "mem_pressure_mark": mark, "mem_shmem": p.shmem}
+
+
+# ---------------------------------------------------------------------------
+# the fleet's own stall — agents.slice's PSI, read by a process OUTSIDE it
+# ---------------------------------------------------------------------------
+#
+# EVERY READING ABOVE IS TAKEN FROM INSIDE THE FLEET. fleet_pressure's callers
+# are Stop hooks, the roster and the scratch plane, and each of them runs in a
+# seat, so a stall of agents.slice ITSELF (its memory.high, its CPU quota)
+# stalls every one of them together, and nothing reports it: every seat stalls
+# for as long as it lasts, the host can read half idle, and no detector inside
+# the fleet posts a row. The readers below are what a process in
+# app.slice (helm/pressurewatch.py, on a user timer) takes, and what a timed-out
+# hook appends to its TIMED OUT line.
+#
+# THEY KEY ON PSI STALL TIME, NEVER ON FULLNESS. agents.slice sits at 96-99%
+# of its memory.high as its healthy steady state, with memory PSI 0.00
+# (measured on a fleet host, with no stall running). memory.current
+# and memory.high are reported beside a reading and never compared to decide
+# anything. The `some` line of a cgroup's *.pressure file counts the time at
+# least one task of the cgroup's subtree waited for that resource; its `total`
+# is microseconds, so the growth of `total` between two readings is the stall
+# time in that window, measured by the kernel.
+
+#: The slice bin/claude nests every seat slice in.
+FLEET_SLICE = "agents.slice"
+#: An explicit fleet slice DIRECTORY. When it is set it is read whatever SWITCH
+#: says, because it names a tree the way a fixture does. bin/helm-hook reads
+#: the same variable, so the two halves of the timeout line agree.
+FLEET_ENV = "HELM_FLEET_CGROUP"
+#: The two stall kinds a fleet reading takes, in the order every line prints.
+PSI_KINDS = ("cpu", "memory")
+#: A user manager's own cgroup component: the fleet slice sits directly under
+#: it, beside app.slice, where a user timer's service runs.
+_USER_MANAGER = re.compile(r"^user@[0-9]+\.service$")
+#: The words both halves of the timeout clause use for their two UNKNOWNs.
+#: bin/helm-hook spells the same sentences; tests/test_pressurewatch.py
+#: compares the two renderings.
+NO_FLEET_PATH = "no agents.slice on this process's cgroup path"
+NO_FLEET_READ = "agents.slice pressure would not read"
+
+#: One fleet reading. `fleet` is the slice directory or None; `psi` is
+#: {kind: parse_psi() or None}; `current` and `high` are parse_size answers,
+#: REPORTED ONLY; `quota` is the cpu.max quota in cores or None; `host` is
+#: {kind: parse_psi() or None} of <proc>/pressure; `swap` is (total, free)
+#: bytes or None; `why` is "" or why the fleet's stall is (partly) UNKNOWN.
+Stall = namedtuple("Stall", "fleet psi current high quota host swap why")
+
+
+def parse_psi(text):
+    """{"some": {...}, "full": {...}} from a *.pressure file, or None.
+
+    avg10, avg60 and avg300 are percents (float), total is microseconds (int).
+    ANY line that does not parse makes the whole answer None, and so does a
+    file with no `some` line: a half-read file is not a reading. A `full`
+    line is optional (a host's /proc/pressure/cpu had none before 5.13)."""
+    if text is None or text is ABSENT:
+        return None
+    out = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if parts[0] not in ("some", "full"):
+            return None
+        row = {}
+        for field in parts[1:]:
+            key, sep, value = field.partition("=")
+            if not sep:
+                return None
+            try:
+                row[key] = int(value) if key == "total" else float(value)
+            except ValueError:
+                return None
+        if not {"avg10", "avg60", "avg300", "total"} <= set(row):
+            return None
+        out[parts[0]] = row
+    return out if "some" in out else None
+
+
+def fleet_slice(root=CGROUP_ROOT, proc=HOST_PROC):
+    """(directory, "") or (None, why): the fleet slice, found from THIS
+    process's own unified cgroup line.
+
+    A seat's process sits under agents.slice, so the path is cut after that
+    component. A user timer's service sits under app.slice, beside it, so a
+    path with a user@<uid>.service component and no agents.slice names the slice
+    under that manager. Nothing else is guessed: a v1 or hybrid line, or a
+    path under neither, is UNKNOWN. FLEET_ENV names the directory outright."""
+    named = os.environ.get(FLEET_ENV)
+    if named:
+        return named, ""
+    raw = _read(os.path.join(proc, "self", "cgroup"))
+    rel = None if raw is None or raw is ABSENT else _unified(raw)
+    parts = [p for p in (rel or "").split("/") if p]
+    if FLEET_SLICE in parts:
+        keep = parts[:parts.index(FLEET_SLICE) + 1]
+    else:
+        at = [i for i, p in enumerate(parts) if _USER_MANAGER.match(p)]
+        if not at:
+            return None, NO_FLEET_PATH
+        keep = parts[:at[0] + 1] + [FLEET_SLICE]
+    return os.path.join(root, *keep), ""
+
+
+def _cores(text):
+    """cpu.max's quota in cores, or None: `max` or a line that will not read
+    is no quota this reader can state."""
+    if text is None or text is ABSENT:
+        return None
+    parts = text.split()
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit() \
+            or not int(parts[1]):
+        return None
+    return int(parts[0]) / float(int(parts[1]))
+
+
+def _swap(proc):
+    """(SwapTotal, SwapFree) in bytes from <proc>/meminfo, or None."""
+    text = _read(os.path.join(proc, "meminfo"))
+    if text is None or text is ABSENT:
+        return None
+    got = {}
+    for line in text.splitlines():
+        parts = line.replace(":", " ").split()
+        if len(parts) >= 2 and parts[0] in ("SwapTotal", "SwapFree") \
+                and parts[1].isdigit():
+            got[parts[0]] = int(parts[1]) * 1024
+    if len(got) != 2:
+        return None
+    return got["SwapTotal"], got["SwapFree"]
+
+
+def fleet_stall(root=CGROUP_ROOT, proc=HOST_PROC):
+    """Stall for the fleet slice NOW, or None when SWITCH is off and nothing
+    names a tree. NEVER raises on a read: a file that will not read is a None
+    in the reading and a sentence in `why`, so a caller can say UNKNOWN and
+    can never mistake a blind reading for a calm one."""
+    named = os.environ.get(FLEET_ENV)
+    if not named and reads_host(root, proc):
+        if not host_read_on():
+            return None
+        sys.audit(HOST_READ_EVENT, root, proc)
+    host = {k: parse_psi(_read(os.path.join(proc, "pressure", k)))
+            for k in PSI_KINDS}
+    swap = _swap(proc)
+    if not named and not os.path.exists(os.path.join(root,
+                                                     "cgroup.controllers")):
+        return Stall(None, {k: None for k in PSI_KINDS}, None, None, None,
+                     host, swap, "there is no cgroup v2 hierarchy at %s" % root)
+    fleet, why = fleet_slice(root, proc)
+    if fleet is None:
+        return Stall(None, {k: None for k in PSI_KINDS}, None, None, None,
+                     host, swap, why)
+    if not os.path.isdir(fleet):
+        return Stall(fleet, {k: None for k in PSI_KINDS}, None, None, None,
+                     host, swap, "there is no agents.slice at %s" % fleet)
+    psi = {k: parse_psi(_read(os.path.join(fleet, "%s.pressure" % k)))
+           for k in PSI_KINDS}
+    blind = [k for k in PSI_KINDS if psi[k] is None]
+    return Stall(fleet, psi,
+                 parse_size(_read(os.path.join(fleet, "memory.current"))),
+                 parse_size(_read(os.path.join(fleet, "memory.high"))),
+                 _cores(_read(os.path.join(fleet, "cpu.max"))), host, swap,
+                 "%s at %s would not read" % (
+                     " and ".join("%s.pressure" % k for k in blind), fleet)
+                 if blind else "")
+
+
+def slice_psi(path):
+    """{kind: parse_psi() or None} for one slice directory."""
+    return {k: parse_psi(_read(os.path.join(path, "%s.pressure" % k)))
+            for k in PSI_KINDS}
+
+
+def _avg10_token(path):
+    """The raw text after `avg10=` on the `some` line, or None. RAW on
+    purpose: bin/helm-hook cannot format a float without a fork, so both
+    halves print the kernel's own digits."""
+    text = _read(path)
+    if text is None or text is ABSENT:
+        return None
+    first = (text.splitlines() or [""])[0].split()
+    if len(first) < 2 or first[0] != "some" \
+            or not first[1].startswith("avg10=") or len(first[1]) == 6:
+        return None
+    return first[1][6:]
+
+
+def stall_clause(root=CGROUP_ROOT, proc=HOST_PROC):
+    """What a TIMED OUT line appends so a timeout arrives with its cause:
+    "; fleet stall (agents.slice PSI some avg10): cpu X%, memory Y%",
+    "; fleet stall UNKNOWN: <why>", or "" when SWITCH is off and FLEET_ENV
+    names no tree — the same "nothing read, nothing said" every other
+    reading here gives under the switch. bin/helm-hook renders the same
+    sentences with shell builtins. Never raises on a read."""
+    if not os.environ.get(FLEET_ENV) and reads_host(root, proc):
+        if not host_read_on():
+            return ""
+        sys.audit(HOST_READ_EVENT, root, proc)
+    fleet, why = fleet_slice(root, proc)
+    if fleet is None:
+        return "; fleet stall UNKNOWN: %s" % why
+    got = [_avg10_token(os.path.join(fleet, "%s.pressure" % k))
+           for k in PSI_KINDS]
+    if None in got:
+        return "; fleet stall UNKNOWN: %s" % NO_FLEET_READ
+    return ("; fleet stall (agents.slice PSI some avg10): cpu %s%%, "
+            "memory %s%%" % tuple(got))

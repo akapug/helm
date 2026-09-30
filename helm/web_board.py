@@ -43,6 +43,13 @@ so the pipeline's newest close ran hours behind main. Every project's
 registered checkout is asked instead, see `_trunk_tip`. The same read counts
 the week's lands, one first-parent commit each.
 
+THE GATE IS READ OFF THE GATE WINDOW, NOT OFF THE PIPELINE (task/3129). A
+train's whole-suite gate is recorded by its door (`gatewindow`) and no land
+request says a train is being gated, so the kanban's gate column said "none"
+while one ran for 46 minutes. `_gate_join` reads the record
+`helm gate window show` reads, and a leased lane whose tip the running gate's
+head carries is drawn ON THE GATE (`_claims_landed`).
+
 LANES ARE COUNTED, NOT PROMISED. The headline is "lanes: R running of M
 possible". R is every live worktree claim across every project, one per lane
 however many seats hold it. M is the seats able to take work right now — up,
@@ -60,7 +67,7 @@ import sys
 import threading
 import time
 
-from . import gitfacts, registry, repofacts, scheduler
+from . import gitfacts, registry, repofacts, scheduler, web_land_model
 from .web_cache import _drop, _read_behind
 from .web_land import _api_lr
 from .web_quota import get_flags
@@ -80,6 +87,24 @@ BOARD_TTL_S = 120
 # not bound by this number; it keeps the snapshot's own bound.
 SECTION_LIMIT_S = 5 * BOARD_TTL_S
 
+# HOW OLD A LAND-PIPELINE SECTION MAY BE (task/3632). Its age is two ages
+# added: how long ago its leg read the pipeline (served for up to
+# SECTION_LIMIT_S while a read runs behind it) and how old the pipeline's
+# own reading was then (served for up to its hard bound while it rebuilds,
+# `web_land_model._LR_HARD_TTL_S`, and a body a restart restores is older
+# still until the first rebuild replaces it). The leg's bound alone sat
+# inside that sum, so a reading both caches were still serving and
+# refreshing read STALE: "helm 24 → helm 0 marked STALE → helm 24" in ten
+# minutes, and "other projects STALE" 48 s after a restart (console walk 2,
+# finding 2). Past the sum, one of the two has stopped.
+PIPELINE_LIMIT_S = SECTION_LIMIT_S + web_land_model._LR_HARD_TTL_S
+
+# HOW LONG THE FIRST BOARD OF A SERVER LIFE WAITS FOR THE ALL-PROJECTS READ
+# it kicks (task/3632): that read restores its body from disk in well under
+# a second, and a board answered without it drew every other project as
+# still being read.
+FLEET_FIRST_WAIT_S = 3.0
+
 # WHAT THE EXPANDED ROW SHOWS, bounded so a busy project stays a pane.
 TOP_TASKS = 5
 TOP_WAITS = 6
@@ -95,11 +120,18 @@ QUIET_S = 30 * 86400
 _WORKTREE = re.compile(r"^worktree:([^:]+):(.+)$")
 
 # THE FLAG FIELDS THE PAGE READS: the chip's hover and the flag card's rows.
-_FLAG_KEYS = ("colour", "cause", "axis", "provenance", "expires_at")
+_FLAG_KEYS = ("colour", "cause", "axis", "provenance", "money_provenance",
+              "expires_at", "credits")
 
 _SECTIONS = (("lights", "helm projects state"), ("flags", "helm burn"),
              ("tasks", "helm task list"), ("seats", "helm chat seats"),
-             ("lands", "helm lr list"), ("trunk", "git for-each-ref"))
+             ("lands", "helm lr list"), ("trunk", "git for-each-ref"),
+             ("gate", "helm gate window show"), ("teams", "helm team"))
+
+# A TRAIN'S MERGE, as `helm train` writes it (landwindow: "<train>: merge
+# lane <lane>"): the lanes a compose room carries are these merges between
+# the trunk it stood on and its head.
+_TRAIN_MERGE = re.compile(r"^(train\d+): merge lane (.+)$")
 
 
 def _section(source, measured_at, limit_s, unavailable=None, **extra):
@@ -315,11 +347,43 @@ def _flags_section():
                         overall=None,
                         unavailable=got.get("why") or "no fresh burn-flag "
                         "snapshot")
-    fams = {fam: {k: fl.get(k) for k in _FLAG_KEYS}
+    fams = {fam: dict({k: fl.get(k) for k in _FLAG_KEYS},
+                      bills=_family_bills(fam))
             for fam, fl in (got.get("families") or {}).items()
             if isinstance(fl, dict)}
     return _section("helm burn", got.get("measured_at"), got.get("bound_s"),
                     families=fams, overall=got.get("overall"))
+
+
+def _family_bills(family):
+    """The account groups that BILL a model family, in route order: the seat
+    catalog's one reading (`seat.billing_groups`), the same one the seeder
+    mints the declared rows from (task/3461). [] for a family served from
+    the operator's own GPUs, which has no bill; None where the catalog names
+    no bill. The flags speak model families and the accounts table vendors;
+    these groups are the join Fleet › credit draws both ways, and no group is
+    guessed from a family's name."""
+    from . import seat
+    return seat.billing_groups(family)
+
+
+def _teams_join():
+    """(section, {project: {team}}) — each project's team, its shares turned
+    into budgets and colours, its drift and its history (`teams.board_model`),
+    joined onto the project's row (task/3156). The section carries what the
+    card re-folds a draft with: the fleet's seats, each rate family's supply,
+    the per-seat burn, each local family's lanes, the owner's sentence per
+    colour, the roles and the approval tier.
+
+    EVERY KEY THE MODEL CARRIES BESIDE ITS PROJECTS RIDES THE SECTION, so a
+    reading `board_model` gains reaches the card without a second list here
+    to forget it (the lanes did not, on the first live read)."""
+    from . import teams
+    read_at = time.time()
+    model = teams.board_model(now=read_at)
+    return _section("helm team", read_at, SECTION_LIMIT_S,
+                    **{k: v for k, v in model.items() if k != "projects"}), \
+        {key: {"team": rec} for key, rec in model["projects"].items()}
 
 
 def _closings():
@@ -344,8 +408,9 @@ def _closings():
 
 
 def _tasks_join(keys):
-    """(section, {project: {open, in_progress, top}}, {project: {opened7,
-    closed7}}) from ONE read of the task ledger. The week's flow is counted
+    """(section, {project: {open, in_progress, p0, p1, top}}, {project:
+    {opened7, closed7}}) from ONE read of the task ledger. `p0` and `p1`
+    count the open rows at each rank, for the project's line (task/3445). The week's flow is counted
     off the ledger's events, so a row closed and then commented on is dated
     by its close, not by the comment."""
     from . import tasks
@@ -379,11 +444,14 @@ def _tasks_join(keys):
         if keys is not None and key not in keys:
             unplaced += 1
             continue
-        rec = out.setdefault(key, {"open": 0, "in_progress": 0, "top": []})
+        rec = out.setdefault(key, {"open": 0, "in_progress": 0, "p0": 0,
+                                   "p1": 0, "top": []})
         rec["open"] += 1
         rec["in_progress"] += row.get("status") == "in_progress"
+        prio = row.get("priority")
+        rec["p0"] += prio == "P0"
+        rec["p1"] += prio == "P1"
         if len(rec["top"]) < TOP_TASKS:
-            prio = row.get("priority")
             rec["top"].append({
                 "id": str(row.get("id") or ""),
                 "title": str(row.get("title") or ""),
@@ -395,31 +463,11 @@ def _tasks_join(keys):
 
 
 def _burn_family(row):
-    """The burn-flag family a roster seat spends, or None.
-
-    THE SAME TWO DOORS ROUTING READS. A self-verified launch family first,
-    translated from the harness word (`claude`) to the credential word the
-    flags use (`anthropic`) through `route.FROM_ALIASES`, which already holds
-    that mapping; then `seat.family_for`, which parses a numbered seat name
-    and reads the spawn register. Unverified runtime is display evidence, not
-    authority, so it is never believed."""
-    from . import route
-    runtime = row.get("runtime") if isinstance(row.get("runtime"), dict) \
-        else {}
-    if row.get("runtime_verified") is True:
-        spelled = str(runtime.get("family") or "").lower()
-        if spelled:
-            return route.FROM_ALIASES.get(spelled, spelled)
-    try:
-        from . import seat
-        family, err = seat.family_for(str(row.get("seat") or ""))
-    except Exception:          # noqa: BLE001 — a chip, not a verdict
-        return None
-    # THE NAME DOOR ANSWERS THE HARNESS WORD TOO (`<project>-claude` ->
-    # `claude`), so it is translated the same way: read raw, a RED anthropic
-    # flag would miss the seat and count it able to work.
-    return None if err or not family \
-        else route.FROM_ALIASES.get(str(family).lower(), family)
+    """The burn-flag family a roster seat spends, or None — asked of
+    `seat_usability.burn_family`, the one door the signing-liveness read
+    shares, so a seat's family has one answer on every surface."""
+    from . import seat_usability
+    return seat_usability.burn_family(row)
 
 
 def _running(claims):
@@ -439,8 +487,9 @@ def _running(claims):
     return out
 
 
-def _claims_landed(projects, key, lanes):
-    """({lane: {state, proof, tip}}, {lane: dirty}) for one project's claimed
+def _claims_landed(projects, key, lanes, gate=None, memo=None):
+    """({lane: {state, proof, tip}}, {lane: dirty}, {lane: gate}) for one
+    project's claimed
     lanes — IS THE WORK UNDER EACH LEASE ALREADY ON THE TRUNK, and for the
     lanes whose work is, IS THEIR ROOM DIRTY. A land releases no lease, so a
     lane stays claimed after it lands, and a claim read alone draws a landed
@@ -460,27 +509,50 @@ def _claims_landed(projects, key, lanes):
     the one the CLI prints as DIRTY and `helm lr foldcheck` keeps, and a board
     that dropped the flag would draw it as done. Nothing stamps a room's
     working tree, so this read is not memoised; the board's own section
-    cache is its bound. A lane not asked, or whose read raised, has no key."""
+    cache is its bound. A lane not asked, or whose read raised, has no key.
+
+    ON THE GATE (task/3130) is the third answer: {lane: gate} for each lane
+    whose work is NOT on the trunk yet and whose tip is an ancestor of the
+    running gate's room head (`gate`, from `_gate_heads`) — the lane rides a
+    train that is being gated, so it is neither building nor under review.
+    ONE `merge-base --is-ancestor` per such lane against that one head,
+    through `memo`, which lives for one board build. A lane already on the
+    trunk is on every later head too, so it is never asked; an UNKNOWN answer
+    is not a verdict and leaves the lane where it was."""
     rec = (projects or {}).get(key)
     path = rec.get("path") if isinstance(rec, dict) else None
     if not lanes or not path:
-        return {}, {}
-    from . import work
+        return {}, {}, {}
+    from . import vcs, work
     try:
         got = work.lanes_landed(path, lanes)
     except Exception as exc:        # noqa: BLE001 — named, never a verdict
         return {lane: {"state": "unknown", "tip": None,
                        "proof": "the landedness read raised (%s)"
-                       % type(exc).__name__} for lane in lanes}, {}
+                       % type(exc).__name__} for lane in lanes}, {}, {}
     landed = [lane for lane, v in got.items()
               if v.get("state") == work.LANE_LANDED]
     try:
         dirty = work.rooms_dirty(path, landed) if landed else {}
     except Exception:               # noqa: BLE001 — unread is null, never clean
         dirty = {}
+    on_gate, head = {}, (gate or {}).get("head")
+    memo = {} if memo is None else memo
+    for lane, v in got.items() if head else ():
+        tip = v.get("tip")
+        if v.get("state") != work.LANE_UNLANDED or not tip:
+            continue
+        ask = (path, tip, head)
+        if ask not in memo:
+            try:
+                memo[ask] = vcs.backend(path).ancestry(path, tip, head)
+            except Exception:       # noqa: BLE001 — unread is no verdict
+                memo[ask] = None
+        if memo[ask] == vcs.ANCESTOR:
+            on_gate[lane] = {"head": head[:12], "label": gate.get("label")}
     return {lane: {"state": v.get("state"), "proof": v.get("proof"),
                    "tip": (v.get("tip") or "")[:12] or None}
-            for lane, v in got.items()}, dirty
+            for lane, v in got.items()}, dirty, on_gate
 
 
 def _usable(seats, flags):
@@ -535,9 +607,12 @@ def _roster_read(reader, room="main"):
     return (hit[0] if hit else time.time()), rep
 
 
-def _seats_join(projects, flags, measured_at, rep):
+def _seats_join(projects, flags, measured_at, rep, gates=None, memo=None):
     """(section, {project: {seats, families, running}}, fleet) from the
-    roster report `rep`. `fleet` is {running, possible, claimed, seats,
+    roster report `rep`. `gates` is {project: the running gate's head and
+    label} (`_gate_heads`); a claimed lane riding that gate's train carries
+    it as `on_gate` (`_claims_landed`), with `memo` the one ancestry cache of
+    this board build. `fleet` is {running, possible, claimed, seats,
     offboard, unscoped}: R, M, R's two halves, the claimed lanes on projects
     the board has no row for (so the shares add up to R), and the seats at
     work where no project claims the directory. It is None when the roster
@@ -588,14 +663,15 @@ def _seats_join(projects, flags, measured_at, rep):
         if keys is not None and key not in keys:
             continue
         lanes = running.get(key) or {}
-        landed, dirty = _claims_landed(projects, key, lanes)
+        landed, dirty, on_gate = _claims_landed(
+            projects, key, lanes, gate=(gates or {}).get(key), memo=memo)
         out.setdefault(key, {"seats": [], "families": []})["running"] = [
             {"lane": lane, "kind": "claim", "seats": sorted(lanes[lane]),
-             "landed": landed.get(lane), "dirty": dirty.get(lane)}
+             "landed": landed.get(lane), "dirty": dirty.get(lane),
+             "on_gate": on_gate.get(lane)}
             for lane in sorted(lanes)] + [
             {"lane": None, "kind": "seat", "seats": [seat]}
             for seat in sorted(at_work.get(key) or ())]
-    why = "the roster did not validate" if rep.get("roster_failed") else None
     claimed = sum(len(lanes) for lanes in running.values())
     # A CLAIM ON A PROJECT THE BOARD HAS NO ROW FOR still runs, so it counts
     # in R and in its own share: the per-project shares plus this one add up
@@ -611,16 +687,25 @@ def _seats_join(projects, flags, measured_at, rep):
     landed_held = None if projects is None else sum(
         1 for rec in out.values() for r in rec.get("running") or ()
         if (r.get("landed") or {}).get("state") == "landed")
-    fleet = None if why else {
+    sec = _seats_section(measured_at, rep,
+                         unplaced if keys is not None else None)
+    fleet = None if sec["unavailable"] else {
         "running": None if seated is None else claimed + seated,
         "possible": len(usable), "claimed": claimed, "seats": seated,
         "offboard": offboard, "unscoped": unscoped, "landed": landed_held}
+    return sec, out, fleet
+
+
+def _seats_section(measured_at, rep, unplaced=None):
+    """The seats section off one roster report `rep` read at `measured_at`:
+    UNAVAILABLE when the roster did not validate. `unplaced` is the join's
+    count of seats on projects the board has no row for (`_seats_join`)."""
     return _section("helm chat seats", measured_at, SECTION_LIMIT_S,
-                    unavailable=why,
-                    unplaced=unplaced if keys is not None else None), out, fleet
+                    unavailable="the roster did not validate"
+                    if rep.get("roster_failed") else None, unplaced=unplaced)
 
 
-def _kanban_card(c):
+def _kanban_card(c, age=None):
     """One land-request card as the kanban draws it — the SAME fields for this
     project's pipeline and every other project's. `trunk_contains_tip` is the
     pipeline's own tri-state (True only when trunk PROVABLY holds the row's
@@ -629,12 +714,158 @@ def _kanban_card(c):
     (`landreq.on_main_unverdicted`: that work with NO verdict recorded). The
     server counts every such card on the on-main line and never sends it as
     a card; the word rides the wire so a page reading an older server's
-    cards folds exactly those, and never a row under a recorded verdict."""
+    cards folds exactly those, and never a row under a recorded verdict. A
+    HELD source-clean row on trunk is not one either (task/3053): it is a
+    live card whose `source_clean_on_main` names the close or the re-hold it
+    owes.
+
+    `owes_rehold` marks the one kind of such card whose move is its
+    RECIPIENT's re-hold (the sentence's RE-HOLD branch, read off the same two
+    fields `landreq.source_clean_on_main` reads): landed work nobody but that
+    reviewer can move, which the kanban counts on one line (`_kanban_feed`).
+    `age_s` is how long the card has waited, None when unknown.
+
+    WHAT THE ONE LAND BOARD DRAWS ON A CARD (task/3585), copied off the same
+    row and never looked up again: the task the pipeline joined (`_card_task`), the
+    holder the next move waits on (`_holder`), the reviewed tip, the gate
+    token, and the two marks the header strip counts, `contrary` and
+    `stalled`. A build with no reviewed tip has none — its base is the trunk
+    it was sent against, not its work.
+
+    `stalled` IS THE ALARM, NOT THE MEASUREMENT: `landreq.stall_alarm`, the
+    predicate `helm lr list` prints STALLED by, so a row a proved successor
+    carried is quiet here exactly as it is there. And the row's own fields
+    the card's marks and detail panel read (`_card_detail`) ride along, so
+    the web shows the detail rather than naming a CLI verb for it."""
     from . import landreq                   # DEFERRED — landreq is heavy
+    rehold = c.get("source_clean_rehold")
     return {"id": str(c.get("id") or ""), "lane": str(c.get("lane") or ""),
             "state": str(c.get("state") or ""),
+            "task": _card_task(c), "holder": _holder(c),
+            "tip": str(c.get("review_sha") or "")[:12] or None,
+            "gate": str(c.get("gate") or ""),
+            "contrary": bool(c.get("contrary")),
+            "stalled": landreq.stall_alarm(c),
             "trunk_contains_tip": c.get("trunk_contains_tip"),
-            "on_main_unverdicted": landreq.on_main_unverdicted(c)}
+            "on_main_unverdicted": landreq.on_main_unverdicted(c),
+            # a source-clean hold on trunk is a live card, and its note is
+            # the one sentence naming the move it owes (task/3053)
+            "source_clean_on_main": c.get("source_clean_on_main"),
+            "owes_rehold": bool(c.get("source_clean_on_main"))
+            and isinstance(rehold, dict) and bool(rehold),
+            "age_s": age, **_card_detail(c)}
+
+
+# WHAT THE ONE LAND BOARD'S MARKS AND DETAIL PANEL READ OFF A ROW (task/3585,
+# owner rule 2: the web shows the detail, never a CLI verb for it): the fields
+# the old wall's renderer read, copied off the row `landreq_cli.card` built.
+_CARD_DETAIL = (
+    "kind", "chain_root", "supersedes", "branch", "base_sha",
+    "review_sha_full", "author", "reviewer", "polarity", "polarity_source",
+    "attest_state", "attest_detail", "attest_source", "owed_by",
+    "owed_seat_standing", "contrary_state", "contrary_provenance",
+    "contrary_discharge", "succession_state", "succession_unknown_reason",
+    "discharged", "superseding_tip", "withdraw_contradicted", "abandoned",
+    "abandon_reason", "close_reason", "closed_by_landing", "receipt_state",
+    "closed_ts_unreadable", "closed_ts_impossible", "ledger_refused",
+    "advisory_lines", "dwell_known", "ungated", "observable", "observe_why",
+    "landed", "merged_local", "has_upstream", "landing_trunk_sha",
+    "timeline", "artifact_ref", "report_ref", "close_evidence",
+    "delivered_report_correction", "cancel_reason",
+    # the HELD tip a source-clean car rides at (`landreq.source_clean_car`),
+    # which may descend from the reviewed tip `tip` names: the work reader
+    # matches a pushed train's car to this row by it (`work_model._carried`)
+    "source_clean_tip")
+# the two whose False is a finding ("never measured", "not observed"), so it
+# rides the wire where every other field's False is left off
+_CARD_FALSE = frozenset(("dwell_known", "observable"))
+
+
+def _card_detail(c):
+    """The `_CARD_DETAIL` fields one row carries a value for: a quiet row's
+    card stays small, and an absent field reads to the page exactly as the
+    empty one it replaces."""
+    return {k: c[k] for k in _CARD_DETAIL
+            if c.get(k) or (k in _CARD_FALSE and c.get(k) is False)}
+
+
+def _card_task(c):
+    """The task the pipeline's one join gave the loop (`task` on the card,
+    over the chain's first row and the lane's record, task/3643), None when
+    it is UNKNOWN or names none; never re-derived from the label, so the
+    board cannot contradict a stored key. A card from an older server that
+    carries no `task` falls back to the label's literal (`_lane_task`)."""
+    if "task" in c:
+        return c.get("task") or None
+    return _lane_task(c.get("lane"))
+
+
+def _lane_task(lane):
+    """`task/N` when the lane names exactly one task by the one join
+    (`taskkey.join` over the lane's literal `task/N` or `task-N`), else None:
+    two named is ambiguous, not the first of them, and a trailing number is
+    never a task."""
+    from . import taskkey                   # DEFERRED — the ledger module
+    return taskkey.join(lane=lane, lanes=False).task
+
+
+def _holder(c):
+    """Who the next move waits on, in one word: the seat when the pipeline
+    named one, else the first word of its role ("integrator", "nobody"),
+    else "unknown" — the bucket the owed-by row always drew."""
+    seat = c.get("holder_seat")
+    if seat:
+        return str(seat)
+    return (str(c.get("holder_role") or "").split() or ["unknown"])[0]
+
+
+def _kanban_tally(live, nonbillable=frozenset()):
+    """{live, marks: {contrary, stalled, nonbillable, moving}, holders:
+    {holder: n}} over
+    EVERY live card of one project — the cards sent, the cards the cap cut and
+    the re-hold line alike — so the one board's header strip counts the row
+    set and never the cap (task/3585). One mark per row, contrary outranking
+    stalled, the partition the in-flight row always drew."""
+    marks = {"contrary": 0, "stalled": 0, "nonbillable": 0, "moving": 0}
+    holders = {}
+    for c in live:
+        marks[_mark(c, nonbillable)] += 1
+        who = c.get("holder") or "unknown"
+        holders[who] = holders.get(who, 0) + 1
+    return {"live": len(live), "marks": marks, "holders": holders}
+
+
+def _mark(c, nonbillable=frozenset()):
+    """The one mark a live card is counted under: `scheduler.mark`, the one
+    the scheduler counts by too (task/3631), so the board's strip and the
+    scheduler cannot count one row two ways."""
+    return scheduler.mark(c, nonbillable)
+
+
+def _nonbillable(body):
+    """{id: why} for the nonbillable holds one /api/lr body lists — the ids
+    the tally counts under their own mark, and the reason each card's NOT
+    MEASURABLE line says."""
+    return {str(u.get("id")): u.get("reason") for u in
+            body.get("unmeasurable") or ()
+            if isinstance(u, dict) and u.get("id")}
+
+
+def _landed_card(r, age_s):
+    """One landed row as the landed column draws it: lane, task, age, and the
+    reviewed tip and gate receipt `recent_lands` carries (task/3585) — and,
+    when the row carries them, the proof the closing ladder recorded
+    (`on_trunk`, `how`, onto `trunk_ref` at `trunk_sha`), the closure stamp
+    or that it was unreadable, and the chain the land's rounds share, so the
+    column says how each land was proven and folds a chain's rounds."""
+    out = {"lane": r.get("lane"), "task": r.get("task"), "age_s": age_s,
+           "tip": str(r.get("reviewed_tip") or "")[:12] or None,
+           "gate": str(r.get("gate") or "")}
+    out.update({k: r[k] for k in ("on_trunk", "how", "trunk_ref", "ts",
+                                  "ts_unreadable", "chain_root") if r.get(k)})
+    if r.get("trunk_sha"):
+        out["trunk_sha"] = str(r["trunk_sha"])[:12]
+    return out
 
 
 def _kanban_split(cards, read_age_s):
@@ -652,8 +883,13 @@ def _kanban_split(cards, read_age_s):
     it counts so the page keeps placing them (a claim on one is not drawn as
     building); it is the scheduler's own line otherwise, the same words, count
     rule and command the waits draw. None when there is none, never a zero
-    claim."""
-    live, folded, lanes = [], [], []
+    claim.
+
+    EACH LINE CARRIES THE ROWS IT COUNTS (`rows`, the same cards a live row
+    is sent as), so the one land board opens a count onto exactly those rows
+    and their detail rather than naming the verb that lists them (task/3585,
+    owner rule 2)."""
+    live, folded, lanes, rows = [], [], [], {}
     for card in cards:
         try:
             age = int(card.get("dwell_s")) + int(read_age_s) \
@@ -666,13 +902,110 @@ def _kanban_split(cards, read_age_s):
         if klass:
             folded.append((klass, age, card.get("frontier")
                            if klass == "off_frontier" else None))
+            rows.setdefault(klass, []).append(_kanban_card(card, age))
         else:
-            live.append(_kanban_card(card))
-    lines = scheduler.collapsed_lines(folded)
+            live.append(_kanban_card(card, age))
+    lines = [dict(line, rows=rows.get(line["class"], []))
+             for line in scheduler.collapsed_lines(folded)]
     on_main = next((dict(line, lanes=lanes) for line in lines
                     if line["class"] == "on_main"), None)
     return live, on_main, [line for line in lines
                            if line["class"] != "on_main"]
+
+
+# THE ROWS THE OWNER CAN MOVE NOW, drawn first (task/3130): a request under
+# review, reviewed, or sent back, whose work is NOT already on main.
+_ACTIONABLE = frozenset(("AWAITING_REVIEW", "REVIEWED", "CHANGES_REQUESTED"))
+REHOLD_COMMAND = "helm lr list"
+
+
+def _kanban_feed(live, nonbillable=frozenset()):
+    """{loops, loops_more, rehold} — one project's live cards as the kanban
+    is sent them, with every cap SAID (task/3130).
+
+    ORDER: the actionable cards first (`_ACTIONABLE`, work not on main), then
+    every other live card, each group in the pipeline's own order. The cards
+    whose move is a recipient's RE-HOLD over landed work (`owes_rehold`) are
+    not sent one each: they are ONE line, `rehold`, with their count, the
+    oldest wait, the lanes it places and each lane's own sentence, and the
+    command that lists them; None when there are none, never a zero claim.
+
+    THE CAP IS KANBAN_ROWS cards, and what it cut is `loops_more`, {state:
+    count}, so the page adds "N more" to the column each state is drawn in.
+    Nothing is cut silently: loops + loops_more + rehold count every card.
+    The cut cards themselves ride as `loops_cut`, so the Work page's reader
+    (`work_model.pipe_rows`, behind `/api/work`) types every row the tally
+    counts (task/3585, task/3643).
+
+    `nonbillable` is the ids /api/lr lists as nonbillable holds, or a
+    {id: why} (`_nonbillable`), whose reason each such card carries."""
+    reasons = nonbillable if isinstance(nonbillable, dict) else {}
+    for c in live:
+        # each card names the mark the tally counts it under, so a filtered
+        # board keeps exactly the cards its number counts
+        c["mark"] = _mark(c, nonbillable)
+        if reasons.get(c.get("id")):
+            c["unmeasurable_reason"] = reasons[c["id"]]
+    rehold = [c for c in live if c.get("owes_rehold")]
+    rest = [c for c in live if not c.get("owes_rehold")]
+    ordered = sorted(rest, key=lambda c: not (
+        c.get("state") in _ACTIONABLE
+        and c.get("trunk_contains_tip") is not True))      # stable
+    more = {}
+    for c in ordered[KANBAN_ROWS:]:
+        more[c.get("state") or ""] = more.get(c.get("state") or "", 0) + 1
+    ages = [c["age_s"] for c in rehold if isinstance(c.get("age_s"), int)]
+    line = {"count": len(rehold), "command": REHOLD_COMMAND,
+            "label": "landed lane%s owe%s a re-hold" % (
+                ("", "s") if len(rehold) == 1 else ("s", "")),
+            "oldest_age_s": max(ages) if ages else None,
+            "lanes": [c["lane"] for c in rehold],
+            # each row names the mark and holder the tally counts it under,
+            # so a filtered board keeps exactly the rows its number counts
+            # and the card itself (`lr`), so the board draws each row's
+            # detail rather than a hover or a CLI verb (task/3585)
+            "rows": [{"lane": c["lane"], "owed": c.get("source_clean_on_main"),
+                      "holder": c.get("holder") or "unknown",
+                      "mark": c["mark"], "lr": c}
+                     for c in rehold]} if rehold else None
+    return {"loops": ordered[:KANBAN_ROWS], "loops_more": more,
+            "loops_cut": ordered[KANBAN_ROWS:],
+            "rehold": line, "tally": _kanban_tally(live, nonbillable)}
+
+
+def _more(total, shown):
+    """How many a capped list left out: `total` less `shown` when the total
+    was measured and exceeds it, else 0."""
+    return total - shown if isinstance(total, int) \
+        and not isinstance(total, bool) and total > shown else 0
+
+
+def _building_detail(building):
+    """{building_rows, building_unmeasured, building_unavailable} off one
+    /api/lr `building` reading: each lane's holder, commits ahead, lease left
+    and uncommitted edits (the newest TOP_LANES, as `building_lanes`), how
+    many leased lanes git could not measure, and why the reading failed."""
+    why = building.get("unavailable")
+    return {"building_unavailable": str(why) if why else None,
+            "building_unmeasured": None if why
+            else building.get("unmeasured"),
+            "building_rows": None if why else [
+                {k: r.get(k) for k in ("lane", "holder", "ahead",
+                                       "lease_remaining_s", "dirty")}
+                for r in (building.get("rows") or ())[:TOP_LANES]
+                if isinstance(r, dict)]}
+
+
+def _lr_read_at(body):
+    """When the land-pipeline reading `body` was taken: the instant `/api/lr`
+    counts its `read_age_s` from (`read_at`), or None when the body does not
+    say. THE READING'S OWN CLOCK, NEVER THE ASKER'S (task/3657): an unmoved
+    pipeline answers every ask with one reading, and a section dated by its
+    ask's own clock less that whole-second age moved its stamp on every ask,
+    so the Work reader, whose revision marks the stamp, rebuilt every poll."""
+    at = body.get("read_at")
+    return at if isinstance(at, (int, float)) and not isinstance(at, bool) \
+        else None
 
 
 def _lands_join(reader):
@@ -682,45 +1015,66 @@ def _lands_join(reader):
     source = "helm lr list"
     body = reader({})[0]
     if not isinstance(body, dict):
-        return _section(source, None, SECTION_LIMIT_S, scope=None,
+        return _section(source, None, PIPELINE_LIMIT_S, scope=None,
                         unavailable="the land pipeline gave no body"), {}
     now = time.time()
     scope = (body.get("withheld") or {}).get("scope")
     if body.get("warming"):
-        return _section(source, None, SECTION_LIMIT_S, scope=scope,
+        return _section(source, None, PIPELINE_LIMIT_S, scope=scope,
                         loading=True, retry=True), {}
     why = body.get("unavailable")
     if not why and not scope:
         why = "the land pipeline names no project scope"
     read_age = body.get("read_age_s")
-    at = now - read_age if isinstance(read_age, (int, float)) else None
+    at = _lr_read_at(body)
     if why:
-        return _section(source, None, SECTION_LIMIT_S, scope=scope,
+        return _section(source, None, PIPELINE_LIMIT_S, scope=scope,
                         unavailable=str(why)), {}
     filed = [c for c in body.get("loops") or ()
              if isinstance(c, dict) and not c.get("honored")]
     live, on_main, folded = _kanban_split(filed, read_age or 0)
+    feed = _kanban_feed(live, _nonbillable(body))
     building = body.get("building") or {}
     model = body.get("scheduler") or {}
+    groups = [g for g in model.get("groups") or () if isinstance(g, dict)]
     lands = body.get("recent_lands") or {}
+    ahead = [str(r.get("lane") or "") for r in building.get("rows") or ()
+             if isinstance(r, dict)]
+    landed = None if lands.get("unavailable") else [
+        _landed_card(r, r.get("age_s"))
+        for r in (lands.get("rows") or ())[:TOP_LANES]
+        if isinstance(r, dict)]
     rec = {
         "lanes": {"in_flight": len(live),
                   "filed": [c["lane"] for c in live][:TOP_LANES],
                   "building": (None if building.get("unavailable")
                                else building.get("total")),
-                  "building_lanes": [str(r.get("lane") or "")
-                                     for r in building.get("rows") or ()
-                                     if isinstance(r, dict)][:TOP_LANES],
+                  "building_lanes": ahead[:TOP_LANES],
+                  # WHAT THE BUILDING LIST LEFT OUT, counted against the
+                  # total the pipeline measured, never a silent cap
+                  "building_more": _more(None if building.get("unavailable")
+                                         else building.get("total"),
+                                         min(len(ahead), TOP_LANES)),
+                  # EACH BUILDING LANE'S DETAIL, the four facts `helm work
+                  # list` prints (task/3585), the lanes git could not
+                  # measure, and a read that failed, named: a failed lane
+                  # read is UNKNOWN on the board, never zero lanes
+                  **_building_detail(building),
                   # THE KANBAN'S CARDS: every LIVE loop in flight with the
-                  # state the pipeline gave it, for the page to put in a
-                  # column; the rest is counted on the two lines beside them
-                  "loops": live[:KANBAN_ROWS],
+                  # state the pipeline gave it, actionable first, for the
+                  # page to put in a column (`_kanban_feed`); what the cap
+                  # cut is counted per state, the re-holds owed on landed
+                  # work are one line, and the rest is counted on the two
+                  # lines beside them
+                  "loops": feed["loops"], "loops_more": feed["loops_more"],
+                  "loops_cut": feed["loops_cut"],
+                  "rehold": feed["rehold"], "tally": feed["tally"],
                   "on_main": on_main, "collapsed": folded},
-        "landed": None if lands.get("unavailable") else [
-            {"lane": r.get("lane"), "task": r.get("task"),
-             "age_s": r.get("age_s")}
-            for r in (lands.get("rows") or ())[:TOP_LANES]
-            if isinstance(r, dict)],
+        "landed": landed,
+        # THE LANDS THE CARD DOES NOT LIST: the pipeline shows its newest few
+        # and counts every one (`recent_lands.total`)
+        "landed_more": None if landed is None
+        else _more(lands.get("total"), len(landed)),
         "owner": {"holds": (None if model.get("unavailable")
                             else model.get("owner_hold_count"))},
         "waits": [] if model.get("unavailable") else [
@@ -728,11 +1082,15 @@ def _lands_join(reader):
              "oldest_age_s": g.get("oldest_age_s"),
              "rows": [{"plain_title": r.get("plain_title"),
                        "stage_class": r.get("stage_class"),
-                       "age_s": r.get("age_s")}
+                       "age_s": r.get("age_s"),
+                       "source_clean_on_main": r.get("source_clean_on_main")}
                       for r in (g.get("rows") or ())[:WAIT_ROWS]
                       if isinstance(r, dict)]}
-            for g in (model.get("groups") or ())[:TOP_WAITS]
-            if isinstance(g, dict)],
+            for g in groups[:TOP_WAITS]],
+        # THE GROUPS THE WAITS DO NOT LIST, counted and never cut silently;
+        # each group's own `count` says how many rows its list left out
+        "waits_more": 0 if model.get("unavailable")
+        else _more(len(groups), TOP_WAITS),
         # WHAT THE WAITS DO NOT LIST, one line per class, from the scheduler
         # that decided it — the groups above hold live obligations only
         "waits_collapsed": [] if model.get("unavailable") else [
@@ -741,7 +1099,10 @@ def _lands_join(reader):
             for line in model.get("collapsed") or ()
             if isinstance(line, dict)],
     }
-    return _section(source, at, SECTION_LIMIT_S, scope=scope), {scope: rec}
+    # `ages_at`: the instant every age in `rec` was stamped, so a response
+    # served from this kept reading moves them on (`_reaged`)
+    return _section(source, at, PIPELINE_LIMIT_S, scope=scope,
+                    ages_at=now), {scope: rec}
 
 
 # EVERY OTHER PROJECT'S PIPELINE: `/api/lr?all_projects=1`, read on its own
@@ -795,6 +1156,44 @@ def _fleet_reset():
         _FLEET.update(thread=None, done=None)
 
 
+def _fleet_reading():
+    """(section, body, read_at) — the last completed all-projects read, after
+    asking for the next one (`_fleet_kick`): the fleet section as it stands
+    before any project is placed (its reading's clock and scope; LOADING
+    before one has completed or while it warms; UNAVAILABLE, with the
+    reason, when it failed), the body when it is a reading to place rows
+    from (else None), and when that read completed. The ONE read of the
+    fleet: `_fleet_now` places its rows, and `_board_marks` needs only the
+    section."""
+    _fleet_kick()
+    with _FLEET_LOCK:
+        done = _FLEET["done"]
+    if done is None:
+        # THE FIRST READ OF A SERVER LIFE IS WAITED FOR, a little (task/3632):
+        # it restores the last body from disk, and without it the first board
+        # after a restart drew every other project as still being read
+        _fleet_wait(FLEET_FIRST_WAIT_S)
+        with _FLEET_LOCK:
+            done = _FLEET["done"]
+    if done is None:
+        return _section(_FLEET_SOURCE, None, PIPELINE_LIMIT_S,
+                        loading=True), None, None
+    read_at, body, why = done
+    if why or not isinstance(body, dict):
+        return _section(_FLEET_SOURCE, None, PIPELINE_LIMIT_S,
+                        unavailable=why or "the all-projects read gave no "
+                        "body"), None, None
+    if body.get("warming"):
+        return _section(_FLEET_SOURCE, None, PIPELINE_LIMIT_S,
+                        loading=True), None, None
+    if body.get("unavailable"):
+        return _section(_FLEET_SOURCE, None, PIPELINE_LIMIT_S,
+                        unavailable=str(body["unavailable"])), None, None
+    return _section(_FLEET_SOURCE, _lr_read_at(body), PIPELINE_LIMIT_S,
+                    scope=(body.get("withheld") or {}).get("scope")), \
+        body, read_at
+
+
 def _fleet_now(keys, now):
     """(section, {project: {loops, landed}}) for every project in `keys` but
     the one the scoped pipeline already projects, off the last completed
@@ -803,26 +1202,15 @@ def _fleet_now(keys, now):
     and found nothing for gets two empty lists — that is an answer. A row whose
     project is unresolved, or is no project on this board, is counted in
     `unplaced` and never guessed onto a row."""
-    _fleet_kick()
-    with _FLEET_LOCK:
-        done = _FLEET["done"]
-    if done is None:
-        return _section(_FLEET_SOURCE, None, SECTION_LIMIT_S, loading=True), {}
-    read_at, body, why = done
-    if why or not isinstance(body, dict):
-        return _section(_FLEET_SOURCE, None, SECTION_LIMIT_S,
-                        unavailable=why or "the all-projects read gave no "
-                        "body"), {}
-    if body.get("warming"):
-        return _section(_FLEET_SOURCE, None, SECTION_LIMIT_S, loading=True), {}
-    if body.get("unavailable"):
-        return _section(_FLEET_SOURCE, None, SECTION_LIMIT_S,
-                        unavailable=str(body["unavailable"])), {}
-    scope = (body.get("withheld") or {}).get("scope")
+    sec, body, read_at = _fleet_reading()
+    if body is None:
+        return sec, {}
+    scope = sec["scope"]
     lands = body.get("recent_lands") or {}
     lands_read = isinstance(lands, dict) and not lands.get("unavailable")
     out = {key: {"loops": [], "landed": [] if lands_read else None,
-                 "on_main": None, "collapsed": []}
+                 "on_main": None, "collapsed": [], "loops_more": {},
+                 "rehold": None, "tally": _kanban_tally([]), "landed_more": 0 if lands_read else None}
            for key in keys if key != scope}
     unplaced = 0
     aged = max(0, now - read_at)
@@ -849,7 +1237,8 @@ def _fleet_now(keys, now):
         live, on_main, folded = _kanban_split(
             cards, (read_age if isinstance(read_age, (int, float)) else 0)
             + int(aged))
-        out[project].update(loops=live[:KANBAN_ROWS], on_main=on_main,
+        out[project].update(_kanban_feed(live, _nonbillable(body)),
+                            on_main=on_main,
                             collapsed=folded)
     for row in (lands.get("rows") or ()) if lands_read else ():
         if not isinstance(row, dict) or "foreign_project" not in row:
@@ -860,14 +1249,13 @@ def _fleet_now(keys, now):
         rec = home(row)
         if rec is None:
             unplaced += 1
-        elif len(rec["landed"]) < TOP_LANES:
+        elif len(rec["landed"]) >= TOP_LANES:
+            rec["landed_more"] += 1         # counted, never cut silently
+        else:
             age = row.get("age_s")
-            rec["landed"].append({
-                "lane": row.get("lane"), "task": row.get("task"),
-                "age_s": age + int(aged) if isinstance(age, (int, float))
-                else None})
-    measured_at = read_at - read_age if isinstance(read_age, (int, float)) \
-        else None
+            rec["landed"].append(_landed_card(
+                row, age + int(aged) if isinstance(age, (int, float))
+                else None))
     # THE LANDS LIST IS CAPPED FLEET-WIDE (the newest few), so a project with
     # none in it may still have landed: the section says how much was read,
     # and the page draws "none among the newest" rather than a quiet zero.
@@ -875,25 +1263,171 @@ def _fleet_now(keys, now):
     total = lands.get("total") if lands_read else None
     partial = {"shown": shown, "total": total} if isinstance(total, int) \
         and shown is not None and total > shown else None
-    return _section(_FLEET_SOURCE, measured_at, SECTION_LIMIT_S, scope=scope,
-                    unplaced=unplaced, landed_partial=partial), out
+    sec.update(unplaced=unplaced, landed_partial=partial)
+    return sec, out
+
+
+# THE GATE WINDOW (task/3129): the whole-suite gate `helm gate window show`
+# reports in flight, per project. The kanban's gate column read the land
+# requests alone and said "none" while a window gate ran for 46 minutes: the
+# door keeps its own record (`gatewindow`) and no request row says a train is
+# being gated. So this leg reads THAT record, through the reader and the
+# liveness ladder `show` uses, never a copy of either.
+_GATE_SOURCE = dict(_SECTIONS)["gate"]
+_SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
+
+
+def _gate_join(projects, path=None, observe=None, inflight=None, now=None):
+    """(section, {project: [gate card]}) — every live run in the gate-window
+    store, on the project whose repository it gates, newest first.
+
+    THE SAME READ AS `helm gate window show`: `gatewindow.read_runs_checked`
+    over the store, then `gatewindow.live_runs`, which asks each run's own
+    authority (or node) whether it still runs. An UNREADABLE store is
+    UNAVAILABLE with its reason, never "no gate". An ABSENT store is a helm
+    home that never launched one, and every project with a checkout gets an
+    empty list: that is an answer.
+
+    A run is placed by `gatewindow.project_id` — the identity the door wrote,
+    the common git directory — asked of each registered checkout; a run whose
+    repository no project claims is counted in `unplaced`. A host that could
+    not be read keeps its runs listed, as `show` does, and each such card
+    says that whether it runs is UNKNOWN. `observe`, `inflight` and `now` are
+    the door's own seams."""
+    from . import gatewindow
+    clock = now or time.time
+    read_at = clock()
+    if projects is None:
+        return _section(_GATE_SOURCE, None, SECTION_LIMIT_S,
+                        unavailable="the registry could not be read, so no "
+                        "gate can be placed on a project"), {}
+    rows, why = gatewindow.read_runs_checked(path or gatewindow.runs_path())
+    if why:
+        return _section(_GATE_SOURCE, None, SECTION_LIMIT_S,
+                        unavailable=why), {}
+    live, _retired, unknown = gatewindow.live_runs(
+        rows, inflight=inflight, observe=observe, now=clock)
+    homes = {}
+    for key, rec in projects.items():
+        where = rec.get("path") if isinstance(rec, dict) else None
+        if not where or rec.get("retired") \
+                or not os.path.exists(os.path.join(where, ".git")):
+            continue
+        ident = gatewindow.project_id(where)
+        if ident:
+            homes.setdefault(ident, []).append(key)
+    out = {key: [] for keys in homes.values() for key in keys}
+    unplaced = 0
+    for row in live:
+        keys = homes.get(row.get("project"))
+        if not keys:
+            unplaced += 1
+            continue
+        card = _gate_card(row, unknown, read_at, projects[keys[0]]["path"])
+        for key in keys:
+            out[key].append(card)
+    for cards in out.values():
+        cards.sort(key=lambda c: (c["age_s"] is None, c["age_s"] or 0))
+    return _section(_GATE_SOURCE, read_at, SECTION_LIMIT_S, unplaced=unplaced,
+                    unknown_hosts=sorted(unknown)), out
+
+
+def _gate_card(row, unknown, now, checkout):
+    """One live gate run as the kanban draws it: its label, the node it runs
+    on, how long it has run, the head it gates and the lanes its train
+    carries (`_train_lanes`). `running` is "running" when its authority or
+    node answered, "unknown" when its node could not be read, and "held" for
+    a dispatch nobody can name, which the window holds without anyone able
+    to ask whether it runs."""
+    from . import gatewindow
+    launched = gatewindow._row_ts(row)
+    host = row.get("host")
+    named = bool(host and (row.get("run_id") or (
+        row.get("job_id") and row.get("generation"))))
+    train, lanes, lanes_why = _train_lanes(row, checkout)
+    if host in unknown:
+        running, why = "unknown", "%s could not be read" % host
+    elif not named:
+        running, why = "held", ("its dispatch was never announced, so no node "
+                                "can be asked whether it runs")
+    else:
+        running, why = "running", None
+    return {"label": row.get("label") or train or None, "train": train,
+            "host": host, "job": row.get("job_id") or row.get("run_id"),
+            "age_s": None if launched is None
+            else max(0, int(now - launched)),
+            "head": row.get("head"), "trunk": row.get("trunk"),
+            "room": row.get("room"), "running": running, "running_why": why,
+            "lanes": lanes, "lanes_unavailable": lanes_why}
+
+
+def _train_lanes(row, checkout):
+    """(train, [{lane, tip}], None), or (None, None, why) — the lanes a gate's
+    compose room carries: the train merges (`_TRAIN_MERGE`) on the first-parent
+    line between the trunk the run stood on and the head it gates, oldest
+    first, each with the lane tip it merged. ONE `git log`, in the room while
+    it stands, else in the project's checkout, which shares its objects."""
+    head, trunk = row.get("head"), row.get("trunk")
+    for name, sha in (("head", head), ("trunk", trunk)):
+        if not isinstance(sha, str) or not _SHA.match(sha):
+            return None, None, "the record names no readable %s" % name
+    room = row.get("room")
+    where = room if isinstance(room, str) and os.path.exists(
+        os.path.join(room, ".git")) else checkout
+    from . import vcs
+    rc, out, _err = vcs.backend(where).text(
+        where, "log", "--first-parent", "--merges", "--format=%P%x09%s",
+        "%s..%s" % (trunk, head), timeout=10)
+    if rc != 0:
+        return None, None, "git could not read the train (rc %s)" % rc
+    train, lanes = None, []
+    for line in reversed(out.splitlines()):
+        parents, _tab, subject = line.partition("\t")
+        hit = _TRAIN_MERGE.match(subject.strip())
+        if not hit:
+            continue
+        tips = parents.split()
+        train = train or hit.group(1)
+        lanes.append({"lane": hit.group(2),
+                      "tip": tips[1][:12] if len(tips) > 1 else None})
+    return train, lanes, None
+
+
+def _gate_heads(by_gate):
+    """{project: {head, label}} — the one head each project's leased lanes
+    are asked about: its newest run whose authority or node CONFIRMED it
+    runs. A run whose node could not be read, or that nobody can name, puts
+    no lane on the gate: a lane drawn as gated under a run that already
+    ended is the misplacement this column exists to end."""
+    out = {}
+    for key, cards in (by_gate or {}).items():
+        for card in cards:                  # newest first
+            if card.get("running") == "running" and card.get("head"):
+                out[key] = {"head": card["head"], "label": card.get("label")}
+                break
+    return out
 
 
 # THE BOARD'S LEGS, READ AT ONCE, EACH UNDER ITS OWN BUDGET: the first read
 # after a restart took 70s against the page's 45s, its legs read in turn. A leg
 # past its budget is STILL BEING READ (`loading`, no numbers, `retry`) while
-# its read goes on (`web_cache._read_behind`); a reading is served BOARD_TTL_S,
+# its read goes on (`web_cache._read_behind`); the budget is the READ's, so a
+# later board does not wait it out again. A reading is served BOARD_TTL_S,
 # then re-read behind itself, and never past SECTION_LIMIT_S.
-_LEGS = ("flags", "tasks", "seats", "lands", "trunk")
+_LEGS = ("flags", "tasks", "seats", "lands", "trunk", "gate", "teams")
 _LEG_BUDGET_S = dict.fromkeys(_LEGS, 3.0)
 # what a leg that raised says, and what its section carries with no reading
 _LEG_RAISED = {"flags": "the burn-flag read raised (%s)",
                "tasks": "the task-ledger read raised (%s)",
                "seats": "the roster could not be read (%s)",
                "lands": "the land-pipeline read raised (%s)",
-               "trunk": "the trunk read raised (%s)"}
+               "trunk": "the trunk read raised (%s)",
+               "gate": "the gate-window read raised (%s)",
+               "teams": "the team read raised (%s)"}
 _LEG_BLANK = {"flags": {"families": {}, "overall": None},
-              "lands": {"scope": None}}
+              "lands": {"scope": None},
+              "teams": {"seats": [], "pace": {}, "burn": None, "say": {},
+                        "roles": {}, "slots": None, "tier": None}}
 _STILL = "still being read"
 
 
@@ -918,16 +1452,20 @@ def _unkept(got):
 
 def _legs(fns):
     """({leg: its answer}, {leg: the section it carries instead}), each leg
-    waited for until its own budget from one start. A leg whose read raised,
-    or whose read behind its served reading failed, is UNAVAILABLE: that
-    reading is held back with its age, never drawn as current."""
-    start = time.monotonic()
+    waited for until ITS READ's budget runs out, counted from when that read
+    began. A read this build started is waited for its whole budget; one an
+    earlier build started and already waited out is STILL BEING READ, and
+    this build says so at once (task/3657: a second full wait on it cost
+    every warm poll three seconds while the land projection rebuilt, and
+    answered nothing new). A leg whose read raised, or whose read behind its
+    served reading failed, is UNAVAILABLE: that reading is held back with
+    its age, never drawn as current."""
     held = {name: _read_behind("board:" + name, BOARD_TTL_S, SECTION_LIMIT_S,
                                fn, _unkept) for name, fn in fns.items()}
     answers, absent = {}, {}
     for name, (thread, box) in held.items():
         if thread is not None:
-            thread.join(max(0.0, start + _LEG_BUDGET_S[name]
+            thread.join(max(0.0, box["began"] + _LEG_BUDGET_S[name]
                             - time.monotonic()))
         if thread is not None and thread.is_alive():
             absent[name] = _blank(name, loading=True, retry=True)
@@ -958,10 +1496,12 @@ def _read(sec):
     return not (sec.get("unavailable") or sec.get("loading"))
 
 
-def _board_build():
-    """Every join, each section stamped with its own read (`_legs`). The
-    readers are bound HERE, on the caller's thread, so a leg that outlives
-    this build still asks the door this build saw."""
+def _board_legs():
+    """(projects, flags, {leg: its answer}, {leg: the section it carries
+    instead}) — the registry and every leg, each read under its own budget
+    (`_legs`): the half of a board build that READS, shared by the build and
+    by `_board_marks`. The readers are bound HERE, on the caller's thread, so
+    a leg that outlives this build still asks the door this build saw."""
     projects = _projects()
     keys = None if projects is None else set(projects)
     roster, lr = _roster_cached, _api_lr
@@ -969,7 +1509,9 @@ def _board_build():
                          "tasks": lambda: _tasks_join(keys),
                          "seats": lambda: _roster_read(roster),
                          "lands": lambda: _lands_join(lr),
-                         "trunk": lambda: _trunk_join(projects)})
+                         "trunk": lambda: _trunk_join(projects),
+                         "gate": lambda: _gate_join(projects),
+                         "teams": _teams_join})
     (flags,) = got.get("flags") or (absent.get("flags"),)
     if flags.get("loading"):
         # THE SEATS JOIN READS THE FLAGS: which seats can take work (none on
@@ -977,14 +1519,56 @@ def _board_build():
         # is still being read until they are.
         got.pop("seats", None)
         absent.setdefault("seats", _blank("seats", loading=True, retry=True))
+    return projects, flags, got, absent
+
+
+def _board_marks():
+    """({"sections": {lands, fleet, seats, tasks}}, projects) — the four
+    sections the Work reader's revision marks (`work_model.revision`: each
+    one's clock, scope and state), aged as `/api/board` ages them, and the
+    registry they were read against, WITHOUT the joins (task/3657). A count
+    only a join makes (`unplaced`, `landed_partial`) is not in them.
+
+    THE SAME READS AS THE BOARD, NOT A SECOND READER: the legs through
+    `_board_legs`, the seats section through `_seats_section`, the fleet
+    through `_fleet_reading`, so a leg past its time is read again behind
+    itself and the next all-projects read is asked for exactly as a board
+    read does. What is left out is what cost a Work poll seconds on the
+    owner's console and never reached a snapshot it was answered from: the
+    roster join (`_claims_landed`), the lights, the repositories and each
+    project's fleet rows. A revision these marks do not find is built from a
+    whole board, under that board's own revision (`work_model.snapshot`)."""
+    projects, _flags, got, absent = _board_legs()
+    seats = got.get("seats")
+    now = time.time()
+    sections = {"lands": (got.get("lands") or (absent.get("lands"),))[0],
+                "fleet": _fleet_reading()[0],
+                "seats": _seats_section(*seats) if seats
+                else absent["seats"],
+                "tasks": (got.get("tasks") or (absent.get("tasks"),))[0]}
+    return {"sections": {name: _aged(sec, now)
+                         for name, sec in sections.items()}}, projects
+
+
+def _board_build():
+    """Every join, each section stamped with its own read (`_board_legs`)."""
+    projects, flags, got, absent = _board_legs()
     tasks_sec, by_tasks, flow = got.get("tasks") or (absent.get("tasks"),
                                                      {}, {})
+    gate_sec, by_gate = got.get("gate") or (absent.get("gate"), {})
+    # ONE ANCESTRY CACHE FOR THIS BUILD: each leased lane is asked once
+    # whether the running gate's head carries it (`_claims_landed`)
     seats_sec, by_seats, fleet = (
-        _seats_join(projects, flags, *got["seats"]) if "seats" in got
+        _seats_join(projects, flags, *got["seats"],
+                    gates=_gate_heads(by_gate) if _read(gate_sec) else None,
+                    memo={}) if "seats" in got
         else (absent["seats"], {}, None))
     lands_sec, by_lands = got.get("lands") or (absent.get("lands"), {})
     trunk_sec, by_trunk = got.get("trunk") or (absent.get("trunk"), {})
+    teams_sec, by_teams = got.get("teams") or (absent.get("teams"), {})
     joins = {}
+    for key, rec in by_teams.items():
+        joins.setdefault(key, {}).update(rec)
     for key, rec in by_tasks.items():
         joins.setdefault(key, {})["tasks"] = rec
     for key, rec in by_seats.items():
@@ -1008,9 +1592,14 @@ def _board_build():
             "lands7": lands7,
             "opened7": week.get("opened7", 0) if _read(tasks_sec) else None,
             "closed7": week.get("closed7", 0) if _read(tasks_sec) else None})
+    # THE GATE RIDES EVERY ROW WITH A CHECKOUT, an empty list when no gate
+    # runs there: the gate window was read, and it said so
+    for key, cards in by_gate.items():
+        joins.setdefault(key, {})["gate"] = cards
     return {"sections": {"flags": flags, "tasks": tasks_sec,
                          "seats": seats_sec, "lands": lands_sec,
-                         "trunk": trunk_sec},
+                         "trunk": trunk_sec, "gate": gate_sec,
+                         "teams": teams_sec},
             "joins": joins, "fleet": fleet}
 
 
@@ -1033,8 +1622,8 @@ def _lights_now(now):
 
 def _quiet(rec, join, lit, tasks_ok, now):
     """Is this project QUIET: nothing seen for thirty days, nothing open, no
-    lane running, and no light set in thirty days? All of them, or it stays
-    up.
+    lane running, no gate running, and no light set in thirty days? All of
+    them, or it stays up.
 
     Activity is the newer of the registry's last session and the newest seat
     beat. The backlog must have been READ as zero: a count nobody could read,
@@ -1042,7 +1631,8 @@ def _quiet(rec, join, lit, tasks_ok, now):
     the row up, because its age is unknown, not old."""
     if not tasks_ok or not isinstance(rec, dict) or not isinstance(lit, dict):
         return False
-    if (join.get("tasks") or {}).get("open") or join.get("running"):
+    if (join.get("tasks") or {}).get("open") or join.get("running") \
+            or join.get("gate"):
         return False
     seen = max(rec.get("last_seen") or 0, join.get("active_at") or 0)
     if seen > now - QUIET_S:
@@ -1068,6 +1658,64 @@ def _visible(joins, quiet, now):
     return {key: [dict(r, **(vis.get(r["slug"]) if r.get("slug") else none))
                   for r in rec["repos"]]
             for key, rec in joins.items() if rec.get("repos")}
+
+
+def _reaged(rec, shift):
+    """This project's pipeline record with every age it carries moved on by
+    `shift` seconds, on copies: the cached leg is shared by every response.
+
+    THE LEG KEEPS ITS READING FOR MINUTES, AND ITS AGES WITH IT (task/3631,
+    walk 2 finding 18). The land pipeline's cards are aged when the leg reads
+    `/api/lr` (`_kanban_split`), and the leg is served for up to
+    SECTION_LIMIT_S after that, so a card read "5m" on the board while the
+    scheduler under it, aged at its own response, read "9m" for the same row.
+    Every age here — each card's, each count line's oldest and its rows',
+    each land's, each wait's — moves on by the time since the leg read it."""
+    if not shift:
+        return rec
+
+    def add(v):
+        return v + shift if isinstance(v, int) and not isinstance(v, bool) \
+            else v
+
+    def card(c):
+        return dict(c, age_s=add(c.get("age_s"))) if isinstance(c, dict) \
+            else c
+
+    def row(r):
+        if isinstance(r, dict) and isinstance(r.get("lr"), dict):
+            return dict(r, lr=card(r["lr"]))
+        return card(r)
+
+    def line(ln):
+        if not isinstance(ln, dict):
+            return ln
+        out = dict(ln, oldest_age_s=add(ln.get("oldest_age_s")))
+        if isinstance(ln.get("rows"), list):
+            out["rows"] = [row(r) for r in ln["rows"]]
+        return out
+
+    out = dict(rec)
+    lanes = rec.get("lanes")
+    if isinstance(lanes, dict):
+        lanes = dict(lanes)
+        for key in ("loops", "loops_cut"):
+            if isinstance(lanes.get(key), list):
+                lanes[key] = [card(c) for c in lanes[key]]
+        for key in ("rehold", "on_main"):
+            lanes[key] = line(lanes.get(key))
+        if isinstance(lanes.get("collapsed"), list):
+            lanes["collapsed"] = [line(c) for c in lanes["collapsed"]]
+        out["lanes"] = lanes
+    if isinstance(rec.get("landed"), list):
+        out["landed"] = [card(r) for r in rec["landed"]]
+    if isinstance(rec.get("waits"), list):
+        out["waits"] = [dict(line(g), rows=[card(r) for r in g.get("rows")
+                                            or ()])
+                        if isinstance(g, dict) else g for g in rec["waits"]]
+    if isinstance(rec.get("waits_collapsed"), list):
+        out["waits_collapsed"] = [line(c) for c in rec["waits_collapsed"]]
+    return out
 
 
 def _stamped(rec, now, **fresh):
@@ -1101,6 +1749,14 @@ def _api_board():
     sections["lights"] = _aged(lights_sec, now)
     tasks_ok = _read(sections["tasks"]) and not sections["tasks"]["stale"]
     joins = built["joins"]
+    # THE LAND PIPELINE'S AGES ARE THIS RESPONSE'S (task/3631): moved on by
+    # the time since its leg read them
+    lands = built["sections"].get("lands") or {}
+    if lands.get("scope") in joins \
+            and isinstance(lands.get("ages_at"), (int, float)):
+        joins = dict(joins)
+        joins[lands["scope"]] = _reaged(
+            joins[lands["scope"]], max(0, int(now - lands["ages_at"])))
     quiet = {key: _quiet((records or {}).get(key), rec,
                          (lights or {}).get(key), tasks_ok, now)
              for key, rec in joins.items()}
@@ -1123,3 +1779,13 @@ def _api_board():
                                        **({"pipeline": pipeline[key]}
                                           if key in pipeline else {}))
                          for key, rec in joins.items()}}
+
+
+def _api_work(qs):
+    """GET /api/work — the Work page's one reader (task/3643): one card per
+    piece of work over the to-do list and THIS board's pipeline reading,
+    counted once on the server (`work_model`). No `key`: the page's body;
+    `key` (and `rev`, the snapshot the page was drawn from): one card and
+    its crossings. Never a 500."""
+    from . import work_model                # DEFERRED — the ledgers' reader
+    return work_model.api(qs)

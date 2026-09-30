@@ -86,7 +86,7 @@ class AddLandedTest(BoardBase):
         p = self.seed()
         ok, err = board.add_landed(
             "fleet-notes-headlines", "abcdef1234567890", "owner can act now",
-            board_path=p, seat="codex-2")
+            board_path=p, seat="seat-b")
         self.assertEqual((ok, err), (True, None))
         note = fleetnotes.rows()[0]
         self.assertEqual(note["key"], "board-landed")
@@ -158,7 +158,7 @@ class AddLandedTest(BoardBase):
         p = self.seed()
         with mock.patch.object(board.fleetnotes, "read",
                                side_effect=RuntimeError("renderer vanished")):
-            ok, warning = board.add_landed("lane", "sha", "n", board_path=p)
+            ok, warning = board.add_landed("lane", "sha1", "n", board_path=p)
         self.assertTrue(ok)
         self.assertIn("board committed", warning)
         self.assertIn("RuntimeError", warning)
@@ -390,8 +390,98 @@ class AddNoteTest(BoardBase):
             self.assertEqual(f.read(), before)
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _run(fn, args):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = fn(list(args))
+    return rc, out.getvalue(), err.getvalue()
+
+
+class CLIDeclaresItsSeatTest(BoardBase):
+    """A guard the PRIMARY ENTRY POINT never invokes does not exist.
+
+    The first cut enforced ownership inside update() and then had the CLI call
+    set_value with no seat, so `helm board set` from any seat failed open and
+    the whole enforcement was decorative — the same shape as a tri-state
+    nobody prints, which is the defect I spent tonight fixing one layer up."""
+
+    def owned(self, extra=None):
+        # `freeze` is narrative AND scalar — `tasks` is a list, and the
+        # pre-existing structure guard would refuse a scalar set before
+        # ownership was ever consulted, which would test the wrong refusal.
+        obj = {"_writer_seat": "seat-a", "freeze": "open",
+               "tasks": ["a"], "landed": []}
+        obj.update(extra or {})
+        return self.board(obj)
+
+    def test_a_seat_replacing_a_narrative_key_is_REFUSED_at_the_CLI(self):
+        p = self.owned()
+        with mock.patch.dict(os.environ, {"HELM_BOARD": p,
+                                          "HELM_CHAT_NAME": "seat-b"}):
+            rc, _out, err = _run(board.cmd_board, ["set", "freeze", "wiped"])
+        self.assertEqual(rc, 1, "a seat replacing a narrative key must refuse")
+        self.assertIn("NARRATIVE", err)
+        self.assertEqual(self.read(p)["freeze"], "open",
+                         "and the board is untouched")
+
+    def test_an_UNDECLARED_operator_shell_still_writes(self):
+        """The owner's own shell declares no seat and must keep working — the
+        intended asymmetry, not an oversight."""
+        p = self.owned()
+        env = {k: v for k, v in os.environ.items() if k != "HELM_CHAT_NAME"}
+        env["HELM_BOARD"] = p
+        with mock.patch.dict(os.environ, env, clear=True):
+            rc, _out, err = _run(board.cmd_board, ["set", "freeze", "by hand"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.read(p)["freeze"], "by hand")
+
+
+class ShowKeyTest(BoardBase):
+    """`helm board show [<key>]` must read a single item, not ignore the key
+    and dump the whole index."""
+
+    def _seed(self):
+        return self.board({"landed": [{"name": "row-a"}],
+                           "phase": "wave-3", "tasks": []})
+
+    def test_show_landed_returns_zero_and_names_the_row(self):
+        p = self._seed()
+        with mock.patch.dict(os.environ, {"HELM_BOARD": p}):
+            rc, out, err = _run(board.cmd_board, ["show", "landed"])
+        self.assertEqual(rc, 0)
+        self.assertIn("row-a", out)
+        self.assertNotIn("phase", out)
+        self.assertNotIn("tasks", out)
+
+    def test_show_phase_returns_zero_and_names_the_value(self):
+        p = self._seed()
+        with mock.patch.dict(os.environ, {"HELM_BOARD": p}):
+            rc, out, _err = _run(board.cmd_board, ["show", "phase"])
+        self.assertEqual(rc, 0)
+        self.assertIn("wave-3", out)
+
+    def test_show_missing_key_fails_and_names_it(self):
+        p = self._seed()
+        with mock.patch.dict(os.environ, {"HELM_BOARD": p}):
+            rc, _out, err = _run(board.cmd_board, ["show", "nope"])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("nope", err)
+
+    def test_show_key_with_json_flag_emits_json(self):
+        p = self._seed()
+        with mock.patch.dict(os.environ, {"HELM_BOARD": p}):
+            rc, out, _err = _run(board.cmd_board, ["show", "landed", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), [{"name": "row-a"}])
+
+    def test_show_bare_still_lists_all_keys(self):
+        p = self._seed()
+        with mock.patch.dict(os.environ, {"HELM_BOARD": p}):
+            rc, out, _err = _run(board.cmd_board, ["show"])
+        self.assertEqual(rc, 0)
+        self.assertIn("landed", out)
+        self.assertIn("phase", out)
+        self.assertIn("tasks", out)
 
 
 class KeyOwnershipTest(BoardBase):
@@ -402,11 +492,11 @@ class KeyOwnershipTest(BoardBase):
     findings, and no contradiction is constructible; two seats replacing one
     narrative slot is a contradiction by construction. So a key added later
     defaults to open-for-annotation and closed-for-replacement, which is the
-    safe direction — the contract this replaces defaulted to a rule nobody
-    could enforce, and it went stale for days without anyone noticing."""
+    safe direction — the contract this replaces defaulted to a rule nobody could
+    enforce, and it went stale for days without anyone noticing."""
 
     def owned(self, extra=None):
-        obj = {"_writer_seat": "opus-integrator", "landed": [], "tasks": [],
+        obj = {"_writer_seat": "seat-a", "landed": [], "tasks": [],
                "defects": [{"id": "a"}], "notes": ["one"]}
         obj.update(extra or {})
         return self.board(obj)
@@ -414,7 +504,7 @@ class KeyOwnershipTest(BoardBase):
     def test_a_NON_OWNER_may_APPEND_to_a_narrative_key(self):
         p = self.owned({"landed": [{"name": "x", "sha": "1", "note": "n"}]})
         ok, err = board.add_landed("y", "2", "n2", board_path=p,
-                                   seat="helm-claude")
+                                   seat="seat-b")
         self.assertEqual((ok, err), (True, None))
         self.assertEqual(len(self.read(p)["landed"]), 2,
                          "an append by a non-owner must land")
@@ -422,17 +512,17 @@ class KeyOwnershipTest(BoardBase):
     def test_a_NON_OWNER_may_not_REPLACE_a_narrative_key(self):
         p = self.owned({"tasks": ["a", "b"]})
         ok, err = board.update(lambda b: b.__setitem__("tasks", ["wiped"]),
-                               board_path=p, seat="helm-claude")
+                               board_path=p, seat="seat-b")
         self.assertIs(ok, False)
         self.assertIn("NARRATIVE", err)
-        self.assertIn("opus-integrator", err)
+        self.assertIn("seat-a", err)
         self.assertEqual(self.read(p)["tasks"], ["a", "b"],
                          "the refusal must leave the board UNTOUCHED")
 
     def test_the_OWNER_may_replace_its_own_narrative_key(self):
         p = self.owned({"tasks": ["a"]})
         ok, err = board.update(lambda b: b.__setitem__("tasks", ["rewritten"]),
-                               board_path=p, seat="opus-integrator")
+                               board_path=p, seat="seat-a")
         self.assertEqual((ok, err), (True, None))
         self.assertEqual(self.read(p)["tasks"], ["rewritten"])
 
@@ -441,7 +531,7 @@ class KeyOwnershipTest(BoardBase):
         defects, and a finding must never queue behind the busiest seat."""
         p = self.owned()
         ok, err = board.update(lambda b: b.__setitem__("defects", [{"id": "z"}]),
-                               board_path=p, seat="helm-claude")
+                               board_path=p, seat="seat-b")
         self.assertEqual((ok, err), (True, None))
         self.assertEqual(self.read(p)["defects"], [{"id": "z"}])
 
@@ -459,7 +549,7 @@ class KeyOwnershipTest(BoardBase):
     def test_a_board_with_NO_declared_owner_is_not_enforced(self):
         p = self.board({"tasks": ["a"], "landed": []})   # no _writer_seat
         ok, err = board.update(lambda b: b.__setitem__("tasks", ["free"]),
-                               board_path=p, seat="helm-claude")
+                               board_path=p, seat="seat-b")
         self.assertEqual((ok, err), (True, None))
 
     def test_a_TRUNCATION_is_a_replace_not_an_append(self):
@@ -467,21 +557,21 @@ class KeyOwnershipTest(BoardBase):
         an edit and destroys another writer's work."""
         p = self.owned({"tasks": ["a", "b", "c"]})
         ok, err = board.update(lambda b: b.__setitem__("tasks", ["a"]),
-                               board_path=p, seat="helm-claude")
+                               board_path=p, seat="seat-b")
         self.assertIs(ok, False)
         self.assertIn("NARRATIVE", err)
 
     def test_a_REORDER_is_a_replace_too(self):
         p = self.owned({"tasks": ["a", "b"]})
         ok, err = board.update(lambda b: b.__setitem__("tasks", ["b", "a"]),
-                               board_path=p, seat="helm-claude")
+                               board_path=p, seat="seat-b")
         self.assertIs(ok, False)
 
     def test_appending_at_EITHER_end_counts_as_an_append(self):
         for new in (["z", "a", "b"], ["a", "b", "z"]):
             p = self.owned({"tasks": ["a", "b"]})
             ok, err = board.update(lambda b, n=new: b.__setitem__("tasks", n),
-                                   board_path=p, seat="helm-claude")
+                                   board_path=p, seat="seat-b")
             self.assertEqual((ok, err), (True, None), new)
 
 
@@ -516,47 +606,5 @@ class NarrativeMapAuditTest(unittest.TestCase):
         self.assertFalse(board._appended_only("scalar", "other"))
 
 
-def _run(fn, args):
-    out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        rc = fn(list(args))
-    return rc, out.getvalue(), err.getvalue()
-
-
-class CLIDeclaresItsSeatTest(BoardBase):
-    """A guard the PRIMARY ENTRY POINT never invokes does not exist.
-
-    The first cut enforced ownership inside update() and then had the CLI call
-    set_value with no seat, so `helm board set` from any seat failed open and
-    the whole enforcement was decorative — the same shape as a tri-state
-    nobody prints, which is the defect I spent tonight fixing one layer up."""
-
-    def owned(self, extra=None):
-        # `freeze` is narrative AND scalar — `tasks` is a list, and the
-        # pre-existing structure guard would refuse a scalar set before
-        # ownership was ever consulted, which would test the wrong refusal.
-        obj = {"_writer_seat": "opus-integrator", "freeze": "open",
-               "tasks": ["a"], "landed": []}
-        obj.update(extra or {})
-        return self.board(obj)
-
-    def test_a_seat_replacing_a_narrative_key_is_REFUSED_at_the_CLI(self):
-        p = self.owned()
-        with mock.patch.dict(os.environ, {"HELM_BOARD": p,
-                                          "HELM_CHAT_NAME": "helm-claude"}):
-            rc, _out, err = _run(board.cmd_board, ["set", "freeze", "wiped"])
-        self.assertEqual(rc, 1, "a seat replacing a narrative key must refuse")
-        self.assertIn("NARRATIVE", err)
-        self.assertEqual(self.read(p)["freeze"], "open",
-                         "and the board is untouched")
-
-    def test_an_UNDECLARED_operator_shell_still_writes(self):
-        """The owner's own shell declares no seat and must keep working — the
-        intended asymmetry, not an oversight."""
-        p = self.owned()
-        env = {k: v for k, v in os.environ.items() if k != "HELM_CHAT_NAME"}
-        env["HELM_BOARD"] = p
-        with mock.patch.dict(os.environ, env, clear=True):
-            rc, _out, err = _run(board.cmd_board, ["set", "freeze", "by hand"])
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(self.read(p)["freeze"], "by hand")
+if __name__ == "__main__":
+    unittest.main()

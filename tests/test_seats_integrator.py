@@ -130,7 +130,13 @@ class TheIntegratorIsResolvedNeverGuessedTest(unittest.TestCase):
         self.assertNotIn("does not resolve in the roster", why)
 
     def test_or_default_NEVER_returns_None_and_is_LOUD_when_it_substitutes(self):
-        seats_integrator._warn_once.__globals__["_FOREIGN_WARNED"].clear()
+        # Emptied so the warning is said here, and put back as it was: the
+        # warn-once set is the process's, and a key this arm leaves in it
+        # would silence the same warning in whatever runs next.
+        warned = seats_integrator._warn_once.__globals__["_FOREIGN_WARNED"]
+        prior = set(warned)
+        self.addCleanup(lambda: (warned.clear(), warned.update(prior)))
+        warned.clear()
         err = io.BytesIO()
         with mock.patch("helm.seats_integrator.integrator_seat",
                         return_value=(None, "roster unreadable")), \

@@ -567,7 +567,21 @@ _KEY_DATA = {"label": "sk-or-v1-" + _MARKER + "...qqqq", "limit": None,
 _CREDITS_DATA = {"total_credits": 50, "total_usage": 16.358006897}
 # the catalog FAMILY key under test; its family seat carries the same name
 _OR = "openrouter"  # noqa: SEAT_NAME — the catalog family key IS the subject of these arms, and its family seat is named after it
-_FAMILIES = ("dots3", "ds4flash", _OR)
+# THE PAID OPENROUTER RUNG, as a synthetic family. The catalog's own paid
+# consumer of this account moved to the flat OpenCode Go subscription (one
+# token source per seat), so the paid/free split these arms pin is exercised
+# on a table entry shaped exactly like the one it replaced.
+_PAID = "flashpaid-under-test"  # noqa: SEAT_NAME — a synthetic family key, no seat carries it
+_PAID_ENTRY = {"port": 8331, "model": "flashpaid-under-test",
+               "mode": "proxy-key", "key_env": "FLASHPAID_API_KEY",
+               "money_reader": "openrouter-key",
+               "pool_default": "openrouter",
+               "pool_providers": {"openrouter": {
+                   "base_url": "https://openrouter.ai/api/v1",
+                   "upstream_model": "deepseek/deepseek-v4-flash",
+                   "rung": "paid", "authstore": "openrouter"}},
+               "probe_models": ("flashpaid-under-test",)}
+_FAMILIES = ("dots3", _PAID, _OR)
 
 
 class OpenRouterKeyReaderTest(unittest.TestCase):
@@ -590,6 +604,10 @@ class OpenRouterKeyReaderTest(unittest.TestCase):
         self.env.start()
         self.calls = []
         self.account = moneyread.cred_ref(_FAKE_KEY).account
+        from helm import seat
+        table = mock.patch.dict(seat.FAMILIES, {_PAID: _PAID_ENTRY})
+        table.start()
+        self.addCleanup(table.stop)
 
     def tearDown(self):
         self.env.stop()
@@ -735,7 +753,7 @@ class OpenRouterKeyReaderTest(unittest.TestCase):
         self.assertEqual(moneyread._next_utc_midnight(_MIDNIGHT - 0.001),
                          _MIDNIGHT)
         # a successful read no longer reads GREY: the free families read
-        # the measured day, ds4flash the measured prepaid balance
+        # the measured day, the paid family the measured prepaid balance
         for family, pct in ((_OR, 14.0), ("dots3", 14.0)):
             with self.subTest(family=family):
                 rows, axis, answer = self.fold(snap, family)
@@ -746,7 +764,7 @@ class OpenRouterKeyReaderTest(unittest.TestCase):
                                  (burnflags.YELLOW, "money:has-headroom",
                                   _MIDNIGHT, "yes"))
                 self.assertEqual(rows[0]["longest_pct"], pct)
-        rows, axis, answer = self.fold(snap, "ds4flash")
+        rows, axis, answer = self.fold(snap, _PAID)
         self.assertEqual([w["label"] for w in rows[0]["windows"]], ["prepaid"])
         self.assertEqual((axis["colour"], answer), (burnflags.YELLOW, "yes"))
 
@@ -771,7 +789,7 @@ class OpenRouterKeyReaderTest(unittest.TestCase):
             snap = moneyread.probe_snapshot(now=_NOW)
         self.assertEqual(self.fold(snap, _OR)[1]["colour"],
                          burnflags.YELLOW)
-        self.assertEqual(self.fold(snap, "ds4flash")[1]["colour"],
+        self.assertEqual(self.fold(snap, _PAID)[1]["colour"],
                          burnflags.RED)
 
     def test_an_unreadable_meter_reads_unread_never_zero(self):  # noqa: VACUOUS_ASSERTION — each literal case asserts the exact unread:<class> status and the GREY unreadable axis on the same reading before its no-number and no-zero checks
@@ -962,7 +980,7 @@ class OpenRouterKeyReaderTest(unittest.TestCase):
                          (burnflags.ORANGE, "money:estimated", "unknown"))
         self.assertIn("1m", axis["cause"])
         # the paid family is not held by the free-model minute
-        self.assertEqual(self.fold(hot, "ds4flash")[1]["colour"],
+        self.assertEqual(self.fold(hot, _PAID)[1]["colour"],
                          burnflags.YELLOW)
         # a derived minute can never wall, even at its cap
         os.remove(path)
@@ -1052,6 +1070,434 @@ class OpenRouterKeyReaderTest(unittest.TestCase):
         self.assertNotIn(_MARKER, text)
         self.assertEqual(creds[0].account, self.account)
         self.assertEqual(creds[0].value["key"].reveal(), _FAKE_KEY)
+
+
+# ---------------------------------------------------- the cursor-dashboard reader
+_CURSOR = "cursor"  # noqa: SEAT_NAME — the catalog family key IS the subject of these arms
+# THE MEASURED REPLY SHAPE of GetCurrentPeriodUsage (task/2943), trimmed to
+# the fields the reader reads plus two it must ignore. Cycle start/end are the
+# epoch-millisecond STRINGS the endpoint sends.
+_CYCLE_START, _CYCLE_END = 1789929920, 1792521920
+_USAGE = {"billingCycleStart": str(_CYCLE_START * 1000),
+          "billingCycleEnd": str(_CYCLE_END * 1000),
+          "planUsage": {"limit": 2000, "remaining": 1905, "includedSpend": 95,
+                        "bonusSpend": 0,
+                        "autoPercentUsed": 0.21111111111111108,
+                        "apiPercentUsed": 0,
+                        "totalPercentUsed": 0.1919191919191919},
+          "autoBucketModels": ["default", "composer-2"],
+          "displayMessage": "You've used 5% of your included usage"}
+_SUBJECT = "github|user_" + _MARKER
+
+
+def _cursor_token(exp):
+    import base64
+
+    def seg(obj):
+        return base64.urlsafe_b64encode(
+            json.dumps(obj).encode()).rstrip(b"=").decode()
+    return "%s.%s.%s" % (seg({"alg": "HS256", "typ": "JWT"}),
+                         seg({"sub": _SUBJECT, "exp": exp}), _MARKER)
+
+
+class CursorDashboardReaderTest(unittest.TestCase):
+    """task/2943: the cursor family's money reader over a synthetic home, a
+    synthetic bridge credential store and a mocked or loopback vendor."""
+
+    def setUp(self):
+        from helm import seat
+        self.root = tempfile.mkdtemp(prefix="helm-test-cursor-meter-")
+        env = {"HOME": os.path.join(self.root, "home"),
+               "HELM_HOME": os.path.join(self.root, "helm"),
+               "HELM_ADOPTED_DIR": os.path.join(self.root, "adopted"),
+               "TMPDIR": os.path.join(self.root, "tmp")}
+        for path in env.values():
+            os.makedirs(path)
+        loopback = "127.0.0.1,localhost"
+        self.env = mock.patch.dict(os.environ, dict(
+            env, no_proxy=loopback, NO_PROXY=loopback))
+        self.env.start()
+        self.store = os.path.join(self.root, "credentials.json")
+        fam = seat.FAMILIES[_CURSOR]
+        self.table = mock.patch.dict(seat.FAMILIES, {_CURSOR: dict(
+            fam, sidecar=dict(fam["sidecar"], credentials=self.store))})
+        self.table.start()
+        self.calls = []
+        self.account = moneyread.cred_ref(_SUBJECT).account
+
+    def tearDown(self):
+        self.table.stop()
+        self.env.stop()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def mint(self, exp=_NOW + 86400):
+        from helm import seat
+        d = seat.seat_dir(_CURSOR)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "config.yaml"), "w") as f:
+            f.write("port: 8315\n")
+        with open(self.store, "w") as f:
+            json.dump({"access": _cursor_token(exp), "refresh": _MARKER,
+                       "expires": exp * 1000}, f)
+
+    def vendor(self, reply=None, fail=None):
+        def fake(url, secret, timeout=None, body=None, headers=None,
+                 unwrap="data"):
+            self.calls.append((url, secret == _cursor_token(_NOW + 86400),
+                               body, dict(headers or {}), unwrap))
+            return (None, fail) if fail else (
+                json.loads(json.dumps(reply or _USAGE)), None)
+        return mock.patch.object(moneyread, "_http_json", side_effect=fake)
+
+    def record(self, snap):
+        rows = [r for r in snap["readings"]
+                if r["reader"] == moneyread.CURSOR_READER]
+        self.assertEqual(len(rows), 1, snap)
+        return rows[0]
+
+    def fold(self, snap):
+        mapped = moneyread.inputs(snap, now=_NOW, max_age_s=1800)
+        axis = burnflags.derive_money(
+            _CURSOR, mapped["money"][_CURSOR], ceiling=90,
+            measured_at=mapped["money_measured_at"].get(_CURSOR),
+            fresh=mapped["money_fresh"][_CURSOR])
+        return mapped["money"][_CURSOR], axis
+
+    def probe(self):
+        return moneyread.probe_snapshot(
+            now=_NOW, table={_CURSOR: self.cursor_fam()})
+
+    @staticmethod
+    def cursor_fam():
+        from helm import seat
+        return seat.FAMILIES[_CURSOR]
+
+    def test_the_catalog_binds_the_family_and_names_the_pool_it_bills(self):
+        self.assertEqual(moneyread.catalog_bindings().get(
+            moneyread.CURSOR_READER), (_CURSOR,))
+        self.assertIn(_CURSOR, burnflags.money_readers())
+        self.assertEqual(self.cursor_fam()["billing_pool"], "auto")
+
+    def test_the_reading_holds_the_included_dollars_and_both_pools(self):
+        self.mint()
+        with self.vendor():
+            snap = self.probe()
+        rec = self.record(snap)
+        self.assertEqual((rec["status"], rec["account"], rec["families"]),
+                         ("ok", self.account, [_CURSOR]))
+        windows = {w["label"]: w for w in rec["windows"]}
+        self.assertEqual(windows[moneyread.INCLUDED]["used_percent"], 4.75)
+        self.assertAlmostEqual(windows[moneyread.AUTO_POOL]["used_percent"],
+                               0.2111111)
+        self.assertEqual(windows[moneyread.API_POOL]["used_percent"], 0)
+        for w in windows.values():
+            self.assertEqual((w["reset_at"], w["seconds"]),
+                             (_CYCLE_END, _CYCLE_END - _CYCLE_START))
+        self.assertEqual((rec["overflow"]["kind"], rec["overflow"]["balance"]),
+                         ("included-dollars", 19.05))
+        # ONE POST, carrying the Connect header and an empty message, with
+        # the bridge's own token, to the dashboard endpoint and nowhere else
+        (url, own_token, body, headers, unwrap), = self.calls
+        self.assertEqual(url, moneyread.CURSOR_API + moneyread.CURSOR_USAGE_PATH)
+        self.assertTrue(own_token)
+        self.assertEqual((body, unwrap), (b"{}", None))
+        self.assertEqual(headers.get("Connect-Protocol-Version"), "1")
+        text = json.dumps(snap)
+        self.assertIn(self.account, text)
+        self.assertNotIn(_MARKER, text)
+
+    def test_the_row_is_the_included_dollars_and_the_pool_it_bills(self):
+        """The catalog claims on-demand off, so the included window leaves
+        the row and the Auto pool the family bills governs it. A claim that
+        is on keeps the included dollars beside whichever pool is named, and
+        both pools when none is."""
+        self.mint()
+        with self.vendor():
+            snap = self.probe()
+        rows, axis = self.fold(snap)
+        self.assertEqual([w["label"] for w in rows[0]["windows"]],
+                         [moneyread.AUTO_POOL])
+        self.assertEqual(rows[0]["longest_pct"], 0.21111111111111108)
+        # headroom, read: YELLOW, since no abundance reading claims GREEN
+        self.assertEqual((axis["colour"], axis["cause_id"]),
+                         (burnflags.YELLOW, "money:has-headroom"))
+        from helm import seat
+        held = {"state": "on", "basis": "a test's claim"}
+        for pool, labels in (("api", [moneyread.INCLUDED, moneyread.API_POOL]),
+                             (None, [moneyread.INCLUDED, moneyread.AUTO_POOL,
+                                     moneyread.API_POOL])):
+            fam = dict(self.cursor_fam(), billing_pool=pool, on_demand=held)
+            with self.subTest(pool=pool), \
+                    mock.patch.dict(seat.FAMILIES, {_CURSOR: fam}):
+                got = moneyread._cursor_rows(
+                    moneyread.Reading(**{k: v for k, v in
+                                         self.record(snap).items()
+                                         if k in ("status", "measured_at",
+                                                  "overflow", "windows",
+                                                  "expires_at")}),
+                    _CURSOR)
+                self.assertEqual([w["label"] for w in got[0]["windows"]],
+                                 labels)
+
+    def test_spent_included_follows_the_billed_pool_while_on_demand_is_off(self):
+        """Remaining 0 with the included dollars spent does not wall the
+        family while the catalog claims on-demand off. The Auto pool it
+        bills governs the row."""
+        self.mint()
+        spent = json.loads(json.dumps(_USAGE))
+        spent["planUsage"].update(remaining=0, includedSpend=2000,
+                                  autoPercentUsed=4.44)
+        with self.vendor(reply=spent):
+            snap = self.probe()
+        rows, axis = self.fold(snap)
+        self.assertEqual([w["label"] for w in rows[0]["windows"]],
+                         [moneyread.AUTO_POOL])
+        self.assertEqual(rows[0]["longest_pct"], 4.44)
+        self.assertEqual((axis["colour"], axis["cause_id"]),
+                         (burnflags.YELLOW, "money:has-headroom"))
+
+    def test_a_zero_remaining_the_endpoint_omits_reads_as_spent(self):
+        """THE ENDPOINT OMITS A ZERO FIELD. MEASURED with a probe that
+        printed key names only: the live reply's planUsage carried limit, includedSpend,
+        bonusSpend, remainingBonus, bonusTooltip, totalSpend and the three
+        percentages, and NO `remaining`, once the included dollars were
+        spent. The reader required `remaining`, so the included window read
+        unread and the family GREY while the plan was measurably spent. The
+        included window is includedSpend of limit, a missing remaining is 0
+        beside a limit, and the bonus dollars Cursor served past the included
+        ones are carried on the overflow. The catalog claim leaves that
+        window out of the row, so the family follows the Auto pool."""
+        self.mint()
+        live = json.loads(json.dumps(_USAGE))
+        del live["planUsage"]["remaining"]
+        live["planUsage"].update(includedSpend=2000, bonusSpend=512,
+                                 totalSpend=2512, autoPercentUsed=4.44)
+        with self.vendor(reply=live):
+            snap = self.probe()
+        rec = self.record(snap)
+        windows = {w["label"]: w for w in rec["windows"]}
+        self.assertEqual(windows[moneyread.INCLUDED]["used_percent"], 100.0)
+        self.assertEqual((rec["overflow"]["kind"], rec["overflow"]["balance"],
+                          rec["overflow"]["status"],
+                          rec["overflow"]["bonus_spent"]),
+                         ("included-dollars", 0.0, "ok", 5.12))
+        rows, axis = self.fold(snap)
+        self.assertEqual([w["label"] for w in rows[0]["windows"]],
+                         [moneyread.AUTO_POOL])
+        self.assertEqual(rows[0]["longest_pct"], 4.44)
+        self.assertEqual((axis["colour"], axis["cause_id"]),
+                         (burnflags.YELLOW, "money:has-headroom"))
+
+    def spent_with_bonus(self, **plan):
+        """The live shape once the included dollars are spent: no
+        `remaining`, includedSpend at the limit, and `remainingBonus` a
+        boolean (its type MEASURED by a probe that printed types only).
+        Caller keys override those defaults."""
+        reply = json.loads(json.dumps(_USAGE))
+        del reply["planUsage"]["remaining"]
+        fields = {"includedSpend": 2000, "bonusSpend": 512,
+                  "autoPercentUsed": 4.44}
+        fields.update(plan)
+        reply["planUsage"].update(fields)
+        return reply
+
+    def probe_as(self, reply, on_demand=None):
+        """(snapshot, rows, axis) with the family's on-demand claim replaced
+        (None keeps the catalog's, "absent" removes it). The fold runs under
+        the same claim: a fold maps the persisted reading again with the
+        catalog in force when it runs, which is how a changed claim
+        re-derives the row."""
+        from helm import seat
+        fam = dict(self.cursor_fam())
+        if on_demand == "absent":
+            fam.pop("on_demand", None)
+        elif on_demand is not None:
+            fam["on_demand"] = on_demand
+        with mock.patch.dict(seat.FAMILIES, {_CURSOR: fam}):
+            with self.vendor(reply=reply):
+                snap = moneyread.probe_snapshot(now=_NOW,
+                                                table={_CURSOR: fam})
+            return (snap,) + self.fold(snap)
+
+    def test_free_bonus_keeps_a_spent_plan_spendable_while_on_demand_is_off(self):
+        """THE OWNER'S PLAN HAS ON-DEMAND OFF, so what Cursor serves past the
+        included dollars (bonus usage) costs nothing: while the reply says
+        bonus remains (`remainingBonus`), the spent included window is not
+        the wall and the Auto pool the family bills governs the row. The
+        claim is the catalog's, with the owner's words beside it, so a
+        change of the claim re-derives the reading."""
+        self.mint()
+        claim = self.cursor_fam()["on_demand"]
+        self.assertEqual(claim["state"], "off")
+        self.assertIn("payg is off", claim["basis"])
+        self.assertIn("just run it until it stops working", claim["basis"])
+        snap, rows, axis = self.probe_as(
+            self.spent_with_bonus(remainingBonus=True))
+        rec = self.record(snap)
+        windows = {w["label"]: w for w in rec["windows"]}
+        self.assertEqual(windows[moneyread.INCLUDED]["used_percent"], 100.0)
+        self.assertIs(rec["overflow"]["bonus_left"], True)
+        self.assertEqual([w["label"] for w in rows[0]["windows"]],
+                         [moneyread.AUTO_POOL])
+        self.assertEqual(rows[0]["longest_pct"], 4.44)
+        self.assertNotEqual(axis["colour"], burnflags.RED)
+        self.assertEqual(axis["cause_id"], "money:has-headroom")
+
+    def test_spent_included_is_not_the_wall_once_on_demand_is_off(self):  # noqa: VACUOUS_ASSERTION — burnflags.YELLOW is a named constant the rung reads as an absence, and its RED twin sits in the closed-claim subtests. The Auto-window and has-headroom pins above run unconditionally.
+        """ON-DEMAND OFF MEANS NOTHING PAST THE INCLUDED DOLLARS CAN BE
+        BILLED. With that claim off and based, bonus gone, included at 100
+        and the Auto pool at 42, the row is the Auto window alone. The same
+        holds when the bonus field is omitted. A claim that is on, absent,
+        or off with no basis keeps the included window and reads 100."""
+        self.mint()
+        _snap, rows, axis = self.probe_as(
+            self.spent_with_bonus(remainingBonus=False, autoPercentUsed=42))
+        self.assertEqual([w["label"] for w in rows[0]["windows"]],
+                         [moneyread.AUTO_POOL])
+        self.assertEqual(rows[0]["longest_pct"], 42)
+        self.assertEqual(axis["colour"], burnflags.YELLOW)
+        self.assertEqual(axis["cause_id"], "money:has-headroom")
+        _snap, rows, axis = self.probe_as(
+            self.spent_with_bonus(autoPercentUsed=42))
+        self.assertEqual([w["label"] for w in rows[0]["windows"]],
+                         [moneyread.AUTO_POOL])
+        self.assertEqual(rows[0]["longest_pct"], 42)
+        held = {"state": "on", "basis": "a test's claim"}
+        bare = {"state": "off"}
+        for name, claim in (("claim on", held), ("claim absent", "absent"),
+                            ("claim without basis", bare)):
+            with self.subTest(name):
+                _snap, rows, axis = self.probe_as(
+                    self.spent_with_bonus(remainingBonus=False,
+                                          autoPercentUsed=42),
+                    on_demand=claim)
+                self.assertEqual(rows[0]["windows"][0]["label"],
+                                 moneyread.INCLUDED)
+                self.assertEqual(rows[0]["longest_pct"], 100.0)
+                self.assertEqual(axis["colour"], burnflags.RED)
+
+    def test_bonus_is_never_headroom_unless_on_demand_is_claimed_off(self):  # noqa: VACUOUS_ASSERTION — every subtest asserts the RED colour and the 100% included window unconditionally
+        """FAILS CLOSED: with the claim `on`, absent, or `off` with no basis,
+        the spent included dollars are the wall and the family reads RED,
+        even while the reply says bonus remains. Bonus left is not the
+        decision once on-demand is claimed off. The bonus is still carried
+        on the reading."""
+        self.mint()
+        on = {"state": "on", "basis": "a test's claim"}
+        cases = (("claim on", self.spent_with_bonus(remainingBonus=True), on),
+                 ("claim absent", self.spent_with_bonus(remainingBonus=True),
+                  "absent"),
+                 ("claim without basis",
+                  self.spent_with_bonus(remainingBonus=True),
+                  {"state": "off"}))
+        for name, reply, claim in cases:
+            with self.subTest(name):
+                snap, rows, axis = self.probe_as(reply, on_demand=claim)
+                self.assertEqual(self.record(snap)["overflow"]["bonus_spent"],
+                                 5.12)
+                self.assertEqual(rows[0]["longest_pct"], 100.0)
+                self.assertEqual(axis["colour"], burnflags.RED)
+
+    def test_an_omitted_spend_is_zero_and_an_omitted_limit_is_unread(self):  # noqa: VACUOUS_ASSERTION — the fresh-cycle half asserts the included window at 0.0 and the overflow's numbers unconditionally before the limitless half asserts an unread window
+        """The same rule from the other side: a fresh cycle's reply omits
+        includedSpend and bonusSpend (both zero), which reads 0% spent and no
+        bonus. Without a limit the included window stays unread. The catalog
+        claim leaves that window out of the row, so the family takes its
+        colour from the Auto pool it bills."""
+        self.mint()
+        fresh = json.loads(json.dumps(_USAGE))
+        for key in ("includedSpend", "bonusSpend"):
+            del fresh["planUsage"][key]
+        fresh["planUsage"]["remaining"] = 2000
+        with self.vendor(reply=fresh):
+            rec = self.record(self.probe())
+        windows = {w["label"]: w for w in rec["windows"]}
+        self.assertEqual(windows[moneyread.INCLUDED]["used_percent"], 0.0)
+        self.assertEqual((rec["overflow"]["balance"],
+                          rec["overflow"]["bonus_spent"]), (20.0, 0.0))
+        limitless = json.loads(json.dumps(_USAGE))
+        for key in ("limit", "remaining"):
+            del limitless["planUsage"][key]
+        self.calls.clear()
+        with self.vendor(reply=limitless):
+            snap = self.probe()
+        rec = self.record(snap)
+        windows = {w["label"]: w for w in rec["windows"]}
+        self.assertIsNone(windows[moneyread.INCLUDED]["used_percent"])
+        self.assertEqual((rec["overflow"]["balance"],
+                          rec["overflow"]["status"]), (None, "unread"))
+        rows, axis = self.fold(snap)
+        self.assertEqual([w["label"] for w in rows[0]["windows"]],
+                         [moneyread.AUTO_POOL])
+        self.assertEqual(rows[0]["longest_pct"], 0.21111111111111108)
+        self.assertEqual((axis["colour"], axis["cause_id"]),
+                         (burnflags.YELLOW, "money:has-headroom"))
+
+    def test_an_expired_token_is_unread_never_sent_never_refreshed(self):  # noqa: VACUOUS_ASSERTION — the unread status naming the expiry and the GREY fold are the unconditional positive controls for the empty call list
+        self.mint(exp=_NOW - 60)
+        with open(self.store, "rb") as f:
+            before = f.read()
+        with self.vendor():
+            snap = self.probe()
+        self.assertEqual(self.record(snap)["status"],
+                         "unread:credentials-expired")
+        self.assertEqual(self.calls, [])
+        with open(self.store, "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(self.fold(snap)[1]["colour"], burnflags.GREY)
+
+    def test_a_refused_read_is_unread_and_grey(self):
+        self.mint()
+        with self.vendor(fail="auth"):
+            snap = self.probe()
+        self.assertEqual(self.record(snap)["status"], "unread:auth")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.fold(snap)[1]["colour"], burnflags.GREY)
+
+    def test_no_minted_seat_sends_nothing(self):  # noqa: VACUOUS_ASSERTION — the unread status names the cause, the unconditional positive control for the empty call list
+        with open(self.store, "w") as f:
+            json.dump({"access": _cursor_token(_NOW + 86400)}, f)
+        with self.vendor():
+            snap = self.probe()
+        self.assertEqual(self.record(snap)["status"],
+                         "unread:credentials-unavailable")
+        self.assertEqual(self.calls, [])
+
+    def test_a_real_transport_posts_the_connect_request(self):
+        import http.server
+        import threading
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                seen.append((self.path, self.headers.get("Authorization"),
+                             self.headers.get("Connect-Protocol-Version"),
+                             self.headers.get("Content-Type"),
+                             self.rfile.read(length)))
+                body = json.dumps(_USAGE).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever,
+                         kwargs={"poll_interval": 0.01}, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.mint()
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        with mock.patch.object(moneyread, "CURSOR_API", base):
+            snap = self.probe()
+        self.assertEqual(self.record(snap)["status"], "ok")
+        self.assertEqual(seen, [(moneyread.CURSOR_USAGE_PATH,
+                                 "Bearer " + _cursor_token(_NOW + 86400),
+                                 "1", "application/json", b"{}")])
 
 
 if __name__ == "__main__":

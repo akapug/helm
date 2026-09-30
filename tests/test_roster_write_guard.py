@@ -243,8 +243,8 @@ class RosterWriteGuardTest(unittest.TestCase):
         for f in sorted(os.listdir(root)):
             if not f.startswith("seats_") or not f.endswith(".py"):
                 continue
-            tree = ast.parse(open(os.path.join(root, f),
-                                  encoding="utf-8").read())
+            with open(os.path.join(root, f), encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
             for d in [n for n in ast.walk(tree)
                       if isinstance(n, ast.FunctionDef)]:
                 writes = any(

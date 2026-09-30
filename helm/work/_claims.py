@@ -1,19 +1,22 @@
 """helm work — the claims cluster: check-in/check-out at the desk plus the
 CLI arg leaf helpers. Moved verbatim from the pre-split helm/work.py.
 """
+import contextlib
 import os
 import sys
 
 from .. import pk, seats, vcs
 from ._common import DEFAULT_TTL, _VALUE_FLAGS
 from ._lanes import (
-    _disposable_worktree_occupant, _occupants, lane_branch, lane_path, resource,
-    worktrees,
+    _disposable_worktree_occupant, _occupants, _worktree_records,
+    describe_occupants, lane_branch, lane_path, resource, worktrees,
 )
 from ._gc import (
-    RETIRABLE, _base, _branch_triage, _delete_lane_branch, _dirty, _has_branch,
-    _merge_state, _proof_word, _retire_disposable_occupants,
-    _runtime_source_in, _wip_commit,
+    RETIRABLE, _base, _branch_triage, _current_branch, _delete_lane_branch,
+    _dirty, _has_branch, _manual_only, _merge_state, _moved_since,
+    _moved_under_scan, _proof_word, _removal_blocker,
+    _retire_disposable_occupants, _room_fingerprint, _room_state,
+    _runtime_source_in, _sweep_state, _wip_commit,
 )
 
 
@@ -141,8 +144,13 @@ def claim(root, lane, seat, ttl=DEFAULT_TTL, lease=None, session=None):
     worked. The overdue surfaces read that answer off the grant now, and a room
     left standing by an unlanded release is no longer mistaken for one."""
     res, v = resource(root, lane), vcs.backend(root)
-    ok, msg, lease_id = seats.claim(res, seat, ttl=ttl, lease=lease,
-                                    session=session, repo=_grant_repo(root))
+    try:
+        ok, msg, lease_id = seats.claim(res, seat, ttl=ttl, lease=lease,
+                                        session=session,
+                                        repo=_grant_repo(root))
+    except OSError as exc:              # an unreadable ledger is never rewritten
+        return 1, ("helm work: REFUSED — %s, so whether lane %s is held is "
+                   "UNKNOWN; nothing claimed" % (exc, lane))
     if not ok:
         return 1, "helm work: " + msg
     path, branch = lane_path(root, lane), lane_branch(lane)
@@ -262,6 +270,19 @@ def claim(root, lane, seat, ttl=DEFAULT_TTL, lease=None, session=None):
                       % (len(terminal), lane, base_name(root),
                          ", ".join(t[:12] for t in terminal[:4])),
                       file=sys.stderr)
+        if fresh:
+            # A FRESH BRANCH HAS NO TASK YET: a record its name's last
+            # branch left behind is dropped before the branch is cut
+            # (task/3643), so the one join never reads another task for it.
+            from .. import taskkey
+            _forgot, why = taskkey.forget_lane(root, lane)
+            if why:
+                # an UNREADABLE ref erased nothing; the claim refuses rather
+                # than cut a branch over a record it could not judge
+                seats.release(res, seat, lease=lease_id, session=session)
+                return 1, ("helm work: REFUSED — %s, so whether lane %s "
+                           "would inherit another task is UNKNOWN (lease "
+                           "returned)" % (why, lane))
         rc, _out, err = v.add_worktree(
             root, path, branch,
             base=_base(root) if fresh else None,
@@ -679,11 +700,14 @@ def _warn_kindred_lane(root, lane):
 def release_lane(root, lane, seat, lease=None, session=None, park=False,
                  superseded=None):
     """(rc, [lines]). Surrender the lease, but retire the room only when Git
-    proves the lane landed. A wrong or expired confirmation token mutates
-    nothing: a park commit first strictly refreshes the existing grant; a clean
-    release performs the single authoritative ledger write. Unlanded work keeps
-    BOTH branch and worktree and emits triage evidence. A holder who lost their
-    token reads it back off `helm work list` (seats.own_leases).
+    proves that what the ROOM has checked out landed, and delete the lease
+    branch only on the lease branch's own proof. A wrong or expired
+    confirmation token mutates nothing: a park commit first strictly refreshes
+    the existing grant; a clean release performs the single authoritative
+    ledger write. Unlanded work keeps BOTH branch and worktree and emits triage
+    evidence. A detached or mid-operation room is manual-only, as in gc. A
+    holder who lost their token reads it back off `helm work list`
+    (seats.own_leases).
 
     `superseded` is the THIRD STATE — work that will never land, deliberately —
     and it retires the ROOM ONLY. See the comment at the retirement itself for
@@ -704,19 +728,40 @@ def release_lane(root, lane, seat, lease=None, session=None, park=False,
         return 1, ["helm work: %s supplies this running helm binary — room and "
                    "lease kept; release it from another checkout" % path]
     occupied = _occupants(path) if room else []
-    disposable = bool(occupied) and all(
-        _disposable_worktree_occupant(pid) for pid in occupied)
-    if occupied and not disposable:
-        return 1, ["helm work: %s is OCCUPIED by cwd pid(s) %s — room and "
-                   "lease kept; move every live pane/process out before release"
-                   % (path, ",".join(occupied))]
+    spare = {pid for pid in occupied if _disposable_worktree_occupant(pid)}
+    if len(spare) < len(occupied):
+        # EACH OCCUPANT BY NAME, NEVER A BARE PID LIST: a pid list plus "move
+        # every live pane/process out" reads as leave to kill, and the holder
+        # may be helm's own findings pass. describe_occupants says whose each
+        # one is and what to do, and none of its answers is a signal.
+        return 1, ["helm work: %s is OCCUPIED — room and lease kept. Each "
+                   "process below is live work, and its line says who acts on "
+                   "it; release again once the room is empty:" % path] \
+            + describe_occupants(occupied, disposable=spare)
+    # WHAT THE ROOM HAS CHECKED OUT, read before anything names or judges it.
+    # The lease names a BRANCH; the room is a checkout that can hold another
+    # branch or none. Judging the room by the lease branch alone removes a
+    # room on a reviewer branch ahead of the trunk on the lease branch's
+    # LANDED proof, and a detached room takes its only reference to its
+    # commits with it (task/3125). A park writes onto this too, so the refusal
+    # names it rather than the lease branch.
+    held, blind = _current_branch(path) if room else (None, None)
+    onto = held or ("its HEAD, which could not be read" if blind
+                    else "its DETACHED HEAD")
     if room and _dirty(path):
         if not park:
             return 1, ["helm work: %s is DIRTY — two exits, no third: commit "
                        "in the room and re-run, or --park (WIP-commits onto "
-                       "%s; nothing is ever discarded)" % (path, branch)]
-        ok, msg = seats.refresh_claim(res, seat, lease=lease, session=session,
-                                      ttl=DEFAULT_TTL)
+                       "%s; nothing is ever discarded)" % (path, onto)]
+        # THE GRANT IS READ STRICTLY BEFORE THE WIP COMMIT (task/3643): a
+        # ledger that cannot be read refuses here, before any byte moves.
+        try:
+            ok, msg = seats.refresh_claim(res, seat, lease=lease,
+                                          session=session, ttl=DEFAULT_TTL)
+        except OSError as exc:
+            return 1, ["helm work: REFUSED — %s, so whether %s is still yours "
+                       "is UNKNOWN; nothing parked, room untouched"
+                       % (exc, res)]
         if not ok:
             return 1, ["helm work: " + msg]
         # AUTONOMOUS=FALSE: this is `helm work release --park`, an operator
@@ -731,12 +776,7 @@ def release_lane(root, lane, seat, lease=None, session=None, park=False,
         if rc != 0:
             return 1, ["helm work: park commit failed — %s (room untouched, "
                        "lease kept)" % err]
-        lines.append("helm work: parked WIP onto %s" % branch)
-    ok, msg = seats.release(res, seat, lease=lease, session=session)
-    if not ok:
-        return 1, lines + ["helm work: " + msg]
-    lines.append("helm work: " + msg)
-
+        lines.append("helm work: parked WIP onto %s" % onto)
     exists = _has_branch(root, branch)
     # FOUR states through one read (see `_merge_state`): the lane retires on
     # ancestry OR on patch identity, because our protocol lands work REBASED
@@ -745,6 +785,16 @@ def release_lane(root, lane, seat, lease=None, session=None, park=False,
     # reads at release says WHICH proof retired the lane.
     state = _merge_state(root, branch) if exists else None
     merged = state in RETIRABLE
+    # THE BRANCH IS DELETED ON A STRONGER PROOF THAN THE ROOM IS RETIRED ON
+    # (task/3436). Its tip on the trunk says what it CARRIES landed; deleting
+    # it also deletes its reflog, and a lane that committed and reset back
+    # reads ANCESTOR while the commit it dropped lives only there. So the
+    # delete asks `_sweep_state` with no room: every commit the reflog records
+    # the lane writing that no ref holds must be on the trunk. The holder
+    # asked, so no age grace applies. The room still retires on the tip's
+    # proof, because the kept branch's reflog keeps that commit.
+    branch_state, branch_why = (_sweep_state(root, None, branch) if merged
+                                else (state, None))
     # THE REAPER HAD TWO STATES FOR A THREE-STATE WORLD. It asks LANDED (retire
     # everything) or NOT-LANDED (keep everything) — and a lane whose work will
     # never land, deliberately, is neither. That is not a rare shape: a class
@@ -764,45 +814,157 @@ def release_lane(root, lane, seat, lease=None, session=None, park=False,
     # proof: it never touches the thing that proof protects. The dirty and
     # occupancy guards above are untouched and still refuse first, so an
     # assertion can no more discard uncommitted bytes than a proof can.
-    retire_room = merged or bool(superseded)
-    if superseded and merged:
-        lines.append("helm work: --superseded was not needed and was not used "
-                     "— %s is PROVEN landed (%s) and retires on that proof, "
-                     "branch included" % (lane, _proof_word(state)))
-    if room:
-        if retire_room and disposable:
-            stopped, stop_error = _retire_disposable_occupants(path)
-            if stopped:
-                lines.append("helm work: stopped disposable Orca shell pid(s) %s" %
-                             ",".join(stopped))
-            if stop_error:
-                return 1, lines + ["helm work: room stays (%s) — lease released; "
-                                   "`helm work gc` retries only after a fresh "
-                                   "landedness proof" % stop_error]
-        v.unlock_worktree(root, path)
-        if retire_room:
-            rc, _out, err = v.remove_worktree(root, path)
-            if rc != 0:
-                return 1, lines + ["helm work: room stays (%s) — lease released; "
-                                   "`helm work gc` retries only after a fresh "
-                                   "landedness proof" % err]
-            lines.append("helm work: room %s removed" % path)
-        else:
-            lines.append("helm work: room %s kept — lane is not proven landed" % path)
+    #
+    # BOTH ARGUMENTS HOLD ONLY FOR A ROOM ON ITS LEASE BRANCH. The landedness
+    # proof and the kept-branch argument are about the lease branch; a room
+    # holding something else is judged by what it holds (`held_state`), and a
+    # detached, mid-operation or unreadable room is manual-only (`_manual_only`,
+    # gc's own answer). The branch still retires on its own proof below.
+    manual = _manual_only(path, held, blind) if room else None
+    own = held == branch
+    held_state = (None if not room or manual or own
+                  else _merge_state(root, held))
+    if manual:
+        retire_room = False
+    elif own:
+        retire_room = merged or bool(superseded and exists)
+    else:
+        retire_room = held_state in RETIRABLE
+    # WHAT REMOVING THE ROOM ALONE WOULD LOSE: a commit only its HEAD reflog
+    # records (a detour on a detached HEAD, then a checkout back) that is not
+    # on the trunk. Neither the lease branch's proof nor --superseded speaks
+    # for it — both are about the branch. `seen` is read first, so the removal
+    # below can prove nothing moved after this verdict.
+    seen = _room_fingerprint(path) if retire_room else None
+    room_state, room_why = (_room_state(root, path, tuple(dict.fromkeys(
+        b for b in (branch, held) if b))) if retire_room else (None, None))
+    if room_state is not None:
+        retire_room = False
+    # THE LEASE GOES BACK INSIDE THE SECTION THAT RETIRES THE ROOM (task/3643).
+    # Given back first and the room removed after, a claim could lease the
+    # lane in between, find the room still registered and reuse it, and this
+    # call then removed the room that claim points at. Under THE claims lock
+    # (`_claim_flocked`, the lock every lease is taken under) the release, the
+    # room's removal and the branch's retirement are one step: a claim that
+    # leases before it is refused here as before, and one that leases after
+    # it finds no room and cuts its own. Everything above only READS, so a
+    # wrong token still mutates nothing, and a section that cannot start
+    # releases nothing and touches nothing. The lock is not re-entrant: the
+    # release and the branch delete are handed it (`held`) and take no other.
+    with seats._claim_flocked(create_dir=True) as lock:
+        if lock.f is None:
+            return 1, lines + ["helm work: " + seats._lock_unavailable()]
+        # `held` already names the branch the room holds; the lock is `ours`
+        ours = contextlib.nullcontext(lock)
+        # STRICT: a ledger that cannot be read, or a write that fails, is
+        # UNKNOWN and refuses here, before any room or branch act; read
+        # leniently it was "not claimed" and the unreadable file was
+        # replaced by an empty one.
+        try:
+            ok, msg = seats.release(res, seat, lease=lease, session=session,
+                                    strict=True, held=ours)
+        except OSError as exc:
+            return 1, lines + ["helm work: REFUSED — %s, so whether %s is "
+                               "released is UNKNOWN; room and branch "
+                               "untouched" % (exc, res)]
+        if not ok:
+            return 1, lines + ["helm work: " + msg]
+        lines.append("helm work: " + msg)
+        if superseded and merged:
+            lines.append("helm work: --superseded was not needed and was not used "
+                         "— %s is PROVEN landed (%s) and retires on that proof%s"
+                         % (lane, _proof_word(state),
+                            ", branch included" if branch_state in RETIRABLE
+                            else "; its branch is judged on its own reflog below"))
+        retired, kept_why = False, "no room was registered"
+        if room:
+            unlock_error = _unlock(v, root, path)
+            if unlock_error:
+                return 1, lines + ["helm work: room %s is still LOCKED — the "
+                                   "unlock failed (%s); the lease IS released, "
+                                   "and the room and branch are kept"
+                                   % (path, unlock_error)]
+            # RE-READ JUST BEFORE THE REMOVAL, as `gc_enact` re-reads its scan: a
+            # room judged on a branch can detach and commit in between, and a
+            # detour undone before this line still moved its HEAD reflog.
+            moved = (_moved_under_scan(path, held) or _moved_since(path, seen)
+                     if retire_room else None)
+            # A BOUND PANE KEEPS THE ROOM, by gc's own check and in gc's order
+            # (task/3643): /proc cannot see a pane, and a room removed under
+            # one leaves the owner a pane at a missing cwd. The blocker is
+            # asked BEFORE any shell is stopped, disposable shells allowed, so
+            # a room kept for its pane keeps its shell too; only a room that
+            # will be removed has its shells stopped (read fresh, so one that
+            # arrived after the first census is stopped too), and then the
+            # blocker is asked again with nothing relaxed.
+            blocked = (_removal_blocker(root, path, stale_lease_ok=True,
+                                        disposable_ok=True)
+                       if retire_room and not moved else None)
+            if retire_room and not moved and not blocked:
+                stopped, stop_error = _retire_disposable_occupants(path)
+                if stopped:
+                    lines.append("helm work: stopped disposable Orca shell pid(s) %s" %
+                                 ",".join(stopped))
+                if stop_error:
+                    return 1, lines + ["helm work: room stays (%s) — lease released; "
+                                       "`helm work gc` retries only after a fresh "
+                                       "landedness proof" % stop_error]
+                blocked = _removal_blocker(root, path, stale_lease_ok=True)
+            if retire_room and not moved and not blocked:
+                rc, _out, err = v.remove_worktree(root, path)
+                if rc != 0:
+                    return 1, lines + ["helm work: room stays (%s) — lease released; "
+                                       "`helm work gc` retries only after a fresh "
+                                       "landedness proof" % err]
+                retired = True
+                lines.append("helm work: room %s removed" % path)
+                if not own:
+                    # THE OTHER BRANCH IS NOT RELEASE'S. Release deletes only its
+                    # lease branch; the branch the room held may be a reviewer's
+                    # or another lane's, so it stays exactly where it is.
+                    lines.append("helm work: that room held %s, not the lease "
+                                 "branch %s — %s; release deletes only its lease "
+                                 "branch, so %s is left in place"
+                                 % (held, branch, _proof_word(held_state), held))
+            else:
+                if moved:
+                    kept_why = moved
+                elif blocked:
+                    kept_why = blocked
+                elif manual:
+                    kept_why = "manual-only: " + manual[0]
+                elif room_state is not None:
+                    # A ROOM THAT MOVED IS SAID TO HAVE MOVED FIRST: a detach made
+                    # after release read the room is the larger fact, and the
+                    # commit it left is what the reflog verdict then names.
+                    kept_why = (_moved_under_scan(path, held) or room_why
+                                or _proof_word(room_state))
+                elif own:
+                    kept_why = "lane is not proven landed"
+                else:
+                    kept_why = ("it holds %s, not the lease branch %s, and that is "
+                                "not proven landed" % (held, branch))
+                lines.append("helm work: room %s kept — %s" % (path, kept_why))
+                if not (own or manual or moved or blocked
+                        or room_state is not None):
+                    lines.append("helm work: " + _branch_triage(
+                        root, lane, held, state=held_state))
+        if exists and merged:
+            lines += ["helm work: " + ln for ln in _delete_lane_branch(
+                root, branch, branch_state, branch_why, held=ours)]
     if exists:
-        if merged:
-            lines += ["helm work: " + ln
-                      for ln in _delete_lane_branch(root, branch, state)]
-        else:
+        if not merged:
             # THE EVIDENCE MUST NOT CONTRADICT THE ACT, AND THE ACT HAS THREE
             # OUTCOMES RATHER THAN TWO. Keying this on `superseded` — the
             # REQUEST — was the same defect one branch over: a lane whose room
             # is not registered retires nothing, and the line still announced
             # a retirement. So it keys on what THIS CALL ACTUALLY DID, which
-            # is `retire_room AND room`: the request asked, and a room existed
-            # to answer with.
-            if retire_room and room:
+            # is `retired`: the room this call actually removed, and on which
+            # proof.
+            if retired and own:
                 disposition = "branch kept, room retired on stated evidence"
+            elif retired:
+                disposition = "branch kept, room retired on %s's own proof" % held
             elif room:
                 disposition = "worktree + branch kept"
             else:
@@ -818,12 +980,15 @@ def release_lane(root, lane, seat, lease=None, session=None, park=False,
                 # reason the work will never land, and the landedness read that
                 # says it has not landed — so the assertion can never be
                 # mistaken for a proof it did not make.
-                note = ("SUPERSEDED %s: %s — room retired on that stated "
-                        "reason; branch %s is KEPT and every commit it carries "
-                        "stays reachable there (`helm work claim %s` re-opens "
-                        "the room). The landedness read below did NOT "
-                        "authorize this. %s"
-                        % (lane, superseded, branch, lane, note))
+                did = ("room retired on that stated reason" if retired and own
+                       else "room retired on %s's own proof, not on that "
+                            "reason" % held if retired
+                       else "room NOT retired on it — %s" % kept_why)
+                note = ("SUPERSEDED %s: %s — %s; branch %s is KEPT and every "
+                        "commit it carries stays reachable there (`helm work "
+                        "claim %s` re-opens the room). The landedness read "
+                        "below did NOT authorize this. %s"
+                        % (lane, superseded, did, branch, lane, note))
             lines.append("helm work: " + note)
             # A HOUSEKEEPING VERB WAKES NOBODY. Releasing a lease is routine,
             # and "not landed by ancestry or patch identity" is the EXPECTED
@@ -865,7 +1030,9 @@ def release_lane(root, lane, seat, lease=None, session=None, park=False,
                     pass
     elif room:
         lines.append("helm work: TRIAGE %s: branch %s is unreadable/missing — "
-                     "room kept" % (lane, branch))
+                     "%s" % (lane, branch,
+                             "room retired on %s's own proof" % held
+                             if retired else "room kept"))
     return 0, lines
 
 
@@ -879,15 +1046,46 @@ def release_stale_lane(root, lane, seat, session=None):
     since a stale holder's room may still carry unlanded or dirty work."""
     res, path = resource(root, lane), lane_path(root, lane)
     v = vcs.backend(root)
-    ok, msg = seats.release_stale(res, seat, session=session)
-    if not ok:
-        return 1, ["helm work: " + msg]
-    lines = ["helm work: " + msg]
-    room = path in {w["path"] for w in worktrees(root)}
-    if room:
-        v.unlock_worktree(root, path)
-        lines.append("helm work: room %s unlocked (claim released)" % path)
+    # ONE SECTION, as in `release_lane` (task/3643): a claim that leased the
+    # lane between the release and the unlock had its fresh lock taken off.
+    with seats._claim_flocked(create_dir=True) as lock:
+        if lock.f is None:
+            return 1, ["helm work: " + seats._lock_unavailable()]
+        try:
+            ok, msg = seats.release_stale(res, seat, session=session,
+                                          held=contextlib.nullcontext(lock))
+        except OSError as exc:
+            return 1, ["helm work: REFUSED — %s, so whether %s is released "
+                       "is UNKNOWN; room untouched" % (exc, res)]
+        if not ok:
+            return 1, ["helm work: " + msg]
+        lines = ["helm work: " + msg]
+        if path in {w["path"] for w in worktrees(root)}:
+            unlock_error = _unlock(v, root, path)
+            if unlock_error:
+                return 1, lines + ["helm work: room %s is still LOCKED — the "
+                                   "unlock failed (%s); the claim IS released "
+                                   "and nothing else changed"
+                                   % (path, unlock_error)]
+            lines.append("helm work: room %s unlocked (claim released)" % path)
     return 0, lines
+
+
+def _unlock(v, root, path):
+    """None once `path` reads unlocked, else why it does not. `git worktree
+    unlock` also exits nonzero on a room that was never locked, so the
+    registry is re-read rather than the exit code trusted."""
+    _rc, _out, err = v.unlock_worktree(root, path)
+    rows, error = _worktree_records(root)
+    if error:
+        return "the worktree registry could not be re-read: %s" % error
+    row = next((w for w in rows if w["path"] == path), None)
+    if row is None:         # absent is not unlocked (gc's blocker refuses it)
+        return "%sthe room is no longer in the worktree registry" % (
+            (err or "").strip() + "; " if (err or "").strip() else "")
+    if row["locked"]:
+        return (err or "").strip() or "the room still reads locked"
+    return None
 
 
 def _positional(rest):

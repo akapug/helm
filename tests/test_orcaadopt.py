@@ -13,6 +13,7 @@ import io
 import inspect
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -1152,24 +1153,49 @@ _SEND_AUTHORITIES = {
         "clean composer, then requires exact equality before delegating Enter; "
         "its caller already proved the handle"),
     ("harness.py", "choose_in_modal"): (
-        "delegated", "the MODAL-CHOICE verb, which is NOT a submit leg: it "
-        "re-reads the pane and derives the option from THAT tail, refuses "
-        "anything that is not a recognised dialog still offering the asked "
-        "intent, spends NO Enter, and types into the handle its caller "
-        "(resumeturn's registered transaction or orcaadopt's authorized "
-        "primitive) already proved"),
+        "delegated", "the VENDOR-INTENT wrapper over the dialog door: it adds "
+        "only the escape's intent (the free option, re-derived from the "
+        "dialog the door reads at the keystroke) and hands the door the handle "
+        "its caller (resumeturn's registered transaction or orcaadopt's "
+        "authorized primitive) already proved, with the caller's witness"),
     ("harness.py", "_press_enter"): (
         "delegated", "the TURN verb's bare-Enter leg — submit reaches it only "
         "through the Enter act door's final HOLDS capture, and recovery only "
-        "through its own final exact recorded-text capture"),
+        "through its own final exact recorded-text capture. No dialog is ever "
+        "answered with it: the dialog door presses an option's digit"),
+    ("harness.py", "submit_exit"): (
+        "delegated", "the EXIT verb: /exit through submit's own text leg, "
+        "then — only when this call typed it and the re-read shows the "
+        "exit-confirm dialog — the dialog door with option 1 and this call's "
+        "own /exit (plus the seat's presence record) as its witness. `handle` "
+        "is a PARAMETER, the one its caller (seat rehome's operation inside "
+        "send_to_pane) already proved"),
+    ("harness.py", "answer_dialog"): (
+        "delegated", "THE DIALOG DOOR (task/3209): ONE digit, never Enter, "
+        "into a dialog proven to await input now — the kind's shape standing "
+        "at the bottom of one fresh read, the caller's witness (the vendor's "
+        "presence record or the caller's own act), and the pointer on the "
+        "option or where the dialog opens; `handle` is a PARAMETER its caller "
+        "already proved"),
     ("seat_rehome.py", "apply_rehome"): (
-        "adopted", "two keystrokes into ONE pane: the /exit, submitted from an "
+        "adopted", "two keystroke sites into ONE pane: the /exit, submitted "
+        "through the exit verb (harness.submit_exit, which answers the "
+        "exit-confirm dialog its own /exit opens with option 1, through the "
+        "dialog door) from an "
         "operation inside send_to_pane that refuses unless the handle bound at "
         "send time is the one orcaadopt.authorized_handle bound in this "
         "function; and then the `helm launch` line into that same handle. The "
         "exit proof (that exact process PROVEN gone through beacons.pid_alive "
         "on the same birth stamp) is what makes the pane a bare shell rather "
         "than another agent's session by the time the second one is typed"),
+    ("planprompt.py", "_press"): (
+        "delegated", "the prompt-stall watch's ONE keystroke (an option's "
+        "digit, or a bare Enter into a blind pane): `handle` is a PARAMETER, "
+        "handed down by answer_stall's operation, which resumeturn.deliver "
+        "calls with the handle its transaction proved — the spawn register "
+        "under the lifecycle lock, or orcaadopt.authorized_handle on the "
+        "stall's stamped pid — after the operation re-read the vendor's "
+        "presence record, so nothing is typed unless the same prompt waits"),
     ("planprompt.py", "_send_choice"): (
         "registered", "the plan-execution choice into a registered seat; the "
         "handle, blocked state, prompt type, plan path and contents, and exact "
@@ -1180,7 +1206,11 @@ _SEND_AUTHORITIES = {
 # EVERY method name that can put keystrokes into a pane. `send` is the
 # transport; `submit` is the turn verb (text, then a bare Enter, then a
 # read-back). A census that knows only one of them is blind to the other.
-_INJECT = ("send", "submit")
+# `submit_exit` joins them (task/3201): it types /exit and may confirm the
+# exit-confirm dialog, so a caller of it is a keystroke site like any other.
+# `answer_dialog` joins them too (task/3209): it is THE keystroke into a
+# dialog, so every caller of it is a keystroke site.
+_INJECT = ("send", "submit", "submit_exit", "answer_dialog")
 
 # `submit` is ALSO concurrent.futures' method, and helm runs thread pools. The
 # ONE exclusion is by receiver name, from this explicit list — deliberately
@@ -1234,7 +1264,18 @@ def _is_non_pane_send(fn):
 # binding by construction: the operation refuses to submit unless the pane
 # send_to_pane bound is the one apply_rehome bound, and the launch line then
 # goes to that same handle.
-_SEND_SITES = 17
+# +1 — the prompt-stall watch answers a stalled Claude Code prompt with one
+# keystroke from an operation inside resumeturn.deliver, the vendor escape's
+# shape; its handle is the one that transaction proved.
+# +1 — task/3201: `harness.submit_exit` is the exit door, and its submit of
+# /exit is a new site. The rehome's own /exit site is UNCHANGED in count — it
+# now calls submit_exit, which `_INJECT` names — and the dialog confirm rides
+# the declared _press_enter leg rather than a new transport call.
+# +2 — task/3209: the dialog door. `answer_dialog`'s digit is a new send;
+# `choose_in_modal` stops sending its own digit and calls the door instead (a
+# site that moves, not a new one); and `submit_exit` answers its dialog through
+# the door rather than `_press_enter`, which is one more `answer_dialog` site.
+_SEND_SITES = 21
 
 
 def _helm_sources(root):
@@ -2726,6 +2767,17 @@ def _p_send_to_sid_pane(blind):
     return str(mode)
 
 
+def _p_projectmcp_holder(blind):
+    from helm import projectmcp
+    procs = [_proc(4242, seat="s1")]
+    with mock.patch.object(orcaadopt, "claude_processes",
+                           return_value=_census(blind, procs)), \
+            mock.patch("helm.beacons.proc_env",
+                       return_value={"CLAUDE_CONFIG_DIR": "/elsewhere"}):
+        held = projectmcp.holder("/a/seat/home")
+    return "HELD" if held else "UNHELD"
+
+
 def _p_live_seats(blind):
     from helm import proxywatch
     procs = [_proc(4242, seat="s1")]
@@ -2878,6 +2930,10 @@ _CENSUS_CONSUMERS = {
         "forward", "resumed", _p_send_to_sid_pane,
         "`resumed` means the text LANDED in a pane; while blind it must fall "
         "back to `manual` rather than deliver to a maybe-stranger"),
+    ("projectmcp.py", "holder"): (
+        "gate", "UNHELD", _p_projectmcp_holder,
+        "UNHELD licenses a write of a seat home's .claude.json; a claude helm "
+        "could not read may be running on that home and rewrite it whole"),
     ("proxywatch.py", "_live_seats"): (
         "forward", "DROPPED", _p_live_seats,
         "dropping the blind flag makes an absent seat read as `off`, which "
@@ -3760,3 +3816,338 @@ class LivenessKeyAnswersItsOwnQuestionTest(unittest.TestCase):
         # confident answer.
         self.assertEqual(orcaadopt.RICH_STATE.get("nonsense", "UNKNOWN"),
                          "UNKNOWN")
+
+
+class _SpawnRecorder:
+    """A metaharness that records the one command a resume hands it."""
+
+    name = "fake"
+
+    def __init__(self):
+        self.spawned = []
+
+    def spawn(self, command, title=None, cwd=None):
+        self.spawned.append((command, title, cwd))
+        return "pane-9"
+
+    def send(self, handle, text, enter=True):
+        return None
+
+
+class AdoptedProxySeatResumeTest(unittest.TestCase):
+    """`helm seat resume` of an orca-ADOPTED seat whose session lives in a
+    PROXY seat's tree.
+
+    ORCA ADOPTION WRITES A REGISTER WITH NO FAMILY AND NO PROJECT, so
+    `_seat_family` refuses the seat's name and the verb takes the adopted
+    branch, which minted a NATIVE claude resume for every session it found:
+    `env -u ANTHROPIC_BASE_URL ... claude --resume <sid>`, with no proxy URL,
+    no token file and no model, and the pane read "Not logged in". The seat is
+    still what its tree says it is: the config home its session lives in names
+    the family and the storage label, the roster's rename lineage says whose
+    storage that is, and the seat's own launch.sh carries the proxy URL, the
+    token file and the model.
+
+    One arm per state:
+      A  a native claude lead                    -> script unchanged, byte for byte
+      B  a register that names its family        -> never reaches this branch
+      C  an adopted proxy seat, register without family -> through its launch.sh
+      D  the same under a renamed storage label  -> through the lineage
+      E  a seat-tree session with no family or no launch.sh -> refused, named
+
+    Hermetic: HELM_HOME, HELM_CHAT_DIR and the resume-script directory are
+    temp dirs, the metaharness is a recorder, and the one arm that EXECUTES a
+    minted script runs it against a throwaway `claude` shim.
+    """
+
+    SID = "0199aaaa-bbbb-cccc-dddd-eeeeffff0001"
+    MODEL = "model-a"
+
+    def setUp(self):
+        from helm import sessions
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-adopted-proxy-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {
+            "HELM_HOME": os.path.join(self.tmp, "helm-home"),
+            "HELM_CHAT_DIR": os.path.join(self.tmp, "chat"),
+            "ORCA_USER_DATA_PATH": os.path.join(self.tmp, "orca")})
+        env.start()
+        self.addCleanup(env.stop)
+        for key in ("MELD_HOME", "HELM_CHAT_NAME", "HELM_SEAT_STORAGE"):
+            os.environ.pop(key, None)       # restored by the dict patch
+        os.makedirs(os.path.join(self.tmp, "chat"))
+        self.resumes = os.path.join(self.tmp, "resumes")
+        os.makedirs(self.resumes)
+        mint = mock.patch.object(sessions, "RESUME_DIR", self.resumes)
+        mint.start()
+        self.addCleanup(mint.stop)
+        self.cwd = os.path.join(self.tmp, "work")
+        os.makedirs(self.cwd)
+
+    # -- fixtures ------------------------------------------------------------
+    def _transcript(self, cfg):
+        proj = os.path.join(cfg, "projects", "-work")
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, self.SID + ".jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"cwd": self.cwd, "type": "user"}) + "\n")
+        return path
+
+    def _row(self, transcript):
+        """The catalog row shape `newest_session_row` hands resume."""
+        return {"i": self.SID, "h": "claude", "cwd": self.cwd, "mt": 1,
+                "p": transcript}
+
+    def _proxy_seat(self, storage, identity, launch=True):
+        """A codex proxy seat's tree as adoption leaves it: its config home
+        holding the session's transcript, a register with NO family and NO
+        project, and (unless `launch` is False) its token file and a launch.sh
+        written by the shipped producers."""
+        from helm import seat
+        from helm.seat_launch_assets import _launch_owner
+        inst = seat._instance_dir("codex", storage)
+        cfg = os.path.join(inst, "claude")
+        transcript = self._transcript(cfg)
+        pk.write_json(os.path.join(inst, "spawn.json"),
+                      {"v": 1, "seat": storage, "harness": "orca",
+                       "handle": "term-gone", "session": self.SID})
+        launch_sh = os.path.join(inst, "launch.sh")
+        if launch:
+            with open(seat._token_file("codex", storage), "w") as f:
+                f.write("tok-%s\n" % storage)
+            seat._write_launch_sh(launch_sh, "#!/bin/sh\n"
+                                  + seat._token_export("codex", storage)
+                                  + _launch_owner(seat.launch_line(
+                                      "codex", seat=storage,
+                                      identity=identity, model=self.MODEL)))
+        return cfg, transcript, launch_sh
+
+    def _project_port(self, storage):
+        from helm import seat
+        os.makedirs(seat.seats_root(), exist_ok=True)
+        pk.write_json(seat._instance_ports_path(),
+                      {storage: seat.PROJECT_PORT_BASE})
+
+    def _roster(self, rows):
+        pk.write_json(seats_common.roster_path(), rows)
+
+    def _renamed(self, storage, name):
+        """The roster row a durable rename leaves: `name`, carrying the
+        storage label's key in its lineage."""
+        self._roster({name: {"session": self.SID,
+                             "seat_keys": [seats_common._seat_key(storage)]}})
+
+    def _resume(self, name, row, home):
+        from helm import seat
+        ad = _SpawnRecorder()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(orcaadopt, "resolve",
+                               return_value={"seat": name}), \
+                mock.patch.object(orcaadopt, "seat_liveness",
+                                  return_value=(orcaadopt.DEAD,
+                                                "nothing holds it")), \
+                mock.patch.object(orcaadopt, "newest_session_row",
+                                  return_value=(dict(row), None)), \
+                mock.patch("helm.sessions.resume_warnings", return_value=[]), \
+                mock.patch("helm.sessions.credhome_for", return_value=home), \
+                mock.patch("helm.sessions.kick_resumed", return_value=True), \
+                mock.patch.object(harness, "detect", return_value=ad), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["resume", name])
+        return rc, out.getvalue(), err.getvalue(), ad
+
+    def _script(self, ad):
+        self.assertEqual(len(ad.spawned), 1, ad.spawned)
+        with open(ad.spawned[0][0]) as f:
+            return f.read()
+
+    def _refused(self, rc, err, ad, name):
+        self.assertEqual(rc, 1, err)
+        self.assertIn("helm seat: refusing to resume %s" % name, err)
+        self.assertEqual(ad.spawned, [])
+        self.assertEqual(os.listdir(self.resumes), [])
+        # the refusal names what could not be read, never a command to type
+        body = err.replace("helm seat: ", "")
+        self.assertNotIn("`", body)
+        self.assertNotIn("helm ", body)
+
+    def _run(self, script):
+        """EXECUTE the minted script against a `claude` shim and return what
+        that claude saw: its proxy env, its identity env and its argv."""
+        import subprocess
+        shim = os.path.join(self.tmp, "bin")
+        os.makedirs(shim)
+        claude = os.path.join(shim, "claude")
+        with open(claude, "w") as f:
+            f.write("#!/bin/sh\n"
+                    'echo "BASEURL=$ANTHROPIC_BASE_URL"\n'
+                    'echo "TOKEN=$ANTHROPIC_AUTH_TOKEN"\n'
+                    'echo "CFG=$CLAUDE_CONFIG_DIR"\n'
+                    'echo "NAME=$HELM_CHAT_NAME"\n'
+                    'echo "FAMILY=${HELM_MODEL_FAMILY-<UNSET>}"\n'
+                    'echo "BACKEND=${HELM_MODEL_BACKEND-<UNSET>}"\n'
+                    'echo "CELL=${HELM_CELL_BIN-<UNSET>}"\n'
+                    'echo "ARGV=$*"\n')
+        os.chmod(claude, 0o755)
+        env = {"PATH": os.pathsep.join(
+            (shim, os.environ.get("PATH", "/usr/bin:/bin"))), "HOME": self.tmp}
+        ran = subprocess.run(["sh", script], env=env, capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        seen = {}
+        for line in ran.stdout.splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                seen[key] = value
+        return seen
+
+    # -- A ---------------------------------------------------------------------
+    def test_A_a_native_lead_mints_the_same_script_byte_for_byte(self):
+        from helm import seat
+        home = os.path.join(self.tmp, "homes", "acct-a")
+        transcript = self._transcript(home)
+        rc, out, err, ad = self._resume("seat-a", self._row(transcript), home)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._script(ad), (
+            "#!/bin/sh\n"
+            "# helm sessions resume — regenerated on every run;\n"
+            "# edit nothing here, it is derived state.\n"
+            "cd %s || { echo \"helm resume: cwd is gone: %s\" >&2; exit 1; }\n"
+            "export HELM_CHAT_NAME=seat-a\n"
+            "exec %sCLAUDE_CONFIG_DIR=%s claude --resume %s\n"
+            % (shlex.quote(self.cwd), self.cwd, seat.paste_unset_prefix(),
+               home, self.SID)))
+        self.assertIn("helm seat: resumed seat-a (orca-adopted) via fake — "
+                      "pane pane-9, session 0199aaaa…", out)
+
+    # -- B ---------------------------------------------------------------------
+    def test_B_a_register_naming_its_family_stays_on_the_managed_path(self):  # noqa: VACUOUS_ASSERTION — positive controls: rc 2 and the managed gate's own sentence on stderr; the uncalled adopted-resume double is the contract
+        from helm import seat
+        inst = seat._instance_dir("codex", "seat-a-codex")
+        os.makedirs(inst)
+        pk.write_json(os.path.join(inst, "spawn.json"),
+                      {"v": 1, "seat": "seat-a-codex", "family": "codex",
+                       "project": "proj-a", "session": self.SID})
+        err = io.StringIO()
+        with mock.patch.object(orcaadopt, "resume") as adopted, \
+                mock.patch.object(seat, "_instance_gate",
+                                  return_value="managed path reached"), \
+                contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["resume", "seat-a-codex"])
+        self.assertEqual(rc, 2)
+        self.assertIn("managed path reached", err.getvalue())
+        adopted.assert_not_called()
+
+    # -- C ---------------------------------------------------------------------
+    def test_C_an_adopted_proxy_seat_resumes_through_its_own_launch_script(self):
+        from helm import seat
+        self._project_port("seat-a-codex")
+        cfg, transcript, launch_sh = self._proxy_seat("seat-a-codex",
+                                                      "seat-a-codex")
+        self._roster({"seat-a-codex": {"session": self.SID}})
+        # control: the register really is the adoption shape, so the name
+        # resolves nothing and the verb takes the adopted branch
+        family, why = seat._seat_family("seat-a-codex")
+        self.assertIsNone(family)
+        self.assertIn("missing family and project", why)
+        rc, out, err, ad = self._resume("seat-a-codex", self._row(transcript),
+                                        cfg)
+        self.assertEqual(rc, 0, err)
+        text = self._script(ad)
+        self.assertIn("exec %s --model %s --resume %s\n"
+                      % (shlex.quote(launch_sh), self.MODEL, self.SID), text)
+        self.assertNotIn("ANTHROPIC_BASE_URL", text)
+        self.assertNotIn("claude --resume", text)
+        self.assertIn("helm seat: resumed seat-a-codex (orca-adopted, codex "
+                      "proxy seat seat-a-codex) via fake — pane pane-9", out)
+        self.assertIn("  launch: %s --model %s" % (launch_sh, self.MODEL), out)
+
+    # -- D ---------------------------------------------------------------------
+    def test_D_a_renamed_storage_label_resolves_through_the_lineage(self):
+        from helm import seats_lineage
+        cfg, transcript, launch_sh = self._proxy_seat("codex-97", "seat-b")
+        self._renamed("codex-97", "seat-b")
+        # control: the roster's lineage is what ties the storage to the seat
+        self.assertEqual(seats_lineage.seat_lineage("codex-97")[:2],
+                         ("seat-b", seats_lineage.SEAT_RENAMED))
+        rc, out, err, ad = self._resume("seat-b", self._row(transcript), cfg)
+        self.assertEqual(rc, 0, err)
+        text = self._script(ad)
+        self.assertIn("exec %s --model %s --resume %s\n"
+                      % (shlex.quote(launch_sh), self.MODEL, self.SID), text)
+        self.assertIn(os.path.join("instances", "codex-97", "launch.sh"), text)
+        self.assertNotIn("claude --resume", text)
+        self.assertIn("helm seat: resumed seat-b (orca-adopted, codex proxy "
+                      "seat codex-97) via fake — pane pane-9", out)
+
+    def test_D_a_storage_the_lineage_does_not_tie_to_the_seat_is_refused(self):
+        cfg, transcript, _launch = self._proxy_seat("codex-97", "seat-b")
+        self._roster({"seat-b": {"session": self.SID}})   # no lineage
+        rc, _out, err, ad = self._resume("seat-b", self._row(transcript), cfg)
+        self._refused(rc, err, ad, "seat-b")
+        self.assertIn("codex-97", err)
+
+    # -- the task's falsifier, EXECUTED ---------------------------------------
+    def test_the_resumed_claude_gets_the_proxy_url_the_token_and_the_model(self):
+        from helm import seat
+        cfg, transcript, _launch = self._proxy_seat("codex-97", "seat-b")
+        self._renamed("codex-97", "seat-b")
+        rc, _out, err, ad = self._resume("seat-b", self._row(transcript), cfg)
+        self.assertEqual(rc, 0, err)
+        seen = self._run(ad.spawned[0][0])
+        self.assertEqual(seen["BASEURL"], "http://127.0.0.1:%d"
+                         % seat._instance_port("codex", "codex-97"))
+        self.assertEqual(seen["TOKEN"], "tok-codex-97")
+        self.assertEqual(seen["CFG"], cfg)
+        # the roster's runtime label is read from these two at join
+        self.assertEqual((seen["FAMILY"], seen["BACKEND"]), ("codex", "proxy"))
+        self.assertEqual(seen["NAME"], "seat-b")
+        self.assertNotEqual(seen["CELL"], "<UNSET>")
+        argv = seen["ARGV"].split()
+        last = len(argv) - 1 - argv[::-1].index("--model")
+        self.assertEqual(argv[last + 1], self.MODEL)
+        self.assertEqual(argv[argv.index("--resume") + 1], self.SID)
+
+    # -- E ---------------------------------------------------------------------
+    def test_E_a_seat_tree_session_with_no_launch_script_is_refused(self):
+        cfg, transcript, launch_sh = self._proxy_seat(
+            "seat-c-codex", "seat-c-codex", launch=False)
+        self._roster({"seat-c-codex": {"session": self.SID}})
+        rc, _out, err, ad = self._resume("seat-c-codex",
+                                         self._row(transcript), cfg)
+        self._refused(rc, err, ad, "seat-c-codex")
+        self.assertIn(launch_sh, err)
+        self.assertIn("does not exist", err)
+
+    def test_E_a_seat_tree_that_names_no_family_is_refused(self):
+        from helm import seat
+        cfg = os.path.join(seat.seats_root(), "not-a-family", "claude")
+        transcript = self._transcript(cfg)
+        rc, _out, err, ad = self._resume("seat-c", self._row(transcript), cfg)
+        self._refused(rc, err, ad, "seat-c")
+        self.assertIn("not-a-family", err)
+
+    def test_E_a_launch_script_without_the_proxy_facts_is_refused(self):
+        cfg, transcript, launch_sh = self._proxy_seat(
+            "seat-c-codex", "seat-c-codex", launch=False)
+        with open(launch_sh, "w") as f:
+            f.write('#!/bin/sh\nexec claude "$@"\n')
+        self._roster({"seat-c-codex": {"session": self.SID}})
+        rc, _out, err, ad = self._resume("seat-c-codex",
+                                         self._row(transcript), cfg)
+        self._refused(rc, err, ad, "seat-c-codex")
+        self.assertIn(launch_sh, err)
+        for fact in ("HELM_MODEL_BACKEND=proxy", "HELM_MODEL_FAMILY=codex",
+                     "proxy URL", "read of its token file", "--model",
+                     "HELM_CHAT_NAME=seat-c-codex (it launches as no seat "
+                     "name)"):
+            self.assertIn(fact, err)
+
+    def test_E_a_seat_home_whose_transcript_lives_elsewhere_is_refused(self):
+        cfg, _transcript, _launch = self._proxy_seat("codex-97", "seat-b")
+        self._renamed("codex-97", "seat-b")
+        elsewhere = self._transcript(os.path.join(self.tmp, "homes", "acct-a"))
+        rc, _out, err, ad = self._resume("seat-b", self._row(elsewhere), cfg)
+        self._refused(rc, err, ad, "seat-b")
+        self.assertIn("disagree", err)

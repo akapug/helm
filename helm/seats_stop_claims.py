@@ -44,21 +44,29 @@ meanwhile is that an exemption has exactly ONE door out of the loop
 (`_exempt`) and that door cannot emit without also printing.
 """
 import hashlib
+import json
+import sys
+import time
 
-from . import pk, projscope, stopfacts
+from . import home, pk, projscope, stopfacts
 from .seats_common import (STATUS_BYTES, _clip, _now_mono, _scrub, _sweep,
                            claims_path)
-from .seats_roster import roster_acquired, roster_indexes, seat_for_session_in
+from .seats_identity import derive_seat
+from .seats_roster import (roster_acquired, roster_indexes, seat_for_session,
+                           seat_for_session_in)
 from .seats_delegation import _delegated_build, proc_scan, release_hint
-from .seats_cursor import _remove_stop_latch, _write_stop_latch
+from .seats_cursor import _write_stop_latch
+from .seats_stop_owed import (IN_PROGRESS, in_progress_reason,
+                               lease_in_progress)
+from .seats_stop_seam import _PENDING_DISCLOSURES, _latch_dir_writable
 from .seats_stop_signals import _off, _stop_fp_path
 from .seats_room_advice import _ROOM_READS, _missed, _room_advice
 
 # stoplease is the latch lane (the `.state` idiom every other rung uses,
 # per (room, seat, session) via _stop_fp_path). LEASE_TTL_ALARM_S is the one
-# severity threshold: a held lease whose remainder crosses it renders as
-# EXPIRING and the crossing changes the latch fingerprint, so escalation
-# re-arms the full block THROUGH the latch instead of being compressed by it.
+# severity threshold: a lease whose remainder crosses it renders as EXPIRING
+# and the crossing changes that lease's latch coordinate, so escalation
+# re-prints its line THROUGH the latch instead of being compressed by it.
 LEASE_LATCH = "stoplease"
 LEASE_TTL_ALARM_S = 120
 
@@ -69,6 +77,26 @@ LEASE_TTL_ALARM_S = 120
 # before running. Two hand-kept spellings of one instruction is how a surface
 # starts advertising a flag nothing else admits to having.
 DETAIL_VERB = "helm chat stop-guard --detail"
+
+# WHOSE VERB A LANE IN GATE WAITS ON, one row per `_gate_pending` stage: the
+# label a stop names and the sentence it prints, formatted with the dispatch
+# id and the seat on the row. Every stage allows the stop and keeps the lease,
+# because releasing opens the lane mid-gate and finishing is not the holder's.
+_GATE_STAGES = {
+    "pending": ("GATE PENDING",
+                "held for a lane in gate (dispatch %s pending at %s, ref == "
+                "worktree HEAD) — stop allowed, lease retained."),
+    "approved": ("GATE APPROVED",
+                 "held for a lane approved, awaiting the land window "
+                 "(dispatch %s APPROVED by %s with a bound gate at the "
+                 "worktree HEAD; landing is the integrator's verb, not the "
+                 "holder's) — stop allowed, lease retained."),
+    "source-clean": ("HELD SOURCE-CLEAN",
+                     "held for a lane held source-clean at the worktree HEAD "
+                     "(dispatch %s, held by %s); it lands on the integrator's "
+                     "train, not the holder's verb — stop allowed, lease "
+                     "retained."),
+}
 
 
 def _ttl_human(left):
@@ -88,7 +116,14 @@ def _ttl_human(left):
     if left >= 60:
         return "%dm" % (left // 60)
     return "%ds" % left
-
+def _lease_label(v, left):
+    """Labels both numbers: "leased 25m ago, expires in 7h35m" (task/3215: a bare
+    "7h35m" read as a runtime). No readable mint time: "expires in" alone, no age."""
+    parsed = pk.parse_ts_epoch(v.get("ts")) if isinstance(v, dict) else None
+    if parsed is None:
+        return "expires in %s" % _ttl_human(left)
+    age = max(0, int(time.time()) - int(parsed))
+    return "leased %s ago, expires in %s" % (_ttl_human(age), _ttl_human(left))
 
 def _ttl_band(left):
     """THE LATCH'S SEVERITY COORDINATE, SPELLED ONCE FOR BOTH KINDS OF LEASE.
@@ -104,6 +139,27 @@ def _ttl_band(left):
     there is one, and both `lease_fps` writers call it.
     """
     return "expiring" if left <= LEASE_TTL_ALARM_S else "held"
+
+
+def _h(text):
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=8).hexdigest()
+
+
+def _remembered(path):
+    """{hash(resource): hash(coordinate)} as the last print left it, or None.
+
+    NONE MEANS NOTHING REMEMBERED, AND EVERY UNREADABLE SHAPE IS NONE. The one
+    that exists on live seats is the pre-task/3123 latch: ONE bare hex
+    fingerprint over the whole set, which JSON refuses — or, when every digit
+    happens to be 0-9, reads as a number. Either way that costs one full print,
+    never a crash and never a compressed stop."""
+    try:
+        with open(path) as f:
+            got = json.loads(f.read())
+    except (OSError, ValueError):
+        return None
+    got = got.get("leases") if isinstance(got, dict) else None
+    return got if isinstance(got, dict) else None
 
 
 def _room_reads(facts, fresh):
@@ -146,12 +202,13 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
                 facts=None, detail=False):
     """The claims/leases rung: append to `blocks` and `warns`, return None.
 
-    `detail` RENDERS THE LONG FORM AND CHANGES NOTHING ELSE — no read, no
-    write, no verdict moves. It is what `helm chat stop-guard --detail` sets,
-    so the per-lane diagnostic the hook's one-line summary replaces stays
-    reachable by a named verb instead of being printed at every stop. It also
-    bypasses the same-state compression, because a reader who asked for the
-    detail is asking about the state the latch says they have already seen.
+    `detail` RENDERS THE LONG FORM OF EVERY LINE AND TOUCHES NO MEMORY. It is
+    what `helm chat stop-guard --detail` sets, so the per-lane diagnostic the
+    short print replaces stays reachable by a named verb instead of being
+    printed at every stop. It reads no latch, because a reader who asked for
+    the detail is asking about the lines the latch says they have seen, and it
+    writes none, because a read must leave the next stop as it found it. Its
+    verdict is therefore the one a first stop on this set would reach.
 
     APPENDS RATHER THAN RETURNS, which is the contract it already had as a
     closure and the one `_seam_gate` keeps too. The accumulators are the
@@ -260,6 +317,9 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
         held = []
         exempt = []            # (res, left, reason, text) — printed, not held
         connected = False       # any session-connected row, exempted or held
+        # THE MEMORY, read first: `_exempt` keeps unchanged IN PROGRESS quiet
+        fpp = _stop_fp_path(room, lease_seat, session, kind=LEASE_LATCH)
+        last = None if detail else _remembered(fpp)
 
         def _exempt(r, res, left, v, state, reason, prefix="lease "):
             """THE ONE DOOR an exempted lease leaves the loop through.
@@ -268,6 +328,7 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
             ladder's own currency: a state word is spoken only where a
             measurement was made, and the branch that reached this door IS that
             measurement. Short and upper-case on purpose — see the sermon.
+            An unchanged IN PROGRESS, which asks nothing, is not reprinted.
 
             AN EXEMPTION WRITTEN AS A `warns.append(...); continue` PAIR IS
             A HOLE, which is why none of them is written that way: the guard's
@@ -282,25 +343,30 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
             is an ANNOTATION on a line that still appears. This door cannot
             emit the warn without also queueing the printed line and the
             fingerprint coordinate, because it does all three in one call."""
+            # THE EXEMPTION IS A LATCH COORDINATE. A delegate dying or a gate
+            # clearing changes what the sermon says about that lane, so the
+            # latch must not compress it away: `state` is the branch that
+            # exempted it, and a change of branch re-prints that lane's line.
+            # THE BAND IS A COORDINATE HERE FOR THE SAME REASON IT IS ON A HELD
+            # LEASE — this line renders EXPIRING, so a crossing is a change of
+            # what the sermon says and owes a reprint (see `_ttl_band`).
+            coord = "%s\x1f%s\x1fexempt:%s\x1f%s" % (
+                r, v.get("lease") or "", state, _ttl_band(left))
+            lease_fps.append((r, coord))
+            if state == IN_PROGRESS and last is not None \
+                    and last.get(_h(r)) == _h(coord):
+                exempt.append((res, left, state, reason, None, r, v))
+                return
             warns.append("[helm stop-guard] %s%s%s %s" % (
                 prefix, res,
                 # DISPLAY SEVERITY AND LATCH TRUTH SAY THE SAME THING. The
-                # coordinate below re-fires the full sermon on the crossing, so
+                # coordinate above re-fires the full sermon on the crossing, so
                 # the sentence that re-fires has to name what changed; without
                 # this the exempt warning carried no TTL at all and a re-print
                 # read as a repeat.
                 " (%ds left, EXPIRING)" % left
                 if left <= LEASE_TTL_ALARM_S else "", reason))
-            exempt.append((res, left, state, reason, warns[-1]))
-            # THE EXEMPTION IS A FINGERPRINT COORDINATE. A delegate dying or a
-            # gate clearing changes what the sermon says about that lane, so
-            # the latch must not compress it away: `state` is the branch that
-            # exempted it, and a change of branch re-prints the full set. THE
-            # BAND IS A COORDINATE HERE FOR THE SAME REASON IT IS ON A HELD
-            # LEASE — this line renders EXPIRING, so a crossing is a change of
-            # what the sermon says and owes a reprint (see `_ttl_band`).
-            lease_fps.append("%s\x1f%s\x1fexempt:%s\x1f%s" % (
-                r, v.get("lease") or "", state, _ttl_band(left)))
+            exempt.append((res, left, state, reason, warns[-1], r, v))
 
         # ONE READING OF THE STOP FACTS PER STOP, taken lazily — a stop with
         # no lane or dispatch lease reads nothing — and NEVER WAITED FOR.
@@ -381,12 +447,12 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
             if not mine_by_session:
                 continue
             connected = True
-            # RENDERED ONCE, FOR EVERY BRANCH BELOW. The scrub/clip pair is
-            # the claim-surface law this module already states below ("SCRUBBED
-            # like every other claim surface"), and four branches each spelling
-            # it differently is how one of them ends up raw. `left` comes up
-            # here too because an exempted line carries its remainder exactly
-            # like a held one.
+            # RENDERED ONCE, FOR EVERY BRANCH BELOW, and SCRUBBED like every
+            # other claim surface: this block once interpolated the RAW key,
+            # so a claim("evil\x1b[2J…") reached the terminal through the
+            # guard while `helm chat claims` was safe. `left` comes up here
+            # too because an exempted line carries its remainder like a held
+            # one.
             res = _clip(_scrub(str(r)).strip(), STATUS_BYTES)
             left = int(v.get("exp_mono", now) - now)
             # DISOWN ONLY ON POSITIVE EVIDENCE. A holder that is not my
@@ -494,8 +560,9 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
             # STAGES 2+3, one lifecycle stage later each: the build is
             # FINISHED and the lane sits IN GATE (an open review dispatch
             # whose --ref is the claimed worktree's current HEAD), or the
-            # gate CLEARED — a bound APPROVE at that same HEAD — and the
-            # lane awaits the integrator's land window. Release opens the
+            # gate CLEARED — a bound APPROVE at that same HEAD, or a
+            # source-clean HOLD whose held tip is that HEAD (task/3097) — and
+            # the lane awaits the integrator's land window. Release opens the
             # lane mid-gate/mid-land; finishing is the reviewer's move and
             # landing the integrator's. Same law: positive proof only,
             # re-derived every stop; a fix/supersede verdict re-blocks.
@@ -518,25 +585,10 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
                 except Exception:
                     gate = None
             if gate:
-                _exempt(
-                    r, res, left, v,
-                    "GATE APPROVED" if gate[2] == "approved" else "GATE PENDING",
-                    ("held for a lane approved, "
-                     "awaiting the land window (dispatch %s APPROVED by %s "
-                     "with a bound gate at the worktree HEAD; landing is "
-                     "the integrator's verb, not the holder's) — stop "
-                     "allowed, lease retained."
-                     if gate[2] == "approved" else
-                     "held for a lane in gate "
-                     "(dispatch %s pending at %s, ref == worktree HEAD) — "
-                     "stop allowed, lease retained.")
-                    % (_scrub(gate[0][:12]), _scrub(gate[1])))
+                label, text = _GATE_STAGES.get(gate[2], _GATE_STAGES["pending"])
+                _exempt(r, res, left, v, label,
+                        text % (_scrub(gate[0][:12]), _scrub(gate[1])))
                 continue
-            # SCRUBBED like every other claim surface. `claims_list` documents
-            # the reason and this block was the one publisher that skipped it:
-            # it interpolated the RAW resource key into the operator's stderr,
-            # so a claim("evil\x1b[2J…") reached the terminal through the guard
-            # even though `helm chat claims` had been safe for months.
             # #66. A LEASE ON A LANE WORKTREE CANNOT BE PROVEN IDLE, and the
             # guard was prescribing release as if it had been. Measured on the
             # integrator's live work-peek lease 2026-08-01: _delegated_build
@@ -596,9 +648,18 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
                     "notification or an armed beacon).",
                     prefix="")
                 continue
+            # A DISPATCH CLAIM ON A ROW NOT PROVEN DISCHARGED IS IN PROGRESS
+            # and owes no act unless it is expiring (`lease_in_progress`).
+            if str(r).startswith("dispatch:") and left > LEASE_TTL_ALARM_S:
+                lf, fresh = _lease(r)
+                if lease_in_progress(lf, fresh, seat, holder):
+                    _exempt(r, res, left, v, IN_PROGRESS, in_progress_reason(
+                        release_hint(r, v), _aged(_dispatch_line(
+                            lf, fresh, seat, brief=not detail), fresh)))
+                    continue
             # the latch identity: raw resource + lease id (hashed, never
             # printed) + the TTL band — the three coordinates whose change
-            # deserves a fresh full sermon.
+            # deserves this lane's line again.
             #
             # AND, FOR A DISPATCH CLAIM, THE ADVICE ITSELF. Those three
             # coordinates are all properties of the LEASE, and a dispatch
@@ -622,10 +683,9 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
             if str(r).startswith("dispatch:"):
                 lf, fresh = _lease(r)
                 _sentence = _dispatch_line(lf, fresh, seat, brief=False)
-                advice_fp = "\x1f" + hashlib.blake2b(
-                    _sentence.encode("utf-8"), digest_size=8).hexdigest()
-            lease_fps.append("%s\x1f%s\x1f%s%s" % (
-                r, v.get("lease") or "", _ttl_band(left), advice_fp))
+                advice_fp = "\x1f" + _h(_sentence)
+            lease_fps.append((r, "%s\x1f%s\x1f%s%s" % (
+                r, v.get("lease") or "", _ttl_band(left), advice_fp)))
             # THE ROW, NOT THE PROSE. The hint and its advice are built below,
             # inside the branch that actually PRINTS them: the latch means most
             # stops emit the one-line compression, which never carried a hint,
@@ -641,8 +701,67 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
         # leases by the same mechanism. It wants the fix `emit_blocks` already
         # describes (delivery decided at the one refusal door, via the
         # survives-refusal arming) applied to this rung's whole output, which
-        # is a separate row rather than a wider version of this cure.
-        if held:
+        # is a separate row rather than a wider version of this cure. What
+        # this rung does own is its MEMORY: it records only a print that
+        # reached the stream (see `_arm`), so a discarded print is printed
+        # again at the next stop rather than remembered as seen.
+        if not connected:
+            return
+        # THE MEMORY IS PER LEASE (task/3123). One fingerprint over the whole
+        # set made any lane's change reprint every lane: measured on a live
+        # seat, the block printed in full on ~25 of ~32 stops, and each reprint
+        # differed from the last in one or two lines — a lane flipping between
+        # held and LIVE DELEGATE or GATE PENDING as a subagent or a fab run
+        # started or ended. So the latch keeps each lease's coordinate, the one
+        # it contributed to that fingerprint, and a stop prints only the lines
+        # whose coordinate is new or changed. `--detail` reads and writes no
+        # memory, so it prints every line and leaves the next stop as it was.
+        mem = {_h(r): _h(coord) for r, coord in lease_fps}
+        moved = {r for r, coord in lease_fps
+                 if last is None or last.get(_h(r)) != _h(coord)}
+        gone = len(set(last or ()) - set(mem))
+        # A MOVED LEASE IS FORGOTTEN NOW, AND REMEMBERED AGAIN ONLY BY A
+        # DELIVERED PRINT (`_arm`). The delivered-print rule alone left a lane
+        # whose exempt line another rung's refusal discarded at its FIRST held
+        # coordinate, so when the exemption lapsed (a delegate dying, a gate
+        # clearing) the stop compared equal and compressed into a WARN — the
+        # one transition the all-exempt rearm exists to make loud, and main
+        # blocks there. Dropping each moved key before the print is decided
+        # makes the next stop print that lane in whatever state it is then.
+        settled = {k: v for k, v in (last or {}).items()
+                   if k not in {_h(r) for r in moved}}
+        if last is not None and settled != last:
+            try:
+                _write_stop_latch(fpp, lease_seat, json.dumps(
+                    {"leases": settled}, sort_keys=True), session=session)
+            except OSError:
+                pass
+
+        def _arm(text):
+            """ARM THE MEMORY, DO NOT WRITE IT: a print is remembered only
+            once it is on the stream. The refusal exit discards every warn,
+            and a memory written while a warn was being built called a line
+            "unchanged" at the next stop that the seat had never seen. So the
+            write is queued with the TEXT it records, the way the seam rung
+            queues its disclosures, and `commit_disclosures` writes it only if
+            that text was printed. Writability is proven now, because an
+            unlatchable print must degrade to a warn before it is published.
+            -> whether it could be armed."""
+            incarnation = _latch_dir_writable(fpp, lease_seat, session)
+            if incarnation:
+                _PENDING_DISCLOSURES.append((fpp, json.dumps(
+                    {"leases": mem}, sort_keys=True), text, lease_seat,
+                    session, incarnation))
+            return bool(incarnation)
+
+        # WHAT THE SEAT STILL OWES, BY NAME, on every print that leaves a held
+        # line out. An auto-compact keeps the session and so the memory, and
+        # a held lane printed before it is not printed again until its own
+        # state moves: without its name no later stop says what is owed.
+        def _owed(skip=()):
+            return ", ".join(x[0] for x in held if x[2] not in skip)
+
+        if held and not moved:
             # THE SAME-STATE LATCH (owner-surfaced 2026-08-04): this arm
             # re-printed its full multi-line sermon on EVERY stop while the
             # held set was UNCHANGED — the owner watched the identical wall
@@ -650,195 +769,232 @@ def claims_rung(session, room, seat, blocks=None, warns=None,
             # sibling rung already latches per state (inbox on the pending
             # fp, beacon on armed|missing, wiring/punt on the finding text,
             # spiral on chain|rounds); this was the one publisher without a
-            # memory. The fingerprint keys on (resource, lease id, TTL band)
-            # so the full sermon re-fires on exactly the events that deserve
-            # it — a new lease, a released lease, or a remainder crossing
-            # LEASE_TTL_ALARM_S (severity escalates THROUGH the latch, it is
-            # never compressed by it) — while a re-stop on the same set
-            # compresses to ONE line that still carries the count and the
-            # expiring tally. The compressed line is a WARN, not a block: the
-            # inbox rung's own law ("a re-stop on the SAME rows passes")
-            # covers an obligation already pointed at, and a block that
-            # re-fires forever on unchanged state is the poll-loop wedge the
-            # renewed-lease fix measured live (three blocked stops in one
-            # session, 2026-08-03). An unwritable latch degrades the sermon
-            # to a WARN as well — the spiral rung's law: a gate that cannot
-            # remember must never become a wall.
-            fp = hashlib.blake2b("|".join(lease_fps).encode("utf-8"),
-                                 digest_size=8).hexdigest()
-            fpp = _stop_fp_path(room, lease_seat, session, kind=LEASE_LATCH)
-            try:
-                with open(fpp) as f:
-                    last = f.read().strip()
-            except OSError:
-                last = None
-            if last == fp and not detail:
-                # THE TALLY COUNTS THE EXEMPT LANES TOO, for the same
-                # reason the count above does: the exempt coordinate now
-                # carries the TTL band, so a crossing re-prints — and a tally
-                # blind to the exempt half would name zero EXPIRING on the
-                # very stop that escalated.
-                expiring = sum(1 for left in ([_h[1] for _h in held]
-                                              + [_e[1] for _e in exempt])
-                               if left <= LEASE_TTL_ALARM_S)
-                # THE HEADER RULING REACHES THE LATCH PATH TOO. This line
-                # said "the full detail (exact release commands) printed
-                # then" UNCONDITIONALLY — the sermon's original coupling
-                # defect surviving one path over, the path the heterogeneous
-                # witness never drives: a first stop on rooms helm could not
-                # prove idle withholds EVERY command, so the latched re-stop
-                # pointed its reader back at commands that were never
-                # printed. Same division of labour as the sermon header: a
-                # summary may describe the sermon's STRUCTURE (each line
-                # owned its own instruction, or said why none was offered —
-                # the exhaustiveness `_room_advice`'s branch arm pins), and
-                # may assert NOTHING about content it does not own.
-                # AND THE COUNT COVERS THE EXEMPT LANES TOO, because a count
-                # that silently excludes them is the same omission one surface
-                # smaller: a seat comparing "2 lease(s) held" against three
-                # rows in `helm work list` reads the missing one as released.
-                # THE SUMMARY MAY DESCRIBE THE SERMON'S STRUCTURE AND ASSERT
-                # NOTHING ABOUT CONTENT IT DOES NOT OWN. It once said "the
-                # exact release commands printed then" unconditionally, which
-                # is false the moment a lane helm could not prove idle
-                # withholds every command — so it names the verb that reprints
-                # instead of describing what that reprint will say.
-                warns.append(
-                    "[helm stop-guard] %d lease(s) held%s%s, unchanged. "
-                    "Reprint: %s"
-                    % (len(held),
-                       " +%d exempt" % len(exempt) if exempt else "",
-                       " (%d EXPIRING)" % expiring if expiring else "",
-                       DETAIL_VERB))
-            else:
-                lines = []
-                for res, left, _r, _v in held:
-                    cmd = release_hint(_r, _v)
-                    # Keyed on what the lease CLAIMS TO BE, not on whether its
-                    # directory currently resolves: a lane lease whose room is
-                    # missing is MORE reason to withhold a blind release, not
-                    # less — and `_room_advice` says so in as many words.
-                    #
-                    # THE ADVICE REVOKES THE COMMAND, and that is the point
-                    # of its first return value. NO room read gives the guard
-                    # standing to hand anyone a copy-pasteable release: the
-                    # four reads see ARTEFACTS, never PRESENCE, so a clean room
-                    # cannot prove nobody is in it and a room with findings has
-                    # PROVEN there is work to strand. So the sentence REPLACES
-                    # the command rather than trailing it. The boolean stays
-                    # because the shape is the audit: the exhaustiveness arm
-                    # reads it against "NO release command is offered", and a
-                    # branch that ever earns a True must pass through here.
-                    if cmd and str(_r).startswith("worktree:"):
-                        lf, fresh = _lease(_r)
-                        keep, advice = _room_advice(
-                            _r, brief=not detail, reads=_room_reads(lf, fresh))
-                        advice = _aged(advice, fresh)
-                        cmd = (cmd + advice) if keep else advice.lstrip(" —").strip()
-                    # A DISPATCH CLAIM GETS THE SAME TREATMENT AND NEVER DID.
-                    # It was listed with its resource and its TTL and nothing
-                    # about the ROW, so a seat whose row had been cancelled or
-                    # rebound read a discharged claim as work it still owed —
-                    # measured twice in one session, on two seats, from one
-                    # rebind of mine.
-                    elif str(_r).startswith("dispatch:"):
-                        # THE SENTENCE RIDES, IT DOES NOT REPLACE. Unlike a
-                        # lane lease, releasing a dispatch claim strands
-                        # nothing — the row keeps its recipient and status —
-                        # so there is no branch where withholding the command
-                        # protects anything, while withholding it denies the
-                        # seat the only printing of its own lease token.
-                        lf, fresh = _lease(_r)
-                        advice = _aged(_dispatch_line(lf, fresh, seat,
-                                                      brief=not detail),
-                                       fresh)
-                        cmd = (cmd + advice) if cmd \
-                            else advice.lstrip(" —").strip()
-                    lines.append(
-                        "  %s %s%s — %s" % (
-                            res, _ttl_human(left),
-                            " EXPIRING" if left <= LEASE_TTL_ALARM_S else "",
-                            cmd or "no lease token on this row; let it expire"))
-                # THE EXEMPT LANES ARE LINES, NOT ABSENCES — the second
-                # promised shape, which this header has promised all along:
-                # "a lane it could not prove idle says why and offers none".
-                # An exemption stopped being an exclusion at `_exempt`.
+            # memory. A re-stop on which no lease moved compresses to ONE line
+            # that still carries the count and the expiring tally. It is a
+            # WARN, not a block: the inbox rung's own law ("a re-stop on the
+            # SAME rows passes") covers an obligation already pointed at, and a
+            # block that re-fires forever on unchanged state is the poll-loop
+            # wedge the renewed-lease fix measured live (three blocked stops in
+            # one session). A lease that went away is COUNTED
+            # here, never named: nothing is owed for it, and a released lease
+            # appears in neither printed shape.
+            #
+            # THE TALLY COUNTS THE EXEMPT LANES TOO, for the same
+            # reason the count above does: the exempt coordinate now
+            # carries the TTL band, so a crossing re-prints — and a tally
+            # blind to the exempt half would name zero EXPIRING on the
+            # very stop that escalated.
+            expiring = sum(1 for left in ([x[1] for x in held]
+                                          + [x[1] for x in exempt])
+                           if left <= LEASE_TTL_ALARM_S)
+            # THE SUMMARY MAY DESCRIBE THE SERMON'S STRUCTURE AND ASSERT
+            # NOTHING ABOUT CONTENT IT DOES NOT OWN. It once said "the exact
+            # release commands printed then" unconditionally, false the moment
+            # a lane helm could not prove idle withholds every command (the
+            # sermon header's coupling defect one path over), so it names the
+            # verb that reprints instead of what that reprint will say.
+            # AND THE COUNT COVERS THE EXEMPT LANES TOO: a seat comparing "2
+            # lease(s) held" against three rows in `helm work list` reads the
+            # missing one as released.
+            # AND IT NAMES NO LEASE. This is the commonest stop, so a name
+            # list here repeats identical text on every stop (10 held leases:
+            # about 520 bytes against 85). The partial print names what is
+            # still owed; a reader who lost that print runs the detail verb.
+            warns.append(
+                "[helm stop-guard] %d lease(s) held%s%s, unchanged%s. "
+                "Reprint: %s"
+                % (len(held),
+                   " +%d exempt" % len(exempt) if exempt else "",
+                   " (%d EXPIRING)" % expiring if expiring else "",
+                   "; %d no longer held" % gone if gone else "",
+                   DETAIL_VERB))
+            if gone:
+                _arm(warns[-1])
+        elif held:
+            lines = []
+            for res, left, _r, _v in held:
+                if _r not in moved:
+                    continue
+                cmd = release_hint(_r, _v)
+                # Keyed on what the lease CLAIMS TO BE, not on whether its
+                # directory currently resolves: a lane lease whose room is
+                # missing is MORE reason to withhold a blind release, not
+                # less — and `_room_advice` says so in as many words.
                 #
-                # COMPACT, BECAUSE THE OTHER OWNER OBSERVATION IS ALSO TRUE.
-                # Claude Code renders every exit-2 emission as a red "Stop hook
-                # error:", so "stop allowed, lease retained" printed beside the
-                # one real demand glows red as an error. Accounting and
-                # reassurance are different jobs: the red block gets ONE
-                # scannable line per lane, marked NO ACTION OWED and carrying
-                # its measured state word and nothing else, so nothing in it
-                # reads as a demand and no lane's absence reads as a release.
-                # The full sentence still rides the warn channel.
-                for res, left, state, _reason, _text in exempt:
+                # THE ADVICE REVOKES THE COMMAND, and that is the point
+                # of its first return value. NO room read gives the guard
+                # standing to hand anyone a copy-pasteable release: the
+                # four reads see ARTEFACTS, never PRESENCE, so a clean room
+                # cannot prove nobody is in it and a room with findings has
+                # PROVEN there is work to strand. So the sentence REPLACES
+                # the command rather than trailing it. The boolean stays
+                # because the shape is the audit: the exhaustiveness arm
+                # reads it against "NO release command is offered", and a
+                # branch that ever earns a True must pass through here.
+                if cmd and str(_r).startswith("worktree:"):
+                    lf, fresh = _lease(_r)
+                    keep, advice = _room_advice(
+                        _r, brief=not detail, reads=_room_reads(lf, fresh))
+                    advice = _aged(advice, fresh)
+                    cmd = (cmd + advice) if keep else advice.lstrip(" —").strip()
+                # A DISPATCH CLAIM GETS THE SAME TREATMENT AND NEVER DID.
+                # It was listed with its resource and its TTL and nothing
+                # about the ROW, so a seat whose row had been cancelled or
+                # rebound read a discharged claim as work it still owed —
+                # measured twice in one session, on two seats, from one
+                # rebind of mine.
+                elif str(_r).startswith("dispatch:"):
+                    # THE SENTENCE RIDES, IT DOES NOT REPLACE. Unlike a
+                    # lane lease, releasing a dispatch claim strands
+                    # nothing — the row keeps its recipient and status —
+                    # so there is no branch where withholding the command
+                    # protects anything, while withholding it denies the
+                    # seat the only printing of its own lease token.
+                    lf, fresh = _lease(_r)
+                    advice = _aged(_dispatch_line(lf, fresh, seat,
+                                                  brief=not detail),
+                                   fresh)
+                    cmd = (cmd + advice) if cmd \
+                        else advice.lstrip(" —").strip()
+                lines.append(
+                    "  %s %s%s — %s" % (
+                        res, _lease_label(_v, left),
+                        " EXPIRING" if left <= LEASE_TTL_ALARM_S else "",
+                        cmd or "no lease token on this row; let it expire"))
+            # THE EXEMPT LANES ARE LINES, NOT ABSENCES — the second
+            # promised shape, which this header has promised all along:
+            # "a lane it could not prove idle says why and offers none".
+            # An exemption stopped being an exclusion at `_exempt`.
+            #
+            # COMPACT, BECAUSE THE OTHER OWNER OBSERVATION IS ALSO TRUE.
+            # Claude Code renders every exit-2 emission as a red "Stop hook
+            # error:", so "stop allowed, lease retained" printed beside the
+            # one real demand glows red as an error. Accounting and
+            # reassurance are different jobs: the red block gets ONE
+            # scannable line per lane, marked NO ACTION OWED and carrying
+            # its measured state word and nothing else, so nothing in it
+            # reads as a demand and no lane's absence reads as a release.
+            # The full sentence still rides the warn channel.
+            for res, left, state, _reason, _text, _r, _v in exempt:
+                if _r in moved:
                     lines.append(
                         "  %s %s%s — NO ACTION OWED (%s)" % (
-                            res, _ttl_human(left),
+                            res, _lease_label(_v, left),
                             " EXPIRING" if left <= LEASE_TTL_ALARM_S else "",
                             state))
-                # THE HEADER IS TWELVE WORDS AND ASSERTS NOTHING ABOUT CONTENT
-                # IT DOES NOT OWN, and the second half of that sentence is the
-                # defect CLASS rather than either instance. It first said "run
-                # the EXACT command shown" unconditionally, which lied once the
-                # advice began REVOKING commands. The obvious patch — compute
-                # the promise from whether ANY line kept its command — is the
-                # SAME coupling at finer granularity, and it lies the moment
-                # one lane is measured and another is not. That mix is not an
-                # edge case: an orchestrating seat is exactly who holds several
-                # lane leases at once.
-                #
-                # So the division of labour is absolute. The HEADER says why
-                # the stop is held and sends the reader down. Each LINE owns
-                # what to do about its own lane — its exact command, or plainly
-                # why none is offered. No line can inherit a promise, so a
-                # heterogeneous sermon cannot lie in either direction.
-                #
-                # THE WORDING DELIBERATELY AVOIDS THE TOKEN "auto-claimed": the
-                # actuator's own whisper owns that phrase, and three
-                # WorkOfferTest cases assert its ABSENCE from a stop's stderr
-                # to prove the rung did not fire. This block rides the same
-                # stream, so reusing the phrase here would forge the very
-                # signal those tests read.
-                #
-                # AND THE DETAIL IS ONE FOOTER, NOT ONE CLAUSE PER LANE. The
-                # long form is what the owner reported reading on every blocked
-                # stop; naming the verb that reprints it costs one line however
-                # many lanes are held, and `--detail` is that verb's flag
-                # rather than a second surface that could answer differently.
-                # WHY AN EXEMPTION WAS NOT GRANTED, WHEN THE FACTS ARE THE
-                # REASON. Each lane's own line carries its note; this one line
-                # names the snapshot's standing once — so "held" is never read
-                # as "helm measured this lane and found it idle".
-                if not_exact:
-                    lines.append("  " + _clip(_scrub(_view().headline()),
-                                              2 * STATUS_BYTES))
-                sermon = ("[helm stop-guard] leases held by this session — "
-                          "act per line, then stop:\n" + "\n".join(lines)
-                          + ("" if detail else
-                             "\n  why, in full: " + DETAIL_VERB))
-                try:
-                    latched = _write_stop_latch(fpp, lease_seat, fp, session=session)
-                except OSError:
-                    latched = False
-                if latched:
-                    blocks.append(sermon)
-                else:
-                    warns.append(sermon)  # unlatchable -> degrade, never wall
-        elif connected:
-            # AN ALL-EXEMPT STOP CLEARS THE EMISSION MEMORY. The hole it
-            # closes: sermon (latched) → a delegation/gate proof appears →
-            # the proof DIES. Without this clear, the third stop's held set
-            # fingerprints identically to the latched one and a delegate's
+            # THE HEADER IS TWELVE WORDS AND ASSERTS NOTHING ABOUT CONTENT
+            # IT DOES NOT OWN, and the second half of that sentence is the
+            # defect CLASS rather than either instance. It first said "run
+            # the EXACT command shown" unconditionally, which lied once the
+            # advice began REVOKING commands. The obvious patch — compute
+            # the promise from whether ANY line kept its command — is the
+            # SAME coupling at finer granularity, and it lies the moment
+            # one lane is measured and another is not. That mix is not an
+            # edge case: an orchestrating seat is exactly who holds several
+            # lane leases at once.
+            #
+            # So the division of labour is absolute. The HEADER says why
+            # the stop is held and sends the reader down. Each LINE owns
+            # what to do about its own lane — its exact command, or plainly
+            # why none is offered. No line can inherit a promise, so a
+            # heterogeneous sermon cannot lie in either direction.
+            #
+            # THE WORDING DELIBERATELY AVOIDS THE TOKEN "auto-claimed": the
+            # actuator's own whisper owns that phrase, and three
+            # WorkOfferTest cases assert its ABSENCE from a stop's stderr
+            # to prove the rung did not fire. This block rides the same
+            # stream, so reusing the phrase here would forge the very
+            # signal those tests read.
+            #
+            # AND THE DETAIL IS ONE FOOTER, NOT ONE CLAUSE PER LANE. The
+            # long form is what the owner reported reading on every blocked
+            # stop; naming the verb that reprints it costs one line however
+            # many lanes are held, and `--detail` is that verb's flag
+            # rather than a second surface that could answer differently.
+            # WHY AN EXEMPTION WAS NOT GRANTED, WHEN THE FACTS ARE THE
+            # REASON. Each lane's own line carries its note; this one line
+            # names the snapshot's standing once — so "held" is never read
+            # as "helm measured this lane and found it idle".
+            if not_exact:
+                lines.append("  " + _clip(_scrub(_view().headline()),
+                                          2 * STATUS_BYTES))
+            # THE LANES NOT REPRINTED ARE ONE COUNTED LINE, and it says they
+            # were printed EARLIER rather than that they need nothing: an
+            # unchanged held lease still owes the act its line named then, so
+            # the line names each one; an unchanged exempt lane owes nothing
+            # and is only counted. It names the reprint verb, so it replaces
+            # the footer.
+            still = ([x[1] for x in held if x[2] not in moved]
+                     + [x[1] for x in exempt if x[5] not in moved])
+            late = sum(1 for left in still if left <= LEASE_TTL_ALARM_S)
+            # A RELEASE IS COUNTED ON THIS PATH TOO, as the compressed line
+            # counts it and never names it. Without it a lease released on the
+            # same stop another lane moved vanished with no mark, because the
+            # full list that once showed its absence is no longer reprinted.
+            if gone:
+                lines.append("  %d no longer held" % gone)
+            if still:
+                kept = _owed(moved)
+                lines.append(
+                    "  %d unchanged lease(s) not reprinted%s, as printed at "
+                    "an earlier stop%s. Every line, in full: %s"
+                    % (len(still), " (%d EXPIRING)" % late if late else "",
+                       " — still owed: " + kept if kept else "", DETAIL_VERB))
+            elif not detail:
+                lines.append("  why, in full: " + DETAIL_VERB)
+            sermon = ("[helm stop-guard] leases held by this session — "
+                      "act per line, then stop:\n" + "\n".join(lines))
+            # A BLOCK ONLY WHEN A PRINTED LINE OWES AN ACT: a held lease whose
+            # coordinate is new or changed. A lane moving INTO an exemption, or
+            # an exempt lane's crossing, is news and owes nothing, so it rides
+            # the WARN. An unwritable latch degrades a block to the WARN as
+            # well — the spiral rung's law: a gate that cannot remember must
+            # never become a wall. `--detail` arms nothing and answers as a
+            # first stop on this set would.
+            latched = detail or _arm(sermon)
+            owed = any(x[2] in moved for x in held)
+            (blocks if latched and owed else warns).append(sermon)
+        elif last != mem and not detail:
+            # AN ALL-EXEMPT STOP REMEMBERS THE EXEMPT STATES IT PRINTED (its
+            # warns carry every lane). The hole this closes: a lane printed
+            # held, then exempt for a stop, then held again with the same
+            # lease id and band. A memory still holding the first stop's
+            # coordinate would call the third stop unchanged, and a delegate's
             # death — the closest thing this arm sees to a stranded lease —
-            # would compress into the one-liner. The stop after an exemption
-            # lapses is a fresh event and must be loud again; the latch
-            # compresses repetition, never severity escalation.
-            try:
-                _remove_stop_latch(
-                    _stop_fp_path(room, lease_seat, session, kind=LEASE_LATCH),
-                    lease_seat, session=session)
-            except OSError:
-                pass
+            # would compress into the one-liner. Clearing the memory would
+            # close it too, by reprinting every lane; remembering the exempt
+            # coordinate makes the returning lane the one line that changed.
+            # Every exempt lane's sentence rides the one warn channel, so the
+            # first printed one stands for the whole print; with none printed
+            # only a release moved, and the memory is armed on no text.
+            _arm(next((x[4] for x in exempt if x[4]), None))
+
+def posture_seat(session, seat=None):
+    """THE RENDER SEAT, SPELLED ONCE: the named seat, else the roster's seat
+    for the session, else the derived one. The stop ladder resolves it once per
+    stop, and the bare `--detail` read below must resolve the same seat."""
+    return seat or seat_for_session(session) or derive_seat(session)
+
+
+def lease_detail(room, seat=None):
+    """`helm chat stop-guard --detail` with no hook payload. -> exit status.
+
+    THE VERB EVERY SHORT PRINT NAMES MUST WORK FROM A SEAT'S SHELL, and there
+    it printed nothing: with no hook payload the ladder had no session, leases
+    are held per session, so this rung returned at once and the verb exited 0.
+    The session comes from the environment, as a payload would carry it, and
+    only this rung runs, in the detail form that reads and writes no memory.
+    The other rungs spend their own latches, and a read must spend none."""
+    session = home.session_id()
+    if not session:
+        print("[helm stop-guard] --detail: no session id in this environment, "
+              "and leases are held per session, so there is nothing to read.",
+              file=sys.stderr)
+        return 1
+    blocks, warns = [], []
+    claims_rung(session, room, posture_seat(session, seat), blocks=blocks,
+                warns=warns, detail=True)
+    for line in blocks + warns or [
+            "[helm stop-guard] no lease line for session %.8s." % session]:
+        print(line, file=sys.stderr)
+    return 2 if blocks else 0

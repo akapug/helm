@@ -162,7 +162,8 @@ class RegisterTest(unittest.TestCase):
              "arms": {"cc-codex": {"endpoint": "u", "model": "m"}}}
         path, err = evalpin.register(r, out=out)
         self.assertIsNone(err)
-        body = json.loads(open(path, encoding="utf-8").read())
+        with open(path, encoding="utf-8") as fh:
+            body = json.loads(fh.read())
         self.assertEqual(body["registered_for_fingerprint"], "abc123")
 
     def test_the_rule_names_the_PRIMARY_metric_and_forbids_self_grading(self):

@@ -16,10 +16,15 @@ State, under <helm home>/_global/.state/reflex-state/<session_id>/:
   counters.json       passive-streak, dirty-streak + cached last-dirty,
                       stuck-signal/-streak, loop-streak + cmd-hash-chain,
                       stalled-turns + the open turn (turn-open/-notice/
-                      -calls/-forward; see turn_open)
+                      -calls/-forward; see turn_open), and the three turn
+                      edges the idle reading reads (call-at, turn-opened-at,
+                      turn-ended-at; helm/seat_idle.py)
   command-log.jsonl   verify-grounding: test-runner invocations with REAL exit
                       codes + record-time semantic identity/cwd (token + digest,
                       never the raw command line)
+                      + a helm verb killed by a timeout and the diagnosis
+                      write naming it (verbtimeout.py: kind verb-timeout /
+                      verb-diagnosis, no token, so runner readers skip them)
   edit-targets.log    verify-grounding: basenames actually edited (a real edit
                       vs prose that merely mentioned a filename)
   edit-paths.log      the SAME edits, home-relative and DIRECTORY-BEARING —
@@ -83,8 +88,8 @@ DIRTYING = EDITS + ("Bash",)         # the only tools worth a git-status probe
 # is credited; the cost is one missed stall, the silent direction.
 COORD_WRITES = {
     "chat": ("post", "dm", "reply", "react", "claim"),
-    "task": ("add", "claim", "update", "close", "comment", "standdown",
-             "takeover"),
+    "task": ("add", "claim", "release", "update", "close", "comment",
+             "standdown", "takeover"),
     "store": ("add", "revise", "supersede", "retire", "rescope", "keywords",
               "gates", "gloss", "evidence", "confirm", "reject", "xrev-clear",
               "demote"),
@@ -727,10 +732,50 @@ def turn_open(session, prompt):
                 return
             c["stalled-turns"] = _closed(c)
             c.update({"turn-open": 1, "turn-calls": 0, "turn-forward": 0,
-                      "turn-notice": notice})
+                      "turn-notice": notice, "turn-opened-at": time.time()})
             pk.write_json(path, c)
     except Exception as exc:
         swallow("record.turn_open", exc)
+
+
+def turn_close(session):
+    """Record that the session's turn ENDED now: the idle reading's third
+    edge (helm/seat_idle.py, task/3118). Never raises, never prints.
+
+    WRITTEN BY THE STOP DOOR ON rc 0 (`turn_closed`), a re-stop included. The
+    owed-row rung refuses every idle stop once and passes the re-stop, so the
+    re-stop IS an idle owing seat's turn end; a writer that skipped it would
+    never date the very seats the idle bar is about. `turn-open` and the
+    stall count are untouched: a turn end is not the next turn's start, and
+    `_closed` still closes the turn when the next one opens.
+
+    GATED ON THE RECORDER'S OWN EVIDENCE, as turn_open is: a session no
+    PostToolUse ever reached gets no state from a stop."""
+    try:
+        sid = str(session or "")
+        if not sid:
+            return
+        sd = session_dir(sid)
+        path = os.path.join(sd, "counters.json")
+        if not os.path.exists(path):
+            return
+        with _counters_locked(sd) as held:
+            c = pk.read_json(path, None) if held else None
+            if not isinstance(c, dict):
+                return
+            c["turn-ended-at"] = time.time()
+            pk.write_json(path, c)
+    except Exception as exc:
+        swallow("record.turn_close", exc)
+
+
+def turn_closed(session, rc):
+    """The stop door's exit: rc 0 lets the harness end the turn, so it is
+    recorded as a turn end (`turn_close`); any other rc is returned
+    untouched and records nothing. Returns `rc`."""
+    if rc == 0:
+        turn_close(session)
+    return rc
 
 
 def parse_event(raw):
@@ -1050,11 +1095,14 @@ def _record(event):
 
     # stuck-signal: action tools only — reads carry error text as data. A
     # failure event carries its tells in the top-level error, not a response.
+    # A success (rc 0) never counts as stuck; an unknown rc (-1) keeps the
+    # text rule, as before (task/1519).
+    rc = _event_exit(event, resp, failed)
     rtext = resp if isinstance(resp, str) else \
         json.dumps(resp) if resp is not None else ""
     if failed:
         rtext = "\n".join(x for x in (rtext, str(event.get("error") or "")) if x)
-    stuck = tool not in PASSIVE and bool(rtext) and bool(STUCK_RE.search(rtext))
+    stuck = tool not in PASSIVE and rc != 0 and bool(rtext) and bool(STUCK_RE.search(rtext))
 
     # command-log: test-runner invocations with the REAL exit code — token +
     # digest, never the raw command line (ids/digests law).
@@ -1072,6 +1120,18 @@ def _record(event):
                 row["cwd"] = _home_relative(event_wd)
             _append(os.path.join(sd, "command-log.jsonl"),
                     json.dumps(row, separators=(",", ":")) + "\n")
+    # ...and a helm VERB killed by a timeout, plus the diagnosis write that
+    # answers one (helm/verbtimeout.py, task/1822): a row on those two events
+    # only, never one per helm call, so the runner tail keeps its rows.
+    # Its own try: a fault here must never cost the counters below.
+    if tool == "Bash" and "helm" in cmd:
+        try:
+            from . import verbtimeout
+            for row in verbtimeout.rows(sid, cmd, event, resp, failed):
+                _append(os.path.join(sd, "command-log.jsonl"),
+                        json.dumps(row, separators=(",", ":")) + "\n")
+        except Exception as _swallowed:     # noqa: BLE001 — fail-open
+            swallow("record._record.verbtimeout", _swallowed)
 
     # edit-targets: the file a real edit landed on (basename only) — a
     # FAILED edit landed nowhere and must not ground verify.
@@ -1145,7 +1205,11 @@ def _record(event):
                 c["stuck-streak"] = int(c.get("stuck-streak") or 0) + 1 \
                     if stuck else 0
 
+            # `call-at` is the idle reading's call edge (helm/seat_idle.py):
+            # `ts` dates it to the second, and a turn end inside that second
+            # would sort before the call it followed.
             c.update(v=1, ts=pk.now_ts())
+            c["call-at"] = time.time()
             c["last-tool"] = tool
             pk.write_json(path, c)
 

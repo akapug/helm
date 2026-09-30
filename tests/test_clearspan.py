@@ -608,7 +608,8 @@ class TriageVerbTest(unittest.TestCase):
                 capture_output=True)
         for cmd in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
             _sp.run(["git"] + cmd, cwd=repo, check=True, capture_output=True)
-        open(os.path.join(repo, "f"), "w").write("one\n")
+        with open(os.path.join(repo, "f"), "w") as fh:
+            fh.write("one\n")
         _sp.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
         _sp.run(["git", "commit", "-qm", "one"], cwd=repo, check=True,
                 capture_output=True)
@@ -832,7 +833,8 @@ class VerdictNamesItsReaderAndMethodTest(unittest.TestCase):
         added next month is invisible to all of them and caught by this one.
         """
         import ast
-        src = open(clearspan.__file__.replace(".pyc", ".py")).read()
+        with open(clearspan.__file__.replace(".pyc", ".py"), encoding="utf-8") as fh:
+            src = fh.read()
         fn = next(n for n in ast.walk(ast.parse(src))
                   if isinstance(n, ast.FunctionDef) and n.name == "re_measure")
         lines = src.splitlines()

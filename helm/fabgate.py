@@ -8,7 +8,9 @@ small duck-typed adapter:
 ``submit(request)``
     Return the exact v2 submit event: admitted request, generation-bound handle,
     disposition and wire snapshot. Submit-or-join is atomic at Fab's sink; Helm
-    keeps no existence mirror.
+    keeps no existence mirror. A transport with a process exit — `fab gate
+    submit` is one — returns ``(exit, event)`` instead, because that exit
+    carries a fact the event does not (see `not_dispatched`).
 ``observe(handle)`` / ``wait(handle, timeout_s)``
     Return one exact v2 ``gate-job`` event. Losing the caller must not signal the
     remote job; stale generation is a terminal ``SUPERSEDED`` observation.
@@ -30,7 +32,7 @@ import signal
 import sys
 import time
 
-from . import gate, gateauthority, gateimport
+from . import gate, gateauthority, gateimport, pk
 
 
 REQUEST_VERSION = 2
@@ -65,6 +67,32 @@ _GENERATION = re.compile(r"run-[0-9a-f]{32}-[1-9][0-9]*-[0-9a-f]{16}\Z")
 _SNAPSHOT_FIELDS = frozenset((
     "state", "exit", "exit_class", "artifact", "artifact_sha256", "receipt",
     "queue_elapsed_s", "execution_elapsed_s", "live", "reason"))
+_HANDLE_FIELDS = frozenset(("v", "key", "job_id", "host", "generation"))
+
+#: FAB LAUNCHED NOTHING (task/3114). `fab gate submit` exits 75, fab's
+#: EX_TEMPFAIL, when the build it started stopped before the node registered
+#: the job: nothing runs under the key, and fab says to retry the submit. The
+#: EXIT IS LOAD-BEARING and the event alone is not: the same null authority on
+#: exit 94 is fab saying a launch's own answer was UNKNOWN, and that job may be
+#: running.
+EXIT_LAUNCHED_NOTHING = 75
+#: The snapshot reason fab's authority writes when the node holds no by-key
+#: record for a job.
+AUTHORITY_ABSENT = "AUTHORITY_ABSENT"
+#: Fab's exit for an UNKNOWN gate-job answer, `gate observe`'s included.
+EXIT_UNKNOWN = 94
+
+
+class NotDispatched(str):
+    """A submit fab answered with NOTHING LAUNCHED: retryable, and it owes
+    nothing — no record, no hold, no follower.
+
+    It IS the refusal sentence, so every caller that prints, joins or compares
+    the error keeps working unchanged; a caller that would otherwise record,
+    hold or follow a job asks `isinstance`, the way `gate.CapacityRefusal`
+    works."""
+
+    kind = "not-dispatched"
 
 
 class ClientDetached(Exception):
@@ -140,13 +168,22 @@ def _elapsed(value):
 def _focus_err(scope):
     plan = scope.get("plan")
     required = {"policy", "trunk", "base", "changed", "selected", "universe"}
-    if not isinstance(plan, dict) or set(plan) != required:
+    # The recorded-loads policy (task/3039) names the load record it
+    # selected from and that record's tree, and nothing else more.
+    recorded = required | {"record", "t0"}
+    if not isinstance(plan, dict) or set(plan) not in (required, recorded):
         return "focused plan is not helm's exact six-field shape"
-    if plan.get("policy") != gate.FOCUS_POLICY:
+    if plan.get("policy") != (gate.FOCUS_POLICY if set(plan) == required
+                              else gate.FOCUS_POLICY_V3):
         return "focused plan names an unknown policy"
     if not all(type(plan.get(name)) is str and _SHA.fullmatch(plan[name])
                for name in ("trunk", "base")):
         return "focused plan does not name exact trunk/base commits"
+    if set(plan) == recorded and not (
+            type(plan.get("t0")) is str and _SHA.fullmatch(plan["t0"])
+            and type(plan.get("record")) is str
+            and re.fullmatch(r"[0-9a-f]{32}", plan["record"])):
+        return "focused plan does not name an exact load record and tree"
     for name in ("changed", "selected"):
         values = plan.get(name)
         if not isinstance(values, list) or not values \
@@ -162,9 +199,12 @@ def _focus_err(scope):
 def _identity_contract(identity):
     required = {"format", "repository", "tree", "scope",
                 "interpreter", "runner"}
-    if not isinstance(identity, dict) or set(identity) != required \
+    if gateimport.identity_without_attempt(identity) != required \
             or identity.get("format") != KEY_FORMAT:
         return None, "job identity is not helm's exact six-field shape"
+    err = gateimport.attempt_err(identity)
+    if err:
+        return None, err
     scope = identity.get("scope")
     if isinstance(scope, dict) and scope.get("kind") == "whole":
         return gateimport._fab_identity_contract(identity)
@@ -254,12 +294,14 @@ def _execution_err(job):
 
 
 def request(repo, tree, scope, interpreter, runner, queue_timeout=None,
-            execution_timeout=None):
+            execution_timeout=None, attempt=None):
     """Build one exact, versioned gate-job request and key.
 
     Budgets are deliberately outside the key: followers may have different
     patience, while the suite object remains repository + tree + scope +
-    interpreter + runner.  The first submitter's queue/execution budgets are
+    interpreter + runner. An attempt, when one is given, is part of that
+    object, so a later attempt is a different key; absent, the key is the
+    six-field key. The first submitter's queue/execution budgets are
     separate named values for Fab to enforce; a join never turns queue wait into
     suite runtime.
     """
@@ -302,6 +344,8 @@ def request(repo, tree, scope, interpreter, runner, queue_timeout=None,
                "repository": {"common_dir": identity},
                "tree": tree, "scope": scope,
                "interpreter": interpreter, "runner": runner}
+    if attempt is not None:
+        payload["attempt"] = attempt
     body, err = _identity_contract(payload)
     if err:
         return None, err
@@ -370,8 +414,7 @@ def snapshot(raw):
 
 
 def _handle(raw, key):
-    if not isinstance(raw, dict) or set(raw) != {
-            "v", "key", "job_id", "host", "generation"} \
+    if not isinstance(raw, dict) or set(raw) != _HANDLE_FIELDS \
             or raw.get("v") != HANDLE_VERSION:
         return None, "Fab returned no exact v%d durable job handle" \
             % HANDLE_VERSION
@@ -459,6 +502,75 @@ def _wire_snapshot(raw):
     if not raw["live"] and not terminal:
         return None, "Fab non-live job has no terminal authority"
     return state, None
+
+
+def _absent_authority(raw):
+    """Is this snapshot Fab's exact null authority with reason AUTHORITY_ABSENT?"""
+    state, err = _wire_snapshot(raw)
+    return err is None and state["state"] == "UNKNOWN" \
+        and state["reason"] == AUTHORITY_ABSENT
+
+
+def not_dispatched(raw, key, rc):
+    """THE ONE READING of a submit answer that says Fab launched nothing.
+
+    A NotDispatched carrying Fab's reason verbatim when, and only when, every
+    fact holds: exit 75, disposition UNKNOWN, the exact null-authority snapshot
+    with reason AUTHORITY_ABSENT, and Fab's own handle for THIS key with a null
+    generation. Anything short of the whole shape is None and the caller's
+    existing reading decides it: a null generation alone is still the
+    rejection it always was, because that job may be running. `submit` and
+    the landing window's `gatewindow.dispatch` both ask this, so neither of
+    them (nor `submit_and_follow`, through `submit`) can read it differently.
+    """
+    if rc != EXIT_LAUNCHED_NOTHING or not isinstance(raw, dict) \
+            or raw.get("v") != EVENT_VERSION \
+            or raw.get("event") != "gate-job" \
+            or raw.get("disposition") != "UNKNOWN" \
+            or not _absent_authority(raw.get("snapshot")):
+        return None
+    handle = raw.get("handle")
+    if not isinstance(handle, dict) or set(handle) != _HANDLE_FIELDS \
+            or handle.get("v") != HANDLE_VERSION \
+            or handle.get("key") != key \
+            or handle.get("job_id") != "gate-%s" % key \
+            or type(handle.get("host")) is not str \
+            or not _ATOM.fullmatch(handle["host"]) \
+            or handle.get("generation") is not None:
+        return None
+    reason = raw.get("reason")
+    return NotDispatched(
+        reason if type(reason) is str and reason.strip() else
+        "Fab launched nothing on %s (exit %d) and gave no reason"
+        % (handle["host"], EXIT_LAUNCHED_NOTHING))
+
+
+def job_absent(raw, key, rc):
+    """THE ONE READING of an observe answer that says the node holds NO job
+    under this key (task/3115).
+
+    Fab's reason verbatim when, and only when, every fact holds: exit 94,
+    disposition UNKNOWN, this key and its canonical job id, no generation,
+    tree, sha, identity or budgets, and the exact null-authority snapshot with
+    reason AUTHORITY_ABSENT — which fab's authority writes only when its
+    by-key record is missing. It is keyed on that reason, never on UNKNOWN
+    alone: an unreachable or refusing node is UNKNOWN with TRANSIENT_AUTHORITY
+    or AUTHORITY_REFUSED, and a present record answers JOINED on exit 0.
+    Anything else is None, and None is never "absent".
+    """
+    if rc != EXIT_UNKNOWN or not isinstance(raw, dict) \
+            or raw.get("v") != EVENT_VERSION \
+            or raw.get("event") != "gate-job" \
+            or raw.get("disposition") != "UNKNOWN" \
+            or raw.get("key") != key or raw.get("job_id") != "gate-%s" % key \
+            or any(raw.get(name) is not None
+                   for name in ("tree", "sha", "generation", "identity")) \
+            or raw.get("budgets") != {"queue_s": None, "execution_s": None} \
+            or not _absent_authority(raw.get("snapshot")):
+        return None
+    reason = raw.get("reason")
+    return reason if type(reason) is str and reason.strip() else \
+        "Fab's authority holds no record of gate-%s" % key
 
 
 def _observed_event(raw, request, handle):
@@ -574,8 +686,25 @@ def _fetched_event(raw, observed):
     return {"event": raw, "snapshot": state}, None
 
 
+def refusal_text(err, event):
+    """`err` with fab's own reason appended, when the gate-job `event` carries
+    one: the reason is fab's account of WHY it answered as it did, and a
+    refusal that drops it names a symptom with no cause. Laundered and cut to
+    300 characters, because it is fab's text printed on a terminal. `err`
+    unchanged when the event carries no non-empty string reason."""
+    reason = event.get("reason") if isinstance(event, dict) else None
+    if not isinstance(reason, str) or not reason.strip():
+        return err
+    return "%s; fab said: %s (%s)" % (
+        err, pk.launder(reason, keep="")[:300], event.get("disposition"))
+
+
 def submit(builder, job):
-    """Submit through Fab's authoritative sink; never decide existence locally."""
+    """Submit through Fab's authoritative sink; never decide existence locally.
+
+    (admitted, None), or (None, refusal). A refusal that is a NotDispatched is
+    Fab saying it launched nothing: retry the submit, there is nothing to
+    follow."""
     frozen, err = _request_contract(job)
     if err:
         return None, err
@@ -590,12 +719,17 @@ def submit(builder, job):
         if err:
             return None, err
         try:
-            raw = builder.submit(attempt)
+            answer = builder.submit(attempt)
             break
         except Exception as exc:             # retry is safe only because the sink
             failure = type(exc).__name__     # decides same-key existence atomically
     else:
         return None, "Fab submit is UNKNOWN (%s)" % failure
+    rc, raw = answer if type(answer) is tuple and len(answer) == 2 \
+        else (None, answer)
+    nothing = not_dispatched(raw, frozen["key"], rc)
+    if nothing:
+        return None, nothing
     if not isinstance(raw, dict) or set(raw) != {
             "v", "event", "disposition", "handle", "snapshot",
             "reason", "request"} \
@@ -612,7 +746,7 @@ def submit(builder, job):
         return None, "Fab launch did not preserve the submitted budgets"
     handle, err = _handle(raw.get("handle"), frozen["key"])
     if err:
-        return None, err
+        return None, refusal_text(err, raw)
     state, err = _wire_snapshot(raw.get("snapshot"))
     if err:
         return None, err
@@ -850,7 +984,8 @@ def follow(builder, request, handle, repo, client_timeout=None, out=None):
 
 
 def submit_and_follow(builder, job, repo, client_timeout=None, out=None):
-    """One Helm front door: submit/join/recover, then disposable follow."""
+    """One Helm front door: submit/join/recover, then disposable follow. A
+    submit Fab launched nothing for returns its NotDispatched unfollowed."""
     admitted, err = submit(builder, job)
     if err:
         return None, err

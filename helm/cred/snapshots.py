@@ -20,8 +20,8 @@ from .account import account_of, verdict_for
 
 
 def rows(provider="claude"):
-    """One row per live credential home: the dir NAME beside the account it
-    ACTUALLY holds, the verdict, and its backup depth. Pure read."""
+    """One row per live credential home: the dir NAME beside the account its
+    metadata names, the verdict, and its backup depth. Pure read."""
     out = []
     for r in homes.homes_list():
         if r.get("archived") or r.get("broken_alias") or r["provider"] != provider:
@@ -108,6 +108,121 @@ def _lineage_accounts(fam):
     if not isinstance(accts, list):
         return set()
     return {a for a in (_email_or_none(x) for x in accts) if a}
+
+
+# ------------------------------------------------------- token lineage ---
+#: How much of the family fingerprint a display carries: enough to tell two
+#: homes' families apart by eye, never the lineage key itself.
+LINEAGE_TAG_HEX = 8
+LINEAGE_MATCH, LINEAGE_MISMATCH, LINEAGE_UNKNOWN = "MATCH", "MISMATCH", "UNKNOWN"
+LINEAGE_AMBIGUOUS = "AMBIGUOUS"
+#: What this verdict IS, said wherever it is shown.
+LINEAGE_BASIS = ("token-family lineage recorded by earlier censuses — only as "
+                 "good as the first sighting")
+
+
+def _lineage_doc():
+    """(families, None) or (None, why). Unlike _lineage_load, a file that is
+    there and cannot be read is told apart from one never written."""
+    path = _lineage_path()
+    if not os.path.lexists(path):
+        return None, "no family lineage recorded yet (a backup census writes it)"
+    doc = _read_json(path)
+    fams = doc.get("families") if isinstance(doc, dict) else None
+    if not isinstance(fams, dict):
+        return None, "family lineage unreadable"
+    return fams, None
+
+
+def token_lineage(config_dir, families=None):
+    """Which accounts the TOKEN a home holds was seen under, beside the
+    account its metadata names. The ONE reader for `helm cred list` and the
+    web quota rows (task/2636).
+
+    THREE IDENTITIES, and the metadata is the weakest: the token a process
+    holds is what bills, `.claude.json` oauthAccount is metadata Orca rewrites
+    on every switch (even under live processes on other tokens), and the
+    Chrome extension's account has no local source helm can read.
+
+    `claude auth status` IS NOT A TOKEN READ. Measured on Claude Code 2.1.284:
+    its email, orgId and orgName come from `Cn()`, which returns
+    `ce().oauthAccount` — the global config, `<CLAUDE_CONFIG_DIR>/.claude.json`
+    — so it prints this same metadata. Only its subscriptionType comes from
+    the stored credential. Do not rebuild this on that premise.
+
+    WHAT THIS IS INSTEAD: the refresh token's family fingerprint
+    (homes._token_family) looked up in the family lineage, which records the
+    metadata account each census saw that family live under. It is only as
+    good as the first sighting — a family first censused after a switch
+    carries the wrong account — and it is never "the token's own identity".
+    A family recorded under more than one account reads AMBIGUOUS (MISMATCH
+    when the metadata is none of them), never MATCH. A family never recorded,
+    an unreadable credentials file, an unreadable lineage, or a credential
+    pair that moved between its two reads reads UNKNOWN and never falls back
+    to the metadata.
+
+    -> {state, tag, accounts, metadata, reason, chrome}. `tag` is the first
+    LINEAGE_TAG_HEX hex of the fingerprint; no token byte leaves here.
+    `families` lets a caller reading many homes load the lineage once."""
+    real = os.path.realpath(os.path.expanduser(config_dir or ""))
+    auth = os.path.join(real, AUTH_JSON)
+    cfg = os.path.join(real, ACCOUNT_JSON)
+    # THE PAIR IS READ UNDER ONE STAT BRACKET, as _census_pair reads it: a
+    # switch between the token read and the metadata read would pair one
+    # account's family with the other's email and could claim a MATCH.
+    before = (_stat_key(auth), _stat_key(cfg))
+    fam = homes._token_family("claude", real)
+    acct = account_of(real)
+    moved = before != (_stat_key(auth), _stat_key(cfg))
+    out = {"state": LINEAGE_UNKNOWN, "tag": None, "accounts": [],
+           "metadata": acct["email"] if acct["ok"] else None,
+           "reason": None, "chrome": LINEAGE_UNKNOWN}
+    if moved:
+        out["reason"] = ("%s or %s moved during the read (an account switch?); "
+                         "read again" % (AUTH_JSON, ACCOUNT_JSON))
+        return out
+    if not os.path.lexists(auth):
+        out["reason"] = "no %s" % AUTH_JSON
+        return out
+    if not fam:
+        out["reason"] = ("%s unreadable" % AUTH_JSON
+                         if not isinstance(_read_json(auth), dict)
+                         else "%s carries no refresh token" % AUTH_JSON)
+        return out
+    out["tag"] = fam[:LINEAGE_TAG_HEX]
+    why = None
+    if families is None:
+        families, why = _lineage_doc()
+    if families is None:
+        out["reason"] = why or "family lineage unreadable"
+        return out
+    entry = families.get(fam)
+    accts = entry.get("accounts") if isinstance(entry, dict) else None
+    out["accounts"] = sorted({a for a in (_email_or_none(x) for x in accts)
+                              if a}) if isinstance(accts, list) else []
+    if not out["accounts"]:
+        out["reason"] = "family never recorded under an account by a census"
+        return out
+    if not out["metadata"]:
+        out["reason"] = "metadata unreadable: %s" % (acct["error"] or "no account")
+        return out
+    # A FAMILY RECORDED UNDER SEVERAL ACCOUNTS HAS NO SINGLE PROVENANCE: the
+    # accounts column only ever unions, so it is AMBIGUOUS, never a MATCH, and
+    # a MISMATCH only when the metadata is none of them.
+    if out["metadata"] not in out["accounts"]:
+        out["state"] = LINEAGE_MISMATCH
+    elif len(out["accounts"]) > 1:
+        out["state"] = LINEAGE_AMBIGUOUS
+    else:
+        out["state"] = LINEAGE_MATCH
+    return out
+
+
+def metadata_says(account, config_dir, families=None):
+    """Label for an oauthAccount email: metadata, with the token-lineage
+    state on the same line. Never says the home holds that account."""
+    state = token_lineage(config_dir, families=families)["state"]
+    return "metadata says %s (lineage %s)" % (account or "-", state)
 
 
 def _census_pair(real):

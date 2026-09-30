@@ -26,8 +26,10 @@ from .seats_incarnation import (  # the identity-generation owner
 # a DAG edge, not a cycle.
 from .seats_identity import (ROOM_CLEARED, _warn_foreign, _warn_once,
                              foreign_seat, owner_names)
-from .seats_runtime import (_prune_runtime_sessions, _roster_proxywatch_entry,
-                            _runtime_metadata, runtime_for_session)
+from .seats_runtime import (_in_land_order, _land_order, _order_join,
+                            _order_testimony, _prune_runtime_sessions,
+                            _roster_proxywatch_entry, _runtime_metadata,
+                            runtime_for_session)
 
 # THE WRITE STAYS INSIDE EACH WRITER. Hoisting all five through one helper
 # made the roster-write guard's arm BLIND — it only inspects functions that
@@ -258,6 +260,7 @@ def _evict_session(r, sid, owner):
 # `seats_incarnation`, which owns the generation marker they are about.
 
 
+@_in_land_order   # a join that rebinds or evicts testimony (door read B4)
 def write_roster(seat, session=None, cwd=None, home_room=None, identity=True,
                  home_room_source=None, runtime=None, presence_beat=True,
                  keyed=False, admission=False, expect=UNCHECKED,
@@ -316,7 +319,8 @@ def write_roster(seat, session=None, cwd=None, home_room=None, identity=True,
         _warn_foreign("session binding", seat)
         session = None
     chat._ensure_dir()
-    with _flocked(roster_path() + ".lock"):
+    # testimony first takes the land order, then the roster's own lock
+    with _land_order(runtime), _flocked(roster_path() + ".lock"):
         r = roster_for_write()
         # ONE CANONICAL KEY PER IDENTITY, RESOLVED BEFORE THE ROW IS LOADED.
         # The roster keys casefold — a case-variant name is the SAME address
@@ -372,6 +376,7 @@ def write_roster(seat, session=None, cwd=None, home_room=None, identity=True,
                        ((seat, None) if keyed else None)
         if canon:
             seat = canon[0]          # keep the EXISTING spelling as the key
+        _order_join(r, seat, session, identity, runtime, SESSIONS_KEPT)
         row = r.get(seat) or {}
         if admits or not isinstance(row.get("incarnation"), str):
             # Rename carries this marker with the row; lawful key reuse mints a
@@ -605,6 +610,7 @@ def write_roster(seat, session=None, cwd=None, home_room=None, identity=True,
     if presence_beat:
         touch_seen(seat, session=session, incarnation=row["incarnation"])
     return ((seat, row, admits) if admission else (seat, row)) if keyed else row
+@_in_land_order   # it deletes or moves testimony (task/3265 r4)
 def disown_session(seat, sid, to=None):
     """(ok, message) — drop ONE remembered session id from ONE seat's row: the
     operator heal for an unverified row (`helm chat seat disown <seat> <sid>`).
@@ -631,6 +637,7 @@ def disown_session(seat, sid, to=None):
             if len(hits) != 1:
                 return False, "no roster row for %r" % seat
             seat, row = hits[0], r[hits[0]]
+        _order_testimony(row)
         had = [row.get("session")] + list(row.get("sessions") or [])
         gone = sorted({s for s in had if isinstance(s, str)
                        and s.startswith(sid)})
@@ -668,6 +675,7 @@ def disown_session(seat, sid, to=None):
                                "changed)" % to)
             owner = hits[0]
             orow = r[owner]
+            _order_testimony(orow)
             keep = [s for s in (orow.get("sessions") or []) if s != dead]
             keep.append(dead)
             orow["sessions"] = keep[-SESSIONS_KEPT:]
@@ -870,6 +878,11 @@ def rename_seat(old, new, whole_row=False, dry_run=False,
                 % (old, _seat_label(seat), len(sess),
                    ", ".join("%.8s" % s for s in sess), new,
                    _seat_label(seat), new, _seat_label(seat), sess[0]))
+        # GUARD 3 — an owner's rest lives under a NAME (helm/seat_rest.py).
+        from .seat_rest import rename_refusal
+        rested = rename_refusal(seat, new)
+        if rested:
+            return False, rested
         until, actor_note, actor_rename, err = rename_window(  # BEFORE write
             seat, new, r, alias_hours, actor_locked=not dry_run)
         if err:

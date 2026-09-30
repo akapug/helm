@@ -3,9 +3,11 @@
 THE GUARD COUNTED ROUNDS. `dispatches.review_spiral` counts distinct reviewed
 tips and, at three, prescribes a MELD — converge every open finding in one
 live exchange. That is the right cure for a chain that argues about ONE
-defect across three rounds. It is the wrong cure for a chain where every
-round found a defect the previous round's arms were structurally unable to
-see: a meld converges OPEN findings, and there are none to converge.
+defect across three rounds. A chain where every round found a defect the
+previous round's arms were structurally unable to see needs a different
+meld: there is no open finding to converge, and what is missing is the BAR —
+the closed list of blocking harms and falsifier classes the next read may
+use (T3). So UNDER-ARMED still blocks, and its cure is a bar meld.
 
 MEASURED, on the `the-quota-page-puts-what-he-uses-on-top` chain: six
 rounds read 1 finding, CLEAN, CLEAN, 4, 2, 1; the guard fired "meld" twice and
@@ -39,8 +41,8 @@ WHAT EACH BUCKET MEANS, and why UNKNOWN is its own:
               is visible at all only because the source-clean hold records it.
 
 THE DIRECTION OF THE DOUBT IS MELD. This module can only ever turn MELD into
-UNDER-ARMED, and only when EVERY keyed round is disjoint from every earlier
-one. Any repetition at all, any shortage of keyed rounds, any unreadable
+UNDER-ARMED (a bar meld), and only when EVERY keyed round is disjoint from
+every earlier one. Any repetition at all, any shortage of keyed rounds, any unreadable
 round: the caller's own prescription stands untouched. The guard's charter is
 not weakened; what it counts is sharpened.
 """
@@ -52,15 +54,17 @@ NEW_DEFECT = "NEW-DEFECT"
 UNKNOWN = "UNKNOWN"
 
 # The prescription this module can mint. The caller ranks it, and the stop
-# rung renders it as an ADVISORY: finding a new defect each round is the
-# behaviour a review exists to produce, and a rung that walls a seat for
-# healthy behaviour is switched off within a day (this tree's own lesson,
-# the built-but-not-wired latch). The block still fires on every chain where
-# one path comes back.
+# rung renders it as a BAR MELD (T3): a chain whose every read finds what the
+# last one's arms could not see keeps finding things until someone closes the
+# set of harms that block and the falsifier classes the next read may use.
+# The cure names both halves: agree the bar, and arm the lane with the
+# shipped function rather than a harness copy of it.
 UNDER_ARMED = "UNDER-ARMED"
 UNDER_ARMED_CURE = (
-    "each round found a defect the previous arms could not see; lift the "
-    "shipped function into the arms, never re-implement it in the harness "
+    "each round found a defect the previous arms could not see; agree the "
+    "BAR in one meld (the blocking harms, the closed falsifier classes, each "
+    "finding's disposition, the tip) before another read; lift the shipped "
+    "function into the arms, never re-implement it in the harness "
     "(docs/MODULE_REGISTRIES.md); ask the author for the generating cause")
 
 # A PATH TOKEN, and every clause of it is load-bearing against prose.

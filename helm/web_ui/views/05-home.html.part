@@ -1,0 +1,84 @@
+<div class="view on" id="view-home">
+  <!-- HOME (task/3445 L3), the console's first page. The owner: "maybe there
+       should be an actual homepage that doesnt need much scrolling, just a
+       really nice overall dashbaord for the app". So it is headlines only —
+       one or two numbers and one plain line per tile, coloured by state —
+       and every tile clicks through to the page that holds its detail. He
+       reads the TOTALS, never row text, so no tile names a command, a read
+       time or an internal subtotal (those are the detail pages' and the hover
+       titles'); a reading past its bound says "stale", one never read "not
+       read", and every cell boots saying "not read yet", because a dashboard
+       that cannot tell ZERO from UNREAD is the defect this console exists to
+       kill. -->
+  <p id="hello">your projects, remembered</p>
+  <!-- ON YOU: what waits on him, one line, and only while something does
+       (or while it cannot be read). Its detail — the decisions he answers,
+       the asks, the holds — is the On-you block on Work › projects. -->
+  <section id="honyou" class="hstrip" data-go="#work/projects">
+    <a class="hlab" href="#work/projects">on you</a>
+    <span id="honyouline"><span class="hstale">not read</span></span>
+  </section>
+  <div class="hgrid">
+    <section class="htile" data-go="#work/projects">
+      <a class="hlab" href="#work/projects">projects</a>
+      <div class="hval" id="hprojects"><span class="dmut">not read yet</span></div>
+    </section>
+    <!-- WORK (task/3643): the Work page's stage row, word for word, and its
+         stuck count — one tile where the pipeline and backlog tiles counted
+         the same work two ways. -->
+    <section class="htile hwide" data-go="#work/work">
+      <a class="hlab" href="#work/work" title="every piece of work in every project, from the to-do list to the shared code: the numbers that head the Work page">work</a>
+      <div class="hval" id="hwork"><span class="dmut">not read yet</span></div>
+    </section>
+    <section class="htile" data-go="#quota">
+      <a class="hlab" href="#quota">supply</a>
+      <div class="hval" id="hsupply"><span class="dmut">not read yet</span></div>
+    </section>
+    <section class="htile" data-go="#quota">
+      <a class="hlab" href="#quota">accounts</a>
+      <div class="hval" id="haccounts"><span class="dmut">not read yet</span></div>
+    </section>
+    <section class="htile" data-go="#roster">
+      <a class="hlab" href="#roster" title="seats active right now (a beat in the last 2 minutes), the ones a vendor has walled off, and whether forward work may resume">seats</a>
+      <div class="hval" id="hseats"><span class="dmut">not read yet</span></div>
+    </section>
+    <section class="htile" data-go="#chat">
+      <a class="hlab" href="#chat">chat</a>
+      <div class="hval" id="hchat"><span class="dmut">not read yet</span></div>
+    </section>
+    <section class="htile" data-go="#history">
+      <a class="hlab" href="#history" title="whether signing is live on the shared record, and how many records the local chain holds and whether they verify">signing record</a>
+      <div class="hval" id="hrecord"><span class="dmut">not read yet</span></div>
+    </section>
+    <section class="htile" data-go="#home" data-open="homenotes">
+      <a class="hlab" href="#home">fleet notes</a>
+      <div class="hval" id="hnotes"><span class="dmut">not read yet</span></div>
+    </section>
+    <!-- AWAY MODE (task/3018): the owner's away flag and his notice to every
+       agent, set here because he does not type verbs — one line and its
+       button, a tile of the grid; why, and the notice, fold under it. Agents
+       learn a change at their next turn; nothing here wakes anyone. It boots
+       saying "Not read yet", and an unreadable flag is never drawn as
+       "here". -->
+    <section id="posturesec"></section>
+  </div>
+  <!-- ANSWERS FOR YOU (owner ruling, task/2364): replies that address HIM,
+       from the same reading of the room the push notification path uses. It
+       sits directly under the band and ABOVE readiness because it is the one
+       thing on this page that is waiting on him rather than reporting to him.
+       HIDDEN AT ZERO — chat states emptiness properly, and an empty card here
+       is one more thing to look past. It is not an inbox: it holds nothing,
+       acknowledges nothing, and reading the room clears it. -->
+  <section id="danswers" hidden></section>
+  <!-- EVERY FLEET NOTE, folded under the grid: the notes tile carries the
+       newest headlines and opens this. -->
+  <details class="grp" id="homenotes">
+    <summary>every fleet note<span class="gmeta">what the fleet left you</span></summary>
+    <!-- FLEET NOTES: the "what happened overnight" answer the fleet leaves
+         for you (`helm note set <key> <text>`). Durable, one note per key,
+         newest first; the notes tile above carries the newest headlines. -->
+    <section id="notesec"></section>
+  </details>
+  <footer id="foot"></footer>
+</div>
+

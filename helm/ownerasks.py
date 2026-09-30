@@ -28,8 +28,9 @@ the web queue's handlers mint (see the WHO WROTE A ROW block below).
 
 THE RESIDUAL, STATED. Every agent runs as the owner's own uid, so the web
 door's bearer proves a browser on loopback, not the owner. The argv-guard
-refuses an agent's shell command that sends to the local decision endpoints
-or the away card (`chat.owner_door_post_refusal`), and one that mints an
+refuses an agent's shell command that sends to the local decision endpoints,
+the task backlog's comment door or the away card
+(`chat.owner_door_post_refusal`), and one that mints an
 OwnerDoor, writes the away flag or the fleet notice by hand, or deletes the
 notice by hand (`chat.owner_posture_forge_refusal`, which reads the command
 through the Actions rung's data fold, so a message or a post that merely
@@ -256,7 +257,9 @@ def decisions_path():
 #     `owner_door()`, and the only production call is inside web_core's
 #     owner POST handlers (a census in tests/test_ownerdecisions.py fails any
 #     other). A caller that passes the string "owner", or any other string,
-#     is refused, and the door the owner used is recorded on the row.
+#     is refused, and the door the owner used is recorded on the row. The
+#     task ledger takes the same capability for his backlog notes
+#     (`tasks.comment`, goal-ledger D1).
 # ---------------------------------------------------------------------------
 
 OWNER = "owner"     # the owner's token on a row; also every legacy default
@@ -355,6 +358,56 @@ VERDICT_DOOR = ("A verdict on an owner decision card is the OWNER's ruling, "
 def decisions_snapshot():
     """(cards-by-id, unavailable) — same contract as snapshot()."""
     return eventledger.latest_checked(decisions_path())
+
+
+# ---------------------------------------------------------------------------
+# REVISIONS (goal-ledger L1). The owner: "i click yes on your well thought out
+# acceptance criteria and/or add comment just like already there".
+# His comment is a "not yet", and the asker answers it by REVISING THE SAME
+# CARD, never by filing a second one that leaves the first in his queue. So a
+# card carries `rev` (1 at filing), `revisions` (every body it has replaced,
+# oldest first, each as it read at its own rev), `rev_ts` (when the current
+# body took effect) and `answering_comment_ts` (the owner comment the current
+# body answers, or None). No status is added: a revised card is still `open`,
+# so no consumer's `else` meets a new value.
+#
+# HIS YES BINDS TO THE TEXT HE READ. A verdict names the rev it ruled on, and
+# one that names an older rev than the card now shows is refused, naming the
+# current one, with nothing recorded. A verdict that names no rev read the
+# card as it was filed, which is rev 1: a page drawn before revisions existed
+# can only have shown the first body.
+# ---------------------------------------------------------------------------
+
+def card_rev(row):
+    """The card's current revision number -> int >= 1, or None when the
+    recorded value is unreadable. A card filed before revisions existed has
+    no `rev` and reads as 1."""
+    raw = (row or {}).get("rev", 1)
+    if raw is None:
+        return 1
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return None
+    return raw
+
+
+class StaleRev(str):
+    """The refusal a verdict on an older revision gets: a sentence, like every
+    other refusal here, that also carries the card's CURRENT rev as `.rev`, so
+    a door can answer "reload" by value instead of by reading prose."""
+
+    def __new__(cls, text, rev):
+        out = str.__new__(cls, text)
+        out.rev = rev
+        return out
+
+
+def _owner_comments_on(row, rev):
+    """The owner's comments recorded while the card read at `rev`, oldest
+    first. A comment written before revisions existed carries no `rev` and
+    was made on rev 1."""
+    return [c for c in (row.get("comments") or [])
+            if isinstance(c, dict) and c.get("door") and is_owner(c.get("by"))
+            and (c.get("rev") if c.get("rev") is not None else 1) == rev]
 
 
 def decision_rows():
@@ -472,7 +525,10 @@ def file_decision(title, context, options, asker, refs=None, source=None):
            # inferred later, because "no field" and "never pushed" are the same
            # bytes and only one of them is a fact about delivery.
            "owner_pushed_ts": None,
-           "delivered_ref": None, "last_updated": ts}
+           "delivered_ref": None, "last_updated": ts,
+           # the card as FILED is rev 1; `revise_decision` moves it
+           "rev": 1, "revisions": [], "rev_ts": ts,
+           "answering_comment_ts": None}
     if not _append(row, decisions_path()):
         return None, ("ledger unwritable (%s) — card NOT recorded"
                       % decisions_path())
@@ -506,20 +562,31 @@ def _push_body(row, stale=(), total=None):
     of the owner surface takes, and a phone notification is the smallest
     surface helm has."""
     lines = [row["title"]]
-    # THE OPTION KEYS TRAVEL, NOT JUST THE LABELS, because the reply has to be
-    # unambiguous from a phone. "2" resolves through _pick_option exactly as a
-    # full label does, and a one-character answer is what a notification can
-    # realistically carry back.
+    # A REVISED CARD SAYS SO FIRST (goal-ledger L1): the same card is coming
+    # back to him, and whether it answers something he said is the reason to
+    # open it again.
+    if (card_rev(row) or 1) > 1:
+        lines.append("revised %s(rev %d)"
+                     % ("after your comment " if row.get("answering_comment_ts")
+                        else "", card_rev(row)))
+    # THE OPTION KEYS TRAVEL, NOT JUST THE LABELS: they are the choices he
+    # will make, headlined, and "2" is the one-character answer a phone
+    # verdict door will carry (_pick_option already resolves a key exactly as
+    # it resolves a full label).
     lines += ["  %s. %s" % (o.get("key"), o["label"])
               for o in row.get("options") or []]
-    # NOT "answer on helm web". The owner, relayed:
-    # "The only reliable way that we have set up to reach my phone so far is the
-    # ntfy notifications ... other than that on my phone, I just use orca's
-    # mobile app." The console binds 127.0.0.1, which on a phone is the phone —
-    # so naming helm web here was pointing him at a surface that device cannot
-    # open. The card id plus a key is answerable from anything that can post a
-    # line, which is the point: the decision travels IN the push.
-    lines.append("reply with the card id and your pick — card %s (asked by %s)"
+    # THE PUSH PROMISES NOTHING NO DOOR KEEPS (goal-ledger D2). This line said
+    # "reply with the card id and your pick", and no door turns such a reply
+    # into a verdict: the OwnerDoor is minted only in the web handlers. A
+    # reply that reads to him as an answer and records nothing is the
+    # lost-verdict bug in his own hand, so until a phone door exists the line
+    # says where a ruling is recorded and that a reply is not. It still names
+    # no URL. The owner, relayed: "The only reliable way that we have set up
+    # to reach my phone so far is the ntfy notifications ... other than that
+    # on my phone, I just use orca's mobile app." The console binds
+    # 127.0.0.1, which on a phone is the phone.
+    lines.append("card %s (asked by %s): answer it on the work tab at your "
+                 "computer; a reply to this push records no verdict yet"
                  % (row["id"], row["asker"]))
     if stale:
         # BATCH, NEVER ONE PUSH PER ROW (notify's own rule). An owner who was
@@ -671,7 +738,8 @@ def flush_unreached():
          % (len(backlog), "" if len(backlog) == 1 else "s")]
         + ["  %s — %s" % (r["id"], (r.get("title") or "")[:70]) for r in named]
         + (["  (and %d more — helm decide list)" % extra] if extra else [])
-        + ["reply with a card id and your pick"])
+        + ["answer them on the work tab at your computer; a reply to this "
+           "push records no verdict yet"])
     if not notify.owner_push(body, title="helm decisions waiting",
                              receipt=("decide.flush_failed", "backlog")):
         return False, "owner push FAILED — the backlog stays armed for the next pass"
@@ -700,9 +768,18 @@ def _announce_filed(row):
     try:
         from . import chat
         opts = "/".join(o["label"] for o in row["options"])
-        chat.post("[decision %s] pending owner: %s (%s) — filed by %s; "
+        # A REVISION IS ONE LINE TOO, and it says which rev and whether it
+        # answers the owner, because "revised" alone reads the same whether
+        # he asked for it or the asker changed its mind.
+        head = ("revised to rev %d%s" % (
+            card_rev(row) or 1, " after the owner's comment"
+            if row.get("answering_comment_ts") else "")
+            if (card_rev(row) or 1) > 1 else "pending owner")
+        chat.post("[decision %s] %s: %s (%s) — %s by %s; "
                   "%s; review on helm web or `helm decide show %s`"
-                  % (row["id"], row["title"], opts, row["asker"],
+                  % (row["id"], head, row["title"], opts,
+                     "revised" if head != "pending owner" else "filed",
+                     row["asker"],
                      "pushed to his phone" if reached
                      else "NOT PUSHED — " + str(note), row["id"]),
                   who=row["asker"])
@@ -726,8 +803,13 @@ def _pick_option(row, choice):
     return None
 
 
-def decide(rid, choice, comment="", by=None):
+def decide(rid, choice, comment="", by=None, rev=None):
     """The owner's RULING -> (row, err): verdict recorded, status 'decided'.
+
+    `rev` is the revision the ruling was made on: the one the owner's page
+    drew. A card that has moved since is refused with a StaleRev naming its
+    current rev, and nothing is recorded; None means rev 1, the card as filed
+    (see REVISIONS above). The verdict records the rev it ruled on.
 
     Deliberately NOT the closer — deliver_verdict is, the same split done/
     reported already took: a ruling the asker never heard is open fleet debt.
@@ -760,6 +842,21 @@ def decide(rid, choice, comment="", by=None):
             return None, ("card %s already decided (%s) — the ruling stands; "
                           "comment on it or file a new card"
                           % (rid, v.get("label") or v.get("choice")))
+        current = card_rev(r)
+        if current is None:
+            return None, ("card %s carries an unreadable revision number (%r) "
+                          "— no verdict can say which text it approves, so "
+                          "none is recorded" % (rid, r.get("rev")))
+        seen = 1 if rev is None else rev
+        if seen != current:
+            return None, StaleRev(
+                "card %s changed since you read it: you ruled on rev %s, and "
+                "it now reads rev %d%s; reload the queue and read rev %d "
+                "before you rule. Nothing was recorded"
+                % (rid, seen, current,
+                   " (revised after your comment)"
+                   if r.get("answering_comment_ts") else "", current),
+                current)
         opt = _pick_option(r, choice)
         if not opt:
             return None, ("choice %r matches no option on card %s — one of: %s"
@@ -770,7 +867,8 @@ def decide(rid, choice, comment="", by=None):
         row["verdict"] = {"choice": opt["key"], "label": opt["label"],
                           "consequence": opt["consequence"],
                           "comment": str(comment or "").strip(),
-                          "by": author, "door": door, "ts": pk.now_ts()}
+                          "by": author, "door": door, "ts": pk.now_ts(),
+                          "rev": current}
         row["status"] = "decided"
         row["last_updated"] = row["verdict"]["ts"]
         if not eventledger.append_unlocked(path, row):
@@ -791,9 +889,15 @@ def _verdict_author(row):
 def _verdict_text(row):
     v = row.get("verdict") or {}
     author = _verdict_author(row)
-    out = ("[decision %s] verdict%s on %r: %s — %s"
+    # THE REV RIDES THE DM once a card has been revised, so the asker knows
+    # which body the ruling approved (rev 1 stays silent, as before).
+    ruled = v.get("rev")
+    out = ("[decision %s] verdict%s on %r%s: %s — %s"
            % (row["id"], (" by %s" % author) if author else "",
-              row.get("title"), v.get("label"), v.get("consequence")))
+              row.get("title"),
+              (" (rev %s)" % ruled) if isinstance(ruled, int)
+              and not isinstance(ruled, bool) and ruled > 1 else "",
+              v.get("label"), v.get("consequence")))
     if v.get("comment"):
         out += ". " + v["comment"]
     # the pull-depth pointer: the DM is ATTENTION, the ledger is AVAILABILITY
@@ -971,8 +1075,11 @@ def comment_decision(rid, text, by=None):
         if not r:
             return None, "no such decision card: %s (helm decide list)" % rid
         row = dict(r)
+        # THE REV THE CARD READ WHEN THIS WAS SAID, so a revision can name the
+        # owner comment it answers without comparing clocks (goal-ledger L1).
         row["comments"] = list(r.get("comments") or []) + [
-            {"ts": pk.now_ts(), "text": text, "by": by, "door": door}]
+            {"ts": pk.now_ts(), "text": text, "by": by, "door": door,
+             "rev": card_rev(r)}]
         row["last_updated"] = row["comments"][-1]["ts"]
         if not eventledger.append_unlocked(path, row):
             return None, "ledger unwritable (%s) — comment NOT recorded" % path
@@ -990,6 +1097,187 @@ def comment_decision(rid, text, by=None):
         return row, None
     except Exception as e:                           # noqa: BLE001 — advisory
         return row, "comment recorded; DM to %s failed: %s" % (row["asker"], e)
+
+
+REVISE_DOOR = ("the ASKER revises its own card; the owner says \"not yet\" with "
+               "a comment, and another seat adds to the card with `helm "
+               "decide comment <id> <text>`")
+
+
+def revise_decision(rid, context, options, title=None, rev=None, by=None,
+                    refs=None):
+    """The asker's REVISION of its own open card -> (row, problem).
+
+    row=None means NOTHING WAS RECORDED and problem says why. row set with
+    problem set means the revision landed and a best-effort side surface (the
+    phone push or the room line) did not — advisory, like `file_decision`.
+
+    SAME CARD, NEXT REV (see REVISIONS above). The body it replaces goes onto
+    `revisions` exactly as it read, the comment thread is kept, and the
+    revision names the owner comment it answers: the newest one he made on
+    the rev being replaced, or None. `rev`, when given, is the rev the reviser
+    read; a card that has moved since is refused, the way a stale verdict is.
+
+    WHO: the card's ASKER, resolved through the identity layer exactly as a
+    seat's comment is (`by` omitted); an OwnerDoor or any caller-stated
+    string is refused. ONLY AN OPEN CARD: a decided card is never re-ruled,
+    so a changed scope after a verdict is a new card. A body identical to the
+    current one is refused, because a rev bump that changes nothing would
+    still turn the owner's page stale under him.
+
+    THE OWNER IS TOLD AGAIN. `owner_pushed_ts` is cleared on the revised row
+    and set again only by a push that left the box, so a revision nobody
+    delivered is carried by the next card's push like any unreached card.
+
+    `refs`, when given, REPLACES the card's refs (a goal card names the
+    criteria version its body carries, `goal-criteria:v<N>`, so a revision
+    that carries the next version re-points them); omitted, they are kept.
+    The replaced refs ride the replaced body on `revisions`. Refs are where
+    the card points, not what he reads, so they never count as a change on
+    their own: the unchanged-body refusal compares the body only."""
+    if isinstance(by, OwnerDoor):
+        return None, ("refusing to revise card %s through the owner's door: "
+                      "%s" % (rid, REVISE_DOOR))
+    author, _who, _door, err = _author(by, "revise a decision card")
+    if err:
+        return None, "%s. %s." % (err.rstrip(". "), REVISE_DOOR)
+    if not str(context or "").strip():
+        return None, "a revised card needs its context paragraph"
+    options = list(options or default_options())
+    from . import seats
+    path = decisions_path()
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "ledger unwritable (%s) — revision NOT recorded" % path
+        current, unavailable = eventledger.latest_checked(path)
+        if unavailable:
+            return None, "decision ledger unavailable: %s" % unavailable
+        r = current.get(str(rid or ""))
+        if not r:
+            return None, "no such decision card: %s (helm decide list)" % rid
+        if not seats.recipient_matches(author, r.get("asker")):
+            return None, ("card %s answers to %s, and only its asker "
+                          "revises it; you are %s. %s"
+                          % (rid, r.get("asker"), author, REVISE_DOOR))
+        if r.get("status") != "open":
+            return None, ("card %s is already %s — a decided card is never "
+                          "revised; a changed scope is a new card (helm decide "
+                          "file)" % (rid, r.get("status")))
+        now_rev = card_rev(r)
+        if now_rev is None:
+            return None, ("card %s carries an unreadable revision number (%r) "
+                          "— nothing was recorded" % (rid, r.get("rev")))
+        if rev is not None and rev != now_rev:
+            return None, ("card %s changed since you read it: you revised rev "
+                          "%s, and it now reads rev %d; read it again (helm "
+                          "decide show %s). Nothing was recorded"
+                          % (rid, rev, now_rev, rid))
+        new_title = " ".join(str(title or "").split()) or r.get("title")
+        new_context = str(context).strip()
+        if (new_title, new_context, options) == (
+                r.get("title"), str(r.get("context") or "").strip(),
+                list(r.get("options") or [])):
+            return None, ("nothing changed: the revision matches rev %d "
+                          "word for word — nothing was recorded" % now_rev)
+        said = _owner_comments_on(r, now_rev)
+        ts = pk.now_ts()
+        row = dict(r)
+        row["revisions"] = list(r.get("revisions") or []) + [{
+            "rev": now_rev, "ts": r.get("rev_ts") or r.get("ts"),
+            "title": r.get("title"), "context": r.get("context"),
+            "options": list(r.get("options") or []),
+            "refs": list(r.get("refs") or []),
+            "answering_comment_ts": r.get("answering_comment_ts")}]
+        row.update(rev=now_rev + 1, rev_ts=ts, title=new_title,
+                   context=new_context, options=options,
+                   answering_comment_ts=said[-1]["ts"] if said else None,
+                   owner_pushed_ts=None, last_updated=ts)
+        if refs is not None:
+            row["refs"] = [str(x).strip() for x in refs if str(x).strip()]
+        if not eventledger.append_unlocked(path, row):
+            return None, "ledger unwritable (%s) — revision NOT recorded" % path
+    pk.event("decide-revise", str(rid), "rev %d" % row["rev"])
+    return row, _announce_filed(row)
+
+
+CUSTODY_DOOR = ("a card's asker moves only with the goal it carries: the goal "
+                "ledger moves it when the goal's accountable seat changes "
+                "(helm/goals.py `follow_custody`)")
+
+
+def move_asker(rid, to, door=None, goal=None):
+    """CUSTODY OF A GOAL'S OPEN CARD FOLLOWS THE GOAL -> (row, err).
+
+    The asker is a card's return address AND the one seat that may revise
+    it (`revise_decision`). A goal's criteria card is filed with the goal's
+    accountable seat as its asker, so when that seat changes (a seat
+    reassignment, a takeover, any door that changes the task row's owner)
+    the card must answer to the new seat, or nobody holding the goal can
+    revise it and his verdict is DM'd to a seat that no longer holds it.
+    This is that move, and nothing else moves an asker:
+
+      * ONLY THROUGH THE GOAL LEDGER'S CUSTODY DOOR: `door` is the GoalDoor
+        helm.goals mints for "custody". Anything else is refused, so no
+        caller re-points a card's verdict by passing a name.
+      * ONLY FOR A CARD THAT NAMES THE GOAL (`goal`, a task id) in its refs.
+      * ONLY ONTO A DELIVERABLE SEAT that is not one of the owner's names,
+        the address law `file_decision` applies at filing.
+      * ONLY WHILE OPEN. A decided card's verdict belongs to the seat that
+        asked, and the card is left exactly as it is.
+
+    The move is recorded on the card (`custody`: from, to, goal, ts) and
+    changes nothing he reads: no rev, no push, so his page stays current. A
+    card already answering to `to` comes back unwritten. row=None means
+    nothing was recorded, and err says why."""
+    from . import goals, seats
+    if not isinstance(door, goals.GoalDoor) or door.act != "custody":
+        return None, ("refusing to move card %s's asker: %s"
+                      % (rid, CUSTODY_DOOR))
+    goal = str(goal or "").strip()
+    if not goal:
+        return None, ("a card's custody follows a goal: name the goal's task "
+                      "id. Nothing was recorded")
+    to = str(to or "").strip().lstrip("@")
+    _canon, aerr = seats._canonical_recipient(to)
+    if aerr:
+        return None, ("asker %r is not a deliverable seat address — %s. "
+                      "Nothing was recorded" % (to, aerr))
+    if is_owner(to):
+        return None, ("asker %r is one of the owner's own names: the asker is "
+                      "the SEAT his verdict returns to. Nothing was recorded"
+                      % to)
+    path = decisions_path()
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "ledger unwritable (%s) — custody NOT moved" % path
+        current, unavailable = eventledger.latest_checked(path)
+        if unavailable:
+            return None, "decision ledger unavailable: %s" % unavailable
+        r = current.get(str(rid or ""))
+        if not r:
+            return None, "no such decision card: %s (helm decide list)" % rid
+        if goal not in [str(x) for x in r.get("refs") or []]:
+            return None, ("card %s does not carry %s (its refs: %s), so its "
+                          "asker does not follow that goal. Nothing was "
+                          "recorded" % (rid, goal, ", ".join(
+                              str(x) for x in r.get("refs") or []) or "none"))
+        if r.get("status") != "open":
+            return None, ("card %s is already %s — a decided card keeps the "
+                          "asker its verdict belongs to (%s). Nothing was "
+                          "recorded" % (rid, r.get("status"), r.get("asker")))
+        if seats.recipient_matches(r.get("asker"), to):
+            return r, None
+        ts = pk.now_ts()
+        row = dict(r)
+        row["custody"] = list(r.get("custody") or []) + [
+            {"from": r.get("asker"), "to": to, "goal": goal, "ts": ts}]
+        row["asker"] = to
+        row["last_updated"] = ts
+        if not eventledger.append_unlocked(path, row):
+            return None, "ledger unwritable (%s) — custody NOT moved" % path
+    pk.event("decide-custody", str(rid), "%s -> %s (%s)" % (
+        row["custody"][-1]["from"], to, goal))
+    return row, None
 
 
 def open_decisions():
@@ -1105,8 +1393,13 @@ def _advise_owner(text):
         pass
 
 
-def _clarity_refusal(text):
+def _clarity_refusal(text, skip=(), surface="asks"):
     """The ERROR-severity clarity finding that must stop a write -> str|None.
+
+    `skip` names rules a caller's text is exempt from BY KIND, and `surface`
+    is the silence switch it answers to. The goal door (helm/goals.py) passes
+    `skip=("provenance",)`: a criterion is a target the owner approves, so
+    its number is the bar, not a claim that owes a MEASURED tier.
 
     Separate from `_advise_owner` on purpose. That one is the SHARED advisory
     (board.py and fleetnotes.py call the same primitive) and its law is that it
@@ -1123,10 +1416,10 @@ def _clarity_refusal(text):
     try:
         from .clarity import _advise_silenced, check_text
         if not isinstance(text, str) or not text.strip() \
-                or _advise_silenced("asks"):
+                or _advise_silenced(surface):
             return None
         for f in check_text(text, mode="owner", lexicon={}) or []:
-            if f.get("severity") == "error":
+            if f.get("severity") == "error" and f.get("rule") not in skip:
                 return str(f.get("message") or "").strip() or None
     except Exception:                    # noqa: BLE001 — fail-open by law
         return None
@@ -1291,7 +1584,14 @@ DECIDE_USAGE = """usage: helm decide file <title...> [--asker SEAT] [--ref R]...
        helm decide verdict <id> <choice> [--comment TEXT...]
        helm decide deliver <id>
        helm decide comment <id> <text...>
+       helm decide revise <id> [--rev N] [<new title...>]
        helm decide board-sync
+  `revise` is the ASKER's answer to a comment: the new body on stdin, in
+  `file`'s grammar, replaces the card's body IN PLACE as the next rev (the
+  old body and the comment thread are kept, the owner's phone is pushed
+  again); only an open card, only its asker; `--rev` names the rev you read
+  and refuses if the card has moved. A verdict names the rev the owner's
+  page drew, and one on an older rev is refused.
   `file` reads the CARD BODY on stdin (quoted heredoc): a phone-readable
   context paragraph, then option lines `* <label> :: <one-line consequence>`
   (`*!` marks the recommended one; no option lines = an approve/reject card):
@@ -1325,8 +1625,14 @@ def _pop_valued(rest, flag):
 
 def _print_card(r):
     v, extra = r.get("verdict") or {}, ""
+    rev = card_rev(r)
+    if rev != 1:
+        extra += "  [rev %s%s]" % (
+            rev if rev is not None else "UNREADABLE",
+            ", after the owner's comment" if r.get("answering_comment_ts")
+            else "")
     if v:
-        extra = " -> %s" % (v.get("label") or v.get("choice"))
+        extra += " -> %s" % (v.get("label") or v.get("choice"))
     # AN OPEN CARD HE WAS NEVER PUSHED IS NOT WAITING ON HIM. It reads exactly
     # like one that is, so the list says which — otherwise the oldest row on
     # this queue looks like the owner ignoring us when nothing ever asked him.
@@ -1430,8 +1736,36 @@ def cmd_decide(args):
                      " (recommended)" if o.get("recommended") else "",
                      o.get("consequence")))
         for c in r.get("comments") or []:
-            print("  comment %s (%s): %s"
-                  % (c.get("ts"), c.get("by"), c.get("text")))
+            print("  comment %s (%s%s): %s"
+                  % (c.get("ts"), c.get("by"),
+                     (", on rev %s" % c["rev"]) if c.get("rev") else "",
+                     c.get("text")))
+        # WHO THE CARD ANSWERED TO, AND WHEN THAT CHANGED: a goal card's asker
+        # follows the goal (`move_asker`), so a verdict's return address is
+        # read here with its history.
+        for m in r.get("custody") or []:
+            if isinstance(m, dict):
+                print("  asker moved %s: %s -> %s (goal %s)"
+                      % (m.get("ts"), m.get("from"), m.get("to"),
+                         m.get("goal")))
+        # EVERY BODY THE CARD HAS REPLACED, oldest first, whole: the owner's
+        # comment answered one of these, and a reader must be able to see
+        # what it answered.
+        for p in r.get("revisions") or []:
+            if not isinstance(p, dict):
+                continue
+            print("  was rev %s (%s)%s: %s"
+                  % (p.get("rev"), p.get("ts"),
+                     " — answering the owner's comment of %s"
+                     % p["answering_comment_ts"]
+                     if p.get("answering_comment_ts") else "",
+                     p.get("title")))
+            print("    " + str(p.get("context") or "").replace("\n", "\n    "))
+            for o in p.get("options") or []:
+                print("    [%s] %s%s :: %s"
+                      % (o.get("key"), o.get("label"),
+                         " (recommended)" if o.get("recommended") else "",
+                         o.get("consequence")))
         v = r.get("verdict") or {}
         if v:
             print("  verdict %s (%s): %s%s"
@@ -1503,6 +1837,48 @@ def cmd_decide(args):
               % (rest[0], row["status"]))
         if problem:
             print("helm decide: " + problem, file=sys.stderr)
+        return 0
+    if verb == "revise":
+        if not rest or rest[0].startswith("-"):
+            print(DECIDE_USAGE, file=sys.stderr)
+            return 2
+        rid = rest.pop(0)
+        named = "--rev" in rest
+        raw_rev = _pop_valued(rest, "--rev")
+        rev = None
+        if named:
+            # isdecimal, not isdigit: "²" is a digit to isdigit and no
+            # number to int(), which was a traceback where rc 2 belongs
+            if not (raw_rev or "").isdecimal() or int(raw_rev) < 1:
+                print("helm decide: --rev takes the card's revision number "
+                      "(1, 2, ...), not %r" % raw_rev, file=sys.stderr)
+                return 2
+            rev = int(raw_rev)
+        title, rc = freetext.tail("helm decide", "revise", rest,
+                                  "the new card title")
+        if rc is not None:
+            return rc
+        body = "" if sys.stdin.isatty() else sys.stdin.read()
+        context, options, err = parse_card_body(body)
+        if err:
+            print("helm decide: " + err, file=sys.stderr)
+            return 2
+        row, problem = revise_decision(rid, context, options, title=title,
+                                       rev=rev)
+        if not row:
+            print("helm decide: " + problem, file=sys.stderr)
+            return 1
+        print("decision %s revised to rev %d: %s (%s)%s"
+              % (row["id"], row["rev"], row["title"],
+                 "/".join(o["label"] for o in row["options"]),
+                 " — answering the owner's comment of %s"
+                 % row["answering_comment_ts"]
+                 if row.get("answering_comment_ts") else ""))
+        if problem:
+            print("helm decide: " + problem, file=sys.stderr)
+        ok, berr = sync_board()
+        if not ok:
+            print("helm decide: board not synced — " + str(berr), file=sys.stderr)
         return 0
     if verb == "board-sync":
         ok, berr = sync_board()

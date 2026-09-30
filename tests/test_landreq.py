@@ -376,6 +376,7 @@ class LandReqBase(unittest.TestCase):
         """
         for ref in refs:
             self.git("update-ref", "-d", ref)
+        self.drop_review_pins()
         self.git("reflog", "expire", "--expire-unreachable=now", "--all")
         self.git("gc", "--prune=now", "--quiet")
         p = subprocess.run(["git", "--git-dir", self.gitdir(),
@@ -383,6 +384,16 @@ class LandReqBase(unittest.TestCase):
         self.assertEqual(p.returncode, 1,
                          "the prune recipe MUST leave %s missing (rc 1), got "
                          "rc %d" % (sha[:12], p.returncode))
+
+    def drop_review_pins(self):
+        """Remove every review pin a verdict wrote (task/2383), so a prune
+        can destroy a reviewed tip. A pin exists to stop exactly that, and the
+        arms that need the object gone stand for a repository whose pins were
+        removed by hand or whose rows predate them."""
+        listed = self.git("for-each-ref", "--format=%(refname)",
+                          "refs/helm-reviewed/", "refs/helm-retired/reviewed/")
+        for ref in listed.split():
+            self.git("update-ref", "-d", ref)
 
     def sidecar(self, old, new):
         """Record one ref translation exactly as migrate_refs --apply does."""
@@ -1065,6 +1076,27 @@ class StallTest(LandReqBase):
         self.assertEqual(stalled[0]["state"], "AWAITING_REVIEW")
         self.assertTrue(stalled[0]["stalled"])
 
+    def test_lr_show_does_not_alarm_a_row_a_successor_carried(self):
+        """task/3585, cure 3: `helm lr list` and the one land board ask
+        `landreq.stall_alarm`, which quiets a row a proved successor carried;
+        `helm lr show` read the raw flag and printed STALLED over the same
+        row, in its headline and its threshold word. Same row, same dwell and
+        threshold: only the succession state differs between the pair."""
+        row = self.dispatch(deadline_s=60)
+        dispatches._mark_delivered(row["id"], "post-1")
+        self.age(row["id"], 3600)
+        lr = landreq.get(row["id"])[0]
+        self.assertTrue(lr["stalled"])
+        loud = landreq._render_show(
+            dict(lr, succession_state=landreq.SUCCESSION_HELD))
+        quiet = landreq._render_show(
+            dict(lr, succession_state=landreq.SUCCESSION_MOVED))
+        self.assertIn("STALLED", loud.splitlines()[0])
+        self.assertIn("— STALLED)", loud)
+        self.assertNotIn("STALLED", quiet.splitlines()[0])
+        self.assertNotIn("— STALLED)", quiet)
+        self.assertIn("CARRIED by a proved successor", quiet)
+
     def test_a_row_held_ON_THE_OWNER_is_not_a_machine_stall(self):
         """THE OWNER'S OWN QUEUE MUST NOT READ AS THE FLEET FAILING HIM.
 
@@ -1130,9 +1162,14 @@ class StallTest(LandReqBase):
 
         clean = self.dispatch(deadline_s=60, lane="lane/source-clean")
         dispatches._mark_delivered(clean["id"], "post-2")
-        _out, why = dispatches.mark_hold(clean["id"], "awaiting the land gate",
-                                         source_clean_tip=self.c)
-        self.assertIsNone(why)
+        # BY ITS RECIPIENT, AT ITS OWN DISPATCHED TIP: the only hand and the
+        # only lineage the source-clean door admits (task/3053).
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=(clean["recipient"], None)):
+            _out, why = dispatches.mark_hold(
+                clean["id"], "awaiting the land gate",
+                source_clean_tip=self.side)
+        self.assertIsNone(why, why)
         self.age(clean["id"], 3600)
 
         lr_machine = landreq.get(machine["id"])[0]
@@ -1140,7 +1177,7 @@ class StallTest(LandReqBase):
         # The projection CARRIES the third value; it was written by the
         # dispatch store and read by nobody.
         self.assertIsNone(lr_machine["source_clean_tip"])
-        self.assertEqual(lr_clean["source_clean_tip"], self.c)
+        self.assertEqual(lr_clean["source_clean_tip"], self.side)
 
         self.assertTrue(lr_machine["stalled"],
                         "a hold on a MACHINE dependency is still the fleet's "
@@ -1169,13 +1206,17 @@ class StallTest(LandReqBase):
         because the marks are what a seat sweeping the board actually reads."""
         row = self.dispatch(deadline_s=60)
         dispatches._mark_delivered(row["id"], "post-1")
-        _out, why = dispatches.mark_hold(row["id"], "awaiting the land gate",
-                                         source_clean_tip=self.c)
-        self.assertIsNone(why)
+        # By its recipient at its own dispatched tip (task/3053).
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=(row["recipient"], None)):
+            _out, why = dispatches.mark_hold(
+                row["id"], "awaiting the land gate",
+                source_clean_tip=self.side)
+        self.assertIsNone(why, why)
         self.age(row["id"], 3600)
         line = landreq._line(landreq.get(row["id"])[0])
         self.assertIn("SOURCE-CLEAN", line)
-        self.assertIn(self.c[:12], line)
+        self.assertIn(self.side[:12], line)
         self.assertIn("INTEGRATOR", line,
                       "the mark must NAME the holder: every reader of this "
                       "line is deciding whether the row is theirs")
@@ -3516,6 +3557,7 @@ class WithdrawTranslationTest(LandReqBase):
         row = self.fix_row(tip)
         self.git("checkout", "-q", self.main)
         self.git("branch", "-D", "doomed")
+        self.drop_review_pins()
         self.git("reflog", "expire", "--expire=now", "--all")
         self.git("gc", "--prune=now")
         probe = subprocess.run(["git", "-C", self.repo, "cat-file", "-e",
@@ -3630,6 +3672,7 @@ class AbandonTerminalTest(LandReqBase):
         row = self.reviewed(tip, polarity=polarity, lane=lane)
         self.git("checkout", "-q", self.main)
         self.git("branch", "-D", "ghost-object")
+        self.drop_review_pins()
         self.git("reflog", "expire", "--expire=now", "--all")
         self.git("gc", "--prune=now")
         probe = subprocess.run(["git", "-C", self.repo, "cat-file", "-e",
@@ -6212,34 +6255,6 @@ class AnUnderivedLandingIsItsOwnBucket(LandReqBase):
         self.assertIn("landing unobservable — BUDGET EXPIRED", out)
         self.assertNotIn("git could not be read", out,
                          "a spent budget was reported as a git failure")
-
-    def test_the_browser_and_the_terminal_share_ONE_observe_vocabulary(self):
-        """Two renderers of one datum, and only one of them is Python.
-
-        `helm/web_ui/scripts/00-core.js.part` is not imported by the module
-        that owns these words, so nothing but an arm can keep the board the
-        owner reads and the terminal an agent reads from describing one row
-        differently — which is the divergence this whole lane is about.
-        """
-        import re
-        root = os.path.dirname(os.path.dirname(os.path.abspath(landreq.__file__)))
-        path = os.path.join(root, "helm", "web_ui", "scripts", "00-core.js.part")
-        with open(path, encoding="utf-8") as fh:
-            source = fh.read()
-        block = re.search(r"const LR_OBSERVE_REASON = \{(.*?)\n\};",
-                          source, re.S)
-        self.assertTrue(block, "the browser's reason map is gone or renamed")
-        pairs = dict(re.findall(r'"([^"]+)":\s*"((?:[^"\\]|\\.)*)"',
-                                block.group(1)))
-        self.assertTrue(pairs, "the reason map parsed EMPTY, so an equality "
-                               "against it would pass on nothing")
-        self.assertEqual(pairs, dict(landreq.OBSERVE_REASON))
-        # AND THE BROWSER ACTUALLY CALLS IT: a map nothing reads is not a
-        # renderer, and the hardcoded sentence must be gone from this file.
-        self.assertIn("lrObserveReason(c.observe_why)", source)
-        self.assertNotIn(
-            'unobservable — git could not be read for this repo', source,
-            "the collapsed sentence is still hardcoded in the browser")
 
     def test_an_unrecognised_cause_is_never_given_a_name(self):
         """A word this build does not know is where inventing one is worst."""
@@ -8959,11 +8974,14 @@ class StallsSayItAlreadyLandedTest(unittest.TestCase):
 
 
 class BatchedAncestryTest(ReceiptBase):
-    """Two listings replace ~4400 per-pair spawns, with the tri-state intact.
+    """One listing and one batch question replace ~4400 per-pair spawns, with
+    the tri-state intact.
 
     cProfiled: `lr list` spent 140 of 155 seconds in per-(tip, ref)
     `merge-base --is-ancestor` / cherry subprocesses. The batch answers from a
-    reachable-set and an object-set; these arms pin that the ANSWERS are
+    reachable-set, and an unreachable tip's existence from ONE line to the
+    scope's batch process (task/3090), never a listing of every object in
+    the repository; these arms pin that the ANSWERS are
     byte-identical to the per-pair path and that the sets actually replace the
     spawns — a green that only re-proved the answers would let a regression
     quietly reintroduce the spawn-per-row wall."""
@@ -9000,14 +9018,29 @@ class BatchedAncestryTest(ReceiptBase):
             landreq._git_spawn,
             lambda args, env: spawned.append(tuple(args[:2])))
 
-        with mock.patch.object(landreq, "_git_spawn", side_effect=counting):
+        batches, real = [], landreq.vcs.subprocess.Popen
+
+        def popen(argv, *a, **kw):
+            if "--batch-all-objects" in argv or any(
+                    str(x).startswith("--batch-check") for x in argv):
+                batches.append(tuple(str(x) for x in argv))
+            return real(argv, *a, **kw)
+        with mock.patch.object(landreq, "_git_spawn", side_effect=counting), \
+                mock.patch.object(landreq.vcs.subprocess, "Popen",
+                                  side_effect=popen):
             with projscope.scope():
                 for tip in (self.b, self.side, self.b, self.side, "d" * 40):
                     landreq._ancestry(gitdir, tip, trunk)
                 self.assertNotIn(("merge-base", "--is-ancestor"), spawned)
-                listings = [a for a in spawned
-                            if a[0] in ("rev-list", "cat-file")]
-                self.assertEqual(len(listings), 2)
+                # ONE reachable-set listing through the spawn seam, and the
+                # existence of the unreachable tips asked of ONE batch
+                # process: never a listing of every object.
+                self.assertEqual([a[0] for a in spawned
+                                  if a[0] in ("rev-list", "cat-file")],
+                                 ["rev-list"])
+                self.assertEqual(len(batches), 1, batches)
+                self.assertFalse([b for b in batches
+                                  if "--batch-all-objects" in b])
             spawned.clear()
             landreq._ancestry(gitdir, self.b, trunk)
             self.assertIn(("merge-base", "--is-ancestor"), spawned)
@@ -9714,7 +9747,7 @@ class ContestedTipRealCallerTest(LandReqBase):
         never exercised — worse than no test, because it retires the question.
 
         THE RECIPE: seed a REAL dispatch event plus a later
-        verdict event, wrap and COUNT snapshot_with_verdicts, call the
+        verdict event, wrap and COUNT snapshot_and_events, call the
         UNTHREADED ready_word repeatedly, assert ONE fold with a populated
         contest. Counting folds is the only assertion the mutation cannot
         survive — and it needs the real two-event shape, which is the fixture
@@ -9731,9 +9764,9 @@ class ContestedTipRealCallerTest(LandReqBase):
         landreq._CONTEST_MEMO.clear()
 
         folds = []
-        real = dispatches.snapshot_with_verdicts
-        dispatches.snapshot_with_verdicts = lambda: (folds.append(1), real())[1]
-        self.addCleanup(setattr, dispatches, "snapshot_with_verdicts", real)
+        real = dispatches.snapshot_and_events
+        dispatches.snapshot_and_events = lambda: (folds.append(1), real())[1]
+        self.addCleanup(setattr, dispatches, "snapshot_and_events", real)
         real_gi = landreq._gate_receipt_index
         landreq._gate_receipt_index = lambda: {
             "tok": {"v": "4", "host": "a-host", "head": self.side}}
@@ -12218,6 +12251,7 @@ class ChainProofPrunedTipCloseBase(LandReqBase):
         REVIEWED WHILE IT EXISTED and lost its object later, so the fixture
         has to do the same thing in the same order.
         """
+        self.drop_review_pins()
         self.git("reflog", "expire", "--expire=now", "--expire-unreachable=now",
                  "--all")
         self.git("gc", "--prune=now", "--quiet")

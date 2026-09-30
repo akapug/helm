@@ -29,7 +29,7 @@ import math
 import os
 import time
 
-from . import chat, home, pk
+from . import chat, home, pk, procid
 from .seats_common import (DEFAULT_TTL, STATUS_BYTES, _claim_flocked,
                            UnresolvedRepo, _unresolved_repo_refusal,
                            CLAIM_LOCK_WAIT_S, _clip, _now_mono,
@@ -49,7 +49,7 @@ def _flock_holder(path, proc_dir="/proc"):
     the HOLDER. A running peer finishes; a STOPPED one never does, and no
     lease TTL rescues it, because a TTL governs the lease RECORD while a
     flock governs FILE ACCESS one layer below it. /proc/locks names the
-    holder by inode, which is the only fact that separates the two.
+    holder by device and inode, which is the only fact that separates the two.
 
     THE PID NAMES AN OPEN FILE DESCRIPTION, NOT A CULPRIT. An flock is held
     by the fd, and processes that inherit that fd across fork() share ONE
@@ -61,30 +61,30 @@ def _flock_holder(path, proc_dir="/proc"):
     ancestry would be OUR GUESS wearing a measurement's clothes. Report the
     recorded holder; let the reader walk the tree. (A review of the lane
     that added this.)
+
+    THE INODE ALONE NAMES THE WRONG FILE. /proc/locks writes the locked
+    file's device as hex major:minor before the decimal inode, and the old
+    read matched the inode only — so a FLOCK on another filesystem with the
+    same inode number named ITS process as this lock's holder, a wrong pid
+    in a refusal an operator acts on. The match is now (dev, ino), from
+    procid.locks; a BLOCKED WAITER (the line's extra '->') is a process
+    queued behind the holder, so its pid never names the holder either.
     """
     try:
-        ino = os.stat(path).st_ino
+        st = os.stat(path)
     except OSError:
         return None
     me = os.getpid()
-    try:
-        with open(os.path.join(proc_dir, "locks")) as f:
-            for line in f:
-                col = line.split()
-                if len(col) < 6 or col[1] != "FLOCK":
-                    continue
-                if col[5].rpartition(":")[2] != str(ino):
-                    continue
-                try:
-                    pid = int(col[4])
-                except ValueError:
-                    continue
-                if pid == me:
-                    continue
-                link = _proc_stat_link(pid, proc_dir=proc_dir, with_state=True)
-                return pid, (link[2] if link else None)
-    except OSError:
+    rows = procid.locks(os.path.join(proc_dir, "locks"))
+    if rows is None:
         return None
+    for row in rows:
+        if (row["kind"] != "FLOCK" or row["waiter"]
+                or (row["dev"], row["ino"]) != (st.st_dev, st.st_ino)
+                or row["pid"] == me):
+            continue
+        link = _proc_stat_link(row["pid"], proc_dir=proc_dir, with_state=True)
+        return row["pid"], (link[2] if link else None)
     return None
 # The holder's /proc state as the refusal names it; R, S or I is RUNNING.
 _HOLDER_STATES = {"T": "STOPPED", "t": "STOPPED", "D": "UNINTERRUPTIBLE",
@@ -142,8 +142,8 @@ def _unique_json_object(pairs):
         out[key] = value
     return out
 def _claims_read(strict=False):
-    if not strict:
-        return pk.read_json(claims_path(), {}) or {}
+    # EVERY READ IS STRICT, `strict` or not (task/3643): each caller writes back
+    # what it read, so a lenient {} would be written over an unparsable file.
     try:
         path = claims_path()
     except Exception as exc:
@@ -220,7 +220,7 @@ def claim(resource, seat, ttl=DEFAULT_TTL, lease=None, session=None,
     monotonic (tmpfs state dies with the boot; wall time only displays).
     Check+sweep+write hold one flock, taken with a bounded wait; a lock that
     stays unavailable is refused, naming its holder. `strict=True` is the
-    serializer seam: it raises that refusal and reads the ledger strictly.
+    serializer seam: it raises that refusal. An unreadable ledger raises.
     `repo` records the grant's provenance; None means UNKNOWN, never a match.
     See `seats_common.UnresolvedRepo` for the rationale and extend-versus-fresh."""
     chat._ensure_dir()
@@ -319,7 +319,7 @@ def rebind_claim_sessions(seat, old_session, new_session):
     Returns the exact resource keys moved, which scopes a registration rollback.
     Every grant byte except `session` is preserved: nonce, fence, expiry, holder
     and timestamp do not become a fresh lease merely because its process resumed.
-    A claims lock that stays unavailable raises OSError naming its holder.
+    An unavailable claims lock (named) or unreadable ledger raises OSError.
     """
     old, new = str(old_session or ""), str(new_session or "")
     if not seat or not old or not new or old == new:
@@ -327,7 +327,7 @@ def rebind_claim_sessions(seat, old_session, new_session):
     with _claim_flocked(create_dir=True) as lock:
         if lock.f is None:
             raise OSError(_lock_unavailable())
-        c = _sweep(pk.read_json(claims_path(), {}) or {})
+        c = _sweep(_claims_read(True))
         moved = []
         for resource, row in list(c.items()):
             if resource == "_fence" or not isinstance(row, dict):
@@ -351,7 +351,7 @@ def rollback_claim_sessions(seat, old_session, new_session, resources):
     with _claim_flocked(create_dir=True) as lock:
         if lock.f is None:
             raise OSError(_lock_unavailable())
-        c = _sweep(pk.read_json(claims_path(), {}) or {})
+        c = _sweep(_claims_read(True))
         rolled = []
         for resource in wanted:
             row = c.get(resource)
@@ -378,7 +378,7 @@ def rollback_claim_holder(source, target, manifest):
     return seats_claim_moves.rollback_claim_holder(source, target, manifest)
 
 
-def release(resource, seat, lease=None, session=None, strict=False):
+def release(resource, seat, lease=None, session=None, strict=False, held=None):
     """(ok, message). Release demands the SAME composite binding as extend —
     {lease token, holding seat, session-if-recorded}. A stale holder whose
     lease expired-and-was-regranted fails on the fresh nonce (ABA), and a
@@ -386,8 +386,8 @@ def release(resource, seat, lease=None, session=None, strict=False):
     token is a deliberate-holder proof, never a secret — see `_binding_ok` and
     `own_leases`. It waits boundedly through contention and never releases
     without exclusion, so a refusal leaves the lease intact; `strict=True`
-    raises that refusal."""
-    with _claim_flocked(create_dir=not strict) as lock:
+    raises that refusal. `held`: the lock a caller's section already holds."""
+    with held or _claim_flocked(create_dir=not strict) as lock:
         if lock.f is None:
             refusal = _lock_unavailable()
             if strict:
@@ -770,7 +770,7 @@ def claim_holder_liveness(holder, session=None, snap=None):
         pass
 
     return "unknown", "no session recorded; cannot prove liveness"
-def release_stale(resource, seat, session=None):
+def release_stale(resource, seat, session=None, held=None):
     """Release a claim whose holder is demonstrably dead.
 
     Returns (ok, message). Only releases when `claim_holder_liveness`
@@ -789,9 +789,9 @@ def release_stale(resource, seat, session=None):
     the only mint for a `StaleReleaseProof` and it refuses anything but a
     verdict of exactly "stale". "unknown" is MISSING EVIDENCE, not evidence of
     death, and the refusal now lives in the mint rather than in each of the
-    three callers that used to re-derive it."""
+    three callers that each re-derived it. `held`: as in `release`."""
     chat._ensure_dir()
-    with _claim_flocked() as lock:
+    with held or _claim_flocked() as lock:
         if lock.f is None:
             return False, _lock_unavailable()
         c = _sweep(_claims_read(True))
@@ -925,8 +925,8 @@ def claims_list(gc=True, swept=None):
     if gc and len(c) != len(raw):  # sweep only ever drops rows
         # ONE TAKE, NO WAIT: every writer persists its own sweep, so a skipped
         # tidy loses nothing, and a reader must not stall behind a stopped holder.
-        with _claim_flocked(wait=0) as lock:
-            if lock.f is not None:
+        with _claim_flocked(wait=0) as lock:    # never tidies a malformed file
+            if lock.f is not None and claims_unavailable() is None:
                 raw = pk.read_json(claims_path(), {}) or {}
                 c = _sweep(raw)
                 if len(c) != len(raw):

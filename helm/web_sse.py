@@ -68,19 +68,21 @@ def _sse_state():
 
 
 
-_CHAT_NAMES = {}          # base dir -> (dir mtime_ns, read_at, [.jsonl names])
+_CHAT_NAMES = {}          # base dir -> (stamp, read_at, [.jsonl names])
 
 # THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
 # data a test unit leaves behind; these names are process-wide by design.
 _GATESLICE_MUTABLE = {
-    "_CHAT_NAMES": "room names per base dir, checked against the dir's mtime",
+    "_CHAT_NAMES": "room names per base dir, checked against the room "
+                   "generation (top) or the dir's mtime (dm/)",
 }
 _NAMES_MAX_AGE_S = 30.0   # the backstop below; NOT the freshness mechanism
 
 
-def _log_names(base):
-    """The `.jsonl` names in `base`, re-listed only when the DIRECTORY moves.
-    -> [names], or None when the dir cannot be read.
+def _log_names(base, stamp=None):
+    """The `.jsonl` names in `base`, re-listed only when `stamp` moves.
+    -> [names], or None when the dir cannot be read. `stamp` None keys the
+    cache on the directory's own mtime.
 
     THE LISTING IS THE COST AND ALMOST NONE OF IT IS USEFUL. Measured live
     2026-08-06 on /dev/shm/helm-chat: 8318 entries at the top, of which 103
@@ -88,31 +90,37 @@ def _log_names(base):
     this single listdir. The rest — cursors, locks, stopwhisper state — is
     enumerated four times a second to be discarded four times a second.
 
-    A DIRECTORY'S OWN mtime IS THE EXACT SIGNAL, not a heuristic: it moves
-    when an entry is created, deleted or renamed, and does NOT move when an
-    existing file is appended. Appends are precisely what the per-file stats
-    below already catch, so caching the NAME list across ticks loses nothing
-    — a new room or DM lane bumps the dir and the very next tick re-lists.
+    THE TOP DIR'S mtime IS NOT THE SIGNAL, AND task/3519 MEASURED WHY. It
+    moves on every create, delete or rename, and the per-session state beside
+    the logs is created and replaced several times a second, so the cache
+    missed on nearly every 250ms tick: 34,058 entries for 305 logs, about 35%
+    of a core while a console was open. The top is keyed on
+    `chat.rooms_generation()` instead, which only a room log's CREATE moves.
+    `dm/` holds DM lanes and nothing else, so its own mtime stays exact there.
+    Appends are what the per-file stats below catch, so caching the NAME
+    list across ticks loses nothing.
 
-    THE AGE BACKSTOP IS FOR THE ONE CASE mtime CANNOT COVER, and it is a
-    containment bound rather than the mechanism: if a create ever landed
-    inside the same mtime_ns as the read that cached the list, that room's
-    appends would be invisible until the NEXT directory change, which could
-    be never. 30s caps that at 30s instead of forever, and still cuts the
-    listing rate by ~120x against a 250ms tick."""
+    THE AGE BACKSTOP IS FOR WHAT THE STAMP CANNOT COVER, and it is a
+    containment bound rather than the mechanism: a log created by a writer
+    running older code (no generation bump), or a create inside the same
+    mtime_ns as the read that cached the list. 30s caps that at 30s instead
+    of forever, and still cuts the listing rate by ~120x against a 250ms
+    tick."""
     try:
         dst = os.stat(base)
     except OSError:
         return None
+    if stamp is None:
+        stamp = dst.st_mtime_ns
     hit = _CHAT_NAMES.get(base)
-    if hit is not None and hit[0] == dst.st_mtime_ns \
+    if hit is not None and hit[0] == stamp \
             and (time.time() - hit[1]) < _NAMES_MAX_AGE_S:
         return hit[2]
     try:
         names = [n for n in os.listdir(base) if n.endswith(".jsonl")]
     except OSError:
         return None
-    _CHAT_NAMES[base] = (dst.st_mtime_ns, time.time(), names)
+    _CHAT_NAMES[base] = (stamp, time.time(), names)
     return names
 
 
@@ -131,8 +139,11 @@ def _chat_fingerprint():
     except OSError:
         return None
     fp, seen = 0, False
-    for base in (d, os.path.join(d, "dm")):
-        names = _log_names(base)
+    # the token is read BEFORE the listing it keys: a log created between
+    # the two is listed now and re-listed once more, never missed
+    for base, stamp in ((d, chat.rooms_generation()),
+                        (os.path.join(d, "dm"), None)):
+        names = _log_names(base, stamp)
         if names is None:
             continue
         seen = True

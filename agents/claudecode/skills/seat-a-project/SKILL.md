@@ -126,9 +126,15 @@ whose session, claims and rows the verb proves and the hand does not.
 ## 4. Spawn the codex pair partner
 
 ```
-helm seat spawn <project>-codex --cwd <git checkout> --model gpt-5.6-sol --role worker --print
-helm seat spawn <project>-codex --cwd <git checkout> --model gpt-5.6-sol --role worker
+helm seat spawn <project>-codex --cwd <git checkout> --role worker --print
+helm seat spawn <project>-codex --cwd <git checkout> --role worker
 ```
+
+Pass no `--model`: every codex seat runs the family model, `gpt-6.1-sol`;
+`gpt-6-sol` remains the second probe and a manual rollback target, not an
+automatic fallback. An explicit `--model` is
+sticky across relaunches, so a pinned seat would keep an old model after the
+next catalog change.
 
 `--cwd` must be an Orca workspace path or Orca adopts the pane into whatever
 workspace contains it (a pane spawned in a non-repo parent folder landed in

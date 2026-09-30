@@ -48,6 +48,16 @@ On a readable result the run's evidence (counts, digests, schedule, leak
 census, per-module seconds) is written where HELM_GATESLICE_EVIDENCE names;
 the gate binds it into a receipt. The runner is a script, like gateshard, so
 no `helm` import precedes the suite's own bootstrap in `tests/__init__.py`.
+
+THE FOCUSED SCOPE. `--modules NAME...` runs the named test modules instead
+of the whole discovery, the way the serial focused command, `python -m
+unittest -v NAME...`, runs them: every worker loads EVERY named module, in
+the order named, through `loadTestsFromName` on the untouched default loader,
+so each worker holds the process state that one serial process builds. The
+inventory agreement, the ascending run order, the leak and data audits, the
+stall detector and the sweep are the whole-suite runner's own. The protocol
+is verbose, because the focused receipt reads WHICH modules reported tests
+off it (`gate._executed_modules`).
 """
 import collections
 import fcntl
@@ -58,6 +68,7 @@ import inspect
 import itertools
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -68,12 +79,16 @@ import unittest
 
 
 _SHARD = None
+_LOADS = None
 
 # THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
 # data a test unit leaves behind; these names are process-wide by design.
 _GATESLICE_MUTABLE = {
     "_SHARD": (
         "gateshard loaded by path once; loading it again yields the same "
+        "code"),
+    "_LOADS": (
+        "gateloads loaded by path once; loading it again yields the same "
         "code"),
 }
 _MISSING = object()
@@ -92,6 +107,10 @@ _PROGRESS_WIDTH = 256
 # The launch path's last two components. The gate's host census reads this to
 # count a running parent as one whole-suite occupant; workers are its children.
 SCRIPT = ("helm", "gateslice.py")
+# The focused scope's flag: `gateslice.py --modules NAME...`. The census
+# counts that argv as a suite occupant too (gate._diagnostic_shard_shaped).
+MODULES_FLAG = "--modules"
+_MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 DEFAULT_WORKERS = 16
 _EXIT_INVENTORY = 3
 _EXIT_CRASH = 70
@@ -109,6 +128,32 @@ def _shard():
         spec.loader.exec_module(module)
         _SHARD = module
     return _SHARD
+
+
+def _loads():
+    """gateloads, loaded by path: the recorder of which files each test
+    module reaches (task/3039). By path for the reason gateshard is: nothing
+    may import `helm` before the suite's own bootstrap."""
+    global _LOADS
+    if _LOADS is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "gateloads.py")
+        spec = importlib.util.spec_from_file_location(
+            "_helm_gateloads_for_slices", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _LOADS = module
+    return _LOADS
+
+
+def _arm_loads():
+    """This worker's load recorder, when the gate asked for one. Never
+    raises: a worker that cannot record runs unrecorded, and the gate reads
+    a missing worker record as no record at all."""
+    try:
+        return _loads().arm_runner(os.getcwd())
+    except Exception:           # noqa: BLE001
+        return None
 
 
 def scrubbed_env(base):
@@ -253,6 +298,35 @@ def discover(labels):
     if len(units) != len(labels):
         raise ValueError("discovery produced %d units for %d modules"
                          % (len(units), len(labels)))
+    _aligned(units, labels)
+    return units
+
+
+def load(labels):
+    """Units exactly as `python -m unittest -v NAME...` builds them: one per
+    named module, in the order named, each from `loadTestsFromName` on the
+    untouched default loader (`loadTestsFromNames` is that call per name).
+    -> units, or raise ValueError when a unit is not its module's.
+
+    A module that cannot be imported is the loader's own `_FailedTest`,
+    named by the last part of the module name and not by the whole: it is
+    what the serial command reports for that module, so it is aligned, and
+    it runs as the ERROR serial shows."""
+    loader = unittest.defaultTestLoader
+    units = [loader.loadTestsFromName(label) for label in labels]
+    _aligned(units, labels, failed_imports=True)
+    return units
+
+
+def _failed_import(test):
+    kind = type(test)
+    return kind.__name__ == "_FailedTest" and kind.__module__ == "unittest.loader"
+
+
+def _aligned(units, labels, failed_imports=False):
+    """Raise ValueError unless every unit holds only its module's tests: each
+    test carries the module's name in its id or belongs to a class the module
+    binds (and, when loading by name, the loader's own import failure)."""
     for unit, label in zip(units, labels):
         leaves = list(_leaves(unit)) if isinstance(unit, unittest.TestSuite) \
             else [unit]
@@ -260,11 +334,11 @@ def discover(labels):
         bound = {id(value) for value in vars(module).values()} \
             if module is not None else set()
         stray = [test.id() for test in leaves
-                 if label not in test.id() and id(type(test)) not in bound]
+                 if label not in test.id() and id(type(test)) not in bound
+                 and not (failed_imports and _failed_import(test))]
         if stray:
             raise ValueError("unit %s holds tests it does not export: %s"
                              % (label, ", ".join(stray[:3])))
-    return units
 
 
 def inventory(units, labels):
@@ -990,17 +1064,21 @@ def _worker(index, work_dir):
     swept = False
     try:
         # The process state `python -m unittest discover -s tests -t .` has
-        # when its discovery starts: cwd first on sys.path, argv as unittest
-        # sees it. Not the script's own directory, which would shadow stdlib
-        # names with helm/*.py.
+        # when its discovery starts (or, for the focused scope, `python -m
+        # unittest -v NAME...` when it loads its names): cwd first on
+        # sys.path, argv as unittest sees it. Not the script's own directory,
+        # which would shadow stdlib names with helm/*.py.
         sys.path[0] = os.getcwd()
-        sys.argv = [os.path.join(os.path.dirname(unittest.__file__),
-                                 "__main__.py"),
-                    "discover", "-s", START_DIR, "-t", "."]
         labels = _read_json(os.path.join(work_dir, "labels.json"))
+        named = _read_json(os.path.join(work_dir, "scope.json")) == "modules"
+        sys.argv = [os.path.join(os.path.dirname(unittest.__file__),
+                                 "__main__.py")] + (
+            ["-v"] + list(labels) if named
+            else ["discover", "-s", START_DIR, "-t", "."])
+        loads = _arm_loads()
         stop_watching = _watch_imports(progress)
         try:
-            units = discover(labels)
+            units = load(labels) if named else discover(labels)
         finally:
             stop_watching()
         rows, digest = inventory(units, labels)
@@ -1016,12 +1094,22 @@ def _worker(index, work_dir):
                              audit, None if plan is None else plan[str(index)],
                              progress=progress)
         warnings = None if sys.warnoptions else "default"
-        verbosity = 2 if os.environ.get("HELM_GATESLICE_VERBOSE") == "1" else 1
+        # The focused scope's protocol is `-v`'s, always: the focused receipt
+        # reads which modules reported tests off it.
+        verbosity = 2 if named or os.environ.get(
+            "HELM_GATESLICE_VERBOSE") == "1" else 1
+        outcome = unittest.TextTestResult
+        if loads is not None:
+            loads.begin_run()
+            outcome = loads.result_class(outcome)
         with open(os.path.join(work_dir, "worker-%d.protocol" % index), "w",
                   encoding="utf-8") as stream:
             result = unittest.TextTestRunner(
                 stream=stream, verbosity=verbosity,
-                warnings=warnings).run(suite)
+                warnings=warnings, resultclass=outcome).run(suite)
+        if loads is not None:
+            _loads().write_runner(loads, [labels[row["index"]]
+                                          for row in suite.claimed])
     finally:
         swept = shard._sweep_own_descendants()
     if not swept:
@@ -1125,9 +1213,15 @@ EVIDENCE_VERSION = 2
 _ARMED = False
 
 
-def run(work_dir, repo=".", workers=None, deadline=None, seconds=None):
+def run(work_dir, repo=".", workers=None, deadline=None, seconds=None,
+        modules=None):
     """Launch the workers, check the whole-run proofs, merge. -> (text, rc,
     evidence or None)
+
+    `modules` names the focused scope's test modules, in the order the serial
+    focused command names them; None is the whole discovery. A focused run's
+    evidence says so (`scope: modules`), so no reader can take it for the
+    whole suite's.
 
     ONLY THE RUNNER'S OWN PROCESS MAY CALL THIS, after `main` has armed
     PR_SET_CHILD_SUBREAPER on it: the sweep below kills every descendant of
@@ -1143,10 +1237,15 @@ def run(work_dir, repo=".", workers=None, deadline=None, seconds=None):
     started = time.monotonic()
     with open(os.path.join(work_dir, "claim"), "w", encoding="ascii") as fh:
         fh.write("%020d" % 0)
-    labels = discovery_modules(working_tree_files(repo))
+    labels = list(modules) if modules is not None \
+        else discovery_modules(working_tree_files(repo))
     with open(os.path.join(work_dir, "labels.json"), "w",
               encoding="utf-8") as fh:
         json.dump(labels, fh)
+    if modules is not None:
+        with open(os.path.join(work_dir, "scope.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump("modules", fh)
     count = max(1, int(workers or worker_count(len(labels))))
     plan = None
     if seconds:
@@ -1322,6 +1421,11 @@ def run(work_dir, repo=".", workers=None, deadline=None, seconds=None):
                     for row in meta["claimed"]},
         "outcome": dict(total, ok=not failed),
     }
+    if modules is not None:
+        # Only the focused scope carries it: the whole suite's evidence keeps
+        # the exact key set the sliced receipt kind (v10) validates, and a
+        # focused run's evidence can never pass for it.
+        evidence["scope"] = "modules"
     return text, 1 if failed else 0, evidence
 
 
@@ -1373,8 +1477,124 @@ def _serial(names):
         mode == "fail" and suite.findings) else 1
 
 
+# THE ONE-PASS FINDER (`gateslice.py --finder`). Two measurements of one
+# tree that no single sliced run makes, because what a sliced run's audit
+# reports depends on which modules share a worker:
+#   EACH   every discovered module ALONE, in a fresh process of its own, under
+#          the same leak and data audit (`--serial MODULE`): whatever a module
+#          leaves behind is found whatever ran before it and wherever it runs;
+#   WHOLE  one sliced whole suite with the audit in report mode: what one
+#          module leaves for ANOTHER in a shared worker, which only a run of
+#          the whole suite can show, reads as a leak or a failure there.
+# The result is one JSON line on stdout (`FINDER_EVENT`); the canary records
+# it (helm/gatecanary.py `finder`). It mints nothing and prints the
+# diagnostic marker first.
+FINDER_FLAG = "--finder"
+FINDER_EVENT = "gateslice-finder"
+_FINDER_SHOWN = 40
+_EACH_TIMEOUT_S = 1800
+_FAILED_LINE = re.compile(r"^(FAIL|ERROR): \S+ \(([\w.]+)\)", re.M)
+_LEAK_LINE = re.compile(r"^gateslice leak: ([\w.]+): (.*)$", re.M)
+
+
+def _findings(text):
+    """(leaks {module: finding}, failures [(kind, test id)]) of one text."""
+    leaks = {m.group(1): m.group(2)[:300] for m in _LEAK_LINE.finditer(text)}
+    return leaks, [(m.group(1), m.group(2))
+                   for m in _FAILED_LINE.finditer(text)]
+
+
+def _each_module(name, env):
+    try:
+        proc = subprocess.run([sys.executable, os.path.abspath(__file__),
+                               "--serial", name], env=env, text=True,
+                              stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE,
+                              timeout=_EACH_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return name, None, "%s: %s" % (type(exc).__name__, exc)
+    return name, proc, None
+
+
+def finder_each(names, jobs):
+    """Every module in `names` alone in a fresh process. -> dict"""
+    from concurrent.futures import ThreadPoolExecutor
+    env = dict(os.environ, HELM_GATESLICE_LEAKS="report")
+    for key in PARENT_ONLY_ENV:
+        env.pop(key, None)
+    leaking, failing, broken = {}, {}, {}
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        for name, proc, why in pool.map(lambda n: _each_module(n, env),
+                                        names):
+            if proc is None:
+                broken[name] = why
+                continue
+            leaks, failures = _findings(proc.stderr or "")
+            if leaks:
+                leaking[name] = "; ".join(leaks.values())[:300]
+            if failures:
+                failing[name] = ["%s %s" % pair for pair in failures]
+            if proc.returncode != 0 and not failures \
+                    and not re.search(r"^OK", proc.stderr or "", re.M):
+                broken[name] = "exited %s with no unittest verdict" \
+                    % proc.returncode
+    return {"modules": len(names), "leaking": _capped(leaking),
+            "failing": _capped(failing), "broken": _capped(broken),
+            "clean": not (leaking or failing or broken)}
+
+
+def _capped(mapping):
+    return {k: mapping[k] for k in sorted(mapping)[:_FINDER_SHOWN]}
+
+
+def finder_whole(work_dir, seconds=None):
+    """One sliced whole suite, the audit in report mode. -> dict"""
+    os.environ["HELM_GATESLICE_LEAKS"] = "report"
+    text, rc, evidence = run(work_dir, seconds=seconds)
+    leaks, failures = _findings(text)
+    outcome = (evidence or {}).get("outcome") or {}
+    return {"leaking": _capped(leaks),
+            "failing": ["%s %s" % pair for pair in failures][:_FINDER_SHOWN],
+            "ran": outcome.get("ran"), "exit": rc,
+            "readable": evidence is not None,
+            "clean": evidence is not None and rc == 0 and not leaks
+            and not failures}
+
+
+def _finder(argv):
+    """`gateslice.py --finder [--jobs N]`: both measurements of this tree,
+    reported as one JSON line. Exit 0 only when both are clean."""
+    jobs = None
+    if argv[:1] == ["--jobs"] and len(argv) == 2 and argv[1].isdigit():
+        jobs = int(argv[1])
+    elif argv:
+        sys.stderr.write("usage: gateslice.py %s [--jobs N]\n" % FINDER_FLAG)
+        return 2
+    sys.stderr.write(DIAGNOSTIC_MARKER + "\n")
+    sys.stderr.flush()
+    global _ARMED
+    if not _shard()._subreaper_armed():
+        sys.stderr.write("gateslice: could not arm PR_SET_CHILD_SUBREAPER; "
+                         "result refused\n")
+        return 2
+    _ARMED = True
+    names = discovery_modules(working_tree_files("."))
+    jobs = jobs or worker_count(len(names))
+    each = finder_each(names, jobs)
+    with tempfile.TemporaryDirectory(prefix="helm-gate-finder-") as tmp:
+        whole = finder_whole(tmp, seconds=_recorded_seconds())
+    sys.stdout.write(json.dumps({
+        "event": FINDER_EVENT, "host": os.uname().nodename, "jobs": jobs,
+        "each": each, "whole": whole}, sort_keys=True) + "\n")
+    sys.stdout.flush()
+    return 0 if each["clean"] and whole["clean"] else 1
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == FINDER_FLAG:
+        return _finder(argv[1:])
     if argv and argv[0] == "--worker":
         if len(argv) != 3 or os.environ.get("HELM_GATESLICE_WORKER") != "1":
             return 2
@@ -1385,7 +1605,17 @@ def main(argv=None):
             return _EXIT_CRASH
     if argv and argv[0] == "--serial":
         return _serial(argv[1:])
-    if argv:
+    modules = None
+    if argv and argv[0] == MODULES_FLAG:
+        modules = argv[1:]
+        # Names the serial focused command would load, each once: a dotted
+        # module name, never a flag, a path or a pattern.
+        if not modules or len(set(modules)) != len(modules) \
+                or not all(_MODULE_NAME.fullmatch(m) for m in modules):
+            sys.stderr.write("usage: gateslice.py %s MODULE... (distinct "
+                             "dotted module names)\n" % MODULES_FLAG)
+            return 2
+    elif argv:
         return 2
     sys.stderr.write(DIAGNOSTIC_MARKER + "\n")
     sys.stderr.flush()
@@ -1400,7 +1630,8 @@ def main(argv=None):
         return 2
     _ARMED = True
     with tempfile.TemporaryDirectory(prefix="helm-gate-slices-") as tmp:
-        text, rc, evidence = run(tmp, seconds=_recorded_seconds())
+        text, rc, evidence = run(tmp, seconds=_recorded_seconds(),
+                                 modules=modules)
         for env_key, name, value in (
                 ("HELM_GATESLICE_KEEP", "summary.json", None),
                 ("HELM_GATESLICE_EVIDENCE", None, evidence)):

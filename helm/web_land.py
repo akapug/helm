@@ -527,7 +527,7 @@ def _api_lr(qs):
                                 fingerprint=_lr_fingerprint,
                                 unchanged_max=web_land_model._LR_UNCHANGED_MAX_S))
     except Exception as e:
-        reason = ("the land-pipeline read failed inside helm web "
+        reason = ("the land-pipeline read failed inside the web server "
                   "(%s) — pipeline UNKNOWN" % type(e).__name__)
         body = {"read_ts": started, "ledger_mtime": None, "receipts_skipped": None,
                 "unavailable": reason, "filed": None,
@@ -584,8 +584,21 @@ def _api_lr(qs):
     # reading, and a body whose inputs were confirmed unmoved twelve seconds
     # ago is a current reading whatever its build clock says.
     built = body.get("read_ts") or now
+    # THE READING'S OWN INSTANT RIDES BESIDE ITS AGE (task/3657). A reader
+    # that dated this body by its own clock less the whole-second age moved
+    # its stamp on every ask of one unmoved reading, and the Work reader,
+    # which keys its snapshot on that stamp, rebuilt on every poll.
+    read_at = max(built, web_cache.verified_at(key) or 0)
     body["projected_age_s"] = max(0, int(now - built))
-    body["read_age_s"] = max(0, int(now - max(built, web_cache.verified_at(key) or 0)))
+    body["read_age_s"] = max(0, int(now - read_at))
+    body["read_at"] = read_at
+    # THE BOUND THIS READING IS JUDGED BY, named by the server that keeps it
+    # (task/3632). The body is served while it rebuilds until its hard bound,
+    # so a reading younger than that is one this server is still standing
+    # behind. The page judged it by four of its own polls (180 s) instead:
+    # read ages ran 62-407 s, and Home's pipeline tile and the strip's
+    # numbers under the land board read "stale" most of every hour.
+    body["limit_s"] = web_land_model._LR_HARD_TTL_S
     mtime = body.pop("ledger_mtime", None)
     body["ledger_age_s"] = None if mtime is None else max(0, int(now - mtime))
     # THE GRAPH IS A RESPONSE-TIME ADAPTER OVER THE SAME WARM BODY. Its LR rows
@@ -620,9 +633,18 @@ def _api_lr(qs):
             "warm scheduler membership disagrees with its loop frontier — graph UNKNOWN"
     scheduler_rows = scheduler_rows if isinstance(scheduler_rows, list) else []
     active_ids = active_ids if isinstance(active_ids, list) else []
+    # THE SCHEDULER MARKS A ROW STALLED BY THE ALARM THE BOARD MARKS IT BY
+    # (task/3631): `landreq.stall_alarm`, which `helm lr list` prints STALLED
+    # by, never the enforcement set `stalled_ids` carries — a row a proved
+    # successor carried was STALLED in the scheduler and quiet on the board
+    # beside it. The wire's `stalled_ids` is untouched.
+    from . import landreq                   # DEFERRED — landreq is heavy
+    alarmed = [card["id"] for card in scheduler_rows
+               if isinstance(card, dict) and isinstance(card.get("id"), str)
+               and landreq.stall_alarm(card)]
     body["scheduler"] = scheduler.project(
         scheduler_rows,
-        stalled_ids=body.get("stalled_ids") or [],
+        stalled_ids=alarmed,
         unmeasurable=body.get("unmeasurable") or [],
         active_ids=active_ids,
         owner_asks=asks,

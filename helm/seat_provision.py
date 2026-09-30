@@ -163,6 +163,13 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
         # key" as a failure, and forgiving that failure here would forgive it
         # for every family that really does need one.
         api_key, key_var = None, None
+        # THE FLOOR HOLDS FOR A ONE-PROVIDER KEYLESS FAMILY TOO (cursor's
+        # loopback bridge); the pool branch above already asked it of a row.
+        if not _safe_endpoint(base_url or "", keyless=True):
+            print("helm seat: %s is not an endpoint a keyless seat may use "
+                  "(https, or plain http to a literal private or loopback "
+                  "address)" % base_url, file=sys.stderr)
+            return 1
     elif not api_key and "--key-from" in args:
         path = os.path.expanduser(args[args.index("--key-from") + 1])
         for v in key_vars:
@@ -247,6 +254,15 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
                                                base_url))
     print("  proxy port %d; next: `helm seat up %s`, then `helm seat launch %s`"
           % (fam["port"], family, family))
+    sidecar = fam.get("sidecar")
+    if sidecar:
+        # THE SECOND PROCESS IS NAMED AT THE MINT, so nobody meets it first as
+        # a seat that answers its port and serves nothing.
+        print("  %s serves through its %s bridge, vendored at %s; `helm seat "
+              "up %s` starts it before the proxy and `helm seat doctor "
+              "--ensure` restarts it"
+              % (family, sidecar["name"], os.path.join(d, sidecar["artifact"]),
+                 family))
     return 0
 
 
@@ -577,6 +593,9 @@ def _add(family, args, room=None, room_source=None):
     ownership = _seat_surface_error(family, family)
     if ownership:
         print("helm seat: " + ownership, file=sys.stderr)
+        return 1
+    if fam.get("activation_refusal"):
+        print("helm seat: " + fam["activation_refusal"], file=sys.stderr)
         return 1
     if fam["mode"] == "proxy-key":
         return _add_proxy_key(

@@ -26,7 +26,7 @@ import os
 from .. import eventledger, vcs
 from ._common import PEEK_DIRNAME
 from ._lanes import (_occupants, _occupants_many, _panes_bound_to,
-                     worktrees)
+                     describe_occupants, worktrees)
 
 
 def peek_area(root):
@@ -121,7 +121,7 @@ def _peek_locked(root, sha):
         occ_map, census = _occupants_many([path])
         return 0, {"path": path, "sha": sha, "reused": True,
                    # A FIELD NOBODY MEASURED IS NULL, NOT A PLAUSIBLE LIST.
-                   # When /proc cannot be listed `_occupants_many` answers
+                   # When it read no cwd link `_occupants_many` answers
                    # ({path: ["unknown"]}, False) — a NON-EMPTY list carrying
                    # a string where pids belong. Passing that through would
                    # hand a consumer of `occupants` a length-1 list it reads
@@ -199,8 +199,11 @@ def _peek_drop_locked(root, path, stale_ttl_s=None, now=None):
                    "dropped" % path]
     occupied = _occupants(path)
     if occupied:
-        return 1, ["helm work: %s is OCCUPIED by cwd pid(s) %s — move out "
-                   "before dropping" % (path, ",".join(occupied))]
+        # EACH OCCUPANT BY NAME, the release refusal's shape: a bare pid list
+        # plus "move out" reads as leave to kill.
+        return 1, ["helm work: %s is OCCUPIED — kept. Each process below is "
+                   "live work, and its line says who acts on it; drop again "
+                   "once the room is empty:" % path] + describe_occupants(occupied)
     panes, pane_err = _panes_bound_to(path)
     if pane_err:
         return 1, ["helm work: cannot prove %s is pane-free — %s"

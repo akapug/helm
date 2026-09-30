@@ -46,6 +46,10 @@ KEYS = {
     "qwen27-provider": ("text", "the provider name the qwen27 family's local "
                         "pool row goes by; a live proxy config and its proofs "
                         "carry it (seat_catalog)"),
+    "local-operator-seat": ("text", "the seat that runs the local model "
+                            "families' hardware, the only seat that may "
+                            "certify them, from its own roster-bound session "
+                            "(burnflags, seat_catalog)"),
     "deploy-dir": ("text", "the directory a deployed gate's scripts run from, "
                    "compared with their committed source (doctor)"),
     "deploy-project": ("text", "the registered project whose checkout owns "
@@ -58,6 +62,8 @@ KEYS = {
                  "with helm)"),
     "generic-keywords": ("words", "extra words the knowledge store never "
                          "treats as a topic (store)"),
+    "public-names": ("words", "extra names the private-name advisory treats "
+                     "as public, beside its shipped allowlist (classify)"),
 }
 
 #: A predecessor's name becomes an environment prefix and a path component,

@@ -39,6 +39,8 @@
 .qonetop b{font-size:var(--f4)}
 .qonetop #qoneMeasure{margin-left:auto}
 .qonehint{padding:8px 2px 0;font-size:var(--f0);color:var(--sub)}
+/* the one account count over the table (task/3635): a sentence, so it wraps */
+.qonecount{padding:0 2px 8px;font-size:var(--f1);color:var(--mut)}
 /* ONE chip rule for every view. */
 .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:var(--r);padding:7px 12px;font-size:var(--f2);cursor:pointer;transition:border-color .12s,background .12s}
 .chip:hover{background:var(--hover);border-color:var(--line2)}
@@ -61,6 +63,9 @@ tr.qfam>th{text-align:left;font-weight:var(--w-med);padding:16px 10px 6px;border
 tr.qfam .qfamcaret{color:var(--mut);margin-right:7px}
 tr.qfam .qfamname{font-size:var(--f3);margin-right:10px}
 tr.qfam .qfamn{color:var(--mut);font-weight:400;font-size:var(--f1);margin-right:10px}
+/* the Families card's "accounts ↓" lands a group below the sticky nav */
+tr.qfam{scroll-margin-top:calc(var(--navh,48px) + 44px)}
+tr.qfam .qfamserves{display:inline-flex;flex-wrap:wrap;align-items:center;gap:4px;margin-right:10px;color:var(--sub);font-weight:400;font-size:var(--f1)}
 .qdecl,.qfor{color:var(--fg);max-width:26em}
 .qfor{color:var(--mut)}
 .qnotmeasured{color:var(--mut);font-size:var(--f1)}
@@ -84,6 +89,17 @@ table.qone tbody tr.atier:first-child td.atiercell{padding-top:4px}
 .acct-name .live{width:6px;height:6px;border-radius:50%;background:var(--ok);margin-left:7px;box-shadow:0 0 5px var(--ok)}
 .acct-line2{font-size:var(--f0);color:var(--sub);margin-top:2px;white-space:nowrap}
 .acct-line2 .sep{opacity:.5;margin:0 5px}
+/* a claude row's name is metadata, and each of its homes says its token
+   lineage in text (task/2636); UNKNOWN is boxed and grey, never a quiet green */
+.qmd{font-size:var(--f0);font-weight:400;color:var(--sub);margin-right:5px}
+.acct-homes{margin-top:3px;font-size:var(--f0);color:var(--sub);white-space:normal;font-weight:400}
+.qhome{line-height:1.5}
+.qhome b{font-weight:var(--w-med);color:var(--mut)}
+.lin{font-weight:var(--w-med)}
+.lin-MATCH{color:var(--ok)}
+.lin-MISMATCH{color:var(--bad)}
+.lin-AMBIGUOUS{color:var(--warn)}
+.lin-UNKNOWN,.lin-UNREAD{color:var(--mut);border:1px dashed var(--line2);border-radius:3px;padding:0 4px}
 /* a quota cell: right-aligned % with a slim bar underneath */
 .qcell{text-align:right;white-space:nowrap;font-variant-numeric:var(--num);min-width:66px}
 .qcell .qv{font-weight:var(--w-med)}
@@ -92,7 +108,6 @@ table.qone tbody tr.atier:first-child td.atiercell{padding-top:4px}
 .qcell .rst{display:block;font-size:var(--f0);color:var(--sub);margin-top:2px}
 .rst{color:var(--mut);font-size:var(--f1)}
 .st-ok{color:var(--ok)}.st-approaching,.st-expired-token,.st-due-refresh{color:var(--warn)}.st-exhausted,.st-api-error,.st-unknown{color:var(--bad)}
-.stfix{cursor:pointer;text-decoration:underline dotted}
 .flagchip{font-size:var(--f0);color:var(--warn)}
 
 /* ---------- collapsible group cards (burn / homes) ---------- */
@@ -102,6 +117,12 @@ table.qone tbody tr.atier:first-child td.atiercell{padding-top:4px}
 .grp>summary::before{content:"▸";color:var(--mut);font-size:var(--f1);transition:.15s}
 .grp[open]>summary::before{transform:rotate(90deg)}
 .gmeta{color:var(--mut);font-size:var(--f1);font-weight:400;white-space:nowrap}
+/* A CARD SUMMARY'S HINT WRAPS rather than being clipped by the card's
+   overflow:hidden (measured at 420 px on Fleet › credit: #acctdeclared,
+   #burncard, #homescard); on a phone it takes its own line under the title. */
+.grp>summary{flex-wrap:wrap}
+.grp>summary .gmeta{white-space:normal;min-width:0}
+@media (max-width:680px){.grp>summary .gmeta{flex-basis:100%;margin-left:0}}
 #burncard>summary .gmeta{margin-left:auto}
 #homescard>summary .gmeta{margin-left:auto}
 .burnrow{display:flex;gap:14px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:baseline;flex-wrap:wrap;font-size:var(--f2)}
@@ -128,8 +149,7 @@ table.qone tbody tr.atier:first-child td.atiercell{padding-top:4px}
 #homeform{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap;align-items:center}
 #homeform input{flex:1;min-width:220px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font-size:var(--f1)}
 #homeform select{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 10px;font-size:var(--f1);cursor:pointer}
-#homeform .cmdbox{flex-basis:100%;background:var(--fg);color:var(--bg);border-radius:8px;padding:9px 12px;font:var(--f1) ui-monospace,Menlo,monospace;word-break:break-all;cursor:pointer}
-#homeform .cmdbox .hintline{font:italic var(--f0) -apple-system,sans-serif;opacity:.7;margin-top:4px}
+#homeform .homenext{flex-basis:100%;font-size:var(--f1);color:var(--fg);margin:4px 0}
 .homehdr{padding:8px 16px;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line)}
 .dupwarn{color:var(--bad);font-size:var(--f1);margin:6px 0}
 /* declared accounts — the owner's own inventory, one plain line per account */

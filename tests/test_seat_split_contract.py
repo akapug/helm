@@ -363,6 +363,13 @@ _POST_SPLIT_SURFACE = frozenset({
     "quota_group_families",
     "quota_group_phrase",
     "QUOTA_GROUP_UNMEASURED",
+    # WHO BILLS A FAMILY (task/3461): the catalog's one reading of the account
+    # groups behind a family's routes. Facade surface because both ends of the
+    # money join read it through `helm.seat` — `accountseed.candidates` mints
+    # the declared rows from it and `web_board` joins Fleet › credit on it —
+    # and a second spelling of it is the defect it replaced.
+    "billing_accounts",
+    "billing_groups",
     # Task/2466's per-subagent tier table: the union of the models a family
     # catalogues. Facade surface because `helm/proxywatch.py` reads it as
     # `seatmod.family_catalogued_models` to decide whether an alias row's name
@@ -541,6 +548,12 @@ _PROJECT_SEAT_SURFACE = frozenset({
     # the expiry it derives from an observation instant (helm/poolwall.py)
     "WALL_UNANCHORED",
     "_pool_expiry",
+    # the off-peak money door: a money-gated proxy is reconciled before any
+    # pane may send through it (helm/offpeak.py, ds4-direct-off-peak-only)
+    "_gated_proxy_before_pane",
+    # the register read STRICTLY: `seat remint` tells an absent spawn.json
+    # from one it could not read (helm/seat_remint.py)
+    "_spawn_record_read",
 })
 
 _CURRENT_SURFACE = (_BASELINE_SURFACE | _FACADE_BRIDGE_SURFACE |
@@ -605,7 +618,7 @@ class SeatSplitCompatibilityTest(unittest.TestCase):
         self.assertEqual(surface, _CURRENT_SURFACE)
         self.assertFalse(hasattr(seat, "definitely_not_a_seat_symbol_7f3c"))
 
-    def test_the_frozen_fanout_inventory_remains_exact(self):  # noqa: VACUOUS_ASSERTION — equality to the non-empty 262-name inventory is the positive control
+    def test_the_frozen_fanout_inventory_remains_exact(self):  # noqa: VACUOUS_ASSERTION — equality to the non-empty 264-name inventory is the positive control
         self.assertEqual(seat._SEAT_FANOUT_NAMES,
                          _CURRENT_SURFACE - {"_SEAT_FANOUT_NAMES"})
 

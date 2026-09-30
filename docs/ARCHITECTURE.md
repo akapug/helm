@@ -2,7 +2,7 @@
 
 ## The two-source model (the constitution)
 
-helm inherits a hard-won information architecture. Its laws:
+helm is built on a strict information architecture. Its laws:
 
 1. **Two primitives only.** Every fact is an **event** (something happened —
    immutable, append-only) or an **artifact** (authored content with
@@ -21,8 +21,7 @@ helm inherits a hard-won information architecture. Its laws:
    `helm projections` renders it; `helm doctor` enforces it (undeclared
    rebuild, source-free projections containing data, staleness, and
    unclassified-squatter files under `~/.helm` or `~/.cache/helm` — the
-   standing guard against the store-rot that killed the ancestor's
-   `~/.remember`). A manifest row may declare the exact empty JSON its producer
+   standing guard against store rot). A manifest row may declare the exact empty JSON its producer
    writes at genesis. While no seat is registered, only that source-free shape
    is healthy; once a seat exists, missing sources fail again even if the bytes
    remain empty. Malformed, extended, or nonempty copies always fail closed.
@@ -44,9 +43,63 @@ helm inherits a hard-won information architecture. Its laws:
 | the authored chain (premises/heuristics/lexicon/prd/journal/evals) | **helm** (`~/.helm/<project>/`) | the durable per-project home |
 | know-your-user | **helm** (`~/.helm/_global/know-your-user/`) | the one operator profile |
 
+## Harness, metaharness, family and backend
+
+helm is an overlay: it owns almost none of the machinery it steers. Four
+independent axes describe where an agent runs, and a seat's runtime record
+carries each one separately (`seats._runtime_metadata`).
+
+**The harness** is the coding-agent CLI itself. Claude Code is helm's harness
+of expertise because of its hooks: helm's per-turn physics (knowledge
+injection, mid-turn chat delivery, the argv and suite guards, the stop guard,
+the compaction handoff and resume) rides Claude Code lifecycle events.
+[HOOKS](HOOKS.md) lists the whole estate. Codex is discovered for sessions
+and projects and OpenCode for projects, but they have no hook surface, so
+they get the cockpit and not the per-turn physics.
+
+**The metaharness** manages the terminal panes agents live in, so helm can
+spawn a seat, read its screen, send it a keystroke, and resolve which pane
+belongs to which session. `helm/harness.py` is an adapter seam with one
+uniform `spawn / list / read / send / stop / resolve_pane` surface. `ADAPTERS`
+is a two-entry dict (orca and herdr) over a small base class:
+
+- [orca](https://github.com/stablyai/orca) is the recommended companion. It
+  gives real pane control plus a git worktree for each seat, so nine agents
+  are not editing one checkout. [ORCA_OPERATIONS](ORCA_OPERATIONS.md) is the
+  operator runbook.
+- herdr is also implemented, and wins automatically inside a herdr session,
+  because panes should spawn where you already are.
+- Any other terminal manager (tmux, cmux, zellij) needs a new adapter. That
+  is a contained amount of work, not an architecture change.
+
+With no metaharness, every pane operation degrades to a no-op and says so.
+
+**The family** is the model behind a seat. Non-Claude families run behind
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), which speaks the
+Anthropic wire protocol to Claude Code and the vendor's own protocol
+upstream. So a seat whose harness is Claude Code inherits every hook,
+whatever family is behind it: a Gemini seat gets the same mid-turn delivery,
+stop guard and compaction resume as a Claude seat, because it is a Claude
+Code process with a different model behind it. One integration, not six.
+
+**The backend** is how a seat reaches its model (direct, or through a proxy).
+It is independent of the harness, and it is the harness that earns the
+hooks, not the proxy. `helm pi run` runs a family through the proxy backend
+but execs the **pi** binary (`helm/pi.py`, pinned by
+`tests/test_pi_start_resume.py::test_run_pins_model_registers_real_roster_row_and_execs_key_in_env`).
+It writes a roster row before exec, so the seat can be addressed in chat. It
+is not a `claude` process, though: no Claude Code hook fires in it,
+`helm hooks install` does not cover it (it enumerates Claude homes and seat
+`CLAUDE_CONFIG_DIR`s), and the uncovered-pane scan cannot see it running (it
+matches argv `claude`). Address a pi seat and nothing wakes it.
+
+**Reading an error.** A `403` or a quota wall shown in a Claude Code pane
+belongs to the underlying vendor, not to Anthropic. Read the vendor off the
+error text, never off the harness.
+
 ## Operating scale (why the machinery is sized the way it is)
 
-Numbers from the founding deployment, so a reader can judge each subsystem
+Numbers from the maintainers' own deployment, so a reader can judge each subsystem
 against its *actual* consumer rather than guessing (every one below shipped
 with a live consumer on day one):
 
@@ -152,8 +205,9 @@ primary, offline, tamper-evident proof (`<helm-home>/_global/.state/attest-chain
 `rec_hash = blake2b256(canonical(core) + prev)`). It depends on no binary and
 no service. A dregg node, when reachable, is an **OPTIONAL external checkpoint**
 that anchors a record hash and is honestly labelled a *node* commitment, never
-a user-cell signature (fail-open — the native record stands regardless). helm
-rides dregg + cv only; it never depends on the meld binary. See
+a user-cell signature (fail-open — the native record stands regardless).
+Attestation rides helm's own chain and, optionally, dregg; it needs no other
+binary. See
 [ATTESTATION.md](ATTESTATION.md).
 
 ### The comparison-resolver seam
@@ -206,7 +260,7 @@ handoff/now probes, the lane gc verdict reads, and the auto-map's root resolver.
 Six private `_git` helpers existed; **five are migrated** (`capsule`, `handoff`,
 `ship`, and `work/_lanes`' two) and `landreq.py`'s `--git-dir` helper is not —
 it is a declared exception, so "six replaced" would be wrong. It is **not** yet
-every git call in helm: **51 direct git spawns** remain across `cli`, `landreq`,
+every git call in helm: **54 direct git spawns** remain across `cli`, `landreq`,
 `seats`, `dispatches`, `record`, `lineage`, `rearm`, `seat`, `web`, `wiring`,
 `cell`, `nevertrack`, `vacuous_assertion`, `hardcode`, `hostpath_guard`,
 `conflict_marker`, `lane_discipline`, `clearspan`,

@@ -210,6 +210,7 @@ class AFixWithNoCureSaysWhyTest(td.DispatchBase):
         with self.verdict_author():
             return run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py", *flags,
                 "the guard is inverted"])
 
@@ -280,6 +281,7 @@ class AFixWithNoCureSaysWhyTest(td.DispatchBase):
         with self.verdict_author():
             rc, _out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--no-patch-because", "--imperfect", "the note"])
         self.assertEqual(rc, 2, err)
@@ -295,13 +297,14 @@ class AFixWithNoCureSaysWhyTest(td.DispatchBase):
         again, why = dispatches.mark_verdict(
             row["id"], row["tip"], "the guard is inverted", "fix",
             basis="measured", worse_than_main_paths=["helm/dispatches.py"],
-            no_patch_because="a meld")
+            no_patch_because="a meld", finding_count=1, prior_relation="new")
         self.assertIsNone(why, why)
         self.assertEqual(again["no_patch_because"], "a meld")
         conflicting, why = dispatches.mark_verdict(
             row["id"], row["tip"], "the guard is inverted", "fix",
             basis="measured", worse_than_main_paths=["helm/dispatches.py"],
-            no_patch_because="a different reason entirely")
+            no_patch_because="a different reason entirely", finding_count=1,
+            prior_relation="new")
         self.assertIsNone(conflicting)
         self.assertIn("already has a verdict", why)
 
@@ -321,6 +324,7 @@ class ACleanReadThatCarriesACureHasADoorTest(td.DispatchBase):
         with self.verdict_author():
             return run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--imperfect", *flags,
                 "not worse than main; moved the port off a live socket"])
 
@@ -372,6 +376,7 @@ class ACleanReadThatCarriesACureHasADoorTest(td.DispatchBase):
         with self.verdict_author():
             rc, _out, err = run(dispatches.cmd_dispatch, [
                 "verdict", other["id"], other["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--no-patch-because", "a design finding for a meld",
                 "it regresses"])
@@ -429,6 +434,7 @@ class ACleanReadThatCarriesACureHasADoorTest(td.DispatchBase):
         with self.verdict_author():
             rc, _out, err = run(dispatches.cmd_dispatch, [
                 "verdict", other["id"], other["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--patch-tip", self.c, "it regresses"])
         self.assertEqual(rc, 0, err)
@@ -466,6 +472,7 @@ class ThePatchIsWhatIsOwedNotTheTipTest(td.DispatchBase):
         with self.verdict_author():
             rc, _out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--imperfect", "--patch-tip", self.cure,
                 "not worse than main; moved the port off a live socket"])
         self.assertEqual(rc, 0, err)
@@ -478,6 +485,7 @@ class ThePatchIsWhatIsOwedNotTheTipTest(td.DispatchBase):
         with self.verdict_author():
             rc, _out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--patch-tip", self.cure, "it regresses on that path"])
         self.assertEqual(rc, 0, err)
@@ -515,6 +523,7 @@ class ThePatchIsWhatIsOwedNotTheTipTest(td.DispatchBase):
         with self.verdict_author():
             rc, _out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--no-patch-because", "a DESIGN finding, bound for a meld",
                 "the shape is wrong"])

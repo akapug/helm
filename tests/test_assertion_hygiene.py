@@ -388,16 +388,37 @@ def discoverable_modules(root=HERE):
                 yield os.path.join(dirpath, name)
 
 
-def scan_tests_tree(root=HERE, skip=()):
-    findings = []
-    skipped = {os.path.realpath(s) for s in skip}
+def _scan_modules(root):
+    """[(realpath, findings)] for every discoverable module under `root`, in
+    discovery order."""
+    out = []
     for path in discoverable_modules(root):
-        if os.path.realpath(path) in skipped:
-            continue
         rel = os.path.relpath(path, root).replace(os.sep, "/")
         with open(path, encoding="utf-8") as fh:
-            findings.extend(scan_source(fh.read(), "tests/" + rel))
-    return findings
+            out.append((os.path.realpath(path),
+                        scan_source(fh.read(), "tests/" + rel)))
+    return out
+
+
+# THE REAL TREE IS SCANNED ONCE PER PROCESS (task/3397), the pattern
+# tests/test_display_launder_tripwire.py holds in `_real_tree_once`. Two arms
+# read the whole tests tree, about 10 s each, and tests/ does not change while
+# one process runs. Only the real tree is remembered, per file, so a skip
+# still drops exactly the files it names; a planted root is a tree an arm
+# built to hold a probe, and it is scanned every time. Answers are new lists.
+_REAL_MODULES = []
+
+
+def scan_tests_tree(root=HERE, skip=()):
+    if root != HERE:
+        modules = _scan_modules(root)
+    else:
+        if not _REAL_MODULES:
+            _REAL_MODULES.extend(_scan_modules(HERE))
+        modules = _REAL_MODULES
+    skipped = {os.path.realpath(s) for s in skip}
+    return [f for path, found in modules if path not in skipped
+            for f in found]
 
 
 # ---- the controls. These strings ARE the forbidden shape, which is why this

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from helm import web_ui_loader
+from tests._ownerverbs import owner_verbs, view_markup
 from tests.test_web_chat_client_runtime import _extract_fn
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -163,15 +164,20 @@ pollLedger().then(() => console.log(JSON.stringify(order)))
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(json.loads(p.stdout), [["mode", False], ["chat", False]])
 
-    def test_the_dregg_strip_refreshes_age_without_structural_churn(self):
+    def test_the_signing_poll_keeps_its_read_for_the_home_tile(self):
+        """The signing strip's row text (the last turn, its author, its age)
+        is the history page's own pulse; the poll keeps its read, stamped,
+        for Home's signing-record tile, which says one word from it and
+        takes it off once the stamp is past its bound (task/3445)."""
         src = web_ui_loader.read_text()
         body = _extract_fn(src, "pollDregg")
-        self.assertIn("ledgerAgeHTML(t.timestamp)", body)
-        self.assertIn("ledgerHTML(el,", body)
-        self.assertNotIn("el.innerHTML =", body)
+        self.assertIn("DREGG_LAST = {d: d, at: Date.now()}", body)
+        self.assertIn("homeRender()", body)
+        self.assertNotIn("innerHTML", body)
         self.assertNotIn("DREGG_SIG", body)
-        self.assertLess(body.index("ledgerAges(el)"), body.index('await j("/api/ledger", 6000)'))
-        self.assertIn("run !== DREGG_RUN", body)
+        # a stopped poll's late answer is not kept
+        self.assertLess(body.index("run !== DREGG_RUN"), body.index("DREGG_LAST ="))
+        self.assertLess(body.index('await j("/api/ledger", 6000)'), body.index("DREGG_LAST ="))
 
     def test_the_independent_dregg_timer_has_a_real_lifecycle(self):
         """Live attribution can stop and restart every timer-owned call."""
@@ -201,12 +207,11 @@ console.log(JSON.stringify({intervals, polls, cleared, timer: DREGG_TIMER}));
         fns = "\n".join(_extract_fn(src, name) for name in
                         ("stopDreggPolling", "pollDregg"))
         code = """
-let DREGG_TIMER = null, DREGG_RUN = 0, DREGG_POLLING = false;
+let DREGG_TIMER = null, DREGG_RUN = 0, DREGG_POLLING = false, DREGG_LAST = null;
 const pending = []; let calls = 0;
 const document = {hidden: false};
 function clearInterval() {}
-function ledgerAges() {}
-function $(sel) { return {}; }
+function homeRender() {}
 function j(url, ms) { calls++; return new Promise((ok, no) => pending.push(no)); }
 """ + fns + """
 (async () => {
@@ -223,6 +228,44 @@ function j(url, ms) { calls++; return new Promise((ok, no) => pending.push(no));
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(json.loads(p.stdout), {
             "calls": 2, "afterOld": True, "afterNew": False})
+
+    def test_history_tells_the_owner_no_helm_verb(self):  # noqa: VACUOUS_ASSERTION — each render's absence of a verb follows an unconditional positive control on the same markup, asserting the branch named was drawn
+        """RULE 2 ON HISTORY (console walk 3, open points). The signing badge's
+        hovers named `helm chat status`, and a signed read that returned no
+        entries told the owner to "run `helm chat status`". Every panel the
+        real renderers draw is read here, hovers included, with the page's
+        own markup for the static half."""
+        self.assertIn("owner_text", self.results, self.proc.stderr)
+        text = self.results["owner_text"]["detail"]
+        page = view_markup(web_ui_loader.read_text(), "history")
+        # POSITIVE CONTROLS on the same renders: each is the state named
+        self.assertIn("signing", text["signed"])
+        self.assertIn("chained", text["signed"])
+        self.assertIn("relay", text["fallback"])
+        self.assertIn("wrong service", text["mismatch"])
+        self.assertIn('id="dchain"', page)
+        for name, markup in dict(text, page=page).items():
+            self.assertEqual(owner_verbs(markup), [], "%s: %s" % (name, markup))
+
+    def test_the_top_card_draws_the_owners_words_for_a_signing_failure(self):
+        """RULE 2 ON HISTORY'S TOP CARD (console walk 4, P1 2). The card read
+        "Relaunch through `helm launch` ... or on `helm chat transport ack
+        --profile meta-claude`" in its body, and the remediation again in its
+        hover. Each branch that draws a failure, and the scoped line, now
+        draws the server's owner copy; the verb sweep above reads them all."""
+        self.assertIn("owner_text", self.results, self.proc.stderr)
+        text = self.results["owner_text"]["detail"]
+        # POSITIVE CONTROLS: each branch is the one named, with the owner copy
+        for name, word in (("degraded", "DEGRADED"), ("unknown", "UNKNOWN"),
+                           ("offline", "offline")):
+            self.assertIn(word, text[name], name)
+            self.assertIn("OWNER-SAY seat-a posts unsigned", text[name], name)
+        self.assertIn("OWNER-SCOPED ds4pro is not running now", text["scoped"])
+        for name in ("degraded", "unknown", "offline", "scoped"):
+            self.assertNotIn("Relaunch", text[name], name)
+            self.assertNotIn("re-probeable", text[name], name)
+            self.assertEqual(owner_verbs(text[name]), [],
+                             "%s: %s" % (name, text[name]))
 
 
 class LedgerHeaderRuntimeTest(unittest.TestCase):
@@ -264,8 +307,9 @@ for (const step of JSON.parse(require("fs").readFileSync(0, "utf8"))) {
   const beforeWrites = writes, beforeMoves = moves;
   ledgerMode(step.transport);
   ledgerTurns(step.turns || []);
-  nativeChat({msgs: 1, rooms: 1, last_ts: 1, last_from: "seat", last_room: "helm"});
-  ledgerStrip({transport: step.transport, status: {dag_height: 1}, node: "test-node"});
+  nativeChat(step.pulse || {msgs: 1, rooms: 1, last_ts: 1, last_from: "seat", last_room: "helm"});
+  ledgerStrip(Object.assign({transport: step.transport, status: {dag_height: 1}, node: "test-node"},
+                            step.strip || {}));
   out.push({header: $("#cavesub").textContent, local: $("#nativesub").textContent,
     rows: $("#ledgerturns").innerHTML, pulse: $("#nativechat").innerHTML,
     strip: $("#ledgerstrip").innerHTML, head: LEDGER_HEAD,
@@ -322,7 +366,10 @@ process.stdout.write(JSON.stringify(out));
             self.assertIn("this read found none", row["rows"])
 
     def test_degraded_incident_does_not_erase_signed_row_evidence(self):
-        tp = {"mode": "degraded", "profile": "seat-a", "reason": "send timed out",
+        # the strip names the incident in the owner's copy the server sends
+        # beside the agents' reason (console walk 4, P1 2)
+        tp = {"mode": "degraded", "profile": "seat-a", "reason": "send failed",
+              "owner_say": "a signed post from seat-a timed out",
               "first_failure": "2026-09-13T07:40:00Z",
               "last_failure": "2026-09-13T07:40:00Z", "head": 38}
         turn = {"chain_index": 38, "turn_hash": "a" * 64, "receipt_hash": "b" * 64,
@@ -332,8 +379,9 @@ process.stdout.write(JSON.stringify(out));
         self.assertIn("#38", row["rows"])
         self.assertIn("exec-signed", row["rows"])
         self.assertIn("DEGRADED", row["strip"])
-        for incident in ("seat-a", "send timed out", "2026-09-13T07:40:00Z"):
+        for incident in ("seat-a", "timed out", "2026-09-13T07:40:00Z"):
             self.assertIn(incident, row["strip"])
+        self.assertNotIn("send failed", row["strip"])
         unsigned = dict(turn, executor_signed=False)
         negative = self.render([{"transport": tp, "turns": [unsigned]}])[0]
         self.assertIn("#38", negative["rows"])
@@ -348,6 +396,26 @@ process.stdout.write(JSON.stringify(out));
         signed, unknown = self.render([{"transport": {"mode": "signed"}}, {}])
         self.assertIn("signing is available", signed["rows"])
         self.assertIn("does not establish", unknown["rows"])
+
+    def test_an_unreadable_room_is_named_on_the_page(self):
+        """task/3715: a room the server could not read is NAMED where the
+        reading it shortens is shown, never a quieter count in silence."""
+        pulse = {"msgs": 1, "rooms": 1, "last_ts": 1, "last_from": "seat",
+                 "last_room": "helm",
+                 "unreadable": [{"room": "locked", "reason": "denied"}]}
+        row = self.render([{"transport": {"mode": "signed"}, "pulse": pulse,
+                            "strip": {"about_unreadable": [
+                                {"room": "sealed", "reason": "not-a-file"}]}}])[0]
+        for fact in ("locked", "denied", "unreadable"):
+            self.assertIn(fact, row["pulse"])
+        for fact in ("sealed", "not-a-file", "unreadable"):
+            self.assertIn(fact, row["strip"])
+        # POSITIVE CONTROL on the same observables: a reading with nothing
+        # unreadable renders both panels and says nothing about it.
+        clean = self.render([{"transport": {"mode": "signed"}}])[0]
+        self.assertIn("chat pulse", clean["pulse"])
+        self.assertIn("test-node", clean["strip"])
+        self.assertNotIn("unreadable", clean["pulse"] + clean["strip"])
 
 
 if __name__ == "__main__":

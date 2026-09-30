@@ -463,6 +463,15 @@ class ActuatorLeaseBase(LeaseRecoveryBase):
             return seats._stop_whisper(SESSION, "main", seat, [], False,
                                        cwd=self.root, actor=actor)
 
+    def discharge(self, rid8):
+        """The dispatcher cancels the row, so the seat's claim on it marks
+        nothing and releasing it is the act a stop owes. Since task/3696 a
+        claim on a row still owed is IN PROGRESS and refuses no stop, so the
+        arms about the printed release command stand on a discharged row."""
+        from helm import dispatches
+        _row, why = dispatches.mark_cancel(rid8, "moot: the lane was dropped")
+        self.assertIsNone(why, why)
+
     def lease_block(self, detail=False):
         """The LEASE rung's block, selected by PROPERTY, never by a header
         literal: a header is prose and prose is a per-lane decision (the
@@ -561,6 +570,7 @@ class GuardInstructionIsFollowableTest(ActuatorLeaseBase):
     def test_the_block_carries_the_real_token_not_a_placeholder(self):
         rid8 = self.dispatch_to(ME)
         self.autoclaim()
+        self.discharge(rid8)
         lease = self.stored("dispatch:" + rid8)["lease"]
         block = self.lease_block()
         self.assertIn("--lease " + lease, block)
@@ -572,6 +582,7 @@ class GuardInstructionIsFollowableTest(ActuatorLeaseBase):
         guard printed is run through the real CLI and the row is GONE."""
         rid8 = self.dispatch_to(ME)
         self.autoclaim()
+        self.discharge(rid8)
         block = self.lease_block()
         # THE LINE CARRIES A COMMAND AND THEN ITS ADVICE: a dispatch claim
         # states what the ROW became, and the sentence RIDES the command
@@ -714,6 +725,7 @@ class GuardInstructionIsFollowableTest(ActuatorLeaseBase):
         ok, _m, _l = seats.claim("dispatch:" + rid8, alias, session=SESSION)
         self.assertTrue(ok)
         self.assertEqual(seats.own_leases(), {})     # unreachable by name
+        self.discharge(rid8)
         block = self.lease_block()
         lease = self.stored("dispatch:" + rid8)["lease"]
         self.assertIn("--lease %s --seat %s" % (lease, alias), block)
@@ -725,8 +737,9 @@ class GuardInstructionIsFollowableTest(ActuatorLeaseBase):
     def test_seat_is_omitted_when_this_process_is_already_the_holder(self):
         """--seat is noise when the ambient identity already matches, and a
         blanket --seat would teach seats to pass an identity out of argv."""
-        self.dispatch_to(ME)
+        rid8 = self.dispatch_to(ME)
         self.autoclaim()
+        self.discharge(rid8)
         self.assertNotIn("--seat", self.lease_block())
 
 
@@ -781,8 +794,9 @@ class GuardInstructionRefusesTheWrongCallerTest(ActuatorLeaseBase):
         both its existence and its token."""
         other = seats.claim("port:elsewhere", THEM, ttl=600,
                             session="99999999-0000-0000-0000-000000000000")[2]
-        self.dispatch_to(ME)
+        rid8 = self.dispatch_to(ME)
         self.autoclaim()
+        self.discharge(rid8)
         block = self.lease_block()
         self.assertNotIn(other, block)
         self.assertNotIn("port:elsewhere", block)

@@ -2,15 +2,16 @@
  * History.
  *
  * The owner merged the board, the work tab and the scheduler into one Work
- * page and made History the signing ledger alone; only Fleet keeps a section
- * row. The load-bearing claim of that change is NEGATIVE — every old hash
+ * area and made History the signing ledger alone; Work and Fleet keep a
+ * section row, and Work's pipeline and backlog are entries into its one Work
+ * page (task/3643), drawn on that page's element. The load-bearing claim of that change is NEGATIVE — every old hash
  * still lands on the page that took it over — and a negative claim about a
  * ROUTER cannot be greped: `if (false && VIEWS.includes(v)) showView(v)` keeps
  * every literal a source check looks for and routes nothing.
  *
  * So the real router runs. tests/test_web_areas.py splices the ACTUAL
- * revealActiveTab / navBadge / areaBadge / canonView / goOldSection /
- * showView out of the assembled UI and the ACTUAL boot block as __runBoot, and
+ * revealActiveTab / navBadge / areaBadge / canonView / pageOf / showView out
+ * of the assembled UI and the ACTUAL boot block as __runBoot, and
  * it builds the DOM below FROM THE ASSEMBLED NAV MARKUP — the areas, the
  * sections and the view panel ids are parsed out of the page, never listed
  * here. A fixture that invented its own tabs would prove nothing about the
@@ -104,7 +105,7 @@ NAV.appendChild(AREAS_ROW);
 const ROOT = el("body", [], {});
 ROOT.appendChild(NAV);
 
-const AREA_BTN = {}, SECTION = {}, TAB = {}, PANEL = {}, ANCHOR = {};
+const AREA_BTN = {}, SECTION = {}, TAB = {}, PANEL = {};
 for (const a of DOM.areas) {
   const b = el("button", ["navarea"], {a: a.key});
   b.textContent = a.label;
@@ -127,11 +128,6 @@ for (const id of DOM.panels) {
   PANEL[id] = p;
   ROOT.appendChild(p);
 }
-for (const id of DOM.anchors) {
-  const a = el("details", [], {}, id);
-  ANCHOR[id] = a;
-  PANEL["view-work"].appendChild(a);
-}
 
 let CREATED = null;
 global.document = {
@@ -150,6 +146,11 @@ global.localStorage = {getItem: k => (k in STORE ? STORE[k] : null),
                        setItem: (k, v) => { STORE[k] = String(v); }};
 global.setTimeout = () => 0;
 global.setInterval = () => 0;
+/* WHERE THE WINDOW WAS SCROLLED TO: a page change lands at the new page's
+ * top (task/3445 L1b; the walk opened the backlog at scrollY 702-811, past
+ * its own header), so every scrollTo is recorded */
+const TOPS = [];
+global.window = {scrollTo: (x, y) => { TOPS.push([x, y]); }};
 global.VIEWS = DOM.views;
 global.AREA_OF = DOM.area_of;
 global.AREA_LAST = {};
@@ -160,12 +161,22 @@ global.LR_LAST = null;
 let QUEUE_READS = 0;
 global.odqInit = () => { QUEUE_READS++; };
 for (const k of ["initQuota", "initStorage", "initSessions", "cfgInit",
-                 "srevInit", "tqInit", "initChat", "initRoster",
+                 "srevInit", "initChat", "initRoster",
                  "initLedger", "startDreggPolling", "stopDreggPolling",
-                 "esConnect", "openSession", "schedulerShow",
-                 "boardReload"]) {
+                 "esConnect", "openSession",
+                 "boardReload", "projRoute", "initHome",
+                 "initModels", "wkShow", "wkPaint"]) {
   global[k] = () => {};
 }
+global.WK = {main: {}};
+/* THE STATE A HASH ROUTES (`viewRoute(v, query)`) is RECORDED: an old
+ * #scheduler bookmark opens the pipeline grouped by who has it (task/3643) */
+const ROUTED = [];
+global.viewRoute = (v, q) => { ROUTED.push([v, q]); };
+/* each view's own state after its "?" (task/3445, task/3448): none in this
+   harness */
+global.projQuery = () => "";
+global.viewQuery = () => "";
 
 /* GEOMETRY IS NOT THIS HARNESS'S SUBJECT (see the header). showView publishes
    the navigation's measured height for whatever sticks below it, which is a real
@@ -197,8 +208,9 @@ function snapshot() {
     sections_on: sec.length,
     solo: STRIP.classes.has("solo"),
     scrolled: SCROLLED.slice(),
-    opened: Object.values(ANCHOR).some(a => a.open),
+    routed: ROUTED.slice(),
     queue_reads: QUEUE_READS,
+    tops: TOPS.slice(),
     hash: HASH,
     saved: STORE["helm.view"] || null,
   };
@@ -211,9 +223,10 @@ function clear() {
   for (const n of ALL) n.classes.delete("on");
   STRIP.classes.delete("solo");
   SCROLLED.length = 0;
+  TOPS.length = 0;
   QUEUE_READS = 0;
+  ROUTED.length = 0;
   showView.cur = undefined;           // a fresh page has shown nothing yet
-  for (const a of Object.values(ANCHOR)) a.open = false;
   for (const k of Object.keys(AREA_LAST)) delete AREA_LAST[k];
   for (const k of Object.keys(NAV_BADGE)) delete NAV_BADGE[k];
   for (const b of Object.values(AREA_BTN)) {
@@ -268,6 +281,14 @@ for (const step of DOM.click_sequence) {
   out.click_seq.push(Object.assign({step: step.view || step.area}, snapshot()));
 }
 
+/* SHOWING THE PAGE ALREADY ON SCREEN scrolls nothing: only a page CHANGE
+ * lands at the top */
+{
+  const before = TOPS.length;
+  showView("history");
+  out.same_view_tops = TOPS.length - before;
+}
+
 /* A SINGLE PAGE'S BADGE: Chat and Work have no tab to carry one, so the area
  * button is where it shows. */
 clear();
@@ -286,6 +307,10 @@ out.badge_closed_area = {area: badgeOf(AREA_BTN.fleet),
                          section_visible: SECTION.fleet.classes.has("on")};
 navBadge("sessions", 5, false, "five");
 out.badge_sums = {area: badgeOf(AREA_BTN.fleet)};
+/* A FLOOR ROLLS UP AS A FLOOR (task/3723, walk 3 finding 2): a section whose
+ * count is "at least" carries its bound to the tab and to the area's sum. */
+navBadge("roster", 2, false, "at least two", "at_least");
+out.badge_floor = {area: badgeOf(AREA_BTN.fleet), section: badgeOf(TAB.roster)};
 navBadge("roster", "?", true, "unreadable");
 out.badge_unknown_wins = {area: badgeOf(AREA_BTN.fleet)};
 navBadge("roster", 0, false, "");

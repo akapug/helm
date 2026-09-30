@@ -251,8 +251,61 @@ def _api_projects_state(payload):
         return {"error": "registry UNKNOWN: %s" % exc}, 500
     if problem:
         return {"error": problem}, 400
+    # A LIGHT MOVES THE SHARES: a red one releases the project's share, so the
+    # teams leg is read again on the next board read (task/3156).
+    _forget_teams_leg()
     return {"ok": True, "name": row["name"], "was": row["was"],
             "state": row["state"]}, 200
+
+
+def _forget_teams_leg():
+    """Drop the board's kept teams reading, so the next board read is a fresh
+    one — a team or light the owner just wrote shows on his next read, never a
+    reading from before it."""
+    try:
+        from .web_cache import _drop
+        _drop("board:teams")
+    except Exception:                       # noqa: BLE001 — a cache, not truth
+        pass
+
+
+def _api_projects_team(payload):
+    """Save a project's team from its card (task/3156), GUI-first: the same
+    one-writer law as the light — this routes through the exact `teams.write`
+    that `helm team set --apply` calls, as "owner", so every refusal the verb
+    has the page has, in the same words.
+
+    `expected` is the version the card was showing. A save against a version
+    that has since moved is answered 409 `stale` and writes nothing: two tabs,
+    or a seat at the verb, must not turn one save into an overwrite nobody
+    saw. An invalid team, reason or project is 400 `invalid`. NOTHING HERE
+    ANSWERS `ok` WITHOUT A WRITE THAT LANDED."""
+    from . import teams
+    name = str(payload.get("name") or "").strip()
+    expected = payload.get("expected")
+    if not name:
+        return {"error": "name is required", "code": "invalid"}, 400
+    if isinstance(expected, bool) or not isinstance(expected, int):
+        return {"error": "expected (the version this card was showing) is "
+                         "required", "code": "invalid"}, 400
+    try:
+        row, problem, code = teams.write(
+            name, payload.get("team"), expected, by="owner",
+            reason=str(payload.get("reason") or "").strip(), apply=True)
+    except (OSError, ValueError) as exc:
+        return {"error": "The team was not saved, because the registry could "
+                         "not be read. An agent can repair it.",
+                "detail": "%s: %s" % (type(exc).__name__, exc),
+                "code": "failed"}, 500
+    if problem:
+        # 409 a version that moved, 503 a roster that did not read (nothing
+        # the owner can fix on the card), 400 a team the verb refuses
+        return {"error": problem, "code": code}, \
+            {"stale": 409, "unread": 503}.get(code, 400)
+    _forget_teams_leg()
+    return {"ok": True, "name": name, "v": row["v"], "team": row["team"],
+            "diff": row["diff"], "notice": row["notice"],
+            "posted": row["posted"]}, 200
 
 
 def _api_friction():
@@ -548,6 +601,12 @@ def _api_decisions():
             "verdict": r.get("verdict") or None,
             "comments": len(r.get("comments") or []),
             "dm_lost": lost,
+            # THE REV THIS PAGE DRAWS IS THE REV HIS YES NAMES (goal-ledger
+            # L1): the verdict POST sends it back, and a card that moved in
+            # between refuses the ruling. An unreadable rev is sent as null,
+            # which no ruling can match.
+            "rev": ownerasks.card_rev(r),
+            "revised_after_comment": bool(r.get("answering_comment_ts")),
         } for r, lost in rows]
         counts = {"open": sum(1 for e in entries if e["status"] == "open"),
                   "undelivered": sum(1 for e in entries
@@ -565,6 +624,14 @@ def _api_decisions():
 # a real opening sentence survives whole, small enough that 477 rows of them
 # stay a payload rather than a download.
 _TASK_NOTE_LINE = 240
+
+
+def _task_comment_count(tasks, row):
+    """How many comments a task row holds, archived ones included — the
+    store's count when it publishes one, the inline length otherwise."""
+    counter = getattr(tasks, "comment_count", None)
+    return (counter(row) if callable(counter)
+            else len(row.get("comments") or []))
 
 
 def _task_last_note(tasks, row):
@@ -668,6 +735,72 @@ def _task_wire_row(entry):
     return row
 
 
+def _task_entry(tasks, r, ages, of_row, owner_of=None):
+    """ONE task row as the console reads it — the projection BOTH task routes
+    serve (`/api/tasks` and `/api/backlog`), so a row reads the same on every
+    surface that draws it. `ages` is the read's clock (`tasks.row_ages` at
+    `read_at`), `of_row` the store's project reader, and `owner_of` the
+    store's holder reader (a placeholder word such as UNOWNED is no holder);
+    each has a land-order fallback at its caller."""
+    owner = (owner_of(r) if callable(owner_of)
+             else str(r.get("owner") or ""))
+    return dict(ages(r), **{
+        "id": str(r.get("id") or ""),
+        "title": str(r.get("title") or ""),
+        "status": str(r.get("status") or ""),
+        "ts": str(r.get("ts") or ""),
+        "last_updated": str(r.get("last_updated") or "") or None,
+        "owner": str(owner or "") or None,
+        "note": str(r.get("note") or "") or None,
+        "refs": [str(x) for x in (r.get("refs") or [])],
+        "source": str(r.get("source") or "") or None,
+        # WHOSE ROW THIS IS (task/974) — the label that makes two
+        # projects' consoles distinguishable. None = UNSCOPED legacy.
+        "project": of_row(r),
+        # PROVENANCE ON THE OWNER'S OWN SURFACE. The field is what the
+        # owner asked to see ("major requests FROM ME"), so shipping it
+        # to the CLI glyph alone would have been the AX-gain-without-a-
+        # UX-gain the standing canon names. TRI-STATE ON THE WIRE: None
+        # is UNKNOWN — the 251 legacy rows nobody witnessed as
+        # provenance — and the browser must not draw it as "agent".
+        # THROUGH tasks.origin_of, NOT the raw field: the real ledger
+        # holds 251 rows stamped with a migration's corpus tag, and
+        # forwarding that raw would hand the browser a FOURTH state while
+        # every consumer here is written against three. Normalized on
+        # read; the record itself is never rewritten.
+        "origin": tasks.origin_of(r),
+        # RANK ON THE WIRE, TRI-STATE LIKE ORIGIN ABOVE IT. None is
+        # UNRANKED — nobody has judged this row — and the browser must
+        # not draw it as P3: judged-lowest and unjudged are different
+        # answers, which is the whole reason the field refuses an eighth
+        # spelling. An unrecognised value normalizes to None here rather
+        # than travelling, so the card is written against four states
+        # plus absence and can never meet a fifth.
+        "priority": (str(r.get("priority"))
+                     if str(r.get("priority") or "")
+                     in getattr(tasks, "PRIORITIES", ()) else None),
+        "closed_reason": str(r.get("closed_reason") or "") or None,
+        # EVERY COMMENT, ARCHIVED ONES INCLUDED. A row that outgrew its
+        # budget keeps only its newest comments inline, so counting the
+        # inline list would shrink the card's number on every archive.
+        "comments": _task_comment_count(tasks, r),
+        # THE LAST NOTE, AS ONE LINE AND A STAMP (task/2622). The count
+        # above answers "is there anything written here"; it cannot answer
+        # "has anybody touched this in a month", which is the question the
+        # owner asked of a backlog he suspects is being ignored. So the
+        # card needs WHEN the newest note was written and enough of it to
+        # recognise — and the full prose stays on `/api/task/notes`, where
+        # that route's own docstring puts it: a first line is bounded, and
+        # folding whole arguments into a payload that carries every row is
+        # the growth this endpoint refuses.
+        #
+        # FIRST LINE, NEVER A TRUNCATED SENTENCE. A cut mid-word reads as
+        # a rendering fault; a first line is a thing the author wrote. The
+        # hard cap is the runaway guard for a note with no newline at all.
+        "last_note": _task_last_note(tasks, r),
+    })
+
+
 def _api_tasks():
     """The team task BACKLOG (#218 Half D) — the second section the work
     tab's socket was built for (worksections' recorded intent). Renders the
@@ -675,20 +808,14 @@ def _api_tasks():
     badge counts decisions only, twice-enforced (this surface never feeds
     board_queue, and helm.tasks exports no board projection at all; the
     19-row collapse at ownerasks.py:687-691 is the precedent both guards
-    answer). Land-order independent: helm.tasks may land after this surface,
-    and absent -> unavailable, never 500 and never an empty-looking backlog.
+    answer). Any failure, the import of helm.tasks included, is
+    unavailable with the exception class named: never 500 and never an
+    empty-looking backlog.
     THE STATE TRIAD IS LOAD-BEARING: empty means "no tasks"; unavailable
     means "cannot SEE the tasks" — drawing them the same tells the owner the
     fleet is idle at the exact moment it lost the ability to answer."""
     try:
-        try:
-            from . import tasks
-        except ImportError:
-            return {"unavailable": True,
-                    "why": "helm.tasks not landed on this trunk yet",
-                    "read_at": None, "queue": None,
-                    "entries": [], "unscoped": [], "counts": {},
-                    "withheld_foreign": 0, "project": None}
+        from . import tasks
         # ONE READ, AND ITS read_at TRAVELS WITH IT (task/2622). The counts,
         # the ordered rows and every age on this wire are one projection of
         # ONE snapshot taken at ONE instant, stamped so the two cells that
@@ -758,79 +885,18 @@ def _api_tasks():
         ages = ((lambda r: _ages(r, read_at)) if callable(_ages)
                 else (lambda r: {"ts_epoch": None, "age_s": None,
                                  "noted_age_s": None, "stale": False}))
-        entries = [dict(ages(r), **{
-            "id": str(r.get("id") or ""),
-            "title": str(r.get("title") or ""),
-            "status": str(r.get("status") or ""),
-            "ts": str(r.get("ts") or ""),
-            "last_updated": str(r.get("last_updated") or "") or None,
-            "owner": str(r.get("owner") or "") or None,
-            "note": str(r.get("note") or "") or None,
-            "refs": [str(x) for x in (r.get("refs") or [])],
-            "source": str(r.get("source") or "") or None,
-            # WHOSE ROW THIS IS (task/974) — the label that makes two
-            # projects' consoles distinguishable. None = UNSCOPED legacy.
-            "project": of_row(r),
-            # PROVENANCE ON THE OWNER'S OWN SURFACE. The field is what the
-            # owner asked to see ("major requests FROM ME"), so shipping it
-            # to the CLI glyph alone would have been the AX-gain-without-a-
-            # UX-gain the standing canon names. TRI-STATE ON THE WIRE: None
-            # is UNKNOWN — the 251 legacy rows nobody witnessed as
-            # provenance — and the browser must not draw it as "agent".
-            # THROUGH tasks.origin_of, NOT the raw field: the real ledger
-            # holds 251 rows stamped `corpus-2026-08-05` by a migration, and
-            # forwarding that raw would hand the browser a FOURTH state while
-            # every consumer here is written against three. Normalized on
-            # read; the record itself is never rewritten.
-            "origin": tasks.origin_of(r),
-            # RANK ON THE WIRE, TRI-STATE LIKE ORIGIN ABOVE IT. None is
-            # UNRANKED — nobody has judged this row — and the browser must
-            # not draw it as P3: judged-lowest and unjudged are different
-            # answers, which is the whole reason the field refuses an eighth
-            # spelling. An unrecognised value normalizes to None here rather
-            # than travelling, so the card is written against four states
-            # plus absence and can never meet a fifth.
-            "priority": (str(r.get("priority"))
-                         if str(r.get("priority") or "")
-                         in getattr(tasks, "PRIORITIES", ()) else None),
-            "closed_reason": str(r.get("closed_reason") or "") or None,
-            "comments": len(r.get("comments") or []),
-            # THE LAST NOTE, AS ONE LINE AND A STAMP (task/2622). The count
-            # above answers "is there anything written here"; it cannot answer
-            # "has anybody touched this in a month", which is the question the
-            # owner asked of a backlog he suspects is being ignored. So the
-            # card needs WHEN the newest note was written and enough of it to
-            # recognise — and the full prose stays on `/api/task/notes`, where
-            # that route's own docstring puts it: a first line is bounded, and
-            # folding whole arguments into a payload that carries every row is
-            # the growth this endpoint refuses.
-            #
-            # FIRST LINE, NEVER A TRUNCATED SENTENCE. A cut mid-word reads as
-            # a rendering fault; a first line is a thing the author wrote. The
-            # hard cap is the runaway guard for a note with no newline at all.
-            "last_note": _task_last_note(tasks, r),
-        }) for r in ordered]
-        # THE PROJECT AXIS ON THE OWNER SURFACE (task/974): this console
-        # renders ONE project's work and NAMES IT — the leak the owner
-        # measured was another project's row rendering as CONTRARY inside helm's
-        # own pipeline count. Scope = the same cwd→project lens the store and
-        # the task CLI use (tasks.current_project, guarded for land-order
-        # independence). FOREIGN rows are withheld as a COUNT, never served —
-        # the API leg must not leak them into this project's card. The
-        # UNSCOPED legacy bucket rides SEPARATELY, disclosed as such: every
-        # row filed before the axis is legacy, so hiding the bucket would
-        # blank the live board the owner reads today, and guessing a scope
-        # would retro-stamp history nobody witnessed. No derivable project =
-        # no scope: serve everything, project: null (the store's global-only
-        # fail-open).
-        axis = getattr(tasks, "current_project", None)
-        scope = axis() if callable(axis) else None
-        if scope:
-            shown = [e for e in entries if e["project"] == scope]
-            bucket = [e for e in entries if e["project"] is None]
-            foreign = len(entries) - len(shown) - len(bucket)
-        else:
-            shown, bucket, foreign = entries, [], 0
+        _owner = getattr(tasks, "owner_of", None)
+        entries = [_task_entry(tasks, r, ages, of_row, _owner)
+                   for r in ordered]
+        # EVERY PROJECT, NOTHING WITHHELD (task/3445 L1b). A route scoped to
+        # the console's cwd project, withholding the rest as a count, hides
+        # every other project's rows from that project's own Tasks tab (261
+        # live rows, measured). The console reads `/api/backlog`, which
+        # labels every row with its project and filters by it, so this route
+        # serves the whole ledger. `project`, `unscoped` and
+        # `withheld_foreign` keep their keys (null, empty, 0) so a reader of
+        # that shape still parses.
+        shown, bucket, foreign, scope = entries, [], 0, None
         # counts describe what the card RENDERS (scoped + unscoped bucket),
         # so the meta numbers and the visible rows cannot disagree; the
         # withheld population travels as its own named count.
@@ -861,7 +927,7 @@ def _api_tasks():
                "read_at": read_at, "queue": queue}
         json.dumps(out)   # unserializable shapes degrade too
         return out
-    except Exception:
+    except Exception as exc:              # noqa: BLE001 — reported UNKNOWN
         # THE DEGRADED SHAPE IS THE UNKNOWN SHAPE, FIELD FOR FIELD. A payload
         # that says `unavailable` and simply omits `queue` lets a consumer
         # fall through to whatever it drew last; `queue: None` and an empty
@@ -870,7 +936,8 @@ def _api_tasks():
         # clear". Same keys as the read-failure branch above, deliberately:
         # one absent-shape for one route, so a client written against either
         # can never meet the other.
-        return {"unavailable": True, "why": "task projection failed",
+        return {"unavailable": True,
+                "why": "task projection FAILED (%s)" % exc.__class__.__name__,
                 "read_at": None, "queue": None,
                 "entries": [], "unscoped": [], "counts": {},
                 "withheld_foreign": 0, "project": None}
@@ -897,11 +964,7 @@ def _api_task_notes(qs):
     NEVER TRUNCATED. A capped ruling is the same defect one layer down: he
     would be reading a decision that stops mid-sentence and could not tell
     that it had. If a row is big, it is big."""
-    try:
-        from . import tasks
-    except ImportError:
-        return {"unavailable": True,
-                "why": "helm.tasks not landed on this trunk yet"}, 200
+    from . import tasks
     rid = str((qs.get("id") or [""])[0]).strip()
     if not rid:
         return {"error": "id is required"}, 400
@@ -916,8 +979,10 @@ def _api_task_notes(qs):
     # which is loud and TRUE.
     try:
         rows, unavailable = tasks.snapshot()
-    except Exception:
-        return {"unavailable": True}, 200
+    except Exception as exc:              # noqa: BLE001 — reported UNKNOWN
+        return {"unavailable": True,
+                "why": "the task store could not be read (%s)"
+                       % exc.__class__.__name__}, 200
     if unavailable:
         # CANNOT SEE is not "no notes" — the state triad this file already
         # enforces for the backlog holds one row down too.
@@ -942,11 +1007,28 @@ def _api_task_notes(qs):
     # while the raw `ts` stays on the wire for any reader that wants what the
     # record literally holds. LAND-ORDER fallback: no parser, no claim.
     _parse = getattr(tasks, "stamp_epoch", None)
+    # THE WHOLE HISTORY, THROUGH THE STORE'S ONE READER. A row that outgrew
+    # its budget carries only its newest comments inline; `comments_of` reads
+    # the archived ones back, proves them, and stands a LOUD entry — its text
+    # says what is missing — in the place of anything it could not prove, so
+    # the card renders the loss without knowing archives exist.
+    # LAND-ORDER fallback: a store without the reader has no archives either.
+    _reader = getattr(tasks, "comments_of", None)
+    # WHO WROTE IT, IN THE STORE'S WORDS (goal-ledger D1). `author` is the
+    # store's label for each comment: the owner's note reads "owner (web)",
+    # and one the old door wrote with no author reads as legacy rather than
+    # a blank the page would have to guess about. `by` stays on the wire as
+    # the raw record. LAND-ORDER fallback: no labeller, no label.
+    _label = getattr(tasks, "comment_author", None)
     notes = [{"ts": str(c.get("ts") or ""),
               "ts_epoch": _parse(c.get("ts")) if callable(_parse) else None,
               "by": str(c.get("by") or "") or None,
-              "text": str(c.get("text") or "")}
-             for c in (row.get("comments") or []) if isinstance(c, dict)]
+              **({"author": _label(c)} if callable(_label) else {}),
+              "text": str(c.get("text") or ""),
+              **({"unreadable": True} if c.get("unreadable") else {})}
+             for c in (_reader(row) if callable(_reader)
+                       else row.get("comments") or [])
+             if isinstance(c, dict)]
     # AND THE ROW'S OWN NOTE, WHOLE, FOR THE SAME REASON THE COMMENTS ARE
     # HERE. `/api/tasks` now carries a bounded opening of `note` and flags the
     # rest with `note_more`, because unbounded prose on a payload that carries
@@ -963,20 +1045,24 @@ def _api_tasks_comment(payload):
     """An owner note on a task, GUI-first (the owner does not run CLI
     commands): same one-writer-path law as decisions — the POST routes
     through the exact tasks function the CLI calls, and the comment lives
-    IN the task row (the decisions precedent, ownerasks.py:532-533)."""
-    try:
-        from . import tasks
-    except ImportError:
-        return {"error": "helm.tasks not landed on this trunk yet"}, 400
+    IN the task row (the decisions precedent, ownerasks.py:532-533).
+
+    THE OWNER BY DESIGN (goal-ledger D1): this is his browser door, so it
+    mints the OwnerDoor and the note is recorded `by: owner, door: web`, the
+    shape his decision-card comments already carry. Before this the call
+    named no author and every note he typed here read as `?`. Same bearer
+    caveat and argv-guard as the decision handlers below."""
+    from . import tasks
+    from . import ownerasks
     rid = str(payload.get("id") or "").strip()
     text = str(payload.get("text") or "").strip()
     if not rid or not text:
         return {"error": "id and text are required"}, 400
-    row, problem = tasks.comment(rid, text)
+    row, problem = tasks.comment(rid, text, by=ownerasks.owner_door("web"))
     if not row:
         return {"error": problem}, 400
     out = {"ok": True, "id": str(row.get("id") or rid),
-           "comments": len(row.get("comments") or [])}
+           "comments": _task_comment_count(tasks, row)}
     if problem:
         out["warning"] = problem
     return out, 200
@@ -1000,9 +1086,24 @@ def _api_decisions_verdict(payload):
     choice = str(payload.get("choice") or "").strip()
     if not rid or not choice:
         return {"error": "id and choice are required"}, 400
+    # THE REV HIS PAGE DREW (goal-ledger L1). Absent is a page from before
+    # revisions, which could only have drawn rev 1, and `decide` reads None
+    # that way; anything else must be a whole number. `isdecimal`, not
+    # `isdigit`: "²" and "①" are digits to the latter and not numbers
+    # to int(), which let a ValueError out of this handler as a 500.
+    raw = payload.get("rev")
+    rev = None
+    if raw is not None:
+        text = str(raw).strip()
+        if isinstance(raw, bool) or not text.isdecimal():
+            return {"error": "rev must be the card's revision number, not %r"
+                             % (raw,)}, 400
+        rev = int(text)
     row, err = ownerasks.decide(rid, choice,
                                 comment=str(payload.get("comment") or ""),
-                                by=ownerasks.owner_door("web"))
+                                by=ownerasks.owner_door("web"), rev=rev)
+    if isinstance(err, ownerasks.StaleRev):
+        return {"error": str(err), "code": "stale_rev", "rev": err.rev}, 409
     if err:
         return {"error": err}, 400
     delivered, derr = ownerasks.deliver_verdict(rid)
@@ -1211,3 +1312,269 @@ def _api_ready():
     except Exception:                      # noqa: BLE001 — the gauge still renders
         return gauge
 del _web
+
+
+# ── /api/backlog — GET with query params (task/3445 slices L1a + L1b) ─────
+#
+# EVERY PROJECT'S TASKS, A PAGE AT A TIME. The owner asked for "all tasks
+# separated by project" and "pagination and other best practices that at least
+# github would have". So this read takes the filters a GitHub issue list takes,
+# counts every facet the page offers, and answers one page. The rows are the
+# SAME projection `/api/tasks` serves (`_task_entry`, then `_task_wire_row`),
+# so a row reads the same wherever the console draws it.
+
+_BACKLOG_DEFAULT_PAGE = 1
+_BACKLOG_DEFAULT_PER_PAGE = 50
+_BACKLOG_PER_PAGE_CAP = 200
+
+_VALID_STATUSES = frozenset({"open", "in_progress", "closed", "all"})
+# `unranked` is a row nobody has ranked: the filter token and the facet key are
+# one spelling, so the page sends back the key it was handed.
+_VALID_PRIORITIES = frozenset({"P0", "P1", "P2", "P3", "unranked", "all"})
+_VALID_SORTS = frozenset({"priority", "created", "oldest", "updated",
+                          "noted", "comments", "project", "id"})
+# GROUPED BY PROJECT, the owner's default view ("all tasks separated by
+# project"): each project a group with its count and its first rows
+_BACKLOG_PER_GROUP = 5
+_BACKLOG_PER_GROUP_CAP = 50
+# THE TWO ABSENCE TOKENS. A row with no project is the `none` bucket and a row
+# nobody holds is `unowned` — each a value a filter can select and a facet can
+# count, never a row the read drops.
+BACKLOG_NO_PROJECT = "none"
+BACKLOG_UNOWNED = "unowned"
+# the facets, in the order the page offers them
+_BACKLOG_DIMS = ("status", "priority", "project", "owner", "asked", "stale")
+
+
+def _parse_qs_int(qs, key, default, lo, hi):
+    """Read one int from qs['key'], return default in [lo, hi] range."""
+    raw = (qs.get(key) or [str(default)])[0]
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        val = default
+    return max(lo, min(hi, val))
+
+
+def _qs_set(qs, key, valid=None, default=""):
+    """A comma list from qs['key'] -> a set, or None when nothing is asked
+    (no filter). `all` anywhere means no filter; a value outside `valid`
+    selects nothing rather than being ignored, so a typo reads as zero rows
+    instead of as the whole backlog."""
+    raw = str((qs.get(key) or [default])[0] or "").strip()
+    got = {t.strip() for t in raw.split(",") if t.strip()}
+    if not got or "all" in got:
+        return None
+    return got & valid if valid is not None else got
+
+
+def _qs_flag(qs, key):
+    return str((qs.get(key) or [""])[0]).strip().lower() in ("1", "true",
+                                                              "yes", "on")
+
+
+def _backlog_facts(tasks, row, ages, of_row, owner_of):
+    """The fields every filter, facet and sort reads, computed ONCE per row."""
+    rank = row.get("priority")
+    owner = owner_of(row)
+    return {"status": str(row.get("status") or ""),
+            "priority": rank if rank in getattr(tasks, "PRIORITIES", ())
+            else "unranked",
+            "project": of_row(row) or BACKLOG_NO_PROJECT,
+            "owner": owner or BACKLOG_UNOWNED,
+            "asked": tasks.origin_of(row) == "owner",
+            "ages": ages(row)}
+
+
+def _backlog_hay(row):
+    """What the search box searches: the id, the title and the note."""
+    return " ".join(str(row.get(k) or "") for k in ("id", "title", "note")
+                    ).lower()
+
+
+def _api_backlog(qs):
+    """Every project's tasks, filtered, sorted, counted and paged.
+
+    Query params (all optional):
+      status    comma list of open, in_progress, closed, all (default all)
+      priority  comma list of P0, P1, P2, P3, unranked, all
+      project   comma list of project keys; `none` is the rows with none
+      owner     comma list of seats (case-insensitive, exact); `unowned`
+      asked     1 = only the rows the owner asked for (origin owner)
+      stale     1 = only the rows nobody has written on in seven days
+      q         words that must all appear in the id, title or note
+      sort      priority (the board order `helm task list` prints), created
+                (newest first, GitHub's order), oldest, updated (latest
+                first), noted (the longest silent first), comments (most
+                first), project (by project, then priority), id
+      page      1-based page; per_page 1..200 (default 50)
+      group     project = answer `groups` instead of a page: one per project
+                (the `none` bucket included), largest first, each
+                {key, count, entries} with its first per_group (1..50,
+                default 5) rows in the sort
+
+    Answers {entries, total_count, total_pages, page, per_page, sort, facets,
+    queue, scope_count, read_at}:
+      facets       per filter, the counts each choice WOULD select with every
+                   other filter kept (so a menu can show "P1 40" while P0 is
+                   picked): status, priority, project and owner are {value: n};
+                   asked and stale are the n that toggle would select
+      queue        `tasks.queue_totals` over the rows every filter but status
+                   and priority keeps: the headline the page draws
+      scope_count  the rows the status and project filters keep: the "of N"
+                   in "showing 4 of N"
+    A read that cannot see the ledger is {unavailable: true, why} with every
+    count unknown, never an empty backlog.
+    """
+    try:
+        from . import tasks
+    except ImportError as exc:
+        return _backlog_unknown("task projection FAILED (%s)"
+                                % exc.__class__.__name__), 200
+    read_at = time.time()
+    rows, unavailable = tasks.snapshot()
+    if unavailable:
+        return _backlog_unknown(str(unavailable)), 200
+
+    want = {"status": _qs_set(qs, "status", _VALID_STATUSES - {"all"}),
+            "priority": _qs_set(qs, "priority", _VALID_PRIORITIES - {"all"}),
+            "project": _qs_set(qs, "project"),
+            "owner": {o.casefold() for o in _qs_set(qs, "owner") or ()}
+            or None,
+            "asked": _qs_flag(qs, "asked") or None,
+            "stale": _qs_flag(qs, "stale") or None}
+    terms = str((qs.get("q") or [""])[0]).lower().split()
+    sort = str((qs.get("sort") or ["priority"])[0])
+    sort = sort if sort in _VALID_SORTS else "priority"
+    per_page = _parse_qs_int(qs, "per_page", _BACKLOG_DEFAULT_PER_PAGE, 1,
+                             _BACKLOG_PER_PAGE_CAP)
+    page = _parse_qs_int(qs, "page", _BACKLOG_DEFAULT_PAGE, 1, 10**6)
+
+    of_row = getattr(tasks, "project_of_row", None) or (
+        lambda r: str(r.get("project") or "").strip() or None)
+    _owner = getattr(tasks, "owner_of", None)
+    owner_of = _owner if callable(_owner) else (
+        lambda r: str(r.get("owner") or "").strip())
+    _ages = getattr(tasks, "row_ages", None)
+    ages = ((lambda r: _ages(r, read_at)) if callable(_ages)
+            else (lambda r: {"ts_epoch": None, "age_s": None,
+                             "noted_age_s": None, "stale": False}))
+    _order = getattr(tasks, "board_order", None)
+    ordered = [r for r in (_order(rows) if callable(_order) else
+                           sorted(rows.values(),
+                                  key=(getattr(tasks, "rank_key", None)
+                                       or tasks.sort_key)))
+               if isinstance(r, dict)]
+
+    # ONE PREDICATE PER FILTER, each asked of the row's facts once, so a
+    # facet can drop exactly its own filter and keep every other.
+    def hits(f, row):
+        return {
+            "status": want["status"] is None or f["status"] in want["status"],
+            "priority": want["priority"] is None
+            or f["priority"] in want["priority"],
+            "project": want["project"] is None
+            or f["project"] in want["project"],
+            "owner": want["owner"] is None
+            or f["owner"].casefold() in want["owner"],
+            "asked": not want["asked"] or f["asked"],
+            "stale": not want["stale"] or f["ages"].get("stale") is True,
+            "q": not terms or all(t in _backlog_hay(row) for t in terms)}
+
+    facets = {"status": {}, "priority": {}, "project": {}, "owner": {},
+              "asked": 0, "stale": 0}
+    shown, queue_rows, scope_count, facts = [], [], 0, {}
+    for row in ordered:
+        f = _backlog_facts(tasks, row, ages, of_row, owner_of)
+        h = hits(f, row)
+        fails = [k for k, ok in h.items() if not ok]
+        if not fails:
+            shown.append(row)
+            facts[id(row)] = f
+        if h["status"] and h["project"]:
+            scope_count += 1
+        if not [k for k in fails if k not in ("status", "priority")]:
+            queue_rows.append(row)
+        # A ROW COUNTS TOWARD A FACET WHEN ONLY THAT FACET'S OWN FILTER (or
+        # nothing) turns it away
+        for dim in _BACKLOG_DIMS:
+            if [k for k in fails if k != dim]:
+                continue
+            if dim == "asked":
+                facets["asked"] += f["asked"]
+            elif dim == "stale":
+                facets["stale"] += f["ages"].get("stale") is True
+            else:
+                key = f[dim]
+                facets[dim][key] = facets[dim].get(key, 0) + 1
+
+    shown = _backlog_sorted(tasks, shown, facts, sort, read_at)
+    total_count = len(shown)
+    total_pages = max(1, (total_count + per_page - 1) // per_page)
+    start = (page - 1) * per_page
+    _totals = getattr(tasks, "queue_totals", None)
+    wire = lambda r: _task_wire_row(_task_entry(tasks, r, ages, of_row,
+                                                owner_of))
+    out = {"entries": [wire(r) for r in shown[start:start + per_page]],
+           "total_count": total_count, "total_pages": total_pages,
+           "page": page, "per_page": per_page, "sort": sort,
+           "facets": facets, "scope_count": scope_count,
+           "queue": (_totals(queue_rows, read_at) if callable(_totals)
+                     else None),
+           "read_at": read_at}
+    if str((qs.get("group") or [""])[0]) == "project":
+        per_group = _parse_qs_int(qs, "per_group", _BACKLOG_PER_GROUP, 1,
+                                  _BACKLOG_PER_GROUP_CAP)
+        runs = {}
+        for r in shown:
+            runs.setdefault(facts[id(r)]["project"], []).append(r)
+        out.update(entries=[], page=1, total_pages=1, groups=[
+            {"key": key, "count": len(run),
+             "entries": [wire(r) for r in run[:per_group]]}
+            for key, run in sorted(runs.items(),
+                                   key=lambda kv: (-len(kv[1]), kv[0]))])
+    json.dumps(out)
+    return out, 200
+
+
+def _backlog_unknown(why):
+    """The UNKNOWN shape: every count unknown, never an empty backlog."""
+    return {"unavailable": True, "why": why, "read_at": None, "entries": [],
+            "facets": {}, "queue": None, "scope_count": None,
+            "total_count": None, "total_pages": None, "page": 1}
+
+
+def _backlog_sorted(tasks, shown, facts, sort, read_at):
+    """`shown` (already in board order) in the order `sort` names. Every sort
+    breaks its ties by the board order, so one read pages the same way twice;
+    a row whose stamp cannot be read sorts after every dated one."""
+    if sort == "priority":
+        return shown
+    ages = lambda r: facts[id(r)]["ages"]
+    _stamp = getattr(tasks, "stamp_epoch", None)
+
+    def dated(value, newest_first):
+        return ((1, 0.0) if value is None
+                else (0, -value if newest_first else value))
+
+    def updated(r):
+        noted = ages(r).get("noted_age_s")
+        seen = [read_at - noted] if noted is not None else []
+        if callable(_stamp):
+            got = _stamp(r.get("last_updated"))
+            seen += [got] if got is not None else []
+        return max(seen) if seen else None
+
+    def number(r):
+        tail = str(r.get("id") or "").rsplit("/", 1)[-1]
+        return (0, int(tail), "") if tail.isdigit() else (1, 0, tail)
+
+    key = {"created": lambda r: dated(ages(r).get("ts_epoch"), True),
+           "oldest": lambda r: dated(ages(r).get("ts_epoch"), False),
+           "updated": lambda r: dated(updated(r), True),
+           "noted": lambda r: dated(ages(r).get("noted_age_s"), True),
+           "comments": lambda r: -_task_comment_count(tasks, r),
+           "project": lambda r: (facts[id(r)]["project"] == BACKLOG_NO_PROJECT,
+                                 facts[id(r)]["project"]),
+           "id": number}[sort]
+    return sorted(shown, key=key)

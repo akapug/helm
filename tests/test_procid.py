@@ -168,6 +168,66 @@ class ExeRungTest(ProcFixture):
                         "the comm rung is unchanged — this is the PRE-EXISTING "
                         "surface, neither widened nor narrowed here")
 
+    def test_a_claude_binary_execd_as_ugrep_is_not_a_seat_process(self):
+        """exec -a ugrep keeps the Claude exe. is_claude still says yes;
+        the seat gate must say no, or the orphan is the seat."""
+        self.plant(4010, exe="/home/x/.local/share/claude/versions/2.1.283",
+                   comm="ugrep")
+        self.assertEqual(procid.exe_of(4010),
+                         "/home/x/.local/share/claude/versions/2.1.283")
+        self.assertTrue(procid.is_claude(4010, b"ugrep"))
+        self.assertIs(procid.is_seat_process(4010, b"ugrep"), False)
+
+    def test_a_node_exe_is_not_a_seat_process(self):  # noqa: VACUOUS_ASSERTION — control is pid 4111: a versioned claude exe is a seat before this node exe is refused
+        self.plant(4111, exe="/home/x/.local/share/claude/versions/2.1.283",
+                   comm="2.1.283")
+        self.assertIs(procid.is_seat_process(4111, b"2.1.283"), True)
+        self.plant(4011, exe="/home/x/.nvm/versions/node/v22.22.0/bin/node",
+                   comm="node")
+        self.assertIs(procid.exe_is_node(4011), True)
+        self.assertIs(procid.is_seat_process(4011, b"node"), False)
+        self.assertIs(procid.is_claude(4011, b"node"), False)
+
+    def test_an_npm_claude_whose_exe_is_node_is_a_seat_process(self):  # noqa: VACUOUS_ASSERTION — control is pid 4115: a versioned claude exe is a seat, and pid 4016 comm node stays refused
+        """An npm install is a node binary whose process.title is claude.
+        Trunk admitted that comm. Refusing every node exe first drops
+        the seat, which is a false DEAD."""
+        self.plant(4115, exe="/home/x/.local/share/claude/versions/2.1.283",
+                   comm="2.1.283")
+        self.assertIs(procid.is_seat_process(4115, b"2.1.283"), True)
+        node = "/home/x/.nvm/versions/node/v22.22.0/bin/node"
+        self.plant(4015, exe=node, comm="claude")
+        self.assertIs(procid.exe_is_node(4015), True)
+        self.assertIs(procid.exe_is_claude(4015), False)
+        self.assertIs(procid.is_seat_process(4015, b"claude"), True)
+        self.assertIs(procid.is_claude(4015, b"claude"), True)
+        self.plant(4016, exe=node, comm="node")
+        self.assertIs(procid.is_seat_process(4016, b"node"), False)
+        self.plant(4017, exe="/usr/bin/sleep", comm="claude")
+        self.assertIs(procid.is_seat_process(4017, b"claude"), False)
+
+    def test_an_unreadable_exe_with_a_tool_comm_is_not_a_seat(self):  # noqa: VACUOUS_ASSERTION — control is pid 4112: a readable versioned claude exe is a seat before the tool comm is refused
+        self.plant(4112, exe="/home/x/.local/share/claude/versions/2.1.283",
+                   comm="2.1.283")
+        self.assertIs(procid.is_seat_process(4112, b"2.1.283"), True)
+        self.plant(4012, comm="timeout")
+        self.assertIsNone(procid.exe_of(4012))
+        self.assertIs(procid.is_seat_process(4012, b"timeout"), False)
+
+    def test_a_versioned_comm_with_an_unreadable_exe_stays_unknown(self):  # noqa: VACUOUS_ASSERTION — control is pid 4113: same call, exe readable, is_seat_process True
+        """The false-DEAD third state belongs to the seat gate too."""
+        self.plant(4013, comm="2.1.283")
+        self.plant(4113, exe="/x/claude/versions/2.1.283", comm="2.1.283")
+        self.assertIs(procid.is_seat_process(4113, b"2.1.283"), True)
+        self.assertIsNone(procid.is_seat_process(4013, b"2.1.283"))
+
+    def test_comm_claude_with_an_unreadable_exe_stays_a_seat(self):  # noqa: VACUOUS_ASSERTION — the positive is is_seat_process True on this same pid; exe_of None is the permission fact, not the verdict
+        """A later unreadable cmdline must still surface as UNKNOWN, which
+        requires this pid to have passed the seat gate on comm alone."""
+        self.plant(4014, comm="claude")
+        self.assertIsNone(procid.exe_of(4014))
+        self.assertIs(procid.is_seat_process(4014, b"claude"), True)
+
 
 class PidIsClaudeTest(ProcFixture):
     """The gate that actually returned the false DEAD."""
@@ -317,6 +377,60 @@ class CensusVerdictTest(ProcFixture):
         # the row is REAL, not an empty shell that happens to be non-None
         self.assertEqual(row["pid"], 4303)
         self.assertIn("start", row)
+
+
+class LocksTableTest(ProcFixture):
+    """procid.locks — /proc/locks parsed as (kind, pid, device, inode).
+
+    The kernel writes the locked file's device as hex major:minor before
+    the decimal inode, and a blocked waiter's line carries an extra '->'
+    token that shifts every column after it right by one — so the device
+    field is found by its SHAPE, not its position. The line shapes below
+    are the kernel's own, byte for byte."""
+
+    def _read(self, text, name="locks"):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w") as f:
+            f.write(text)
+        return procid.locks(p)
+
+    def test_the_device_is_makedev_hex_and_the_inode_decimal(self):
+        """Measured lines: /tmp (major 259, minor 5) prints "103:05:<ino>"
+        and /dev/shm (major 0, minor 27) prints "00:1b:<ino>". Both must
+        come back as their st_dev integer."""
+        rows = self._read(
+            "1: FLOCK  ADVISORY  WRITE 7072 103:05:53625209 0 EOF\n"
+            "2: POSIX  ADVISORY  WRITE 82026 00:1b:11 0 EOF\n")
+        self.assertEqual(rows[0]["kind"], "FLOCK")
+        self.assertEqual(rows[0]["pid"], 7072)
+        self.assertEqual(rows[0]["dev"], os.makedev(0x103, 0x05))
+        self.assertEqual(rows[0]["ino"], 53625209)
+        self.assertFalse(rows[0]["waiter"])
+        self.assertEqual(rows[1]["kind"], "POSIX")
+        self.assertEqual(rows[1]["dev"], os.makedev(0, 0x1b))
+        self.assertEqual(rows[1]["ino"], 11)
+
+    def test_a_waiters_line_is_parsed_not_skipped_and_marked(self):
+        """The '->' shifts the pid and device field right by one: col 6 is
+        now the pid, col 7 the device. A parser that indexed the old
+        columns would take the pid from the wrong slot — or, worse, drop
+        the line — and a waiter's lock is a real lock a holder test must
+        see. The waiter flag is what lets the reader say 'queued behind',
+        not 'holding'."""
+        rows = self._read(
+            "1: -> FLOCK  ADVISORY  WRITE 7080 00:1b:11 0 EOF\n")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pid"], 7080)
+        self.assertEqual(rows[0]["dev"], os.makedev(0, 0x1b))
+        self.assertEqual(rows[0]["ino"], 11)
+        self.assertTrue(rows[0]["waiter"])
+
+    def test_an_unreadable_table_is_none_not_empty(self):  # noqa: VACUOUS_ASSERTION — the two positive arms above parse real lines; this one pins that the absence is None, not an empty table
+        """A vanished /proc/locks must read as declining to answer, never
+        as 'nobody holds anything': a caller that turned the empty list
+        into a verdict would name no holder for a genuinely wedged lock,
+        and the diagnostic that raises or refuses is the one that lies."""
+        self.assertIsNone(procid.locks(os.path.join(self.tmp, "no-such")))
 
 
 if __name__ == "__main__":

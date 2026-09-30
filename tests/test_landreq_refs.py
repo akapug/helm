@@ -51,7 +51,8 @@ class RefsAuditTest(unittest.TestCase):
         _git(self.repo, "init", "-q")
         _git(self.repo, "config", "user.email", "t@example.invalid")
         _git(self.repo, "config", "user.name", "t")
-        open(os.path.join(self.repo, "f"), "w").write("x")
+        with open(os.path.join(self.repo, "f"), "w") as fh:
+            fh.write("x")
         _git(self.repo, "add", "f")
         _git(self.repo, "commit", "-qm", "one")
         self.sha = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
@@ -403,7 +404,8 @@ class RefReadArgvSpellingTest(unittest.TestCase):
         self.assertEqual([], self._handrolled(using_constant))
 
     def test_no_ref_read_in_landreq_hand_rolls_its_argv(self):
-        src = open(landreq.__file__, encoding="utf-8").read()
+        with open(landreq.__file__, encoding="utf-8") as fh:
+            src = fh.read()
         # THE UNCONDITIONAL POSITIVE CONTROL, on the SAME observable and the
         # SAME source text: inject one hand-rolled call into the real module's
         # source and require the scan to find exactly it. An empty result from

@@ -222,8 +222,8 @@ def _pair_misbound(snapshot, target):
                 % foreign[0])
     if (target.get("family") == fam and target["account"]
             and target["account"] != snapshot["account"]):
-        return ("its token bytes are the ones the current occupant (%s) "
-                "holds live" % target["account"])
+        return ("its token bytes are live in the home whose %s"
+                % _cred.metadata_says(target["account"], target["real"]))
     return None
 
 

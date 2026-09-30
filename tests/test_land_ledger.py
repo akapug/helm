@@ -645,8 +645,9 @@ class CarrierProofLedgerTest(LedgerBase):
         # to the same byte count and with the mtime restored to the nanosecond.
         # Trailing space before the newline is JSON-legal and the reader strips
         # it, so the padding changes the bytes and not the record.
-        other = dict(json.loads(open(path, encoding="utf-8").read().strip()),
-                     proof=landreq.PROOF_ABSENT)
+        with open(path, encoding="utf-8") as fh:
+            other = dict(json.loads(fh.read().strip()),
+                         proof=landreq.PROOF_ABSENT)
         body = json.dumps(other, sort_keys=True)
         pad = st.st_size - len(body.encode("utf-8")) - 1
         self.assertGreaterEqual(
@@ -2165,6 +2166,32 @@ class FrontierProofAsksAncestryFirstTest(LedgerBase):
             self.assertEqual(self.annotate(_tip), landreq.PROOF_ANCESTOR)
             self.assertEqual(self.annotate(absent), landreq.PROOF_UNKNOWN,
                              "an unanswerable batch manufactured an ancestor")
+
+    def test_existence_is_asked_about_the_sha_never_by_listing(self):
+        """task/3090. The `--git-dir` twin asked "is this unreachable tip
+        present" by listing every object in the repository; it asks the one
+        sha now. All three answers survive, and no process lists the store.
+
+        LOAD-BEARING MUTATION: restore the `--batch-all-objects` listing.
+          -> AssertionError: listed every object to ask about one sha
+        """
+        tip, stranded, trunk = self.world()
+        seen, real = [], subprocess.Popen
+
+        def spy(argv, *a, **kw):
+            seen.append(tuple(str(x) for x in argv))
+            return real(argv, *a, **kw)
+        cases = ((tip, landreq.ANCESTOR), (stranded, landreq.NOT_ANCESTOR),
+                 ("c" * 40, landreq.UNDETERMINED))
+        with mock.patch.object(subprocess, "Popen", side_effect=spy):
+            for sha, want in cases:
+                with projscope.scope():
+                    self.assertEqual(
+                        landreq._batched_ancestry(self.gitdir, sha, trunk),
+                        want, sha)
+        self.assertTrue(seen, "the spy saw no process, so it measures nothing")
+        self.assertFalse([a for a in seen if "--batch-all-objects" in a],
+                         "listed every object to ask about one sha")
 
 
 if __name__ == "__main__":

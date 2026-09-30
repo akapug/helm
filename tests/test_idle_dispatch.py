@@ -3,6 +3,7 @@
 recipient). Hermetic: dispatches.open_rows, presence, claims, derive_seat, and
 dm are all patched, so no ledger/roster/chat node is touched. Verifies the
 watchdog flags EXACTLY the stranded dispatches and DMs the resolved sender."""
+import json
 import os
 import shutil
 import tempfile
@@ -16,6 +17,12 @@ from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-idle-", var="HELM_HOME")
 
 from helm import idle_dispatch, proxywatch  # noqa: E402
+
+# THE REAL OPEN-ROW READER, taken before any fixture patches it, for the arms
+# that must meet an unreadable ledger the way production does: through the
+# real reader over a real path, never a fixture that decides what
+# "unreadable" returns.
+_REAL_OPEN_ROWS = idle_dispatch.dispatches.open_rows
 
 
 def _row(rid, recipient, source="sess-oi", sender=None, deadline_s=2700):
@@ -64,6 +71,23 @@ class ProviderWallOnAStrandedRowTest(unittest.TestCase):
         self.assertIn("cannot derive whether a restart", got)
         self.assertNotIn("restart does not repair", got)
         self.assertIn("cannot tell whether reassignment", got)
+
+    def test_only_an_auth_state_says_stranded_on_auth(self):
+        """The row now carries the canary's detail, and a detail is vendor
+        prose: a RATE-LIMITED wall whose body happens to say OAUTH is not
+        stranded on auth. The STATE decides, never a word in the detail."""
+        rem = {"restart": "UNKNOWN", "target": None,
+               "evidence": "restart effect unmeasured", "action": None}
+        rate = self.wall({"state": "WALLED", "remediation": rem,
+                          "blocked_on": "upstream RATE-LIMITED since T — "
+                                        "HTTP 429 OAUTH token bucket empty"})
+        self.assertIn("RATE-LIMITED", rate)
+        self.assertNotIn("stranded on auth", rate)
+        auth = self.wall({"state": "WALLED", "remediation": rem,
+                          "blocked_on": "upstream AUTH-401 since T — port "
+                                        "8502: 10 requests failed on "
+                                        "upstream auth"})
+        self.assertIn("stranded on auth", auth)
 
     def test_a_proxy_cooldown_says_restart_can_help_on_the_same_path(self):
         got = self.wall({"state": "WALLED",
@@ -156,7 +180,7 @@ class IdleDispatchBase(unittest.TestCase):
         self.dm_result = None   # None => the real success shape (row, None)
         self.p = mock.patch.multiple(
             "helm.idle_dispatch.dispatches",
-            open_rows=mock.Mock(side_effect=lambda: list(self.rows)),
+            open_rows=mock.Mock(side_effect=lambda snap=None: list(self.rows)),
             _age_s=mock.Mock(side_effect=lambda r, now=None: self.age),
             _is_overdue=mock.Mock(side_effect=lambda r, now=None: self.age >= r["deadline_s"]),
         )
@@ -315,7 +339,13 @@ class IdleDispatchTest(IdleDispatchBase):
         The old check tested ONE key, `dispatch:<id8>`, then generalised the
         miss to a sentence about the seat. On the live estate that day: 21 live
         claims, every one a `worktree:…` key, ZERO `dispatch:…` keys — so the
-        clause was false for essentially every seat actually working."""
+        clause was false for essentially every seat actually working.
+
+        AND THE SENDER IS NOT DMd AT ALL (task/3161). Its decision about
+        a quiet holder is "do nothing": the rescue belongs to the watchdogs
+        that own wedged seats, and a hold nobody renews lapses into STRANDED
+        when its lease expires. So the reassign recommendation cannot reach
+        the sender for a holder because no message does."""
         self.rows = [_row("a1a1a1a1aaaa", "codex-3")]
         self.presence = {"codex-3": "quiet"}
         self.claims = {"worktree:helm:lr-close-delivered-report":
@@ -325,13 +355,16 @@ class IdleDispatchTest(IdleDispatchBase):
         self.assertEqual(f["claim"], idle_dispatch.CLAIM_HOLDING)
         self.assertFalse(f["stranded"])
         self.assertIn("worktree:helm:lr-close-delivered-report", f["held"])
-        to, text = self.dms[0]
-        self.assertIn("QUIET BUT HOLDING", text)
-        self.assertIn("RESCUE, do not reassign", text)
-        self.assertIn("worktree:helm:lr-close-delivered-report", text)
-        # the verdict AND the recommendation that would have cost the afternoon
-        self.assertNotIn("is STRANDED", text)
-        self.assertNotIn("Re-check or reassign", text)
+        self.assertEqual(res["alerted"], [], "a quiet holder was alerted")
+        self.assertEqual(self.dms, [], "a quiet holder's sender was DMd: %r"
+                         % (self.dms,))
+        # UNCONDITIONAL POSITIVE CONTROL on the same observable: the SAME row
+        # with the claim released is STRANDED and its sender IS DMd, so the
+        # silence above is about holding and not a dead sender leg.
+        self.claims = {}
+        idle_dispatch.check()
+        self.assertEqual(len(self.dms), 1, "the sender leg is dead")
+        self.assertIn("is STRANDED", self.dms[0][1])
 
     def test_quiet_recipient_holding_nothing_is_still_stranded(self):
         """The guard must not block everything: a genuinely stranded row —
@@ -423,31 +456,33 @@ class IdleDispatchTest(IdleDispatchBase):
         self.assertIn("UNKNOWN", text)
         self.assertNotIn("Re-check or reassign", text)
 
-    def test_context_pressure_rides_a_holding_alert(self):
+    def test_context_pressure_rides_a_holding_finding(self):
         """What the codex-3 case ACTUALLY was: out of window, pane alive. The
-        gauge is already computed by autocompact; surfacing it on the alert is
-        what turns "why is a working seat quiet?" into an answer."""
+        gauge is already computed by autocompact; surfacing it on the finding
+        (the report and --json, since a holder DMs nobody) is what
+        turns "why is a working seat quiet?" into an answer."""
         self.rows = [_row("f6f6f6f6ffff", "codex-3")]
         self.presence = {"codex-3": "quiet"}
         self.claims = {"worktree:helm:lr": {"holder": "codex-3"}}
         with mock.patch("helm.autocompact.read",
                         return_value={"pct": 100.1, "window": 320000}):
-            idle_dispatch.check()
-        text = self.dms[0][1]
-        self.assertIn("100.1%", text)
-        self.assertIn("320k window", text)
+            f = idle_dispatch.check()["findings"][0]
+        self.assertEqual(f["claim"], idle_dispatch.CLAIM_HOLDING)
+        self.assertIn("100.1%", f["context"])
+        self.assertIn("320k window", f["context"])
 
-    def test_a_broken_context_gauge_never_suppresses_the_alert(self):
-        """A context read is one more FACT on an alert that already fired; it
-        must never be able to swallow one. The stranded-work signal outranks
-        every convenience riding on it."""
+    def test_a_broken_context_gauge_never_suppresses_the_finding(self):
+        """A context read is one more FACT on a finding; it must never be able
+        to swallow one. The stranded-work signal outranks every convenience
+        riding on it."""
         self.rows = [_row("a7a7a7a7aaaa", "codex-3")]
         self.presence = {"codex-3": "quiet"}
         self.claims = {"worktree:helm:lr": {"holder": "codex-3"}}
         with mock.patch("helm.autocompact.read", side_effect=RuntimeError("x")):
             res = idle_dispatch.check()
-        self.assertTrue(res["findings"])
-        self.assertIn("QUIET BUT HOLDING", self.dms[0][1])
+        self.assertEqual([f["claim"] for f in res["findings"]],
+                         [idle_dispatch.CLAIM_HOLDING])
+        self.assertEqual(res["findings"][0]["context"], "")
 
     def test_latched_once_per_episode_then_rearms(self):
         self.rows = [_row("aaaaaaaa1111", "ds4pro")]
@@ -471,10 +506,6 @@ class IdleDispatchTest(IdleDispatchBase):
         res = idle_dispatch.check(post=True)               # a real run still alerts
         self.assertEqual(len(self.dms), 1)
         self.assertEqual(len(res["alerted"]), 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class OneInstantPerScanTest(unittest.TestCase):
@@ -549,21 +580,21 @@ class ALivePaneIsNotStrandedTest(unittest.TestCase):
 
     Measured 2026-08-05, twice within one hour on the SAME seat: codex-2 was
     reported STRANDED while seat_liveness said IDLE on pane-tail evidence.
-    Two agents independently repeated the claim before either checked."""
+    Two agents independently repeated the claim before either checked.
+
+    A LIVE PANE HANDS THE SENDER A DECISION ONLY WHEN NOTHING CAN WAKE IT
+    (task/3161). Its act is a wake. Leg B sends that wake to the recipient
+    when a beacon is armed, and then the sender has nothing to do. With no
+    armed beacon a DM reaches nobody, so the pane needs tending or the row a
+    reassign, and that is the sender's to arrange: it is told, and told
+    again at the backoff cap for as long as nothing can wake the pane.
+    These arms pin the decision, the text and the facts."""
 
     def _finding(self, **over):
         f = {"sender": "me", "id8": "abc12345", "lane": "review",
              "recipient": "codex-9", "presence": "absent", "age_min": 37,
              "overdue": False, "claim": idle_dispatch.CLAIM_NONE,
-             "held": [], "context": "", "wall": "", "live_pane": "",
-             # EXPLICIT, THOUGH IT IS ALSO WHAT AN OMITTED KEY WOULD YIELD.
-             # A fixture that names no wake route IS an unmeasured one, so
-             # UNKNOWN is the faithful default rather than a convenient one.
-             # Spelling it out is the point: without this line every arm here
-             # exercises the UNKNOWN branch by silent omission, and an arm
-             # whose branch is decided by a key nobody wrote is one nobody
-             # re-reads. An arm that means ARMED or NONE now has to say so.
-             "wake_route": idle_dispatch.WAKE_UNKNOWN}
+             "held": [], "context": "", "wall": "", "live_pane": ""}
         f.update(over)
         return f
 
@@ -574,44 +605,56 @@ class ALivePaneIsNotStrandedTest(unittest.TestCase):
                                              "evidence": evidence}):
             return idle_dispatch._live_pane("codex-9")
 
-    def test_a_LIVE_recipient_is_called_WORKING_and_never_STRANDED(self):
-        """THE WORD IS THE PART A READER ACTS ON.
+    def test_the_SENDER_DECISION_for_every_claim_state(self):
+        """Three decisions and two silences. STRANDED and CLAIM-UNKNOWN each
+        hand the sender something to do. A WORKING row whose recipient leg B
+        can wake does not: both halves of STRANDED are the NORMAL CONDITION of
+        a working reviewer (presence goes quiet 120s after a tool boundary
+        while a whole-suite gate runs ~835s, and reviewing takes no worktree
+        lease), so a MEASURED live pane outranks an inference drawn from two
+        absences, and its wake is leg B's. A WORKING row leg B CANNOT wake
+        does: no DM reaches that pane, so without the sender nobody acts on
+        it. HOLDING does not: a holder is never reassigned.
 
-        Appending a contradicting fact to an alert headed STRANDED leaves the
-        reader to choose between them, and the prescribed disposition for
-        STRANDED is the destructive one. Both halves of that state are the
-        NORMAL CONDITION of a working reviewer: presence goes quiet 120s after
-        a tool boundary while a whole-suite gate on this fleet runs ~835s, and
-        reviewing, rebasing, retipping and gating take no worktree lease. Their
-        conjunction is therefore the steady state of the role rather than a
-        signal about it, and a MEASURED live pane is a positive reading that
-        outranks an inference drawn from two absences."""
-        text = idle_dispatch._alert_text(
-            self._finding(live_pane=self._pane("RUNNING")))
-        self.assertIn("NOT stranded", text)
-        self.assertNotIn("is STRANDED", text,
-                         "the headline still says STRANDED about a recipient "
-                         "the same alert calls live: %r" % (text,))
-        self.assertIn("WAKE", text)
-        # the tail already carries the disposition; the headline must not
-        # re-state it, so this asserts the SHARED wording, not new prose
-        self.assertIn("DO NOT reassign", text)
+        AN UNRECOGNISED STATE READS AS THE SAFE DECISION, never as silence and
+        never as the reassign text."""
+        live = self._pane("RUNNING")
+        cases = ((dict(claim=idle_dispatch.CLAIM_NONE),
+                  idle_dispatch.ACT_STRANDED),
+                 (dict(claim=idle_dispatch.CLAIM_NONE, live_pane=live,
+                       wakeable=True), ""),
+                 (dict(claim=idle_dispatch.CLAIM_NONE, live_pane=live,
+                       wakeable=False), idle_dispatch.ACT_UNWAKEABLE),
+                 (dict(claim=idle_dispatch.CLAIM_HOLDING,
+                       held=["worktree:helm:x"]), ""),
+                 (dict(claim=idle_dispatch.CLAIM_UNKNOWN),
+                  idle_dispatch.ACT_UNKNOWN),
+                 (dict(claim="some-state-invented-later"),
+                  idle_dispatch.ACT_UNKNOWN))
+        got = [idle_dispatch._sender_act(self._finding(**over))
+               for over, _want in cases]
+        self.assertEqual(got, [want for _over, want in cases])
+        self.assertEqual(set(idle_dispatch.SENDER_ACTS),
+                         {idle_dispatch.ACT_STRANDED, idle_dispatch.ACT_UNKNOWN,
+                          idle_dispatch.ACT_UNWAKEABLE})
 
     def test_a_live_pane_with_NO_BEACON_is_not_sent_at_the_wake_route(self):
         """THE REMEDY TRAVELS THE BEACON, NOT THE PANE, AND THIS FINDING KNOWS
-        BOTH. Four alerts told a sender to wake a recipient with an @mention
-        while the same rung's console line read `no wake: beacon none`. The
-        sender sent it, nobody woke, and the same sentence forbade the only
-        other move. One finding, two surfaces, opposite instructions."""
-        f = self._finding(live_pane=self._pane("IDLE"),
+        BOTH. Four alerts once told a sender to wake a recipient with an
+        @mention while the same rung's console line read `no wake: beacon
+        none`. The sender sent it, nobody woke, and the same sentence forbade
+        the only other move. The text for a pane nothing can wake names the
+        two moves that remain."""
+        f = self._finding(live_pane=self._pane("IDLE"), wakeable=False,
                           wake_route=idle_dispatch.WAKE_NONE)
         text = idle_dispatch._alert_text(f)
         self.assertIn("NO BEACON IS LISTENING", text,
                       "the alert names a wake route its own finding measured "
                       "as dead: %r" % (text,))
+        self.assertIn("pane-level tending", text)
         self.assertNotIn("use its named WAKE route", text)
         # the judgement that was RIGHT is preserved: a live pane still means
-        # do not take the work off a seat that holds it
+        # do not take the work off a seat that holds it on this alert alone
         self.assertIn("DO NOT reassign", text)
         self.assertNotIn("Re-check or reassign", text)
 
@@ -619,9 +662,8 @@ class ALivePaneIsNotStrandedTest(unittest.TestCase):
         """`WAKE_UNKNOWN` IS NOT `WAKE_NONE` AND THE CONSTANT SAYS SO — "the
         probe could not tell — never none". A tail keyed on `!= WAKE_ARMED`
         would tell the sender a beacon is dead on evidence that only says it
-        was never measured, which is the unmeasured-as-negative error one
-        refusal further along."""
-        f = self._finding(live_pane=self._pane("IDLE"),
+        was never measured."""
+        f = self._finding(live_pane=self._pane("IDLE"), wakeable=False,
                           wake_route=idle_dispatch.WAKE_UNKNOWN)
         text = idle_dispatch._alert_text(f)
         self.assertIn("could NOT be measured", text)
@@ -629,29 +671,6 @@ class ALivePaneIsNotStrandedTest(unittest.TestCase):
                          "an unmeasured wake path is being reported as a "
                          "measured-dead one: %r" % (text,))
         self.assertIn("DO NOT reassign", text)
-
-    def test_an_ARMED_beacon_still_names_the_wake_route(self):
-        """THE MUST-HIT CONTROL. The two arms above assert what the tail stops
-        saying; this one proves it still SAYS it when the beacon really is
-        listening, so a tail that never names the wake route at all cannot
-        pass all three."""
-        f = self._finding(live_pane=self._pane("IDLE"),
-                          wake_route=idle_dispatch.WAKE_ARMED)
-        text = idle_dispatch._alert_text(f)
-        self.assertIn("use its named WAKE route", text)
-        self.assertNotIn("NO BEACON IS LISTENING", text)
-        self.assertNotIn("could NOT be measured", text)
-
-    def test_the_alert_STILL_FIRES_for_a_live_recipient(self):
-        """NOTHING IS SUPPRESSED, and that is deliberate. The sender's
-        obligation really is idle and they still need to know; only the word
-        and the disposition change. An alert that vanished would trade a false
-        STRANDED for a silent stall, which is the worse of the two."""
-        text = idle_dispatch._alert_text(
-            self._finding(live_pane=self._pane("LIVE")))
-        self.assertIn("IDLE-DISPATCH", text)
-        self.assertIn("abc12345", text)
-        self.assertIn("37min", text)
 
     def test_WITHOUT_a_pane_reading_it_is_still_STRANDED(self):
         """THE POLE, without which the demotion swallows every genuine case.
@@ -663,8 +682,9 @@ class ALivePaneIsNotStrandedTest(unittest.TestCase):
 
     def test_the_OPERATOR_RENDER_uses_the_same_word_as_the_DM(self):
         """TWO SURFACES ANSWERING ONE QUESTION DIFFERENTLY IS HOW A READER
-        LEARNS TO TRUST NEITHER. The console line and the DM are both read by
-        the same person about the same row."""
+        LEARNS TO TRUST NEITHER. The console line and the sender's DM are both
+        read by the same person about the same row, and for a WORKING row the
+        console line is the only surface, since no DM is written."""
         import io as _io
         from contextlib import redirect_stdout
         live = self._finding(live_pane=self._pane("IDLE"))
@@ -687,9 +707,13 @@ class ALivePaneIsNotStrandedTest(unittest.TestCase):
         them is what produced the false STRANDED, so the cure must not mix
         them back the other way — a live recipient still holds no claim, and
         anything reading the claim field must still see that."""
-        f = self._finding(live_pane=self._pane("RUNNING"))
-        idle_dispatch._alert_text(f)
-        self.assertEqual(f["claim"], idle_dispatch.CLAIM_NONE,
+        woken = self._finding(live_pane=self._pane("RUNNING"), wakeable=True)
+        idle_dispatch._sender_act(woken)
+        told = self._finding(live_pane=self._pane("RUNNING"), wakeable=False)
+        idle_dispatch._sender_act(told)
+        idle_dispatch._alert_text(told)
+        self.assertEqual((woken["claim"], told["claim"]),
+                         (idle_dispatch.CLAIM_NONE, idle_dispatch.CLAIM_NONE),
                          "the demotion mutated the claim state")
 
     def test_a_LIVE_pane_contradicts_the_reassign_recommendation(self):
@@ -697,12 +721,20 @@ class ALivePaneIsNotStrandedTest(unittest.TestCase):
         self.assertIn("LIVE", fact)
         self.assertIn("WAKE", fact)
         self.assertIn("pane-tail", fact)          # the EVIDENCE travels
-        text = idle_dispatch._alert_text(self._finding(live_pane=fact))
-        self.assertIn("DO NOT reassign", text,
-                      "the alert still recommends reassigning a seat it has "
-                      "just described as live — a self-negating alert leaves "
-                      "the reader to pick, and the destructive one gets picked")
+        # A WAKEABLE live pane hands the sender no decision, so no text is
+        # written that could say "reassign".
+        self.assertEqual(idle_dispatch._sender_act(
+            self._finding(live_pane=fact, wakeable=True)), "",
+            "a wakeable live pane still hands its sender a decision")
+        # An UNWAKEABLE one is told, and its text must not recommend the
+        # destructive act the live pane contradicts.
+        text = idle_dispatch._alert_text(self._finding(
+            live_pane=fact, wakeable=False, wake_route=idle_dispatch.WAKE_NONE))
+        self.assertIn("DO NOT reassign", text)
         self.assertNotIn("Re-check or reassign", text)
+        self.assertNotIn("is STRANDED", text,
+                         "the headline says STRANDED about a recipient the "
+                         "same alert calls live: %r" % (text,))
 
     def test_a_GONE_seat_still_reads_STRANDED(self):  # noqa: VACUOUS_ASSERTION — MUTATION-PROVEN, so not vacuous: flipping
         # _live_pane from an allowlist to a blocklist makes this arm FAIL.
@@ -755,6 +787,38 @@ class ALivePaneIsNotStrandedTest(unittest.TestCase):
         self.assertIn("work ownership", text)
         self.assertNotIn("DO NOT reassign", text)
         self.assertNotIn("Re-check or reassign", text)
+
+    def test_when_recipient_is_walled_on_auth_row_is_stranded_on_auth_not_live(self):
+        """When recipient's liveness is WALLED on upstream auth, idle-dispatch
+        does not call the recipient live, and the alert DM text includes
+        'stranded on auth' (task/3199)."""
+        walled_pane = {
+            "seat": "seat-under-test",
+            "state": "WALLED",
+            "blocked_on": "upstream AUTH-401 since 2026-09-25T22:45:26Z — "
+                          "port 8502: 10 requests failed on upstream auth",
+            "evidence": "pane-tail+proxywatch",
+            "remediation": {"restart": "UNKNOWN", "target": None,
+                            "evidence": "no measured local restart capability",
+                            "action": None},
+        }
+        from helm import seat
+        with mock.patch.object(seat, "seat_liveness", return_value=walled_pane):
+            live_fact = idle_dispatch._live_pane("seat-under-test")
+            self.assertEqual(live_fact, "",
+                             "_live_pane should be empty when walled on auth")
+            finding = self._finding(recipient="seat-under-test",
+                                    claim=idle_dispatch.CLAIM_NONE)
+            finding["wall"] = idle_dispatch._provider_wall("seat-under-test", walled_pane)
+            finding["live_pane"] = idle_dispatch._live_pane("seat-under-test", walled_pane)
+            act = idle_dispatch._sender_act(finding)
+            self.assertEqual(act, idle_dispatch.ACT_STRANDED)
+            text = idle_dispatch._alert_text(finding)
+            self.assertIn("stranded on auth", text)
+            self.assertIn("STRANDED", text)
+            self.assertNotIn("IDLE BUT ITS RECIPIENT IS LIVE", text)
+            self.assertNotIn("the recipient is LIVE and between turns", text)
+
 
 
 class WakeTheOwingSeatTest(IdleDispatchBase):
@@ -879,14 +943,18 @@ class WakeTheOwingSeatTest(IdleDispatchBase):
                          "the wake latch was reaped and the seat re-woken")
         self.assertTrue(second["findings"][0]["wake_latched"])
 
-    def test_a_QUIET_HOLDER_is_never_woken_though_the_sender_is_told(self):
+    def test_a_QUIET_HOLDER_is_never_woken_and_the_sender_is_not_told(self):  # noqa: VACUOUS_ASSERTION — the released-claim pass below asserts one wake AND one alert on the same row through the same check
         """Quiet + holding is a busy or WEDGED owner whose room may hold
-        uncommitted work. The sender alert must still fire — the positive
-        control that this arm is testing admission and not a dead rung."""
+        uncommitted work. The FINDING is the control that this arm is testing
+        admission and not a dead rung. The sender is not told either: task/3161
+        leaves a holder's sender nothing to decide, so the leg-A half of this
+        arm asserts silence, and the released claim below is its control."""
         seat = self._stranded()
         self.claims = {"worktree:helm:some-lane": {"holder": seat}}
         res = idle_dispatch.check()
-        self.assertEqual(len(res["alerted"]), 1, "the sender leg went silent")
+        self.assertEqual([f["claim"] for f in res["findings"]],
+                         [idle_dispatch.CLAIM_HOLDING], "the rung saw no holder")
+        self.assertEqual(res["alerted"], [], "a holder's sender was alerted")
         self.assertEqual(res["woke"], [], "a holding owner was poked")
         self.assertEqual(self._wake_dms(seat), [])
         # UNCONDITIONAL POSITIVE CONTROL on the same observable: release the
@@ -898,6 +966,9 @@ class WakeTheOwingSeatTest(IdleDispatchBase):
         self.assertEqual(len(released["woke"]), 1,
                          "the wake leg is dead, so the silence above measured "
                          "nothing about HOLDING")
+        self.assertEqual(len(released["alerted"]), 1,
+                         "the sender leg is dead, so its silence above "
+                         "measured nothing about HOLDING")
         self.assertEqual(len(self._wake_dms(seat)), 1)
 
     def test_a_CLAIM_UNKNOWN_row_is_never_woken_even_when_the_recheck_is_clean(self):
@@ -1442,7 +1513,7 @@ class WakeLifecycleTest(IdleDispatchBase):
         first = {"n": 0}
         rows_snapshot = list(self.rows)
 
-        def closes_after_scan():
+        def closes_after_scan(snap=None):
             first["n"] += 1
             return list(rows_snapshot) if first["n"] == 1 else []
 
@@ -1512,7 +1583,7 @@ class SendBoundaryIdentityTest(IdleDispatchBase):
         rid, seat = self._stranded_row()
         reads = {"n": 0}
 
-        def rebinds_after_scan():
+        def rebinds_after_scan(snap=None):
             reads["n"] += 1
             if reads["n"] == 1:
                 return [_row(rid, seat)]
@@ -1541,7 +1612,7 @@ class SendBoundaryIdentityTest(IdleDispatchBase):
         rid, seat = self._stranded_row()
         reads = {"n": 0}
 
-        def closes_late():
+        def closes_late(snap=None):
             reads["n"] += 1
             return [_row(rid, seat)] if reads["n"] <= 1 else []
 
@@ -1645,7 +1716,7 @@ class CanonicalIdentityAtSendTest(IdleDispatchBase):
         self.beacons = {idle_dispatch._recipient_key(seat): ([4242], "")}
         reads = {"n": 0}
 
-        def rebinds():
+        def rebinds(snap=None):
             reads["n"] += 1
             if reads["n"] == 1:
                 return [row]
@@ -2303,7 +2374,10 @@ class ADroppedRowIsTheRungsJobTest(IdleDispatchBase):
         self.rows = [_row("d6d6d6d6dddd", self.U, sender=self.C),
                      _row("d5d5d5d5dddd", self.B, sender=self.C)]
         self.presence = {self.U: "fresh", self.B: "quiet"}
-        with self._liveness({self.U: self.WALL, self.B: self.FINE}):
+        # B READS NO PANE, so its row is STRANDED and reaches its sender. A
+        # live pane (FINE) would make it WORKING, which does not DM the
+        # sender (task/3161), and the control below would have no text to read.
+        with self._liveness({self.U: self.WALL}):
             idle_dispatch.check()
         texts = [t for _to, t in self.dms]
         walled = [t for t in texts if "d6d6d6d6" in t][0]
@@ -2327,3 +2401,731 @@ class ADroppedRowIsTheRungsJobTest(IdleDispatchBase):
                       "activity) AND holds no live claim", text)
         self.assertNotIn("SELF-ADDRESSED", text)
         self.assertNotIn("FRESHNESS GATE", text)
+
+
+def _label(f):
+    """The console word for one finding, spelled the way the report spells it."""
+    if f["claim"] == idle_dispatch.CLAIM_NONE:
+        return "WORKING" if f.get("live_pane") else "STRANDED"
+    if f["claim"] == idle_dispatch.CLAIM_HOLDING:
+        return "HOLDING"
+    return "CLAIM-UNKNOWN"
+
+
+class TheSenderIsToldOnlyWhenItMustActTest(IdleDispatchBase):
+    """task/3161: THE SENDER LEG WAKES THE SENDER ONLY WHEN IT HAS AN ACT.
+
+    THE COST IT CURES: one sender measured 22 DMs in one DM window, about
+    19 KB and each one a wake, about five rows on one busy reviewer. 13 said WORKING
+    ("NOT stranded ... DO NOT reassign"), 9 said HOLDING ("NOT stranded ...
+    RESCUE, do not reassign") and 0 said STRANDED. Every one told the sender
+    to do nothing, and a change of label woke it again. Canon
+    `notify-dedup-key-on-recipient-decision`: the dedup signature keys on what
+    the RECIPIENT of the message decides. Here that is the sender, and it has
+    three decisions: re-check or reassign (STRANDED), read the ledger
+    (CLAIM-UNKNOWN), and tend or reassign a live pane that no beacon can wake
+    (WORKING with no armed beacon, told at first sight and again every
+    LATCH_BACKOFF_CAP_S while the row stays open).
+
+    AND SILENCE MUST NOT BE THE PRICE (the review of record, F1). The base
+    fixture's default is NO BEACON, which is also the measured case: over
+    seven days every WORKING row read `no wake: beacon none` and leg B woke
+    none of them. A WORKING row whose recipient cannot be woken reaches
+    nobody unless the sender is told.
+
+    ONE ROW, ONE SEAT, ONE SENDER in every arm. The state moves only through
+    the claims and the pane reading, so each pass's label is asserted before
+    its silence is. A silent pass is not evidence unless the row was a finding
+    in the state the arm names."""
+
+    SEAT = "ds4pro"
+    LIVE = {"state": "IDLE", "blocked_on": None, "evidence": "pane-tail"}
+    GONE = {"state": "GONE", "blocked_on": None, "evidence": "no pane"}
+
+    def setUp(self):
+        super().setUp()
+        self.rows = [_row("aaaaaaaa1111", self.SEAT)]
+        self.presence = {self.SEAT: "absent"}
+        self.pane = self.GONE
+        # THE SENDER IS WHATEVER THE BASE FIXTURE RESOLVES, asked rather than
+        # spelled, so this class names no seat of its own.
+        self.sender = idle_dispatch.seats.derive_seat("sess-oi")
+        from helm import seat
+        live = mock.patch.object(seat, "seat_liveness",
+                                 side_effect=lambda s, *a, **k: self.pane)
+        live.start()
+        self.addCleanup(live.stop)
+
+    def _working(self):
+        self.claims, self.pane = {}, self.LIVE
+
+    def _holding(self):
+        self.claims = {"worktree:helm:some-lane": {"holder": self.SEAT}}
+        self.pane = self.LIVE
+
+    def _stranded(self):
+        self.claims, self.pane = {}, self.GONE
+
+    def _unknown(self):
+        # an UNATTRIBUTABLE live claim cannot be ruled out as this seat's
+        self.claims = {"worktree:helm:orphan": {"session": "s"}}
+        self.pane = self.GONE
+
+    def _arm(self):
+        """A measured armed beacon on the recipient, so leg B can wake it."""
+        self.beacons = {idle_dispatch._recipient_key(self.SEAT): ([4242], "")}
+
+    def _pass(self, at, label):
+        """One real sending pass at instant `at` -> the texts the SENDER got.
+        The row must be a finding in state `label`, or the pass proves nothing."""
+        self.dms = []
+        with mock.patch.object(idle_dispatch.time, "time", return_value=at):
+            res = idle_dispatch.check()
+        self.assertEqual([_label(f) for f in res["findings"]], [label])
+        return [t for to, t in self.dms if to == self.sender]
+
+    def _record(self, act):
+        from helm import pk
+        st = pk.read_json(idle_dispatch._state_path(), {}) or {}
+        return st.get(idle_dispatch._record_key(
+            idle_dispatch.LEG_ALERT, "aaaaaaaa", act))
+
+    def test_WORKING_then_HOLDING_then_WORKING_sends_the_sender_nothing(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control is the STRANDED pass after the loop, through the same _pass read of the same row
+        """Arm (a), on a recipient leg B CAN wake. Each pass is more than the
+        backoff cap after the last, so a latch that only backs off would let
+        every one of them through. The zero measures admission, not backoff.
+        The STRANDED pass after it is the lane's promise too: a first
+        STRANDED on a row the sender was never told about sends exactly one."""
+        self._arm()
+        base = time.time()
+        step = idle_dispatch.LATCH_BACKOFF_CAP_S + 1
+        for k, (state, label) in enumerate(((self._working, "WORKING"),
+                                            (self._holding, "HOLDING"),
+                                            (self._working, "WORKING"))):
+            state()
+            told = self._pass(base + k * step, label)
+            self.assertEqual(told, [], "a %s row woke its sender, which has "
+                             "nothing to decide: %r" % (label, told))
+        # UNCONDITIONAL POSITIVE CONTROL on the same row, fixture and
+        # observable: the leg still speaks when the sender has an act.
+        self._stranded()
+        told = self._pass(base + 3 * step, "STRANDED")
+        self.assertEqual(len(told), 1, "the sender leg is dead, so the silence "
+                         "above measured nothing")
+
+    def test_a_STRANDED_WORKING_STRANDED_flap_is_told_once_and_keeps_its_backoff(self):  # noqa: VACUOUS_ASSERTION — the first and the last pass each assert exactly one DM through the same _pass read of the same row
+        """Arm (b), the review of record's F2. A flap is not a new decision.
+        Replayed over seven days of the service journal, one row flapping
+        STRANDED <-> WORKING drew STRANDED DMs that main had latched, and
+        docs/VERBS.md promises "a return to a decision already told is not
+        told again". The STRANDED record survives the WORKING pass because
+        the row is still open, so the return waits out its backoff, and the
+        backoff COUNT survives with it: at 1x the first wait the return is
+        still silent, which a record reset to n=0 would have let through.
+
+        The recipient is wakeable, so the WORKING pass is silent to the
+        sender for its own reason and every count here is STRANDED's."""
+        self._arm()
+        base = time.time()
+        self._stranded()
+        told = self._pass(base, "STRANDED")
+        self.assertEqual(len(told), 1, "a STRANDED row did not reach its sender")
+        self.assertIn("is STRANDED", told[0])
+        self._working()
+        self.assertEqual(self._pass(base + 1, "WORKING"), [])
+        rec = self._record(idle_dispatch.ACT_STRANDED) or {}
+        self.assertEqual(int((rec.get("told") or {}).get("n") or 0), 1,
+                         "the WORKING pass reaped the STRANDED record, so the "
+                         "row's backoff count is gone: %r" % (rec,))
+        self._stranded()
+        self.assertEqual(self._pass(base + 2, "STRANDED"), [],
+                         "a return to a decision already told was told again")
+        self.assertEqual(
+            self._pass(base + idle_dispatch.LATCH_TTL_S + 1, "STRANDED"), [],
+            "the flap reset the backoff count: the second DM owes 2x the "
+            "first wait, not 1x")
+        # UNCONDITIONAL POSITIVE CONTROL on the same row and observable: past
+        # the 2x wait the same record lets the next DM through, so the
+        # silences above are the backoff and not a dead sender leg.
+        told = self._pass(base + 2 * idle_dispatch.LATCH_TTL_S + 1, "STRANDED")
+        self.assertEqual(len(told), 1, "the backoff never expired, so the "
+                         "silences above measured a dead leg")
+
+    def test_a_live_recipient_with_NO_BEACON_is_told_and_RE_TOLD_at_the_cap(self):  # noqa: VACUOUS_ASSERTION — the first pass and the pass at the cap each assert exactly one DM through the same _pass read of the same row
+        """The review of record's F1, and main's deleted arm
+        `test_the_alert_STILL_FIRES_for_a_live_recipient` brought back in
+        adapted form. Its reason still holds: "An alert that vanished would
+        trade a false STRANDED for a silent stall, which is the worse of the
+        two." Leg B never wakes a seat with no armed beacon, so for this row
+        the sender is the only party who can act.
+
+        AND IT NEVER GOES SILENT (round 3, D1). Told once per row lifetime,
+        a row that stayed unwakeable for days said nothing after its first
+        DM, which breaks this module's standing law that a stuck row keeps
+        speaking at the cap. "Tend or reassign" is an unanswered act that
+        gets older, exactly as STRANDED's is. So it is re-told every
+        LATCH_BACKOFF_CAP_S, a fixed cadence and not the doubling backoff:
+        inside the cap it is silent (a doubling backoff would already have
+        spoken at twice the first wait), and at the cap it speaks.
+
+        THE CADENCE IS THE ROW'S, NOT THE EPISODE'S. The record lives as long
+        as the row is open, through HOLDING and through a pass where the
+        recipient reads fresh and the row is not a finding at all, so none of
+        those restarts the clock. Only closing the row ends it."""
+        base = time.time()
+        cap = idle_dispatch.LATCH_BACKOFF_CAP_S
+        self._working()                  # the base fixture's default: no beacon
+        told = self._pass(base, "WORKING")
+        self.assertEqual(len(told), 1, "a live pane nothing can wake reached "
+                         "nobody: leg B cannot wake it and the sender was "
+                         "not told")
+        for must in ("IDLE-DISPATCH", "aaaaaaaa", "NO BEACON IS LISTENING",
+                     "pane-level tending", "DO NOT reassign",
+                     "every %dh" % (cap // 3600)):
+            self.assertIn(must, told[0])
+        self.assertNotIn("Re-check or reassign", told[0])
+        self.assertEqual(self._pass(base + cap - 1, "WORKING"), [],
+                         "re-told inside the cap: the cadence is the cap, "
+                         "not the doubling backoff")
+        told = self._pass(base + cap + 1, "WORKING")
+        self.assertEqual(len(told), 1, "an unwakeable row went SILENT past the "
+                         "cap while it stayed open and unwakeable")
+        self.assertIn("NO BEACON IS LISTENING", told[0])
+        self._holding()
+        self.assertEqual(self._pass(base + cap + 2, "HOLDING"), [])
+        # the recipient crosses a tool boundary: the row stays OPEN and is
+        # not a finding on this pass
+        self.presence = {self.SEAT: "fresh"}
+        with mock.patch.object(idle_dispatch.time, "time",
+                               return_value=base + cap + 3):
+            self.assertEqual(idle_dispatch.check()["findings"], [])
+        self.presence = {self.SEAT: "absent"}
+        self._working()
+        self.assertEqual(self._pass(base + cap + 4, "WORKING"), [],
+                         "a flap restarted the cadence: re-told inside the cap")
+        told = self._pass(base + 2 * cap + 2, "WORKING")
+        self.assertEqual(len(told), 1, "the second cap passed in silence")
+        # THE RECORD ENDS WITH THE ROW. It exists while the row is open (the
+        # positive control) and is reaped when it closes.
+        self.assertTrue(self._record(idle_dispatch.ACT_UNWAKEABLE),
+                        "no record was ever written")
+        self.rows = []
+        with mock.patch.object(idle_dispatch.time, "time",
+                               return_value=base + 2 * cap + 3):
+            idle_dispatch.check()
+        self.assertIsNone(self._record(idle_dispatch.ACT_UNWAKEABLE),
+                          "a closed row's record outlived it")
+
+    def test_a_NEW_CUSTODIAN_of_an_unwakeable_row_is_told_at_once(self):  # noqa: VACUOUS_ASSERTION — the same pass asserts exactly one DM to the new custodian through the same dms read
+        """A CUSTODY TRANSFER KEEPS THE ROW AND MOVES THE READER (round 3,
+        D1a). custodian_of moves the sender of a row without changing its id,
+        so a record that says only "told" and not WHO was told reads the new
+        custodian as already told, and the one seat now positioned to act on
+        the row hears nothing until the cap. The record names the custodian
+        it told, and a different one is a fresh tell."""
+        base = time.time()
+        self._working()                  # no beacon: an unwakeable row
+        self.assertEqual(len(self._pass(base, "WORKING")), 1)
+        new = "seat-new-custodian"
+        self.rows[0]["custodian"] = new
+        self.dms = []
+        with mock.patch.object(idle_dispatch.time, "time",
+                               return_value=base + 1):
+            res = idle_dispatch.check()
+        self.assertEqual([f["sender"] for f in res["findings"]], [new],
+                         "the fixture did not move custody, so this arm "
+                         "measures nothing")
+        self.assertEqual(len([t for to, t in self.dms if to == new]), 1,
+                         "the new custodian was never told: the record said "
+                         "the row was told, not who was told")
+        self.assertEqual([t for to, t in self.dms if to == self.sender], [],
+                         "the previous custodian was told again")
+        # and the new custodian's own record then holds for the cap
+        self.dms = []
+        with mock.patch.object(idle_dispatch.time, "time",
+                               return_value=base + 2):
+            idle_dispatch.check()
+        self.assertEqual([t for to, t in self.dms if to == new], [],
+                         "the new custodian was told twice inside the cap")
+
+    def test_a_REFUSED_tell_stays_THROTTLED_for_its_custodian_and_a_new_one_is_tried_at_once(self):  # noqa: VACUOUS_ASSERTION — each silent pass follows a pass asserting exactly one attempt to the same custodian through the same dms read
+        """RETRY IS BOUND TO ITS ADDRESSEE (round 3), and the binding has two
+        halves. `_finish` writes the custodian a failed send was for into the
+        RETRY record, and `_blocked` reads that record for this pass's
+        custodian. Written without the name, the record reads as somebody
+        else's on every pass, so a transport refusing one stable custodian is
+        retried on every pass: the DM storm the retry clock exists to
+        prevent, and no other arm here watches leg A's retry clock (dropping
+        `retry["to"]` left all 107 arms green). Read without the name, a new
+        custodian waits out a throttle earned by the seat it replaced."""
+        base = time.time()
+        self._stranded()                 # no beacon: leg A is the only sender
+        self.dm_result = (None, "not a routable seat")
+        self.assertEqual(len(self._pass(base, "STRANDED")), 1,
+                         "the first refused attempt was never made")
+        self.assertEqual(self._pass(base + 1, "STRANDED"), [],
+                         "a refused tell to the SAME custodian was retried on "
+                         "the very next pass: its RETRY record did not hold")
+        new = "seat-new-custodian"
+        self.rows[0]["custodian"] = new
+        self.dms = []
+        with mock.patch.object(idle_dispatch.time, "time",
+                               return_value=base + 2):
+            res = idle_dispatch.check()
+        self.assertEqual([f["sender"] for f in res["findings"]], [new],
+                         "the fixture did not move custody, so this arm "
+                         "measures nothing")
+        self.assertEqual(len([t for to, t in self.dms if to == new]), 1,
+                         "a new custodian waited out the throttle earned by "
+                         "the seat it replaced")
+        self.dms = []
+        with mock.patch.object(idle_dispatch.time, "time",
+                               return_value=base + 3):
+            idle_dispatch.check()
+        self.assertEqual([t for to, t in self.dms if to == new], [],
+                         "a refused tell to the new custodian was retried on "
+                         "the very next pass")
+
+    def test_a_BEACON_FLIP_keeps_the_cadence_and_the_lost_beacon_is_re_told(self):  # noqa: VACUOUS_ASSERTION — the first pass and the pass at the cap each assert exactly one DM through the same _pass read of the same row
+        """Unwakeable -> armed -> lost (round 3, D1b). While the beacon is
+        armed leg B wakes the recipient and the sender has nothing to do. When
+        it is lost again the flap does not restart anything, and the row is
+        re-told at the cap rather than never."""
+        base = time.time()
+        cap = idle_dispatch.LATCH_BACKOFF_CAP_S
+        self._working()
+        self.assertEqual(len(self._pass(base, "WORKING")), 1)
+        self._arm()
+        self.assertEqual(self._pass(base + 1, "WORKING"), [],
+                         "the sender was DMd about a row leg B can wake")
+        self.beacons = {}
+        self.assertEqual(self._pass(base + 2, "WORKING"), [],
+                         "a beacon flap restarted the cadence")
+        self.assertEqual(len(self._pass(base + cap + 1, "WORKING")), 1,
+                         "a beacon lost again was never re-told")
+
+    def test_a_live_recipient_WITH_an_armed_beacon_is_woken_and_its_sender_is_not(self):
+        """F1's other half. With an armed beacon leg B wakes the recipient
+        itself, and the sender has nothing to decide, so it is not DMd."""
+        self._arm()
+        self._working()
+        self.dms = []
+        res = idle_dispatch.check()
+        self.assertEqual([_label(f) for f in res["findings"]], ["WORKING"])
+        self.assertEqual([t for to, t in self.dms if to == self.sender], [],
+                         "the sender was DMd about a row leg B can wake")
+        self.assertEqual(res["alerted"], [])
+        woke = [t for to, t in self.dms
+                if to == idle_dispatch._recipient_key(self.SEAT)]
+        self.assertEqual(len(woke), 1, "leg B never woke the live recipient")
+        self.assertIn("IDLE-DISPATCH WAKE", woke[0])
+        self.assertIn("aaaaaaaa", woke[0])
+
+    def test_CLAIM_UNKNOWN_still_tells_the_sender_once(self):  # noqa: VACUOUS_ASSERTION — the empty second pass follows a first pass asserting exactly one DM through the same _pass read
+        """Arm (c). An unread ledger is a decision: go read it."""
+        base = time.time()
+        self._unknown()
+        told = self._pass(base, "CLAIM-UNKNOWN")
+        self.assertEqual(len(told), 1, "CLAIM-UNKNOWN did not reach the sender")
+        self.assertIn("claim state UNKNOWN", told[0])
+        self.assertNotIn("Re-check or reassign", told[0])
+        self.assertEqual(self._pass(base + 1, "CLAIM-UNKNOWN"), [])
+
+    def test_a_NEW_decision_is_told_and_a_return_to_a_told_one_is_not(self):
+        """The latch keys on the sender's DECISION, so it separates the two
+        acts. STRANDED said "reassign". A later UNKNOWN says "do not reassign
+        on an unread fact", which is a different decision and retracts the
+        first, so it is told. A return to STRANDED inside the same run of
+        acts repeats a decision the sender already has, so it is not."""
+        base = time.time()
+        self._stranded()
+        self.assertEqual(len(self._pass(base, "STRANDED")), 1)
+        self._unknown()
+        told = self._pass(base + 1, "CLAIM-UNKNOWN")
+        self.assertEqual(len(told), 1, "a change of decision was swallowed by "
+                         "the other decision's latch")
+        self.assertIn("claim state UNKNOWN", told[0])
+        self._stranded()
+        self.assertEqual(self._pass(base + 2, "STRANDED"), [],
+                         "a decision already told re-fired inside one episode")
+
+    def test_WORKING_and_HOLDING_are_REPORTED_where_a_reader_looks(self):  # noqa: VACUOUS_ASSERTION — each subTest asserts exactly one report line naming the state before any absence is read
+        """Not DMd is not invisible. The console line names the state and says
+        no DM went out, and --json carries the sender's decision (empty) beside
+        every fact a DM would have carried. The recipient is wakeable, the one
+        WORKING case that sends the sender nothing."""
+        import contextlib
+        import io
+        import json as _json
+        self._arm()
+        for state, label in ((self._working, "WORKING"),
+                             (self._holding, "HOLDING")):
+            with self.subTest(state=label):
+                state()
+                self.dms = []
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    idle_dispatch.cmd_idle_dispatch([])
+                lines = [ln for ln in buf.getvalue().splitlines()
+                         if "aaaaaaaa" in ln]
+                self.assertEqual(len(lines), 1, buf.getvalue())
+                self.assertIn(label, lines[0])
+                self.assertIn("no DM", lines[0])
+                self.assertNotIn("ALERTED", lines[0])
+                self.assertEqual([to for to, _t in self.dms if to == self.sender],
+                                 [], "the sender was DMd about a %s row" % label)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    idle_dispatch.cmd_idle_dispatch(["--dry-run", "--json"])
+                doc = _json.loads(buf.getvalue())
+                self.assertEqual([_label(f) for f in doc["findings"]], [label])
+                self.assertEqual(doc["findings"][0].get("sender_act"), "")
+                self.assertEqual(doc["alerted"], [])
+
+    # UNREADABLE IS NOT EMPTY, MET THE WAY PRODUCTION MEETS IT. The two arms
+    # below make the ledger unreadable through the REAL reader over a real
+    # path in this test's HELM_HOME. `dispatches.open_rows()` never raises
+    # there: it folds `rows()`, which is `snapshot()[0]`, and the reason sits
+    # in the half `rows()` drops, so the ledger comes back as []. A try/except
+    # around that call never fires, and [] reads as "no row is open".
+
+    def _unreadable(self):
+        from helm import dispatches
+        path = dispatches.ledger_path()
+        os.makedirs(path)
+        self.addCleanup(lambda: os.path.isdir(path) and os.rmdir(path))
+        # MUST-HIT: the real reader calls it unreadable, and the real
+        # open_rows answers [] for it, not an exception. Without both, the
+        # arms below would measure a fixture.
+        self.assertTrue(dispatches.snapshot()[1])
+        self.assertEqual(_REAL_OPEN_ROWS(), [])
+        return path
+
+    def _state(self):
+        from helm import pk
+        return pk.read_json(idle_dispatch._state_path(), {}) or {}
+
+    def test_an_UNREADABLE_ledger_reaps_no_latch_on_either_leg(self):  # noqa: VACUOUS_ASSERTION — the wake latch's absence at the end follows assertIn on the same key and state file, and the silent STRANDED pass follows a pass asserting exactly one DM through the same _pass read
+        """The sender's backoff and leg B's wake latch both survive a pass that
+        could not read the ledger, and leg B's latch is still reaped by the
+        first readable pass on which its row is no longer wakeable, so it is
+        never stuck."""
+        self._arm()
+        self._stranded()
+        base = time.time()
+        self.assertEqual(len(self._pass(base, "STRANDED")), 1)
+        alert = idle_dispatch._record_key(idle_dispatch.LEG_ALERT, "aaaaaaaa",
+                                          idle_dispatch.ACT_STRANDED)
+        wake = idle_dispatch._record_key(idle_dispatch.LEG_WAKE, "aaaaaaaa")
+        st = self._state()
+        # MUST-HIT: both legs recorded a delivery on the readable pass
+        self.assertTrue((st.get(alert) or {}).get("told"), st)
+        self.assertTrue((st.get(wake) or {}).get("told"), st)
+        path = self._unreadable()
+        with mock.patch.object(idle_dispatch.dispatches, "open_rows",
+                               _REAL_OPEN_ROWS), \
+                mock.patch.object(idle_dispatch.time, "time",
+                                  return_value=base + 1):
+            self.assertEqual(idle_dispatch.check()["findings"], [])
+        st = self._state()
+        self.assertEqual(int(((st.get(alert) or {}).get("told") or {}).get("n")
+                             or 0), 1, "a pass that could not read the ledger "
+                         "reaped the sender's backoff: %r" % (st,))
+        self.assertIn(wake, st, "a pass that could not read the ledger reaped "
+                      "leg B's wake latch")
+        os.rmdir(path)
+        self.assertEqual(self._pass(base + 2, "STRANDED"), [],
+                         "the sender was re-told inside its backoff")
+        # AND LEG B'S LATCH IS NOT STUCK: the recipient takes a claim, the
+        # row stops being wakeable, and the next readable pass reaps it.
+        self._holding()
+        self._pass(base + 3, "HOLDING")
+        self.assertNotIn(wake, self._state(),
+                         "leg B's wake latch outlived its episode")
+
+    def test_an_UNREADABLE_ledger_at_the_send_boundary_does_not_suppress(self):
+        """`_went_terminal`'s own law: "an unreadable ledger does not
+        suppress". The scan reads the row; by the send the ledger cannot be
+        read, and the send-time re-read got [] and called the row closed."""
+        from helm import dispatches
+        self._stranded()
+        reads = {"n": 0}
+        path = dispatches.ledger_path()
+
+        def unreadable_after_the_scan(snap=None):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                os.makedirs(path)
+                self.addCleanup(lambda: os.path.isdir(path) and os.rmdir(path))
+                return list(self.rows)
+            return _REAL_OPEN_ROWS(snap)
+
+        with mock.patch.object(idle_dispatch.dispatches, "open_rows",
+                               side_effect=unreadable_after_the_scan):
+            res = idle_dispatch.check()
+        # MUST-HIT: the scan saw the row and the ledger was unreadable after
+        self.assertEqual([_label(f) for f in res["findings"]], ["STRANDED"])
+        self.assertTrue(dispatches.snapshot()[1])
+        self.assertFalse(res["findings"][0].get("closed_after_scan"),
+                         "an unreadable ledger at the send boundary was read "
+                         "as the row closing")
+        self.assertEqual(len([t for to, t in self.dms if to == self.sender]),
+                         1, "the sender was not told")
+
+
+
+# A Claude-Code-over-proxy viewport after its last request failed: the error
+# entry, the turn-landed row, the input box and the footer. The body carries no
+# credential shape.
+_DEAD_FOOTER = ("────────────────────────────────\n❯ \n"
+                "────────────────────────────────\n"
+                "  ⏵⏵ bypass permissions on · ← for agents")
+_DIED_401 = ("● Bash(helm chat read)\n"
+             "  ⎿  3 rows\n"
+             "● API Error: 401 {\"type\":\"error\",\"error\":{\"type\":"
+             "\"authentication_error\",\"message\":\"Incorrect API key "
+             "provided\"}}\n"
+             "✻ Worked for 2s\n" + _DEAD_FOOTER)
+
+
+class ADeadTurnWakesWithOnePromptTest(IdleDispatchBase):
+    """A LIVE PROCESS HOLDING THE SEAT IS NOT A SEAT THAT CAN TAKE A TURN
+    (task/3217).
+
+    A recipient's turn died on an upstream 401 and its beacon ended with the
+    turn. The proxy then recovered and read HEALTHY, and every @mention
+    queued unread, because nothing was listening and no turn would start. The
+    sender was told the recipient was LIVE, NOT stranded, and not to reassign.
+    Every word was true about the process and wrong about the remedy: one
+    prompt into the pane wakes the seat.
+
+    These arms run the REAL readers: a planted pane tail and a planted
+    proxywatch record through `seat.seat_liveness`, and a planted beacon
+    through `seats.beacon_procs`, into `check`."""
+
+    def _world(self, tail, seat_state="HEALTHY", dark=False, beacon=False):
+        from helm import seat
+        self.rows = [_row("aaaaaaaa1111", "seat-a")]
+        self.presence = {"seat-a": "quiet"}
+        self.key = idle_dispatch._recipient_key("seat-a")
+        if beacon:
+            self.beacons = {self.key: ([4242], "")}
+        record = {"state": seat_state, "dark": dark, "since": "T0",
+                  "detail": "fixture"}
+        snapshot = ({"fam-a": dict(record, seats={"seat-a": record})}, None)
+        ad = mock.Mock()
+        ad.read.return_value = tail
+        spawn = {"seat": "seat-a", "harness": "orca", "handle": "term_x",
+                 "worktree": "/w", "room": "helm", "ts": "T"}
+        for patch in (
+                mock.patch.object(seat, "_spawn_record", return_value=spawn),
+                mock.patch.object(seat, "_seat_family",
+                                  return_value=("fam-a", None)),
+                mock.patch.object(seat, "_resolve_registered_pane",
+                                  return_value=(ad, "term_x", "")),
+                mock.patch.object(proxywatch, "upstream_snapshot",
+                                  return_value=snapshot)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _sender_texts(self):
+        return [t for _to, t in self.dms if " IDLE-DISPATCH: " in t]
+
+    def test_a_dead_turn_over_a_healthy_proxy_reads_wake_with_one_prompt(self):
+        self._world(_DIED_401)
+        res = idle_dispatch.check()
+        told = self._sender_texts()
+        self.assertEqual(len(told), 1, "the sender was not told: %r"
+                         % (self.dms,))
+        text = told[0]
+        for part in ("turn died on upstream error (API Error: 401)",
+                     "proxy healthy since T0", "wake with one prompt",
+                     "`helm seat resume-turn --nudge --seat %s`" % self.key):
+            self.assertIn(part, text)
+        self.assertNotIn("do not reassign", text.lower())
+        self.assertNotIn("IDLE BUT ITS RECIPIENT IS LIVE", text)
+        self.assertNotIn("between turns", text)
+        self.assertIn("turn died on upstream error",
+                      res["findings"][0].get("dead_turn") or "")
+
+    def test_the_console_names_the_dead_turn_as_the_DM_does(self):
+        """One question, one word on both surfaces the sender reads."""
+        import io as _io
+        from contextlib import redirect_stdout
+        self._world(_DIED_401)
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            idle_dispatch.cmd_idle_dispatch(["--dry-run"])
+        out = buf.getvalue()
+        self.assertIn("DEAD-TURN", out)
+        self.assertIn("helm seat resume-turn --nudge --seat %s" % self.key,
+                      out)
+        self.assertNotIn("WORKING", out)
+
+    def test_a_live_beacon_takes_the_ordinary_wake_and_no_dead_turn(self):  # noqa: VACUOUS_ASSERTION — the one recipient wake read off the same captured DMs is the positive control
+        """An armed beacon hears an @mention, so leg B's DM is the wake and
+        the sender has nothing to do."""
+        self._world(_DIED_401, beacon=True)
+        res = idle_dispatch.check()
+        woke = [t for to, t in self.dms if to == self.key and "WAKE" in t]
+        self.assertEqual(len(woke), 1, "leg B did not wake the armed seat")
+        self.assertEqual(self._sender_texts(), [])
+        self.assertEqual([f.get("dead_turn") or "" for f in res["findings"]], [""])
+
+    def test_a_proxy_still_refusing_reads_stranded_on_auth_not_a_dead_turn(self):
+        self._world(_DIED_401, seat_state="AUTH-401", dark=True)
+        idle_dispatch.check()
+        told = self._sender_texts()
+        self.assertEqual(len(told), 1)
+        self.assertIn("stranded on auth", told[0])
+        self.assertNotIn("turn died", told[0])
+        self.assertNotIn("wake with one prompt", told[0])
+
+    def test_a_turn_in_flight_is_not_a_dead_turn(self):
+        self._world(_DIED_401.replace("← for agents", "esc to interrupt"))
+        res = idle_dispatch.check()
+        told = self._sender_texts()
+        self.assertEqual(len(told), 1)
+        self.assertIn("IDLE BUT ITS RECIPIENT IS LIVE", told[0])
+        self.assertNotIn("turn died", told[0])
+        self.assertEqual([f.get("dead_turn") or "" for f in res["findings"]], [""])
+
+    def test_an_idle_pane_with_no_error_line_keeps_the_live_pane_text(self):
+        self._world("● Done — the lane is landed.\n✻ Worked for 9s\n"
+                    + _DEAD_FOOTER)
+        res = idle_dispatch.check()
+        told = self._sender_texts()
+        self.assertEqual(len(told), 1)
+        self.assertIn("IDLE BUT ITS RECIPIENT IS LIVE", told[0])
+        self.assertNotIn("turn died", told[0])
+        self.assertEqual([f.get("dead_turn") or "" for f in res["findings"]], [""])
+
+
+# A relay seat name this fleet does not use, so no arm can pass on a live seat.
+RELAY_SEAT = "relay-fixture-seat"
+RELAY_ROW = "a1" * 12
+RELAY_SID = "session_fixture0001"
+
+
+class RelaySessionIsTheRelaySeatsLivenessTest(IdleDispatchBase):
+    """A RELAY SEAT'S LIVENESS IS ITS SESSION IN THE RELAY JOURNAL (task/3329).
+
+    A seat helm/remote_relay.py drives has no roster row, so the roster reads
+    it quiet for its whole life. Every arm goes through check() over a REAL
+    relay config and a REAL journal in this test's HELM_HOME, written in the
+    shape the relay writes (events keyed by the dispatch ROW id), so nothing
+    here decides what the relay reads."""
+
+    def setUp(self):
+        super().setUp()
+        from helm import remote_session
+        self.rs = remote_session
+        self.now = time.time()
+        self.configure()
+
+    def configure(self, text=None):
+        path = os.path.join(self.tmp, "_global", self.rs.CONFIG)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if text is None:
+            text = json.dumps({"seats": {RELAY_SEAT: {
+                "driver": self.rs.DRIVER_CLAUDE_CLOUD, "model": "opus",
+                "accounts": [{"email": "reviewer@example.com",
+                              "home": self.tmp}]}}, "projects": {}})
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def ts(self, ago_s):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                             time.gmtime(self.now - ago_s))
+
+    def journal(self, *events):
+        os.makedirs(self.rs.state_dir(), exist_ok=True)
+        with open(self.rs.journal_path(), "a", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps(dict({"row": RELAY_ROW, "seat": RELAY_SEAT,
+                                         "sid": RELAY_SID}, **e)) + "\n")
+
+    def launched(self, ago_s):
+        self.journal({"event": "launch", "ts": self.ts(ago_s),
+                      "account": "reviewer@example.com"})
+
+    def told(self):
+        return [text for _to, text in self.dms]
+
+    def test_a_live_relay_session_holds_its_row_and_a_roster_seat_still_alarms(self):
+        self.rows = [_row(RELAY_ROW, RELAY_SEAT), _row("b2" * 12, "ds4pro")]
+        self.launched(600)
+        res = idle_dispatch.check()
+        self.assertEqual([f["recipient"] for f in res["findings"]], ["ds4pro"])
+        told = self.told()
+        self.assertEqual(len(told), 1)
+        self.assertIn("ds4pro", told[0])
+        self.assertIn("no recent activity", told[0])   # the roster text, unchanged
+
+    def test_a_relay_that_is_still_nudging_keeps_the_row_live(self):
+        self.rows = [_row(RELAY_ROW, RELAY_SEAT)]
+        self.launched(self.rs.nudge_after_s() * 2)
+        self.journal({"event": "deliver", "kind": "nudge", "ok": True,
+                      "ts": self.ts(600)})
+        self.assertEqual(idle_dispatch.check()["findings"], [])
+        self.assertEqual(self.dms, [])
+        # CONTROL on the same row and observable: once the relay records the
+        # session archived, the row alarms, so the silence above is a reading.
+        self.journal({"event": "archived", "ts": self.ts(60),
+                      "error": "session is archived"})
+        self.assertEqual(len(idle_dispatch.check()["findings"]), 1)
+        self.assertEqual(len(self.dms), 1)
+
+    def test_an_archived_relay_session_alarms_with_the_relays_reason(self):
+        self.rows = [_row(RELAY_ROW, RELAY_SEAT)]
+        self.launched(600)
+        self.journal({"event": "archived", "ts": self.ts(300),
+                      "error": "session is archived"})
+        idle_dispatch.check()
+        told = self.told()
+        self.assertEqual(len(told), 1)
+        self.assertIn("STRANDED", told[0])
+        self.assertIn("ARCHIVED", told[0])
+        self.assertIn(RELAY_SID, told[0])
+
+    def test_a_relay_row_with_no_session_alarms_and_quotes_the_hold(self):
+        self.rows = [_row(RELAY_ROW, RELAY_SEAT)]
+        self.journal({"event": "held", "ts": self.ts(300), "sid": None,
+                      "reason": "no remote-session project is configured"})
+        idle_dispatch.check()
+        told = self.told()
+        self.assertEqual(len(told), 1)
+        self.assertIn("holds no session for this row", told[0])
+        self.assertIn("no remote-session project is configured", told[0])
+
+    def test_an_unreadable_relay_journal_alarms_and_names_what_it_could_not_read(self):
+        self.rows = [_row(RELAY_ROW, RELAY_SEAT)]
+        os.makedirs(self.rs.journal_path())     # a directory: open() refuses it
+        idle_dispatch.check()
+        told = self.told()
+        self.assertEqual(len(told), 1)
+        self.assertIn("relay journal", told[0])
+        self.assertIn("could not be read", told[0])
+
+    def test_a_session_the_relay_stopped_attending_is_not_live_forever(self):
+        self.rows = [_row(RELAY_ROW, RELAY_SEAT)]
+        self.launched(self.rs.nudge_after_s() + 6 * 3600)
+        idle_dispatch.check()
+        told = self.told()
+        self.assertEqual(len(told), 1)
+        self.assertIn("LAUNCHED", told[0])
+        self.assertIn("helm remote tick", told[0])
+
+    def test_an_unreadable_relay_config_keeps_the_roster_alarm_and_says_so(self):
+        self.rows = [_row(RELAY_ROW, RELAY_SEAT)]
+        self.launched(600)
+        self.configure("{not json")
+        with mock.patch.object(idle_dispatch, "_warn_once") as warn:
+            idle_dispatch.check()
+        self.assertEqual(len(self.told()), 1)
+        said = " ".join(str(c.args[1]) for c in warn.call_args_list)
+        self.assertIn("remote-session config could not be read", said)
+
+
+if __name__ == "__main__":
+    unittest.main()

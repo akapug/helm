@@ -337,6 +337,27 @@ def _jwt_email(id_token):
         return None
 
 
+def _codex_auth(home):
+    """(auth, tokens, why) for one codex home's auth.json: the auth object or
+    None, its tokens object or {}, and why the login cannot be read (None
+    when it can). NEVER RAISES. Valid JSON that is not an object — a list, a
+    string — is ONE home's unreadable login; raised through `accounts()` it
+    makes the web read the whole measured census as unreadable, and raised
+    through a probe it costs every sibling account its row (task/3635)."""
+    auth = _read_json(os.path.join(home, "auth.json"))
+    if auth is None:
+        return None, {}, "auth.json is missing or is not valid JSON"
+    if not isinstance(auth, dict):
+        return None, {}, "auth.json is not a JSON object"
+    tokens = auth.get("tokens")
+    if not isinstance(tokens, dict):
+        return auth, {}, "auth.json carries no tokens object"
+    token = tokens.get("id_token")
+    if not (isinstance(token, str) and _jwt_email(token)):
+        return auth, tokens, "auth.json carries no id_token email claim"
+    return auth, tokens, None
+
+
 def _find_cwd(obj, depth=0):
     if depth > 3 or not isinstance(obj, dict):
         return None
@@ -382,6 +403,8 @@ class NativeQuotaProvider:
                or the predecessor's spelling):
                {"models": {"<model-substring>": {"prefer": [...], "avoid": [...]}},
                 "drain_pin": {"enabled": true}}. No file -> pure headroom ranking.
+               Between equal headroom, a Claude account whose 5h window is
+               WATCH or TIGHT (helm/claudepace.py) ranks last.
     """
 
     TTL = 60  # seconds; helm web caches on top of this too
@@ -479,23 +502,27 @@ class NativeQuotaProvider:
         active = self._active_homes()
         seen, rows, names = set(), [], set()
 
-        def add(name, provider, home, tier=None, usable=False, email=None):
+        def add(name, provider, home, tier=None, usable=False, email=None,
+                login_unknown=None):
             if name in names:  # two distinct homes, same identity — keep both, unambiguous
                 name = f"{name}#{os.path.basename(home)}"
             names.add(name)
             rows.append({"name": name, "provider": provider, "home": home,
                          "active": home in active, "tier": tier,
                          "usable": usable, "email": email})
+            # WHY THIS HOME'S LOGIN IS UNKNOWN, on the row, when it is
+            if login_unknown:
+                rows[-1]["login_unknown"] = login_unknown
 
         for home in self._dedup_dirs(self.claude_root, seen):
             email, tier = self._anthropic_identity(home)
             add(email or os.path.basename(home), "anthropic", home, tier,
                 usable=os.path.exists(os.path.join(home, ".credentials.json")), email=email)
         for home in self._dedup_dirs(self.codex_root, seen):
-            auth = _read_json(os.path.join(home, "auth.json"))
-            email = _jwt_email(((auth or {}).get("tokens") or {}).get("id_token") or "")
-            add(os.path.basename(home), "codex", home,
-                usable=bool(auth), email=email)
+            auth, tokens, why = _codex_auth(home)
+            add(os.path.basename(home), "codex", home, usable=bool(auth),
+                email=None if why else _jwt_email(tokens["id_token"]),
+                login_unknown=why)
         for home, name, provider, authfile in (
                 (os.path.expanduser("~/.claude"), "(default-claude)", "anthropic", ".credentials.json"),
                 (os.path.expanduser("~/.codex"), "(default-codex)", "codex", "auth.json")):
@@ -507,10 +534,21 @@ class NativeQuotaProvider:
             if (st.st_dev, st.st_ino) in seen or not os.path.exists(os.path.join(real, authfile)):
                 continue  # symlinked onto a scanned home, or not authed
             seen.add((st.st_dev, st.st_ino))
-            tier = email = None
+            tier = email = why = None
             if provider == "anthropic":
                 email, tier = self._anthropic_identity(real)
-            add(name, provider, real, tier, usable=True, email=email)
+            else:
+                # THE DEFAULT CODEX HOME'S LOGIN, read the way every scanned
+                # codex home's is (task/3635). A default is a pointer at a
+                # subscription, and it collapses onto the row it points at
+                # only through its login; without one it is a second codex
+                # account on the credit table with the numbers of the home it
+                # points at, and its identity is probed twice.
+                # A login it cannot read costs THIS home its login, named.
+                _auth, tokens, why = _codex_auth(real)
+                email = None if why else _jwt_email(tokens["id_token"])
+            add(name, provider, real, tier, usable=True, email=email,
+                login_unknown=why)
         return rows
 
     # -- usage probing -------------------------------------------------------
@@ -787,7 +825,7 @@ class NativeQuotaProvider:
         # gets probed exactly as before. Any failure -> "unknown" with a note,
         # never a provider failure.
         from . import codexbudget, codexhomes
-        tokens = (_read_json(os.path.join(acct["home"], "auth.json")) or {}).get("tokens") or {}
+        tokens = _codex_auth(acct["home"])[1]
         # A POOL THIS PASS COULD NOT READ IS THIS ACCOUNT'S UNKNOWN, AND
         # NOBODY ELSE'S (task/2480 R5). This function's contract is "never
         # raises; failure degrades the row", and `cred_state` relies on it
@@ -1005,6 +1043,13 @@ class NativeQuotaProvider:
                     os.replace(tmp, self.history_path)
             except OSError:
                 pass
+            # Nested history for the calibrate backtest — best-effort, never raises.
+            try:
+                from . import codexcal
+                codexcal.append_anthropic_history(list(rows), now=time.time(),
+                                                 path=None)
+            except Exception:
+                pass
         return rows
 
     def history(self, hours):
@@ -1199,9 +1244,28 @@ class NativeQuotaProvider:
             out.append({"account": a["name"], "eligible": not blocked,
                         "headroom_pct": headroom, "tier": s.get("tier") or a.get("tier"),
                         "home": a["home"], "blocked_by": blocked, "why": "headroom"})
-        out.sort(key=lambda r: (r["headroom_pct"] is None, -(r["headroom_pct"] or 0)))
+        # THE 5H PACE BREAKS A TIE, AND ONLY A TIE (pace5h). An account whose
+        # five-hour window is WATCH or TIGHT ranks after an EQUAL one that is
+        # not; it stays eligible and nothing it is running is touched.
+        pressed = self._pressed_5h([r["account"] for r in out]) \
+            if family == "anthropic" else {}
+        for r in out:
+            if r["account"] in pressed:
+                r["why"] = "headroom; 5h %s" % pressed[r["account"]]
+        out.sort(key=lambda r: (r["headroom_pct"] is None, -(r["headroom_pct"] or 0),
+                                r["account"] in pressed))
         rules = self._allocation_rules()
         return self._apply_rules(out, model, rules) if rules else out
+
+    @staticmethod
+    def _pressed_5h(names):
+        """{account: WATCH|TIGHT} from the 5h pace snapshot, or {} — a file
+        read, never a probe and never a raise."""
+        try:
+            from . import claudepace
+            return claudepace.pressed_accounts(names)
+        except Exception:
+            return {}
 
     @staticmethod
     def _allocation_rules():

@@ -64,9 +64,21 @@ DELIBERATE-AND-NAMED:
            fell back to the same ALPHABETICAL PREFIX on every pass forever, so
            rooms sorting past the budget were never scanned again and
            "eventual" quietly became "never" — escape 4's shape, one layer up,
-           attacking the CLAIM rather than the code. It still fails open (a
-           pass that cannot rotate must still deliver) and now says out loud
-           that coverage is not eventual until rotation is readable again.
+           attacking the CLAIM rather than the code. A pass that cannot
+           rotate must still deliver, and says so out loud. Since task/2520
+           the ring lock fails closed and such a pass rotates in its
+           process's memory, newest-written rooms first, so a long-lived
+           waiter still covers every room and a short-lived process reaches
+           the rooms written most recently; the warning says the saved
+           rotation does not advance.
+       6c. WHICH rooms a capped pass skips is not arbitrary. The slice takes
+           dirty rooms first -- never handed out, or written since the lane
+           last handed them out -- so a room written since the last look is
+           in the next pass unless more than a pass's worth are dirty, and
+           the skipped remainder is clean rooms and the overflow of dirt. The
+           rotation's head (the room handed out longest ago) is never passed
+           over, which is what keeps "eventual" true while dirty rooms keep
+           arriving. Pinned in tests/test_roomscan_dirty_first.py.
   7. A failed room LISTING answering "no other rooms" — A BUG of escape 4's
      exact shape, found while pinning 6 and closed here: the scan proceeds
      with what it has and SAYS coverage is unknown instead of implying the
@@ -592,9 +604,12 @@ class ScanCapAndRotationAreProvenTest(unittest.TestCase):
     def test_dead_rotation_state_SAYS_coverage_is_no_longer_eventual(self):
         """6b. An unreadable round-robin state returned the same alphabetical
         prefix on every pass forever, so rooms past the budget were never
-        scanned again and "coverage is EVENTUAL" quietly became "never". It
-        still fails open — a pass that cannot rotate must still deliver — and
-        it must SAY so."""
+        scanned again and "coverage is EVENTUAL" quietly became "never". A
+        pass that cannot rotate must still deliver, and it must SAY so.
+        Since task/2520 the ring lock fails closed and the pass rotates in
+        its process's memory instead of a fixed prefix (pinned in
+        test_roomscan_dirty_first.AnUnlockableRingStaysFairTest), so what it
+        says is that the saved rotation does not advance."""
         import io
         import contextlib
         from unittest import mock
@@ -608,12 +623,12 @@ class ScanCapAndRotationAreProvenTest(unittest.TestCase):
                                side_effect=OSError("rr state unreadable")), \
                 contextlib.redirect_stderr(err):
             out = seats._fair_room_slice(["b", "a", "c"], "seat", "s", 2, "stop")
-        self.assertEqual(out, ["a", "b"])          # fails OPEN: still delivers
+        self.assertEqual(out, ["a", "b"])          # still delivers a slice
         text = err.getvalue()
-        self.assertIn("NOT eventual", text)
-        self.assertIn("FIXED prefix", text)
+        self.assertIn("rotation state unavailable", text)
+        self.assertIn("saved rotation does not advance", text)
 
-    def test_a_readable_rotation_stays_silent(self):
+    def test_a_readable_rotation_stays_silent(self):  # noqa: VACUOUS_ASSERTION — silence on stderr is the contract; its failing pole is the arm above, the same call with the lock broken, which must print the sentence
         """NEGATIVE CONTROL: the warning must fire on failure only. Without
         this the arm above could pass on a version that warns every pass and
         buries every real signal under it."""
@@ -623,7 +638,7 @@ class ScanCapAndRotationAreProvenTest(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             out = seats._fair_room_slice(["b", "a", "c"], "seat", "s", 2, "stop")
         self.assertEqual(len(out), 2)
-        self.assertNotIn("NOT eventual", err.getvalue())
+        self.assertNotIn("rotation state unavailable", err.getvalue())
 
     def test_an_unreadable_room_TAIL_says_so_and_never_reads_clean(self):
         """THE NINTH ESCAPE. `_tail` answered an unreadable room
@@ -816,23 +831,30 @@ class DeadSinkCannotStealTheWakeTest(unittest.TestCase):
             chat.post("filler", who="alice", room="r%02d" % i)
         seats.join(session=self.SID, seat=self.SEAT, cwd=self.tmp)
         ring = seats_roomscan.scan_path(self.SEAT, self.SID, "deliver")
+
+        def ring_text():
+            if not os.path.exists(ring):
+                return False
+            with open(ring) as fh:
+                return fh.read()
         # MUST-HIT, TAKEN BEFORE THE ADDRESSED ROW EXISTS so this probe cannot
         # consume the row the arm is about: a pass that CAN deliver really
         # does move this file, or "unchanged" below is a statement about a
         # file nothing ever writes.
-        empty = os.path.exists(ring) and open(ring).read()
+        empty = ring_text()
         seats.deliver_any(session=self.SID, seat=self.SEAT,
                           emit=[].append, sink_usable=True)
-        self.assertNotEqual(empty, os.path.exists(ring) and open(ring).read(),
+        self.assertNotEqual(empty, ring_text(),
                             "MUST-HIT: the shared rotation is not being "
                             "persisted at all, so this arm measures nothing")
         self.addressed("this must not be rotated past")
-        before = open(ring).read()
+        with open(ring) as fh:
+            before = fh.read()
 
         self.assertIsNone(
             seats.deliver_any(session=self.SID, seat=self.SEAT,
                               emit=[].append, sink_usable=False))
-        after = os.path.exists(ring) and open(ring).read()
+        after = ring_text()
         self.assertEqual(before, after,
                          "a consumer that cannot deliver spent the shared "
                          "rotation budget its usable peer needs")
@@ -865,6 +887,44 @@ class DeadSinkCannotStealTheWakeTest(unittest.TestCase):
             "the row was not consumed, so the arm above cannot distinguish "
             "a committed delivery from a withheld one")
 
+    def _follow(self, step):
+        """Run the real follower, `seats_join.wait(follow=True)`, until
+        `step(n, line)` answers True after its n-th delivery call. Returns
+        the sink reading the follower handed each of those calls.
+
+        THE FOLLOWER ENDS ON ITS OWN DELIVERIES, NOT ON A CLOCK. The follower
+        hands each delivery the sink reading it took beside it, through
+        `seats_join.deliver_any`. This wraps that call and still makes it,
+        so `step` runs once the real delivery has withheld or consumed, and
+        a slow host changes when that happens and never whether it has. A
+        window on the wall clock can close before the follower has read its
+        sink once: a withhold arm then passes having exercised nothing, and
+        a delivery arm fails having seen no delivery. The wait's timeout is
+        HANG_S, a hang bound that a passing run never approaches."""
+        from helm import seats_join
+        from tests._lockwait import HANG_S
+        real = seats_join.deliver_any
+        readings = []
+
+        class Done(BaseException):
+            """Ends the follower, which otherwise runs until its timeout. It
+            is not an Exception, so the loop's fail-open handler passes it."""
+
+        def deliver_any(**kw):
+            line = real(**kw)
+            readings.append(kw.get("sink_usable"))
+            if step(len(readings), line):
+                raise Done
+            return line
+
+        try:
+            with mock.patch.object(seats_join, "deliver_any", deliver_any):
+                seats_join.wait(seat=self.SEAT, session=self.SID,
+                                follow=True, timeout=HANG_S, poll=0.05)
+        except Done:
+            pass
+        return readings
+
     def test_a_FOLLOWER_on_dev_null_measures_itself_and_withholds(self):
         """THE PLUMBING MUST BE REACHED IN PRODUCTION, or the fence is dead
         code that every arm above exercises by hand. This one drives the real
@@ -877,7 +937,6 @@ class DeadSinkCannotStealTheWakeTest(unittest.TestCase):
         usable consumer afterwards still finds it. Asserting only that the
         follower printed nothing would be vacuous: printing to /dev/null looks
         identical either way, which is the whole difficulty of this defect."""
-        from helm import seats_join
         self.addressed("a follower on the discard must not eat this")
 
         saved = os.dup(1)
@@ -889,8 +948,7 @@ class DeadSinkCannotStealTheWakeTest(unittest.TestCase):
             # running against an ordinary sink and proves nothing.
             state, _tok = beacons.sink_probe(os.getpid())
             measured = state
-            seats_join.wait(seat=self.SEAT, session=self.SID, follow=True,
-                            timeout=0.25, poll=0.05)
+            readings = self._follow(lambda n, line: True)
         finally:
             os.dup2(saved, 1)
             os.close(saved)
@@ -899,6 +957,9 @@ class DeadSinkCannotStealTheWakeTest(unittest.TestCase):
         self.assertEqual(measured, beacons.SINK_REFUTES,
                          "MUST-HIT: fd 1 on /dev/null did not classify as "
                          "REFUTES, so this arm never exercised the fence")
+        self.assertTrue(readings,
+                        "MUST-HIT: the follower made no delivery, so it never "
+                        "read its sink and the row below proves nothing")
         landed = []
         got = seats.deliver_any(session=self.SID, seat=self.SEAT,
                                 emit=landed.append, sink_usable=True)
@@ -910,32 +971,39 @@ class DeadSinkCannotStealTheWakeTest(unittest.TestCase):
 
     def _wait_while_fd1_flips(self, first, second, then_address=None):
         """Run the real follower with fd 1 on `first`, flip it to `second`
-        part-way through the wait from another thread, and optionally plant an
-        addressed row AFTER the flip. Returns nothing; the caller reads the
-        observables. fd 1 is restored whatever happens."""
-        import threading
-        from helm import seats_join
-        saved = os.dup(1)
-        flipped = threading.Event()
+        between two of its deliveries, and optionally plant an addressed row
+        AFTER the flip. Returns nothing; the caller reads the observables.
+        fd 1 is restored whatever happens.
 
-        def flip():
+        THE FLIP AND THE END ARE STEPS OF THE FOLLOWER'S OWN LOOP, NOT
+        MOMENTS ON A CLOCK (`_follow`). When the follower's first delivery
+        call returns, fd 1 flips and the row is planted, before the loop can
+        take its next reading. The wait ends when the first call that carries
+        a reading taken after the flip returns. So the follower is seen
+        exactly once on each side of the flip, however slowly the host runs
+        the reader walk or schedules the loop."""
+        def step(n, line):
+            if n > 1:
+                return True
             os.dup2(second, 1)
             if then_address:
                 self.addressed(then_address)
-            flipped.set()
-        t = threading.Timer(0.2, flip)
+            return False
+
+        saved = os.dup(1)
         try:
             os.dup2(first, 1)
-            t.start()
-            seats_join.wait(seat=self.SEAT, session=self.SID, follow=True,
-                            timeout=0.7, poll=0.05)
+            readings = self._follow(step)
         finally:
-            t.cancel()
             os.dup2(saved, 1)
             os.close(saved)
-        self.assertTrue(flipped.is_set(),
+        self.assertTrue(readings,
                         "MUST-HIT: the flip never ran, so the wait was never "
                         "observed across a change of destination")
+        self.assertGreater(len(readings), 1,
+                           "MUST-HIT: the follower took no reading after the "
+                           "flip, so nothing below is about the new "
+                           "destination")
 
     def test_a_sink_that_goes_DEAF_mid_wait_stops_consuming(self):
         """THE READING IS TAKEN BESIDE EACH DELIVERY, NOT ONCE BEFORE THE WAIT.
@@ -1008,8 +1076,10 @@ class DeadSinkCannotStealTheWakeTest(unittest.TestCase):
         DIRECTION TWO — fd 1 is /dev/null and stdout is redirected to a live
         in-process collector. The same check reads PROVEN-UNUSABLE and
         withholds from a consumer that would have delivered, which is worse
-        than the parent behaviour rather than merely unhelpful."""
-        from helm import seats_join
+        than the parent behaviour rather than merely unhelpful.
+
+        Each direction ends on the follower's first delivery (`_follow`), so
+        it is judged on a reading the follower really took."""
 
         # DIRECTION ONE. fd 1 is made a REAL PIPE rather than inherited,
         # because under a test runner it may already be a file — and then the
@@ -1025,8 +1095,7 @@ class DeadSinkCannotStealTheWakeTest(unittest.TestCase):
             # can only come from classifying the redirected stdout.
             pipe_state, _t = beacons.sink_probe(os.getpid(), fd=1)
             with contextlib.redirect_stdout(null):
-                seats_join.wait(seat=self.SEAT, session=self.SID, follow=True,
-                                timeout=0.25, poll=0.05)
+                readings = self._follow(lambda n, line: True)
         finally:
             os.dup2(saved1, 1)
             os.close(saved1)
@@ -1036,6 +1105,9 @@ class DeadSinkCannotStealTheWakeTest(unittest.TestCase):
         self.assertEqual(pipe_state, beacons.SINK_ADMISSIBLE,
                          "MUST-HIT: fd 1 was not a usable pipe, so direction "
                          "one is not exercising the false-usable case")
+        self.assertTrue(readings,
+                        "MUST-HIT: the follower made no delivery, so "
+                        "direction one never read the redirected stdout")
         landed = []
         got = seats.deliver_any(session=self.SID, seat=self.SEAT,
                                 emit=landed.append, sink_usable=True)
@@ -1056,8 +1128,7 @@ class DeadSinkCannotStealTheWakeTest(unittest.TestCase):
             # being exercised at all and the assertion below is free.
             state, _tok = beacons.sink_probe(os.getpid(), fd=1)
             with contextlib.redirect_stdout(collector):
-                seats_join.wait(seat=self.SEAT, session=self.SID, follow=True,
-                                timeout=0.25, poll=0.05)
+                self._follow(lambda n, line: True)
         finally:
             os.dup2(saved, 1)
             os.close(saved)

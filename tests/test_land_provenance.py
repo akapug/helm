@@ -696,9 +696,9 @@ class LaunchLabelArms(ProvenanceBase):
     def measure(self, options):
         event = {"v": 2, "event": "gate-measure", "host": "snoozy",
                  "interpreter": dict(INTERPRETER), "runner": dict(RUNNER),
-                 "route_preimage": "f" * 64}
-        if options is not None:
-            event["submit_options"] = options
+                 "route_preimage": "f" * 64,
+                 "submit_options": [gatewindow.LAND_AUTHORITY_OPTION]
+                                     + list(options or ())}
         return json.dumps(event) + "\n"
 
     def identity(self, options, label="train200"):

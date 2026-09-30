@@ -66,8 +66,8 @@ from .write import (
     _CANDIDATE_TYPES, _pick_candidate, confirm, reject, revise, _notify_graduation,
     xrev_clear, demote, pinned_stats, retag, regate, regloss, rescope, _kw_list,
     _KEYWORD_TYPES,
-    guard_entry_keywords, guard_add_keywords, record_mint_events,
-    corpus_common, corpus_profile, stem_probes, stem_drift_cells, doctor,
+    guard_entry_keywords, record_mint_events,
+    corpus_profile, stem_probes, stem_drift_cells, doctor,
     canonical_id, spaced_id, authored_probes,
 )
 from .index import (

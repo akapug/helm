@@ -170,18 +170,38 @@ HANG_S = 45 * 60          # a seat with a live pane and no COMPLETED SEMANTIC
                           # "hangs", so the bar is deliberately suggestive not
                           # accusatory. Raw mtime never moves this clock.
 _STATE = "proxywatch.json"
+#: The dark-family recheck's cadence (`helm-proxywatch-dark.timer`). A family
+#: whose dark latch holds is re-probed this often, so a recovered upstream
+#: reaches the dispatch door, `helm chat seats` and delivery within about a
+#: minute instead of at the next fifteen-minute pass. While no family is
+#: latched the pass is one file read and exits 0.
+DARK_INTERVAL_S = 60
+# A wedged oneshot must not consume its next cadence forever. The full pass owns
+# several deliberately slow vendor rungs, so it gets nearly its whole interval.
+# The minute recheck's bound must still admit what it runs on a HEALTHY
+# reading: the FULL measurement, a probe and then an upstream and a
+# runtime-proof canary each up to UPSTREAM_PASS_DEADLINE_S (a full pass
+# measured 71 s on this fleet). A oneshot still running at its next tick is
+# not started twice, so a bound past the tick skips a tick; a bound below the
+# measurement kills every recovery and leaves the latch to the fifteen-minute
+# pass.
+SERVICE_TIMEOUT_S = INTERVAL_S - DARK_INTERVAL_S
+DARK_SERVICE_TIMEOUT_S = 300
+_UNIT = "helm-proxywatch"
+_DARK_UNIT = "helm-proxywatch-dark"
 
 _SERVICE = """[Unit]
-Description=helm proxywatch (cli-proxy fix invariants + seat liveness, one pass)
+Description=%(description)s
 
 [Service]
 Type=oneshot
+TimeoutStartSec=%(timeout)ss
 # Run FROM the repo: helm derives a post's room from cwd, and a unit with no
 # WorkingDirectory starts in $HOME, derives no project, and falls back to
 # #main — so every watchdog alert landed in a room no seat homes in, while the
 # agents that could act on it live in #helm. Measured 2026-07-29.
 WorkingDirectory=%(cwd)s
-ExecStart=%(helm)s proxywatch --post
+ExecStart=%(helm)s proxywatch %(args)s
 # Exit 1 means the watch RAN and FOUND FAULTS (they are latched and posted);
 # only exit 2 means the watchdog itself failed. Without this line the two are
 # one signal: systemctl read `failed (exit-code 1)` off this unit all through
@@ -196,6 +216,20 @@ Description=helm proxywatch cadence (external, no demons)
 [Timer]
 OnBootSec=%(interval)ss
 OnUnitActiveSec=%(interval)ss
+
+[Install]
+WantedBy=timers.target
+"""
+
+_DARK_TIMER = """[Unit]
+Description=helm proxywatch dark-family recheck cadence (one file read while no family is dark)
+
+[Timer]
+OnBootSec=%(interval)ss
+OnUnitActiveSec=%(interval)ss
+# systemd's default AccuracySec is one minute, which on this cadence can
+# stretch one wait to two; the recheck is cheap, so it fires on time.
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target
@@ -406,9 +440,10 @@ def delivery_state_guard(wait=None):
 
     Atomic rename prevents torn reads but cannot order "checked healthy" against
     "recorded dark" and a later cursor commit. Delivery holds this short lock
-    through its cursor mutation; record() holds it only around the atomic write.
-    The authenticated canary remains outside, so a chat boundary never waits on
-    provider I/O.
+    through its cursor mutation; record() holds it only around the atomic write,
+    and so does `helm seat rest` around the owner's rest record, an input of
+    the same pause (helm/seat_rest.py). The authenticated canary remains
+    outside, so a chat boundary never waits on provider I/O.
 
     WHY A BOUNDED WAIT EXISTS AT ALL, and why it is OPT-IN rather than the
     default. This lock is fleet-wide and every seat takes it on every tool
@@ -422,9 +457,10 @@ def delivery_state_guard(wait=None):
     whole event and a line the owner cannot act on.
 
     OPT-IN because the other holders are not on a budget and must not learn to
-    skip. `record()` writing proxywatch state and the chat writer that replaces
-    it are not retried by a next tool call; a silent skip there would lose the
-    write this lock exists to order. They pass no `wait` and are untouched.
+    skip. `record()` writing proxywatch state, the chat writer that replaces
+    it and the rest writer are not retried by a next tool call; a silent skip
+    there would lose the write this lock exists to order. They pass no `wait`
+    and are untouched.
     """
     path = os.path.join(os.path.dirname(_state_path()), ".proxywatch-state.lock")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -490,30 +526,51 @@ def _read_watch_state():
 # completely? User prompts, queue operations, attachments, and CPU ticks never
 # advance semantic age.
 
-def _read_delivery_state():
-    """Best readable canonical snapshot for the delivery actuator.
+def _read_delivery_snapshot():
+    """(state, error, provenance) for the delivery actuator's canonical view.
 
     The primary remains proxywatch's transactional outbox authority. Delivery
     additionally keeps one byte-equivalent last-good snapshot so deleting or
     corrupting the primary during a dark episode cannot masquerade as HEALTHY.
-    A genuinely first-run absence (neither file exists) stays empty and does not
-    pause every proxy before the watcher has ever measured one.
+    Provenance is ``primary``, ``last-good`` or ``first-run``: a fast actuator
+    can therefore use the same fallback and still name which durable copy made
+    its decision. Only a genuine absence of BOTH files is first-run; an existing
+    unreadable backup fails explicitly rather than becoming an empty fleet.
     """
     state, err = _read_watch_state()
-    primary_exists = os.path.exists(_state_path())
+    # `exists` calls a dangling state symlink absent. It is instead an existing
+    # unreadable state path and must never earn the first-run empty-fleet answer.
+    primary_exists = os.path.lexists(_state_path())
     shape_err = upstream_records(state)[1] if primary_exists and not err else None
     if primary_exists and not err and not shape_err:
-        return state, None
+        return state, None, "primary"
+
+    backup_path = _backup_state_path()
+    backup_exists = os.path.exists(backup_path)
+    backup_err = None
     try:
-        with pk.open_regular(_backup_state_path(), encoding="utf-8") as handle:
+        with pk.open_regular(backup_path, encoding="utf-8") as handle:
             backup = json.load(handle)
-        if upstream_records(backup)[1] is None:
-            return backup, None
-    except (OSError, ValueError, TypeError):
-        pass
-    if not primary_exists and not err:
-        return {}, None
-    return state, err or shape_err or "proxywatch delivery snapshot unreadable"
+        backup_err = upstream_records(backup)[1]
+        if backup_err is None:
+            return backup, None, "last-good"
+    except FileNotFoundError:
+        backup_exists = False
+    except (OSError, ValueError, TypeError) as ex:
+        backup_err = "proxywatch last-good snapshot unreadable — %s" % ex
+
+    if not primary_exists and not backup_exists:
+        return {}, None, "first-run"
+    return (state,
+            err or shape_err or backup_err or
+            "proxywatch delivery snapshot unreadable",
+            None)
+
+
+def _read_delivery_state():
+    """(state, error) compatibility view of `_read_delivery_snapshot`."""
+    state, err, _source = _read_delivery_snapshot()
+    return state, err
 
 
 def _parse_timestamp(value):
@@ -776,7 +833,7 @@ def transcript_reality(path, now=None):
 
 
 def health(seats=None, include_upstream=True, prior_state=None,
-           include_probe=True):
+           include_probe=True, frozen_families=()):
     """The composite -> a dict. Reads only; never posts, never writes.
 
     The authenticated family rung is deliberately LAST: the current pane census,
@@ -792,6 +849,11 @@ def health(seats=None, include_upstream=True, prior_state=None,
     "not measured" — `turn_state` never consults `probe`, and `findings()`
     raises no probe finding from a probe-less pass, which is correct: a rung
     that did not run has found nothing.
+
+    frozen_families is the dark recheck's recovery boundary. Those families
+    were validated from `prior_state` and deliberately held until a future
+    quota reset, so both authenticated canary paths copy their prior family
+    record and spend zero requests on them while another family recovers.
     """
     from . import seat as seatmod
     from . import silent_drop, seats as seatsmod
@@ -814,29 +876,47 @@ def health(seats=None, include_upstream=True, prior_state=None,
                "pending_after": None, "hang_candidate": False,
                "probe": None, "probe_detail": None, "probe_ms": None,
                "log": None, "log_detail": None, "log_status_401": None,
-               "log_empty_turns": None,
-               "inflight": None, "ctx_pct": None, "spawn_age_s": None,
-               "open_dispatches": None, "fanout": None,
+               "log_empty_turns": None, "log_toolless": None,
+               "inflight": None, "ctx_pct": None, "ctx_unknown": None,
+               "spawn_age_s": None, "open_dispatches": None, "fanout": None,
                "turn_state": None, "turn_evidence": None,
                "upstream": None, "upstream_detail": None,
-               "upstream_ms": None, "upstream_since": None}
+               "upstream_ms": None, "upstream_since": None,
+               "down": None, "down_marker_error": None}
         if err:
             row["error"] = err
             rows.append(row)
             continue
+        # AN OPERATOR STOOD THIS SEAT DOWN. It rides the `error` channel on
+        # purpose: that is this report's existing "this seat gets no verdict"
+        # row, which every reducer already skips (findings, the upstream
+        # grouping, the runtime proofs, the pool-wall announcer) and which the
+        # usability join already renders as pane-only scope with this reason.
+        # `down` carries the record itself for the readers that name the state
+        # (report_lines, upstream_health's DOWN family). No probe, no canary.
+        down, unreadable = _desired_down(family, name)
+        if down:
+            row["down"] = down
+            row["error"] = _down_text(name, down)
+            rows.append(row)
+            continue
+        row["down_marker_error"] = unreadable
         phome = seatmod._proxy_home(family, name)
         cfg = os.path.join(phome, "config.yaml")
         drift = seatmod.config_drift(cfg) if os.path.exists(cfg) else []
         row["config_ok"] = not drift
         row["drift"] = ["%s=%s want %s" % (k, g, w) for k, w, g, _why in drift]
-        log = log_observation(os.path.join(phome, "proxy.log"))
+        log = log_observation(os.path.join(phome, "proxy.log"), now=now)
         row["log"], row["log_detail"] = log["state"], log["detail"]
         row["log_status_401"] = log["status_401"]
         row["log_empty_turns"] = log.get("empty_turns")
+        row["log_auth_failed"] = log.get("auth_failed")
+        row["log_toolless"] = log.get("toolless")
         try:
             from . import pi as pimod
             port, perr = pimod.seat_port(
                 name, verified_family=verified_family)
+            row["port"] = port
             if perr:
                 row["probe_detail"] = perr
             elif port and include_probe:
@@ -880,6 +960,9 @@ def health(seats=None, include_upstream=True, prior_state=None,
     # measurement behind it).
     live, host_blind, seat_blind = _live_seats()
     open_counts, open_scanned = None, False
+    # ONE JOURNAL READ PER PASS, and none on a host that never suspended:
+    # every seat's window is placed against the same sleep records.
+    clock_memo = {}
     for row in rows:
         entry = latch.get(row["seat"]) or {}
         row["alerted_at"] = entry.get("alerted_at")
@@ -903,7 +986,11 @@ def health(seats=None, include_upstream=True, prior_state=None,
         # per pass, and only when a candidate needs it.
         if row["pane_live"] and (age is None or age > HANG_S):
             row["inflight"] = _inflight_for(row["seat"])
-            row["ctx_pct"] = _ctx_pct(row["seat"])
+            # A str is the reader naming why the context is UNKNOWN
+            # (task/3534: "window unproven"); it is never a percentage.
+            ctx = _ctx_pct(row["seat"])
+            row["ctx_pct"], row["ctx_unknown"] = \
+                (None, ctx) if isinstance(ctx, str) else (ctx, None)
             row["spawn_age_s"] = _spawn_age_s(row["seat"])
             if not open_scanned:
                 open_counts, open_scanned = _open_work(), True
@@ -935,8 +1022,14 @@ def health(seats=None, include_upstream=True, prior_state=None,
             row["pane_live"], age, row.get("log"), row["inflight"],
             row["ctx_pct"], _compact_threshold(), row["spawn_age_s"],
             pane_blind=census_blind, reality=row.get("transcript_reality"),
+            ctx_unknown=row.get("ctx_unknown"),
             open_dispatches=row["open_dispatches"],
-            suspend_gap_s=host_suspend_gap_s(), onboarding=onboarding,
+            # THE SUSPEND INSIDE THIS SEAT'S WINDOW, never the since-boot
+            # total (task/3693): a sleep that ended before the seat's last
+            # turn took nothing from it. No age, no window: cannot tell.
+            suspend_gap_s=(None if age is None else host_suspend_gap_s(
+                within_s=age, memo=clock_memo)),
+            onboarding=onboarding,
             onboarding_age_s=row["onboarding_age_s"])
         # Sample the pane-tail classifier HERE, at the owner layer, so the
         # renderer stays a pure reduction (r1 HIGH): findings() reading
@@ -954,14 +1047,23 @@ def health(seats=None, include_upstream=True, prior_state=None,
                 row["liveness"] = _seatmod.seat_liveness(row["seat"])
             except Exception:
                 row["liveness"] = None
-        if row["turn_state"] == "idle":
-            # every pending census measured EMPTY — the opposite of a hang
-            # shape, so the candidate flag must not survive the verdict
+        # A PANE WHOSE TURN DIED ON AN UPSTREAM ERROR over a proxy reading
+        # HEALTHY again is woken by one prompt when no beacon listens, and by
+        # an @mention when one does. The liveness row cannot see a beacon, so
+        # the one seat that carries the dead turn pays for one strict probe.
+        if isinstance(row["liveness"], dict) and \
+                row["liveness"].get("turn_died"):
+            row["beacon_none"] = _beacon_none(row["seat"])
+        if row["turn_state"] in ("idle", "ok"):
+            # neither a measured empty pending census nor a suspend-corrected
+            # fresh turn is a hang, even when the raw transcript age is stale
             row["hang_candidate"] = False
-    upstream = upstream_health(rows, now=now, prior=prior_state) \
-        if include_upstream else {}
+    upstream = upstream_health(
+        rows, now=now, prior=prior_state,
+        frozen_families=frozen_families) if include_upstream else {}
     runtime_proofs = proxy_runtime_proofs(
-        rows, observed_at=int(now)) if include_upstream else {}
+        rows, observed_at=int(now),
+        frozen_families=frozen_families) if include_upstream else {}
     for row in rows:
         family = upstream.get(row.get("family")) or {}
         measured = upstream_seat_sample(upstream, row.get("family"), row["seat"])
@@ -971,6 +1073,35 @@ def health(seats=None, include_upstream=True, prior_state=None,
         row["upstream_since"] = measured.get("since")
     return {"ts": int(now), "seats": rows, "upstream": upstream,
             "proxy_runtime": runtime_proofs}
+
+
+def _beacon_none(seat_name):
+    """True when a strict probe finds no live beacon for this seat, False
+    when one is listening, None when the probe could not look. None is not
+    "no beacon": an unreadable process table proves nothing."""
+    try:
+        from . import seats as _seats
+        pids, trouble = _seats.beacon_procs(seat_name, strict=True)
+    except Exception:                       # noqa: BLE001 — a watch never raises
+        return None
+    return None if trouble else not pids
+
+
+def _desired_down(family, name):
+    """(record, error) from helm/seat_down.py — never raises into the watch.
+    An error is the SUPERVISED direction: the seat is watched as if it carried
+    no record, and `findings` says so."""
+    from . import seat_down
+    try:
+        return seat_down.read(family, name)
+    except Exception as e:                  # noqa: BLE001 — a watch never raises
+        return None, "desired-down record could not be read: %s" % e
+
+
+def _down_text(name, rec):
+    from . import seat_down
+    return ("DOWN — %s; proxywatch does not probe, canary or darken it; %s"
+            % (seat_down.describe(rec), seat_down.resume_hint(name)))
 
 
 # The PROBE rung. Credit where it is due: this idea was not mine — an untracked
@@ -1068,7 +1199,17 @@ def probe(port, timeout=PROBE_TIMEOUT_S):
 # auth path answer; this one spends eight tokens through the configured route and
 # asks whether the FAMILY can complete a fresh request now.
 UPSTREAM_TOKENS = 8
+# A READER'S WHOLE CANARY, and the longest silence any canary waits through.
+# The tier resolver and a dispatch send read a live canary under this bound.
 UPSTREAM_TIMEOUT_S = 30
+# THE PASS WAITS LONGER, because the pass reads CLIENT-TIMEOUT as TIMEOUT-500,
+# a dark state (`upstream_canary`), and a local seat busy generating holds the
+# canary open while its proxy writes keepalive bytes. The dark recheck's
+# DARK_SERVICE_TIMEOUT_S admits a probe plus an upstream and a runtime-proof
+# canary at this deadline. A seat still busy at the deadline, its proxy writing
+# keepalive bytes, reads UNKNOWN, weather (`_busy_timeout`); a silent one reads
+# TIMEOUT-500.
+UPSTREAM_PASS_DEADLINE_S = 120
 UPSTREAM_CONFIRM_S = 3
 DARK_FALSIFICATION_S = INTERVAL_S
 _CANARY_QUERY = "helm_canary=1"
@@ -1121,6 +1262,12 @@ _UPSTREAM_DARK = frozenset(("UPSTREAM-OVERLOADED", "QUOTA-402", _QUOTA_WALL,
                             "TIMEOUT-500", "UPSTREAM-4XX", "UPSTREAM-5XX",
                             "EMPTY200", "MALFORMED200"))
 _UPSTREAM_AGGREGATE = frozenset(("FAMILY-MIXED",))
+# AN OPERATOR'S DECISION, NOT A MEASUREMENT. Every seat of the family carries a
+# desired-down record (`helm seat down`, helm/seat_down.py), so nothing was
+# canaried and nothing is dark: the family reads DOWN, never FAMILY-DARK, and
+# never a latched UNKNOWN "absent from the census". Deliberately outside
+# _UPSTREAM_DARK, so no reader can take it for a wall.
+_DESIRED_DOWN = "DOWN"
 
 # WHOSE FAILURE IS IT. A dark state does not say where the failure happened,
 # and three of them DO: a PROXY-COOLDOWN and a PROXY-LOCAL-403 are helm's own
@@ -1725,13 +1872,14 @@ def _alias_rows_that_rename_a_route(rows):
 
     THE NAME MAY BE ANY MODEL THE CHANNEL'S OWN FAMILY CATALOGUES, and that is
     not a loosening — it is the shape a family with a `subagent_tiers` table
-    emits (seat_catalog): an astra codex seat's block names gpt-6-astra on the
-    opus row and gpt-5.6-sol on the sonnet row, both ids one codex OAuth
-    serves on the codex channel, so every row still points at a route this
-    observer could attest for THIS family. The `instance_models` table is the
-    same fact one level out: a codex instance declared on gpt-5.6-sol emits
-    sol on every row of its own block while its sibling emits astra, and both
-    blocks are this channel's family's catalogue, so neither is foreign. A name belonging to ANOTHER
+    emits (seat_catalog): a codex pane an operator pinned to gpt-5.6-sol
+    names 5.6-sol on the opus row and gpt-6.1-sol on the sonnet row, both ids
+    one codex OAuth serves on the codex channel, so every row still points at
+    a route this observer could attest for THIS family. The `instance_models`
+    table is the same fact one level out: an instance declared on another
+    catalogued model emits it on every row of its own block while its sibling
+    emits the family model, and both blocks are this channel's family's
+    catalogue, so neither is foreign. A name belonging to ANOTHER
     family's catalogue is refused instead, and that is the tightening this
     door was missing: the name is the model the upstream actually serves, so a
     foreign name on this channel would let a response come back stamped with
@@ -2050,8 +2198,80 @@ def _proxy_runtime_shape(seat_name):
             "proof": proof}, None
 
 
+class _CanaryDeadline(TimeoutError):
+    """The canary's deadline passed after `received` body bytes arrived."""
+
+    def __init__(self, received):
+        super().__init__("canary deadline passed after %d body bytes"
+                         % received)
+        self.received = received
+
+
+def _read_by(response, deadline):
+    """At most CANARY_MAX_BODY + 1 body bytes, read before the monotonic
+    `deadline`, else _CanaryDeadline; UPSTREAM_TIMEOUT_S of silence first is
+    a plain TimeoutError.
+
+    A socket timeout bounds one read, and a proxy holding a completion open
+    writes a keepalive chunk before any read waits it out, so only a deadline
+    over the whole body bounds the body. Each wait on the socket is set to
+    the time left, never to more than UPSTREAM_TIMEOUT_S of silence; the
+    socket is read off the http.client response (or the one an HTTPError
+    carries) and is gone once the response has closed it."""
+    body = bytearray()
+    while len(body) <= CANARY_MAX_BODY:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _CanaryDeadline(len(body))
+        wait = min(left, UPSTREAM_TIMEOUT_S)
+        fp = getattr(response, "fp", None)
+        raw = getattr(getattr(fp, "fp", fp), "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if sock is not None:
+            sock.settimeout(wait)
+        try:
+            chunk = response.read1(CANARY_MAX_BODY + 1 - len(body))
+        except TimeoutError:
+            if wait < UPSTREAM_TIMEOUT_S:   # the deadline bounded this wait
+                raise _CanaryDeadline(len(body)) from None
+            raise
+        if not chunk:
+            break
+        body += chunk
+    return bytes(body)
+
+
+# A CANARY THE PROXY KEPT OPEN IS BUSY, NOT SILENT. Body bytes before the
+# deadline are the proxy's keepalives: it accepted the request and its
+# upstream is still working, as a local seat does mid-generation. The pass
+# reads that CLIENT-TIMEOUT as weather (`upstream_canary`); zero body bytes,
+# and any HTTP error status, stay a silent CLIENT-TIMEOUT. The mark lives in
+# the detail, and `_busy_timeout` is its one reader.
+_BUSY = "; busy: %d body bytes arrived before the deadline"
+
+
+def _client_timeout(ms, received=0):
+    """The CLIENT-TIMEOUT answer for a canary that ran `ms` milliseconds,
+    BUSY when `received` body bytes arrived before its deadline."""
+    detail = "no upstream completion in %ds" % round(ms / 1000.0)
+    return (_CLIENT_TIMEOUT, detail + (_BUSY % received if received else ""),
+            ms, None, None, None)
+
+
+def _busy_timeout(result):
+    """Whether a canary result is a BUSY CLIENT-TIMEOUT (`_client_timeout`),
+    or the UNKNOWN the pass reads it as (`upstream_canary`)."""
+    return result[0] in (_CLIENT_TIMEOUT, "UNKNOWN") and \
+        _BUSY.partition("%")[0] in str(result[1] or "")
+
+
 def _canary_once(base_url, token, model, timeout=UPSTREAM_TIMEOUT_S):
-    """One authenticated request -> state/detail/ms/status/model/trace-id."""
+    """One authenticated request -> state/detail/ms/status/model/trace-id.
+
+    `timeout` is the DEADLINE for the whole exchange, on a monotonic clock
+    from before the request to the last body byte; no wait on the socket is
+    longer than UPSTREAM_TIMEOUT_S. A canary past its deadline is
+    CLIENT-TIMEOUT."""
     import urllib.error
     import urllib.request
     body = json.dumps({"model": model, "max_tokens": UPSTREAM_TOKENS,
@@ -2065,9 +2285,11 @@ def _canary_once(base_url, token, model, timeout=UPSTREAM_TIMEOUT_S):
                  "Anthropic-Version": "2023-06-01",
                  "Authorization": "Bearer " + token})
     t0 = time.time()
+    deadline = time.monotonic() + timeout
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            payload = response.read(CANARY_MAX_BODY + 1)
+        with urllib.request.urlopen(
+                req, timeout=min(timeout, UPSTREAM_TIMEOUT_S)) as response:
+            payload = _read_by(response, deadline)
             trace = getattr(response, "headers", {}).get("X-CPA-TRACE-ID")
             ms = int((time.time() - t0) * 1000)
             if len(payload) > CANARY_MAX_BODY:
@@ -2091,10 +2313,12 @@ def _canary_once(base_url, token, model, timeout=UPSTREAM_TIMEOUT_S):
                     response.status, response_model, trace)
     except urllib.error.HTTPError as ex:
         try:
-            payload = ex.read(CANARY_MAX_BODY + 1)
+            payload = _read_by(ex, deadline)
             headers = getattr(ex, "headers", None) or {}
             trace = headers.get("X-CPA-TRACE-ID")
             origin = headers.get(_REFUSAL_ORIGIN_HEADER)
+        except TimeoutError:                # an error status is never busy
+            return _client_timeout(int((time.time() - t0) * 1000))
         finally:
             ex.close()
         ms = int((time.time() - t0) * 1000)
@@ -2132,8 +2356,8 @@ def _canary_once(base_url, token, model, timeout=UPSTREAM_TIMEOUT_S):
         reason = getattr(ex, "reason", None)
         if isinstance(ex, TimeoutError) or isinstance(reason, TimeoutError) \
                 or ms >= timeout * 1000 - 100:
-            return (_CLIENT_TIMEOUT, "no upstream completion in %ds" % timeout,
-                    ms, None, None, None)
+            return _client_timeout(ms, ex.received
+                                   if isinstance(ex, _CanaryDeadline) else 0)
         return "UNKNOWN", "%s" % ex, ms, None, None, None
 
 
@@ -2187,13 +2411,56 @@ def _cooldown_names_one_loaded_route(detail, shape):
     return named[0], None
 
 
-def proxy_runtime_canary(seat_name, observed_at=None):
-    """(sanitized proof, error) after one stable exact route completes."""
+def _billed_sidecar_family(shape):
+    """The sidecar family one of the shape's candidate routes ends at, else
+    None. Such a route ends at a bridge on which every request bills the
+    owner's plan (cursor: a one-word prompt measured 2.24 cents).
+
+    THE DESTINATION DECIDES, not only the catalogued identity: a candidate
+    route whose endpoint is a sidecar family's `base_url` bills whatever alias
+    it carries, and a deferred candidate set is never family-checked before
+    the request, so the endpoint is compared before the family is resolved."""
+    from . import seat as seatmod
+    bridges = {str(fam.get("base_url") or "").rstrip("/"): name
+               for name, fam in seatmod.FAMILIES.items()
+               if isinstance(fam, dict) and fam.get("sidecar")}
+    routes = [shape["proof"].get("route")] + [
+        route for routes in (shape.get("auth_routes") or {}).values()
+        for route in (routes or ())]
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        hit = bridges.get(str(route.get("base_url") or "").rstrip("/"))
+        if hit:
+            return hit
+        family, why = _proxy_route_family(route)
+        if not why and family in bridges.values():
+            return family
+    return None
+
+
+def proxy_runtime_canary(seat_name, observed_at=None,
+                         timeout=UPSTREAM_TIMEOUT_S):
+    """(sanitized proof, error) after one stable exact route completes, its
+    canary under the deadline `timeout`: a reader's by default, and the
+    pass's UPSTREAM_PASS_DEADLINE_S from `proxy_runtime_proofs`.
+
+    NO ATTESTATION CANARY GOES DOWN A BILLED BRIDGE. Every live pane on a
+    sidecar family would otherwise spend one billed request per watch pass,
+    per bare `helm proxywatch` read and per tier-resolving process. The seat
+    then carries no measured proxy proof, so its verdicts resolve DARK, which
+    is where they stood before the family was catalogued; attesting it
+    without a billed request is a design question, not this door's."""
     shape, err = _proxy_runtime_shape(seat_name)
     if err:
         return None, err
+    billed = _billed_sidecar_family(shape)
+    if billed:
+        return None, ("%s routes through its billed bridge, so no attestation "
+                      "canary is sent and the seat carries no measured proxy "
+                      "proof" % billed)
     state, detail, _ms, status, response_model, trace = _canary_once(
-        shape["url"], shape["token"], shape["model"])
+        shape["url"], shape["token"], shape["model"], timeout=timeout)
     if state == _PROXY_COOLDOWN and status == 429:
         # walled, and attested by the proxy's own refusal: identity holds,
         # availability does not, and the proof says exactly that. A
@@ -2227,10 +2494,19 @@ def proxy_runtime_canary(seat_name, observed_at=None):
     expected_model, err = seatmod.proxy_route_response_model(family, route)
     if err:
         return None, err
-    if response_model != expected_model:
+    # A MODEL CLASS ROUTE IS ANSWERED BY THE MODEL IT SERVED, never by its own
+    # upstream id: OpenRouter's free-models router names a different free
+    # model in each response. `class_serves` is the one reading of which
+    # served ids the class admits; on every other route it answers False and
+    # the exact projection below stands unchanged.
+    from . import seat_catalog  # the facade above is imported first (seat_compat)
+    if response_model != expected_model \
+            and not seat_catalog.class_serves(family, route, response_model):
+        cls = seat_catalog.model_class(route.get("upstream_model"))
         return None, ("canary response model does not match the selected route "
-                      "projection (got %r, expected %r)" %
-                      (response_model, expected_model))
+                      "projection (got %r, expected %r%s)" %
+                      (response_model, expected_model,
+                       ", or a model the %s class serves" % cls if cls else ""))
     confirmed, err = _proxy_runtime_shape(seat_name)
     if err or confirmed != shape:
         return None, ("measured proxy runtime changed across its canary%s" %
@@ -2243,14 +2519,28 @@ def proxy_runtime_canary(seat_name, observed_at=None):
         None, "measured route produced a malformed proof")
 
 
-def proxy_runtime_proofs(rows, observed_at=None):
-    """Current successful session-bound proofs, keyed only for storage lookup."""
+def proxy_runtime_proofs(rows, observed_at=None, frozen_families=()):
+    """Current successful session-bound proofs, keyed only for storage lookup.
+
+    A frozen family is quota-held by the dark recheck. Its validated prior
+    family record remains authoritative for this recovery measurement, so this
+    second authenticated canary path must skip it just as `upstream_health`
+    does. The canaries run one seat at a time, so k seats busy past the pass's
+    UPSTREAM_PASS_DEADLINE_S spend k times it of the pass's SERVICE_TIMEOUT_S.
+    """
+    from . import offpeak
+    frozen = frozenset(frozen_families or ())
     out = {}
+    at = time.time() if observed_at is None else observed_at
     for row in rows:
-        if row.get("error") or row.get("probe") != "healthy":
+        if row.get("error") or row.get("probe") != "healthy" \
+                or row.get("family") in frozen:
+            continue
+        if offpeak.canary_hold(row.get("family"), at=at,
+                               seat_name=row.get("seat"), prove_clock=True):
             continue
         proof, _err = proxy_runtime_canary(
-            row.get("seat"), observed_at=observed_at)
+            row.get("seat"), observed_at=at, timeout=UPSTREAM_PASS_DEADLINE_S)
         if proof:
             out[str(row.get("seat"))] = proof
     return out
@@ -2359,7 +2649,17 @@ def _valid_canary_payload(payload):
     # that just answered OK, and refusing them would darken a family the way
     # the whitespace refusal did. Trunk never gated this branch on stop_reason
     # either (measured across nine values, identical on both sides).
-    if spoken == ["OK"] and typed and valid_thinking:
+    # A SPOKEN OK IS THE EVIDENCE; A BLANK THINKING BLOCK BESIDE IT IS NOT A
+    # VETO. The openrouter route answered text "OK" followed by an unsigned
+    # thinking block of "\n\n" (an OpenRouter free model); the harness
+    # took those replies turn after turn while this canary darkened the family
+    # MALFORMED200 for an hour. Beside speech a blank thinking string is the
+    # same as the blank text block the line above already ignores. A thinking
+    # value that is not a string at all is still a broken envelope, and a
+    # thinking-only reply still needs content or a signature (below).
+    beside_speech = all(isinstance(b.get("thinking"), str)
+                        or _thinking_block_valid(b) for b in thinking_blocks)
+    if spoken == ["OK"] and typed and beside_speech:
         return "with OK"
     # A REASONING MODEL THAT SPENT THE CAP THINKING IS GENERATING, NOT BROKEN.
     # Through an openai-compatible upstream the translator emits NO thinking
@@ -2593,16 +2893,24 @@ def _upstream_state(code, text, origin=None):
     return "UNKNOWN"
 
 
-def _upstream_once(seat_name, timeout=UPSTREAM_TIMEOUT_S, family=None):
-    """One authenticated eight-token request -> (state, detail, elapsed_ms)."""
+def _upstream_once(seat_name, timeout=None, family=None):
+    """One authenticated eight-token request -> (state, detail, elapsed_ms).
+
+    The pass's canary: `timeout` is its deadline, UPSTREAM_PASS_DEADLINE_S
+    read at call time when None. A sidecar bridge's GET /models is not a
+    completion, so no busy seat holds it open, and it keeps the reader's
+    UPSTREAM_TIMEOUT_S."""
     import urllib.error
     import urllib.request
     from . import pi as pimod, seat as seatmod
 
+    timeout = UPSTREAM_PASS_DEADLINE_S if timeout is None else timeout
     if family is None:
         family, err = seatmod._seat_family(seat_name)
         if err:
             return "UNKNOWN", err, None
+    if (seatmod.FAMILIES.get(family) or {}).get("sidecar"):
+        return _sidecar_canary(family, min(timeout, UPSTREAM_TIMEOUT_S))
     port, perr = pimod.seat_port(seat_name)
     token = pimod._pi_api_key(seat_name, family)
     model = (seatmod.FAMILIES.get(family) or {}).get("model")
@@ -2612,6 +2920,32 @@ def _upstream_once(seat_name, timeout=UPSTREAM_TIMEOUT_S, family=None):
     state, detail, ms, _status, _response_model, _trace = _canary_once(
         "http://127.0.0.1:%d" % port, token, model, timeout=timeout)
     return state, detail, ms
+
+
+def _sidecar_canary(family, timeout):
+    """A sidecar family's canary: its bridge's unbilled GET /models. Every
+    request through the cursor bridge bills the owner's Cursor plan (a
+    one-word prompt measured 2.24 cents), so the watch sends none; the money
+    reader (`cursor-dashboard`) owns the quota and wall reading, and
+    `seat doctor --ensure` owns a bridge that is down.
+
+    THE BUILD IS CHECKED BEFORE THE PROBE, as `seat_sidecar.verdict` checks
+    it, and so is the process serving the port (`seat_sidecar.unprobeable`).
+    A GET /models runs the serving process's own discovery code, and an
+    unvetted or stale build's is the code the pin exists to refuse: the build
+    before the pin put the Cursor bearer on curl's argv on every /models
+    read."""
+    from . import seat_sidecar
+    held = seat_sidecar.unprobeable(family)
+    if held:
+        return "UNKNOWN", "bridge %s, not probed: %s" % held, None
+    t0 = time.time()
+    kind, what = seat_sidecar.probe(family, timeout=timeout)
+    ms = int((time.time() - t0) * 1000)
+    if kind != "answered":
+        return "UNKNOWN", "bridge %s: %s" % (kind, what), ms
+    state = "HEALTHY" if 200 <= what < 300 else _upstream_state(what, "")
+    return state, "bridge /models HTTP %d (unbilled)" % what, ms
 
 
 # NOT DERIVED FROM INTERVAL_S, AND THAT IS THE WHOLE POINT. The bar tracks
@@ -2745,6 +3079,11 @@ def proxy_runtime_snapshot(session, now=None, expected_proof=None):
     attested_at = _PROXY_AUTH_CANARIES.get(cache_key)
     if type(attested_at) not in (int, float) or now - attested_at < 0 \
             or now - attested_at > _PROXY_AUTH_CANARY_FRESH_S:
+        from . import offpeak
+        held = offpeak.canary_hold(family, at=now, seat_name=identity,
+                                   prove_clock=True)
+        if held:
+            return None, None, ("live proxy runtime canary withheld: %s" % held)
         current, err = proxy_runtime_canary(
             identity, observed_at=proof["observed_at"])
         if err:
@@ -2824,7 +3163,7 @@ def upstream_record(state, family):
         return None, "proxywatch has no readable %s family record" % family
     verdict = record.get("state")
     if verdict not in _UPSTREAM_DARK | _UPSTREAM_AGGREGATE | \
-            {"HEALTHY", "UNKNOWN", _PROXY_COOLDOWN}:
+            {"HEALTHY", "UNKNOWN", _PROXY_COOLDOWN, _DESIRED_DOWN}:
         return None, "proxywatch %s state is invalid" % family
     dark = record.get("dark")
     invalid_dark = dark is not None and type(dark) is not bool
@@ -2856,7 +3195,8 @@ def upstream_seat_record(state, family, seat_name):
         return None, "proxywatch has no readable %s/%s seat record" % (
             family, seat_name)
     verdict = record.get("state")
-    if verdict not in _UPSTREAM_DARK | {"HEALTHY", "UNKNOWN", _PROXY_COOLDOWN}:
+    if verdict not in _UPSTREAM_DARK | {"HEALTHY", "UNKNOWN", _PROXY_COOLDOWN,
+                                        _DESIRED_DOWN}:
         return None, "proxywatch %s/%s state is invalid" % (family, seat_name)
     since = record.get("since")
     if since is not None and not isinstance(since, str):
@@ -2883,9 +3223,11 @@ def beacon_paused(record):
         return False
     state, dark = record.get("state"), record.get("dark")
     if state not in _UPSTREAM_DARK | _UPSTREAM_AGGREGATE | \
-            {"HEALTHY", "UNKNOWN", _PROXY_COOLDOWN} \
+            {"HEALTHY", "UNKNOWN", _PROXY_COOLDOWN, _DESIRED_DOWN} \
             or dark is not None and type(dark) is not bool:
         return False
+    if state == _DESIRED_DOWN:
+        return False                    # an operator's decision, never a wall
     if state in _UPSTREAM_AGGREGATE:
         return False
     dark = _named_upstream_dark(state) if dark is None else dark
@@ -2900,6 +3242,30 @@ def _observer_pause(family, error):
 def delivery_pause(seat_name, state=None, now=None, runtime=None,
                    runtime_verified=False):
     """(pause_or_none, error_or_none) for one seat's delivery actuator.
+
+    THE OWNER'S REST IS READ FIRST, BEFORE ANY FAMILY (helm/seat_rest.py). A
+    seat the owner paused is held whatever its runtime, and the seat he
+    paused was a native one with no proxy family, which the wall below
+    answers "unaffected" for. A rest and a wall together are ONE record
+    naming both (`seat_rest.combine`); each is re-read on every call, so
+    ending one leaves the other. The wall itself is `_wall_pause`, and a
+    wall that raises cannot lift a rest: the rest holds on its own."""
+    from . import seat_rest
+    rest = seat_rest.pause(seat_name, now=now)
+    try:
+        wall, err = _wall_pause(seat_name, state=state, now=now,
+                                runtime=runtime,
+                                runtime_verified=runtime_verified)
+    except Exception:
+        if rest:
+            return rest, None
+        raise
+    return seat_rest.combine(rest, wall), err
+
+
+def _wall_pause(seat_name, state=None, now=None, runtime=None,
+                runtime_verified=False):
+    """(pause_or_none, error_or_none) — the CREDENTIAL wall for one seat.
 
     This intentionally reads the persisted dark LATCH rather than
     ``upstream_snapshot``'s display freshness gate. Once a wall is measured,
@@ -2926,7 +3292,13 @@ def delivery_pause(seat_name, state=None, now=None, runtime=None,
     if ferr or not family:
         return None, None              # direct-Claude/unknown seats have no wall
     now = time.time() if now is None else now
-    from . import poolwall
+    # THE OFF-PEAK GATE IS READ BEFORE ANY WALL (helm/offpeak.py): a seat
+    # whose every route is a paid provider closed for its vendor's peak is
+    # held the same way, rows kept owed, until the window opens.
+    from . import offpeak, poolwall
+    held = offpeak.seat_pause(seat_name, family, now, prove_clock=True)
+    if held is not None:
+        return held, None
     wall, _why = poolwall.seat_wall(seat_name, family=family, now=now)
     if wall is not None:
         return poolwall.pause(wall, now), None
@@ -2960,7 +3332,12 @@ def upstream_canary(seat_name, sleep=time.sleep, family=None):
     first = _upstream_once(seat_name) if family is None else \
         _upstream_once(seat_name, family=family)
     if first[0] == _CLIENT_TIMEOUT:
-        return "TIMEOUT-500", first[1], first[2]
+        # BUSY IS WEATHER, SILENCE IS A WALL: a canary its proxy kept open met
+        # a seat mid-generation and reads UNKNOWN, which keeps a dark prior
+        # record dark and a HEALTHY one HEALTHY (`_compose_upstream_seat`); a
+        # silent one reads TIMEOUT-500, dark.
+        return ("UNKNOWN" if _busy_timeout(first) else "TIMEOUT-500",
+                first[1], first[2])
     if first[0] in ("HEALTHY", "UNKNOWN"):
         return first
     sleep(UPSTREAM_CONFIRM_S)
@@ -3031,6 +3408,15 @@ def _compose_upstream_seat(seat_name, result, before, now, birth=None,
     """One canonical local-process verdict with cooldown continuity."""
     state, detail, elapsed = result
     before = before if isinstance(before, dict) else {}
+    # A BUSY READING OVER A HEALTHY RECORD KEEPS IT HEALTHY. Keepalive bytes
+    # past the deadline are a measurement: the proxy is up, it accepted the
+    # request, and its upstream is working on it with no error, while an
+    # auth failure answers fast with a status. The record keeps its since and
+    # carries the busy detail. Over a dark record a busy reading keeps the
+    # wall, and over none it stays UNKNOWN.
+    if _busy_timeout(result) and before.get("state") == "HEALTHY" \
+            and before.get("dark") is not True:
+        state = "HEALTHY"
     prior_wall = (before.get("state") if before.get("state") in _UPSTREAM_QUOTA
                   else before.get("quota_wall")
                   if before.get("quota_wall") in _UPSTREAM_QUOTA else None)
@@ -3122,8 +3508,14 @@ def _compose_upstream_seat(seat_name, result, before, now, birth=None,
     return current
 
 
-def upstream_health(rows, now=None, prior=None):
-    """Per-seat upstream truth with a derived family compatibility summary."""
+def upstream_health(rows, now=None, prior=None, frozen_families=()):
+    """Per-seat upstream truth with a derived family compatibility summary.
+
+    Families frozen by a dark recovery pass are copied from their validated
+    prior records and never enter the candidate pool. A future-reset quota wall
+    therefore spends zero canaries merely because a different family read
+    HEALTHY and triggered the recovery measurement.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     now = time.time() if now is None else now
@@ -3132,14 +3524,30 @@ def upstream_health(rows, now=None, prior=None):
         if err:
             prior = {}
     prior_upstream = (prior.get("upstream") or {}) if isinstance(prior, dict) else {}
-    grouped = {}
+    frozen = {}
+    for family in frozenset(frozen_families or ()):
+        record, frozen_err = upstream_record(prior, family)
+        if not frozen_err:
+            frozen[family] = record
+    grouped, down = {}, {}
     for row in rows:
         if row.get("family") and not row.get("error"):
             grouped.setdefault(row["family"], []).append(row)
+        elif row.get("family") and isinstance(row.get("down"), dict):
+            down.setdefault(row["family"], {})[row["seat"]] = row["down"]
 
     candidates = [(family, row["seat"])
                   for family, family_rows in grouped.items()
+                  if family not in frozen
                   for row in family_rows if row.get("probe") == "healthy"]
+    # A PROVIDER CLOSED BY THE OFF-PEAK GATE IS NOT CANARIED: the proxy's own
+    # 502 for it is the gate working, not a dark upstream, and the seat's
+    # last measured record is carried forward until the window opens.
+    from . import offpeak
+    gate_hold = {key: offpeak.canary_hold(
+        key[0], now, seat_name=key[1], prove_clock=True)
+                 for key in candidates}
+    candidates = [key for key in candidates if not gate_hold[key]]
     results = {}
     if candidates:
         with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as pool:
@@ -3154,30 +3562,79 @@ def upstream_health(rows, now=None, prior=None):
                                                 None, "UNREADABLE")
 
     out = {}
-    families = set(grouped) | set(prior_upstream)
+    families = set(grouped) | set(prior_upstream) | set(down)
     for family in sorted(families):
+        if family in frozen:
+            out[family] = frozen[family]
+            continue
         before_family = prior_upstream.get(family) or {}
         before_seats = _prior_seats(before_family)
         seats = {}
         for row in sorted(grouped.get(family, ()), key=lambda item: item["seat"]):
             name = row["seat"]
+            if gate_hold.get((family, name)) and \
+                    isinstance(before_seats.get(name), dict) and \
+                    before_seats[name].get("state"):
+                seats[name] = dict(before_seats[name])
+                continue
             if (family, name) in results:
                 result, birth, identity_state = results[(family, name)]
+            elif gate_hold.get((family, name)):
+                result = ("UNKNOWN", gate_hold[(family, name)], None)
+                birth, identity_state = None, "NO-REPRESENTATIVE"
             else:
                 result = ("UNKNOWN",
                           "no locally healthy proxy to carry the canary", None)
                 birth, identity_state = None, "NO-REPRESENTATIVE"
+            # THE LOG FILLS ONLY A CANARY THAT COULD NOT SAY. The canary runs
+            # this pass, after every row the log holds, and classifies its own
+            # body, so any named verdict it returns (HEALTHY, QUOTA-WALL, ...)
+            # is the fresher measurement. The seat's own recent auth failures
+            # name the wall when no canary could (task/3199).
+            auth_failed = row.get("log_auth_failed")
+            before = before_seats.get(name)
+            before = before if isinstance(before, dict) else {}
+            log_born = before.get("measured_by") == _LOG_MEASURED
+            measured_by = None
+            if auth_failed and result[0] == "UNKNOWN":
+                result = ("AUTH-401",
+                          _auth_failure_detail(row.get("port"), auth_failed),
+                          None)
+                birth, identity_state = None, "LOG-AUTH-FAILED"
+                # The log owns the episode only when it opened it: a wall a
+                # canary measured keeps the canary's exit.
+                if log_born or not (before.get("dark") or
+                                    _named_upstream_dark(before.get("state"))):
+                    measured_by = _LOG_MEASURED
+            elif result[0] == "UNKNOWN" and log_born:
+                # A WALL THE LOG OPENED ENDS WITH ITS LOG EVIDENCE. The log
+                # rung fills only a canary that cannot say, and the only exit
+                # from a dark latch is a canary HEALTHY -- which that seat can
+                # never measure (cursor, 2026-09-25: UNKNOWN on every pass). So
+                # once the log shows no fresh auth streak (a success, a canary
+                # 2xx, or nothing inside UPSTREAM_CACHE_FRESH_S), the episode
+                # it opened ends here instead of latching the family for good.
+                before = {}
             seats[name] = _compose_upstream_seat(
-                name, result, before_seats.get(name), now,
+                name, result, before, now,
                 birth=birth, identity_state=identity_state)
+            if measured_by:
+                seats[name]["measured_by"] = measured_by
         for name, before in sorted(before_seats.items()):
-            if name not in seats and (before.get("dark") or any(
-                    before.get(key) is not None for key in (
-                        "falsification_observed_at",
-                        "falsification_proxy_identity"))):
+            # A seat stood down is not "absent from the census": carrying its
+            # old dark latch forward is exactly the FAMILY-DARK an operator's
+            # `seat down` must not produce.
+            if name not in seats and name not in down.get(family, {}) and (
+                    before.get("dark") or any(
+                        before.get(key) is not None for key in (
+                            "falsification_observed_at",
+                            "falsification_proxy_identity"))):
                 seats[name] = _compose_upstream_seat(
                     name, ("UNKNOWN", "seat absent from current census", None),
                     before, now)
+        if not seats and family in down:
+            out[family] = _down_family(down[family], before_family, now)
+            continue
         if not seats:
             if before_family.get("dark") is True:
                 out[family] = {
@@ -3237,6 +3694,26 @@ def upstream_health(rows, now=None, prior=None):
             current["falsification_bar_s"] = DARK_FALSIFICATION_S
         out[family] = current
     return out
+
+
+def _down_family(stood, before_family, now):
+    """The family record when every seat the census found is desired-down:
+    DOWN, never dark, one DOWN member per seat. `since` holds across passes
+    while the family stays DOWN, so the state reads as one episode."""
+    from . import seat_down
+    since = before_family.get("since") \
+        if before_family.get("state") == _DESIRED_DOWN \
+        and isinstance(before_family.get("since"), str) else _iso(now)
+    seats = {name: {"state": _DESIRED_DOWN, "detail": seat_down.describe(rec),
+                    "ms": None, "since": since, "dark": False}
+             for name, rec in sorted(stood.items())}
+    return {"state": _DESIRED_DOWN, "dark": False, "ms": None, "seat": None,
+            "detail": "every seat desired-down: " + "; ".join(
+                "%s %s" % (name, record["detail"])
+                for name, record in sorted(seats.items())),
+            "seats": seats,
+            "members": {name: _DESIRED_DOWN for name in sorted(seats)},
+            "since": since}
 
 
 # The LOG rung. The grok seat's starvation was written, line by line, into the
@@ -3433,10 +3910,13 @@ def _proxy_log_rows(path, tail_bytes):
     for ln in lines:
         m = _REQ.match(ln)
         if m:
+            delivery = _stream_evidence(ln)
+            if delivery is not None:
+                delivery["line"] = ln       # the TOOLLESS rung quotes its row
             rows.append((m.group(1), int(m.group(2)), m.group(3),
                          _logged_response_body(ln),
                          _logged_refusal_origin(ln),
-                         _stream_evidence(ln)))
+                         delivery))
     return rows, None, {"bytes": len(raw), "truncated": size > tail_bytes}
 
 
@@ -3462,6 +3942,78 @@ def _status_401_provenance(rows, scope):
             "total": helm_marked + unmarked,
             "basis": "request query marker %s" % _CANARY_QUERY,
             "scope": scope}
+
+
+def _auth_failure_observation(rows, now=None, streak_n=STREAK_N,
+                              min_window_s=STREAK_MIN_WINDOW_S, fresh_s=None):
+    """How many trailing real agent requests failed on UPSTREAM auth, or None.
+
+    The same refusal-cluster rule `_log_state` applies, narrowed to one cause:
+    at least `streak_n` unmarked agent rows with only weather between them,
+    each classified AUTH-401 by `_upstream_state` from its code, body and
+    origin, spanning at least `min_window_s`, the newest younger than
+    `fresh_s` (UPSTREAM_CACHE_FRESH_S). A floor of two with no clock was measured wrong
+    on the fleet's live logs: 18 runs of exactly two auth refusals, most a
+    request and its retry 0-5 s apart that the next request cleared, and
+    a numbered codex instance's ten 401s still read AUTH-401 88 minutes after the last of them
+    and 50 minutes after its own canary had recovered.
+
+    WHAT ENDS THE STREAK. A success on the agent path, an authenticated
+    canary's 2xx (measured recovery through this same proxy), and any vendor
+    answer that got past auth (a quota wall, a content flag, another 4xx).
+    Canary rows never COUNT (a marked row is helm's instrument, not the
+    seat's traffic), and the invalid-key probe's 200 is not recovery: a 200
+    to an invalid key is an auth failure of its own (EMPTY200).
+
+    WEATHER NEITHER COUNTS NOR ENDS IT. A 5xx, a rate-limit 429 and any row
+    OUR proxy refused (a local 401/403/429: ours, not the vendor's) say
+    nothing about the key. A codex seat's live outage read 'HTTP 401 x20 (also
+    429/520)'; ending the streak on those left the rung clear for minutes
+    mid-outage, and a wall this rung opened would have closed with it.
+    """
+    from . import poolwall
+    now = time.time() if now is None else now
+    fresh_s = UPSTREAM_CACHE_FRESH_S if fresh_s is None else fresh_s
+    streak = []                             # newest first
+    for ts, code, request_path, body, origin, _delivery in reversed(rows or ()):
+        if not request_path.startswith(_AGENT_PATH):
+            continue
+        if _is_helm_canary_path(request_path):
+            if 200 <= code < 300:
+                break                       # measured recovery, this proxy
+            continue
+        if code < 400:
+            break                           # a request that got through
+        if origin == _REFUSAL_LOCAL:
+            continue                        # ours: says nothing of the key
+        state = _upstream_state(code, body, origin=origin)
+        if state == "AUTH-401":
+            streak.append((ts, code, body, origin))
+            continue
+        if state != _CONTENT_FLAGGED and (code >= 500
+                                          or state == "RATE-LIMITED"):
+            continue                        # weather: says nothing of the key
+        break
+    if len(streak) < streak_n:
+        return None
+    window = _window_s(streak)
+    newest = poolwall._log_epoch(streak[0][0])
+    if window is None or window < min_window_s or newest is None \
+            or now - newest >= fresh_s:
+        return None
+    return len(streak)
+
+
+# The provenance a seat record carries when the proxy LOG, not a canary,
+# opened its AUTH-401 episode. `upstream_health` reads it back off the
+# persisted record to end that episode when its log evidence ends.
+_LOG_MEASURED = "proxy-log"
+
+
+def _auth_failure_detail(port, count):
+    """The upstream detail a log-read auth wall carries: port and count."""
+    return "port %s: %d request%s failed on upstream auth" % (
+        port or "UNKNOWN", count, "" if count == 1 else "s")
 
 
 _EMPTY_ZERO_TERMINAL = "message_stop"
@@ -3635,6 +4187,150 @@ def empty_turn_lines(rep):
     return out
 
 
+# TOOLLESS (task/3533). A seat whose model stops making tool calls answers
+# every turn and does no work, and every rung above reads it healthy: each
+# request completes 200 and delivers text. Measured on the live fleet: the
+# cursor seat answered text-only for 30 hours, its proxy.log reading
+# `text_bytes=1538 tool_uses=0` on every row, while helm showed it idle and
+# the owner found it by looking at the pane.
+#
+# A TEXT-ONLY REPLY IS NOT ALWAYS THE END OF A CLIENT TURN. One proxy carries
+# concurrent conversations: parallel subagents each end on a text-only final
+# and then the main agent answers, and the harness's own background
+# small-model calls (a session title, a topic check) are text-only replies
+# too. So text-only replies that complete within TOOLLESS_FOLD_S of the
+# newest reply of their group are FOLDED into one turn: that concurrent tail
+# lands in seconds, while a client's next prompt follows a human or a
+# dispatch. A turn with no tool call is then a folded group whose previous
+# group was text-only too. A working turn's final answer is text-only, so ONE
+# such group is normal: the oldest group of a trailing text-only run is
+# credited as the answer of the turn before it, and when nothing observable
+# precedes it that credit is still given, because the tail may have cut its
+# turn off. The run must also span TOOLLESS_MIN_SPAN_S of wall time, from its
+# first counted turn to its newest reply, before it trips: a few quick
+# replies are a burst, not a seat that stopped working. A timestamp helm
+# cannot parse folds nothing and makes the span unknown, which never trips.
+#
+# WHAT NEITHER COUNTS NOR ENDS THE RUN. An empty reply (`text_bytes=0
+# tool_uses=0`) belongs to the empty-turn census and the silent-drop rung,
+# which already report it, so it is not reported twice. A refusal (4xx/5xx)
+# is the refusal rungs' weather. A canary is helm's instrument, not the
+# seat's traffic. A stream that did not commit and stop cleanly is not a
+# turn this rung can read. A 2xx agent row carrying no delivery suffix ends
+# the walk: helm cannot see what it delivered.
+#
+TOOLLESS_N = 3                # consecutive tool-less turns that read TOOLLESS
+TOOLLESS_FOLD_S = 45          # text-only replies this close are one turn: a
+                              # subagent tail and a title call land in seconds
+TOOLLESS_MIN_SPAN_S = 300     # and the run spans five minutes before it trips
+_EVIDENCE_CHARS = 400
+
+
+def _log_epoch(ts):
+    """A proxy.log timestamp as epoch seconds, or None when it is opaque."""
+    try:
+        import calendar
+        return calendar.timegm(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
+def _toolless_turns(rows):
+    """The trailing run of tool-less turns in one parsed tail, or None.
+
+    None means no agent row in the tail carries the delivery suffix, so the
+    count is unobservable, never zero (the empty-turn census's law)."""
+    agent = [(ts, code, d) for ts, code, request_path, _b, _o, d in rows
+             if request_path.startswith(_AGENT_PATH)
+             and not _is_helm_canary_path(request_path)]
+    if not any(d is not None for _ts, _code, d in agent):
+        return None
+    run = []                                # text-only replies, newest first
+    for ts, code, d in reversed(agent):
+        if code >= 400:
+            continue
+        if d is None or d["tool_uses"]:
+            break
+        if not d["text_bytes"]:
+            continue                        # empty: the silent-drop rung's
+        if d["stream"] != "committed" or d["terminal"] != _EMPTY_ZERO_TERMINAL:
+            continue
+        run.append((ts, d.get("line") or "", _log_epoch(ts)))
+    groups = []                     # folded turns, newest first; each newest first
+    for item in run:
+        head = groups[-1][0][2] if groups else None
+        if head is not None and item[2] is not None \
+                and 0 <= head - item[2] <= TOOLLESS_FOLD_S:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+    turns = max(0, len(groups) - 1)
+    evidence = groups[0][0][1] if turns else None
+    if evidence and len(evidence) > _EVIDENCE_CHARS:
+        evidence = evidence[:_EVIDENCE_CHARS - 3] + "..."
+    first = groups[-2][-1] if turns else None
+    newest = groups[0][0][2] if turns else None
+    span = (newest - first[2] if newest is not None
+            and first[2] is not None else None)
+    return {"turns": turns,
+            "toolless": turns >= TOOLLESS_N and span is not None
+            and span >= TOOLLESS_MIN_SPAN_S,
+            "since": first[0] if turns else None, "span_s": span,
+            "evidence": evidence, "bar": TOOLLESS_N,
+            "basis": "proxy.log: a text-only reply ends its turn, and "
+                     "text-only replies within %ds of their group's newest "
+                     "are one turn; the oldest turn of the run is the prior turn's "
+                     "answer; the run spans %ds before it trips; empty "
+                     "replies, refusals and canaries are skipped"
+                     % (TOOLLESS_FOLD_S, TOOLLESS_MIN_SPAN_S)}
+
+
+def toolless_observation(path, tail_bytes=_TAIL_BYTES):
+    """One seat's tool-less-turn reading from its proxy.log, or None when the
+    log is unreadable or carries no delivery suffix."""
+    rows, err, _scope = _proxy_log_rows(path, tail_bytes)
+    return None if err else _toolless_turns(rows)
+
+
+def _family_has_tools(family):
+    """Does a seat of `family` run with tools? Every catalogued family runs
+    the claude harness, whose deny lists never take its whole tool set, so a
+    catalogued family has tools; an unknown family is not asserted to."""
+    if not family:
+        return False
+    try:
+        from helm import seat as _seat_facade  # noqa: F401 — facade beside the impl import
+        from . import seat_catalog
+        return family in seat_catalog.FAMILIES
+    except Exception:                       # noqa: BLE001 — a watch never raises
+        return False
+
+
+def toolless_reading(row):
+    """The TOOLLESS reading one health row carries, or None.
+
+    THE ONE PREDICATE every surface asks: proxywatch's finding, the usability
+    join the dispatch door refuses on, and `helm seat doctor`. It trips only
+    for a seat whose family has tools and whose log shows TOOLLESS_N or more
+    consecutive turns with no tool call."""
+    seen = (row or {}).get("log_toolless")
+    if not isinstance(seen, dict) or not seen.get("toolless"):
+        return None
+    if not _family_has_tools((row or {}).get("family")):
+        return None
+    return seen
+
+
+def toolless_text(seat, seen):
+    """The fail-loud line: seat, count, since when, and the evidence row."""
+    return ("%s: TOOLLESS — %d consecutive turns with no tool call since %s "
+            "(bar %d): the model answers every turn with text only, so the "
+            "seat looks alive and does no work. Read its pane; this clears "
+            "on the first turn with a tool call. Evidence: %s"
+            % (seat, seen["turns"], seen.get("since") or "?",
+               seen.get("bar") or TOOLLESS_N, seen.get("evidence") or "?"))
+
+
 def _log_state(rows, tail_bytes, streak_n, min_window_s):
     hits = [(ts, code, body, origin)
             for ts, code, request_path, body, origin, _delivery in rows
@@ -3699,7 +4395,7 @@ def _log_state(rows, tail_bytes, streak_n, min_window_s):
 
 
 def log_observation(path, tail_bytes=_TAIL_BYTES, streak_n=STREAK_N,
-                    min_window_s=STREAK_MIN_WINDOW_S):
+                    min_window_s=STREAK_MIN_WINDOW_S, now=None):
     """One proxy-log read -> refusal state plus explicit 401 provenance.
 
     The 2026-08-03 #97 audit counted 1,967 keyless 401s and called their source
@@ -3710,11 +4406,14 @@ def log_observation(path, tail_bytes=_TAIL_BYTES, streak_n=STREAK_N,
     rows, err, scope = _proxy_log_rows(path, tail_bytes)
     if err:
         return {"state": "unknown", "detail": err, "status_401": None,
-                "empty_turns": None}
+                "empty_turns": None, "auth_failed": None, "toolless": None}
     state, detail = _log_state(rows, tail_bytes, streak_n, min_window_s)
+    auth_failed = _auth_failure_observation(rows, now=now)
     return {"state": state, "detail": detail,
             "status_401": _status_401_provenance(rows, scope),
-            "empty_turns": _empty_turn_accounting(rows, scope)}
+            "empty_turns": _empty_turn_accounting(rows, scope),
+            "auth_failed": auth_failed,
+            "toolless": _toolless_turns(rows)}
 
 
 def logscan(path, tail_bytes=_TAIL_BYTES, streak_n=STREAK_N,
@@ -3808,12 +4507,27 @@ def _inflight_for(name):
         return None
 
 
+#: What `_ctx_pct` answers for a seat whose window is only ASSUMED.
+CTX_WINDOW_UNPROVEN = "window unproven"
+
+
 def _ctx_pct(name):
     """The seat's context %, via the reader autocompact already trusts —
-    transcript usage first, proxy.log usage fallback. None = unknowable."""
+    transcript usage first, proxy.log usage fallback. None = unknowable.
+
+    A PERCENTAGE OF AN ASSUMED WINDOW IS NOT A READING (task/3534). For a
+    row autocompact marks `window-unproven` this answers CTX_WINDOW_UNPROVEN,
+    a str naming why the context is UNKNOWN, never the percentage: the
+    compact-needed rung would otherwise call the seat autocompact's to fix,
+    and autocompact does not fire on an unproven window."""
     try:
         from . import autocompact
-        return autocompact.read(name).get("pct")
+        row = autocompact.read(name)
+        if row.get("status") == "window-unproven" or (
+                row.get("window_src") == autocompact.ASSUMED_WINDOW_SRC
+                and row.get("pct") is not None):
+            return CTX_WINDOW_UNPROVEN
+        return row.get("pct")
     except Exception:                       # noqa: BLE001 — a watch never raises
         return None
 
@@ -3959,29 +4673,108 @@ def _spawn_onboarded(name, family=None):
             % (type(exc).__name__, path))
 
 
-def host_suspend_gap_s():
-    """Seconds this HOST has spent suspended since boot, or None if unreadable.
+#: systemd's catalogued sleep records, SD_MESSAGE_SLEEP_START
+#: (6bbd95ee977941e497c48be27c254128) and SD_MESSAGE_SLEEP_STOP
+#: (8811e6df2a8e40f58a94cea26f8ebf14). systemd-sleep writes the first just
+#: before the host sleeps and the second on its way back (a failed sleep
+#: writes the second as well), and journald stamps each with the wall clock
+#: and CLOCK_MONOTONIC. Matched by MESSAGE_ID, never by MESSAGE, whose wording
+#: changed between systemd releases.
+SLEEP_MESSAGE_IDS = ("6bbd95ee977941e497c48be27c254128",
+                     "8811e6df2a8e40f58a94cea26f8ebf14")
+def _sleep_journal_marks():
+    """[(wall_s, monotonic_s)] for this boot's systemd-sleep records, in time
+    order, or [] when the journal gives none.
 
-    CLOCK_BOOTTIME advances while the machine is suspended; CLOCK_MONOTONIC
-    does not. Their difference IS the suspended total — one syscall, no
-    threshold, no heuristic, and a FACT rather than an inference. That is why
-    it is the authority and the lockstep signature is only its corroborator.
-
-    NONE, NEVER ZERO, WHEN IT CANNOT LOOK. A kernel without CLOCK_BOOTTIME, or
-    a platform where the two clocks mean something else, has told us nothing —
-    and `turn_state` treats None as "cannot tell" precisely so that silence
-    cannot become a confident "the box was up the whole time". Reporting 0 here
-    on failure is the single change that would turn this guard back into the
-    six false HUNGs it exists to prevent.
-
-    CAVEAT WORTH KEEPING: this is suspend-since-BOOT, so it is a monotone
-    total, not a per-window figure. Subtracting it whole is correct only while
-    the staleness window is younger than the last suspend — which is the case
-    that matters (a suspend that predates the transcript entry did not inflate
-    its age). A caller wanting per-window precision must difference two
-    readings, and proxywatch's own posted rows are already
-    that record."""
+    [] IS NOT "NO SUSPEND". The reader below places a suspend only against a
+    record and checks every span against the kernel's own total, so a missing
+    record (a vacuumed journal, a user who cannot read the system journal, a
+    host without systemd, a sleep started outside systemd-sleep) leaves the
+    kernel's suspend in that span UNPLACED, and a window opening inside it
+    reads UNKNOWN. A missing record can widen what helm does not know. It can
+    never shrink an age.
+    """
     try:
+        done = subprocess.run(
+            ["journalctl", "-b", "-q", "-o", "json", "--no-pager",
+             "--output-fields=MESSAGE_ID"]
+            + ["MESSAGE_ID=" + m for m in SLEEP_MESSAGE_IDS],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    marks = []
+    for line in done.stdout.splitlines() if done.returncode == 0 else ():
+        try:
+            entry = json.loads(line)
+            marks.append((int(entry["__REALTIME_TIMESTAMP"]) / 1e6,
+                          int(entry["__MONOTONIC_TIMESTAMP"]) / 1e6))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return sorted(marks, key=lambda mark: mark[1])
+
+
+def _suspend_after(start, points):
+    """Seconds of host suspend between wall time `start` and the last point,
+    or None when helm cannot place it.
+
+    `points` are (wall, offset) readings of the host's clocks in time order,
+    the first at boot and the last now. The offset is wall time minus
+    CLOCK_MONOTONIC, and it grows only while the host is suspended, so the
+    suspend between two points is their offset difference. Every span that
+    lies wholly after `start` counts in full. The span `start` falls inside
+    counts only what is certain: its suspend is placed as EARLY as the span
+    allows. If placing it as LATE gives a different rounded second, the
+    answer is unknown rather than treating unplaced sleep as known uptime.
+    """
+    walls = [wall for wall, _ in points]
+    if walls != sorted(walls):
+        return None             # the wall clock stepped back; nothing places
+    end = points[-1][1]
+    if start <= walls[0]:
+        return int(round(max(0.0, end - points[0][1])))
+    for (w0, o0), (w1, o1) in zip(points, points[1:]):
+        if start < w1:
+            slept = max(0.0, o1 - o0)
+            early = max(0.0, slept - (start - w0))
+            late = min(slept, w1 - start)
+            after = max(0.0, end - o1)
+            if round(early + after) != round(late + after):
+                return None
+            return int(round(early + after))
+    return 0
+
+
+def host_suspend_gap_s(within_s=None, memo=None):
+    """Seconds this HOST spent suspended, or None if helm cannot tell.
+
+    With no `within_s`, the total since boot: CLOCK_BOOTTIME advances while
+    the machine is suspended and CLOCK_MONOTONIC does not, so their difference
+    IS the suspended total. One syscall, no threshold, no heuristic. The
+    post-suspend sweep (helm/suspend.py) reads this total.
+
+    With `within_s`, only the suspend inside the last `within_s` seconds,
+    which is what a seat's turn age may subtract. THE TOTAL IS NOT THAT
+    ANSWER: it says how long the host slept since boot and never WHEN. On a
+    laptop whose boot held 78 h of sleep, subtracting it whole read seats
+    whose last turns were 5 h, 24 h and 78 h old as fresh, because every
+    sleep had ended before their windows opened. The journal's systemd-sleep
+    records say when (`_sleep_journal_marks`), and `_suspend_after` credits
+    the window only with suspend it can place inside it.
+
+    `memo` is a dict one caller keeps for one pass, so the journal is read at
+    most once however many seats ask. The journal is not read at all on a
+    host that has never suspended.
+
+    NONE, NEVER ZERO, WHEN IT CANNOT LOOK. A kernel without CLOCK_BOOTTIME, a
+    platform where the two clocks mean something else, or a suspend helm
+    cannot place against the window has told us nothing, and `turn_state`
+    reads None as "cannot tell" so that silence cannot become a confident
+    "the box was up the whole time". Reporting 0 here on failure is the
+    single change that would turn this guard back into the six false HUNGs it
+    exists to prevent.
+    """
+    try:
+        wall = time.time()
         boot = time.clock_gettime(time.CLOCK_BOOTTIME)
         mono = time.clock_gettime(time.CLOCK_MONOTONIC)
     except (AttributeError, OSError):
@@ -4000,12 +4793,25 @@ def host_suspend_gap_s():
     # two clocks lack the semantics this depends on, and that is UNKNOWN.
     if -1 < gap < 1:
         return 0
-    return int(gap) if gap > 0 else None
+    if gap < 0:
+        return None
+    if within_s is None:
+        return int(gap)
+    marks = None if memo is None else memo.get("sleep_marks")
+    if marks is None:
+        marks = _sleep_journal_marks()
+        if memo is not None:
+            memo["sleep_marks"] = marks
+    points = ([(wall - boot, wall - boot)]
+              + [(w, w - m) for w, m in marks]
+              + [(wall, wall - mono)])
+    return _suspend_after(wall - within_s, points)
 
 
 def turn_state(pane_live, age, log_state, inflight_n, ctx_pct, ctx_threshold,
                spawn_age, pane_blind=None, reality=None, open_dispatches=None,
-               suspend_gap_s=0, onboarding=None, onboarding_age_s=None):
+               suspend_gap_s=0, onboarding=None, onboarding_age_s=None,
+               ctx_unknown=None):
     """(verdict, evidence) — the fused turn-state ladder, pure on its inputs.
 
     `pane_live` is THREE-VALUED, exactly as the process census is: True, False,
@@ -4023,8 +4829,10 @@ def turn_state(pane_live, age, log_state, inflight_n, ctx_pct, ctx_threshold,
     separates IDLE from HUNG.
 
     `suspend_gap_s` is THREE-VALUED like `pane_live`, and for the same reason:
-    the seconds the HOST was suspended across the staleness window, 0 when it
-    provably was not, and None when the caller COULD NOT TELL. None is not
+    the seconds the HOST was suspended INSIDE the staleness window, 0 when it
+    provably was not, and None when the caller COULD NOT TELL. Inside, never
+    since boot: a suspend that ended before the last turn took nothing from
+    this seat (`host_suspend_gap_s(within_s=age)`). None is not
     zero. A reading that could not look has made no claim, and letting it
     collapse into "no suspend" is how a box-level event becomes N false hangs.
 
@@ -4052,7 +4860,11 @@ def turn_state(pane_live, age, log_state, inflight_n, ctx_pct, ctx_threshold,
                        toward hung. Without a reality reading a socket still
                        reads thinking — the pre-reality contract.
         compact-needed context at/over the compact bar — the known-benign
-                       class; autocompact owns the fix
+                       class; autocompact owns the fix. Only a MEASURED
+                       percentage of a DECLARED window reaches this rung:
+                       `ctx_unknown` ("window unproven", task/3534) makes the
+                       context an unread input instead, because autocompact
+                       does not fire on an assumed window
         fresh          the process came up moments ago and has not turned yet
                        — starting, not hung (a resume relaunches onto an old
                        transcript, which reads stale immediately)
@@ -4110,9 +4922,12 @@ def turn_state(pane_live, age, log_state, inflight_n, ctx_pct, ctx_threshold,
     # THIS IS THE "WRONG AUTHORITY" IN ONE LINE: no per-seat question can see a
     # host-wide event, because it is not a property of any seat. The fix is not
     # a new verdict beside `hung` — it is that the AGE was never the seat's
-    # elapsed time to begin with. Subtracting the suspend restores the quantity
-    # the whole ladder below already reasons about correctly, so every rung
-    # inherits the correction instead of each growing a suspend clause.
+    # elapsed time to begin with. Subtracting the suspend INSIDE THE WINDOW
+    # restores the quantity the whole ladder below already reasons about
+    # correctly, so every rung inherits the correction instead of each growing
+    # a suspend clause. Only inside: subtracting the since-boot total read a
+    # seat 78 h stale as fresh on a laptop whose sleeps had all ended before
+    # that seat's last turn (task/3693).
     #
     # A GENUINELY HUNG SEAT STILL READS HUNG: its excess staleness survives the
     # subtraction. This only ever removes time the host provably did not run.
@@ -4131,9 +4946,12 @@ def turn_state(pane_live, age, log_state, inflight_n, ctx_pct, ctx_threshold,
         if age is not None and age > HANG_S and pane_live:
             return "hung-unknown", (
                 "semantic entry stale %dm, but whether the HOST was suspended "
-                "across that window is UNREADABLE — a suspend adds the same "
-                "delta to every seat and would make this staleness not the "
-                "seat's own. UNKNOWN, never a confident HUNG" % (age // 60))
+                "inside that window is UNKNOWN — its clocks are unreadable, or "
+                "it slept and its journal cannot place the sleep before or "
+                "after this seat's last turn. A suspend adds the same delta to "
+                "every seat and would make this staleness not the seat's own. "
+                "The age is not shrunk: UNKNOWN, never a confident HUNG or ok"
+                % (age // 60))
     elif suspend_gap_s and age is not None:
         corrected = max(0, age - suspend_gap_s)
         suspended = ("; %dm of that is host suspend (wall age %dm, agent age "
@@ -4225,7 +5043,7 @@ def turn_state(pane_live, age, log_state, inflight_n, ctx_pct, ctx_threshold,
             % (wall_age // 60, onboarding_age_s // 60,
                (onboarding.proof or "not recorded")))
     if ctx_pct is not None and ctx_threshold is not None \
-            and ctx_pct >= ctx_threshold:
+            and not ctx_unknown and ctx_pct >= ctx_threshold:
         return "compact-needed", "context %.1f%% >= %d%% — the known-benign " \
             "compact class; autocompact owns the fix" % (ctx_pct, ctx_threshold)
     if spawn_age is not None and spawn_age <= SPAWN_FRESH_S:
@@ -4234,7 +5052,8 @@ def turn_state(pane_live, age, log_state, inflight_n, ctx_pct, ctx_threshold,
             % (spawn_age // 60, SPAWN_FRESH_S // 60)
     unread = [label for label, v in (("semantic transcript age", age),
                                      ("socket census", inflight_n),
-                                     ("context%", ctx_pct),
+                                     ("context%",
+                                      ctx_unknown or ctx_pct),
                                      ("spawn age", spawn_age),
                                      ("open-dispatch census", open_dispatches))
               if v is None]
@@ -4258,10 +5077,11 @@ def turn_state(pane_live, age, log_state, inflight_n, ctx_pct, ctx_threshold,
     if inflight_n:
         pending.append("a held socket beside fresh nonsemantic writes")
     if not pending:
-        return "idle", ("pane LIVE; semantic entry stale %dm but every "
+        return "idle", ("pane LIVE; semantic entry stale %dm%s but every "
                         "pending census measured EMPTY (0 in-flight, 0 open "
                         "dispatches%s) — out of work, not stuck"
-                        % (age // 60, "; turn complete, nothing queued"
+                        % (age // 60, suspended,
+                           "; turn complete, nothing queued"
                            if reality is not None else ""))
     inflight_part = "0 in-flight connections at the proxy port (true " \
         "silence, not mid-stream)" if not inflight_n else \
@@ -4273,11 +5093,14 @@ def turn_state(pane_live, age, log_state, inflight_n, ctx_pct, ctx_threshold,
                  if write_age > HANG_S else
                  "; raw writes stayed fresh (%dm) — only queue/retry/"
                  "nonsemantic rows advanced") % (write_age // 60)
-    return "hung", ("pane LIVE; semantic entry stale %dm > %dm; pending: %s; "
-                    "%s; context %.1f%% < %d%% compact bar; spawned %dm ago "
-                    "(not fresh)%s"
-                    % (age // 60, HANG_S // 60, ", ".join(pending),
-                       inflight_part, ctx_pct, ctx_threshold,
+    return "hung", ("pane LIVE; semantic entry stale %dm > %dm%s; pending: "
+                    "%s; %s; %s; spawned %dm ago (not fresh)%s"
+                    % (age // 60, HANG_S // 60, suspended, ", ".join(pending),
+                       inflight_part,
+                       "context UNKNOWN (%s), which autocompact does not act "
+                       "on" % ctx_unknown if ctx_unknown else
+                       "context %.1f%% < %d%% compact bar"
+                       % (ctx_pct, ctx_threshold),
                        spawn_age // 60, churn))
 
 
@@ -4497,6 +5320,11 @@ def findings(rep):
     for row in rep["seats"]:
         if row.get("error"):
             continue
+        if row.get("down_marker_error"):
+            from . import seat_down
+            out.append(("DOWN-MARKER-UNREADABLE", "%s: %s" % (
+                row["seat"], seat_down.unreadable_text(
+                    row["seat"], row["down_marker_error"]))))
         if row["config_ok"] is False:
             out.append(("CONFIG", "%s: proxy config drifted — %s. This is the "
                         "class that left ds4pro without the keepalive for a "
@@ -4542,6 +5370,11 @@ def findings(rep):
                         % (row["seat"], row["log_detail"],
                            "; probe=healthy and turn=ok say the seat is taking turns"
                            if taking_turns else "")))
+        # TOOLLESS IS A FINDING, and it reads a seat every other rung calls
+        # healthy: each request completes and delivers text (task/3533).
+        toolless = toolless_reading(row)
+        if toolless:
+            out.append(("TOOLLESS", toolless_text(row["seat"], toolless)))
         # AN UNREADABLE REGISTER IS LOUD, AND IT IS ITS OWN LINE.
         # Reported from the DECISION the door made, independently of the turn
         # verdict, so the two facts cannot mask each other: a blind pane
@@ -4595,6 +5428,10 @@ def findings(rep):
             # stored on the row. Calling seat_liveness here made findings()
             # impure — the verdict depended on when it was asked (r1).
             liv = row.get("liveness")
+            from . import seat  # noqa: F401 — facade contract: an impl import is accompanied by the facade in its own scope
+            from .seat_lifecycle import dead_turn_reading
+            dead = dead_turn_reading(liv, row.get("beacon_none"),
+                                     seat=row["seat"])
             if liv and liv.get("state") == "WALLED":
                 why = liv.get("blocked_on") or \
                     "a measured availability wall is present"
@@ -4650,6 +5487,15 @@ def findings(rep):
                             "is prescribed on process evidence alone."
                             % (row["seat"], row.get("turn_evidence"),
                                liv.get("evidence") or "?")))
+            elif dead:
+                # A DEAD TURN IS NOT A HUNG PROCESS. The classifier cleared
+                # the pane (IDLE at its prompt), the proxy answers again, and
+                # no beacon listens: one prompt starts the next turn, and a
+                # relaunch or reseed would spend the seat's context for it.
+                out.append(("HUNG", "%s: pane LIVE, turn loop DEAD — %s. No "
+                            "beacon is listening, so an @mention queues "
+                            "unread; the process needs no relaunch."
+                            % (row["seat"], dead)))
             else:
                 out.append(("HUNG", "%s: pane LIVE, turn loop DEAD — %s. "
                             "Measured twice 2026-07-29 on the primary codex "
@@ -4754,6 +5600,10 @@ def fingerprint(rep, include_upstream=True):
                                                row.get("log"),
                                                row.get("turn_state"),
                                                liv.get("state")))
+        # Appended only while it trips, so every other seat's digest stays
+        # byte-identical to the one a pass before this rung recorded.
+        if toolless_reading(row):
+            parts.append("toolless|%s" % row["seat"])
     if include_upstream:
         for family, upstream in sorted((rep.get("upstream") or {}).items()):
             state = upstream.get("state")
@@ -4774,15 +5624,22 @@ def fingerprint(rep, include_upstream=True):
                            digest_size=8).hexdigest()
 
 
-def changed(rep):
+def changed(rep, prior=None):
     """(bool, previous_fingerprint) — has the health state moved since the last
     pass? A first-ever run counts as changed ONLY if it has findings, so
-    installing the timer on a healthy fleet does not announce itself."""
-    try:
-        with pk.open_regular(_state_path(), encoding="utf-8") as f:
-            prior = json.load(f) or {}
-    except (OSError, ValueError):
-        prior = {}
+    installing the timer on a healthy fleet does not announce itself.
+
+    A posting caller passes the exact canonical snapshot it measured. That is
+    load-bearing when the primary disappeared and the last-good copy supplied a
+    dark latch: re-reading only the primary here would relabel its recovery as a
+    first run and suppress the changed report.
+    """
+    if prior is None:
+        try:
+            with pk.open_regular(_state_path(), encoding="utf-8") as f:
+                prior = json.load(f) or {}
+        except (OSError, ValueError):
+            prior = {}
     prev = prior.get("fingerprint")
     if prev is None:
         return bool(findings(rep)), None
@@ -4812,7 +5669,11 @@ def upstream_transitions(rep, prior=None):
                         "since": current.get("since"),
                         "detail": current.get("detail")})
         elif not is_dark and was_dark:
-            out.append({"kind": "family-recovered", "family": family,
+            # NOT A RECOVERY: nothing was measured healthy. The operator stood
+            # the family's seats down, and the edge says exactly that.
+            out.append({"kind": "family-down"
+                        if current.get("state") == _DESIRED_DOWN
+                        else "family-recovered", "family": family,
                         "state": current.get("state"),
                         "since": current.get("since"),
                         "detail": current.get("detail")})
@@ -4820,10 +5681,10 @@ def upstream_transitions(rep, prior=None):
 
 
 def _transition_lines(transitions):
+    heads = {"family-dark": "🚨 FAMILY-DARK", "family-down": "⏸ FAMILY-DOWN"}
     return ["%s %s: %s since %s — %s" %
-            ("🚨 FAMILY-DARK" if row["kind"] == "family-dark" else
-             "✅ FAMILY-RECOVERED", row["family"], row["state"],
-             row.get("since") or "?", row.get("detail") or "")
+            (heads.get(row["kind"], "✅ FAMILY-RECOVERED"), row["family"],
+             row["state"], row.get("since") or "?", row.get("detail") or "")
             for row in transitions]
 
 
@@ -4859,9 +5720,9 @@ def _owner_push(transitions):
     if not transitions:
         return True
     from . import notify
+    said = {"family-dark": "dark", "family-down": "stood down"}
     body = "helm proxywatch: " + "; ".join(
-        "%s %s %s" % (row["family"],
-                      "dark" if row["kind"] == "family-dark" else "recovered",
+        "%s %s %s" % (row["family"], said.get(row["kind"], "recovered"),
                       row["state"]) for row in transitions)
     return notify.owner_push(body, title="helm upstream transition",
                              receipt=("proxywatch.notify_failed", "upstream"))
@@ -4971,6 +5832,24 @@ def _codex_pace_pass(rep):
         return None
 
 
+def _claude_pace_pass(rep):
+    """Each Claude account's five-hour pace on THIS pass (pace5h) -> the
+    reading, or None.
+
+    It reads the native usage history the creds probe cycle writes, folds it
+    against the last snapshot's states and writes the snapshot every surface
+    reads. It makes no vendor call and moves no colour.
+
+    Never raises: a reporting rung must not take the watchdog down."""
+    try:
+        from . import claudepace
+        return claudepace.watch_pass(now=rep["ts"])
+    except Exception as e:                  # noqa: BLE001
+        print("helm proxywatch: claude 5h pace unread (%s)" % e,
+              file=sys.stderr)
+        return None
+
+
 def _burn_flags_pass(rep, prior=None):
     """Fold THIS PASS'S OWN READINGS into the burn-flag snapshot -> the flags.
 
@@ -5020,7 +5899,11 @@ def _burn_flags_pass(rep, prior=None):
                   # step table is its only effect on a colour.
                   "runway": ({"codex": rep["codex_runway"]}
                              if rep.get("codex_runway") else {}),
-                  "declarations": mod.read_declarations()}
+                  "declarations": mod.read_declarations(),
+                  # THIS PASS IS THE SNAPSHOT'S ONLY PRODUCTION WRITER, so a
+                  # local certification the fold is not handed here reads
+                  # GREY on every surface whatever the certifier was told.
+                  "local_certifications": mod.read_local_certifications()}
         payload = mod.fold(inputs, now=rep["ts"])
         mod.write_snapshot(inputs=inputs, now=rep["ts"])
         return payload
@@ -5212,6 +6095,16 @@ def record(rep, pending_chat=None, pending_ntfy=None, prior_state=None):
         return False
 
 
+def _offpeak_clause(row):
+    """`` gate=OFF-PEAK-ONLY: ...`` for a seat with a gated provider, else ""."""
+    from . import offpeak
+    try:
+        line = offpeak.seat_line(row.get("family"), row["seat"])
+    except Exception as exc:              # noqa: BLE001 — a clause never raises
+        return " gate=UNREADABLE(%s)" % exc.__class__.__name__
+    return (" gate=" + line) if line else ""
+
+
 def report_lines(rep):
     out, represented = [], set()
     for row in sorted(rep["seats"], key=lambda r: r["seat"]):
@@ -5256,7 +6149,8 @@ def report_lines(rep):
                       if write_age is not None else "none",
                       row.get("turn_state") or "-", fanout,
                       provenance + delivery,
-                      " beacon=PAUSED-CRED-WALL" if paused else "",
+                      (" beacon=PAUSED-CRED-WALL" if paused else "") +
+                      _offpeak_clause(row),
                       "  HANG?" if row["hang_candidate"]
                       and row.get("turn_state") in (None, "hung-unknown")
                       else ""))
@@ -5287,9 +6181,12 @@ def report_lines(rep):
     return out
 
 
-def timer_units(interval=INTERVAL_S):
+def _unit_home():
+    """(helm binary, user unit dir, WorkingDirectory) every proxywatch unit
+    shares."""
     helm_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "helm")
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    from . import timerhealth
+    udir = timerhealth.user_unit_dir()
     # WorkingDirectory is DERIVED, never a literal — seat.py's rebind-unit
     # law, learned here the same way: an operator path baked into a tracked
     # template is a never-track needle in history and a machine identity this
@@ -5299,38 +6196,68 @@ def timer_units(interval=INTERVAL_S):
     from . import work
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cwd = work.find_root(here) or here
-    return (os.path.join(udir, "helm-proxywatch.service"),
-            _SERVICE % {"helm": helm_bin, "cwd": cwd},
-            os.path.join(udir, "helm-proxywatch.timer"),
-            _TIMER % {"interval": interval})
+    return helm_bin, udir, cwd
 
 
-def ensure_timer(interval=INTERVAL_S):
-    """(ok, detail) — install + enable the cadence."""
+def timer_units(interval=INTERVAL_S, inputs=None):
+    """(service path, service, timer path, timer) for the fifteen-minute
+    posting pass. `inputs` replaces per-install values
+    (timerhealth.unit_values)."""
+    from . import timerhealth
+    helm_bin, udir, cwd = _unit_home()
+    return (os.path.join(udir, _UNIT + ".service"),
+            _SERVICE % timerhealth.unit_values(
+                {"helm": helm_bin, "cwd": cwd, "args": "--post",
+                 "timeout": SERVICE_TIMEOUT_S,
+                 "description": "helm proxywatch (cli-proxy fix "
+                 "invariants + seat liveness, one pass)"}, inputs),
+            os.path.join(udir, _UNIT + ".timer"),
+            _TIMER % timerhealth.unit_values({"interval": interval}, inputs))
+
+
+def dark_timer_units(interval=DARK_INTERVAL_S, inputs=None):
+    """(service path, service, timer path, timer) for the dark-family
+    recheck: the same service shape running `--dark-only --post`."""
+    from . import timerhealth
+    helm_bin, udir, cwd = _unit_home()
+    return (os.path.join(udir, _DARK_UNIT + ".service"),
+            _SERVICE % timerhealth.unit_values(
+                {"helm": helm_bin, "cwd": cwd, "args": "--dark-only --post",
+                 "timeout": DARK_SERVICE_TIMEOUT_S,
+                 "description": "helm proxywatch dark-family recheck "
+                 "(re-probes only the families latched dark)"}, inputs),
+            os.path.join(udir, _DARK_UNIT + ".timer"),
+            _DARK_TIMER % timerhealth.unit_values({"interval": interval},
+                                                  inputs))
+
+
+def ensure_timer(interval=INTERVAL_S, dark_interval=DARK_INTERVAL_S):
+    """(ok, detail) — install + enable both cadences: the fifteen-minute
+    posting pass and the dark-family recheck."""
     import shutil
-    from . import pk
-    if interval < 1:
+    from . import timerhealth
+    if interval < 1 or dark_interval < 1:
         return False, "interval must be at least 1 second"
     systemctl = shutil.which("systemctl")
     if not systemctl:
         return False, ("systemctl unavailable; run `helm proxywatch --post` "
                        "from another scheduler")
     spath, service, tpath, timer = timer_units(interval)
-    try:
-        pk.atomic_write(spath, service)
-        pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    for cmd in ([systemctl, "--user", "daemon-reload"],
-                [systemctl, "--user", "enable", "--now", "helm-proxywatch.timer"]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, "%s failed: %s" % (
-                " ".join(cmd), (r.stderr or r.stdout or "").strip()[:200])
-    return True, "timer enabled every %ds (%s)" % (interval, tpath)
+    dspath, dservice, dtpath, dtimer = dark_timer_units(dark_interval)
+    # ONE reload, then ONE `enable --now` naming both timers: the verb
+    # sequence this installer always ran (task/3254's review, finding 6).
+    error, _unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer), (dspath, dservice),
+         (dtpath, dtimer)), (_UNIT + ".timer", _DARK_UNIT + ".timer"),
+        systemctl, subprocess)
+    if error:
+        return False, error
+    return True, ("timer enabled every %ds (%s); dark-family recheck every "
+                  "%ds (%s)" % (interval, tpath, dark_interval, dtpath))
 
 
 _USAGE = """usage: helm proxywatch [--post] [--json] [--force] [--install-timer]
+       helm proxywatch --dark-only [--post]
 
   Do the cli-proxy fixes still hold for EVERY minted seat and represented family,
   and is each pane alive? Six rungs, a fuse, and one actuator:
@@ -5407,6 +6334,28 @@ _USAGE = """usage: helm proxywatch [--post] [--json] [--force] [--install-timer]
   --force posts a report without inventing an edge. --install-timer wires the
   cadence (neither of those two runs the cred-follow rung: they configure, they
   do not supervise).
+
+  A bare read persists nothing. When it measures a family HEALTHY whose dark
+  latch still holds, it prints one line saying the latch is unchanged, because
+  the dispatch door, `helm chat seats` and delivery all read the latch, and only
+  a posting pass moves it.
+
+  --dark-only --post is the DARK-FAMILY RECHECK. --install-timer also installs
+  it on a 60s timer, with this oneshot bounded below the minute and the full one
+  below fifteen minutes. While no family is latched dark it reads delivery's
+  canonical primary-or-last-good snapshot and exits 0, with no canary, no lock
+  and no chat. For each latched family it sends one eight-token request per
+  recorded seat. A HEALTHY reading runs the full measurement, freezing quota
+  families held to a future reset at their validated prior records so both
+  authenticated canary paths spend zero requests on them, and persists and
+  posts through the same change-latched outbox as --post. The recovery clears
+  the latch and resumes waiters within about a minute. A failing reading writes
+  nothing. A quota wall waits for the fifteen-minute pass until its recorded
+  reset has passed. It never runs the
+  cred-follow, codex budget, reset-credit, proxy-usage, burn-flag or pool-wall
+  rungs; those keep the fifteen-minute cadence. It shares the outbox lock with
+  --post and stands down while another pass holds it. Without --post it
+  re-probes and persists nothing.
 """
 
 
@@ -5579,9 +6528,14 @@ def _compose_upstream_records(rep, before_all):
                                                             dark)}
         seats = row.get("seats")
         if isinstance(seats, dict):
+            # A seat's detail can be vendor prose and stays out of the
+            # durable record, except the log rung's own port-and-count text,
+            # which is how the WALLED row names the wall (task/3199).
             upstream[family]["seats"] = {
                 name: {key: value for key, value in record.items()
-                       if key not in ("detail", "ms")}
+                       if key not in ("detail", "ms")
+                       or (key == "detail"
+                           and record.get("measured_by") == _LOG_MEASURED)}
                 for name, record in sorted(seats.items())
                 if isinstance(name, str) and isinstance(record, dict)
             }
@@ -5918,10 +6872,6 @@ def _cooldown_text(row):
                              time.gmtime(row["proxy_reset_at"])), measured))
 
 
-def codex_cooldown_lines(rows):
-    """The stale-cooldown rows as report lines; nothing for [] or None."""
-    return ["  %s %s" % (STALE_COOLDOWN, _cooldown_text(r)) for r in (rows or ())]
-
 
 def proxy_usage_lines(rows):
     """The meter's NON-READ rows as their own report lines: a sidecar that
@@ -5933,6 +6883,317 @@ def proxy_usage_lines(rows):
     return ["helm proxywatch: proxy-usage %s %s"
             % (r["seat"], proxy_usage.row_note(r))
             for r in (rows or ()) if r.get("status") != proxy_usage.READ]
+
+
+def dark_recheck_families(state, now=None):
+    """(due, held) for one persisted watch state: the latched families the
+    dark-family recheck re-probes, and the ones it leaves to the
+    fifteen-minute pass.
+
+    A family is latched when `beacon_paused` holds its record, the same
+    predicate every door reads. `due` is [(family, seats)], with the seat
+    names the last pass recorded for the family, sorted and never empty.
+    `held` is [(family, reason)] for the latched families left to the
+    fifteen-minute pass:
+
+      - a quota wall whose recorded reset has not passed. A quota wall lifts
+        on the vendor's clock, so a canary every minute before that instant
+        is a refused request to a walled account and cannot bring the
+        recovery forward. An unknown reset has not passed.
+      - a family with no recorded seat, which has nothing to carry a canary.
+
+    A record `upstream_record` refuses is in neither list: the doors hold it
+    as UNKNOWN, and only a full pass rewrites it."""
+    records = state.get("upstream") if isinstance(state, dict) else None
+    if not isinstance(records, dict):
+        return [], []
+    now_ms = (time.time() if now is None else now) * 1000
+    due, held = [], []
+    for family in sorted(records):
+        record, err = upstream_record(state, family)
+        if err or not beacon_paused(record):
+            continue
+        wall, reset = quota_wall(record), record.get("resets_at_ms")
+        if wall and not (type(reset) is int and reset <= now_ms):
+            held.append((family, "a %s is re-probed after its recorded reset "
+                         "(%s)" % (wall, _iso_from_ms(reset)
+                                   if type(reset) is int else "none recorded")))
+            continue
+        seats = record.get("seats") if isinstance(record.get("seats"),
+                                                  dict) else {}
+        names = sorted(name for name, seat in seats.items()
+                       if isinstance(seat, dict))
+        if names:
+            due.append((family, names))
+        else:
+            held.append((family, "no recorded seat carries a canary"))
+    return due, held
+
+
+def unpersisted_recoveries(measured, state=None):
+    """[(family, measured state, latched state)] for each family this read
+    measured out of pause while its persisted dark latch still holds.
+
+    `measured` maps a family to a record with `state` (and `dark`). `state`
+    is the snapshot the doors read (`_read_delivery_state`), read here when
+    not given; an unreadable one answers [] because it proves no latch."""
+    if state is None:
+        state, err = _read_delivery_state()
+        if err:
+            return []
+    out = []
+    for family, record in sorted((measured or {}).items()):
+        if not isinstance(record, dict) or beacon_paused(record):
+            continue
+        latched, err = upstream_record(state, family)
+        if not err and beacon_paused(latched):
+            out.append((family, record.get("state"), latched.get("state")))
+    return out
+
+
+def unpersisted_line(family, measured, latched):
+    """The one line a read prints for a recovery it measured and cannot
+    persist."""
+    return ("helm proxywatch: %s measured %s but its dark latch is unchanged "
+            "(still %s; a read persists nothing), so the dispatch door, chat "
+            "seats and delivery keep it dark until `helm proxywatch --post` "
+            "records the measurement" % (family, measured, latched))
+
+
+def _dark_trigger(due):
+    """{family: (seat, state, detail)}: the reading that decides whether the
+    recheck runs the full measurement.
+
+    One eight-token request per recorded seat, in name order, stopping at
+    the family's first HEALTHY seat. There is no confirmation retry: this
+    reading only starts the measurement, and the measurement applies every
+    confirmation and corroboration rule itself. A family with no recorded
+    seat has no reading."""
+    readings = {}
+    for family, seats in due:
+        for name in seats:
+            try:
+                state, detail, _ms = _upstream_once(name, family=family)
+            except Exception as ex:          # noqa: BLE001 — a watch never raises
+                state, detail = "UNKNOWN", "canary failed: %s" % ex
+            readings[family] = (name, state, detail)
+            if state == "HEALTHY":
+                break
+    return readings
+
+
+def _outbox_lock_path():
+    """The outbox lock every posting pass holds: the authenticated-canary
+    single-flight and the one writer of the watch state."""
+    state_dir = os.path.dirname(_state_path())
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(state_dir, ".proxywatch.lock")
+
+
+def _outbox(rep, hits, prior, force=False, first=()):
+    """(pending_chat, pending_ntfy) for one posting pass.
+
+    The chat queue is the prior outbox, then `first`, then this pass's
+    change report when the health fingerprint moved or `force` is set. The
+    phone queue is the prior batch merged with this pass's family edges,
+    deduplicated, so a stuck edge and a fresh one never both go out."""
+    moved, _prev = changed(rep, prior=prior)
+    transitions = upstream_transitions(rep, prior=prior)
+    pending_chat = list(prior.get("pending_chat") or ()) + list(first)
+    pending_ntfy = _merge_transitions(prior.get("pending_ntfy"), transitions)
+    if moved or force:
+        edges = _transition_lines(transitions)
+        pending_chat.append(
+            "proxywatch: proxy health CHANGED\n" +
+            ("\n".join(edges) + "\n" if edges else "") +
+            "\n".join(report_lines(rep)) +
+            ("\n(no findings — no alerting state)" if not hits else ""))
+    return pending_chat, pending_ntfy
+
+
+def _deliver(rep, prior, pending_chat, pending_ntfy):
+    """Persist the latch and both outboxes, deliver, acknowledge -> None, or
+    2 when the watchdog itself failed.
+
+    Persistence comes BEFORE delivery, so a failed first write sends nothing
+    and a failed delivery stays queued for the next pass (at-least-once).
+    THE ACKNOWLEDGEMENT REPLACES THE FIRST WRITE, so the first write is its
+    prior. Composed against the pass's original prior, a pass that changed a
+    family's verdict would mint that change's transition identity twice, and
+    an act that captured the first write while the new verdict was already
+    in force would read a change it never ran under."""
+    written = record(rep, pending_chat=pending_chat,
+                     pending_ntfy=pending_ntfy, prior_state=prior)
+    if not written:
+        print("helm proxywatch: state write failed; no alerts delivered",
+              file=sys.stderr)
+        return 2
+    remaining_chat = list(pending_chat)
+    try:
+        from . import chat
+        for body in pending_chat:
+            chat.post(body, who="proxywatch", room="helm")
+            remaining_chat.pop(0)
+    except Exception as ex:          # noqa: BLE001 — retry next cadence
+        print("helm proxywatch: chat post failed (%s)" % ex, file=sys.stderr)
+    if _owner_push(pending_ntfy):
+        pending_ntfy = []
+    if not record(rep, pending_chat=remaining_chat,
+                  pending_ntfy=pending_ntfy, prior_state=written):
+        print("helm proxywatch: delivery acknowledgement write failed; "
+              "at-least-once retry may duplicate an alert", file=sys.stderr)
+        return 2
+    # The queue is durable (retried next cadence), but a watch that cannot
+    # reach its own alert surface is a broken watchdog, not a finding: exit 2
+    # keeps the unit red until delivery works.
+    return 2 if remaining_chat else None
+
+
+def dark_pass(post=False):
+    """`helm proxywatch --dark-only [--post]` -> exit code.
+
+    Only a persisted pass that measures HEALTHY clears a family's dark
+    latch. On the fifteen-minute cadence alone, a family whose upstream is
+    back one minute after a blip stays refused by the dispatch door, `helm
+    chat seats` and delivery until the next pass. This pass runs every
+    minute and costs one file read while nothing is latched.
+
+    For each latched family it sends one canary per recorded seat
+    (`_dark_trigger`). A HEALTHY reading runs the FULL measurement, `health`,
+    and persists and posts it through `_outbox` and `_deliver`, the same path
+    as `--post`. The write is therefore the one a fifteen-minute pass makes
+    of the same world: the same latch, the same change-latched report, the
+    same edge, and no second latch. The measurement re-applies the
+    confirmation and corroboration rules, so a trigger it does not confirm
+    persists that measurement and invents no edge. A failing reading writes
+    nothing, which keeps the latch's `since` and transition identity.
+
+    It never runs the cred-follow, codex budget, cooldown, reset-credit,
+    proxy-usage, money, pace, burn-flag or pool-wall rungs; those keep the
+    fifteen-minute cadence. It takes the `--post` outbox lock without
+    waiting: a pass already holding it measures every family and persists,
+    so this one stands down with 0. A `--post` pass that arrives second
+    waits on the lock and composes against what this one wrote.
+
+    Exit 0: nothing latched, or a recovery persisted with no findings.
+    1: a family stays latched, or the persisted pass found faults. 2: the
+    watchdog failed (unreadable state, lock, write or delivery)."""
+    prefix = "helm proxywatch --dark-only"
+    announced_sources = set()
+
+    def read_state():
+        state, err, source = _read_delivery_snapshot()
+        if err:
+            print("%s: %s (%s)" % (prefix, err, _state_path()),
+                  file=sys.stderr)
+            return None
+        if source == "last-good" and source not in announced_sources:
+            print("%s: primary state unavailable; rechecking the canonical "
+                  "last-good delivery snapshot (%s)"
+                  % (prefix, _backup_state_path()))
+            announced_sources.add(source)
+        return state
+
+    def latched(state):
+        if isinstance(state, dict) and "upstream" in state:
+            shape_err = upstream_records(state)[1]
+            if shape_err:
+                print("%s: %s (%s)" % (prefix, shape_err, _state_path()),
+                      file=sys.stderr)
+                return None
+        return dark_recheck_families(state)
+
+    def readings_lines(due, readings):
+        for family, _seats in due:
+            seat_name, state, detail = readings[family]
+            if state == "HEALTHY":
+                if post:
+                    print("%s: %s read HEALTHY on %s; running the full "
+                          "measurement" % (prefix, family, seat_name))
+                continue
+            print("%s: %s still dark — %s read %s (%s); latch unchanged"
+                  % (prefix, family, seat_name, state, detail or "-"))
+
+    state = read_state()
+    if state is None:
+        return 2
+    found = latched(state)
+    if found is None:
+        return 2
+    due, held = found
+    for family, reason in held:
+        print("%s: %s held for the fifteen-minute pass — %s"
+              % (prefix, family, reason))
+    if not due:
+        if not held:
+            print("%s: no family is latched dark; nothing re-probed" % prefix)
+        return 1 if held else 0
+    if not post:
+        readings = _dark_trigger(due)
+        readings_lines(due, readings)
+        for row in unpersisted_recoveries(
+                {family: {"state": verdict}
+                 for family, (_seat, verdict, _detail) in readings.items()
+                 if verdict == "HEALTHY"}, state=state):
+            print(unpersisted_line(*row))
+        return 1
+    lock_fd = os.open(_outbox_lock_path(), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        print("%s: another proxywatch pass holds the outbox lock and "
+              "measures every family; this recheck stands down" % prefix)
+        return 0
+    except OSError:
+        os.close(lock_fd)
+        print("%s: could not acquire outbox lock" % prefix, file=sys.stderr)
+        return 2
+    try:
+        # RE-READ UNDER THE LOCK: a pass that held it may have just
+        # persisted the recovery, or a new edge. Use the delivery actuator's
+        # canonical fallback here too: deleting the primary must not hide a
+        # last-good dark latch between the fast census and this decision.
+        prior = read_state()
+        if prior is None:
+            return 2
+        found = latched(prior)
+        if found is None:
+            return 2
+        due, held = found
+        if not due:
+            if not held:
+                print("%s: no family is latched dark; nothing re-probed"
+                      % prefix)
+            return 1 if held else 0
+        readings = _dark_trigger(due)
+        readings_lines(due, readings)
+        if not any(verdict == "HEALTHY"
+                   for _seat, verdict, _detail in readings.values()):
+            return 1
+        frozen = []
+        for family, _reason in held:
+            _record, frozen_err = upstream_record(prior, family)
+            if frozen_err:
+                print("%s: held %s record became unreadable — %s"
+                      % (prefix, family, frozen_err), file=sys.stderr)
+                return 2
+            frozen.append(family)
+        rep = health(prior_state=prior, frozen_families=tuple(frozen))
+        hits = findings(rep)
+        for line in report_lines(rep):
+            print(line)
+        pending_chat, pending_ntfy = _outbox(rep, hits, prior)
+        failed = _deliver(rep, prior, pending_chat, pending_ntfy)
+        if failed is not None:
+            return failed
+        return 1 if hits else 0
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def cmd_proxywatch(args):
@@ -6016,10 +7277,20 @@ def cmd_proxywatch(args):
               "<ISO-8601|epoch-ms> | show | clear <family>", file=sys.stderr)
         return 2
     rc = guard_tail("helm proxywatch", args,
-                    flags=("--post", "--json", "--force", "--install-timer"),
+                    flags=("--post", "--json", "--force", "--install-timer",
+                           "--dark-only"),
                     usage=_USAGE)
     if rc is not None:
         return rc
+    # THE DARK-FAMILY RECHECK, dispatched ahead of every rung below: it must
+    # not run the cred-follow rung or install anything.
+    if "--dark-only" in args:
+        other = sorted(set(args) - {"--dark-only", "--post"})
+        if other:
+            print("helm proxywatch: --dark-only combines only with --post "
+                  "(got %s)" % " ".join(other), file=sys.stderr)
+            return 2
+        return dark_pass(post="--post" in args)
     # DISTINCT EXIT CODES, the same law the unit template states: 0 clean,
     # 1 = the watch RAN and FOUND FAULTS, 2 = the watchdog ITSELF failed
     # (guard_tail's bad-invocation 2 is the same species). Both watch units
@@ -6068,18 +7339,18 @@ def cmd_proxywatch(args):
         rep = health()
         hits = findings(rep)
         render(rep, hits)
+        # A READ THAT MEASURES A LATCHED FAMILY HEALTHY SAYS THE LATCH DID NOT
+        # MOVE. Every door reads the persisted latch, so the HEALTHY above is
+        # not what they act on until a posting pass records it.
+        if "--json" not in args:
+            for row in unpersisted_recoveries(rep.get("upstream")):
+                print(unpersisted_line(*row))
         return 1 if hits else 0
 
     # The existing outbox lock is also the authenticated-canary single-flight.
     # Health must run INSIDE it: otherwise two timer passes can both spend family
     # tokens before either reaches the protected state decision.
-    state_dir = os.path.dirname(_state_path())
-    try:
-        os.makedirs(state_dir, exist_ok=True)
-    except OSError:
-        pass
-    lock_path = os.path.join(state_dir, ".proxywatch.lock")
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    lock_fd = os.open(_outbox_lock_path(), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
     except OSError:
@@ -6127,9 +7398,6 @@ def cmd_proxywatch(args):
         rep["codex_runway"] = _codex_pace_pass(rep)
         hits = findings(rep)
         render(rep, hits)
-        moved, _prev = changed(rep)
-        transitions = upstream_transitions(rep, prior=prior)
-        pending_chat = list(prior.get("pending_chat") or ())
         # A FAILED-PERSIST ROW REACHES THE OWNER CHANNEL THROUGH THE SAME
         # OUTBOX AS EVERY OTHER ALERT (task/2522 round 3): the very lines the
         # text render printed go into `pending_chat`, which `record` writes
@@ -6141,26 +7409,21 @@ def cmd_proxywatch(args):
         # sidecar awaiting its respawn is a state, not a loss.
         persist_failed = [r for r in (usage or ())
                           if r.get("status") == _proxy_usage_mod().FAILED_PERSIST]
+        meter = []
         if persist_failed:
             # THE HEADER SAYS WHAT THE ROWS SAY: records are LOST only when a
             # row's `lost` is above zero; a refused read marker over fully
             # persisted records is named as exactly that.
             lost = sum(r.get("lost") or 0 for r in persist_failed)
-            pending_chat.append("proxywatch: sidecar meter FAILED-PERSIST — %s\n%s" % (
+            meter.append("proxywatch: sidecar meter FAILED-PERSIST — %s\n%s" % (
                 "popped records the ledger refused are LOST" if lost
                 else "the read marker was not persisted, 0 record(s) lost",
                 "\n".join(proxy_usage_lines(persist_failed))))
         # The phone channel queues EDGES, deduplicated against any stuck batch
         # from a failed prior push — at-least-once, same as chat.
-        pending_ntfy = _merge_transitions(prior.get("pending_ntfy"),
-                                          transitions)
-        if moved or "--force" in args:
-            edges = _transition_lines(transitions)
-            body = ("proxywatch: proxy health CHANGED\n" +
-                    ("\n".join(edges) + "\n" if edges else "") +
-                    "\n".join(report_lines(rep)) +
-                    ("\n(no findings — no alerting state)" if not hits else ""))
-            pending_chat.append(body)
+        pending_chat, pending_ntfy = _outbox(rep, hits, prior,
+                                             force="--force" in args,
+                                             first=meter)
         # FAMILY-BUDGET-LOW IS LATCHED ON THE COLOUR, NOT ON THE NUMBERS.
         # Percentages move every pass by construction; what the room needs to
         # hear once is that a FAMILY CROSSED. The announcer is the burn-flag
@@ -6173,6 +7436,7 @@ def cmd_proxywatch(args):
         if rep.get("codex_budget") is not None:
             rep["codex_budget_decision"] = _codexbudget().verdict(
                 rep["codex_budget"])["decision"]
+        _claude_pace_pass(rep)
         rep["burn_flags"] = _burn_flags_pass(rep, prior=prior)
         prior_flags = (prior.get("burn_flags")
                        if isinstance(prior.get("burn_flags"), dict) else {})
@@ -6187,6 +7451,29 @@ def cmd_proxywatch(args):
                 rep["burn_flags"].get("families"), prior_flags.get("colours"))
         if flag_body:
             pending_chat.append(flag_body)
+        # PROJECT-BUDGET, PER PROJECT, TO THE PROJECT'S LEAD (task/3156):
+        # the same fold read against each authored team's share, latched on
+        # the project's colour and never on the numbers, and posted once the
+        # colour has held for the dwell (design read D4). Its own latch and
+        # its own delivery, so a project's line can never hold up the
+        # fleet's.
+        if rep["burn_flags"] is not None:
+            try:
+                from . import codexpace, teams
+                _sent, budget_problem = teams.budget_watch_pass(
+                    rep["burn_flags"].get("families") or {},
+                    ({codexpace.FAMILY: rep["codex_runway"]}
+                     if rep.get("codex_runway") else {}),
+                    codexpace.cached_seat_burn(now=rep["ts"]), now=rep["ts"])
+                # A LATCH THAT CANNOT BE WRITTEN, OR A LINE THAT DID NOT
+                # POST, IS SAID (design read D4), never reposted in silence
+                if budget_problem:
+                    print("helm proxywatch: project budgets NOT POSTED — %s"
+                          % budget_problem, file=sys.stderr)
+            except Exception as ex:          # noqa: BLE001 — never the pass
+                # THE CLASS, NOT ONLY THE MESSAGE: a KeyError's is a bare key
+                print("helm proxywatch: project budgets FAILED (%s: %s)"
+                      % (ex.__class__.__name__, ex), file=sys.stderr)
         rep["burn_flag_line"] = _burn_flags_board(
             rep["burn_flags"], prior_flags.get("line"))
         # ONE ROOM LINE FOR THE RESET RUNG, AND ONLY WHEN IT ACTED OR WANTED
@@ -6220,39 +7507,9 @@ def cmd_proxywatch(args):
             sorted({row["seat"] for row in rep["seats"]
                     if row.get("family") and not row.get("error")})))
         # Persist both channel outboxes and the family latch before delivery.
-        written = record(rep, pending_chat=pending_chat,
-                         pending_ntfy=pending_ntfy, prior_state=prior)
-        if not written:
-            print("helm proxywatch: state write failed; no alerts delivered",
-                  file=sys.stderr)
-            return 2
-        remaining_chat = list(pending_chat)
-        try:
-            from . import chat
-            for body in pending_chat:
-                chat.post(body, who="proxywatch", room="helm")
-                remaining_chat.pop(0)
-        except Exception as ex:          # noqa: BLE001 — retry next cadence
-            print("helm proxywatch: chat post failed (%s)" % ex,
-                  file=sys.stderr)
-        if _owner_push(pending_ntfy):
-            pending_ntfy = []
-        # THE ACKNOWLEDGEMENT REPLACES THE FIRST WRITE, so the first write is
-        # its prior. Composed against the pass's original prior, a pass that
-        # changed a family's verdict would mint that change's transition
-        # identity twice, and an act that captured the first write while the
-        # new verdict was already in force would read a change it never ran
-        # under.
-        if not record(rep, pending_chat=remaining_chat,
-                      pending_ntfy=pending_ntfy, prior_state=written):
-            print("helm proxywatch: delivery acknowledgement write failed; "
-                  "at-least-once retry may duplicate an alert", file=sys.stderr)
-            return 2
-        if remaining_chat:
-            # The queue is durable (retried next cadence), but a watch that
-            # cannot reach its own alert surface is a broken watchdog, not a
-            # finding — exit 2 keeps the unit red until delivery works.
-            return 2
+        failed = _deliver(rep, prior, pending_chat, pending_ntfy)
+        if failed is not None:
+            return failed
         # A LOST RECORD IS A FINDING: the pass exits 1 on it exactly as it
         # does on a health fault, so the timer unit reads it the same way.
         return 1 if hits or persist_failed else 0

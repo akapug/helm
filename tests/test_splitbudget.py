@@ -13,6 +13,7 @@ budget refuses, a commit that SHRINKS an over-budget module passes, and a
 standing debt in a file this commit does not touch is reported and never
 refuses.
 """
+import json
 import os
 import subprocess
 import sys
@@ -24,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from helm import splitbudget                                  # noqa: E402
 
 RUNG = os.path.abspath(splitbudget.__file__)
+REPO = os.path.dirname(os.path.dirname(RUNG))
 
 
 class BudgetRungTest(unittest.TestCase):
@@ -66,6 +68,140 @@ class BudgetRungTest(unittest.TestCase):
                       "the refusal does not say what the module BECOMES")
         self.assertIn(str(splitbudget.FINISH), said,
                       "the refusal does not say what the budget IS")
+
+    def test_the_refusal_LEADS_with_the_way_out_and_names_past_splits(self):
+        """A REFUSAL A SMALL MODEL CAN ACT ON (task/3524). A seat met this
+        refusal for hours and trimmed comments to fit, because the words it
+        read stated the rule and put the fix last, as one word. The way out now
+        comes first, on the REFUSED line itself: split the file into a sibling
+        module, with numbered steps and real past splits to copy."""
+        self._write("seats_x.py", 500)
+        self._git("commit", "-qm", "base")
+        self._write("seats_x.py", splitbudget.FINISH + 3)
+        rc, said = self._run()
+        self.assertEqual(rc, 1, "the growth was not refused: %r" % said)
+        first = next((l for l in said.splitlines() if "REFUSED" in l), "")
+        self.assertIn("sibling module", first,
+                      "the REFUSED line does not name the way out, so a reader "
+                      "that quotes only that line learns the rule and not the "
+                      "fix: %r" % first)
+        self.assertIn("helm/seats_x_<topic>.py", said,
+                      "the refusal does not name the file to create: %r" % said)
+        self.assertLess(said.index("sibling module"), said.index("never raised"),
+                        "the rule comes before the way out: %r" % said)
+        self.assertGreater(said.index("comment"), said.index("git add"),
+                           "comment advice comes before the steps that fix "
+                           "it: %r" % said)
+        self.assertNotIn("Move the rationale", said)
+        self.assertTrue(splitbudget.EXAMPLES, "no past split is named to copy")
+        for new, old, commit in splitbudget.EXAMPLES:
+            self.assertIn("%s  moved out of %s" % (new, old), said,
+                          "the refusal does not name the past split %s: %r"
+                          % (new, said))
+            self.assertIn(commit, said)
+            for rel in (new, old):
+                self.assertTrue(os.path.isfile(os.path.join(REPO, rel)),
+                                "the refusal names %s as a split to copy, and "
+                                "that file is gone from this tree" % rel)
+
+    def _log(self, common=None):
+        """The refusal record's lines, or None when no file was written."""
+        path = os.path.join(common or os.path.join(self.root, ".git"),
+                            "helm", "refusals.jsonl")
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().splitlines()
+
+    def test_a_refusal_appends_exactly_one_well_formed_record(self):  # noqa: VACUOUS_ASSERTION — the one absence (no record after an admitted commit) is the must-miss; the same _log() observable is then read unconditionally as exactly one parsed line after the refusal, and two after a second one
+        """A REFUSAL LEAVES A DURABLE RECORD a progress check can read without
+        a transcript: one JSON line under the git common dir, naming the
+        guard, the room, the branch, and each module with its numbers."""
+        self._write("seats_x.py", 500)
+        self._git("commit", "-qm", "base")
+        # THE MUST-MISS, in the same repository: a commit the rung admits
+        # (in the warning band, so the rung speaks) records nothing.
+        self._write("seats_x.py", splitbudget.FINISH - 1)
+        rc, said = self._run()
+        self.assertEqual(rc, 0, said)
+        self.assertIn("seats_x.py", said, "this reading is mute, so the absent "
+                                          "record below proves nothing")
+        self.assertIsNone(self._log(), "an admitted commit wrote a record")
+        self._write("seats_x.py", splitbudget.FINISH + 3)
+        rc, said = self._run()
+        self.assertEqual(rc, 1, said)
+        lines = self._log()
+        self.assertIsNotNone(lines, "the refusal left no record: %r" % said)
+        self.assertEqual(len(lines), 1, lines)
+        row = json.loads(lines[0])
+        branch = self._git("symbolic-ref", "--short", "HEAD").stdout.strip()
+        self.assertTrue(branch, "the fixture has no branch to compare")
+        self.assertEqual(sorted(row),
+                         ["branch", "guard", "modules", "ts", "worktree"])
+        self.assertEqual(row["guard"], "split-budget")
+        self.assertEqual(row["branch"], branch)
+        self.assertEqual(os.path.realpath(row["worktree"]),
+                         os.path.realpath(self.root))
+        self.assertRegex(row["ts"], r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
+        self.assertEqual(row["modules"], [{"path": "helm/seats_x.py",
+                                           "lines": splitbudget.FINISH + 3,
+                                           "was": 500,
+                                           "budget": splitbudget.FINISH}])
+        # ONE LINE PER REFUSAL: a second refusal appends and keeps the first.
+        rc, _said = self._run()
+        self.assertEqual(rc, 1)
+        again = self._log()
+        self.assertEqual(len(again), 2, again)
+        self.assertEqual(again[0], lines[0])
+
+    def test_a_linked_worktree_records_in_the_COMMON_dir(self):  # noqa: VACUOUS_ASSERTION — no absence is asserted: the common dir's record must exist and hold exactly one parsed line naming the lane's branch and worktree
+        """EVERY ROOM OF ONE REPOSITORY APPENDS TO ONE FILE, so one reader
+        sees every lane's refusals; a per-worktree git dir would scatter them
+        and vanish with the room."""
+        self._write("seats_x.py", 500)
+        self._git("commit", "-qm", "base")
+        holder = tempfile.mkdtemp(prefix="splitbudget-lane-")
+        self.addCleanup(_rmtree, holder)
+        lane = os.path.join(holder, "lane")
+        r = self._git("worktree", "add", "-q", "-b", "lane-x", lane)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(lane, "helm", "seats_x.py"), "w") as fh:
+            fh.write("x = 1\n" * (splitbudget.FINISH + 3))
+        subprocess.run(("git", "add", "helm/seats_x.py"), cwd=lane,
+                       check=True, capture_output=True)
+        p = subprocess.run([sys.executable, RUNG, "--staged", "--repo", lane],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        lines = self._log()
+        self.assertIsNotNone(lines, "the lane's refusal is not in the COMMON "
+                                    "dir's record: %r" % p.stderr)
+        self.assertEqual(len(lines), 1, lines)
+        row = json.loads(lines[0])
+        self.assertEqual(row["branch"], "lane-x")
+        self.assertEqual(os.path.realpath(row["worktree"]),
+                         os.path.realpath(lane))
+
+    def test_a_record_that_cannot_be_written_never_changes_the_refusal(self):
+        """THE RECORD IS FAIL-OPEN AND THE REFUSAL DOES NOT DEPEND ON IT. A
+        file where the record's directory belongs makes every write fail, for
+        any user; the commit is still refused with the same words and the
+        failed write is named, not raised."""
+        self._write("seats_x.py", 500)
+        self._git("commit", "-qm", "base")
+        blocker = os.path.join(self.root, ".git", "helm")
+        with open(blocker, "w") as fh:
+            fh.write("in the way\n")
+        self._write("seats_x.py", splitbudget.FINISH + 3)
+        rc, said = self._run()
+        self.assertEqual(rc, 1, "a failed record changed the refusal: %r"
+                                % said)
+        self.assertIn("REFUSED", said)
+        self.assertIn("sibling module", said)
+        self.assertNotIn("Traceback", said)
+        self.assertIn("not recorded", said,
+                      "the failed write is silent: %r" % said)
+        with open(blocker) as fh:
+            self.assertEqual(fh.read(), "in the way\n")
 
     def test_a_commit_that_SHRINKS_an_over_budget_module_passes(self):
         """PROGRESS MID-WAY IS NOT A VIOLATION. A module coming down from over

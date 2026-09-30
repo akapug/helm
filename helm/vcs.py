@@ -59,7 +59,9 @@ import contextlib
 import os
 import threading
 import re
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -89,6 +91,33 @@ def observed(fn):
         yield
     finally:
         _OBSERVER.fn = prev
+
+
+#: How long a killed group's output is still read before its pipes are let
+#: go: a helper that left the group may hold them open.
+GROUP_DRAIN_S = 5
+
+
+def _group_answer(proc, timeout):
+    """(rc, out, err) of `proc`, which leads a process group of its own: its
+    answer within `timeout`, else rc -1 once the WHOLE group is killed, the
+    git it started and git's transport helpers with it
+    (`GitVcs.run_holding`)."""
+    with proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+            return proc.returncode, out, err
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                out, err = proc.communicate(timeout=GROUP_DRAIN_S)
+            except subprocess.TimeoutExpired:
+                out, err = b"", b""
+            return -1, out or b"", b"%s\n%s" % (os.fsencode(str(exc)),
+                                                 err or b"")
 
 
 def _observed(cwd, args, env, stdin, answer):
@@ -229,6 +258,493 @@ def _observation_argv(args):
                             or words[:2] == ("worktree", "list")
                             or symbolic or reflog)
 
+
+# TWO EXACT FORMS BEYOND `_READ_VERBS` THAT THE SCOPE MEMO MAY ANSWER
+# (task/3056). They are the dispatch fold's replay witnesses, spelled exactly as
+# `rowworld._postimages_at_head` and `rowworld._replay_is_a_noop` ask them and
+# exactly as `foldckpt._DERIVED` records them: the leading words, then how many
+# operands follow, and every operand a FULL object id.
+#
+# NEITHER VERB JOINS `_READ_VERBS`, because each one owns forms a scope cannot
+# pin: `diff` with fewer than two revisions reads the working tree or the
+# index, which anyone may change during a projection, `diff --output=<file>`
+# writes a file, and `merge-tree` without `--write-tree` is a different
+# command. These two forms read only the objects their ids name and the config
+# and attributes git reads beside them, which is what the scope already holds
+# still for every verb in `_READ_VERBS`.
+#
+# THE OBJECTS `--write-tree` WRITES ARE CONTENT-ADDRESSED. A second identical
+# run inside one scope writes the identical objects again or nothing, so a memo
+# hit skips a write that could only be a no-op. The answer is the tree id and
+# the conflict listing, and a caller compares that id; none reads the objects.
+#
+# MEASURED on an isolated copy of the ledger (19,969 events): a board read
+# folds the ledger plainly and then again under an epoch lens IN ONE SCOPE, and
+# the second fold re-asked all 262 merge-trees and 265 diffs of the first, at
+# 16-19 s for the merge-trees alone.
+_SCOPE_FORMS = (
+    (("diff", "--raw", "-z", "--abbrev=40", "--no-renames"), 2),
+    (("merge-tree", "--write-tree"), 3),
+)
+_MERGE_BASE = "--merge-base="
+
+
+def _scope_form(args):
+    """Is this one of `_SCOPE_FORMS`, every operand a full object id?"""
+    words = tuple(str(a) for a in args)
+    for lead, arity in _SCOPE_FORMS:
+        if words[:len(lead)] != lead:
+            continue
+        operands = list(words[len(lead):])
+        if len(operands) != arity:
+            return False
+        if lead[0] == "merge-tree":
+            if not operands[0].startswith(_MERGE_BASE):
+                return False
+            operands[0] = operands[0][len(_MERGE_BASE):]
+        return all(_FULL_SHA.match(word) for word in operands)
+    return False
+
+
+# THE SMALL QUESTIONS ONE `git cat-file --batch-check` PROCESS ANSWERS for a
+# whole scope (task/3056). Measured on the same fold: 1,407 of its 1,952 git
+# processes were one existence or resolution question each — `cat-file -e`
+# 545, `rev-parse --verify --quiet` 475, `rev-parse <id>^{tree}` 387 — and each
+# paid a fork and an exec for a few microseconds of object lookup.
+#
+# THE QUESTION IS NOT CHANGED, ONLY WHO CARRIES IT. The expression handed to
+# the batch is the caller's own operand, byte for byte, so git resolves and
+# PEELS it with the same `get_oid_with_context` the single command runs (a
+# type read off an unpeeled answer is not the same question: an annotated tag
+# peels to a commit and advertises `tag`, which is how `landreq` learned this).
+# The answer is recorded at `run` as the question the caller asked, so
+# `foldckpt`'s plan and re-check see what they saw before.
+#
+# ONLY A RESOLVED LINE IS TRANSLATED, AND ONLY FOR FULL OBJECT IDS. A resolved
+# line fixes the single command's exit code and stdout: `cat-file -e` exits 0
+# and prints nothing, and `rev-parse` exits 0 and prints the id it resolved,
+# which is the id the line names. Every other line — `missing`, `ambiguous`, a
+# type the peel does not name, anything unreadable — goes to the ordinary
+# spawn, because the single command's failure is not one answer: `rev-parse
+# --verify --quiet <tree>^{commit}` exits 1 AND writes an `error:` line, where
+# a missing object exits 1 in silence, and a batch line says `missing` for
+# both. An abbreviated or ref operand is not batched at all. So every answer
+# this path does not reproduce is produced by the command itself.
+#
+# STDERR OF A RESOLVED ANSWER IS NOT REPRODUCED, AND NO CALLER READS IT. The
+# batch answers with none. The single command writes only git's own advice and
+# warnings there beside a success: a seven-line `hint:` block about the grafts
+# file on EVERY command run under the fold's own `GIT_GRAFT_FILE` pin, because
+# the pin names a path that EXISTS (`/dev/null`) and that is what trips
+# `advice.graftFileDeprecated` — measured on git 2.51 and 2.53 alike, and
+# silent on either only where that advice is configured off, so a box that
+# prints none has the config, not a newer git — and a `warning: refname ... is
+# ambiguous` when a full id is also a ref's name, a check batch mode switches
+# off. Every caller of these three forms through this seam discards stderr,
+# and `foldckpt` records the exit code and stdout only.
+_BATCH_OPERAND = re.compile(
+    r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})(?:\^\{(commit|tree)\})?\Z")
+# A RESOLVED line names an object and one of git's four object TYPES. The type
+# is spelled out rather than matched as any word because a refusal has the
+# same two-field shape: an unpeeled operand is a full id, so `<id> missing` is
+# `<id>` and a word, and the first cut read exactly that as present — a bare
+# missing object answered `cat-file -e` with 0. `tests.test_vcs` holds it.
+_BATCH_LINE = re.compile(
+    r"((?:[0-9a-f]{40}|[0-9a-f]{64})) (commit|tree|blob|tag)\Z")
+_BATCH_FORMAT = "--batch-check=%(objectname) %(objecttype)"
+
+
+def _batch_question(args):
+    """(expression, peel, prints) when the scope's batch may carry this
+    question, else None. `prints` is whether the single command prints the id
+    it resolved; `peel` is the type the expression peels to, or None."""
+    words = tuple(str(a) for a in args)
+    if len(words) == 3 and words[:2] == ("cat-file", "-e"):
+        shape = _BATCH_OPERAND.match(words[2])
+        if shape:
+            return words[2], shape.group(1), False
+    elif len(words) == 4 and words[:3] == ("rev-parse", "--verify", "--quiet"):
+        shape = _BATCH_OPERAND.match(words[3])
+        if shape and shape.group(1):
+            return words[3], shape.group(1), True
+    elif len(words) == 2 and words[0] == "rev-parse":
+        shape = _BATCH_OPERAND.match(words[1])
+        if shape and shape.group(1) == "tree":
+            return words[1], "tree", True
+    return None
+
+
+def _batch_answer(line, expr, peel, prints):
+    """(rc, stdout, stderr) the single command gives when the batch answered
+    `line` to `expr`, or None when that line does not fix the answer.
+
+    Two agreements are required beside the shape. A PEELED expression must
+    resolve to the type it peels to. An UNPEELED one names its object outright,
+    so the line must name that same object back: nothing but the id it was
+    handed can be the object `cat-file -e <id>` asked about."""
+    got = _BATCH_LINE.match(line or "")
+    if not got:
+        return None
+    if peel is None and got.group(1) != expr:
+        return None
+    if peel is not None and got.group(2) != peel:
+        return None
+    return 0, (got.group(1).encode("ascii") + b"\n" if prints else b""), b""
+
+
+def _overlay(env):
+    """The ambient environment with the overlay `env` applied: a `None` value
+    and the seam's own `gitfacts.UNCACHED` key REMOVE a variable, anything
+    else sets it. `GitVcs._spawn` carries the reasons."""
+    child = dict(os.environ)
+    for key, value in env.items():
+        if key == gitfacts.UNCACHED or value is None:
+            child.pop(key, None)
+        else:
+            child[key] = value
+    return child
+
+
+def _child_env(env):
+    """The child environment for the overlay `env`, BUILT ONCE PER SCOPE.
+
+    Measured on one cold fold: copying `os.environ` for each of 1,951 spawns
+    cost 304k environment lookups. Inside a scope the copy is taken at the
+    first spawn that needs it and reused, under the scope's own law — one
+    projection is one instant, and the ambient environment is part of that
+    instant as much as trunk is. Outside a scope it is built per call, exactly
+    as before. The overlay is the key, sorted so two dicts that say the same
+    thing key the same; a `None` value keys differently from an absent key,
+    because they are different instructions."""
+    return projscope.memo(("vcs.child_env", tuple(sorted(env.items()))),
+                          lambda: _overlay(env))
+
+
+def _named_dir(cwd):
+    """The directory `git -C cwd` enters, spelled from the root: how the
+    memo in `GitVcs.run`, the ancestry reach set, the patch-id map and the
+    `gitfacts` table name a repository. -> str, or None when this process
+    cannot spell it (task/3105).
+
+    A RELATIVE CWD IS HALF A NAME. `git -C repo` enters `repo` under whatever
+    directory the process stands in at the spawn, so a key holding the string
+    `repo` names every repository at that relative path. An answer measured in
+    one is then served in another after a chdir inside a scope, and in
+    `gitfacts` to any other process started elsewhere. Joined to `getcwd()`,
+    the key names the one directory the spawn enters now.
+
+    RESOLVED, NEVER LEXICALLY FOLDED. `realpath(path)` follows the kernel's
+    component walk, including resolving `link/..` from the link target; the
+    tempting `realpath(abspath(path))` folds `..` before it follows the link
+    and can name another repository. Resolution is load-bearing beyond cache
+    sharing: an absolute symlink can be retargeted while a scope is open, so
+    its spelling alone can serve the first repository's answer to the second.
+
+    None for a cwd that is not a path, whose process working directory vanished,
+    or that does not currently name a directory. Those are unreadable questions,
+    not negative answers: a caller that gets None remembers nothing, so a path
+    that appears later in the same scope reaches git.
+
+    THE BATCH DOORS USE THE SAME FORM. `exists` already qualifies its git
+    directory with `realpath`, and `_batched` keys by the git directory
+    `_batch_dir` reads through this memo. All three therefore name the directory
+    `git -C` enters without lexical `link/..` folding, and all three decline a
+    path that does not name a directory."""
+    try:
+        path = os.path.realpath(os.fsdecode(cwd))
+    except (TypeError, OSError, ValueError):
+        return None
+    return path if os.path.isdir(path) else None
+
+
+class _Batch(object):
+    """ONE `git cat-file --batch-check` HELD OPEN FOR THE LIFE OF A SCOPE, for
+    one repository under one overlay. Questions go one line at a time and each
+    answer is read before the next is written; git flushes each answer line
+    unless `--buffer` is asked for, and it is not.
+
+    IT FAILS TOWARD THE SPAWN, NEVER TOWARD AN ANSWER. A write that fails, a
+    read that ends, an answer that does not arrive within the caller's timeout
+    or the ambient budget: each one closes this process for the rest of the
+    scope, and the caller asks the ordinary spawn, which then applies its own
+    timeout and budget exactly as it always has — including raising `Expired`
+    when the budget is what ran out.
+
+    A PROCESS THAT FORKED DOES NOT SHARE IT. A child forked while a scope is
+    open inherits this object and its pipes, and two processes writing
+    questions into one git would read each other's answers; `pid` refuses it
+    in any process but the one that opened it."""
+
+    __slots__ = ("proc", "pid", "buf", "selector")
+
+    def __init__(self, proc):
+        self.proc, self.pid, self.buf = proc, os.getpid(), b""
+        self.selector = None
+        try:
+            self.selector = selectors.DefaultSelector()
+            self.selector.register(proc.stdout, selectors.EVENT_READ)
+        except Exception:                   # noqa: BLE001 — the spawn answers
+            self.close()                    # a batch that cannot wait is shut
+
+    def ask(self, expr, timeout):
+        """The answer line for `expr`, or None when this process gave none."""
+        if self.proc is None or os.getpid() != self.pid:
+            return None
+        left = projscope.spend_or_raise("git batch question")
+        wait = timeout if left is None else \
+            (left if timeout is None else min(timeout, left))
+        deadline = None if wait is None else time.monotonic() + wait
+        fd = self.proc.stdout.fileno()
+        try:
+            os.write(self.proc.stdin.fileno(), expr.encode("ascii") + b"\n")
+            while b"\n" not in self.buf:
+                pause = None if deadline is None \
+                    else deadline - time.monotonic()
+                if pause is not None and pause <= 0:
+                    raise TimeoutError(expr)
+                if not self.selector.select(pause):
+                    raise TimeoutError(expr)
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    raise EOFError(expr)
+                self.buf += chunk
+        except (OSError, EOFError, ValueError):
+            self.close()
+            return None
+        except BaseException:               # noqa: BLE001 — closes, then re-raises
+            # AN EXCHANGE INTERRUPTED BY ANYTHING ELSE — a hook's `_Timeout`
+            # alarm, a `KeyboardInterrupt` — leaves the question written and
+            # its answer unread in the pipe. The next question would then read
+            # THIS one's line, and for a peeled expression whose type matches
+            # that is a wrong id served as an answer, never a refusal. So the
+            # process is closed on the way out: the interruption is the last
+            # thing it does, and the scope's later questions spawn.
+            self.close()
+            raise
+        line, _nl, self.buf = self.buf.partition(b"\n")
+        return line.decode("ascii", "replace")
+
+    def close(self):
+        """End the process; idempotent, silent, and reaped.
+
+        A FORKED CHILD CLOSES ONLY ITS COPIES OF THE PIPES. The process is its
+        parent's to kill and reap, and killing it from a child — whose own
+        scope exit runs this closer too — would take the parent's batch away
+        mid-scope. Closing the copies is still owed: while a child holds the
+        write end, git never sees the parent's EOF."""
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            self.selector.close()
+        except Exception:                   # noqa: BLE001 — cleanup only
+            pass
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except Exception:               # noqa: BLE001 — cleanup only
+                pass
+        if os.getpid() != self.pid:
+            return
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:                   # noqa: BLE001 — cleanup only
+            pass
+
+
+def _open_batch(cwd, env):
+    """The scope's batch process for (`cwd`, overlay), or None when it could
+    not start — remembered for the scope either way, so a git that cannot
+    start a batch is not asked to once per question."""
+    projscope.spend_or_raise("git batch subprocess")
+    try:
+        proc = subprocess.Popen(
+            [GIT, "-C", cwd, "cat-file", _BATCH_FORMAT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_child_env(env) if env else None)
+    except Exception:                       # noqa: BLE001 — the spawn answers
+        return None
+    batch = _Batch(proc)
+    projscope.on_exit(batch.close)
+    return batch
+
+
+# THE OVERLAY AN EXISTENCE QUESTION IS ASKED UNDER. git reads the variable's
+# presence, not its value; see `_batched` for why an unpeeled lookup needs it.
+_NO_REPLACE = {"GIT_NO_REPLACE_OBJECTS": "1"}
+#: A full object id, 40 (sha1) or 64 (sha256) and nothing between, anchored
+#: at both ends so a .match or .search caller reads it as exactly as the
+#: .fullmatch in `exists` does (the foldcompose._FULL_ID form).
+_FULL_ID = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+
+
+def exists(cwd, sha, timeout=60):
+    """True or False: is the full object id `sha` in `cwd`'s object store,
+    asked WITHOUT replacement. None when no scope is open, the scope's batch
+    could not start, its line is not one of the two answers, `cwd` is gone,
+    or the inherited environment selects a repository by a RELATIVE path —
+    the caller then asks the way it did before this existed.
+
+    ONE LINE, NOT ONE LISTING (task/3090). The ancestry batch asked this by
+    listing every object in the repository and testing membership: on the
+    live repository 1,491,784 objects, 1.03 s of git and 119 MB RSS per
+    listing, plus a Python set of the same size, which helm web paid about
+    every 22 s. The scope's `cat-file --batch-check` process answers the one
+    id in microseconds.
+
+    REPLACEMENT IS OFF, AS THE LISTING'S WAS. `--batch-all-objects` enumerates
+    the store and never consults refs/replace; a replacement-aware lookup
+    names an absent id as present when a replace ref points it at a real
+    object, which would turn an unknowable tip into a confident NOT_ANCESTOR.
+    The overlay makes the question the listing's question. `missing` IS an
+    answer here, unlike in `_batched`: a full id under no replacement is
+    either in the store or not, and nothing about it is ambiguous.
+
+    `cwd` IS A GIT DIRECTORY, NEVER A WORKTREE. The batch lives for the whole
+    scope, and `git -C` makes its cwd that path. The stop guard proves a live
+    delegated build by finding a process whose cwd IS a lane's room and whose
+    ancestry carries the session, so a coprocess parked in a lane worktree
+    reads as that lane's delegate and exempts the stop. The object store is
+    all this question needs, so it is asked where no room is."""
+    sha = str(sha).strip().lower()
+    if not projscope.active() or not _FULL_ID.fullmatch(sha):
+        return None
+    # AS `_batched` REFUSES (task/3099): the batch's cwd is a git directory,
+    # so git resolves a relative repository selector in the inherited
+    # environment against it and not against the caller's worktree — from
+    # `.git`, `modules/<sub>/.git/objects` is a submodule's whole store, whose
+    # commit would prove a tip present here — and a target that is gone is
+    # one `git -C` refuses. Both fall to the spawn, which answers as `git -C`
+    # does.
+    #
+    # QUALIFY THE DIRECTORY BEFORE IT BECOMES THE MEMO KEY. A caller may spell
+    # its git directory relatively; after process-wide chdir, the same bytes can
+    # name another repository. Keying on those bytes reused the first
+    # repository's live batch and made its objects evidence about the second.
+    # realpath alone, never after abspath: abspath folds `link/..` lexically to
+    # the link's own parent, while the kernel (and `git -C`) resolves `..`
+    # from the link's target, so the fold names another directory.
+    try:
+        cwd = os.path.realpath(os.fsdecode(cwd))
+    except (OSError, TypeError, ValueError):
+        return None
+    if not os.path.isdir(cwd) or _relative_selection(_NO_REPLACE):
+        return None
+    batch = projscope.memo(
+        ("vcs.batch", cwd, tuple(sorted(_NO_REPLACE.items()))),
+        lambda: _open_batch(cwd, _NO_REPLACE))
+    if batch is None:
+        return None
+    line = batch.ask(sha, timeout)
+    if line == sha + " missing":
+        return False
+    m = _BATCH_LINE.fullmatch(line or "")
+    return True if m and m.group(1) == sha else None
+
+
+def _batch_dir(cwd, env):
+    """`cwd`'s own absolute git directory as `git -C cwd` sees it UNDER THE
+    SAME OVERLAY the batch will run with, or None. It is deliberately NOT the
+    common directory: a linked worktree's git directory is the identity Git
+    uses for `includeIf.gitdir` and for its `config.worktree`, so moving the
+    batch to the common directory can change replacement-object answers. The
+    ambient GIT_DIR and GIT_WORK_TREE select a repository too, so resolving
+    without the overlay can name another repository's store and turn its
+    objects into existence proofs here. `run` memoises the read for the scope,
+    never across one. The read is hidden from the fold recorder: it names
+    WHERE the questions are asked, not an answer a checkpoint depends on, and
+    recording it would change every fold's recorded question set."""
+    with observed(None):
+        rc, out, _err = GitVcs().run(cwd, "rev-parse", "--path-format=absolute",
+                                     "--absolute-git-dir", env=env)
+    gitdir = os.fsdecode(out).strip() if rc == 0 else ""
+    return gitdir or None
+
+
+#: The environment paths whose meaning changes when Git changes cwd. The
+#: repository selectors can redirect the object store; HOME and
+#: XDG_CONFIG_HOME can redirect global config, including core.useReplaceRefs.
+_CWD_RESOLVED_ENV = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "HOME",
+    "XDG_CONFIG_HOME",
+)
+
+
+def _relative_selection(env):
+    """True when a path-valued repository-selection variable the batch would
+    inherit, under the overlay `env`, holds anything but absolute paths. An
+    empty value counts: an empty GIT_DIR is not reliably the same as none."""
+    live = _child_env(env) if env else os.environ
+    for name in _CWD_RESOLVED_ENV:
+        value = live.get(name)
+        if value is not None and not all(
+                p and os.path.isabs(p) for p in value.split(os.pathsep)):
+            return True
+    return False
+
+
+def _batched(cwd, args, timeout, env):
+    """(rc, stdout, stderr) for a small question, answered by the scope's
+    batch process — or None, and the caller spawns, whenever no scope is open,
+    the question is not one `_batch_question` names, or the batch's line does
+    not fix the single command's answer."""
+    if not projscope.active():
+        return None
+    question = _batch_question(args)
+    if question is None:
+        return None
+    expr, peel, prints = question
+    # AN UNPEELED `cat-file -e` ASKS WITHOUT REPLACEMENT, and the batch looks
+    # objects up WITH it: under `refs/replace/<missing id>` the batch names
+    # the id back as a present object while the single command exits 1. Only
+    # an overlay that pins GIT_NO_REPLACE_OBJECTS (git reads its presence, not
+    # its value) makes the two the same question, so anything else spawns.
+    # Every peeled form resolves through replacement in both, and stays.
+    if peel is None and "GIT_NO_REPLACE_OBJECTS" not in (
+            _child_env(env) if env else os.environ):
+        return None
+    # A CWD THAT NAMES NO DIRECTORY (`_named_dir`) IS NEVER BATCHED. `isdir`
+    # below raises on None instead of answering, and the spawn answers -1.
+    if _named_dir(cwd) is None:
+        return None
+    # THE BATCH LIVES IN THE CALLER'S OWN GIT DIRECTORY, NEVER ITS WORKTREE
+    # CWD (task/3099). It stays open for the whole scope and `git -C` makes
+    # its cwd that path; the stop guard proves a live delegated build by a
+    # process whose cwd IS a lane room, so a batch opened in the room would
+    # read as that lane's delegate. It is the OWN git directory, not the
+    # common one: linked worktrees may select config by gitdir or carry
+    # config.worktree, including core.useReplaceRefs, and those are part of
+    # the object question. Thus one process serves each worktree, rather than
+    # one process serving the whole repository.
+    # IT ANSWERS ONLY WHAT `git -C cwd` WOULD: a target that is gone falls
+    # to the spawn, which refuses it, and the directory is resolved under
+    # the caller's own overlay, never the ambient repository selection.
+    # A RELATIVE PATH IN THE INHERITED ENVIRONMENT NAMES ANOTHER REPOSITORY
+    # OR CONFIG FROM THERE: git resolves it against the process's cwd, and
+    # the batch's cwd is the git directory, so anything but absolute paths
+    # spawns.
+    if not os.path.isdir(cwd) or _relative_selection(env):
+        return None
+    gitdir = _batch_dir(cwd, env)
+    if not gitdir:
+        return None
+    batch = projscope.memo(
+        ("vcs.batch", gitdir, tuple(sorted(env.items())) if env else None),
+        lambda: _open_batch(gitdir, env))
+    if batch is None:
+        return None
+    answer = _batch_answer(batch.ask(expr, timeout), expr, peel, prints)
+    if answer is not None:
+        projscope.spend_or_raise("git batch result")
+    return answer
+
 # HELM_VCS is read DIRECTLY, not through home.env: the env2 legacy-fallback
 # pattern exists for variables that REPLACED a predecessor tool's spelling, and
 # this knob is new — there has never been a MELD_VCS. Reading one would
@@ -250,7 +766,7 @@ _WT_LIST = ("worktree", "list", "--porcelain", "-z")   # GitVcs-internal argv
 # A full object id in either hash size — the observation is only ever
 # compared against what git itself printed, so a short or partial answer is
 # an unreadable one rather than a shorter true one.
-_FULL_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_FULL_SHA = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 TRUNK_LOCAL, TRUNK_FETCHED = "local", "fetched"
 
@@ -297,13 +813,20 @@ def canonical_source_refusal(source_ref):
 # does not merely answer wrongly, it reaches out from the wrong repository.
 # MEASURED: with GIT_DIR pointing elsewhere, an observation of one repository
 # returned the OTHER repository's tip.
+#
+# GIT_CONFIG_PARAMETERS IS THE `git -c` CHANNEL: `git -c k=v <cmd>` exports it
+# to every child, hooks included, and git reads it at the same precedence as
+# GIT_CONFIG_COUNT. MEASURED (git 2.53): a planted
+# `'remote.origin.url'='<public url>'` made `git config --get-regexp` print a
+# second origin URL after the checkout's own, and the or-free public verdict
+# admitted a private tip on it (tests/test_or_free_model_class.py).
 _REPO_SELECTION_ENV = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
     "GIT_NAMESPACE", "GIT_PREFIX", "GIT_CONFIG", "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_COUNT",
-    "GIT_ALTERNATE_REFS", "GIT_REPLACE_REF_BASE",
+    "GIT_CONFIG_PARAMETERS", "GIT_ALTERNATE_REFS", "GIT_REPLACE_REF_BASE",
 )
 
 
@@ -322,6 +845,41 @@ def _authority_env():
         out["GIT_CONFIG_VALUE_%d" % i] = None
     out["GIT_TERMINAL_PROMPT"] = "0"
     return out
+
+
+# EVERY GIT_ VARIABLE THAT NAMES A PROGRAM GIT RUNS WHILE IT PUSHES (task/3265
+# r4, R1 of the round-3 codex read). git looks for a push's transport in
+# GIT_EXEC_PATH before PATH (`git-receive-pack` for a local path,
+# `git-remote-<scheme>` for a URL), runs ssh as GIT_SSH or GIT_SSH_COMMAND
+# says, a git:// proxy as GIT_PROXY_COMMAND says, and a credential prompt as
+# GIT_ASKPASS says. MEASURED (git 2.53): with GIT_EXEC_PATH naming a planted
+# directory, its `git-receive-pack` answered a push in place of git's own.
+# `GitVcs.run_holding`, the push's seam, removes them all. `_authority_env`
+# keeps them: its fetches and reads run in a seat's own environment, where a
+# GIT_SSH_COMMAND is how a sandbox or an operator reaches its remote.
+# HYGIENE, NOT A DEFENCE: a process that controls auto-land's environment
+# could run `git push` itself, and that is outside what auto-land defends
+# (helm/autoland.py, THE THREAT MODEL). GIT_TEMPLATE_DIR is not here: only
+# init and clone read it.
+_HELPER_SELECTION_ENV = ("GIT_EXEC_PATH", "GIT_SSH", "GIT_SSH_COMMAND",
+                         "GIT_ASKPASS", "GIT_PROXY_COMMAND")
+
+#: THE HOLDER (task/3265 door read B3): `GitVcs.run_holding` runs it as
+#: `python -I -S -c _HOLDER <alarm> <git argv>`. It inherits the caller's
+#: descriptors, starts git with close_fds (git and all it starts get none of
+#: them), sets git's SIGALRM to its default action and arms it `<alarm>`
+#: seconds out before git execs (0 arms none), waits for git, and exits with
+#: git's code (128 + the signal that ended it), which closes its copies.
+_HOLDER = """\
+import signal, subprocess, sys
+def arm(s=int(sys.argv[1])):
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    if s:
+        signal.alarm(s)
+rc = subprocess.call(sys.argv[2:], stdin=subprocess.DEVNULL, close_fds=True,
+                     preexec_fn=arm)
+sys.exit(rc if rc >= 0 else 128 - rc)
+"""
 
 
 def _first_line(blob):
@@ -563,14 +1121,123 @@ class Vcs:
         """Ordered stable patch ids in ``base..tip``, or None when unreadable."""
         raise NotImplementedError
 
-    def patch_sequence_containment(self, root, reviewed, candidate, timeout=30):
-        """Typed verdict: does candidate contain reviewed's ordered patches?"""
+    def patch_twins(self, root, base, tip, trunk, timeout=30):
+        """(state, twins, detail) — does every commit in ``base..tip`` have
+        exactly one patch-identical commit on ``trunk``? (GitVcs carries the
+        law, the bound and the refusals.)"""
         raise NotImplementedError
 
-    def landed_state(self, root, tip, ref, cap=None, timeout=30):
+    def fork_point(self, root, one, other, timeout=30):
+        """The UNIQUE merge base of two commits, or None. Several best bases
+        make any range drawn from one of them an arbitrary pick."""
+        raise NotImplementedError
+
+    def default_trunk(self, root, timeout=30):
+        """(commit, name) of the repository's remote default branch as the
+        VCS records it, or (None, why) when none resolves."""
+        raise NotImplementedError
+
+    def patch_sequence_containment(self, root, reviewed, candidate, timeout=30,
+                                   trunk=None, report=None):
+        """(state, start, width, total) — does `candidate` carry `reviewed`'s
+        ordered patches as one unique contiguous run?
+
+        CONCRETE ON PURPOSE, like `is_ancestor`: one law for every backend,
+        which implements only `fork_point`, `default_trunk`, `patch_sequence`
+        and `ancestry`.
+
+        THE PAIR READING FIRST, AND EVERY ANSWER IT GIVES STANDS. The pair's
+        unique merge base defines both histories. A repeated match is
+        AMBIGUOUS, not stronger evidence: patch-id drops location, so two
+        placements cannot tell which bytes the review names. Empty reviewed
+        work supplies no evidence. UNKNOWN never authorizes.
+
+        AN UNREADABLE PAIR IS READ AGAIN FROM TRUNK. When trunk moved between
+        two spellings of one lane, the pair's base range carries trunk's own
+        history, and a train merge in it has no patch id, so a plain rebase
+        read UNKNOWN (measured on a live retip: 26 train merges in the pair's
+        range, one commit and one patch id a side). The trunk reading takes
+        each side from its own unique fork point off trunk, so only each tip's
+        OWN commits are compared, and a merge among those still reads
+        UNKNOWN. Trunk is `trunk` — a commit, or a zero-argument callable
+        returning either one or ``(commit, refusal)`` — called only here, so a
+        caller whose trunk costs an observation pays it only when the pair
+        cannot answer. No commit and no refusal permits `default_trunk`; a
+        refusal is a declared authority contradiction and never discovery.
+
+        THE TRUNK ONLY PLACES THE CUT, so a wrong trunk can fail this reading
+        and never pass it: each needle carries everything between its cut and
+        its tip. What a cut cannot show is DIRECTION — a tip rebased onto an
+        OLDER trunk carries the same own patches — so a match counts only when
+        the candidate's fork point is the reviewed one's or a descendant of
+        it. Otherwise the answer is BACKWARD, which is a refusal.
+
+        `report`, when a dict, receives `reading` ("pair" or "trunk"),
+        `basis` (the base the counts are measured from, in words) and `why`
+        for UNKNOWN and BACKWARD answers.
+        """
+        def run(bases):
+            if None in bases:
+                return PATCH_SEQUENCE_UNKNOWN, None, None, None
+            return _containment(
+                self.patch_sequence(root, bases[0], reviewed, timeout),
+                self.patch_sequence(root, bases[1], candidate, timeout))
+        said = {} if report is None else report
+        base = self.fork_point(root, reviewed, candidate, timeout)
+        said.update(reading="pair", basis="the two tips' common base" +
+                    ((" " + base[:12]) if base else ""))
+        got = run((base, base))
+        if got[0] != PATCH_SEQUENCE_UNKNOWN:
+            return got
+        choice = trunk() if callable(trunk) else trunk
+        refusal = None
+        if isinstance(choice, tuple):
+            trunk, refusal = choice
+        else:
+            trunk = choice
+        name = None
+        if refusal:
+            said["why"] = ("the two tips' common base range cannot be read, "
+                           "and %s" % refusal)
+            return got
+        if not trunk:
+            trunk, name = self.default_trunk(root, timeout)
+        if not trunk:
+            said["why"] = ("the two tips' common base range cannot be read, "
+                           "and %s" % name)
+            return got
+        forks = (self.fork_point(root, trunk, reviewed, timeout),
+                 self.fork_point(root, trunk, candidate, timeout))
+        said.update(reading="trunk",
+                    basis="each tip's own fork point off trunk %s%s"
+                    % (trunk[:12], (" (%s)" % name) if name else ""))
+        got = run(forks)
+        if got[0] == PATCH_SEQUENCE_UNKNOWN:
+            said["why"] = ("neither the two tips' common base range nor each "
+                           "tip's own commits off trunk %s can be read"
+                           % trunk[:12])
+        if got[0] not in (PATCH_SEQUENCE_EXACT, PATCH_SEQUENCE_CONTAINED) \
+                or forks[0] == forks[1]:
+            return got
+        forward = self.ancestry(root, forks[0], forks[1])
+        if forward == ANCESTOR:
+            return got
+        if forward == NOT_ANCESTOR:
+            said["why"] = ("the candidate's fork point %s off trunk %s is not "
+                           "provably forward of the reviewed tip's %s"
+                           % (forks[1][:12], trunk[:12], forks[0][:12]))
+            return PATCH_SEQUENCE_BACKWARD, None, got[2], got[3]
+        said["why"] = ("whether the candidate's fork point %s off trunk %s is "
+                       "forward of the reviewed tip's %s cannot be read"
+                       % (forks[1][:12], trunk[:12], forks[0][:12]))
+        return PATCH_SEQUENCE_UNKNOWN, None, None, None
+
+    def landed_state(self, root, tip, ref, cap=None, timeout=30, limit=None):
         """ANCESTOR / PATCH_EQUIVALENT / NOT_ANCESTOR / UNKNOWN — did the WORK
-        in `tip` reach `ref`, by object identity OR by content? (GitVcs carries
-        the law, the guard and the measurement.)"""
+        in `tip` reach `ref`, by object identity OR by content? `limit`, a
+        full sha, narrows the content question to `limit..tip`, as `git
+        cherry`'s own third argument does. (GitVcs carries the law, the guard
+        and the measurement.)"""
         raise NotImplementedError
 
     def delete_branch(self, root, branch, force=False, expect=None):
@@ -665,7 +1332,8 @@ class GitVcs(Vcs):
         instead of a shell pipeline — no shell, no quoting, argv stays a list.
 
         ONE ANSWER PER READ QUESTION PER PROJECTION, and ONLY for the verbs in
-        `_READ_VERBS` and only inside a `projscope.scope()`. Every write verb
+        `_READ_VERBS` (plus the two exact read forms `_SCOPE_FORMS` names) and
+        only inside a `projscope.scope()`. Every write verb
         and every call outside a scope goes straight to the spawn, so this
         cannot serve a stale answer to anything that changes the repo.
 
@@ -700,7 +1368,11 @@ class GitVcs(Vcs):
         on 2026-07-31, 4140 over 1222 rows on 2026-08-06.
         """
         projscope.spend_or_raise("git memo lookup")
-        if args and str(args[0]) in _READ_VERBS:
+        # `_SCOPE_FORMS` are the two exact merge-tree and diff forms the fold's
+        # replay witnesses ask; see the note above them for why only those.
+        where = _named_dir(cwd) if args and (
+            str(args[0]) in _READ_VERBS or _scope_form(args)) else None
+        if where is not None:
             # TWO THINGS THE FIRST CUT GOT WRONG, both found in
             # this lane's review and both the same law stated twice.
             #
@@ -724,8 +1396,13 @@ class GitVcs(Vcs):
             # hashable and distinct from the absent key, so "unset GIT_DIR"
             # and "leave GIT_DIR alone" are two questions here as they are two
             # questions to git.
-            key = ("vcs.run", cwd, tuple(str(a) for a in args), stdin, timeout,
-                   tuple(sorted(env.items())) if env else None)
+            # (4) AND THE REPOSITORY IS A DIRECTORY, NOT A STRING. `where` is
+            # the directory the spawn enters, so a relative cwd asked again
+            # after a chdir is a different question; a cwd `_named_dir` cannot
+            # spell is not remembered. The spawn and the observer still get
+            # `cwd` as the caller spelled it.
+            key = ("vcs.run", where, tuple(str(a) for a in args), stdin,
+                   timeout, tuple(sorted(env.items())) if env else None)
             hit = projscope.memo(
                 key, lambda: self._durable(cwd, args, timeout, env, stdin))
             projscope.spend_or_raise("git memo result")
@@ -765,10 +1442,19 @@ class GitVcs(Vcs):
 
         `gitfacts` decides what is cacheable — see its module docstring for
         the whole argument. Nothing here needs to know, and a call it refuses
-        costs one dict lookup and a regex."""
+        costs one dict lookup and a regex.
+
+        AND INSIDE A SCOPE A SMALL QUESTION RIDES THE SCOPE'S ONE
+        `cat-file --batch-check` PROCESS instead of a process of its own
+        (`_batched`, task/3056). It sits after `gitfacts`, which never admits
+        those three forms, and before the spawn, which answers every question
+        the batch's line does not fix."""
         if stdin is not None:
             return self._spawn(cwd, args, timeout, env, stdin)
         hit = gitfacts.lookup(cwd, args, env)
+        if hit is not None:
+            return hit
+        hit = _batched(cwd, args, timeout, env)
         if hit is not None:
             return hit
         rc, out, err = self._spawn(cwd, args, timeout, env, stdin)
@@ -799,17 +1485,11 @@ class GitVcs(Vcs):
         carries it. It names nothing git reads, so it is removed here rather
         than exported: an unknown variable in a child environment is a thing a
         reader has to rule out, and the next tool spawned under it inherits
-        it."""
-        child = None
-        if env:
-            child = dict(os.environ)
-            for key, value in env.items():
-                if key == gitfacts.UNCACHED:
-                    child.pop(key, None)
-                elif value is None:
-                    child.pop(key, None)
-                else:
-                    child[key] = value
+        it.
+
+        The child environment is `_child_env`'s: built once per scope for each
+        overlay, and per call outside one (task/3056)."""
+        child = _child_env(env) if env else None
         left = projscope.spend_or_raise("git subprocess")
         observation = _observation_argv(args)
         ambient_limited = observation and left is not None \
@@ -839,6 +1519,55 @@ class GitVcs(Vcs):
         rc -1 so every caller fails toward its SAFE verdict."""
         rc, out, err = self.run(cwd, *args, timeout=timeout, env=env,
                                 stdin=stdin)
+        return rc, os.fsdecode(out).strip(), os.fsdecode(err).strip()
+
+    def run_holding(self, cwd, *args, keep=(), alarm=0, timeout=30,
+                    env=None):
+        """(rc, out, err) as `text` answers them, for a git child whose
+        caller's descriptors `keep` must stay open until git ends, even when
+        the caller is killed first. Written for auto-land's push, which holds
+        its tick's locks until it ends (helm/autoland.py `Ops.push`,
+        task/3265). Never memoised, kept in `gitfacts` or batched: it is a
+        write, not a question with an answer to keep.
+
+        THE DESCRIPTORS LIVE IN ONE PROCESS, THE HOLDER, NEVER IN GIT
+        (task/3265 door read B3). `keep` is inherited by `_HOLDER` (subprocess
+        `pass_fds`), which starts git with every descriptor but its three
+        standard ones closed, waits for it, and exits with its code. So
+        nothing git starts (a transport helper, git's credential-cache daemon,
+        an ssh ControlMaster) ever holds a lock `keep` names: a daemon that
+        outlived a push that succeeded held the dispatch ledger's lock for its
+        idle timeout. The holder holds them exactly until git ends. `alarm`
+        seconds after git starts, the holder's SIGALRM, set in git before it
+        execs, ends git and so the holder; it ends git alone, never a helper
+        git started, and that helper holds no lock.
+
+        THE HOLDER LEADS A PROCESS GROUP OF ITS OWN, with git and git's
+        helpers in it, and a timeout kills the whole group (task/3265 races
+        R3): killing git alone left its helpers running with a push already
+        sent still able to land. Nothing it runs may prompt, so its stdin is
+        /dev/null.
+
+        NO AMBIENT PROGRAM (task/3265 r4): every variable that names a
+        program git runs while it pushes is removed, the caller's `env`
+        included (`_HELPER_SELECTION_ENV`), so git runs its own transport.
+        The holder is this interpreter in isolated mode (-I -S), so no
+        PYTHON* variable or site hook reaches it either."""
+        child = _child_env(dict(env or {},
+                                **dict.fromkeys(_HELPER_SELECTION_ENV)))
+        projscope.spend_or_raise("git subprocess")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable or "python3", "-I", "-S", "-c", _HOLDER,
+                 str(int(alarm or 0)), GIT, "-C", cwd] + list(args),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=child, pass_fds=tuple(keep),
+                start_new_session=True)
+        except Exception as exc:
+            answer = (-1, b"", os.fsencode(str(exc)))
+        else:
+            answer = _group_answer(proc, timeout)
+        rc, out, err = _observed(cwd, args, env, None, answer)
         return rc, os.fsdecode(out).strip(), os.fsdecode(err).strip()
 
     def _capture(self, cwd, args, timeout):
@@ -1256,27 +1985,30 @@ class GitVcs(Vcs):
 
         None on: no open scope (a lone caller must not pay a full rev-list),
         a tip that is not one full sha (only exact object names can use set
-        membership), or either set unavailable. The POSITIVE set is keyed by
-        (root, ref) because it answers reachability from that ref; the object
-        set is keyed by root alone because existence has no ref."""
+        membership), or either question unanswerable. The POSITIVE set is
+        keyed by (root, ref) because it answers reachability from that ref;
+        existence is ONE batch question about the tip (`exists`), because
+        listing the whole store to answer it cost a second per scope."""
         from . import projscope
         if not projscope.active():
             return None
         sha = str(tip).strip().lower()
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
             return None
+        named = _named_dir(root)           # the directory, not the string
+        if named is None:
+            return None
         reach = self._sha_set(root, ("rev-list", str(ref)),
-                              ("vcs.revset", root, str(ref)))
+                              ("vcs.revset", named, str(ref)))
         if reach is None:
             return None
         if sha in reach:
             return ANCESTOR
-        objs = self._sha_set(root, ("cat-file", "--batch-check=%(objectname)",
-                                    "--batch-all-objects", "--unordered"),
-                             ("vcs.objset", root))
-        if objs is None:
+        where = self.common_dir(root)
+        present = exists(where, sha) if where else None
+        if present is None:
             return None
-        return NOT_ANCESTOR if sha in objs else UNKNOWN
+        return NOT_ANCESTOR if present else UNKNOWN
 
     def _sha_set(self, root, args, key):
         """frozenset of shas from one git listing, memoized per projection.
@@ -1318,15 +2050,27 @@ class GitVcs(Vcs):
             return None
         if not commits:
             return ()
+        ids = self._patch_ids(root, ("%s..%s" % (base, tip),), timeout)
+        if ids is None or set(ids) != set(commits):
+            return None
+        return tuple(ids[c] for c in commits)
+
+    def _patch_ids(self, root, revs, timeout=30, mode="--stable"):
+        """{commit: patch id} for the commits `revs` select, under ONE pinned
+        diff shape, or None when unreadable. A commit that emits no id (a
+        merge, an empty commit) is simply absent, so a caller that needs every
+        commit compares the keys against its own listing."""
         rc, diff, _err = self.run(
             root, "-c", "diff.noprefix=false", "log", "--reverse", "-p",
             "--no-renames", "--diff-algorithm=myers", "--unified=3",
             "--inter-hunk-context=0", "--src-prefix=a/", "--dst-prefix=b/",
             "--no-ext-diff", "--no-textconv", "--pretty=format:commit %H",
-            "%s..%s" % (base, tip), timeout=timeout)
-        if rc != 0 or not diff:
+            *revs, timeout=timeout)
+        if rc != 0:
             return None
-        rc, out, _err = self.text(root, "patch-id", "--stable", stdin=diff,
+        if not diff:
+            return {}
+        rc, out, _err = self.text(root, "patch-id", mode, stdin=diff,
                                   timeout=timeout)
         if rc != 0:
             return None
@@ -1337,42 +2081,142 @@ class GitVcs(Vcs):
                     or not _FULL_SHA.fullmatch(parts[1]) or parts[1] in ids:
                 return None
             ids[parts[1]] = parts[0]
-        if set(ids) != set(commits):
-            return None
-        return tuple(ids[c] for c in commits)
+        return ids
 
-    def patch_sequence_containment(self, root, reviewed, candidate, timeout=30):
-        """Typed, unique contiguous containment of one reviewed patch train.
+    def patch_twins(self, root, base, tip, trunk, timeout=30):
+        """(state, twins, detail) — did every commit in `base..tip` reach
+        `trunk` under ANOTHER sha, one trunk commit per commit?
 
-        The unique merge base defines both histories. A repeated match is
-        AMBIGUOUS, not stronger evidence: patch-id drops location, so two
-        placements cannot tell which bytes the review names. Empty reviewed
-        work supplies no evidence. UNKNOWN never authorizes.
-        """
-        rc, out, _err = self.text(root, "merge-base", "--all", reviewed,
-                                  candidate, timeout=timeout)
-        bases = out.split() if rc == 0 else []
-        if len(bases) != 1 or not _FULL_SHA.fullmatch(bases[0]):
-            return PATCH_SEQUENCE_UNKNOWN, None, None, None
-        base = bases[0]
-        needle = self.patch_sequence(root, base, reviewed, timeout)
-        train = self.patch_sequence(root, base, candidate, timeout)
-        if needle is None or train is None:
-            return PATCH_SEQUENCE_UNKNOWN, None, None, None
-        if not needle:
-            return PATCH_SEQUENCE_EMPTY, None, 0, len(train)
-        if needle == train:
-            return PATCH_SEQUENCE_EXACT, 0, len(needle), len(train)
-        width = len(needle)
-        hits = [i for i in range(len(train) - width + 1)
-                if train[i:i + width] == needle]
-        if len(hits) == 1:
-            return PATCH_SEQUENCE_CONTAINED, hits[0], width, len(train)
-        if len(hits) > 1:
-            return PATCH_SEQUENCE_AMBIGUOUS, None, width, len(train)
-        return PATCH_SEQUENCE_ABSENT, None, width, len(train)
+        THE CURE'S QUESTION, NOT THE LANE'S (task/1484). A reviewer's FIX
+        names a cure (`patch_tip`) committed off the reviewed tip; the lane
+        rebases onto it and lands, so the cure reaches trunk patch-identical
+        and object-different while the lane's own commits beneath it often
+        land REWORKED. `landed_state(limit=)` answers the same range as a yes
+        or no; this answers it as a MAPPING, so a close can record which trunk
+        commit carries which reviewed one.
 
-    def landed_state(self, root, tip, ref, cap=None, timeout=30):
+        THE WINDOW IS BOUNDED AND STATED: the non-merge commits of
+        `<trunk> ^<tip>` — trunk since its fork from the cure, which is every
+        commit a rebase-land of it could have written — at most
+        PATCH_TWIN_WINDOW of them. Over the bound is UNKNOWN, because a twin
+        past the window is not a twin proven absent. The range itself is
+        capped at PATCH_SEQUENCE_CAP.
+
+        `trunk` IS A FULL SHA, the pinned commit the caller measured, so the
+        window cannot move between the question and the answer.
+
+        THE ANSWERS. MATCHED: every range commit has exactly one twin, no two
+        share one, and each pair is byte-identical under `--verbatim` too
+        (`--stable` normalises whitespace, the one patch-id blind spot that
+        fails toward "landed" — `_range_is_verbatim_identical` records the
+        measurement). UNMATCHED: some commit has no twin, or only a
+        whitespace-normalised one; `detail` names those commits. COLLISION:
+        two range commits map to one trunk commit, or one maps to several;
+        `detail` names every commit involved. UNKNOWN: anything unreadable —
+        a non-full sha, `base` not an ancestor of `tip`, an empty or
+        over-cap range, a merge or empty commit in it (no id to match), a
+        window over the bound, a git that did not answer; `detail` says which.
+        `twins` is ((reviewed, trunk, stable patch id), ...) in range order,
+        and is empty on every answer but MATCHED."""
+        if not all(_FULL_SHA.fullmatch(str(sha or ""))
+                   for sha in (base, tip, trunk)):
+            return UNKNOWN, (), "a cure range and its trunk must be full shas"
+        if self.ancestry(root, base, tip) != ANCESTOR:
+            return UNKNOWN, (), ("%s does not descend from %s here"
+                                 % (tip[:12], base[:12]))
+        rc, out, _err = self.text(root, "rev-list", "--reverse",
+                                  "%s..%s" % (base, tip), timeout=timeout)
+        commits = out.split() if rc == 0 else []
+        if rc != 0 or not commits or len(commits) > PATCH_SEQUENCE_CAP \
+                or any(not _FULL_SHA.fullmatch(c) for c in commits):
+            return UNKNOWN, (), ("the range %s..%s could not be listed, or is "
+                                 "empty or over %d commits"
+                                 % (base[:12], tip[:12], PATCH_SEQUENCE_CAP))
+        mine = self._patch_ids(root, ("%s..%s" % (base, tip),), timeout)
+        if mine is None or set(mine) != set(commits):
+            return UNKNOWN, (), ("not every commit in %s..%s has a patch id "
+                                 "(a merge, an empty commit, or git did not "
+                                 "answer)" % (base[:12], tip[:12]))
+        window = (trunk, "^" + tip)
+        rc, out, _err = self.text(root, "rev-list", "--count", "--no-merges",
+                                  *window, timeout=timeout)
+        if rc != 0 or not out.isdigit():
+            return UNKNOWN, (), "the trunk window could not be counted"
+        if int(out) > PATCH_TWIN_WINDOW:
+            return UNKNOWN, (), ("the trunk window holds %s commits, over the "
+                                 "%d this question is bounded to"
+                                 % (out, PATCH_TWIN_WINDOW))
+        theirs = self._patch_ids(root, ("--no-merges",) + window, timeout) \
+            if int(out) else {}
+        if theirs is None:
+            return UNKNOWN, (), "the trunk window's patch ids could not be read"
+        by_id = {}
+        for sha, pid in theirs.items():
+            by_id.setdefault(pid, []).append(sha)
+        pairs = [(c, by_id.get(mine[c], [])) for c in commits]
+        unmatched = tuple(c for c, found in pairs if not found)
+        if unmatched:
+            return PATCH_TWINS_UNMATCHED, (), unmatched
+        claimed = {}
+        for c, found in pairs:
+            for sha in found:
+                claimed.setdefault(sha, []).append(c)
+        tangled = tuple(c for c, found in pairs if len(found) > 1
+                        or any(len(claimed[sha]) > 1 for sha in found))
+        if tangled:
+            return PATCH_TWINS_COLLISION, (), tangled
+        exact = self._patch_ids(
+            root, ("--no-walk=unsorted",) + tuple(commits)
+            + tuple(found[0] for _c, found in pairs), timeout,
+            mode="--verbatim")
+        if exact is None:
+            return UNKNOWN, (), "the verbatim patch ids could not be read"
+        loose = tuple(c for c, found in pairs
+                      if exact.get(c) is None or exact.get(c) != exact.get(found[0]))
+        if loose:
+            return PATCH_TWINS_UNMATCHED, (), loose
+        return PATCH_TWINS_MATCHED, tuple(
+            (c, found[0], mine[c]) for c, found in pairs), ()
+
+    def fork_point(self, root, one, other, timeout=30):
+        """`merge-base --all`, and only a single answer counts."""
+        rc, out, _err = self.text(root, "merge-base", "--all", one, other,
+                                  timeout=timeout)
+        found = out.split() if rc == 0 else []
+        return found[0] if len(found) == 1 and _FULL_SHA.fullmatch(found[0]) \
+            else None
+
+    def default_trunk(self, root, timeout=30):
+        """(sha, name) of `refs/remotes/<remote>/HEAD`, the default branch git
+        records at clone or `git remote set-head`, on `origin` — or on the one
+        remote a repository without `origin` has — else (None, why). It is a
+        local snapshot: it places a cut for the containment reading and is
+        never a trunk authority."""
+        rc, out, _err = self.text(root, "remote", timeout=timeout)
+        if rc != 0:
+            return None, "no remote default branch resolves: git remote failed"
+        remotes = out.split()
+        remote = "origin" if "origin" in remotes else \
+            (remotes[0] if len(remotes) == 1 else None)
+        if remote is None:
+            return None, ("no remote default branch resolves: %s" % (
+                "the repository has no remote" if not remotes else
+                "no remote is named origin and %d others are" % len(remotes)))
+        head = "refs/remotes/%s/HEAD" % remote
+        rc, ref, _err = self.text(root, "symbolic-ref", "-q", head,
+                                  timeout=timeout)
+        if rc != 0 or not ref.startswith("refs/remotes/%s/" % remote):
+            return None, ("no remote default branch resolves: %s is not set "
+                          "(`git remote set-head %s --auto` records it)"
+                          % (head, remote))
+        rc, sha, _err = self.text(root, "rev-parse", "--verify", "-q",
+                                  ref + "^{commit}", timeout=timeout)
+        if rc != 0 or not _FULL_SHA.fullmatch(sha):
+            return None, ("no remote default branch resolves: %s names no "
+                          "commit" % ref)
+        return sha, ref[len("refs/remotes/"):]
+
+    def landed_state(self, root, tip, ref, cap=None, timeout=30, limit=None):
         """ANCESTOR / PATCH_EQUIVALENT / NOT_ANCESTOR / UNKNOWN — did the WORK
         in `tip` reach `ref`?
 
@@ -1438,12 +2282,32 @@ class GitVcs(Vcs):
         rev-list/NOT_ANCESTOR contradiction all return UNKNOWN. This function
         gates a deletion, so UNKNOWN must never be spendable as a verdict —
         the caller keeps.
+
+        `limit` ASKS ABOUT THE COMMITS AFTER IT, NOT THE WHOLE BRANCH, which is
+        `git cherry <upstream> <head> <limit>`'s own meaning: a commit `limit`
+        reaches is neither listed nor counted. It exists for a question about
+        ONE CURE on top of a lane (obligation's answered-FIX read, task/3357).
+        A reviewer's patch lands under a new sha while the lane commits under
+        it land REWORKED, so the whole-branch question says NOT_ANCESTOR about
+        work the FIX never asked for. Measured on both live specimens: 3 of 6
+        and 3 of 14 lane commits read '+', every cure commit '-'. Every refusal
+        below runs over the narrowed range; an empty one counts 0 and is
+        UNKNOWN, and a `limit` that is not a full sha is UNKNOWN before any
+        spawn, because git would read it as a revision name or an option. The
+        ancestry fast path is unchanged: it asks about `tip` itself.
         """
+        if limit is not None and not _FULL_SHA.fullmatch(str(limit)):
+            return UNKNOWN
         anc = self.ancestry(root, tip, ref)
         if anc != NOT_ANCESTOR:
             return anc          # ANCESTOR is decisive and costs one call
+        # ONE MORE EXCLUDED REVISION, AND NOTHING WHEN THERE IS NO LIMIT: the
+        # memo keys on argv, so every caller that passes none asks exactly
+        # the question it asked before.
+        also = () if limit is None else ("^" + limit,)
         rc, out, _err = self.text(root, "rev-list", "--count",
-                                  "%s..%s" % (ref, tip), timeout=timeout)
+                                  "%s..%s" % (ref, tip), *also,
+                                  timeout=timeout)
         if rc != 0 or not out.isdigit():
             return UNKNOWN
         ahead = int(out)
@@ -1453,7 +2317,9 @@ class GitVcs(Vcs):
         # negative, it is an unknown.
         if ahead == 0 or ahead > cap:
             return UNKNOWN
-        rc, out, _err = self.text(root, "cherry", ref, tip, timeout=timeout)
+        rc, out, _err = self.text(root, "cherry", ref, tip,
+                                  *(() if limit is None else (limit,)),
+                                  timeout=timeout)
         if rc != 0:
             return UNKNOWN
         lines = [ln for ln in out.split("\n") if ln.strip()]
@@ -1473,13 +2339,14 @@ class GitVcs(Vcs):
         # diff supplies none), the second that the evidence is BYTE-exact
         # rather than whitespace-normalised. Either one silent -> UNKNOWN,
         # which keeps. A '-' from cherry is now necessary and not sufficient.
-        if not self._range_has_no_empty_commit(root, ref, tip, timeout):
+        if not self._range_has_no_empty_commit(root, ref, tip, timeout, also):
             return UNKNOWN
-        if not self._range_is_verbatim_identical(root, ref, tip, timeout):
+        if not self._range_is_verbatim_identical(root, ref, tip, timeout,
+                                                 also):
             return UNKNOWN
         return PATCH_EQUIVALENT
 
-    def _range_has_no_empty_commit(self, root, ref, tip, timeout=30):
+    def _range_has_no_empty_commit(self, root, ref, tip, timeout=30, also=()):
         """True only when every non-merge commit in `ref..tip` touches a file.
 
         AN EMPTY DIFF HAS AN EMPTY PATCH-ID, SO EVERY EMPTY COMMIT IS
@@ -1499,9 +2366,11 @@ class GitVcs(Vcs):
         fast path never reaches here. `--name-only` after a NUL-prefixed
         `%H` gives one record per commit; a record with no file lines is an
         empty commit. An unreadable/unparsable read is False (refuse), same
-        direction as every other failure in this predicate."""
+        direction as every other failure in this predicate. `also` is
+        `landed_state`'s excluded `limit`, so the range read is the one it
+        judged."""
         rc, out, _err = self.text(root, "log", "--no-merges", "--format=%x00%H",
-                                  "--name-only", "%s..%s" % (ref, tip),
+                                  "--name-only", "%s..%s" % (ref, tip), *also,
                                   timeout=timeout)
         if rc != 0:
             return False
@@ -1514,10 +2383,11 @@ class GitVcs(Vcs):
                 return False          # a commit that touched no file
         return True
 
-    def _verbatim_ids(self, root, rng, timeout=30):
+    def _verbatim_ids(self, root, rng, timeout=30, also=()):
         """The set of `--verbatim` patch-ids for the non-merge commits in
-        `rng`, or None if the range could not be read. None is never a match."""
-        rc, diff, _err = self.run(root, "log", "--no-merges", "-p", rng,
+        `rng` less any revision `also` excludes, or None if the range could
+        not be read. None is never a match."""
+        rc, diff, _err = self.run(root, "log", "--no-merges", "-p", rng, *also,
                                   timeout=timeout)
         if rc != 0 or not diff:
             return None
@@ -1594,9 +2464,13 @@ class GitVcs(Vcs):
         #
         # projscope.memo caches None, which is what makes the failure half
         # expressible; outside a scope it computes and caches nothing, and this
-        # is only reached inside one.
+        # is only reached inside one. The key names the directory `_named_dir`
+        # spells, and a root it cannot spell is walked and not remembered.
         from . import projscope
-        return projscope.memo(("vcs._verbatim_map", root, ref),
+        where = _named_dir(root)
+        if where is None:
+            return self._verbatim_map_uncached(root, ref, timeout)
+        return projscope.memo(("vcs._verbatim_map", where, ref),
                               lambda: self._verbatim_map_uncached(root, ref, timeout))
 
     def _verbatim_map_uncached(self, root, ref, timeout=60):
@@ -1654,7 +2528,8 @@ class GitVcs(Vcs):
                 ids.add(got[sha])
         return ids or None
 
-    def _range_is_verbatim_identical(self, root, ref, tip, timeout=30):
+    def _range_is_verbatim_identical(self, root, ref, tip, timeout=30,
+                                     also=()):
         """True only when every lane commit's diff is upstream BYTE-FOR-BYTE.
 
         `git cherry`'s '-' is patch-id's DEFAULT algorithm, which normalizes
@@ -1689,13 +2564,15 @@ class GitVcs(Vcs):
         direction as every other refusal here.
 
         Two extra spawns, and only on the patch-identity path — ancestry never
-        reaches this. Any unreadable half is False (refuse)."""
+        reaches this. Any unreadable half is False (refuse). `also` narrows
+        MINE to `landed_state`'s `limit..tip`, and the trunk side is then
+        read only where a twin can be (below), which changes no answer."""
         rc, base, _err = self.text(root, "merge-base", ref, tip,
                                    timeout=timeout)
         base = (base or "").strip()
         if rc != 0 or not base:
             return False
-        mine = self._verbatim_ids(root, "%s..%s" % (base, tip), timeout)
+        mine = self._verbatim_ids(root, "%s..%s" % (base, tip), timeout, also)
         # `theirs` is base..TRUNK and is the expensive half — the same walk
         # repeated per row over nested subsets of one history. Answered from a
         # single whole-ref map when that is readable, and by the original walk
@@ -1712,6 +2589,23 @@ class GitVcs(Vcs):
         # So the shortcut is taken ONLY when a scope is active, which is
         # exactly the condition under which the map's cost is amortised across
         # many rows. Outside a scope the original bounded walk runs unchanged.
+        if also:
+            # A NARROWED QUESTION READS THE TRUNK SIDE ONLY WHERE A TWIN CAN
+            # BE. A verbatim twin has the same diff, so it touches exactly the
+            # paths its lane commit touches: selecting trunk commits by those
+            # paths (`--full-history`, so no side branch is simplified away,
+            # and `--full-diff`, so each id is the whole commit's) drops no
+            # twin and yields ids identical to the unlimited walk's. MEASURED
+            # on task/3357's live ledger: the unlimited walk was 7.45 of the
+            # 8.8 seconds its four cure questions cost `helm owed`, 1.3 to 2.3
+            # seconds each over 611 to 1047 trunk commits. A path read that
+            # fails, or finds no trunk commit, is not a match.
+            paths = self._range_paths(root, ref, tip, also, timeout)
+            theirs = self._verbatim_ids(
+                root, "%s..%s" % (base, ref), timeout,
+                ("--full-history", "--full-diff", "--")
+                + tuple(":(literal)" + p for p in paths)) if paths else None
+            return bool(mine and theirs) and mine <= theirs
         from . import projscope
         theirs = None
         if projscope.active():
@@ -1721,6 +2615,18 @@ class GitVcs(Vcs):
         if not mine or not theirs:
             return False
         return mine <= theirs
+
+    def _range_paths(self, root, ref, tip, also=(), timeout=30):
+        """The paths the non-merge commits in `ref..tip` (less `also`) touch,
+        or () when git could not say. Read NUL-separated, so no path arrives
+        quoted, and handed to git as literal pathspecs, so none is a glob."""
+        rc, out, _err = self.text(root, "log", "--no-merges", "--format=",
+                                  "--name-only", "-z", "%s..%s" % (ref, tip),
+                                  *also, timeout=timeout)
+        if rc != 0:
+            return ()
+        return tuple(sorted({p.strip("\n") for p in (out or "").split("\0")}
+                            - {""}))
 
     def delete_branch(self, root, branch, force=False, expect=None):
         """`branch -d` — SAFE by construction: git itself refuses an unmerged
@@ -1751,10 +2657,58 @@ class GitVcs(Vcs):
         expected <READ-BACK>", rc 1, branch intact (rc 0 and gone when the sha
         still matches). Passing `expect` therefore makes PRESERVE-THEN-DELETE
         atomic in the only sense that matters: what gets deleted is exactly
-        what was proven saved, or nothing is."""
+        what was proven saved, or nothing is.
+
+        THE BRANCH'S CONFIG GOES WITH ITS REF (task/3643). `branch -d` drops
+        the `branch.<name>` section; `update-ref -d` does not, so a lane's
+        task record (`taskkey`, `branch.lane/<lane>.helmTask`) outlived the
+        ref it describes and a reused lane name inherited it. After a delete
+        that succeeded the section is removed the way `branch -d` removes it;
+        a section that is already absent is not a failure. The section is read
+        again after the removal: one that is still there (a locked config)
+        is REPORTED in the answer's third field while the answer stays rc 0,
+        because the ref IS gone; `taskkey.lane_records` never reads a record
+        whose branch is gone, and `helm work claim` drops it before it cuts
+        the lane name again (`taskkey.forget_lane`).
+
+        THE SECTION IS REMOVED ONLY WHILE THE BRANCH IS STILL ABSENT: the ref
+        is read again (`show-ref --exists`, rc 2 alone is absent; rc 1 is a
+        lookup error) immediately before the removal, and a branch that
+        exists, or a ref that cannot be read, keeps its section. That read
+        does not close the window by itself: a claim that re-cut the name and
+        recorded its task between the read and the removal would lose its
+        record, and a lane named task-N would then join the literal task-N, a
+        WRONG task. A lane branch is therefore retired only through
+        `work._gc._delete_lane_branch`, which runs this whole delete under
+        the claims lock and only while the lane holds no live lease
+        (`work._gc._unleased`); a claim takes its lease under that lock
+        before it re-cuts the branch or records a task."""
         if expect:
-            return self.text(root, "update-ref", "-d",
-                             "refs/heads/" + branch, expect)
+            got = self.text(root, "update-ref", "-d",
+                            "refs/heads/" + branch, expect)
+            if got[0] == 0:
+                ref_rc, _o, ref_err = self.text(
+                    root, "show-ref", "--exists", "refs/heads/" + branch)
+                if ref_rc == 0:
+                    return got
+                if ref_rc != 2:
+                    return (0, got[1], "the ref is deleted, but whether "
+                            "branch %s was cut again could not be read (%s), "
+                            "so its config section was left in place"
+                            % (branch, (ref_err or "rc %s" % ref_rc)
+                               .strip()[:160]))
+                self.text(root, "config", "--remove-section",
+                          "branch." + branch)
+                rc, left, err = self.text(
+                    root, "config", "--get-regexp",
+                    "^branch\\.%s\\." % re.sub(r"([.^$*+?()\[\]{}|\\])",
+                                                r"\\\1", branch))
+                if rc != 1:
+                    return (0, got[1], "the ref is deleted, but its config "
+                            "section branch.%s was NOT removed (%s)"
+                            % (branch, (err or left or "rc %s" % rc)
+                               .strip()[:160]))
+            return got
         return self.text(root, "branch", "-D" if force else "-d", branch)
 
     def wip_commit(self, path, msg):
@@ -1824,8 +2778,42 @@ PATCH_SEQUENCE_CONTAINED = "patch-sequence-contained"
 PATCH_SEQUENCE_ABSENT = "patch-sequence-absent"
 PATCH_SEQUENCE_EMPTY = "patch-sequence-empty"
 PATCH_SEQUENCE_AMBIGUOUS = "patch-sequence-ambiguous"
+# The candidate's patches match off trunk but sit on an older fork point.
+PATCH_SEQUENCE_BACKWARD = "patch-sequence-backward"
 PATCH_SEQUENCE_UNKNOWN = UNKNOWN
 PATCH_SEQUENCE_CAP = 500
+
+# A cure range's patch TWINS on trunk (`patch_twins`, task/1484). UNKNOWN is
+# the seam-wide spelling; the other three are measured answers, and only
+# MATCHED is ever spent as a proof.
+PATCH_TWINS_MATCHED = "patch-twins-matched"
+PATCH_TWINS_UNMATCHED = "patch-twins-unmatched"
+PATCH_TWINS_COLLISION = "patch-twins-collision"
+# THE TRUNK WINDOW'S BOUND: the non-merge trunk commits a cure's tip does not
+# reach (`<trunk> ^<tip>`), which is every commit a rebase-land could have
+# written. Over it the question is UNKNOWN, never a miss — a twin past the
+# window is not a twin proven absent.
+PATCH_TWIN_WINDOW = 2000
+
+
+def _containment(needle, train):
+    """(state, start, width, total) for two ordered patch-id sequences, the
+    reviewed needle and the candidate train; None on either side is UNKNOWN."""
+    if needle is None or train is None:
+        return PATCH_SEQUENCE_UNKNOWN, None, None, None
+    if not needle:
+        return PATCH_SEQUENCE_EMPTY, None, 0, len(train)
+    if needle == train:
+        return PATCH_SEQUENCE_EXACT, 0, len(needle), len(train)
+    width = len(needle)
+    hits = [i for i in range(len(train) - width + 1)
+            if train[i:i + width] == needle]
+    if len(hits) == 1:
+        return PATCH_SEQUENCE_CONTAINED, hits[0], width, len(train)
+    if len(hits) > 1:
+        return PATCH_SEQUENCE_AMBIGUOUS, None, width, len(train)
+    return PATCH_SEQUENCE_ABSENT, None, width, len(train)
+
 
 # The bound on `git cherry`'s range. Cost scales with the tip's DISTANCE from
 # trunk (measured 2026-08-02: 3.4ms at 10 commits, 44.1ms at 577), so a cap is

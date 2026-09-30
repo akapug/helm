@@ -28,6 +28,13 @@ THREE READINGS, EACH WITH ITS INPUTS STATED
            the supply is the other horizon; the reset policy decides when a
            credit is spent, and hands such an event in (`planned`).
 
+  CREDITS  each account's HELD reset credits, read from the same usage body
+           the watchdog pass already probes (`codexresets.usage_balance`),
+           and each valued against the horizon by THE RESET CLOCK law below.
+           A non-Pro credit counts its account's week in tokens.
+           The runway the verdict reads is the supply plus every credit that
+           lands supply before the horizon.
+
 THE VERDICT is the key of the fold's step table (`burnflags._RUNWAY_STEP_TABLE`):
 `short` (runway under the horizon: the money axis steps UP one colour),
 `use-it` (runway at least `WELL_ABOVE` times the horizon while an account
@@ -60,6 +67,29 @@ LAWS
   shortage nor a surplus: the verdict is `unknown`. The same holds for an
   unreadable ledger and for a newest pass older than the budget gate's own
   freshness bound.
+
+  THE RESET CLOCK SETS A CREDIT'S WORTH (the owner: "codex resets also reset
+  the date to a week from the point the reset was used").
+  A credit spent on an account whose natural reset is h hours away gives one
+  fresh week W now and moves that account's next reset from h to 168h out,
+  so over the long run it nets W*h/168. For a PRO credit that is two cases,
+  each stated per credit in `fleet.credits.per`:
+    - its account resets AFTER the horizon: spent once that account is empty
+      it adds W before the horizon, and the runway counts it. A shortage
+      empties every account before the horizon, so such a credit is always
+      spendable in time;
+    - its account resets AT or BEFORE the horizon (the horizon account
+      itself, or an earlier one): spending it first forfeits that refill, so
+      it adds nothing before the horizon and is worth W after it.
+  A NON-PRO credit counts W before the horizon wherever its reset lies. The
+  owner's ruling: a smaller account's week is exhausted again in well under
+  a day, so the week its reset clock moves costs little. A workspace
+  "credits depleted" wall is a weekly wall a reset is measured to lift
+  (`codexresets.CREDITS_DEPLETED_TYPES`), so a credit held there counts.
+  A credit whose worth before the horizon cannot be stated (no weight, an
+  unread reset, a wall with no reason) and an account whose balance was not
+  read are UNKNOWN, never 0: while one could land supply before the horizon,
+  a short runway is a floor and the verdict is `unknown`.
 
   NO IDENTITY REACHES THE FOLD. `fold_input` carries the verdict, the cause
   and numbers; the cause names plans and seats, never an account. The
@@ -167,6 +197,21 @@ def member_key(row):
     return codexresets.member_id({"file": handle}), False
 
 
+def _balance(value):
+    """The held reset-credit counts of one budget row, or None when the
+    balance was not read. Counts only: the row's own shape is
+    `codexresets.usage_balance`'s."""
+    if not isinstance(value, dict):
+        return None
+    held = value.get("available")
+    if isinstance(held, bool) or not isinstance(held, int) or held < 0:
+        return None
+    applicable = value.get("applicable")
+    return {"available": held,
+            "applicable": applicable if isinstance(applicable, int)
+            and not isinstance(applicable, bool) else None}
+
+
 def _longest(windows):
     """The account's LONGEST window, or None. Chosen by length among every
     window, so a longest window with no percent is an unread account rather
@@ -194,6 +239,7 @@ def history_line(rows, now):
                  "label": codexresets.label(row), "plan": row.get("plan"),
                  "state": row.get("state"),
                  "reached_type": row.get("reached_type"),
+                 "reset_credits": _balance(row.get("reset_credits")),
                  "windows": [{"label": w.get("label"),
                               "seconds": w.get("seconds"),
                               "used_percent": w.get("used_percent"),
@@ -269,14 +315,22 @@ def ledger_requests(now):
 
 
 class _Ledger:
-    """Codex tokens by account and by seat, indexed for window sums."""
+    """Tokens by account and by seat, indexed for window sums.
 
-    def __init__(self, requests):
+    ONE FAMILY BY DEFAULT, EVERY FAMILY ON REQUEST (task/3156). The pace and
+    the wall events read codex and nothing else, so `family` defaults to it;
+    the per-seat burn a project's team is measured against reads every proxy
+    family from the same ledger (`family=None`), so there is one reader of the
+    proxy-usage ledger's tokens and not a second one per surface."""
+
+    def __init__(self, requests, family=FAMILY):
         from . import proxy_usage
         rows = []
         for ev in requests or ():
-            if not isinstance(ev, dict) or ev.get("family") != FAMILY \
-                    or ev.get("failed"):
+            if not isinstance(ev, dict) or ev.get("failed"):
+                continue
+            fam = str(ev.get("family") or "")
+            if family is not None and fam != family:
                 continue
             at = _num(ev.get("at"))
             at = _num(ev.get("ts")) if at is None else at
@@ -284,7 +338,7 @@ class _Ledger:
                 continue
             inp, out = proxy_usage.tokens_of(ev)
             rows.append((at, float(inp + out), str(ev.get("seat") or "?"),
-                         str(ev.get("source") or "").strip().casefold()))
+                         str(ev.get("source") or "").strip().casefold(), fam))
         rows.sort(key=lambda r: r[0])
         self.rows = rows
         self.ats = [r[0] for r in rows]
@@ -318,6 +372,77 @@ class _Ledger:
         ranked = sorted(by.items(), key=lambda kv: (-kv[1], kv[0]))
         return [(seat, round(n / total, 3)) for seat, n in ranked
                 if n / total >= TOP_SEAT_MIN_SHARE][:TOP_SEATS]
+
+    def burn(self, t0, t1):
+        """{family: {seat: tokens}} over (t0, t1] — EVERY seat, no top-N cut
+        and no share floor: `seats` ranks for a sentence, this sums for a bill,
+        and a seat cut from a bill is spend nobody is charged for."""
+        out = {}
+        for r in self._slice(t0, t1):
+            fam = out.setdefault(r[4], {})
+            fam[r[2]] = fam.get(r[2], 0.0) + r[1]
+        return out
+
+
+# THE PER-SEAT BURN, every proxy family (task/3156). A projection of the
+# proxy-usage ledger that the posting pass writes beside the runway, so a
+# routing answer reads one small file instead of the whole ledger.
+SEAT_BURN_NAME = "seat-burn.json"
+#: The window a project's burn is measured over: the same three hours the
+#: runway cause names its top seats over, so the two sentences agree.
+SEAT_BURN_WINDOW_S = TOP_SEATS_S
+
+
+def seat_burn_path():
+    return os.path.join(_state_dir(), SEAT_BURN_NAME)
+
+
+def seat_burn(requests, now, window_s=SEAT_BURN_WINDOW_S):
+    """The ledger's requests -> {v, ts, window_s, families: {family:
+    {per_hour, seats: {seat: per_hour}}}}. PURE. `requests` None is a ledger
+    that could not be read, and the reading says so rather than reading zero."""
+    if requests is None:
+        return {"v": V, "ts": now, "window_s": window_s, "families": {},
+                "why": "the proxy-usage ledger could not be read"}
+    hours = window_s / HOUR
+    burned = _Ledger(requests, family=None).burn(now - window_s, now)
+    return {"v": V, "ts": now, "window_s": window_s, "why": None,
+            "families": {fam: {"per_hour": sum(seats.values()) / hours,
+                               "seats": {seat: n / hours
+                                         for seat, n in sorted(seats.items())}}
+                         for fam, seats in sorted(burned.items())}}
+
+
+def write_seat_burn(reading, path=None):
+    """Persist the per-seat burn -> True/False. Best effort, never raises."""
+    try:
+        pk.atomic_write(path or seat_burn_path(),
+                        json.dumps(reading, sort_keys=True))
+        return True
+    except Exception:                           # noqa: BLE001
+        return False
+
+
+def cached_seat_burn(now=None, max_age=None, path=None):
+    """The per-seat burn from its snapshot, or None when absent, unreadable or
+    past the burn flags' own freshness bound. NEVER reads the ledger."""
+    from . import burnflags
+    now = time.time() if now is None else now
+    bound = burnflags.max_age_s() if max_age is None else max_age
+    payload = pk.read_json(path or seat_burn_path(), default=None)
+    if not isinstance(payload, dict) or payload.get("v") != V \
+            or _num(payload.get("ts")) is None \
+            or not isinstance(payload.get("families"), dict):
+        return None
+    age = now - payload["ts"]
+    return payload if 0 <= age <= bound else None
+
+
+def live_seat_burn(now=None):
+    """The per-seat burn read from the ledger itself (seconds on a busy host):
+    for a verb a person ran, when the pass has not written the snapshot."""
+    now = time.time() if now is None else now
+    return seat_burn(ledger_requests(now), now)
 
 
 # ------------------------------------------------------------------ the pace
@@ -359,7 +484,7 @@ def _slope(points):
 
 
 def _account(entry, series, ledger, now, window_s):
-    from . import accounts as accountsmod
+    from . import accounts as accountsmod, codexresets
     label = entry.get("label")
     rec = {"account": accountsmod.mask_identity(label) or "?",
            "member": entry["member"], "proven": bool(entry.get("proven")),
@@ -368,7 +493,11 @@ def _account(entry, series, ledger, now, window_s):
            "points": 0, "span_h": 0.0, "reset_at": None,
            "hours_to_reset": None, "hours_to_wall": None,
            "walls_before_reset": None, "strand_pct": None,
-           "tokens_per_pct": None, "weight_source": None}
+           "tokens_per_pct": None, "weight_source": None,
+           "credits_held": (_balance(entry.get("reset_credits"))
+                            or {}).get("available"),
+           "reached_type": entry.get("reached_type"),
+           "wall_kind": codexresets.wall_kind(entry.get("reached_type"))}
     newest = _longest(entry.get("windows"))
     if newest is None:
         rec["why"] = ("the newest pass could not read this account (%s)"
@@ -432,7 +561,7 @@ def _borrow_weights(accounts):
 
 def _is_pro(plan):
     from . import codexhomes
-    return codexhomes.tier(plan) == codexhomes.tier("pro")
+    return codexhomes.tier(plan) != codexhomes.tier("team")
 
 
 def _fleet(accounts, newest, ledger, now, window_s, planned):
@@ -501,6 +630,164 @@ def _hours(h):
     return "%.1fh" % h if h < 10 else "%.0fh" % h
 
 
+# ------------------------------------------------------------------ credits
+
+def _day(at):
+    return time.strftime("%A", time.localtime(at)) if at is not None else "?"
+
+
+def _worth(tokens, rate):
+    """One account's week in the fleet's own hours, or in tokens when the
+    fleet's rate is unknown or idle. An unknown week is never 0."""
+    if tokens is None:
+        return "an unknown amount"
+    if rate:
+        return "~" + _hours(tokens / rate)
+    return "~%s tokens" % _tokens(tokens)
+
+
+def _usable(a):
+    """(True | None, why) — whether a credit held on this account is known to
+    lift the wall it would be spent against. None is not known either way.
+    A rate-limit wall and a workspace credits-depleted wall are both measured
+    to lift (`codexresets.wall_kind`)."""
+    from . import codexresets
+    kind = a.get("wall_kind")
+    if not a["proven"]:
+        return None, ("not counted: its member is not proven, so it may be "
+                      "a sibling's credit read twice")
+    if kind == codexresets.WALL_UNRECOGNISED:
+        return None, ("value unknown: the vendor calls its wall %r, which "
+                      "helm does not recognise" % a.get("reached_type"))
+    if kind is None and (a["used_pct"] or 0.0) >= 100.0:
+        return None, ("value unknown: its week is spent and the vendor names "
+                      "no reason, so a reset may not lift it")
+    return True, None
+
+
+def _credits(accounts, fleet):
+    """The held reset credits, each valued against the horizon -> the fleet
+    block's `credits`. See THE RESET CLOCK law."""
+    rate = fleet.get("tokens_per_hour") or None
+    horizon = fleet.get("horizon_at")
+    pro_horizon = fleet.get("horizon_kind") == "pro-reset"
+    name = ("%s's reset" % _day(horizon)) if pro_horizon and horizon \
+        else "the horizon"
+    per, unread, unknown = [], [], 0
+    for a in accounts:
+        if a["state"] == "unread":
+            continue                    # the fleet's own why already says so
+        pro = _is_pro(a["plan"])
+        # A NON-PRO CREDIT IS NEVER AFTER THE HORIZON ONLY: its clock is
+        # cheap (THE RESET CLOCK), so it counts wherever its reset lies.
+        later = (not pro or horizon is None or a["reset_at"] is None
+                 or a["reset_at"] > horizon + RESET_TOLERANCE_S)
+        held = a["credits_held"]
+        if held is None:
+            unread.append(a)
+            if later:
+                unknown += 1            # a credit there could carry supply
+            continue
+        if held <= 0:
+            continue
+        week = 100.0 * a["tokens_per_pct"] if a["tokens_per_pct"] else None
+        usable, why = _usable(a)
+        if not later:
+            own = pro_horizon and \
+                abs(a["reset_at"] - horizon) <= RESET_TOLERANCE_S
+            kind, value = ("horizon" if own else "early"), 0.0
+            why = "it cannot help before %s without forfeiting %s; %s" % (
+                name, "it" if own else "its own account's earlier %s reset"
+                % _day(a["reset_at"]),
+                "worth %s after" % _worth(week, rate) if usable else why)
+        elif usable is None:
+            kind, value = "unknown", None
+        elif week is None:
+            kind, value = "unknown", None
+            why = ("value unknown: its account has no tokens-per-percent "
+                   "weight, so its week is not known in tokens")
+        elif not pro:
+            kind, value = "counted", week
+            why = ("counted: spent once its account is empty it adds a %s "
+                   "week, %s, before the horizon; a smaller account's reset "
+                   "clock costs little" % (_plan(a["plan"]),
+                                           _worth(week, rate)))
+        elif horizon is None:
+            kind, value = "unknown", None
+            why = "value before a horizon unknown: no Pro reset is known"
+        elif a["reset_at"] is None:
+            kind, value = "unknown", None
+            why = "value unknown: its account's reset is unread"
+        else:
+            kind, value = "counted", week
+            why = ("counted: its account resets after %s (%s), so spent once "
+                   "that account is empty it adds %s before the horizon"
+                   % (name, _day(a["reset_at"]), _worth(week, rate)))
+        worth_h = (round(week / rate, 2)
+                   if week is not None and rate else None)
+        horizon_h = fleet.get("horizon_h")
+        for n in range(held):
+            item_kind, item_value, item_why = kind, value, why
+            if item_value and n and horizon_h is not None:
+                if worth_h is None:
+                    item_kind, item_value = "unknown", None
+                    item_why = ("value unknown: credit %d cannot be placed before "
+                                "the horizon without a measured fleet burn rate"
+                                % (n + 1))
+                elif n * worth_h >= horizon_h:
+                    item_kind, item_value = "after-horizon", 0.0
+                    item_why = ("not counted: credit %d cannot be redeemed until "
+                                "~%s, after the %s horizon" %
+                                (n + 1, _hours(n * worth_h),
+                                 _hours(horizon_h)))
+            if item_value is None:
+                unknown += 1
+            per.append({"account": a["account"], "plan": a["plan"],
+                        "kind": item_kind, "usable": usable,
+                        "week_tokens": week, "value_tokens": item_value,
+                        "worth_h": worth_h, "why": item_why})
+    value = sum(p["value_tokens"] or 0.0 for p in per)
+    supply = fleet.get("supply_tokens")
+    return {"held": len(per),
+            "usable": sum(1 for p in per if p["usable"]),
+            "value_tokens": value, "unknown": unknown,
+            "unread": [a["account"] for a in unread],
+            "unread_plans": [a["plan"] for a in unread],
+            "runway_h": (round((supply + value) / rate, 2)
+                         if rate and supply is not None else None),
+            "per": per}
+
+
+def _plan(plan):
+    return (plan or "?").capitalize()
+
+
+def _credits_text(credits):
+    """The credits in plain words, by plan and never by account: this reaches
+    the fold. '' when nothing is held and no balance went unread."""
+    groups, order = {}, []
+    for p in credits["per"]:
+        key = (p["plan"], p["why"])
+        if key not in groups:
+            groups[key] = 0
+            order.append(key)
+        groups[key] += 1
+    out = []
+    for key in order:
+        plan, why = key
+        n = groups[key]
+        out.append("+%d %s reset credit%s held%s: %s"
+                   % (n, _plan(plan), "s"[:n != 1], "" if n == 1 else ", each",
+                      why))
+    plans = {}
+    for plan in credits.get("unread_plans") or ():
+        plans[plan] = plans.get(plan, 0) + 1
+    for plan, n in sorted(plans.items(), key=lambda kv: str(kv[0])):
+        out.append("reset-credit balance unread on %d %s account%s"
+                   % (n, _plan(plan), "s"[:n != 1]))
+    return ". ".join(out)
+
+
 def _tokens(n):
     if n is None:
         return "?"
@@ -522,11 +809,30 @@ def _seats_text(seats):
 
 
 def _verdict(fleet, accounts, window_h):
+    """(verdict, cause). The cause ends with the held reset credits in plain
+    words, whatever the verdict, so a reader never has to guess whether the
+    runway counted them."""
+    verdict, cause = _runway_verdict(fleet, accounts, window_h)
+    text = _credits_text(fleet["credits"])
+    return verdict, cause + (". " + text if text else "")
+
+
+def _runway_verdict(fleet, accounts, window_h):
     short, use_it, even, unknown = _verdicts()
     if fleet["state"] != "measured":
         return unknown, "codex runway not stated: %s" % fleet["why"]
+    credits = fleet["credits"]
     runway = fleet["runway_h"]
     said = "idle, no codex tokens spent" if runway is None else _hours(runway)
+    counted = [p for p in credits["per"] if p["kind"] == "counted"]
+    if runway is not None and counted:
+        # THE RUNWAY THE VERDICT READS COUNTS EVERY CREDIT THAT LANDS SUPPLY
+        # BEFORE THE HORIZON, and says how much of it is credit.
+        said = "%s (%s of supply + %s from %d reset credit%s)" % (
+            _hours(credits["runway_h"]), _hours(runway),
+            _hours(credits["runway_h"] - runway), len(counted),
+            "s"[:len(counted) != 1])
+        runway = credits["runway_h"]
     if fleet["horizon_h"] is None:
         return unknown, ("codex runway %s, and no Pro account's reset is "
                          "known, so there is no horizon to set it against"
@@ -536,6 +842,16 @@ def _verdict(fleet, accounts, window_h):
             else "a planned reset credit")
     rate = "%s tokens/h over the last %gh" % (
         _tokens(fleet["tokens_per_hour"]), window_h)
+    if runway is not None and runway < horizon and credits["unknown"]:
+        # A CREDIT OF UNKNOWN WORTH MAKES THE SUPPLY A FLOOR, and a floor
+        # proves no shortage: it could carry the fleet to the horizon.
+        return unknown, ("codex runway %s is under the %s horizon (%s, %s) at "
+                         "%s, but what %d reset credit%s could add before it "
+                         "is not known, so the shortage is not proven"
+                         % (said, _hours(horizon), name,
+                            _local(fleet["horizon_at"]), rate,
+                            credits["unknown"],
+                            "s"[:credits["unknown"] != 1]))
     if runway is not None and runway < horizon:
         return short, ("codex runway %s is under the %s horizon (%s, %s) at "
                        "%s; top seats over %dh: %s"
@@ -581,6 +897,7 @@ def read(lines, requests, now, window_h=WINDOW_H, planned=()):
                 if isinstance(entry, dict) and entry.get("member")]
     _borrow_weights(accounts)
     fleet = _fleet(accounts, newest, ledger, now, window_s, planned)
+    fleet["credits"] = _credits(accounts, fleet)
     verdict, cause = _verdict(fleet, accounts, window_h)
     return {"v": V, "ts": now, "window_h": window_h, "passes": len(lines),
             "accounts": accounts, "fleet": fleet, "verdict": verdict,
@@ -599,7 +916,12 @@ def fold_input(reading):
             "horizon_h": fleet.get("horizon_h"),
             "horizon_at": fleet.get("horizon_at"),
             "tokens_per_hour": fleet.get("tokens_per_hour"),
-            "top_seats": [list(s) for s in fleet.get("top_seats") or ()]}
+            "top_seats": [list(s) for s in fleet.get("top_seats") or ()],
+            # NUMBERS ONLY: the per-credit rows name accounts and stay in the
+            # snapshot.
+            "credits": {k: (fleet.get("credits") or {}).get(k)
+                        for k in ("held", "usable", "value_tokens", "unknown",
+                                  "runway_h")}}
 
 
 # ------------------------------------------------------------------ the walls
@@ -760,6 +1082,9 @@ def watch_pass(rows, now=None):
     requests = ledger_requests(now)
     reading = read(lines, requests, now)
     write_snapshot(reading)
+    # THE SAME LEDGER READ, EVERY FAMILY: the per-seat burn a project's share
+    # is measured against (task/3156). Best effort, like the snapshot above.
+    write_seat_burn(seat_burn(requests, now))
     try:
         announce(wall_events(rows, reading, requests, now), now=now)
     except Exception:                           # noqa: BLE001 — never the pass
@@ -832,5 +1157,20 @@ def render(reading, now=None):
                   _hours(fleet["horizon_h"]), _local(fleet["horizon_at"])))
     if fleet.get("why"):
         out.append("  %s" % fleet["why"])
+    credits = fleet.get("credits") or {}
+    if credits.get("per") or credits.get("unread"):
+        out.append("reset credits: %d held, %d usable, %s tokens counted "
+                   "before the horizon (runway with them %s)%s"
+                   % (credits["held"], credits["usable"],
+                      _tokens(credits["value_tokens"]),
+                      _hours(credits["runway_h"]),
+                      "; %d of unknown worth" % credits["unknown"]
+                      if credits["unknown"] else ""))
+        for p in credits.get("per") or ():
+            out.append("  %-26s %-5s %s" % (p["account"][:26],
+                                             (p["plan"] or "?")[:5], p["why"]))
+        for name in credits.get("unread") or ():
+            out.append("  %-26s %-5s the reset-credit balance was not read"
+                       % (name[:26], ""))
     out.append("verdict %s: %s" % (reading["verdict"], reading["cause"]))
     return out

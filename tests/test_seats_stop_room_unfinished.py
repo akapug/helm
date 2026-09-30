@@ -23,6 +23,7 @@ the module these arms came from, so one fixture serves both files and the two
 cannot drift.
 """
 import contextlib
+import io
 import json
 import os
 import shutil
@@ -34,7 +35,7 @@ from unittest import mock
 from tests.test_seats import SeatsBase
 
 from helm import (chat, dispatches, seats, seats_room_advice,
-                  seats_stop_budget, seats_stop_claims)
+                  seats_stop_budget, seats_stop_claims, seats_stop_seam)
 
 # THE FIXTURE THAT PROTECTS THESE ARMS LIVES IN ANOTHER FILE, and two
 # source-driven audits read THIS one. `SeatsBase.setUp` snapshots every key in
@@ -52,9 +53,15 @@ from helm import (chat, dispatches, seats, seats_room_advice,
 # than trusting that it inherited the setting. If SeatsBase ever stops doing
 # either, this module is still safe instead of quietly deleting host scratch.
 _ENV_PRIOR = {}
+_PENDING_PRIOR = []
 
 
 def setUpModule():
+    # helm.seats_stop_seam._PENDING_DISCLOSURES is a process-wide queue a
+    # stop-guard pass fills; this module puts back what it found, so no
+    # later unit reads its disclosures (the sliced gate's leak audit)
+    from helm import seats_stop_seam
+    _PENDING_PRIOR[:] = list(seats_stop_seam._PENDING_DISCLOSURES)
     _ENV_PRIOR["HELM_SCRATCH_GC"] = os.environ.get("HELM_SCRATCH_GC")
     os.environ["HELM_SCRATCH_GC"] = "0"
     # No dispatch row this module writes walks the host's process table
@@ -64,6 +71,8 @@ def setUpModule():
 
 
 def tearDownModule():
+    from helm import seats_stop_seam
+    seats_stop_seam._PENDING_DISCLOSURES[:] = _PENDING_PRIOR
     for key, was in _ENV_PRIOR.items():
         if was is None:
             os.environ.pop(key, None)
@@ -410,6 +419,56 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         self.assertEqual(unknowns, [])
         self.assertIn("the room's tip %s is NOT landed by ancestry or patch "
                       "identity vs the trunk" % tip[:12], unlanded)
+
+    def _merge_side_into_the_room(self):
+        """A side branch off the room's branch point, merged into the room
+        --no-ff: the train-top shape, where the range carries a merge that
+        `git cherry` skips."""
+        side = self.root + "-wt/side"
+        subprocess.run(["git", "-C", self.root, "worktree", "add", "-q",
+                        "-b", "side", side, "main"], check=True,
+                       capture_output=True, timeout=30)
+        self.commit("side work", side)
+        self.commit("lane work", self.wt)
+        subprocess.run(["git", "-C", self.wt, "-c", "user.email=t@t",
+                        "-c", "user.name=t", "merge", "-q", "--no-ff",
+                        "--no-edit", "side"], check=True,
+                       capture_output=True, timeout=30)
+        return self.rev(self.wt)
+
+    def test_a_tip_AHEAD_of_the_trunk_through_a_merge_is_NAMED_not_unknown(self):  # noqa: VACUOUS_ASSERTION — the UNKNOWN premise and the exactly-one named finding are unconditional positive controls on the same read
+        """LANES STACKED ON AN UNLANDED TRAIN. A train top carries merge
+        commits, `git cherry` skips merges, and `landed_state` rightly answers
+        UNKNOWN (tests/test_vcs.py pins why a '+' past a merge proves
+        nothing). But a tip that DESCENDS from the trunk is ahead of it by
+        ancestry alone, so the room holds commits the trunk does not. That is
+        a finding. Asking for a hand check at every stop is noise: every
+        lease on a train stack would read "landedness UNKNOWN" at every stop."""
+        tip = self._merge_side_into_the_room()
+        from helm import vcs
+        from helm.work import _gc
+        self.assertEqual(_gc._merge_state(self.wt, tip), vcs.UNKNOWN,
+                         "the premise: cherry cannot account for the merge")
+        findings, unknowns = seats._room_unfinished(self.res)
+        self.assertEqual([u for u in unknowns if u.startswith("landedness")],
+                         [], unknowns)
+        named = [f for f in findings if f.startswith(
+            "the room's tip %s is 3 commit(s) ahead of the trunk it descends "
+            "from" % tip[:12])]
+        self.assertEqual(len(named), 1, findings)
+
+    def test_a_tip_that_DIVERGED_from_the_trunk_through_a_merge_stays_unknown(self):  # noqa: VACUOUS_ASSERTION — exactly one landedness unknown is the unconditional positive control on the same read
+        """THE CONTROL. Once the trunk moves past the branch point the tip no
+        longer descends from it, ancestry says nothing about content, and the
+        unknown stays an unknown."""
+        tip = self._merge_side_into_the_room()
+        self.commit("trunk moved", self.root)
+        findings, unknowns = seats._room_unfinished(self.res)
+        self.assertEqual([f for f in findings if "ahead of the trunk" in f],
+                         [], findings)
+        self.assertEqual(len([u for u in unknowns
+                              if u.startswith("landedness")]), 1, unknowns)
+        self.assertNotEqual(tip, self.rev(self.root))
 
     # --- read 3: somebody else holds the verdict --------------------------
     def test_an_open_review_is_NAMED_at_the_exact_tip_the_exemption_cannot_use(self):
@@ -1755,6 +1814,9 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
             blocks, _w = seats.stop_guard(session=self.sid, seat="alice")
             self.assertIn("unfinished work is bound to this room",
                           " ".join(blocks))
+            # DELIVERED, as the CLI does: the lease memory commits only what
+            # the refusal exit put on the stream (task/3123).
+            seats_stop_seam.emit_blocks(blocks, stream=io.StringIO())
             _b2, warns2 = seats.stop_guard(session=self.sid, seat="alice")
         self.assertIn("unchanged. Reprint:", " ".join(warns2))
         self.assertEqual(calls, [], "a stop paid for the four git reads")
@@ -1780,6 +1842,7 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         self.assertIn(self.res, first)
         self.assertIn("check the lane by hand", first)
         self.assertNotIn("helm work release", first)
+        seats_stop_seam.emit_blocks(blocks, stream=io.StringIO())  # delivered
         _b2, warns2 = seats.stop_guard(session=self.sid, seat="alice")
         latched = [w for w in warns2
                    if "unchanged. Reprint:" in w]

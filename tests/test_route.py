@@ -32,8 +32,8 @@ FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "route")
 # tests/ is publication debt that compounds with every copy — so no arm here
 # spells one. Unpacking also makes a NEW family a visible event in this file
 # instead of a silent widening of every set below.
-(NATIVE, CODEX, DOTS3, DS4FLASH, DS4PRO, GEMINI, GPTOSS, GROK, KIMI,
- OPENROUTER, OPUS46, QWEN27) = bf.families()
+(NATIVE, BONSAI, CODEX, CURSOR, DOTS3, DS4FLASH, DS4PRO, GEMINI, GPTOSS, GROK,
+ KIMI, OPENROUTER, OPUS46, QWEN27, QWENLOCAL) = bf.families()
 
 # THE BENCH NAMES ITS FAMILIES THROUGH *THIS MODULE'S* VOCABULARY, NEVER
 # THROUGH AN ORDINAL INTO THE CATALOG'S. bench.json addresses each seat's
@@ -64,7 +64,8 @@ _BENCH_FAMILIES = (NATIVE, CODEX, DS4PRO, GEMINI, GROK, KIMI, OPENROUTER)
 # shape nobody measured. What the arms below then exercise for them is the
 # real production answer for a family the register does not cover, which is
 # the same named drop `route` gives the council-only family beside them.
-_UNBENCHED = (DS4FLASH, DOTS3, GPTOSS, OPUS46, QWEN27)
+_UNBENCHED = (BONSAI, DS4FLASH, DOTS3, GPTOSS, OPUS46, QWEN27, QWENLOCAL,
+              CURSOR)
 
 # AND THE BURN-FLAG CAPTURE PREDATES SEVERAL OF THEM, WHICH IS ALSO A
 # DECLARATION RATHER THAN A PATCH. burn-flags.json is a READING taken off a
@@ -76,7 +77,7 @@ _UNBENCHED = (DS4FLASH, DOTS3, GPTOSS, OPUS46, QWEN27)
 # act and not a test edit. So the uncaptured families are NAMED here and left
 # out of the mapping; any OTHER length mismatch still refuses, because the
 # silent slide is what the length check exists to catch.
-_UNCAPTURED = (DOTS3, GPTOSS, OPUS46)
+_UNCAPTURED = (BONSAI, DOTS3, GPTOSS, OPUS46, QWENLOCAL, CURSOR)
 if sorted(_BENCH_FAMILIES + _UNBENCHED) != sorted(bf.families()):
     raise AssertionError(
         "the bench vocabulary covers %r and this tree knows %r: give the new "
@@ -225,9 +226,29 @@ class World(object):
         self.flags = flags
         return self
 
+    def seat_field(self, field):
+        """seat -> one field of its bench row (None when unset): the resolved
+        model and the context percent are planted on the bench, never read."""
+        return lambda seat: (self.bench["seats"].get(seat) or {}).get(field)
+
+    def review_sends(self, families, now=None):
+        return dict(self.bench.get("review_sends") or {})
+
     def seams(self, **extra):
+        # THE THREE task/3156 READERS, EACH SEAMED TO "NOTHING AUTHORED": no
+        # light, no team, no share. That is the world every arm above was
+        # written against, and it keeps the verb off this host's registry.
         out = {"cached_flags": self.cached_flags, "bench": self.bench_seam,
-               "join": self.join, "fanout_live": self.live, "find": self.find}
+               "join": self.join, "fanout_live": self.live, "find": self.find,
+               "light": lambda project: (None, None),
+               "team": lambda project: None,
+               "allocation": lambda project: {},
+               # the family door for a team's seats: nothing registered, so
+               # every member keeps the family its team names
+               "families_of": lambda seats: {},
+               "runtime_model": self.seat_field("model"),
+               "context": self.seat_field("context_pct"),
+               "review_sends": self.review_sends}
         out.update(extra)
         return out
 
@@ -311,8 +332,11 @@ class ProofCaseTest(unittest.TestCase):
         # rationing term is OUTSIDE the family term, so a family the owner
         # said to route around still sorts below the author's own healthy
         # one. The demotion orders candidates the fleet is equally free to
-        # use, it does not promote a rationed family over a green one.
-        peers = [r for r in report["answer"] if not r["critical_path_only"]]
+        # use, it does not promote a rationed family over a green one. And
+        # since landing refactor item 5 an equal holds the same QUEUE: a door
+        # read ranks on the queue first, so a piled peer sorts below it.
+        peers = [r for r in report["answer"] if not r["critical_path_only"]
+                 and r["queue_bucket"] == own["queue_bucket"]]
         self.assertGreater(len(peers), 1)
         self.assertEqual(own["rank"], max(r["rank"] for r in peers))
         # the CONTROL on the demotion: a cross-family peer is admitted in the
@@ -520,6 +544,24 @@ class EdgeResolutionTest(unittest.TestCase):
         self.assertNotIn(edge["retired"][0], every)
 
 
+class BrokenSeatTest(unittest.TestCase):
+    """task/3546: a seat the dispatch door refuses as BROKEN (an operator
+    hold or a drop storm) is never the router's recommendation."""
+
+    def test_a_broken_seat_is_dropped_at_N4_and_named(self):
+        world = World().freshly_read()
+        control = world.ask("verify", frm="fable", project="helm",
+                            seams={"broken": lambda names: {}})
+        self.assertEqual(control["answer"][0]["family"], DS4PRO)
+        report = world.ask("verify", frm="fable", project="helm", seams={
+            "broken": lambda names: {"seat-c": ["HOLD"]}
+            if "seat-c" in names else {}})
+        self.assertIsNone(world.admitted(report, DS4PRO))
+        self.assertEqual(world.refused(report, DS4PRO)["node"], route.N4)
+        self.assertEqual(report["broken"],
+                         [{"seat": "seat-c", "facts": ["HOLD"]}])
+
+
 class CapTest(unittest.TestCase):
     """F21 — the cap arithmetic, and the null that reports the cap only."""
 
@@ -647,9 +689,11 @@ class NoProbeTest(unittest.TestCase):
                 mock.patch.object(subprocess, "run", refuse("run")), \
                 mock.patch.object(urllib.request, "urlopen",
                                   refuse("urlopen")):
-            started = time.time()
+            # task/3465: the bound is CPU time — under a loaded gate the wall
+            # clock grades the box, not the in-process answer.
+            started = time.process_time()
             report = world.ask("verify", frm="fable", project="helm")
-            elapsed = time.time() - started
+            elapsed = time.process_time() - started
             # THE MUST-HIT CONTROL: the spies are installed and DO fire, so a
             # green arm above is the verb's silence and not a dead patch.
             for door in (socket.socket, subprocess.Popen,
@@ -875,6 +919,688 @@ class BenchAndPolicyTest(unittest.TestCase):
                          sorted(world.families(report)))
 
 
+class TeamAndLightTest(unittest.TestCase):
+    """task/3156: N0b LIGHT, the authored team as the bench, and the share of
+    a short family as the project's own colour at N3 and N5."""
+
+    RED_LIGHT = {"colour": "red", "authored": True, "reason": "frozen",
+                 "by": "owner", "ts": 1}
+
+    def light(self, lit):
+        return lambda project: (lit, None)
+
+    def team(self, *members):
+        return lambda project: {
+            "project": project, "authored": True, "v": 3, "by": "owner",
+            "members": [{"seat": s, "family": f, "role": r}
+                        for s, f, r in members], "shares": {}}
+
+    def test_n0b_a_red_light_refuses_build_and_admits_review(self):
+        world = World().freshly_read()
+        report = world.ask("build", seams={"light": self.light(self.RED_LIGHT)})
+        self.assertTrue(report["light"]["refuses"])
+        self.assertEqual(report["answer"], [])
+        self.assertEqual(route.exit_code(report), 1)
+        self.assertEqual(world.calls["bench"], 0, "nothing past N0b was asked")
+        text = "\n".join(route.render(report, now=world.now))
+        self.assertIn(route.N0B, text)
+        self.assertIn("starts nothing new", text)
+        # a review finishes work already in flight: admitted
+        report = world.ask("review", seams={"light": self.light(self.RED_LIGHT)})
+        self.assertFalse(report["light"]["refuses"])
+        self.assertTrue(report["answer"])
+        self.assertIn("light RED", "\n".join(route.render(report,
+                                                          now=world.now)))
+
+    def test_n0b_CONTROL_the_scans_red_is_no_decision(self):
+        world = World().freshly_read()
+        scan = dict(self.RED_LIGHT, authored=False)
+        report = world.ask("build", seams={"light": self.light(scan)})
+        # the scan's colour decides nothing, and an unopted answer carries
+        # no light at all (the zero-config arm below pins it against trunk)
+        self.assertNotIn("light", report)
+        self.assertEqual(world.calls["bench"], 1)
+
+    def test_an_authored_team_puts_a_seat_homed_elsewhere_on_this_bench(self):
+        """TODAY N2 REFUSES IT: the derived bench is the home room, and a
+        reviewer homed in another project's room is not on this one's. The
+        owner's team is what puts it there."""
+        world = World().freshly_read()
+        report = world.ask("review", project="another-project")
+        dropped = world.refused(report, DS4PRO)
+        self.assertEqual(dropped["node"], route.N2)
+        self.assertNotIn("bench_source", report)          # unopted: trunk's
+        report = world.ask("review", project="another-project", seams={
+            "team": self.team(("seat-h", KIMI, "lead"),
+                              ("seat-c", DS4PRO, "reviewer"))})
+        self.assertIsNone(world.refused(report, DS4PRO))
+        self.assertIn("seat-c", [r["seat"] for r in report["answer"]])
+        self.assertEqual(report["bench_source"], "team v3")
+
+    def test_a_role_that_does_not_take_the_kind_keeps_the_seat_off(self):
+        world = World().freshly_read()
+        report = world.ask("review", project="another-project", seams={
+            "team": self.team(("seat-h", KIMI, "lead"),
+                              ("seat-c", DS4PRO, "checker"))})
+        self.assertEqual(world.refused(report, DS4PRO)["node"], route.N2)
+        self.assertEqual(report["team"]["filtered"],
+                         [{"seat": "seat-c", "role": "checker"}])
+        text = "\n".join(route.render(report, now=world.now))
+        self.assertIn("not taking review by role: @seat-c (checker)", text)
+
+    def test_a_team_member_the_join_cannot_name_takes_the_owners_family(self):
+        """A seat the usability join has no row for (not started yet, or
+        native) lands on the family its team record names."""
+        class NoRegister:
+            @staticmethod
+            def registered_seat_family(name):
+                return None, None
+        world = World().freshly_read()
+        report = world.ask("council", project="another-project", seams={
+            "seatmod": NoRegister,
+            "team": self.team(("seat-h", KIMI, "lead"),
+                              ("seat-q", QWEN27, "reviewer"))})
+        self.assertIn("seat-q", report["bench"].get(QWEN27, []))
+
+    def test_the_family_door_rules_the_bench_over_the_authored_word(self):
+        """D3 (the task/3156 design read; the cross-family read's Q4
+        seam). A NATIVE seat written onto a team as codex: the join cannot name a native seat's
+        family (it has no proxy), so the authored word decided and the seat
+        landed on the codex bench, the cross-family reviewer. The family
+        door names what it spends, and that rules the bench."""
+        class NoRegister:
+            @staticmethod
+            def registered_seat_family(name):
+                return None, None
+        world = World().freshly_read()
+
+        def join(seats=None, now=None, **kw):
+            rows = world.join(seats=seats, now=now)
+            rows["seat-n"] = {"seat": "seat-n", "family": None,
+                              "can_take_work": None, "measured_at": now}
+            return rows
+        team = self.team(("seat-h", KIMI, "lead"),
+                         ("seat-n", CODEX, "reviewer"))
+        report = world.ask("review", project="another-project", seams={
+            "join": join, "seatmod": NoRegister, "team": team,
+            "families_of": lambda seats: {"seat-n": NATIVE}})
+        self.assertNotIn("seat-n", report["bench"].get(CODEX, []))
+        self.assertIn("seat-n", report["bench"].get(NATIVE, []))
+        self.assertEqual(report["team"]["family_differs"],
+                         [{"seat": "seat-n", "authored": CODEX,
+                           "spends": NATIVE}])
+        text = "\n".join(route.render(report, now=world.now))
+        self.assertIn("@seat-n is on the team as codex and spends anthropic",
+                      text)
+        # CONTROL: a seat the family door cannot name keeps the typed family
+        report = world.ask("review", project="another-project", seams={
+            "join": join, "seatmod": NoRegister, "team": team,
+            "families_of": lambda seats: {}})
+        self.assertIn("seat-n", report["bench"].get(CODEX, []))
+        self.assertEqual(report["team"]["family_differs"], [])
+
+    def dark_join(self, world, *dark):
+        """The frozen join, with `dark` seats UNUSABLE (N4 would drop them)."""
+        def join(seats=None, now=None, **kw):
+            rows = world.join(seats=seats, now=now)
+            for name in dark:
+                if name in rows:
+                    rows[name] = dict(rows[name], can_take_work=False,
+                                      verdict="UNUSABLE")
+            return rows
+        return join
+
+    def test_every_dark_member_who_takes_the_kind_falls_back(self):
+        """D5 (the task/3156 design read; the cross-family read's Q1
+        seam): when every member of an authored team who takes this kind is dark, the answer
+        was empty while the project's other seats sat idle. The derived bench
+        answers instead, without the team's own seats, and the answer says
+        so."""
+        world = World().freshly_read().at_colour(**{
+            f: bf.YELLOW for f in bf.families()})
+        team = self.team(("seat-c", DS4PRO, "reviewer"))
+        report = world.ask("review", seams={
+            "team": team, "join": self.dark_join(world, "seat-c")})
+        self.assertTrue(report["bench_source"].startswith("derived bench"),
+                        report["bench_source"])
+        self.assertIn("every member of team v3 who takes review is dark",
+                      report["team"]["fallback"])
+        self.assertIn("@seat-c", report["team"]["fallback"])
+        self.assertTrue(report["answer"])
+        self.assertNotIn("seat-c", [r["seat"] for r in report["answer"]])
+        self.assertEqual(world.calls["bench"], 1)
+        text = "\n".join(route.render(report, now=world.now))
+        self.assertIn("is dark (@seat-c); the derived bench answered", text)
+        # CONTROL: with the reviewer able to work, the team answers alone
+        report = world.ask("review", seams={"team": team})
+        self.assertEqual(report["bench_source"], "team v3")
+        self.assertIsNone(report["team"].get("fallback"))
+        self.assertEqual(world.calls["bench"], 1, "the derived bench was read")
+
+    def test_takers_refused_at_n1_or_red_at_n3_fall_back_too(self):
+        """Round 3, ruling b: the same fallback when the team's only takers
+        are refused at N1 (the native credential is the asker, E9) or sit on
+        a RED family at N3. The answer was empty and said nothing about the
+        project's other seats; now the derived bench answers without the
+        team's own seats, and the why names each taker and what refused
+        it."""
+        world = World().freshly_read().at_colour(**{
+            f: bf.YELLOW for f in bf.families()})
+        # SINCE LANDING REFACTOR ITEM 5 a native seat reads a door as a
+        # fresh-context Opus (E34), so the N1 refusal needs a Fable seat
+        world.bench = json.loads(json.dumps(world.bench))
+        world.bench["seats"]["seat-a"]["model"] = "claude-fable-5-1"
+        report = world.ask("review", seams={
+            "team": self.team(("seat-a", NATIVE, "lead"))})
+        why = report["team"]["fallback"]
+        self.assertIn("every member of team v3 who takes review is refused",
+                      why)
+        self.assertIn("@seat-a (anthropic, N1 E9)", why)
+        self.assertTrue(report["answer"])
+        self.assertNotIn("seat-a", [r["seat"] for r in report["answer"]])
+        self.assertIn(why, "\n".join(route.render(report, now=world.now)))
+        # a RED family at N3
+        world = World().freshly_read().at_colour(**dict(
+            {f: bf.YELLOW for f in bf.families()}, **{CODEX: bf.RED}))
+        report = world.ask("build", seams={
+            "team": self.team(("seat-b", CODEX, "builder"))})
+        self.assertIn("@seat-b (codex RED, N3 E11)",
+                      report["team"]["fallback"])
+        self.assertTrue(report["answer"])
+        # CONTROL: one taker the team can use, and the team answers alone
+        report = world.ask("build", seams={
+            "team": self.team(("seat-b", CODEX, "builder"),
+                              ("seat-c", DS4PRO, "builder"))})
+        self.assertEqual(report["bench_source"], "team v3")
+        self.assertIsNone(report["team"]["fallback"])
+        self.assertEqual(world.families(report), [DS4PRO])
+
+    def test_an_empty_answer_after_the_fallback_is_never_silent(self):
+        """Nothing on the derived bench either: the answer is empty, and it
+        still says which taker was refused where, and that the derived bench
+        was asked."""
+        world = World().freshly_read().at_colour(**dict(
+            {f: bf.YELLOW for f in bf.families()}, **{KIMI: bf.RED}))
+        report = world.ask("council", project="another-project", seams={
+            "team": self.team(("seat-h", KIMI, "reviewer"))})
+        self.assertEqual(report["answer"], [])
+        self.assertIn("@seat-h (kimi RED, N3 E11)",
+                      report["team"]["fallback"])
+        text = "\n".join(route.render(report, now=world.now))
+        self.assertIn("the derived bench answered", text)
+        self.assertIn("@seat-h (kimi RED, N3 E11)", text)
+        self.assertIn("none  no family on this bench", text)
+
+    def test_a_team_with_no_member_for_the_kind_falls_back(self):
+        world = World().freshly_read().at_colour(**{
+            f: bf.YELLOW for f in bf.families()})
+        report = world.ask("review", seams={
+            "team": self.team(("seat-c", DS4PRO, "checker"))})
+        self.assertIn("no member of team v3 takes review",
+                      report["team"]["fallback"])
+        self.assertTrue(report["answer"])
+        # the team's own seat stays off: its role does not take the kind
+        self.assertNotIn("seat-c", [r["seat"] for r in report["answer"]])
+
+    def share(self, colour, ratio, family_colour=bf.ORANGE):
+        return {CODEX: {"mode": "rate", "share": 30, "shares_total": 100,
+                        "over_promised": False, "budget_per_h": 13.9e6,
+                        "burn_per_h": 13.9e6 * ratio, "ratio": ratio,
+                        "colour": colour, "family_colour": family_colour,
+                        "rationed": True, "say": bf.BEHAVIOUR[colour]["say"],
+                        "shared": [], "burn_measured": True}}
+
+    def ask_build(self, share):
+        world = World().freshly_read().at_colour(**{CODEX: bf.ORANGE})
+        return world, world.ask("build", seams={
+            "team": self.team(("seat-a", NATIVE, "lead"),
+                              ("seat-b", CODEX, "builder")),
+            "allocation": lambda project: share})
+
+    def test_the_cap_follows_the_projects_own_colour(self):
+        world, report = self.ask_build(self.share(bf.YELLOW, 0.9))
+        row = world.admitted(report, CODEX)
+        self.assertEqual(row["colour"], bf.YELLOW)
+        self.assertEqual(row["family_colour"], bf.ORANGE)
+        self.assertFalse(row["critical_path_only"])
+        self.assertEqual(row["cap"]["delegate_factor"],
+                         bf.BEHAVIOUR[bf.YELLOW]["delegate_factor"])
+        self.assertIn("E33", [r["edge"] for r in row["reasons"]])
+        text = "\n".join(route.render(report, now=world.now))
+        self.assertIn("share codex 30% → 13.9M/h budget, burning 12.5M/h "
+                      "(0.90×) → YELLOW for helm", text)
+        # CONTROL: the same family with no team reads its fleet colour
+        world = World().freshly_read().at_colour(**{CODEX: bf.ORANGE})
+        plain = world.admitted(world.ask("build"), CODEX)
+        self.assertEqual(plain["colour"], bf.ORANGE)
+        self.assertEqual(plain["cap"]["delegate_factor"],
+                         bf.BEHAVIOUR[bf.ORANGE]["delegate_factor"])
+        self.assertNotIn("E33", [r["edge"] for r in plain["reasons"]])
+
+    def test_past_twice_its_budget_the_project_starts_nothing_new_there(self):
+        world, report = self.ask_build(self.share(bf.RED, 2.4))
+        dropped = world.refused(report, CODEX)
+        self.assertEqual(dropped["node"], route.N3)
+        self.assertEqual(dropped["colour"], bf.RED)
+        self.assertEqual([r["edge"] for r in dropped["reasons"]][:1], ["E33"])
+        text = "\n".join(route.render(report, now=world.now))
+        self.assertIn("(2.4×) → RED for helm", text)
+
+    def slot(self, queued):
+        """A local family's slots row for this project (`teams._slot_row`
+        joined to the allocation row): 30% of 10 lanes, 3 slots."""
+        in_use = 3 if queued else 1
+        return {QWEN27: {"mode": "slots", "share": 30, "shares_total": 100,
+                         "over_promised": False, "budget_per_h": None,
+                         "burn_per_h": None, "ratio": in_use / 3.0,
+                         "colour": bf.YELLOW, "family_colour": bf.YELLOW,
+                         "rationed": False,
+                         "say": bf.BEHAVIOUR[bf.YELLOW]["say"],
+                         "shared": ["seat-q"], "burn_measured": False,
+                         "capacity": 10, "slots": 3.0, "in_use": in_use,
+                         "in_use_fleet": 7, "queued": queued,
+                         "capacity_measured": True}}
+
+    def test_a_local_lane_past_the_projects_slots_is_queued_not_refused(self):
+        """The owner's slots direction: route offers a local reviewer to a
+        project whose team holds it; one row past its slots is QUEUED —
+        still offered, ranked with ORANGE, and the line says why."""
+        world = World().freshly_read().at_colour(**{
+            f: bf.YELLOW for f in bf.families()})
+        team = self.team(("seat-h", KIMI, "lead"),
+                         ("seat-q", QWEN27, "reviewer"),
+                         ("seat-c", DS4PRO, "reviewer"))
+        report = world.ask("council", seams={
+            "team": team, "allocation": lambda project: self.slot(True)})
+        self.assertIsNone(world.refused(report, QWEN27))
+        row = world.admitted(report, QWEN27)
+        self.assertTrue(row["share"]["queued"])
+        self.assertIn("E33", [r["edge"] for r in row["reasons"]])
+        self.assertEqual(world.families(report)[-1], QWEN27)
+        text = "\n".join(route.render(report, now=world.now))
+        self.assertIn("slots qwen27 30% of 10 lanes → 3 slots, 3 in use "
+                      "(fleet 7 of 10) → YELLOW for helm; QUEUED — new work "
+                      "waits for a lane, it is not refused", text)
+        # CONTROL: inside its slots the same seat is offered with no E33
+        report = world.ask("council", seams={
+            "team": team, "allocation": lambda project: self.slot(False)})
+        row = world.admitted(report, QWEN27)
+        self.assertFalse(row["share"]["queued"])
+        self.assertNotIn("E33", [r["edge"] for r in row["reasons"]])
+
+    def test_the_approval_tier_still_decides_who_closes_a_review(self):
+        """SLOTS ALLOCATE LANES; THEY DO NOT APPROVE A READER. A review CLOSES
+        a row, and the owner's approval tier (E3) says which families may;
+        the owner's words are "once these local reviewer lanes are confirmed
+        useful". A local family on the team is dropped at N1 for review until
+        the tier admits it, whatever its slots say."""
+        world = World().freshly_read()
+        report = world.ask("review", seams={
+            "team": self.team(("seat-h", KIMI, "lead"),
+                              ("seat-q", QWEN27, "reviewer")),
+            "allocation": lambda project: self.slot(False)})
+        self.assertEqual(world.refused(report, QWEN27)["node"], route.N1)
+        # CONTROL: council closes nothing, and the same seat is admitted
+        report = world.ask("council", seams={
+            "team": self.team(("seat-h", KIMI, "lead"),
+                              ("seat-q", QWEN27, "reviewer")),
+            "allocation": lambda project: self.slot(False)})
+        self.assertIsNone(world.refused(report, QWEN27))
+        self.assertEqual(world.admitted(report, QWEN27)["seat"], "seat-q")
+
+
+class TempRegistry(unittest.TestCase):
+    """A temp helm home whose registry holds the fixture's project, `helm`,
+    and no team: the world the task/3156 readers' DEFAULTS read when no arm
+    seams them. Nothing here reads this host's registry."""
+
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory(prefix="helm-route-home-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        env = {"HELM_HOME": os.path.join(self.tmp, "helm-home")}
+        patch = mock.patch.dict(os.environ, env)
+        patch.start()
+        self.addCleanup(patch.stop)
+        for k in ("MELD_HOME", "HELM_CHAT_DIR"):
+            if k in os.environ:
+                saved = os.environ.pop(k)
+                self.addCleanup(os.environ.__setitem__, k, saved)
+        from helm import home, pk
+        self.assertTrue(home.helm_home().startswith(self.tmp))
+        self.path = os.path.join(self.tmp, "dev", "helm")
+        os.makedirs(self.path)
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "helm": {"name": "helm", "path": self.path, "kind": "git",
+                     "status": "active", "sessions": {}}}})
+        pk.write_json(home.authored_path(), {"version": 1, "projects": {}})
+
+    def author(self, *members, **shares):
+        from helm import teams
+        row, problem, _code = teams.write(
+            "helm", {"members": [{"seat": s, "family": f, "role": r}
+                                 for s, f, r in members], "shares": shares},
+            0, by="owner", reason="the arm's team", apply=True,
+            post=lambda *a, **kw: None, families_of=lambda seats: {})
+        self.assertIsNone(problem)
+        return row
+
+
+class FailLoudTest(TempRegistry):
+    """D6 (the task/3156 design read): a reader that RAISES reads FAILED,
+    never unmeasured, and a share read that failed makes the answer PARTIAL.
+    It was appended to the reasons and the answer still read whole, exit 0;
+    and the default share reader swallowed a raising burn read into
+    "unmeasured", the one answer a failed read cannot give."""
+
+    TEAM = (("seat-a", NATIVE, "lead"), ("seat-b", CODEX, "builder"))
+
+    def test_a_share_read_that_raises_makes_the_answer_partial(self):
+        def boom(project):
+            raise KeyError("pace")
+        world = World().freshly_read().at_colour(**{
+            f: bf.YELLOW for f in bf.families()})
+        team = lambda project: {"project": project, "authored": True,
+                                "v": 3, "by": "owner", "shares": {},
+                                "members": [{"seat": s, "family": f,
+                                             "role": r}
+                                            for s, f, r in self.TEAM]}
+        report = world.ask("build", seams={"team": team, "allocation": boom})
+        self.assertTrue(report["partial"])
+        self.assertIn("the project's shares FAILED (KeyError",
+                      " ".join(report["partial_why"]))
+        self.assertEqual(route.exit_code(report), 3)
+        # CONTROL: the same ask with a share read that answers is whole
+        report = world.ask("build", seams={"team": team,
+                                           "allocation": lambda p: {}})
+        self.assertFalse(report["partial"])
+
+    def test_the_default_share_reader_raises_what_a_reader_raised(self):
+        from helm import codexpace
+        self.author(*self.TEAM, codex=30)
+        world = World().freshly_read().at_colour(**{
+            f: bf.YELLOW for f in bf.families()})
+        seams = {"team": None, "allocation": None}
+        with mock.patch.object(codexpace, "cached_seat_burn",
+                               side_effect=ValueError("burn torn")):
+            report = world.ask("build", seams=seams)
+        self.assertEqual(report["bench_source"], "team v1")
+        self.assertTrue(report["partial"])
+        self.assertIn("the project's shares FAILED (ValueError",
+                      " ".join(report["partial_why"]))
+        # CONTROL: no burn snapshot is not a failure: nothing measured, and
+        # the answer is whole
+        report = world.ask("build", seams=seams)
+        self.assertFalse(report["partial"], report["partial_why"])
+
+    def test_lanes_or_capacity_that_do_not_read_make_the_answer_partial(self):
+        """Round 3, ruling c: the share reader's lanes (the dispatch ledger)
+        and the lane capacity file were each swallowed into "nothing in
+        use" / "capacity not measured", on an answer that read whole."""
+        from helm import dispatches, teams
+        self.author(("seat-h", KIMI, "lead"), ("seat-q", QWEN27, "reviewer"),
+                    qwen27=30)
+        world = World().freshly_read().at_colour(**{
+            f: bf.YELLOW for f in bf.families()})
+        seams = {"team": None, "allocation": None, "families_of": None}
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=({}, "ledger locked")):
+            report = world.ask("council", seams=seams)
+        self.assertTrue(report["partial"], report["partial_why"])
+        self.assertIn("the project's shares FAILED (LedgerUnread",
+                      " ".join(report["partial_why"]))
+        os.makedirs(os.path.dirname(teams.capacity_path()), exist_ok=True)
+        with open(teams.capacity_path(), "w", encoding="utf-8") as fh:
+            fh.write("{torn")
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=({}, None)), \
+                mock.patch.object(dispatches, "owed", return_value=[]):
+            report = world.ask("council", seams=seams)
+        self.assertTrue(report["partial"], report["partial_why"])
+        self.assertIn("the project's shares FAILED (CapacityUnread",
+                      " ".join(report["partial_why"]))
+        # CONTROL: both read, and the answer is whole
+        os.remove(teams.capacity_path())
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=({}, None)), \
+                mock.patch.object(dispatches, "owed", return_value=[]):
+            report = world.ask("council", seams=seams)
+        self.assertFalse(report["partial"], report["partial_why"])
+
+    def test_a_roster_that_does_not_read_makes_the_answer_partial(self):
+        """The family door's roster read FAILED (`roster_checked` says so,
+        it does not raise). Its default readers turned that into an empty
+        roster, so every member was benched and billed on its TYPED family
+        in silence: the D3 defect, re-entered through an unreadable input,
+        on an answer that read whole. A strict reader is told instead."""
+        from helm import seats_roster
+        self.author(*self.TEAM, codex=30)
+        world = World().freshly_read().at_colour(**{
+            f: bf.YELLOW for f in bf.families()})
+        seams = {"team": None, "allocation": None, "families_of": None}
+        with mock.patch.object(seats_roster, "roster_checked",
+                               return_value=({}, True)):
+            report = world.ask("build", seams=seams)
+        self.assertEqual(report["bench_source"], "team v1")
+        self.assertTrue(report["partial"], report["partial_why"])
+        why = " ".join(report["partial_why"])
+        self.assertIn("the team's seat families FAILED (RosterUnread", why)
+        self.assertIn("the project's shares FAILED (RosterUnread", why)
+        self.assertEqual(route.exit_code(report), 3)
+        # CONTROL: a roster that reads (none on disk: proven empty) is whole
+        report = world.ask("build", seams=seams)
+        self.assertFalse(report["partial"], report["partial_why"])
+
+
+# THE COMMIT THAT LAST CHANGED ROUTE'S UNOPTED ANSWER ON PURPOSE. It was the
+# trunk task/3156 forked from (byte-identical to trunk's route.py when this
+# arm was written); landing refactor item 5 then ranked every door read by
+# queue for every project, team or none, and re-pinned it here. A deliberate
+# later change to route's unopted answer re-pins this to the commit that
+# made it.
+TRUNK_REF = "45c55148e3c90091602f9e2334cfb759c0bac2f1"
+
+
+def _route_at(ref):
+    """`helm/route.py` as it stood at `ref`, loaded as a module of THIS tree:
+    the same catalog, the same fixtures and the same temp registry, so the
+    only thing that differs from `route` is route.py itself."""
+    import subprocess
+    import types
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        got = subprocess.run(["git", "-C", repo, "show",
+                              "%s:helm/route.py" % ref],
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise unittest.SkipTest("git could not read route.py at %s (%s)"
+                                % (ref[:11], exc.__class__.__name__))
+    if got.returncode:
+        raise unittest.SkipTest("route.py at %s is not in this checkout's "
+                                "history (a shallow clone or an export): %s"
+                                % (ref[:11], got.stderr.strip()[:200]))
+    mod = types.ModuleType("helm._route_at_%s" % ref[:11])
+    mod.__package__ = "helm"
+    mod.__file__ = "<helm/route.py at %s>" % ref[:11]
+    exec(compile(got.stdout, mod.__file__, "exec"), mod.__dict__)
+    return mod
+
+
+class ZeroConfigTest(TempRegistry):
+    """ZERO CONFIG IS UNCHANGED, MEASURED AGAINST TRUNK (the task/3156
+    design read's missing arm, then round 3's ruling). `route.answer` runs
+    through its DEFAULT light, team, share and family readers on a registry
+    that holds the project with no team and no authored light, and TRUNK'S
+    `route.answer` (`TRUNK_REF`, loaded from history) runs on the same
+    registry and the same frozen world. An unopted project must answer byte
+    for byte as trunk does: the same `--json` document, the same render, no
+    new key and no new line. Comparing against this lane's own readers
+    seamed off missed exactly that: both sides grew the same keys."""
+
+    DEFAULTS = {"light": None, "team": None, "allocation": None,
+                "families_of": None}
+
+    def test_an_unopted_project_answers_byte_for_byte_as_trunk(self):  # noqa: VACUOUS_ASSERTION — each kind and asker asserts a non-empty trunk answer first, then two unconditional equalities; the authored-team control asserts the defaults are live
+        from helm import teams
+        trunk = _route_at(TRUNK_REF)
+        self.assertTrue(hasattr(trunk, "_seat_bar"), "premise: the ref is "
+                        "the commit that ranked door reads by queue")
+        for kind in route.KINDS:
+            for frm in (None, "fable"):
+                world = World().freshly_read()
+                theirs, err = trunk.answer(
+                    kind, frm=frm, project="helm", now=world.now,
+                    seams=world.seams(**self.DEFAULTS))
+                self.assertIsNone(err)
+                with mock.patch.object(
+                        teams, "live_families",
+                        side_effect=AssertionError("roster read")), \
+                        mock.patch.object(
+                            teams, "project_row",
+                            side_effect=AssertionError("shares read")):
+                    ours = world.ask(kind, frm=frm, seams=self.DEFAULTS)
+                with self.subTest(kind=kind, frm=frm):
+                    self.assertTrue(theirs["answer"] or theirs["refused"])
+                    self.assertEqual(
+                        json.dumps(ours, indent=1, sort_keys=True,
+                                   default=str),
+                        json.dumps(theirs, indent=1, sort_keys=True,
+                                   default=str))
+                    for explain in (False, True):
+                        self.assertEqual(
+                            route.render(ours, now=world.now,
+                                         explain=explain),
+                            trunk.render(theirs, now=world.now,
+                                         explain=explain))
+        # CONTROL: the same default readers DO read an authored team, and
+        # the answer then says which bench it read
+        self.author(("seat-a", NATIVE, "lead"), ("seat-c", DS4PRO, "reviewer"))
+        report = World().freshly_read().ask("review", seams=self.DEFAULTS)
+        self.assertEqual(report["bench_source"], "team v1")
+
+    def test_an_authored_light_with_no_team_still_refuses_new_work(self):
+        """THE PROJECT LIGHT SUPERSEDES THE CREDENTIAL FLAG, team or no team
+        (round 3, confirmed as intended). The light is the owner's
+        permission, authored with `helm projects state`, and trunk's doors
+        already obey it: `dispatch send` (`_project_light_rung`) and `work
+        claim` (`registry.admits`) refuse new work in a red project. N0b makes
+        route say what those doors do. An authored light is an opt-in, so
+        this answer carries the light."""
+        from helm import registry
+        registry.state("helm", "red", reason="frozen for the release",
+                       by="owner", apply=True)
+        world = World().freshly_read()
+        report = world.ask("build", seams=self.DEFAULTS)
+        self.assertTrue(report["light"]["refuses"])
+        self.assertEqual(report["answer"], [])
+        self.assertEqual(route.exit_code(report), 1)
+        self.assertNotIn("team", report)
+        # a review finishes work in flight: admitted, and the light is said
+        report = world.ask("review", seams=self.DEFAULTS)
+        self.assertTrue(report["answer"])
+        self.assertIn("light RED", "\n".join(route.render(report,
+                                                          now=world.now)))
+
+
+class NoLaneWaitsWhileAQualifiedReaderIsIdleTest(unittest.TestCase):
+    """Landing refactor item 5: a door read goes to an idle approval-tier
+    reader before a piled one. seat-a is the native seat, seat-b codex and
+    seat-c ds4pro; every colour is declared so no ration confounds a rank."""
+
+    OPUS, FABLE = "claude-opus-5-5", "claude-fable-5-1"
+
+    def world(self, **rows):
+        world = World().freshly_read().at_colour(
+            **{f: bf.YELLOW for f in bf.families()})
+        world.bench = json.loads(json.dumps(world.bench))
+        for seat, fields in rows.items():
+            world.bench["seats"][seat].update(fields)
+        return world
+
+    def test_H1_an_idle_ds4pro_is_named_over_a_codex_holding_seven(self):
+        world = self.world(**{"seat-b": {"holding": 7}})
+        order = world.families(world.ask("review"))
+        self.assertEqual(order[0], DS4PRO)
+        self.assertLess(order.index(DS4PRO), order.index(CODEX))
+        # CONTROL: unpiled, codex's higher rating puts it first again
+        world = self.world(**{"seat-b": {"holding": 0}})
+        self.assertEqual(world.families(world.ask("review"))[0], CODEX)
+
+    def test_H3_an_idle_opus_seat_beats_a_pile_and_ds4pro_beats_it(self):
+        world = self.world(**{"seat-a": {"model": self.OPUS},
+                              "seat-b": {"holding": 7}})
+        report = world.ask("review")
+        order = world.families(report)
+        self.assertLess(order.index(DS4PRO), order.index(NATIVE))
+        self.assertLess(order.index(NATIVE), order.index(CODEX))
+        self.assertEqual(world.admitted(report, NATIVE)["seat"], "seat-a")
+        self.assertIn("E34", [r["edge"] for r in
+                              world.admitted(report, NATIVE)["reasons"]])
+
+    def test_M6_fable_and_sonnet_are_never_named_opus_is(self):
+        for model in (self.FABLE, "claude-sonnet-5"):
+            world = self.world(**{"seat-a": {"model": model}})
+            report = world.ask("review")
+            self.assertNotIn(NATIVE, world.families(report), model)
+            dropped = world.refused(report, NATIVE)
+            self.assertEqual(dropped["node"], route.N1)
+            self.assertIn("E34", [r["edge"] for r in dropped["reasons"]])
+        world = self.world(**{"seat-a": {"model": self.OPUS}})   # control
+        self.assertIn(NATIVE, world.families(world.ask("review")))
+
+    def test_M2_a_codex_spark_seat_is_input_and_never_the_reader(self):
+        world = self.world(**{"seat-b": {"model": "gpt-5.3-codex-spark"}})
+        report = world.ask("review")
+        self.assertNotIn(CODEX, world.families(report))
+        self.assertEqual(world.refused(report, CODEX)["node"], route.N1)
+        self.assertEqual([r["seat"] for r in report["input"]], ["seat-b"])
+        for family in (GEMINI, QWEN27):
+            self.assertIn(world.refused(report, family)["node"],
+                          (route.N1, route.N2), family)
+        world = self.world(**{"seat-b": {"model": "gpt-6-astra"}})  # control
+        self.assertIn(CODEX, world.families(world.ask("review")))
+
+    def test_M4_with_every_reader_piled_an_answer_is_still_given(self):
+        world = self.world(**{s: {"holding": n} for s, n in (
+            ("seat-a", 4), ("seat-b", 7), ("seat-c", 3), ("seat-f", 2))})
+        report = world.ask("review")
+        self.assertTrue(report["answer"])
+        self.assertEqual(route.exit_code(report), 0)
+        self.assertEqual(sorted(r["queue_bucket"] for r in report["answer"]),
+                         [3] * len(report["answer"]))
+
+    def test_M8_an_unreadable_holding_sorts_between_measured_and_piled(self):
+        world = self.world(**{"seat-c": {"holding": None},
+                              "seat-f": {"holding": 3}})
+        order = world.families(world.ask("review"))
+        self.assertLess(order.index(CODEX), order.index(DS4PRO))
+        self.assertLess(order.index(DS4PRO), order.index(KIMI))
+
+    def test_E9_cites_the_live_ruling_and_names_the_retired_one(self):
+        """E9's old source is retired in the store; the edge carries the entry
+        that replaced it and names the retired id, as E17 does."""
+        edge = route.EDGE["E9"]
+        self.assertEqual(edge["sources"], (
+            "opus55-is-the-default-fable-is-the-crossmodel-reviewer-of-last-"
+            "resort",))
+        self.assertEqual(edge["retired"],
+                         ("fable-reviews-are-high-stakes-only-not-the-default",))
+
+    def test_the_row_bars_its_author_before_the_pick(self):
+        """--row applies the author, input and tier exclusions first."""
+        def seam(rid, **kw):
+            return {"row": {"id": rid}, "eligible": [], "unreadable": {},
+                    "seats": [{"seat": "seat-c", "state": "EXCLUDED",
+                               "conjunct": "chain"}]}, None
+        world = self.world()
+        report = world.ask("review", row="r1", seams={"eligibility": seam})
+        self.assertNotIn(DS4PRO, world.families(report))
+        self.assertIn("E1", [r["edge"] for r in
+                             world.refused(report, DS4PRO)["reasons"]])
+        self.assertIn(DS4PRO, world.families(world.ask("review")))  # control
+
+
 class VerbTest(unittest.TestCase):
     """The CLI surface: the kinds, the refusals, and the router collision."""
 
@@ -971,3 +1697,20 @@ class RenderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnUnprovenWindowIsUnknownContextTest(unittest.TestCase):
+    """task/3534: the context reader answers "window unproven" for a seat
+    whose window is only ASSUMED. The route row carries no percentage for it,
+    names why, and ranks it in the unknown bucket."""
+
+    def test_an_unproven_window_is_context_unknown_never_a_percentage(self):  # noqa: VACUOUS_ASSERTION — assertTrue(report["answer"]) runs unconditionally before the loop, so the loop has rows to check
+        world = World().freshly_read()
+        for row in world.bench["seats"].values():
+            row["context_pct"] = "window unproven"
+        report = world.ask("verify", frm="fable", project="helm")
+        self.assertTrue(report["answer"], "the world routed nobody")
+        for row in report["answer"]:
+            self.assertIsNone(row["context_pct"])
+            self.assertEqual(row["context_unknown"], "window unproven")
+            self.assertEqual(row["context_bucket"], 1)

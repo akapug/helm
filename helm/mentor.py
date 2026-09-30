@@ -506,8 +506,8 @@ def cmd_mentor(args):
     critique brief, taught project reflexes with teacher/target provenance
     (optionally attested), before/after review. teach is the ONE write."""
     if not args:
-        print(_USAGE)
-        return 0
+        print(_USAGE, file=sys.stderr)
+        return 2
     sub, rest = args[0], list(args[1:])
     if sub == "observe":
         return _cmd_observe(rest)

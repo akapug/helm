@@ -24,12 +24,15 @@ own doors) AND one of his names (owner_names). Either alone is not him.
 """
 
 SUBSYSTEMS = frozenset((
-    "autocompact", "beacons", "chat-durability", "dispatches", "faucet-watch",
-    "gate-canary", "helm-rearm",
-    "idle-dispatch", "owed-bot", "plan-prompt", "preread", "prompt-stall",
-    "proxy-fork-watch", "proxywatch", "resume-turn", "resume-turn/recovery",
-    "resume-turn/wake", "rogue-watchdog", "scratch-gc", "silent-drop",
-    "stale-bot", "upstream-watch", "watchdog", "worktree-gc",
+    "auto-land", "autocompact", "beacons", "chat-durability", "chat-signing", "dispatches",
+    "faucet-watch",
+    "checkout-watch", "gate-canary", "helm-rearm",
+    "idle-dispatch", "owed-bot", "plan-prompt", "preread", "pressure-watch", "prompt-stall",
+    "proxy-fork-watch", "proxywatch", "remote-relay", "resume-turn", "resume-turn/recovery",
+    "resume-turn/wake", "rogue-watchdog", "scratch-gc", "seat-rehome",
+    "silent-drop",
+    "stale-bot", "teams", "train-blame", "upstream-watch", "watchdog",
+    "worktree-gc",
 ))
 
 

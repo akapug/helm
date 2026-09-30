@@ -830,13 +830,12 @@ process.stdout.write(JSON.stringify(out));
             nign=(self.model(notice={"state": "ignored", "why": "door cli"}),))
         self.assertIn("Not read yet.", out["pending"])
         self.assertIn("could not read this card", out["dark"])
-        self.assertIn("You are not marked away.", out["here"])
+        self.assertIn("You’re not marked away", out["here"])
         self.assertIn("I’m away", out["here"])
         self.assertIn("No notice is set.", out["here"])
         self.assertIn("Nobody is woken.", out["here"])
-        self.assertIn("You are marked away, since 10 minutes ago.", out["away"])
+        self.assertIn("You’re marked away (10 minutes) · I’m back", out["away"])
         self.assertIn("You set this here.", out["away"])
-        self.assertIn("I’m back", out["away"])
         self.assertIn("not set from your console: seat-a", out["cli"])
         self.assertIn("disk said no", out["unknown"])
         self.assertIn("not the same as being here", out["unknown"])
@@ -849,6 +848,52 @@ process.stdout.write(JSON.stringify(out));
         self.assertNotIn("No notice is set", out["nunk"])
         self.assertIn("A notice you did not write", out["nign"])
         self.assertIn("Away: a2a only", out["here"])               # preset
+
+    def test_the_card_is_one_line_and_its_button_and_the_rest_is_folded(self):
+        """The owner reads one line: whether he is marked away, for how long,
+        and the one button. Who set it and what agents do about it are behind
+        "why?", and the notice to every agent behind "Leave a note for
+        agents"; neither fold is open unless he opened it or is typing."""
+        html = self.render(
+            away=(self.model({"state": "away", "owner_door": False,
+                              "by": "seat-a", "via": "declared",
+                              "t": self.NOW - 2 * 86400}),),
+            here=(self.model(),),
+            typed=(self.model(), "half typed"))
+        line, why, note = ('<p class="pline">', '<details class="pfold" data-fold="why">',
+                           '<details class="pfold" data-fold="note">')
+        for key in ("away", "here"):
+            got = html[key]
+            self.assertLess(got.index(line), got.index(why), key)
+            self.assertLess(got.index(why), got.index(note), key)
+            self.assertIn("<summary>why?</summary>", got, key)
+            self.assertIn("<summary>Leave a note for agents", got, key)
+            self.assertNotIn(" open>", got, key)
+            # the line holds the state and its button, and nothing else
+            one = got[got.index(line):got.index("</p>", got.index(line))]
+            self.assertIn('class="pbtn"', one, key)
+            # who set it, and the notice, are inside the folds
+            self.assertLess(got.index(why), got.index("Nobody is woken."), key)
+            self.assertLess(got.index(note), got.index('<textarea class="pnote"'), key)
+        text = re.sub(r"<[^>]*>", "", html["away"])
+        self.assertTrue(text.startswith("away modeYou’re marked away (2 days) · I’m back"), text)
+        self.assertLess(html["away"].index(why),
+                        html["away"].index("not set from your console"))
+        # a half-typed note keeps its fold open across the redraw
+        self.assertIn('<details class="pfold" data-fold="note" open>', html["typed"])
+
+    def test_a_redraw_keeps_each_fold_as_he_left_it(self):
+        """Opened or closed: a fold he opened stays open, and the note fold a
+        half-typed draft opens stays shut once he shuts it. Every fold's state
+        is remembered before the redraw and put back after it."""
+        from tests.test_web_chat_client_runtime import _extract_fn
+        src = web_ui_loader.read_text()
+        body = _extract_fn(src, "postureShow")
+        draw = body.index("sec.innerHTML =")
+        self.assertLess(body.index('querySelectorAll("details[data-fold]")'), draw)
+        self.assertLess(body.index("POSTURE_FOLD[f.dataset.fold] = f.open"), draw)
+        self.assertGreater(body.index("POSTURE_FOLD[x.dataset.fold]"), draw)
+        self.assertIn("const POSTURE_FOLD = {}", src)
 
     def test_the_draft_survives_a_redraw_and_nothing_is_injected(self):
         html = self.render(

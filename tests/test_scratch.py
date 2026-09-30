@@ -16,6 +16,7 @@ import ast
 import contextlib
 import glob
 import io
+import json
 import os
 import re
 import shutil
@@ -1090,9 +1091,19 @@ class GcTest(unittest.TestCase):
         self.assertFalse(stat.called)
 
     def test_auto_gc_never_raises(self):
+        """A survey that raises never raises out of the leg, and never
+        answers None either: None is what the resident renders as "idle", a
+        pass at rest with nothing to reap, and a survey that did not finish
+        read nothing. The line and one pk.event name the exception class."""
         with mock.patch.object(scratch, "survey",
-                               side_effect=RuntimeError("boom")):
-            self.assertIsNone(scratch.auto_gc())
+                               side_effect=RuntimeError("boom")), \
+                mock.patch.object(scratch, "gc") as g, \
+                mock.patch.object(scratch.pk, "event") as ev:
+            line = scratch.auto_gc()
+        self.assertIn("pressure survey FAILED (RuntimeError)", line or "")
+        self.assertFalse(g.called, "a pass reaped on an unread survey")
+        self.assertEqual(len(self._events_naming(ev, "RuntimeError")), 1,
+                         ev.call_args_list)
 
     def test_auto_gc_propagates_budget_expiry(self):  # noqa: VACUOUS_ASSERTION — the GC double raises Expired; absent stamp proves incomplete work was not throttled as complete
         rows = [{"bytes_pct": 36, "inodes_pct": 100, "mount": "/x", "dev": 1,
@@ -1104,12 +1115,61 @@ class GcTest(unittest.TestCase):
                 scratch.auto_gc()
         self.assertFalse(os.path.exists(scratch._stamp_path()))
 
-    def test_auto_gc_keeps_ordinary_gc_errors_fail_open(self):  # noqa: VACUOUS_ASSERTION — the GC double raises RuntimeError; None is the explicit janitor fail-open contract
+    def test_auto_gc_keeps_ordinary_gc_errors_fail_open(self):
+        """Fail-open still means the leg never raises and never gates a
+        stop, but it no longer means None. None was the contract here, and
+        the resident renders None as "idle": a reap pass that raised read as
+        a quiet, healthy minute. The line and one pk.event now name the
+        exception class, and the hourly throttle stays unstamped, because
+        only a completed pass earns it."""
         rows = [{"bytes_pct": 36, "inodes_pct": 100, "mount": "/x", "dev": 1,
                  "inodes_total": 10}]
         with mock.patch.object(scratch, "survey", return_value=rows), \
-             mock.patch.object(scratch, "gc", side_effect=RuntimeError("boom")):
-            self.assertIsNone(scratch.auto_gc())
+             mock.patch.object(scratch, "gc", side_effect=RuntimeError("boom")), \
+             mock.patch.object(scratch.pk, "event") as ev:
+            line = scratch.auto_gc()
+        self.assertIn("gc pass FAILED (RuntimeError)", line or "")
+        self.assertEqual(len(self._events_naming(ev, "RuntimeError")), 1,
+                         ev.call_args_list)
+        self.assertFalse(os.path.exists(scratch._stamp_path()))
+
+    AT_REST = [{"bytes_pct": 30, "inodes_pct": 40, "mount": "/x", "dev": 1,
+                "inodes_total": 10}]
+
+    def _events_naming(self, ev, name):
+        return [c for c in ev.call_args_list
+                if name in " ".join(map(str, c[0]))]
+
+    def test_a_raising_spell_pass_is_named_in_the_line_and_an_event(self):
+        """The memory rescue and owner escalation (`spells`) failing is named:
+        the leg's line and one pk.event carry the exception class. A quiet
+        None reads as a pass with nothing to escalate."""
+        with mock.patch.object(scratch, "survey", return_value=self.AT_REST), \
+             mock.patch.object(scratch, "spells", return_value=[]) as sp:
+            scratch.auto_gc()
+        self.assertEqual(sp.call_count, 1,
+                         "control: the calm seat plane ran spells")
+        os.remove(scratch._seat_stamp_path())
+        with mock.patch.object(scratch, "survey", return_value=self.AT_REST), \
+             mock.patch.object(scratch, "spells",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(scratch.pk, "event") as ev:
+            line = scratch.auto_gc()
+        self.assertIn("spells FAILED (RuntimeError)", line or "")
+        self.assertEqual(len(self._events_naming(ev, "RuntimeError")), 1,
+                         ev.call_args_list)
+
+    def test_a_raising_seat_plane_read_is_named_in_the_line_and_an_event(self):
+        """The seat-plane read failing means `spells` never runs; the leg's
+        line and one pk.event say so, naming the exception class."""
+        with mock.patch.object(scratch, "survey", return_value=self.AT_REST), \
+             mock.patch.object(scratch, "seat_plane",
+                               side_effect=RuntimeError("census")), \
+             mock.patch.object(scratch.pk, "event") as ev:
+            line = scratch.auto_gc()
+        self.assertIn("seat plane FAILED (RuntimeError)", line or "")
+        self.assertEqual(len(self._events_naming(ev, "RuntimeError")), 1,
+                         ev.call_args_list)
 
     def test_auto_gc_wakes_on_host_memory_alone_on_a_ram_mount(self):
         """THE HOLE, closed at the gate that kept the reaper asleep: every mount
@@ -1180,6 +1240,49 @@ class GcTest(unittest.TestCase):
         with mock.patch.object(scratch, "auto_gc") as b:
             seats.stop_guard(session=None, room="main", seat="nobody")
         self.assertFalse(b.called, "a stop ran the scratch reaper")
+
+    PRESSED = [{"bytes_pct": 36, "inodes_pct": 100, "mount": "/x", "dev": 1,
+                "inodes_total": 10}]
+    REP = {"reaped": 2, "files": 9, "pressure": 100, "level": "critical",
+           "ttl": 3600, "kept": [], "candidates": 4, "victims": []}
+
+    def _receipt(self, **patches):
+        """The resident's own receipt over the real auto_gc, with the survey
+        and the pass doubled. The index cap is stubbed, never run: it rewrites
+        the adopted memory index."""
+        from helm import store, stopfacts_resident
+        with mock.patch.object(store, "index_cap"), \
+                mock.patch.object(scratch.pk, "event"), \
+                mock.patch.object(scratch, "survey", **patches["survey"]), \
+                mock.patch.object(scratch, "gc", **patches["gc"]):
+            return stopfacts_resident.mechanical()["scratch"]
+
+    def test_a_failed_read_reaches_the_resident_receipt_never_idle(self):
+        """The resident's word for a pass at rest is "idle". A survey or a
+        reap pass that raised must reach the receipt as the named failure,
+        with its exception class, never as "idle"."""
+        got = self._receipt(survey={"side_effect": OSError("statvfs")},
+                            gc={"return_value": self.REP})
+        self.assertNotEqual(got, "idle")
+        self.assertIn("pressure survey FAILED (OSError)", got)
+        got = self._receipt(survey={"return_value": self.PRESSED},
+                            gc={"side_effect": KeyError("victims")})
+        self.assertNotEqual(got, "idle")
+        self.assertIn("gc pass FAILED (KeyError)", got)
+
+    def test_a_read_that_succeeds_keeps_its_old_answer_byte_for_byte(self):
+        """THE CONTROL for the arm above: the same resident and the same
+        doubles, answering. At rest the receipt is "idle" exactly; under
+        pressure it is the pass's summary line exactly, with nothing
+        appended."""
+        got = self._receipt(survey={"return_value": self.AT_REST},
+                            gc={"return_value": self.REP})
+        self.assertEqual(got, "idle")
+        got = self._receipt(survey={"return_value": self.PRESSED},
+                            gc={"return_value": self.REP})
+        self.assertEqual(got, "reaped 2 dead-session scratch dirs (9 files) at "
+                              "100% pressure (critical, ttl 1h); 0 kept live, "
+                              "4 candidates")
 
 
 class CliTest(unittest.TestCase):
@@ -2630,8 +2733,8 @@ class SecondTierTest(unittest.TestCase):
         every call site in the package is checked for the argument."""
         with self.assertRaises(TypeError):
             scratch.worktree_dirty(self.tmp)
-        tree = ast.parse(io.open(
-            os.path.join(PKG, "scratch.py")).read())
+        with io.open(os.path.join(PKG, "scratch.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
         calls = [n for n in ast.walk(tree)
                  if isinstance(n, ast.Call)
                  and getattr(n.func, "id", getattr(n.func, "attr", None))
@@ -3870,7 +3973,9 @@ class SeatPressurePlaneTest(unittest.TestCase):
     FLOOR = 64 * 1024
     ENV = ("HELM_CACHE_DIR", "HELM_HOME", "HELM_CHAT_DIR",
            "HELM_SCRATCH_GC_TIER2", "HELM_SCRATCH_GC_SEATS", "HELM_CHAT_NAME",
-           "CLAUDE_CODE_SESSION_ID", "HELM_INTEGRATOR_SEAT")
+           "CLAUDE_CODE_SESSION_ID", "HELM_INTEGRATOR_SEAT",
+           "HELM_STEWARD_SEAT", "HELM_SEAT_PRESSURE_PHONE_S",
+           "HELM_SEAT_RESCUE", "HELM_SEAT_RESCUE_GRACE_S")
 
     unit = SecondTierTest.unit
     age = SecondTierTest.age
@@ -3901,6 +4006,14 @@ class SeatPressurePlaneTest(unittest.TestCase):
         floor = mock.patch.object(scratch, "PRESSURE_UNIT_FLOOR", self.FLOOR)
         floor.start()
         self.addCleanup(floor.stop)
+        # NO ARM REACHES THE OWNER'S PHONE: an arm that does not inject one
+        # reads an opted-out notifier, and a push through it fails the arm.
+        from helm import notify
+        for name, value in (("configured", lambda: False),
+                            ("owner_push", self._no_real_push)):
+            patch = mock.patch.object(notify, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
         self.specs = [(os.path.join(self.root, "*"), "test scratch")]
         self.pad = os.path.join(self.root, self.LIVE, "scratchpad")
         self.other_pad = os.path.join(self.root, self.OTHER, "scratchpad")
@@ -3917,6 +4030,9 @@ class SeatPressurePlaneTest(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    def _no_real_push(self, *_a, **_k):
+        raise AssertionError("an arm reached the owner's phone")
 
     live_proc = SecondTierTest.live_proc
 
@@ -4196,8 +4312,11 @@ class SeatPressurePlaneTest(unittest.TestCase):
         posts = []
         scratch.spells(plane, rep, roster=self.roster(),
                        post=lambda t, r: posts.append(t) or {"id": "x"})
-        self.assertEqual(len(posts), 1, "a known pressing slice woke nobody")
+        self.assertEqual(len(posts), 2, "the unnamed slice did not wake and "
+                                          "escalate when no distinct actor was "
+                                          "proven")
         self.assertIn("NEAR now", posts[0])
+        self.assertIn("No phone is configured", posts[1])
 
     # ── the wake, once per spell ─────────────────────────────────────────
     ROSTER = {"seat-under-test": {"home_room": "helm", "cwd": "/x/helm-wt/lane"},
@@ -4256,6 +4375,713 @@ class SeatPressurePlaneTest(unittest.TestCase):
                              post=lambda t, r: posts.append(t) or {"id": "x"})
         self.assertEqual(len(posts), 1, "the failed wake was latched anyway")
         self.assertEqual(len(got), 1)
+
+
+    # ── the spell's life: the phone, and the rescue ─────────────────────
+    class Phone(object):
+        """The phone seam: records every push; `on` is configured()."""
+
+        def __init__(self, on=True, ok=True):
+            self.on, self.ok, self.pushes = on, ok, []
+
+        def configured(self):
+            return self.on
+
+        def owner_push(self, body, title=None, receipt=None, reply_key=None):
+            self.pushes.append(body)
+            return self.ok
+
+    def posts(self):
+        out = []
+
+        def post(text, room):
+            out.append((room, text))
+            return {"id": "row-%d" % len(out)}
+        return out, post
+
+    def book(self, now, post, phone, roster=None, **kw):
+        plane = self.plane()
+        return scratch.spells(plane, None, now=now, post=post,
+                              roster=self.roster() if roster is None
+                              else roster, phone=phone, **kw)
+
+    def test_a_spell_still_open_after_the_window_reaches_the_phone_once(self):
+        self.slice("seat-under-test", "999", 95 * MB, 100 * MB)
+        out, post = self.posts()
+        phone = self.Phone()
+        t0 = 1000000.0
+        self.book(t0, post, phone)
+        self.assertEqual(len(out), 1, "control: the spell opened and woke")
+        self.book(t0 + scratch.PHONE_S - 1, post, phone)
+        self.assertEqual(phone.pushes, [], "the phone rang inside the window")
+        self.book(t0 + scratch.PHONE_S, post, phone)
+        self.assertEqual(len(phone.pushes), 1)
+        for want in ("@seat-under-test", "NEAR", "95%", "for 10m",
+                     "the wake went unanswered"):
+            self.assertIn(want, phone.pushes[0])
+        self.book(t0 + 2 * scratch.PHONE_S, post, phone)
+        self.assertEqual(len(phone.pushes), 1, "the phone rang twice")
+        # the spell closes, and a new one owns a new escalation
+        self.slice("seat-under-test", "999", 50 * MB, 100 * MB)
+        self.book(t0 + 3 * scratch.PHONE_S, post, phone)
+        self.slice("seat-under-test", "999", 95 * MB, 100 * MB)
+        self.book(t0 + 4 * scratch.PHONE_S, post, phone)
+        self.book(t0 + 5 * scratch.PHONE_S, post, phone)
+        self.assertEqual(len(phone.pushes), 2)
+
+    def test_the_phone_window_is_a_knob(self):
+        os.environ["HELM_SEAT_PRESSURE_PHONE_S"] = "60"
+        self.assertEqual(scratch.phone_after_s(), 60)
+        self.slice("seat-under-test", "999", 95 * MB, 100 * MB)
+        out, post = self.posts()
+        phone = self.Phone()
+        self.book(1000.0, post, phone)
+        self.book(1060.0, post, phone)
+        self.assertEqual(len(phone.pushes), 1)
+        for bad in ("", "soon", "-5"):
+            os.environ["HELM_SEAT_PRESSURE_PHONE_S"] = bad
+            self.assertEqual(scratch.phone_after_s(), scratch.PHONE_S, bad)
+
+    def test_legacy_missing_able_is_unknown_not_an_immediate_false_page(self):  # noqa: VACUOUS_ASSERTION — the same arm unconditionally advances to PHONE_S and asserts the positive one-push control
+        """Old spell rows predate the `able` proof. Missing is UNKNOWN, not a
+        proof that nobody heard the wake: no immediate phone line or false
+        wake claim, while the ordinary unanswered window still pages."""
+        d = self.slice("seat-under-test", "999", 95 * MB, 100 * MB)
+        path = scratch._spells_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        name = os.path.basename(d)
+        t0 = 1000000.0
+        with open(path, "w") as f:
+            json.dump({name: {"since": t0, "word": "NEAR",
+                              "seat": "seat-under-test",
+                              "mentions": ["seat-a"], "room": "helm",
+                              "owed": True}}, f)
+        out, post = self.posts()
+        phone = self.Phone()
+        self.book(t0, post, phone)
+        self.assertEqual(phone.pushes, [], "missing able caused a false page")
+        self.assertNotIn("goes to the owner's phone now", out[0][1])
+        self.book(t0 + scratch.PHONE_S, post, phone)
+        self.assertEqual(len(phone.pushes), 1,
+                         "unknown suppressed the ordinary timed page")
+        self.assertIn("the wake went unanswered", phone.pushes[0])
+
+    def test_a_failed_push_stays_owed(self):
+        self.slice("seat-under-test", "999", 95 * MB, 100 * MB)
+        out, post = self.posts()
+        phone = self.Phone(ok=False)
+        t0 = 1000000.0
+        self.book(t0, post, phone)
+        self.book(t0 + scratch.PHONE_S, post, phone)
+        self.book(t0 + scratch.PHONE_S + 60, post, phone)
+        self.assertEqual(len(phone.pushes), 2, "a failed push was latched")
+        phone.ok = True
+        self.book(t0 + scratch.PHONE_S + 120, post, phone)
+        self.book(t0 + scratch.PHONE_S + 180, post, phone)
+        self.assertEqual(len(phone.pushes), 3)
+
+    def test_with_no_phone_the_room_is_told_once(self):  # noqa: VACUOUS_ASSERTION — the phone is opted out by design; the post seam is asserted to carry exactly one told line in the spell's room, the positive observable of the same pass
+        self.slice("seat-under-test", "999", 95 * MB, 100 * MB)
+        out, post = self.posts()
+        phone = self.Phone(on=False)
+        t0 = 1000000.0
+        self.book(t0, post, phone)
+        self.book(t0 + scratch.PHONE_S, post, phone)
+        self.book(t0 + 2 * scratch.PHONE_S, post, phone)
+        self.assertEqual(phone.pushes, [])
+        told = [t for _r, t in out if "No phone is configured" in t]
+        self.assertEqual(len(told), 1)
+        self.assertEqual(out[-1][0], "helm", "the line went to another room")
+        self.assertIn("@seat-a", told[0])
+
+    def test_an_undelivered_wake_still_reaches_the_phone_on_time(self):
+        """AN ALARM ABOUT THE FLEET MUST NOT DEPEND ON THE FLEET: chat down
+        for the whole spell, and the phone still rings at the window."""
+        self.slice("seat-under-test", "999", 95 * MB, 100 * MB)
+        phone = self.Phone()
+        t0 = 1000000.0
+        down = []
+        self.book(t0, lambda t, r: down.append(t) and None, phone)
+        self.book(t0 + scratch.PHONE_S, lambda t, r: down.append(t) and None,
+                  phone)
+        self.assertEqual(len(down), 2, "control: the wake was retried")
+        self.assertEqual(len(phone.pushes), 1)
+
+    def test_a_wake_that_reaches_no_seat_able_to_act_rings_at_once(self):  # noqa: VACUOUS_ASSERTION — the empty audience IS the case under test; the posted wake text and the phone seam's one push are its positive observables
+        """The pressed seat IS the integrator and nobody else is present: the
+        wake names nobody who can act, so the phone does not wait."""
+        roster = {"seat-integrator": {"home_room": "main", "cwd": "/x/helm",
+                                      "last_seen": time.time()},
+                  "seat-gone": {"home_room": "helm", "cwd": "/x/helm",
+                                "last_seen": 0}}
+        os.environ["HELM_CHAT_NAME"] = "seat-b"
+        self.slice("seat-integrator", "999", 95 * MB, 100 * MB)
+        census = self.census()
+        census["rows"][0]["environ"] = {"HELM_CHAT_NAME": "seat-integrator"}
+        plane = scratch.seat_plane(proc_dir=self.proc, root=self.cg,
+                                   census=census, sleep=lambda _s: None)
+        out, post = self.posts()
+        phone = self.Phone()
+        woke = scratch.spells(plane, None, now=1000.0, post=post,
+                              roster=roster, phone=phone)
+        self.assertEqual(woke[0][2], [], "the wedged integrator was its own "
+                                         "only audience")
+        self.assertIn("goes to the owner's phone now", out[0][1])
+        self.assertEqual(len(phone.pushes), 1)
+        self.assertIn("no seat able to act was reached", phone.pushes[0])
+
+    def test_a_wake_whose_mentions_cannot_be_proven_able_rings_at_once(self):
+        """A MENTION IS NOT A SEAT ABLE TO ACT. The wake names the integrator
+        whenever it is not the pressed seat by name, so a list that is not
+        empty can still reach nobody who can act: the pressed seat unnamed
+        (it may BE the integrator), or the integrator absent. Each rings the
+        phone at once and says so. Control: the pressed seat named and the
+        integrator present, the same fixture waits the window."""
+        self.slice("seat-under-test", "999", 95 * MB, 100 * MB)
+
+        def ring(named, integrator_seen):
+            if os.path.exists(scratch._spells_path()):
+                os.remove(scratch._spells_path())
+            now = time.time()
+            roster = {"seat-integrator": {"home_room": "main",
+                                          "cwd": "/x/helm",
+                                          "last_seen": integrator_seen},
+                      "seat-under-test": {"home_room": "main",
+                                          "cwd": "/x/helm", "last_seen": now},
+                      "seat-gone": {"home_room": "helm", "cwd": "/x/helm",
+                                    "last_seen": 0}}
+            census = self.census()
+            if not named:
+                census["rows"][0]["environ"] = {}
+            plane = scratch.seat_plane(proc_dir=self.proc, root=self.cg,
+                                       census=census, sleep=lambda _s: None)
+            out, post = self.posts()
+            phone = self.Phone()
+            woke = scratch.spells(plane, None, now=1000.0, post=post,
+                                  roster=roster, phone=phone)
+            return woke[0][2], out[0][1], phone.pushes
+        mentions, wake, pushes = ring(True, time.time())
+        self.assertEqual(mentions, ["seat-integrator"], "control: the cell")
+        self.assertEqual(pushes, [], "control: a present integrator named "
+                                     "apart from the pressed seat waits")
+        self.assertNotIn("goes to the owner's phone now", wake)
+        for label, named, seen in (("unnamed", False, time.time()),
+                                   ("integrator absent", True, 0)):
+            with self.subTest(cell=label):
+                mentions, wake, pushes = ring(named, seen)
+                self.assertEqual(mentions, ["seat-integrator"])
+                self.assertIn("goes to the owner's phone now", wake)
+                self.assertEqual(len(pushes), 1, "the phone waited on a wake "
+                                                 "no seat able to act heard")
+                self.assertIn("no seat able to act was reached", pushes[0])
+
+    def member(self, pid, comm, argv, ppid, rss, stalled=False):
+        """A full /proc entry in the seat-under-test slice: stat with a start
+        time, comm, cmdline, status with VmRSS, cgroup, wchan."""
+        from helm import seatceiling
+        rel = "%s/%s" % (AGENTS, seatceiling.seat_slice_name(
+            "seat-under-test"))
+        d = os.path.join(self.proc, str(pid))
+        os.makedirs(d, exist_ok=True)
+        for name, text in (
+                ("stat", "%d (%s) %s %d %s %d 0 0\n" % (
+                    pid, comm, "D" if stalled else "S", ppid,
+                    " ".join(["0"] * 17), 5000 + pid)),
+                ("comm", comm + "\n"),
+                ("cmdline", "\0".join(argv) + "\0"),
+                ("status", "VmRSS:\t%d kB\n" % (rss // 1024)),
+                ("cgroup", "0::/%s/run-p999-i1.scope\n" % rel),
+                ("wchan", "__mem_cgroup_handle_over_high" if stalled
+                 else "0")):
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
+
+    def test_a_held_child_throttle_is_ended_through_the_spell(self):  # noqa: VACUOUS_ASSERTION — the kill and post seams are the injected observables of this path (no real signal may be sent); kills is asserted EQUAL to the one SIGTERM and the posts carry the ENDED line
+        """THE WEDGE, END TO END through the spell book: the wake names the
+        child and its cure, nothing is ended inside the grace, and past it
+        the child — never the agent — is ended and the room is told."""
+        import signal
+        d = self.slice("seat-under-test", "999", 104 * MB, 100 * MB,
+                       stalled=True, shmem=2 * MB)
+        self.member(999, "claude", ["claude"], 1, 20 * MB, stalled=True)
+        self.member(1001, "bash", ["/bin/bash", "-c", "python3 -"], 999, MB)
+        self.member(1002, "python3", ["python3", "-"], 1001, 80 * MB,
+                    stalled=True)
+        count = [7]
+
+        def tick(_s=None):
+            count[0] += 50
+            with open(os.path.join(d, "memory.events"), "w") as f:
+                f.write("low 0\nhigh %d\nmax 0\noom 0\noom_kill 0\n"
+                        % count[0])
+        kills = []
+
+        def kill(pid, start, sig, proc):
+            kills.append((pid, sig))
+            shutil.rmtree(os.path.join(proc, str(pid)))
+            return True
+        out, post = self.posts()
+        phone = self.Phone()
+        t0 = 1000000.0
+        self.book(t0, post, phone, kill=kill, sleep=tick)
+        self.assertEqual(kills, [], "ended inside the grace")
+        for want in ("THROTTLED now", "pid 1002", "`python3 -`",
+                     "END THAT CHILD", "never a larger memory.high"):
+            self.assertIn(want, out[0][1])
+        self.assertNotIn("no-restart cure is a larger memory.high", out[0][1])
+        self.book(t0 + 100, post, phone, kill=kill, sleep=tick)
+        self.assertEqual(kills, [], "ended inside the grace")
+        self.book(t0 + 200, post, phone, kill=kill, sleep=tick)
+        self.assertEqual(kills, [(1002, signal.SIGTERM)])
+        ended = out[-1][1]
+        for want in ("ENDED pid 1002", "for @seat-under-test", "0.08G RSS",
+                     "@seat-a", "agent (pid 999) was never a candidate"):
+            self.assertIn(want, ended)
+        self.book(t0 + 300, post, phone, kill=kill, sleep=tick)
+        self.assertEqual(kills, [(1002, signal.SIGTERM)], "a second rescue "
+                                                          "in one spell")
+
+    def test_legacy_throttled_without_stalled_at_restarts_the_run(self):
+        """A pre-stalled_at spell carries an old `throttled` time with no proof
+        the run stayed unbroken. Its first new reading starts timing now, rather
+        than signalling immediately; the fresh run ends the child at grace."""
+        import signal
+        from helm import seatrescue
+        d = self.slice("seat-under-test", "999", 104 * MB, 100 * MB,
+                       stalled=True, shmem=2 * MB)
+        self.member(999, "claude", ["claude"], 1, 20 * MB, stalled=True)
+        self.member(1002, "python3", ["python3", "-"], 999, 80 * MB,
+                    stalled=True)
+        count = [7]
+
+        def tick(_s=None):
+            count[0] += 50
+            with open(os.path.join(d, "memory.events"), "w") as f:
+                f.write("low 0\nhigh %d\nmax 0\noom 0\noom_kill 0\n"
+                        % count[0])
+        kills = []
+
+        def kill(pid, start, sig, proc):
+            kills.append((pid, sig))
+            shutil.rmtree(os.path.join(proc, str(pid)))
+            return True
+        t0, now = 1000.0, 10000.0
+        path = scratch._spells_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        name = os.path.basename(d)
+        with open(path, "w") as f:
+            json.dump({name: {"since": t0, "word": "THROTTLED",
+                              "seat": "seat-under-test",
+                              "mentions": ["seat-a"], "room": "helm",
+                              "able": True, "owed": False,
+                              "throttled": t0}}, f)
+        out, post = self.posts()
+        self.book(now, post, self.Phone(), kill=kill, sleep=tick)
+        self.assertEqual(kills, [], "an unknown legacy run signalled at once")
+        with open(path) as f:
+            spell = json.load(f)[name]
+        self.assertEqual((spell["throttled"], spell["stalled_at"]),
+                         (now, now))
+        self.book(now + seatrescue.GRACE_S, post, self.Phone(), kill=kill,
+                  sleep=tick)
+        self.assertEqual(kills, [(1002, signal.SIGTERM)])
+
+    def test_the_grace_counts_an_unbroken_run_of_stalled_readings(self):  # noqa: VACUOUS_ASSERTION — the kill seam is the injected observable (no real signal may be sent), and the same arm asserts it EQUAL to the one SIGTERM once the unbroken run passes the grace
+        """A reading inside the spell that is THROTTLED by a rising counter
+        but has NO stalled process ends the run: the grace starts over from
+        the next stalled reading."""
+        import signal
+        d = self.slice("seat-under-test", "999", 104 * MB, 100 * MB,
+                       stalled=True, shmem=2 * MB)
+        self.member(999, "claude", ["claude"], 1, 20 * MB, stalled=True)
+        self.member(1002, "python3", ["python3", "-"], 999, 80 * MB,
+                    stalled=True)
+        count = [7]
+
+        def tick(_s=None):
+            count[0] += 50
+            with open(os.path.join(d, "memory.events"), "w") as f:
+                f.write("low 0\nhigh %d\nmax 0\noom 0\noom_kill 0\n"
+                        % count[0])
+        kills = []
+
+        def kill(pid, start, sig, proc):
+            kills.append((pid, sig))
+            shutil.rmtree(os.path.join(proc, str(pid)))
+            return True
+
+        def book(now, stalled):
+            for pid in (999, 1002):
+                self.member(pid, "claude" if pid == 999 else "python3",
+                            ["claude"] if pid == 999 else ["python3", "-"],
+                            1 if pid == 999 else 999,
+                            20 * MB if pid == 999 else 80 * MB,
+                            stalled=stalled)
+            plane = scratch.seat_plane(proc_dir=self.proc, root=self.cg,
+                                       census=self.census(), sleep=tick)
+            return scratch.spells(plane, None, now=now, post=post,
+                                  roster=self.roster(), phone=self.Phone(),
+                                  kill=kill, sleep=tick)
+        out, post = self.posts()
+        t0 = 1000000.0
+        book(t0, True)
+        book(t0 + 100, False)        # THROTTLED by the rise, nothing stalled
+        book(t0 + 150, True)
+        book(t0 + 200, True)
+        self.assertEqual(kills, [], "the run was not broken by a reading "
+                                    "with nothing stalled")
+        book(t0 + 330, True)
+        self.assertEqual(kills, [(1002, signal.SIGTERM)])
+
+    def test_a_quiet_reading_or_a_gap_ends_the_run(self):  # noqa: VACUOUS_ASSERTION — the kill seam is the injected observable (no real signal may be sent); every case asserts it EQUAL to the one SIGTERM once a fresh unbroken run passes the grace
+        """THE RUN IS UNBROKEN OR IT IS OVER. A reading that is not pressing
+        at all is not both halves of the throttle either: HIGH at 95% in page
+        cache, or calm at 85%, sits between a spell's open and its clear, and
+        the run starts over after it. A gap longer than RUN_GAP_S with no
+        reading proves nothing held across it. Control, each case: the fresh
+        run that follows, held past the grace, ends the child."""
+        import signal
+        from helm import seatceiling
+        count = [7]
+        sl = [None]
+
+        def tick(_s=None):
+            count[0] += 50
+            with open(os.path.join(sl[0], "memory.events"), "w") as f:
+                f.write("low 0\nhigh %d\nmax 0\noom 0\noom_kill 0\n"
+                        % count[0])
+        kills = []
+
+        def kill(pid, start, sig, proc):
+            kills.append((pid, sig))
+            shutil.rmtree(os.path.join(proc, str(pid)))
+            return True
+        out, post = self.posts()
+
+        def book(now, current, stalled):
+            sl[0] = self.slice("seat-under-test", "999", current, 100 * MB,
+                               stalled=stalled, shmem=2 * MB)
+            self.member(999, "claude", ["claude"], 1, 20 * MB, stalled=stalled)
+            self.member(1002, "python3", ["python3", "-"], 999, 80 * MB,
+                        stalled=stalled)
+            plane = scratch.seat_plane(
+                proc_dir=self.proc, root=self.cg, census=self.census(),
+                sleep=tick if stalled else (lambda _s: None))
+            scratch.spells(plane, None, now=now, post=post,
+                           roster=self.roster(), phone=self.Phone(),
+                           kill=kill, sleep=tick)
+            (r,) = [r for path, r in plane["slices"].items()
+                    if path.endswith("agents-seat_under_test.slice")]
+            return r
+        t0 = 1000000.0
+        for label, quiet in (("HIGH at 95%", (95 * MB, seatceiling.HIGH)),
+                             ("calm at 85%", (85 * MB, None)),
+                             ("no reading for an hour", None)):
+            with self.subTest(case=label):
+                if os.path.exists(scratch._spells_path()):
+                    os.remove(scratch._spells_path())
+                del kills[:]
+                book(t0, 104 * MB, True)
+                start = t0 + 3600
+                if quiet:
+                    r = book(t0 + 60, quiet[0], False)
+                    self.assertEqual(r.word, quiet[1], "control: the reading")
+                    self.assertFalse(seatceiling.pressing(r)
+                                     or seatceiling.cleared(r),
+                                     "control: neither pressing nor cleared")
+                    start = t0 + 120
+                book(start, 104 * MB, True)
+                book(start + 60, 104 * MB, True)
+                self.assertEqual(kills, [], "the run outlived a reading or a "
+                                            "gap that did not show it held")
+                book(start + 180, 104 * MB, True)
+                self.assertEqual(kills, [(1002, signal.SIGTERM)],
+                                 "control: the fresh run past the grace")
+
+    def test_a_signal_that_did_not_end_the_child_is_said_and_retried(self):
+        """ENDED IS POSTED ONLY ON A PROVEN EXIT. A SIGTERM that could not be
+        sent ends nothing: the room hears COULD NOT END once, the spell's one
+        rescue is not spent, and the next reading tries again, and ends the
+        child once the signal goes."""
+        import signal
+        d = self.slice("seat-under-test", "999", 104 * MB, 100 * MB,
+                       stalled=True, shmem=2 * MB)
+        self.member(999, "claude", ["claude"], 1, 20 * MB, stalled=True)
+        self.member(1001, "bash", ["/bin/bash", "-c", "python3 -"], 999, MB)
+        self.member(1002, "python3", ["python3", "-"], 1001, 80 * MB,
+                    stalled=True)
+        count = [7]
+
+        def tick(_s=None):
+            count[0] += 50
+            with open(os.path.join(d, "memory.events"), "w") as f:
+                f.write("low 0\nhigh %d\nmax 0\noom 0\noom_kill 0\n"
+                        % count[0])
+        kills, works = [], [False]
+
+        def kill(pid, start, sig, proc):
+            kills.append((pid, sig))
+            if not works[0]:
+                return None           # what the pidfd seam says: not sent
+            shutil.rmtree(os.path.join(proc, str(pid)))
+            return True
+        out, post = self.posts()
+        phone = self.Phone()
+        t0 = 1000000.0
+        for at in (t0, t0 + 100, t0 + 200):
+            self.book(at, post, phone, kill=kill, sleep=tick)
+        self.assertEqual(kills, [(1002, signal.SIGTERM)],
+                         "control: the rescue ran past the grace")
+        said = [t for _r, t in out[1:]]
+        self.assertEqual([t for t in said if "ENDED pid" in t], [],
+                         "a signal that was never sent was posted as ENDED")
+        (told,) = [t for t in said if "COULD NOT END pid 1002" in t]
+        for want in ("SIGTERM could not be sent", "@seat-a"):
+            self.assertIn(want, told)
+        self.book(t0 + 260, post, phone, kill=kill, sleep=tick)
+        self.assertEqual(kills, [(1002, signal.SIGTERM)] * 2,
+                         "the failed rescue was latched and never retried")
+        self.assertEqual(len([t for _r, t in out if "COULD NOT END" in t]), 1,
+                         "the room was told twice")
+        works[0] = True
+        self.book(t0 + 320, post, phone, kill=kill, sleep=tick)
+        self.assertEqual(kills, [(1002, signal.SIGTERM)] * 3)
+        self.assertIn("ENDED pid 1002", out[-1][1])
+
+    def test_a_load_or_rescue_that_raises_still_wakes_once(self):
+        """FAIL-OPEN: a bug in the load read or the rescue must not silence
+        the wake, nor lose the spell book (which would re-wake every read)."""
+        from helm import seatrescue
+        self.slice("seat-under-test", "999", 104 * MB, 100 * MB, stalled=True,
+                   shmem=2 * MB)
+        out, post = self.posts()
+        with mock.patch.object(seatrescue, "load",
+                               side_effect=RuntimeError("load")), \
+                mock.patch.object(seatrescue, "rescue",
+                                  side_effect=RuntimeError("rescue")):
+            self.book(1000.0, post, self.Phone())
+            self.book(1300.0, post, self.Phone())
+        self.assertEqual(len(out), 1, "the wake repeated or never went")
+        self.assertIn("the load read failed (RuntimeError)", out[0][1])
+
+    def test_a_shmem_spell_names_reap_or_raise_and_ends_nothing(self):  # noqa: VACUOUS_ASSERTION — ending nothing IS the contract; the wake posted by the same passes is asserted to name reap-or-raise
+        self.slice("seat-under-test", "999", 104 * MB, 100 * MB, stalled=True)
+        self.member(999, "claude", ["claude"], 1, 20 * MB, stalled=True)
+        self.member(1002, "python3", ["python3", "-"], 999, 80 * MB)
+        kills = []
+        out, post = self.posts()
+        phone = self.Phone()
+        self.book(1000.0, post, phone, kill=lambda *a: kills.append(a),
+                  sleep=lambda _s: None)
+        self.book(2000.0, post, phone, kill=lambda *a: kills.append(a),
+                  sleep=lambda _s: None)
+        self.assertIn("The load is shmem", out[0][1])
+        self.assertIn("reap its scratch", out[0][1])
+        self.assertEqual(kills, [])
+
+
+class WakeAudienceTest(unittest.TestCase):
+    """WHO A SPELL'S WAKE REACHES: the seats that can act, never the pressed
+    seat alone. The wedge this pins: the one alarm about a wedged integrator
+    was addressed only to that integrator — it IS the integrator, no lead
+    resolved, and its pid-named slice named no seat — so the post reached
+    nobody who could act for 36 minutes.
+
+    THE COVERAGE MATRIX, pressed seat x {has a lead, is the integrator,
+    unnamed, homed in main}: every cell below names who hears the wake, and
+    every cell but the first carries a BACKUP — a present seat outside the
+    list whose own slice is not pressing, the steward first. Roster-only:
+    no /proc, no cgroup."""
+
+    ENV = ("HELM_HOME", "HELM_CHAT_DIR", "HELM_INTEGRATOR_SEAT",
+           "HELM_STEWARD_SEAT")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-wake-audience-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.prior = {k: os.environ.get(k) for k in self.ENV}
+        self.addCleanup(self.restore)
+        for k in self.ENV:
+            os.environ.pop(k, None)
+        # last_seen reads the chat dir's seen files first: point it here
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
+        self.now = time.time()
+
+    def restore(self):
+        for k, v in self.prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # name: (home room, cwd, seconds since seen; None = absent)
+    BASE = {"seat-lane": ("helm", "/x/helm-wt/lane", 5),
+            "seat-lead": ("helm", "/x/helm", 10),
+            "seat-integrator": ("main", "/x/helm", 20),
+            "seat-idle": ("other", "/x/other", 30),
+            "seat-gone": ("other", "/x/other", None)}
+
+    def rows(self, **over):
+        spec = dict(self.BASE)
+        spec.update(over)
+        return {name: {"home_room": room, "cwd": cwd,
+                       "last_seen": 0 if age is None else self.now - age}
+                for name, (room, cwd, age) in spec.items()
+                if room is not None}
+
+    def targets(self, seat, rows, hot=()):
+        """([mention], room): who hears the wake, and where."""
+        from helm import seats_common, seats_integrator
+        return scratch._wake_targets(seat, rows, seats_common,
+                                     seats_integrator, set(hot))[:2]
+
+    # ── the matrix ───────────────────────────────────────────────────────
+    def test_the_matrix_every_cell_reaches_a_seat_that_can_act(self):
+        cells = {
+            # a lane seat of a team room with a lead: the lead and the
+            # integrator can both act, and no backup is added
+            "has a lead": ("seat-lane", {},
+                           (["seat-lead", "seat-integrator"], "helm")),
+            # the integrator itself, homed in main: no lead, and it is never
+            # its own audience — the freshest other present seat is
+            "is the integrator": ("seat-integrator", {},
+                                  (["seat-lane"], "main")),
+            # the integrator homed in a team room: its lead AND a backup
+            "is the integrator, with a lead": (
+                "seat-integrator",
+                {"seat-integrator": ("helm", "/x/helm", 20)},
+                (["seat-lead", "seat-lane"], "helm")),
+            # no name resolved: it may BE the integrator, so a backup rides
+            # beside the integrator, and never the integrator twice
+            "unnamed": (None, {}, (["seat-integrator", "seat-lane"], "main")),
+            # a named seat homed in main: no lead there, so a backup
+            "homed in main": ("seat-idle",
+                              {"seat-idle": ("main", "/x/other", 30)},
+                              (["seat-integrator", "seat-lane"], "main")),
+        }
+        self.assertEqual(len(cells), 5, "a cell of the matrix was dropped")
+        got = {label: self.targets(seat, self.rows(**over))
+               for label, (seat, over, _want) in cells.items()}
+        self.assertEqual(got, {label: want for label, (_s, _o, want)
+                               in cells.items()})
+        for label, (seat, _o, _w) in cells.items():
+            mentions = got[label][0]
+            with self.subTest(cell=label):
+                self.assertNotIn(seat, mentions, "the pressed seat was its "
+                                                 "own audience")
+                self.assertNotIn("seat-gone", mentions)
+
+    def test_the_incident_cell_a_pid_slice_resolves_through_the_roster(self):
+        """The wedged seat's slice was named for a pid and its process carried
+        no seat name. The roster's recorded session names it — the
+        integrator — so it drops out of its own audience and the backup
+        carries the wake. Control: with no session to resolve, the unnamed
+        cell still adds the backup beside the integrator."""
+        from helm import seatceiling
+        sid = "abcdef01-2222-3333-4444-555555555555"
+        sl = "/cg/%s" % seatceiling.seat_slice_name("pid4242")
+        r = seatceiling.Pressure(sl, 104, 100, 1.04, None, (4242,),
+                                 (4242,), seatceiling.THROTTLED, None)
+        rows = self.rows()
+        rows["seat-integrator"]["session"] = sid
+        plane = {"slices": {sl: r}, "slice_seats": {},
+                 "slice_sessions": {sl: [sid]}}
+        self.assertEqual(scratch._audience(sl, plane, rows),
+                         ("seat-integrator", ["seat-lane"], "main", True))
+        plane["slice_sessions"] = {}
+        self.assertEqual(scratch._audience(sl, plane, rows),
+                         (None, ["seat-integrator", "seat-lane"], "main",
+                          False), "an unnamed slice cannot prove its backup is "
+                                  "distinct from the pressed seat")
+
+    def test_the_backup_prefers_the_steward(self):
+        rows = self.rows(**{"fleet-steward": ("other", "/x/other", 60)})
+        self.assertEqual(self.targets(None, rows),
+                         (["seat-integrator", "fleet-steward"], "main"))
+        # two seats with the suffix name no steward: the freshest carries it
+        rows = self.rows(**{"fleet-steward": ("other", "/x/other", 60),
+                            "other-steward": ("other", "/x/other", 70)})
+        self.assertEqual(self.targets(None, rows)[0],
+                         ["seat-integrator", "seat-lane"])
+
+    def test_the_steward_knob_names_it_and_a_typo_names_nobody(self):
+        os.environ["HELM_STEWARD_SEAT"] = "seat-idle"
+        self.assertEqual(self.targets(None, self.rows())[0],
+                         ["seat-integrator", "seat-idle"])
+        os.environ["HELM_STEWARD_SEAT"] = "no-such-seat"
+        rows = self.rows(**{"fleet-steward": ("other", "/x/other", 60)})
+        self.assertEqual(self.targets(None, rows)[0],
+                         ["seat-integrator", "seat-lane"],
+                         "a knob that resolves nothing fell back to a guess")
+
+    def test_a_pressing_seat_is_never_the_backup_nor_the_lead(self):
+        from helm import seatceiling
+        for hot in ({"seat-lane"},
+                    {seatceiling.seat_slice_name("seat-lane")}):
+            with self.subTest(hot=sorted(hot)):
+                self.assertEqual(self.targets(None, self.rows(), hot)[0],
+                                 ["seat-integrator", "seat-lead"])
+        # a pressing lead is no lead: the backup rides with the integrator
+        self.assertEqual(self.targets("seat-lane", self.rows(),
+                                      {"seat-lead"}),
+                         (["seat-integrator", "seat-idle"], "helm"))
+        # control, unconditional: cold, the same cells read as the matrix
+        self.assertEqual(self.targets(None, self.rows())[0],
+                         ["seat-integrator", "seat-lane"])
+
+    def test_an_unresolved_integrator_adds_a_backup_beside_the_lead(self):
+        """Two seats end in the integrator suffix, so no integrator resolves
+        and none is mentioned as one; the freshest present seat outside the
+        lead carries the backup."""
+        rows = self.rows(**{"other-integrator": ("main", "/x/o", 25)})
+        self.assertEqual(self.targets("seat-lane", rows),
+                         (["seat-lead", "seat-integrator"], "helm"))
+
+    def test_absent_seats_never_carry_the_wake(self):
+        rows = self.rows(**{"seat-lane": ("helm", "/x/helm-wt/lane", None),
+                            "seat-lead": ("helm", "/x/helm", None),
+                            "seat-idle": ("other", "/x/other", None)})
+        self.assertEqual(self.targets("seat-integrator", rows), ([], "main"))
+        self.assertEqual(self.targets(None, rows),
+                         (["seat-integrator"], "main"),
+                         "control: the integrator itself is present")
+
+    def test_only_a_seat_proven_able_counts_as_reached(self):  # noqa: VACUOUS_ASSERTION — the whole matrix is asserted EQUAL, and every cell names a non-empty mention list
+        """THE THIRD ANSWER: does the wake reach a seat PROVEN able to act?
+        The lead and the backup are chosen present and cold. The integrator
+        is mentioned whatever its state, so it counts only when it is named
+        apart from the pressed seat, present, and its own slice is cold."""
+        from helm import seats_common, seats_integrator
+        gone = {"seat-lane": ("helm", "/x/helm-wt/lane", None),
+                "seat-lead": ("helm", "/x/helm", None),
+                "seat-idle": ("other", "/x/other", None)}
+        cells = {
+            "has a lead": ("seat-lane", {}, (),
+                           (["seat-lead", "seat-integrator"], "helm", True)),
+            "is the integrator": ("seat-integrator", {}, (),
+                                  (["seat-lane"], "main", True)),
+            "unnamed, backup not proven distinct": (
+                None, {}, (), (["seat-integrator", "seat-lane"], "main",
+                               False)),
+            "unnamed, only the integrator present": (
+                None, gone, (), (["seat-integrator"], "main", False)),
+            "the integrator pressing, no lead, no backup": (
+                "seat-idle",
+                dict(gone, **{"seat-idle": ("main", "/x/other", 30)}),
+                ("seat-integrator",), (["seat-integrator"], "main", False)),
+            "the integrator absent, no lead, no backup": (
+                "seat-lane",
+                dict(gone, **{"seat-lane": ("helm", "/x/helm-wt/lane", 5),
+                              "seat-integrator": ("main", "/x/helm", None)}),
+                (), (["seat-integrator"], "helm", False)),
+        }
+        got = {label: scratch._wake_targets(seat, self.rows(**over),
+                                            seats_common, seats_integrator,
+                                            set(hot))
+               for label, (seat, over, hot, _want) in cells.items()}
+        self.assertEqual(got, {label: want for label, (_s, _o, _h, want)
+                               in cells.items()})
 
 
 class CloneSteerTest(unittest.TestCase):

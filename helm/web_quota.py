@@ -47,14 +47,23 @@ def _catalog_rows():
 
 
 
-def _claude_home_identity(home_p):
-    """oauthAccount email from a home's .claude.json — identity METADATA, never tokens."""
+def _claude_home_lineage(home_p):
+    """The token-lineage verdict `helm cred list` prints, from the ONE shared
+    reader (cred.token_lineage, task/2636): the accounts earlier censuses
+    recorded the home's token family under, beside the oauthAccount metadata.
+    A read that fails is UNKNOWN, never the metadata alone."""
+    from . import cred
     try:
-        with pk.open_regular(os.path.join(home_p, ".claude.json")) as f:
-            d = json.load(f)
-        return (d.get("oauthAccount") or {}).get("emailAddress")
-    except Exception:
-        return None
+        return cred.token_lineage(home_p)
+    except Exception:  # noqa: BLE001 — one row's read never costs the world
+        return {"state": "UNKNOWN", "tag": None, "accounts": [], "metadata": None,
+                "reason": "token lineage could not be read", "chrome": "UNKNOWN"}
+
+
+def _claude_home_identity(home_p):
+    """oauthAccount email from a home's .claude.json — identity METADATA, never
+    tokens — read through the same shared reader as the lineage."""
+    return _claude_home_lineage(home_p)["metadata"]
 
 
 
@@ -338,6 +347,18 @@ def _read_the_world():
         states, windows = {}, {}
         enrichment_cause = type(exc).__name__
         _log_world_fault("the quota windows could not be read")
+    try:
+        # THE 5H PACE (pace5h), from the watchdog pass's snapshot: a file
+        # read, never a probe, and never the reason a row is missing. Each
+        # record is described inside this same net, so one it cannot read
+        # leaves the rows "not measured", never the world unreadable.
+        from . import claudepace
+        pace = claudepace.cached()
+        pace = {a["name"]: claudepace.account_record(a["name"], pace)
+                for a in acquired
+                if pace and a.get("provider") == "anthropic"}
+    except Exception:  # noqa: BLE001
+        pace = {}
     merged = []
     for a in acquired:
         if a.get("provider") not in ("anthropic", "codex"):
@@ -347,7 +368,9 @@ def _read_the_world():
         home_p = a.get("home") or ""
         real = os.path.realpath(home_p) if home_p else ""
         home_name = os.path.basename(home_p) if home_p else None
-        identity = _claude_home_identity(real) if a["provider"] == "anthropic" and real else None
+        lineage = (_claude_home_lineage(real)
+                   if a["provider"] == "anthropic" and real else None)
+        identity = lineage["metadata"] if lineage else None
         name_lies = bool(identity) and _norm(identity) not in (_norm(home_name), _norm(os.path.basename(real)))
         merged.append({
             # WHICH SUBSCRIPTION THIS HOME IS ONE OF. Opaque: the login it
@@ -362,7 +385,13 @@ def _read_the_world():
             # provider's own spelling on the way to disk.
             "measured_key": _accounts.measured_key(a["name"]),
             "name": a["name"], "provider": a["provider"], "home": home_p,
+            # why the provider could not read this home's login, or None: one
+            # home's unknown login, never the census's (task/3635)
+            "login_unknown": a.get("login_unknown"),
             "home_name": home_name, "identity": identity, "name_lies": name_lies,
+            # the token family's recorded accounts against that metadata —
+            # lineage from earlier censuses, never the token's own identity
+            "token_lineage": lineage,
             "active": a.get("active", False), "tier": s.get("tier") or a.get("tier"),
             "headroom": s.get("headroom_pct"), "state": s.get("cred_state", "unknown"),
             "status": s.get("status"), "resets_at_ms": s.get("resets_at_ms"),
@@ -375,6 +404,7 @@ def _read_the_world():
             # credential, not to log in. So it rides its own flag, and the
             # page gives it its own label and cause.
             "member_unproven": s.get("status") == POOL_MEMBER_UNKNOWN,
+            "pace_5h": pace.get(a["name"]),
         })
         if enrichment_cause:
             # CARRIED ON THE ROW, because the table filters a row with no
@@ -590,6 +620,70 @@ def _api_flags():
         return {"measured": False, "families": {}, "overall": None,
                 "why": "the burn-flag read raised — UNMEASURED, not clean"}
 
+
+#: How long a declaration made from the family sheet lasts, by the word the
+#: sheet offers; "reset" is the flag's own next change, read from the fold.
+DECLARE_FOR_S = {"24h": 86400, "7d": 7 * 86400}
+
+
+def _api_burn_declare(payload):
+    """Declare a family's colour from its sheet (task/3155, placed on the
+    family sheet by task/3156) through `burnflags.declare`, the writer `helm
+    burn declare` calls.
+
+    WORSE-ONLY AT THE DOOR (the owner's Q1 default). The fold already ignores
+    a declaration that would improve a measured colour and says so
+    (`declared_ignored`); this door refuses it outright, so the owner is told
+    at the moment he presses rather than a pass later. To let one project run
+    lighter the lever is its share, which is measured, not declared."""
+    from . import burnflags as bf
+    family = str(payload.get("family") or "").strip()
+    colour = str(payload.get("colour") or "").strip().upper()
+    until = str(payload.get("until") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    if family not in bf.families():
+        return {"error": "%r is not a family helm measures" % family,
+                "code": "invalid"}, 400
+    if colour not in (bf.YELLOW, bf.ORANGE, bf.RED):
+        return {"error": "a declaration is YELLOW, ORANGE or RED",
+                "code": "invalid"}, 400
+    if not reason:
+        return {"error": "Say why: a declaration without a reason is "
+                         "unreadable by the next person.",
+                "code": "invalid"}, 400
+    flag = bf.family_flag(family) or {}
+    refused = bf.improving_declaration(colour, flag)
+    if refused:
+        return {"error": refused, "code": "not-worse"}, 400
+    now = time.time()
+    if until == "reset":
+        at = flag.get("expires_at")
+        if not isinstance(at, (int, float)) or at <= now:
+            return {"error": "no reset instant is known for %s; pick 24 "
+                             "hours or 7 days" % family,
+                    "code": "invalid"}, 400
+    elif until in DECLARE_FOR_S:
+        at = now + DECLARE_FOR_S[until]
+    else:
+        return {"error": "until is 24h, 7d or reset", "code": "invalid"}, 400
+    ok, err = bf.declare(family, colour, at, why=reason)
+    if not ok:
+        return {"error": err, "code": "failed"}, 500
+    return {"ok": True, "family": family, "colour": colour, "until": at,
+            "note": "Declared. It takes effect at the next watchdog pass "
+                    "(every 15 minutes) and shows as DECLARED by the owner, "
+                    "never as measured."}, 200
+
+
+
+def _api_models(qs):
+    """Fleet › models: the model scorecard (task/3448), the SAME board `helm
+    eval board --json` prints, over the same read (`scorecard.board_now`)."""
+    from . import scorecard
+    window = _q1(qs, "window") or scorecard.DEFAULT_WINDOW
+    if window not in scorecard.WINDOWS:
+        return {"error": "window is one of " + ", ".join(sorted(scorecard.WINDOWS))}, 400
+    return scorecard.board_now(window), 200
 
 
 def _api_creds(qs):
@@ -826,8 +920,9 @@ def _api_accounts_post(payload):
         # WHICH ROW THE FORM OPENED, beside the revision and for the same
         # reason: both say what the editor was looking at when he started. An
         # add carries neither.
-        out, err, code = accounts.save(row, expected_revision=revision,
-                                       original_id=payload.get("original_id"))
+        wrote = accounts.save(row, expected_revision=revision,
+                              original_id=payload.get("original_id"))
+        out, err, code = wrote
         if err:
             return {"error": err, "code": code}, _status(code)
         # THE SAME PRODUCER THE GET USES, never `out` on its own. `save`
@@ -876,9 +971,15 @@ def _api_accounts_post(payload):
                              "changed underneath it and helm can no longer "
                              "see the row. Reloading so the screen matches "
                              "what is really there.",
-                    "code": "stale", "revision": view["revision"]}, 409
+                    "code": "stale", "revision": wrote.revision}, 409
+        # THE REVISION THIS SAVE WROTE, never the read's. The read above ran
+        # after the lock was released, so it can already hold a third
+        # writer's save; the fill path adopts this revision without redrawing,
+        # and a revision covering that save would let its next cell pass the
+        # compare-and-set over a change it never drew. With the written one,
+        # that cell is refused and the card reloads.
         return {"ok": True, "account": saved,
-                "revision": view["revision"]}, 200
+                "revision": wrote.revision}, 200
     if act == "remove":
         ok, err, code = accounts.remove(payload.get("id") or "",
                                         expected_revision=revision)

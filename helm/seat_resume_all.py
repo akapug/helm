@@ -26,13 +26,19 @@ ONE ROW PER REGISTERED SEAT, classified through rebind's OWN proof:
              owner's layout survives.
   PANE-GONE  the same death evidence and orca answers terminal_not_found for
              the pane key -> `_resume` mints a pane through the metaharness.
+  NOT-LIVE-BEFORE-BOOT
+             the same death evidence and a register that predates the boot,
+             but the seat is absent from the live set recorded in the boot
+             before this one (below) -> nothing is done; the reason names the
+             dead state it was found in.
   UNKNOWN    anything else: an unreadable register, a rebind refusal that is
              NOT the death sentence (ambiguity, a live process whose pane is
              not in inventory, an RPC failure), a census that disagrees with
              rebind, a config dir with no transcript, a pane key resolving to
-             a pane that is not writable, or a pane key a LIVE claude process
+             a pane that is not writable, a pane key a LIVE claude process
              carries in its environ (the pane is up but not bare — typing a
-             launch line there would land in someone's composer). Rendered
+             launch line there would land in someone's composer), or a dead
+             row whose pre-boot live set did not read. Rendered
              with the reason, counted
              in the exit code under --apply, NEVER folded into skip or dead.
 
@@ -54,6 +60,28 @@ with "register postdates boot" so an operator can resume it by hand. An
 orca-adopted seat (a roster row, no register) is bound the same way through
 its roster `last_seen`.
 
+THE PRE-BOOT LIVE SET. "Predates the boot" is necessary and not sufficient:
+after ANY reboot every register predates the boot, so the stamp alone would
+relaunch every seat that ever had a register — seats merged into another,
+retired seats, test seats, rows whose session id is junk — and an unattended
+boot (a crash, a power loss) has no pre-flight step to stop it. So every
+--apply pass records the seats it found LIVE, plus the ones it resumed, in
+`<HELM_HOME>/_global/.state/resume-live-set/<boot id>.json` (disk, never
+tmpfs; one atomic rename; the file NAME is the kernel's boot id), and a dead
+row is acted on only when its seat is in the set recorded LAST in an earlier
+boot. The boot id, not btime, tells the boots apart: btime is the wall clock
+minus uptime, so a clock step moves it inside one boot, while the id is fixed
+for the life of a boot. The record is rewritten on every pass, so the last
+pass before a boot ended is the one the next boot reads; this boot's own
+record is never its population. Absent and unreadable are separate answers
+and both act on nothing: no earlier record is one footer line and the dead
+rows say so, while a record that does not read, or a boot id that does not,
+makes each such row UNKNOWN and names the file and the error — it is never
+read as an empty set (every dead row NOT-LIVE-BEFORE-BOOT on no evidence)
+nor as every seat. A dry run reads the set and records nothing. A pass whose
+roster did not read records nothing either: a set missing the adopted seats
+would read as complete at the next boot.
+
 FLEET HOLD, PER BOOT. When `<HELM_HOME>/_global/.state/fleet-hold` exists
 AND was written during the current boot (mtime >= btime), the sweep
 classifies and reports exactly as before but performs NO resume and NO disarm
@@ -67,22 +95,54 @@ without this bound the only ways to honour it were a hand step between
 reboot, the opposite of quiet) or a CLI step for the owner afterwards. The
 sweep removes an expired marker and says so in the footer; a hold meant to
 survive a boot is re-created after it.
+
+DESIRED-DOWN, PER SEAT. A seat an operator stood down with `helm seat down`
+carries a desired-down record in its proxy home (helm/seat_down.py). Its dead
+row reads DOWN (desired), names who stood it down, when and why, and is never
+relaunched: a reboot is not the operator changing their mind. It is not
+UNKNOWN and not a failure, so it never moves rc. `helm seat up <seat>` clears
+the record, and the next sweep treats the seat like any other. A record the
+sweep cannot read is planned as if absent, and the row says so.
+
+THE COMPOSED RULE (`gate`). A dead row is resumed ONLY IF its seat is in the
+pre-boot live set AND it is not desired-down. When both refuse, or when the
+set is missing or unreadable, the row reads DOWN (desired) and names what the
+set answered: the record is the operator's standing reason and outlives the
+boot, the set only measures the boot before. And the live set never records a
+desired-down seat as live, even one whose pane is still up (`seat down` stops
+the proxy, not the pane): a seat stood down before the last pass of a boot is
+outside the next boot's population, so clearing the record after the reboot
+(`seat up`) leaves it NOT-LIVE-BEFORE-BOOT, and `seat resume <seat>` is the
+hand relaunch. A seat stood down after the last pass is still in the set, and
+its record alone keeps it down.
 """
 import calendar
 import contextlib
 import io
+import json
 import os
+import re
 import shlex
 import sys
 import time
 
-from . import home
+from . import home, pk
 from .seat_launch_owner import TERMINAL_DISARM
 
 LIVE, DEAD_PANE, PANE_GONE, UNKNOWN = "LIVE", "DEAD-PANE", "PANE-GONE", "UNKNOWN"
+NOT_LIVE_BEFORE_BOOT = "NOT-LIVE-BEFORE-BOOT"
+STATES = (LIVE, DEAD_PANE, PANE_GONE, NOT_LIVE_BEFORE_BOOT, UNKNOWN)
 HOLD_MARKER = "fleet-hold"
 RESUMING = "RESUMING"          # the one ACTION value the sweep acts on
 HELD = "HELD"
+DOWN = "DOWN (desired)"        # an operator's `seat down`; never relaunched
+
+LIVE_SET_DIR = "resume-live-set"
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+_BOOT_ID = re.compile(r"\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+# read_pre_boot's three answers; only SET_READ lets a dead row be planned
+SET_READ, SET_MISSING, SET_UNREADABLE = "read", "missing", "unreadable"
+_LEAD = "helm seat resume --all: "
 
 # orca's own answer for a pane key the runtime no longer knows. PANE-GONE
 # requires this POSITIVE answer; any other resolve failure (daemon down,
@@ -108,9 +168,6 @@ def hold_state():
         return False, True
     return True, False
 
-
-def fleet_held():
-    return hold_state()[0]
 
 
 def disarm_line():
@@ -157,6 +214,160 @@ def boot_epoch():
     return rearm._boot_time()
 
 
+def boot_id():
+    """This boot's kernel id, or None when it does not read as one. It names
+    the live-set file a pass records and excludes that file from the pre-boot
+    choice, so a value that is not the kernel's uuid shape is None, never a
+    file name."""
+    try:
+        with open(BOOT_ID_PATH, encoding="ascii") as fh:
+            raw = fh.read().strip()
+    except (OSError, ValueError):
+        return None
+    return raw if _BOOT_ID.match(raw) else None
+
+
+def live_set_dir():
+    return os.path.join(home.global_dir(), ".state", LIVE_SET_DIR)
+
+
+def _load_live_set(path, boot):
+    """(seats, why) for one recorded set, validated WHOLE: a file that is not
+    exactly what `record_live_set` writes is unreadable, never partly read."""
+    try:
+        doc = pk.read_json(path, strict=True)
+    except (OSError, ValueError) as e:
+        return None, str(e)
+    if not isinstance(doc, dict) or doc.get("v") != 1 \
+            or isinstance(doc.get("v"), bool):
+        return None, "not a version-1 live-set record"
+    if doc.get("boot_id") != boot:
+        return None, "its boot_id is not the boot its file name says"
+    seats = doc.get("seats")
+    if not isinstance(seats, dict):
+        return None, "its seats field is not an object"
+    if not all(isinstance(e, dict)
+               and isinstance(e.get("session"), (str, type(None)))
+               for e in seats.values()):
+        return None, "a seat entry is not an object with a session id or null"
+    return {k: e["session"] for k, e in seats.items()}, None
+
+
+def read_pre_boot(boot):
+    """(answer, seats, line): the live set recorded LAST in a boot other than
+    `boot` — the only seats a post-boot pass may relaunch.
+
+    answer is SET_READ with seats {seat: session or None}, SET_MISSING when no
+    earlier boot recorded one, or SET_UNREADABLE when this boot's id, the
+    directory or the newest earlier record did not read. `line` is the one
+    footer sentence saying which. "Last" is the newest file by mtime among
+    the other boots' files, and each boot's file is rewritten by every pass
+    in it, so the last pass before a boot ended wins."""
+    if boot is None:
+        return SET_UNREADABLE, None, _LEAD + (
+            "this boot's id did not read from %s, so no record can be told "
+            "from this boot's own; no seat is relaunched as a reboot casualty"
+            % BOOT_ID_PATH)
+    d = live_set_dir()
+    try:
+        names = sorted(os.listdir(d))
+    except FileNotFoundError:
+        names = []
+    except OSError as e:
+        return SET_UNREADABLE, None, _LEAD + (
+            "the live-set directory %s did not read: %s; no seat is "
+            "relaunched as a reboot casualty" % (d, e))
+    found = []
+    for n in names:
+        stem = n[:-len(".json")] if n.endswith(".json") else ""
+        if stem == boot or not _BOOT_ID.match(stem):
+            continue                    # this boot's own, a tmp, or a stranger
+        path = os.path.join(d, n)
+        try:
+            found.append((os.lstat(path).st_mtime, path, stem))
+        except OSError as e:
+            return SET_UNREADABLE, None, _LEAD + (
+                "the live-set record %s did not read: %s; no seat is "
+                "relaunched as a reboot casualty" % (path, e))
+    if not found:
+        return SET_MISSING, None, _LEAD + (
+            "no live set was recorded in an earlier boot (%s); no seat is "
+            "relaunched as a reboot casualty until one is" % d)
+    _mtime, path, stem = max(found)
+    seats, why = _load_live_set(path, stem)
+    if why:
+        return SET_UNREADABLE, None, _LEAD + (
+            "the pre-boot live set %s did not read: %s; no seat is relaunched "
+            "as a reboot casualty, and it is never read as empty" % (path, why))
+    return SET_READ, seats, _LEAD + (
+        "pre-boot live set %s names %d seat(s); a dead row outside it reads "
+        "%s and is left alone" % (path, len(seats), NOT_LIVE_BEFORE_BOOT))
+
+
+def admit(row, pre):
+    """True when a dead row the boot binding kept actionable may be planned:
+    its seat is in the pre-boot live set. Any other answer rewrites the row
+    to say why nothing is done, and is False."""
+    answer, seats, _line = pre
+    if answer == SET_MISSING:
+        row.action = "none: no pre-boot live set"
+        return False
+    if answer != SET_READ:
+        row.state = UNKNOWN
+        row.reason += "; its pre-boot live set did not read (see footer)"
+        return False
+    if row.seat not in seats:
+        row.reason = "%s now: %s" % (row.state, row.reason)
+        row.state, row.action = NOT_LIVE_BEFORE_BOOT, "none: not live before boot"
+        return False
+    return True
+
+
+def record_live_set(table, apply, partial, boot, btime):
+    """(line, failed): write THIS boot's live set, the next boot's
+    population. It holds every row found LIVE and every row resumed with rc 0
+    — a crash before the next pass must not forget a seat this pass brought
+    back. Written only under --apply, and never from a partial table.
+
+    A DESIRED-DOWN SEAT IS NEVER LIVE HERE. `seat down` stops a proxy seat's
+    proxy, not its pane, so a stood-down seat can still read LIVE; recorded,
+    it would be the next boot's population, and the only thing then keeping
+    it dead would be its record. Left out, a seat stood down before the last
+    pass of a boot is outside the next boot's set, and reads DOWN (or, once
+    `seat up` clears the record, NOT-LIVE-BEFORE-BOOT) after it. Only a
+    READABLE record leaves a seat out: an unreadable one is supervised as if
+    absent (helm/seat_down.py), and the row already says so. The line names
+    every seat left out."""
+    from . import seats as seats_mod
+    found = [r for r in table if r.state == LIVE or r.action == "resumed"]
+    seats = {r.seat: {"session": r.session,
+                      "via": "live" if r.state == LIVE else "resumed"}
+             for r in found if not r.down}
+    down = sorted(seats_mod._seat_label(r.seat) for r in found if r.down)
+    left = ("; %d desired-down seat(s) left out, never recorded live: %s"
+            % (len(down), ", ".join(down))) if down else ""
+    if not apply:
+        return _LEAD + ("this boot's live set (%d seat(s)) is not recorded: "
+                        "DRY RUN%s" % (len(seats), left)), False
+    if partial:
+        return _LEAD + ("this boot's live set is NOT recorded: the roster did "
+                        "not read, and a set missing the adopted seats would "
+                        "read as complete at the next boot"), True
+    if boot is None:
+        return _LEAD + ("this boot's live set is NOT recorded: this boot's id "
+                        "did not read from %s" % BOOT_ID_PATH), True
+    path = os.path.join(live_set_dir(), boot + ".json")
+    doc = {"v": 1, "boot_id": boot, "btime": btime, "written": pk.now_ts(),
+           "seats": seats}
+    try:
+        pk.atomic_write(path, json.dumps(doc, indent=1, sort_keys=True) + "\n")
+    except OSError as e:
+        return _LEAD + ("could not record this boot's live set at %s: %s"
+                        % (path, e)), True
+    return _LEAD + ("recorded this boot's live set, %d seat(s): %s%s"
+                    % (len(seats), path, left)), False
+
+
 def _memo(fn):
     box = []
 
@@ -168,24 +379,30 @@ def _memo(fn):
 
 
 class Row(object):
-    __slots__ = ("seat", "kind", "state", "session", "action", "reason")
+    # `down` is the seat's READABLE desired-down record, set by `gate`: a row
+    # carrying one is never relaunched and never recorded in the live set
+    __slots__ = ("seat", "kind", "state", "session", "action", "reason",
+                 "down")
 
     def __init__(self, seat, kind, state, session=None, action="-", reason=""):
         self.seat, self.kind, self.state = seat, kind, state
         self.session, self.action, self.reason = session, action, reason
+        self.down = None
 
     def line(self):
         # the seat column is the table's first and widest, and for an adopted
         # seat it is a ROSTER KEY (unvalidated at the join seam) — laundered
         # here, at the one emit site, the same law as `seat panes`
         from . import seats
-        return "%-14s %-14s %-9s %-8s %-30s %s" % (
+        return _ROW % (
             seats._seat_label(self.seat), self.kind, self.state,
             (self.session or "-")[:8], self.action, self.reason)
 
 
-HEADER = "%-14s %-14s %-9s %-8s %-30s %s" % (
-    "SEAT", "FAMILY/HARNESS", "STATE", "SESSION", "ACTION", "REASON")
+# the STATE column fits its widest word, so every row stays aligned
+_ROW = "%%-14s %%-14s %%-%ds %%-8s %%-30s %%s" % max(map(len, STATES))
+HEADER = _ROW % ("SEAT", "FAMILY/HARNESS", "STATE", "SESSION", "ACTION",
+                 "REASON")
 
 
 def _inventory_row(rows, handle):
@@ -455,9 +672,107 @@ def classify_adopted(name, ad, boot, roster_row=None, rows=(), apply=False):
                               else None, boot, "roster last_seen")
 
 
-def plan(row, apply, held):
-    """Fill the ACTION column for a dead row; RESUMING is what the sweep acts
-    on, HELD is rendered as itself so a held fleet never reads as swept."""
+def desired_down(name):
+    """(record, error) for a seat's desired-down record (helm/seat_down.py).
+    Never raises into the sweep: a read that breaks is an error, and an error
+    is the SUPERVISED direction — the seat is swept as if no record existed,
+    and its row says why."""
+    from . import seat_down
+    try:
+        return seat_down.read_seat(name)
+    except Exception as e:                  # noqa: BLE001 — a reason on the row, never a dead sweep
+        return None, "desired-down record could not be read: %s" % e
+
+
+def gate(row, apply, held, pre):
+    """THE COMPOSED RULE, over one classified row: a dead row is resumed ONLY
+    IF its seat is in the pre-boot live set AND no operator stood it down.
+
+    Each half answers a different question and neither implies the other. The
+    live set measures the boot before (was this seat running when the boot
+    ended?); the desired-down record states the operator's intent (should it
+    run at all?). A seat live before the boot and stood down after the last
+    pass is IN the set, so only its record keeps it dead; a seat stood down
+    and never live is OUTSIDE it and carries the record too.
+
+    DOWN WINS when both say no, and when the set did not read at all. The
+    record is a standing statement that outlives any number of boots and
+    names its own remedy; the set is only a measurement of the boot before,
+    and a set helm could not read or never wrote says nothing about a seat
+    whose operator already answered the one question the row asks. So the row
+    reads DOWN (desired), never NOT-LIVE-BEFORE-BOOT or UNKNOWN, never moves
+    rc, and still says what the set answered — after `seat up` clears the
+    record, that answer is the row's word.
+
+    A LIVE row whose seat carries a record stays LIVE (its pane IS alive: the
+    proxy is what `seat down` stops) and is marked so `record_live_set`
+    leaves it out. An UNREADABLE record is supervised as if absent on every
+    row it reaches, and the row says so (helm/seat_down.py). A dead row the
+    boot binding already answered (a register stamped this boot) is left to
+    that answer, with the record named beside it."""
+    from . import seat_down
+    if row.state not in (LIVE, DEAD_PANE, PANE_GONE):
+        return row
+    rec, unreadable = desired_down(row.seat)
+    if unreadable:
+        row.reason += "; ⚠ " + seat_down.unreadable_text(row.seat, unreadable)
+    row.down = rec or None
+    if row.state == LIVE:
+        if rec:
+            row.reason += ("; %s — left out of this boot's live set, so no "
+                           "later boot relaunches it" % seat_down.describe(rec))
+        return row
+    if row.action != "-":
+        if rec:
+            row.reason += "; %s" % seat_down.describe(rec)
+        return row
+    if rec:
+        return plan(row, apply, held, rec, pre)
+    if admit(row, pre):
+        plan(row, apply, held)
+    return row
+
+
+def _beside_the_set(seat_name, pre):
+    """What a DOWN row says about the pre-boot live set it did not need."""
+    answer, seats, _line = pre
+    if answer == SET_READ and seat_name in seats:
+        return ""
+    if answer == SET_READ:
+        return ("; also absent from the pre-boot live set — DOWN wins: the "
+                "record is the operator's standing reason, the set only "
+                "measures the boot before, so once `helm seat up %s` clears "
+                "the record this row reads %s, and `helm seat resume %s` "
+                "relaunches it by hand" % (seat_name, NOT_LIVE_BEFORE_BOOT,
+                                            seat_name))
+    if answer == SET_MISSING:
+        return ("; no pre-boot live set either (see footer) — DOWN wins: the "
+                "operator's record needs no set")
+    return ("; its pre-boot live set did not read (see footer) — DOWN wins: "
+            "the operator's record already answers whether it is relaunched, "
+            "so the row is not UNKNOWN")
+
+
+def plan(row, apply, held, down=None, pre=None):
+    """Fill the ACTION column for a dead row `gate` admitted, or for one
+    whose seat carries a readable desired-down record `down`. RESUMING is
+    what the sweep acts on, HELD is rendered as itself so a held fleet never
+    reads as swept.
+
+    DOWN comes first and is its own action: an operator ran `helm seat down`
+    on this seat, and a reboot is not an operator changing their mind. The
+    seat is reported, never relaunched, and never counted as a failure; it
+    outranks HELD too, because the hold lifts with the boot and the record
+    does not. `helm seat up <seat>` clears the record and the next sweep
+    treats the seat like any other — through the pre-boot live set, which
+    `_beside_the_set` names on the row whenever it would not admit the seat."""
+    from . import seat_down
+    if down:
+        row.action = DOWN
+        row.reason += "; %s — not relaunched; %s%s" % (
+            seat_down.describe(down), seat_down.resume_hint(row.seat),
+            _beside_the_set(row.seat, pre) if pre else "")
+        return row
     if held:
         row.action = HELD
     elif not apply:
@@ -536,6 +851,8 @@ def cmd_resume_all(rest):
     census = _memo(orcaadopt.claude_processes)
     held_sids = _memo(sessions.live_sids)
     boot = boot_epoch()
+    this_boot = boot_id()
+    pre = read_pre_boot(this_boot)
 
     print(HEADER)
     table, failed = [], 0
@@ -548,8 +865,7 @@ def cmd_resume_all(rest):
     for name, classify in pending:
         row, handle = classify()
         table.append(row)
-        if row.state in (DEAD_PANE, PANE_GONE) and row.action == "-":
-            plan(row, apply, held)
+        gate(row, apply, held, pre)
         print(row.line())
         if row.action != RESUMING:
             continue
@@ -577,12 +893,18 @@ def cmd_resume_all(rest):
     for row in table:
         counts[row.state] = counts.get(row.state, 0) + 1
     acted = sum(1 for r in table if r.action.startswith("resume"))
-    print("helm seat resume --all: %s%s%s" % (
-        ", ".join("%d %s" % (counts[k], k) for k in
-                  (LIVE, DEAD_PANE, PANE_GONE, UNKNOWN) if counts.get(k))
+    stood_down = sum(1 for r in table if r.action == DOWN)
+    print("helm seat resume --all: %s%s%s%s" % (
+        ", ".join("%d %s" % (counts[k], k) for k in STATES if counts.get(k))
         or "no registered seats",
         "" if apply else " — DRY RUN, nothing written, nothing sent",
-        "; %d resumed, %d failed" % (acted - failed, failed) if acted else ""))
+        "; %d resumed, %d failed" % (acted - failed, failed) if acted else "",
+        "; %d desired-down, not relaunched" % stood_down if stood_down
+        else ""))
+    print(pre[2])
+    line, unrecorded = record_live_set(table, apply, roster_failed, this_boot,
+                                       boot)
+    print(line)
     if held:
         print("helm seat resume --all: FLEET HOLD in effect — no resume and no "
               "disarm write while %s exists" % hold_marker_path())
@@ -595,7 +917,7 @@ def cmd_resume_all(rest):
             gone = "could not remove it: %s" % e
         print("helm seat resume --all: the fleet hold at %s predates this boot "
               "and EXPIRED with it — %s" % (hold_marker_path(), gone))
-    if apply and (counts.get(UNKNOWN) or failed):
+    if apply and (counts.get(UNKNOWN) or failed or unrecorded):
         return 1
     return 0
 

@@ -116,7 +116,8 @@ class TestApplySeed(LineageBase):
                                           "confirmed": True}],
                                "external": [{"name": "gamma"}]}, f)
                 self.assertEqual(lineage.seed_path(), owned)
-                seed = json.load(open(owned, encoding="utf-8"))
+                with open(owned, encoding="utf-8") as fh:
+                    seed = json.load(fh)
                 for e in seed["edges"]:
                     for k in ("src", "rel", "dst", "note"):
                         self.assertIn(k, e)

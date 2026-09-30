@@ -185,7 +185,8 @@ class HollowTest(unittest.TestCase):
         sections whose content is the next key in the block — measured, and
         precisely backwards: the emptier the entry, the healthier it looks."""
         p = self._entry("just some prose\n")
-        whole = handoff._summaries(open(p, encoding="utf-8").read())
+        with open(p, encoding="utf-8") as fh:
+            whole = handoff._summaries(fh.read())
         self.assertTrue(whole, "the trap must be real, or this proves nothing")
         self.assertEqual(handoff.hollow(p), ("done", "remaining", "next"),
                          "hollow() must read the body, never the frontmatter")

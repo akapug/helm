@@ -21,9 +21,9 @@ import time
 import unittest
 from unittest import mock
 
-from helm import (carriageckpt, dispatches, eventledger, foldckpt, landreq,
-                  obligation, projscope, proxywatch, rowstate, rowworld, seats,
-                  vcs)
+from helm import (carriageckpt, dispatches, eventledger, foldckpt, gitfacts,
+                  landreq, obligation, projscope, proxywatch, rowstate,
+                  rowworld, seats, vcs)
 from tests._satellite_resolution import ledger_sources
 # The module, never its TestCase: tests/test_suite_collection.py says why.
 from tests import test_landreq as _landreq
@@ -390,9 +390,9 @@ class CloseBase(_landreq.LandReqBase):
                  "proxy_pid": 4201, "proxy_identity": "proc:702",
                  "proxy_config": "/safe/config.yaml",
                  "config_sha256": "a" * 64,
-                 "route": {"alias": "ds4-pro", "provider": "opencode-go",
+                 "route": {"alias": "ds4-pro", "provider": "deepseek-direct",
                            "upstream_model": "deepseek-v4-pro",
-                           "base_url": "https://opencode.ai/zen/go/v1"},
+                           "base_url": "https://api.deepseek.com/v1"},
                  "observed_at": 1000,
                  "canary": {"state": "HEALTHY", "status": 200}}
         # DERIVED FROM THE PROOF, never hand-written to match it. The minter
@@ -7710,6 +7710,462 @@ class CarriedRebaseLandedTest(CloseBase):
                          "door the sentence names must be measured here")
 
 
+class CarriedReviewedPatchIdentityTest(CloseBase):
+    """A FIX WHOSE REVIEWED PATCHES LANDED UNDER REBASED SHAS (task/1484).
+
+    Measured on the live board: rows 0f27a80f3708 (goal-ledger-wave1) and
+    514b6b43ad39 (gateaudits composition) landed with the reviewer's patch
+    commits on trunk under new shas, and every door refused them. `carried`
+    asks patch identity over the WHOLE lane up to the reviewed tip, and those
+    lanes landed their own commits REWORKED, so the range read `+` for work
+    the FIX never asked about while every cure commit had a twin on trunk.
+
+    THE RUNG ASKS THE CURE'S QUESTION: every commit in `reviewed..patch_tip`
+    must have exactly one patch-identical (`git patch-id --stable`) commit on
+    the pinned trunk, inside a bounded window, and the close records each
+    reviewed sha beside its trunk sha and patch id. Nothing else is loosened:
+    an unmatched, partly landed or colliding cure refuses by name, and a git
+    that cannot answer is UNKNOWN."""
+
+    def cured_lane(self):
+        """Lane work R reviewed as a FIX, and the reviewer's cure A-B off it
+        with patch tip B."""
+        self.git("checkout", "-q", "-b", "cured-lane")
+        reviewed = self.commit("R", path="feature")
+        a = self.commit("A", path="cure-a")
+        b = self.commit("B", path="cure-b")
+        self.git("checkout", "-q", self.main)
+        return reviewed, a, b
+
+    def fix_row(self, reviewed, patch, lane="lane/cured-fix"):
+        row, why, sent = dispatches.send(
+            "codex-3", lane, "review " + lane, reviewed, repo=self.repo,
+            key="key-" + lane, sign=False, new_work=True)
+        self.assertIsNone(why)
+        self.assertTrue(sent)
+        out, err = self.mark_verdict(row["id"], reviewed, "findings",
+                                     polarity="fix", patch_tip=patch)
+        self.assertIsNone(err)
+        self.assertEqual(out["patch_tip"], patch)
+        return row
+
+    def rebase_land(self, patches):
+        """Trunk carries the lane REWORKED plus each of `patches` under a new
+        sha, with unrelated commits between them. A `(sha, None)` entry is
+        cherry-picked; `(sha, text)` lands that cure's file with DIFFERENT
+        content, which is a different patch id."""
+        self.commit("unrelated one", path="other")
+        self.commit("R reworked on land", path="feature")
+        landed = []
+        for sha, changed in patches:
+            if changed is None:
+                self.git("cherry-pick", sha)
+            else:
+                self.commit(changed, path=changed.split()[0])
+            landed.append(self.git("rev-parse", "HEAD"))
+            self.commit("unrelated after", path="other")
+        return landed
+
+    def patch_id(self, sha):
+        shown = subprocess.run(["git", "-C", self.repo, "show", sha],
+                               capture_output=True, check=True).stdout
+        out = subprocess.run(["git", "patch-id", "--stable"], input=shown,
+                             capture_output=True, check=True).stdout
+        return out.decode().split()[0]
+
+    def test_a_rebased_cure_closes_with_its_mapping_recorded(self):
+        reviewed, a, b = self.cured_lane()
+        a2, b2 = self.rebase_land([(a, None), (b, None)])
+        row = self.fix_row(reviewed, b)
+        # MUST-HITS: nothing reached trunk by sha, and the whole-lane
+        # question refuses — the lane's own commit landed reworked.
+        trunk = "refs/heads/" + self.main
+        for sha in (reviewed, a, b):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.git("merge-base", "--is-ancestor", sha, trunk)
+        self.assertEqual(rowworld._reached_trunk(self.gitdir(), reviewed,
+                                                 trunk), (None, [reviewed]))
+        before = self.history_len(row["id"])
+        out, err = landreq.close(row["id"], "carried",
+                                 evidence="the cure landed rebased",
+                                 repo=self.repo)
+        self.assertEqual(err, None)
+        self.assertEqual(out["close_reason"], "carried")
+        self.assertEqual(self.history_len(row["id"]), before + 1)
+        event = self.close_event(row["id"])
+        self.assertEqual(event["close_proof_mode"], "reviewed-patch-identity")
+        self.assertEqual((event["carried_base"], event["carried_tip"]),
+                         (reviewed, b))
+        self.assertEqual(event["patch_twins"], [
+            {"reviewed": a, "trunk": a2, "patch_id": self.patch_id(a)},
+            {"reviewed": b, "trunk": b2, "patch_id": self.patch_id(b)}])
+        self.assertEqual(self.patch_id(a2), self.patch_id(a))
+        # AND THE FOLD CARRIES THE MAPPING onto the closed row.
+        current, _verdicts, unavailable = dispatches.snapshot_with_verdicts()
+        self.assertEqual(unavailable, None)
+        self.assertEqual(current[row["id"]]["close_reason"], "carried")
+        self.assertEqual(current[row["id"]]["patch_twins"],
+                         event["patch_twins"])
+
+    def test_a_changed_patch_refuses_and_names_it(self):
+        reviewed, a, b = self.cured_lane()
+        self.rebase_land([(a, None), (b, "cure-b B reworked on land")])
+        row = self.fix_row(reviewed, b)
+        before = self.history_len(row["id"])
+        out, err = landreq.close(row["id"], "carried", evidence="try it",
+                                 repo=self.repo)
+        self.assertEqual(out, None)
+        self.assertIn("no patch-identical commit", err)
+        self.assertIn(b[:12], err)
+        self.assertNotIn(a[:12], err)
+        self.assertEqual(self.history_len(row["id"]), before)
+
+    def test_only_the_first_patch_landed_refuses(self):
+        reviewed, a, b = self.cured_lane()
+        self.rebase_land([(a, None)])
+        row = self.fix_row(reviewed, b)
+        before = self.history_len(row["id"])
+        out, err = landreq.close(row["id"], "carried", evidence="try it",
+                                 repo=self.repo)
+        self.assertEqual(out, None)
+        self.assertIn("no patch-identical commit", err)
+        self.assertIn(b[:12], err)
+        self.assertEqual(self.history_len(row["id"]), before)
+
+    def test_two_reviewed_patches_on_one_trunk_commit_refuse(self):
+        """A collision: the cure adds a file, removes it and adds it again, so
+        its first and third commits share one patch id while trunk carries
+        that patch ONCE."""
+        self.git("checkout", "-q", "-b", "colliding-lane")
+        reviewed = self.commit("R", path="feature")
+        first = self.commit("X", path="cure-x")
+        self.git("rm", "-q", "cure-x")
+        self.git("commit", "-q", "-m", "drop")
+        drop = self.git("rev-parse", "HEAD")
+        third = self.commit("X", path="cure-x")
+        self.git("checkout", "-q", self.main)
+        self.assertEqual(self.patch_id(first), self.patch_id(third))
+        self.rebase_land([(first, None), (drop, None)])
+        row = self.fix_row(reviewed, third, lane="lane/colliding-fix")
+        before = self.history_len(row["id"])
+        out, err = landreq.close(row["id"], "carried", evidence="try it",
+                                 repo=self.repo)
+        self.assertEqual(out, None)
+        self.assertIn("share one trunk commit", err)
+        self.assertIn(first[:12], err)
+        self.assertIn(third[:12], err)
+        self.assertEqual(self.history_len(row["id"]), before)
+
+    def test_a_git_that_cannot_answer_is_unknown_and_closes_nothing(self):
+        reviewed, a, b = self.cured_lane()
+        self.rebase_land([(a, None), (b, None)])
+        row = self.fix_row(reviewed, b)
+        before = self.history_len(row["id"])
+        real = vcs.GitVcs.text
+
+        def failing(this, cwd, *args, **kwargs):
+            if args and args[0] == "patch-id":
+                return 128, "", "fatal: simulated"
+            return real(this, cwd, *args, **kwargs)
+        with mock.patch.object(vcs.GitVcs, "text", failing):
+            out, err = landreq.close(row["id"], "carried", evidence="try it",
+                                     repo=self.repo)
+        self.assertEqual(out, None)
+        self.assertIn("UNKNOWN", err)
+        self.assertEqual(self.history_len(row["id"]), before)
+
+    def test_an_ancestor_land_keeps_the_carried_door_as_it_was(self):
+        """The cure merged by ANCESTRY is not this rung's subject: carried's
+        own answer stands, and nothing new is asked or recorded."""
+        reviewed, _a, b = self.cured_lane()
+        self.git("merge", "-q", "--ff-only", b)
+        row = self.fix_row(reviewed, b, lane="lane/ancestor-fix")
+        before = self.history_len(row["id"])
+        out, err = landreq.close(row["id"], "carried", evidence="try it",
+                                 repo=self.repo)
+        self.assertEqual(out, None)
+        self.assertIn("ALREADY history of", err)
+        self.assertNotIn("patch-identical", err)
+        self.assertEqual(self.history_len(row["id"]), before)
+
+    def test_a_whole_range_rebase_still_takes_the_reached_trunk_witness(self):
+        """The rung runs only where carried's own witnesses are silent: a lane
+        that landed ENTIRELY by patch identity keeps closing as before."""
+        reviewed, a, b = self.cured_lane()
+        self.commit("unrelated one", path="other")
+        for sha in (reviewed, a, b):
+            self.git("cherry-pick", sha)
+        row = self.fix_row(reviewed, b, lane="lane/whole-fix")
+        out, err = landreq.close(row["id"], "carried", evidence="why",
+                                 repo=self.repo)
+        self.assertEqual(err, None)
+        event = self.close_event(row["id"])
+        self.assertEqual(event["close_proof_mode"], "reached-trunk")
+        self.assertEqual(event.get("patch_twins"), None)
+
+    def test_a_forged_mapping_is_refused_at_replay(self):
+        reviewed, a, b = self.cured_lane()
+        self.rebase_land([(a, None), (b, None)])
+        row = self.fix_row(reviewed, b)
+        pre_current, pre_verdicts, _u = dispatches.snapshot_with_verdicts()
+        pre_state = pre_current[row["id"]]
+        _out, err = landreq.close(row["id"], "carried", evidence="why",
+                                  repo=self.repo)
+        self.assertEqual(err, None)
+        event = self.close_event(row["id"])
+        self.assertEqual(dispatches._close_event_error(
+            event, pre_state, current=pre_current, verdicts=pre_verdicts),
+            None)
+        twins = event["patch_twins"]
+        for name, forged in (
+                ("tip", dict(event, carried_tip=reviewed)),
+                ("base", dict(event, carried_base=a)),
+                ("partial", dict(event, patch_twins=twins[:1])),
+                ("collision", dict(event, patch_twins=[twins[0], dict(
+                    twins[1], trunk=twins[0]["trunk"])])),
+                ("schema", dict(event, patch_twins=[
+                    dict(twins[0], patch_id="short"), twins[1]])),
+                ("witness", dict(event, close_proof_mode="reached-trunk"))):
+            with self.subTest(forged=name):
+                self.assertTrue(dispatches._close_event_error(
+                    forged, pre_state, current=pre_current,
+                    verdicts=pre_verdicts))
+
+    def test_the_writer_refuses_a_mapping_git_does_not_measure(self):
+        """Replay holds the ledger half only, so a well-shaped mapping naming
+        commits git never paired is the WRITER's to refuse, under the lock."""
+        reviewed, a, b = self.cured_lane()
+        a2, b2 = self.rebase_land([(a, None), (b, None)])
+        row = self.fix_row(reviewed, b)
+        before = self.history_len(row["id"])
+        forged = [{"reviewed": a, "trunk": b2, "patch_id": self.patch_id(a)},
+                  {"reviewed": b, "trunk": a2, "patch_id": self.patch_id(b)}]
+        out, err = dispatches._record_close_proven(
+            row["id"], "carried", reviewed, evidence="forged",
+            closing_repo_id=self.gitdir(),
+            closing_trunk_ref="refs/heads/" + self.main,
+            closing_trunk_sha=self.git("rev-parse", self.main),
+            carried_base=reviewed, carried_tip=b,
+            proof_mode=dispatches.REVIEWED_PATCH_IDENTITY,
+            patch_twins=forged)
+        self.assertEqual(out, None)
+        self.assertIn("not the mapping git measures", err)
+        self.assertEqual(self.history_len(row["id"]), before)
+
+    # -- THE TRUNK BINDING (the codex review's P2 on task/1484) --------------
+    #
+    # The mapping is measured against ONE pinned trunk commit, so it says
+    # nothing about trunk once that commit is no longer history of the trunk
+    # ref. `carried` has always held that binding: its replay asks
+    # `_measured_trunk_is_history` before any witness, and its writer runs
+    # that replay under the lock. The rung returned before that question, so
+    # a trunk moved or force-rewritten between the ladder's pin and the
+    # writer, or rewritten after the close, left a cure current trunk does
+    # not carry CLOSED on a schema-only replay. The arms below hold the rung
+    # to carried's binding, and the ordinary rebased cure is the must-hit.
+
+    def close_while_trunk_moves(self, move):
+        """Close the rebased cure while `move(base)` rewrites trunk AFTER the
+        ladder pinned it and BEFORE the writer runs; `base` is trunk before
+        the land. -> (row, out, err, ref, pin, before)"""
+        base = self.git("rev-parse", "HEAD")
+        reviewed, a, b = self.cured_lane()
+        self.rebase_land([(a, None), (b, None)])
+        row = self.fix_row(reviewed, b)
+        before = self.history_len(row["id"])
+        real = dispatches._record_close_proven
+        pins = []
+
+        def moved(*args, **kwargs):
+            if not pins:
+                pins.append((kwargs["closing_trunk_ref"],
+                             kwargs["closing_trunk_sha"]))
+                move(base)
+            return real(*args, **kwargs)
+        with mock.patch.object(dispatches, "_record_close_proven", moved):
+            out, err = landreq.close(row["id"], "carried", evidence="why",
+                                     repo=self.repo)
+        self.assertEqual(len(pins), 1, "the ladder never reached the writer")
+        ref, pin = pins[0]
+        # MUST-HITS: the move really took the pin out of the ref's history,
+        # and the mapping measured against the pin STILL matches, so a
+        # refusal below is the trunk binding's and never the twins'.
+        self.assertIs(dispatches._measured_trunk_is_history(
+            self.gitdir(), pin, ref), False,
+            "the move left the pin in trunk's history; it tests nothing")
+        state = dispatches.snapshot()[0][row["id"]]
+        twins, why = landreq._reviewed_patch_twins(self.gitdir(), state, pin)
+        self.assertTrue(twins, "the pinned trunk no longer matches: %s" % why)
+        return row, out, err, ref, pin, before
+
+    def assert_pin_refused(self, row, out, err, ref, pin, before):
+        self.assertEqual(out, None, "a close bound a trunk its ref no "
+                                    "longer holds")
+        self.assertIn("no longer history of", err or "")
+        self.assertIn(pin[:12], err)
+        self.assertIn(ref, err)
+        self.assertEqual(self.history_len(row["id"]), before)
+
+    def test_trunk_moved_off_the_pin_before_the_writer_refuses(self):  # noqa: VACUOUS_ASSERTION — the positives are one call deep: `assert_pin_refused` requires the refusal to name the pin and the ref, and `close_while_trunk_moves` requires the pin out of the ref's history with its twins still matching
+        """(a) Trunk is moved back past the land between the ladder's pin and
+        the writer, so the cure is absent from trunk NOW while the pinned
+        commit still carries every twin."""
+        row, out, err, ref, pin, before = self.close_while_trunk_moves(
+            lambda base: self.git("reset", "--hard", "-q", base))
+        now = self.git("rev-parse", ref)
+        state = dispatches.snapshot()[0][row["id"]]
+        _twins, why = landreq._reviewed_patch_twins(self.gitdir(), state, now)
+        self.assertIn("no patch-identical commit", why or "",
+                      "the moved trunk still carries the cure; the arm "
+                      "does not reach the harm it names")
+        self.assert_pin_refused(row, out, err, ref, pin, before)
+
+    def test_a_force_rewrite_that_drops_the_pin_refuses(self):  # noqa: VACUOUS_ASSERTION — the refusal is named one call deep (`assert_pin_refused`), and the re-run close on the SAME world binds the rewritten trunk and records it
+        """(b) Trunk is force-rewritten between the pin and the writer: the
+        pinned commit is dropped and a new one written in its place, while
+        the twins beneath it survive. The pin is refused all the same, and a
+        re-run close binds the rewritten trunk — the refusal is about the
+        pin, never a verdict on the cure."""
+        def rewrite(_base):
+            self.git("reset", "--hard", "-q", "HEAD~1")
+            self.commit("a rewritten tail", path="rewritten")
+        row, out, err, ref, pin, before = self.close_while_trunk_moves(
+            rewrite)
+        self.assert_pin_refused(row, out, err, ref, pin, before)
+        out, err = landreq.close(row["id"], "carried", evidence="re-run",
+                                 repo=self.repo)
+        self.assertEqual(err, None)
+        event = self.close_event(row["id"])
+        self.assertEqual(event["close_proof_mode"],
+                         dispatches.REVIEWED_PATCH_IDENTITY)
+        self.assertEqual(event["closing_trunk_sha"],
+                         self.git("rev-parse", ref))
+        self.assertNotEqual(event["closing_trunk_sha"], pin)
+
+    def test_a_replay_whose_measured_trunk_is_gone_is_refused_as_carried_is(self):  # noqa: VACUOUS_ASSERTION — the [None, None] reads are bracketed by the must-hit ['carried', 'carried'] fold on the untouched trunk and the (measured, False) ancestry answer after the rewrite; each refusal's words are asserted per mode
+        """(c) Recorded closes, then trunk rewritten past them. Beside the
+        rebased cure sits a lane landed WHOLE by patch identity, which closes
+        by carried's own reached-trunk witness against the same trunk: the
+        control this rung's replay is held to. Both replay closed while the
+        measured trunk is history, and both are refused, in the same words,
+        once it is not."""
+        base = self.git("rev-parse", "HEAD")
+        reviewed, a, b = self.cured_lane()
+        self.git("checkout", "-q", "-b", "whole-lane")
+        w1 = self.commit("W1", path="whole-1")
+        w2 = self.commit("W2", path="whole-2")
+        self.git("checkout", "-q", self.main)
+        self.rebase_land([(a, None), (b, None)])
+        for sha in (w1, w2):
+            self.git("cherry-pick", sha)
+        cured = self.fix_row(reviewed, b)
+        whole = self.fix_row(w1, w2, lane="lane/whole-fix")
+        pre_current, pre_verdicts, _u = dispatches.snapshot_with_verdicts()
+        rows = (cured, whole)
+        for row in rows:
+            _out, err = landreq.close(row["id"], "carried", evidence="why",
+                                      repo=self.repo)
+            self.assertEqual(err, None)
+        events = [self.close_event(row["id"]) for row in rows]
+        self.assertEqual([e["close_proof_mode"] for e in events],
+                         [dispatches.REVIEWED_PATCH_IDENTITY,
+                          dispatches.REACHED_TRUNK])
+        measured, ref = (events[0]["closing_trunk_sha"],
+                         events[0]["closing_trunk_ref"])
+        self.assertEqual((events[1]["closing_trunk_sha"],
+                          events[1]["closing_trunk_ref"]), (measured, ref))
+
+        def replayed():
+            return [dispatches._close_event_error(
+                event, pre_current[row["id"]], current=pre_current,
+                verdicts=pre_verdicts) for row, event in zip(rows, events)]
+
+        def folded():
+            current = dispatches.snapshot()[0]
+            return [current[row["id"]].get("close_reason") for row in rows]
+        self.assertEqual(replayed(), [None, None])
+        self.assertEqual(folded(), ["carried", "carried"])
+        self.git("reset", "--hard", "-q", base)
+        self.commit("a different history", path="divergent")
+        self.assertIs(dispatches._measured_trunk_is_history(
+            self.gitdir(), measured, ref), False)
+        said = ("%s, the trunk this close was measured against, is no longer "
+                "history of %s" % (measured[:12], ref))
+        for event, err in zip(events, replayed()):
+            with self.subTest(mode=event["close_proof_mode"]):
+                self.assertIn(said, err or "")
+        self.assertEqual(folded(), [None, None],
+                         "a close whose measured trunk is gone still folds "
+                         "as carried")
+
+    def test_an_unreadable_trunk_history_refuses_the_replay_by_name(self):  # noqa: VACUOUS_ASSERTION — replayed(True) is the falsifier on the same event; the arm's observable is the refusal replayed(None) names, asserted unconditionally
+        """(c) The third answer: git cannot say whether the measured trunk is
+        still history. The replay refuses naming that, exactly as a carried
+        close does, and never reads it as either answer."""
+        reviewed, a, b = self.cured_lane()
+        self.rebase_land([(a, None), (b, None)])
+        row = self.fix_row(reviewed, b)
+        pre_current, pre_verdicts, _u = dispatches.snapshot_with_verdicts()
+        _out, err = landreq.close(row["id"], "carried", evidence="why",
+                                  repo=self.repo)
+        self.assertEqual(err, None)
+        event = self.close_event(row["id"])
+
+        def replayed(held):
+            with mock.patch.object(dispatches, "_measured_trunk_is_history",
+                                   lambda *_a, **_k: held):
+                return dispatches._close_event_error(
+                    event, pre_current[row["id"]], current=pre_current,
+                    verdicts=pre_verdicts)
+        err = replayed(None)
+        self.assertIn("could not ask whether %s, the trunk this close was "
+                      "measured against, is still history of %s"
+                      % (event["closing_trunk_sha"][:12],
+                         event["closing_trunk_ref"]), err or "")
+        # THE FALSIFIERS ON THE SAME EVENT: the one input moved, and only it.
+        self.assertIn("is no longer history of", replayed(False) or "")
+        self.assertEqual(replayed(True), None)
+
+    def test_the_rebased_cure_still_closes_through_the_trunk_binding(self):
+        """(d) THE MUST-HIT CONTROL: the ordinary rebased cure still closes,
+        the writer asked the binding and was told yes, and trunk moving
+        FORWARD after the close keeps the pin history and the row closed."""
+        reviewed, a, b = self.cured_lane()
+        self.rebase_land([(a, None), (b, None)])
+        row = self.fix_row(reviewed, b)
+        pre_current, pre_verdicts, _u = dispatches.snapshot_with_verdicts()
+        real = dispatches._measured_trunk_is_history
+        seen = []
+
+        def spy(gitdir, sha, ref):
+            got = real(gitdir, sha, ref)
+            seen.append((sha, ref, got))
+            return got
+        with mock.patch.object(dispatches, "_measured_trunk_is_history", spy):
+            out, err = landreq.close(row["id"], "carried", evidence="why",
+                                     repo=self.repo)
+        self.assertEqual(err, None)
+        self.assertEqual(out["close_reason"], "carried")
+        event = self.close_event(row["id"])
+        self.assertEqual(event["close_proof_mode"],
+                         dispatches.REVIEWED_PATCH_IDENTITY)
+        pinned = (event["closing_trunk_sha"], event["closing_trunk_ref"], True)
+        self.assertIn(pinned, seen,
+                      "the writer never proved its pin is still trunk's")
+        self.commit("trunk moves on", path="later")
+        self.assertNotEqual(self.git("rev-parse", event["closing_trunk_ref"]),
+                            event["closing_trunk_sha"])
+        del seen[:]
+        with mock.patch.object(dispatches, "_measured_trunk_is_history", spy):
+            self.assertEqual(dispatches._close_event_error(
+                event, pre_current[row["id"]], current=pre_current,
+                verdicts=pre_verdicts), None)
+        self.assertEqual(seen, [pinned],
+                         "the replay did not ask the measured trunk's history")
+        self.assertEqual(
+            dispatches.snapshot()[0][row["id"]].get("close_reason"), "carried")
+
+
 class CarriageReplayDerivedTest(CloseBase):
     """THE REPLAY WITNESS'S ANSWER, RE-DERIVED THROUGH THE FOLD CHECKPOINT'S
     DOOR (task/2813, `helm/carriageckpt.py`).
@@ -7725,7 +8181,20 @@ class CarriageReplayDerivedTest(CloseBase):
 
     EVERY ARM HERE SPIES AT BOTH DOORS. `rowworld`'s reads go through the `vcs`
     seam and `landreq`'s go through its own `--git-dir` spawn, and a count taken
-    at one of them cannot see a question that moved to the other."""
+    at one of them cannot see a question that moved to the other.
+
+    AND THE RAW-ANSWER TABLE BELOW THE WITNESS IS SWITCHED OFF HERE. Since
+    task/3056 `gitfacts` keeps `merge-tree`'s exit code and stdout under the
+    view git's merge machinery reads, so a merge this door re-derives inside a
+    scope can be answered from that table with no process at all. Every arm
+    here reads a spawned merge as "this door derived", which is the door's
+    observable and not the table's; the table's own arms are
+    `tests.test_gitfacts.MergeViewTest`."""
+
+    def setUp(self):
+        super().setUp()
+        gitfacts.disable()
+        self.addCleanup(gitfacts.enable)
 
     def spawn_spy(self):
         """Every git argv this test spawns, at BOTH doors, as

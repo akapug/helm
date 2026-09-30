@@ -533,6 +533,124 @@ class LiveObligationsTest(unittest.TestCase):
         self.assertEqual(got["owner_hold_count"], 1)
         self.assertEqual(self.lines(got)["on_main"]["count"], 1)
 
+    # -- task/3053: a source-clean hold on main is owed, never "no verdict" ---
+
+    def test_a_source_clean_hold_on_main_stays_a_listed_wait_naming_its_move(self):
+        """THE AUTHOR'S RULING ON THE SEAM (task/3053). A HELD row whose
+        reviewer read it clean is not "on main with no verdict recorded": the
+        landing does not settle it, and its close is owed — the integrator's
+        `foldcheck --apply` when its holder rung passes, its recipient's
+        re-hold when `source_clean_rehold` answers. Folding it took that debt
+        off both queues while `lr list` billed it. So it stays listed, exactly
+        as an owner-gated hold does, and its row carries the card's own
+        sentence. THE CONTROLS in this projection: an ordinary never-verdicted
+        row on the same mark folds onto the on-main line, and an owner-gated
+        hold stays listed as before."""
+        owed = "on main · SOURCE-CLEAN close owed by the integrator: X"
+        rehold = "on main · RE-HOLD owed by @seat-a: Y"
+        got = self.project([
+            card("clean", state="AWAITING_REVIEW", trunk_contains_tip=True,
+                 source_clean_tip="c" * 40, source_clean_on_main=owed),
+            card("rehold", state="AWAITING_REVIEW", holder_role="reviewer",
+                 holder_seat="seat-a", owed_by="reviewer",
+                 trunk_contains_tip=True, source_clean_tip="d" * 40,
+                 source_clean_rehold={"kind": "NO HOLDER", "door": "Y",
+                                      "why": "NO HOLDER; Y"},
+                 source_clean_on_main=rehold),
+            card("gated", state="AWAITING_REVIEW", holder_role="owner",
+                 owner_gated=True, hold_ts="2033-05-18T03:30:00Z",
+                 trunk_contains_tip=True),
+            card("plain", state="AWAITING_REVIEW", trunk_contains_tip=True)])
+        self.assertEqual(self.listed(got), ["clean", "gated", "rehold"])
+        self.assertEqual({k: v["count"] for k, v in self.lines(got).items()},
+                         {"on_main": 1})
+        rows = {r["id"]: r for g in got["groups"] for r in g["rows"]}
+        self.assertEqual(rows["clean"]["source_clean_on_main"], owed)
+        self.assertEqual(rows["rehold"]["source_clean_on_main"], rehold)
+        self.assertIsNone(rows["gated"]["source_clean_on_main"])
+        self.assertEqual(got["listed_count"] + got["collapsed_count"],
+                         got["row_count"])
+
+    def test_the_predicate_exempts_a_source_clean_hold_and_one_sentence_names_it(self):  # noqa: VACUOUS_ASSERTION — the same row's sentence is asserted PRESENT by its exact prefix and door before the None answers, which are the intentional absences for rows that owe no on-main move
+        """ONE PREDICATE, ONE SENTENCE. `on_main_unverdicted` reads a HELD
+        source-clean row as owed, not as a review that never happened, and
+        `source_clean_on_main` is the one sentence every surface prints for
+        it: the integrator's close door when the holder rung passes, the
+        recipient's re-hold when it refuses. THE CONTROLS: the same row with
+        no source-clean tip is "no verdict recorded" again, an owner-gated
+        hold is unchanged (the predicate answers True and the scheduler keeps
+        it listed), and a row trunk does not hold, or a closed one, owes no
+        on-main move."""
+        from helm import landreq
+        clean = {"id": "0123456789abcdef", "state": "AWAITING_REVIEW",
+                 "polarity": None, "trunk_contains_tip": True,
+                 "source_clean_tip": "c" * 40, "reviewer": "seat-a",
+                 "terminal": False}
+        self.assertIs(landreq.on_main_unverdicted(clean), False)
+        self.assertIsNone(scheduler.collapse_class(clean))
+        self.assertIs(landreq.on_main_unverdicted(
+            dict(clean, source_clean_tip=None)), True)
+        gated = {"state": "AWAITING_REVIEW", "trunk_contains_tip": True,
+                 "owner_gated": True}
+        self.assertIs(landreq.on_main_unverdicted(gated), True)
+        self.assertIsNone(scheduler.collapse_class(gated))
+        said = landreq.source_clean_on_main(clean)
+        self.assertTrue(said.startswith(
+            "on main · SOURCE-CLEAN close owed by the integrator: "
+            "`helm lr foldcheck <head> --gate gate:<id> --apply`"), said)
+        self.assertIn("helm lr close 0123456789ab --reason "
+                      "source-clean-landed --gate gate:<id>", said)
+        door = ("helm dispatch release 0123456789ab; helm dispatch hold "
+                "0123456789ab <reason> --source-clean cccccccccccc")
+        said = landreq.source_clean_on_main(dict(clean, source_clean_rehold={
+            "kind": "NO HOLDER", "door": door, "why": "NO HOLDER; " + door}))
+        self.assertEqual(said, "on main · RE-HOLD owed by @seat-a: " + door)
+        self.assertIsNone(landreq.source_clean_on_main(
+            dict(clean, trunk_contains_tip=False)))
+        self.assertIsNone(landreq.source_clean_on_main(
+            dict(clean, terminal=True)))
+        self.assertIsNone(landreq.source_clean_on_main(
+            dict(clean, source_clean_tip=None)))
+
+    def test_a_tip_on_trunk_only_as_a_COPY_names_no_land_door(self):  # noqa: VACUOUS_ASSERTION — the ancestor control in the same arm is asserted to NAME the foldcheck door by value, so the copy row's absent door is a discrimination on one field
+        """THE FABLE READ of task/3053 (finding on (c)/(d)): `trunk_contains_tip`
+        is True by ancestry OR by patch identity (`_PROOF_DISCHARGE`), but
+        `source-clean-landed` closes on ancestry ALONE — so for a held tip
+        trunk carries only as a cherry-picked COPY the integrator's sentence
+        named `foldcheck --apply` and `lr close --reason source-clean-landed`,
+        two doors that refuse that row by name (condition 2), while the stale
+        sweep's classifier answered the same row "no land door closes this
+        row" (`stalebot._source_clean_door`). Measured live on the lane's own
+        code: row b080150f6193, proof patch-equivalent, once stamped. ONE
+        SENTENCE, THE SWEEP'S: the board reads `trunk_contains_proof` and
+        prints the clause the sweep prints, so the two cannot disagree; a
+        re-hold still outranks it, as it does in the sweep."""
+        from helm import landreq
+        clean = {"id": "0123456789abcdef", "state": "AWAITING_REVIEW",
+                 "polarity": None, "trunk_contains_tip": True,
+                 "trunk_contains_proof": landreq.PROOF_PATCH_EQUIVALENT,
+                 "source_clean_tip": "c" * 40, "reviewer": "seat-a",
+                 "terminal": False}
+        said = landreq.source_clean_on_main(clean)
+        self.assertTrue(said and said.startswith("on main · "), said)
+        self.assertIn(landreq.SOURCE_CLEAN_COPY_ON_TRUNK, said)
+        self.assertIn("cccccccccccc", said)
+        for door in ("helm lr foldcheck", "helm lr close", "--apply"):
+            self.assertNotIn(door, said, said)
+        # THE CONTROL: the same row reached by ANCESTRY names the close.
+        by_ancestry = landreq.source_clean_on_main(
+            dict(clean, trunk_contains_proof=landreq.PROOF_ANCESTOR))
+        self.assertIn("helm lr foldcheck <head> --gate gate:<id> --apply",
+                      by_ancestry)
+        self.assertNotIn("COPY", by_ancestry)
+        # THE SWEEP'S PRECEDENCE: a hold its holder rung refuses is the
+        # recipient's re-hold first, on a copy as on an ancestor.
+        door = ("helm dispatch release 0123456789ab; helm dispatch hold "
+                "0123456789ab <reason> --source-clean cccccccccccc")
+        said = landreq.source_clean_on_main(dict(clean, source_clean_rehold={
+            "kind": "NO HOLDER", "door": door, "why": "NO HOLDER; " + door}))
+        self.assertEqual(said, "on main · RE-HOLD owed by @seat-a: " + door)
+
     def test_one_line_per_row_with_on_main_between_frontier_and_superseded(self):
         """A row the census placed off the frontier is named by the frontier
         line, whose command acts on it; a round a later round absorbed is

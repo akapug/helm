@@ -388,7 +388,8 @@ class OutputTest(PrereadBase):
         self.assertEqual(sorted(line), ["cost", "drafts", "dropped", "judge",
                                         "kept", "readers", "ref", "row",
                                         "ts", "wall_s"])
-        body = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
         self.assertIn("THIS IS NOT A VERDICT", body)
         self.assertIn(IN_DIFF, body)
 
@@ -414,8 +415,9 @@ class OutputTest(PrereadBase):
         path, line = preread.write(result)
         self.assertEqual(int(preread.facts(path)["kept"]), line["kept"])
         self.assertNotEqual(line["kept"], 99)
-        self.assertIn("- kept: 99", open(path, encoding="utf-8").read(),
-                      "the control: the spoof really is in the file")
+        with open(path, encoding="utf-8") as fh:
+            self.assertIn("- kept: 99", fh.read(),
+                          "the control: the spoof really is in the file")
 
     def test_the_triage_pointer_appears_only_once_the_file_exists(self):
         rid = "row-triage-control"
@@ -452,10 +454,12 @@ class NeverMintsTest(PrereadBase):
                                 "recipient": "seat-a", "lane": "lane-a",
                                 "ref": "tip-under-test", "status": "open"})
                     + "\n")
-        before = open(ledger, "rb").read()
+        with open(ledger, "rb") as fh:
+            before = fh.read()
         result = self.run_one(Fake())
         preread.write(result)
-        after = open(ledger, "rb").read()
+        with open(ledger, "rb") as fh:
+            after = fh.read()
         self.assertEqual(after.count(b"\n"), before.count(b"\n"))
         self.assertEqual(after, before,
                          "a pre-read rewrote the dispatch ledger")
@@ -537,8 +541,10 @@ class KeyTest(PrereadBase):
             if c["url"] != JUDGE_URL:
                 self.assertNotIn("authorization", c["headers"],
                                  "a local reader was handed the judge's key")
-        written = open(path, encoding="utf-8").read()
-        ledger = open(preread.ledger_path(), encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            written = fh.read()
+        with open(preread.ledger_path(), encoding="utf-8") as fh:
+            ledger = fh.read()
         for surface, what in ((out.getvalue(), "stdout"),
                               (err.getvalue(), "stderr"),
                               (written, "the pre-read file"),
@@ -602,9 +608,10 @@ class SeamTest(PrereadBase):
         """The census, not a habit: this module may not import the spawn
         machinery at all, so a direct git call cannot be written here without
         first going red."""
-        src = open(os.path.join(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))), "helm", "preread.py"),
-            encoding="utf-8").read()
+        with open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "helm", "preread.py"),
+                encoding="utf-8") as fh:
+            src = fh.read()
         tree = ast.parse(src)
         imported = {a.name for n in ast.walk(tree)
                     if isinstance(n, ast.Import) for a in n.names}

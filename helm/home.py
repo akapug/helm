@@ -146,6 +146,19 @@ def session_id():
     return None
 
 
+_SESSION_HARNESS = {"CLAUDE_CODE_SESSION_ID": "claude",
+                    "CLAUDE_SESSION_ID": "claude", "CODEX_SESSION_ID": "codex"}
+
+
+def session_harness(sid):
+    """The harness whose session-id var carries `sid` in THIS process, or None
+    when none does (a `--session` naming another session, or no harness at
+    all). Only a var that equals the id counts: a Claude var set beside a
+    different id says nothing about that id."""
+    return next((_SESSION_HARNESS[k] for k in _SESSION_ENV
+                 if sid and os.environ.get(k) == sid), None)
+
+
 def helm_home():
     """The root. HELM_HOME env else ~/.helm — anchored on $HOME, never cwd."""
     override = env("HOME")

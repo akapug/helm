@@ -190,7 +190,7 @@ def rename_register_identity(old, new, apply=False):
 def _one_line(exc):
     """An exception rendered as ONE line — every string this module returns is
     appended to a sentence a terminal prints."""
-    return " ".join(str(exc).split()) or exc.__class__.__name__
+    return pk.launder(" ".join(str(exc).split())) or exc.__class__.__name__
 
 
 def _runtime_stamp(seat_name, storage_seat=None):
@@ -343,17 +343,26 @@ def _session_record_root(d, record=None):
     return os.path.join(d, "claude", "sessions")
 
 
-def _exact_live_session_processes(d, session, record=None):
-    """(matches, unavailable); zero is proof only when unavailable is None.
+def _live_session_records(d, record=None, session=None):
+    """([(pid, procStart, record)], unavailable) for every LIVE claude process
+    whose pid-keyed session record sits in this seat's record root, or only
+    those naming `session` when one is given. Zero is proof only when
+    unavailable is None.
+
+    A record outlives its process — MEASURED on claude 2.1.283: a SIGKILLed
+    session's record stays on disk until the next claude start in that home
+    prunes it — so a record counts only while its pid is a live claude of the
+    SAME incarnation (`sessions._pid_is_claude` against its procStart).
 
     `record` is the caller's already-read spawn record, which names the claude
     home its launch selected (`_session_record_root`).
     """
     from . import sessions
+    from .seat_paths import _pid_alive
     found, unavailable = [], []
     root = _session_record_root(d, record)
     try:
-        names = os.listdir(root)
+        names = sorted(os.listdir(root))
     except FileNotFoundError:
         return [], None
     except OSError as e:
@@ -366,13 +375,24 @@ def _exact_live_session_processes(d, session, record=None):
             with pk.open_regular(path) as f:
                 rec = json.load(f)
         except (OSError, ValueError, TypeError) as e:
+            # A corrupt `<digits>.json` from a dead process is debris left by
+            # a terminated process — not a live session, not an unreadable
+            # record.  Skip it entirely so it is neither found nor unavailable.
+            # (task/3495 part N2.)
+            m = re.match(r"^(\d+)\.json$", name)
+            if m and not _pid_alive(int(m.group(1))):
+                continue
             unavailable.append("%s: %s" % (os.path.basename(path), e))
             continue
         if not isinstance(rec, dict):
+            # Same dead-pid debris rule for non-dict bodies.
+            m = re.match(r"^(\d+)\.json$", name)
+            if m and not _pid_alive(int(m.group(1))):
+                continue
             unavailable.append("%s: record is not an object"
                                % os.path.basename(path))
             continue
-        if rec.get("sessionId") != session:
+        if session is not None and rec.get("sessionId") != session:
             continue
         try:
             pid = int(rec.get("pid") or 0)
@@ -386,9 +406,141 @@ def _exact_live_session_processes(d, session, record=None):
                                "identity" % os.path.basename(path))
             continue
         if sessions._pid_is_claude(pid, start):
-            found.append((pid, str(start)))
+            found.append((pid, str(start), rec))
     detail = "; ".join(unavailable) if unavailable else None
     return found, detail
+
+
+def _exact_live_session_processes(d, session, record=None):
+    """(matches, unavailable); zero is proof only when unavailable is None.
+
+    `record` is the caller's already-read spawn record, which names the claude
+    home its launch selected (`_session_record_root`).
+    """
+    found, detail = _live_session_records(d, record, session)
+    return [(pid, start) for pid, start, _rec in found], detail
+
+
+#: What `live_seat_session` can say about the session a seat's live claude
+#: process holds. NONE is a measured absence and keeps every caller's older
+#: rung; FOREIGN is live records none of which the register lets speak for the
+#: seat, and keeps that rung too; UNKNOWN is a failed or contradictory read and
+#: is never folded into any of the others.
+LIVE_NONE = "none"
+LIVE_FOREIGN = "foreign"
+LIVE_SESSION = "live"
+LIVE_UNKNOWN = "unknown"
+
+
+def live_seat_session(d, record=None):
+    """(state, session, cwd, why) — the session this seat's LIVE claude process
+    holds NOW, from Claude Code's own presence record (task/3208).
+
+    WHY NOT THE NEWEST TRANSCRIPT. A transcript is written by the session, so
+    it can only say what a session HAS done, and "newest" answers a different
+    question from "current". MEASURED on claude 2.1.283 in a scratch config
+    dir: the process rewrites <config>/sessions/<pid>.json with the NEW session
+    id the instant /clear lands, while the new session's transcript either does
+    not exist yet (a claude that writes it lazily, which is what a fleet host
+    measured twice) or holds only the /clear command's records and no
+    assistant turn — which `_newest_seat_session`'s reboot-stub ranking puts
+    BELOW the old session's real turns. Both roads led a resume back into the
+    pre-/clear session at 85%.
+
+    THE RECORD NAMES ONE SESSION PER PROCESS, and a seat's config home can hold
+    more than one live process: a `claude -p` child a seat runs writes a record
+    there too while it runs (MEASURED: kind "interactive", entrypoint
+    "sdk-cli"), and it can outlive the seat's own claude. So a live record
+    speaks for the SEAT only on the register's evidence (a review's F3, the
+    coordinator's rule): its session IS the register's, or the register pins
+    that exact pid and birth stamp (`session_pid` + `session_pid_identity`,
+    written by the SessionStart bind — the orca /clear rebind writes both), or
+    the register holds no session to contradict it AND the record is the
+    interactive claude's (entrypoint "cli"; a helper writes "sdk-cli"), the
+    rule `seat_rehome._live_session` applies to a pane's processes. With no
+    register session there is nothing else to tell the seat's claude from an
+    orphaned helper that outlived it (a review's F1 on this task: admitting
+    every record there resumed the helper's session where the ranking took
+    the seat's). A record with none of those is a helper's,
+    and a resume onto it brings the seat back as a stranger, so it is
+    FOREIGN and the caller's transcript ranking decides, exactly as before
+    this read existed.
+    Admitted records naming several sessions are resolved only by the pin;
+    anything else is UNKNOWN, never a guess.
+
+    The price, stated: a /clear whose SessionStart bind the register refused
+    (no pin, the old session still recorded) reads FOREIGN, and the ranking
+    answers the old session as it did before task/3208.
+
+    NONE — no live claude process holds a record here (a stale record of a dead
+    pid names nothing). FOREIGN — live records, none of them admitted. LIVE —
+    exactly one admitted session, a full session id. UNKNOWN — the records
+    could not be read, or the admitted ones name several sessions the register
+    cannot choose between. `cwd` is the record's own, when it carries one.
+    """
+    found, unavailable = _live_session_records(d, record)
+    root = _session_record_root(d, record)
+    if unavailable:
+        return (LIVE_UNKNOWN, None, None,
+                "the session records under %s could not all be read (%s)"
+                % (root, unavailable))
+    if not found:
+        return (LIVE_NONE, None, None,
+                "no live claude process holds a session record under %s"
+                % root)
+    reg = record if isinstance(record, dict) else {}
+    reg_sid = reg.get("session")
+
+    def pinned(pid, start):
+        return (reg.get("session_pid") == pid
+                and reg.get("session_pid_identity") == "proc:" + start)
+
+    def speaks(pid, start, r):
+        if pinned(pid, start):
+            return True
+        if reg_sid:
+            return r.get("sessionId") == reg_sid
+        return r.get("entrypoint") == "cli"
+    admitted = [(pid, start, r) for pid, start, r in found
+                if speaks(pid, start, r)]
+    if not admitted and reg_sid:
+        return (LIVE_FOREIGN, None, None,
+                "the live claude records under %s (%s) name neither the spawn "
+                "register's session %s… nor its pinned process, so none speaks "
+                "for the seat (a helper such as a `claude -p` child)"
+                % (root, ", ".join("pid %d: %s" % (pid, str(
+                    r.get("sessionId"))[:8]) for pid, _start, r in found),
+                   str(reg_sid)[:8]))
+    if not admitted:
+        return (LIVE_FOREIGN, None, None,
+                "the spawn register holds no session and no live claude "
+                "record under %s (%s) is the seat's interactive claude "
+                "(entrypoint 'cli') or its pinned process, so none speaks for "
+                "the seat (a helper such as a `claude -p` child)"
+                % (root, ", ".join("pid %d: %s, entrypoint %r" % (
+                    pid, str(r.get("sessionId"))[:8], r.get("entrypoint"))
+                    for pid, _start, r in found)))
+    found = admitted
+    if len({rec.get("sessionId") for _pid, _start, rec in found}) > 1:
+        chosen = [(pid, start, r) for pid, start, r in found
+                  if pinned(pid, start)]
+        if len(chosen) != 1:
+            return (LIVE_UNKNOWN, None, None,
+                    "%d live claude processes under %s hold different "
+                    "sessions (%s) and the spawn register binds none of them"
+                    % (len(found), root, ", ".join(
+                        "pid %d: %s" % (pid, str(r.get("sessionId"))[:8])
+                        for pid, _start, r in found)))
+        found = chosen
+    pid, _start, rec = found[0]
+    sid = rec.get("sessionId")
+    if not isinstance(sid, str) or not _SESSION_JSONL.match(sid + ".jsonl"):
+        return (LIVE_UNKNOWN, None, None,
+                "pid %d's session record names %r, which is not a session id"
+                % (pid, sid))
+    cwd = rec.get("cwd")
+    return (LIVE_SESSION, sid, cwd if isinstance(cwd, str) and cwd else None,
+            "live pid %d's presence record names session %s" % (pid, sid))
 
 
 def _live_session_orca_identity(d, session, seat_name=None, record=None):
@@ -1978,9 +2130,20 @@ def _sessionstart_pane_fields(rec):
     ad = harness.OrcaAdapter(path)
     try:
         resolved = ad.resolve_pane(pane_key)
-        rows = ad.list()
     except harness.HarnessError as e:
         return None, str(e)
+    # THE INVENTORY COMES OVER THE SAME RESIDENT SOCKET `resolve_pane` JUST
+    # USED, never from `ad.list()`: that is an `orca terminal list` subprocess,
+    # and this proof runs inside the 2 s PostToolUse delivery budget whenever
+    # a killed SessionStart join is replayed there (`seats_join.owed_emitter`).
+    # MEASURED on the agents box: 17 of 30 hook timeouts in a two-day window
+    # were that subprocess; the CLI leg took p50 1109 ms and max 2481 ms at
+    # load 12-17, the RPC leg p50 10 ms, with the same 25 rows (task/3259).
+    # A failed RPC refuses the proof, as a failed `resolve_pane` already did;
+    # there is no CLI fallback to wait on.
+    rows, err = ad.panes()
+    if err:
+        return None, err
     handle, pty = resolved.get("handle"), resolved.get("pty_id")
     matches = [row for row in rows if row.get("handle") == handle and
                row.get("pty_id") == pty and

@@ -26,6 +26,8 @@ you reload before large work.
 - **Dogfood** (the closing gate, `/dogfood`): use the shipped thing on REAL work before calling it
   proven - tests show the code does what you imagined; dogfood shows you imagined the right thing.
   Fold friction back immediately (bit-me -> fix+fixture; fought-me -> task; surprised-me -> premise).
+  Friction is a tax (store premise `friction-tax`): put its size on the task as steps x times per
+  day, measured, never guessed; a tax cut that pays back within about 2 days goes ahead of new features.
 - **Research is ordered + reflexive:** (1) web/prior-art FIRST for anything new, (2) then local
   primitives + memory + the codebase, (3) then a cross-family sibling for refutation.
 - **Refine** (the early gate, `/refine`): converge the idea to its ideal shape before implementing -
@@ -47,25 +49,59 @@ you reload before large work.
   completely. The human reviews the refined WHOLE, not fragments.
 - **Author != reviewer, and every family is an equal counterpart.** A non-trivial change gets a
   cross-family refutation before it lands; the refuter looks for the substrate rule the change
-  violates. A bare "looks good" is not review. The refuter PATCHES what it finds mechanically —
-  commit off the exact reviewed tip in your own worktree and name it with `--patch-tip` on the FIX
-  verdict; a DESIGN finding goes to a meld. A lane may carry several authors, and what keeps the
-  families independent is one re-read of the composed tip by a reader who wrote none of it.
-- **No reviewer is NEVER a blocker.** A review is
-  **CROSS-FAMILY**, or **FABLE** when only a different model is needed, in a fresh context;
-  **Sonnet and Haiku never review anything** (store premise
-  review-is-cross-family-or-fable-never-sonnet). When the reviewer you wanted is walled, DEAF,
-  UNUSABLE, or there is "no workable reviewer", run the ladder, never park: (1) **any other-family
-  seat**, and the **openrouter** seat is always one — the free lane
-  (`helm dispatch send openrouter <lane> --ref <tip> --kind review --supersedes <row>`); (2) a
-  **Fable one-agent Workflow** (the Workflow tool, one agent, opts.model `fable`, the alias; never
-  the Agent tool, whose model flag is ignored); (3) on "You have reached your Fable limit": that
-  limit is one credential's, not a wall and never a reason to step down a model — get **Fable through
-  another credential or seat**, and failing that the openrouter seat. A Workflow read goes on the row
-  as an ADVISORY read with `helm dispatch verdict <row> <tip> --concur|--fix --measured
-  --reviewer-model <model> --reviewer-run <run id> [--author-model <yours>] <evidence>`: the model
-  must be another family than the author's, or Fable for a Claude author, and never Sonnet or Haiku;
-  the row stays owed until helm can verify the run.
+  violates. A bare "looks good" is not review. The refuter follows the row's REVIEW FIX MODE
+  for mechanical findings: PATCH commits off the exact reviewed tip in its own room or a
+  `git clone --shared` clone whose commit it fetches into the repo and returns `--patch-tip`;
+  MELD-DIFF posts the exact fix in the pair meld for the author to apply, and records a FIX with
+  the validated `--diff-handoff ROOM/MSGID` receipt and `--no-patch-because`.
+  Only a child whose send/add proves it applies the receipted diff confirms the cure;
+  an unrelated child is an ordinary round. Prose without a receipt, including
+  historical rows, proves no cure: its direct child is an ordinary round and
+  its reason remains a T1 design nudge. A DESIGN finding goes to a meld. A lane may carry several authors;
+  the composed tip owes the re-read described in reviewer-implements-own-findings step 7.
+- **No reviewer is NEVER a blocker.** Take the cheapest reader that clears the bar (store premise
+  review-routing-is-cheapest-reader-that-clears-the-bar-measured, owner 2026-09-25);
+  **Sonnet and Haiku never review anything**. When the reviewer you wanted is walled, DEAF,
+  UNUSABLE, or there is "no workable reviewer", run the ladder; a REVERSIBLE lane never parks:
+  (1) a **fresh-context Opus read** is the default: from an Opus seat a subagent
+  (**the Agent tool**) given the review brief and none of your context, else a one-agent Workflow
+  with opts.model `opus`; it is a full review leg on a **REVERSIBLE** lane; (2) a lane that touches
+  prod, a migration, a deletion, money, credentials, a process kill, a public push or a safety door
+  needs **ONE approval-tier read by a reader that is NOT the author**, chosen by `helm burn` and
+  judged on the RESOLVED model (store prior approval-tier-2026-08-11-owner-revised): claude on
+  Opus 5.5 as a fresh-context, non-author read (an Opus subagent or another Opus seat, never the
+  author's own context), codex, ds4pro on V4 Pro, kimi or grok (the cursor route included). A
+  different family is not required for that one read (the owner confirmed it, room row 2217).
+  Among readers who clear the bar, prefer another lane over an Opus agent, especially a local seat
+  once the owner admits it, without overusing codex, and never prefer Fable over Opus
+  automatically; the exact order is weighed case by case, never a fixed list. Gemini, codex-spark and
+  local seats read as INPUT only until the owner admits them on their record: for a local seat,
+  5 door reads with no miss is the evidence put to him, never an automatic admission. No seat is
+  always free (qwen27 is prefill-bound): `helm reviewers <row>` names who can take it now, then
+  `helm dispatch send <seat> <lane> --ref <tip> --kind review --supersedes <row>`. When none can
+  take it, the door read **PARKS until a tier reader can take it**, with gemini reading
+  meanwhile as input only. **Fable is for max QC only**, never a default and never automatic: the
+  most important work (an owner P0, a release, a public push, or a money or creds door with no
+  other reader), at about 3 Opus tokens per Fable token, and not while `helm burn` reads anthropic
+  ORANGE or worse (owner ruling, task/3202). A max-QC read is a one-agent Workflow
+  (opts.model `fable`, the alias; never the Agent tool, which runs your own model). On
+  "You have reached your Fable limit": that limit is one credential's, not a wall and never a
+  reason to step down a model — get **Fable through another credential or seat**. A model run's
+  read goes on the row as an ADVISORY read with `helm dispatch verdict <row> <tip>
+  --concur|--fix --measured --reviewer-model <model> --reviewer-run <run id>
+  [--author-model <yours>] <evidence>`: the model must be another family than the author's, or
+  Fable for a Claude author, and an Opus read is recorded as `fresh-context run <id>` on a
+  door lane as on a REVERSIBLE one, whatever model the author ran, when its run record, which
+  helm checks on disk, holds every bound, as
+  recorded (unattested) because a same-user process could plant one (no fork, finished, Opus
+  models, no Write or Edit to the lane's files in the shared checkout or the lane worktree (a cure in
+  your own clone is fine), it began after the reviewed tip was committed (a builder that edited
+  through the shell began before its tip), its transcript names the reviewed tip, and its own
+  lines show no fork mark and no conversation it continues before a turn of its own; the session that
+  spawned it is no input, so a fresh subagent of your own counts). A fresh-context CONCUR at
+  the row's tip also records the source-clean hold it carries, so that one verb makes the row
+  a `helm train` car for the land gate; every other model run's read is advisory (act on its
+  findings and cite it in the re-dispatch), and the row stays owed.
 - **Receipt-verify coordination.** An addressed `helm chat` message has an observable delivery path
   (the delivery lane's tool-boundary nudge; an idle recipient wakes only through its armed beacon —
   `helm chat wait --follow` under a Monitor). Check delivery, not vibes; going quiet is not
@@ -143,5 +179,6 @@ Reload `/build` before a large/new task:
 - `ground-truth-cross-reference-loop` - when debugging is not converging.
 - `/xchk` - the user-invocable front door that runs one pass of the grounding loop across ALL sources
   (web/local/memory/code/git + a cross-family refute) to ground a claim/topic and flag red herrings.
-- `reviewer-implements-own-findings` - THE review procedure: the refuter commits its own mechanical
-  cure off the reviewed tip and the lane carries both authors.
+- `reviewer-implements-own-findings` - THE review procedure: PATCH commits the bounded mechanical
+  cure off the reviewed tip; MELD-DIFF posts the exact diff for the author to apply
+  and records its validated `--diff-handoff ROOM/MSGID` receipt, not just a prose reason.

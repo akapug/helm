@@ -308,9 +308,16 @@ _REAL_EVENT_SHAPES = (
      {"v": 3, "event": "cancel", "seq": 1, "id": "3c" * 16, "ts": None,
       "reason": "no longer needed"}),
 
-    ("a hold records no hand at all", None,
+    ("a hold written before the holder stamp records no hand at all", None,
      {"v": 3, "event": "hold", "seq": 1, "id": "4d" * 16, "ts": None,
       "reason": "owner gate", "owner_gated": True}),
+
+    ("A HOLD CREDITS THE HOLDING SEAT its writer resolved from the declared "
+     "identity (task/3053): the source-clean land closes a row on WHO held "
+     "it, so the hand is recorded rather than inferred", "holding-seat",
+     {"v": 3, "event": "hold", "seq": 1, "id": "4e" * 16, "ts": None,
+      "reason": "SOURCE-CLEAN: read clean", "owner_gated": False,
+      "source_clean_tip": "b" * 40, "hold_actor": "holding-seat"}),
 
     ("a release records no hand at all", None,
      {"v": 3, "event": "release", "seq": 2, "id": "5e" * 16, "ts": None,
@@ -1124,6 +1131,7 @@ class ReasonPositiveTest(RetireBase):
         promise, and an arm built on an object that survived would be
         measuring nothing."""
         self.git("branch", "-D", "retire-ghost")
+        self.drop_review_pins()
         self.git("reflog", "expire", "--expire=now", "--all")
         self.git("gc", "--prune=now")
         probe = subprocess.run(["git", "-C", self.repo, "cat-file", "-e",
@@ -3045,6 +3053,10 @@ _ALLOW_RETIRED_OPT_INS = {
     "get": "READ",
     "_selected_chain_ids": "READ",
     "_cmd_compose": "READ",
+    # `lr show` of a cancelled id finds the row that continues it (task/3081);
+    # it returns rows to print and mutates nothing.
+    "live_successors": "READ (lr show of a cancelled id finds the row that "
+                       "continues it; mutates nothing)",
     # DIAGNOSIS — exactly ONE, and it is an EARNED PROPERTY rather than a
     # kind label: `_resolve_row_for_diagnosis` consumes a retired row into
     # (None, specific terminal refusal), so no caller can receive that row as
@@ -3233,6 +3245,13 @@ _WRITERS_NOT_TRANSPLANTABLE = {
                   "taking a row id — the event's proof is the successor's "
                   "identity, so transplanting it onto another row is a "
                   "different claim.",
+    "hold-actor-backfill": "its writer admits only a HELD source-clean "
+                           "row whose hold records no holder, named by that "
+                           "hold's seq and proved by the recipient's own "
+                           "transcript, so an event captured on a twin names "
+                           "a hold the retired twin does not carry. Its "
+                           "inertness after a retirement is pinned in "
+                           "tests.test_hold_actor_backfill.",
     "retarget": "LEGACY COMPAT with no shipping writer. It stays in "
                 "_ACTIVE_ONLY_EVENTS so a compat replay after a retirement is "
                 "inert, but no production path emits one, "
@@ -3517,10 +3536,17 @@ class TheActorRegistryBELONGSToTheWriterTest(RetireBase):
                         found.add(value.value)
             return found
 
+        # A SATELLITE SPELLS A LEDGER NAME `dispatches.NAME` so the call-time
+        # lookup reaches a patch on the ledger; `dispatches.attest_path()` is
+        # the same sidecar call the bare name makes inside the ledger.
         def calls(node, name):
             return any(isinstance(sub, ast.Call)
-                       and isinstance(sub.func, ast.Name)
-                       and sub.func.id == name
+                       and ((isinstance(sub.func, ast.Name)
+                             and sub.func.id == name)
+                            or (isinstance(sub.func, ast.Attribute)
+                                and isinstance(sub.func.value, ast.Name)
+                                and sub.func.value.id == "dispatches"
+                                and sub.func.attr == name))
                        for sub in ast.walk(node))
 
         required, elsewhere = set(), set()
@@ -6487,6 +6513,179 @@ class OffFrontierTest(RetireBase):
         self.assertEqual(verdict["rung"], "reachability")
         self.assertIn("refs/helm-retired/salvage/unrelated-name",
                       verdict["evidence"])
+
+    # THE PIN NAMESPACES AND WHAT A PREFIX COVER COULD CONFUSE WITH THEM
+    # (task/3642). Each lookalike is one character or one slash away from a
+    # pin: a cover that selects too much reads a pin again, and one that
+    # selects too little drops a ref that really retains the work, which is
+    # the one direction this rung may never fail in.
+    PIN_LOOKALIKES = ("refs/helm-retired/reviewer",
+                      "refs/helm-retired/reviewedx/one",
+                      "refs/helm-retired/salvage/unrelated-name",
+                      "refs/helm-review/one",
+                      "refs/helm-reviewedx",
+                      "refs/parked")
+
+    def pinned_world(self):
+        """(tip, pins, others) — a tip off every branch, held by two dozen
+        pins and by each lookalike, in a repository whose other refs are the
+        fixture's own. `others` is every ref that is NOT a pin, read from git
+        and not typed here, so a fixture ref added later is counted too."""
+        self.git("checkout", "-q", "-b", "lane/pinned-world", self.main)
+        tip = self.commit("held-under-pins", path="pinned")
+        self.git("checkout", "-q", self.main)
+        self.git("branch", "-D", "lane/pinned-world")
+        namespaces = (dispatches.REVIEWED_PIN_NS, dispatches.RETIRED_PIN_NS)
+        planted = {ns + "fixture-%02d" % n for n in range(12)
+                   for ns in namespaces}
+        subprocess.run(["git", "-C", self.repo, "update-ref", "--stdin"],
+                       input="".join("create %s %s\n" % (ref, tip) for ref in
+                                     sorted(planted) +
+                                     list(self.PIN_LOOKALIKES)),
+                       capture_output=True, text=True, check=True)
+        listed = set(self.git("for-each-ref", "--format=%(refname)").split())
+        pins = {ref for ref in listed if ref.startswith(namespaces)}
+        # THE FIXTURE'S OWN CONTROL: git lists every planted pin and every
+        # lookalike, and no lookalike reads as a pin by name, so a cover that
+        # leaves them out is measured and not presumed.
+        self.assertEqual(sorted(planted - pins), [])
+        self.assertEqual(sorted(set(self.PIN_LOOKALIKES) - (listed - pins)),
+                         [])
+        return tip, pins, listed - pins
+
+    def walked(self, gitdir, tip):
+        """((ref, err), every git argv, the reachability walks among them)."""
+        calls = []
+        real = landreq._git
+
+        def spy(where, *args, **kw):
+            calls.append(tuple(str(a) for a in args))
+            return real(where, *args, **kw)
+
+        with mock.patch.object(landreq, "_git", side_effect=spy):
+            answer = landreq._reaching_ref(gitdir, tip)
+        walks = [a for a in calls if a[:1] == ("for-each-ref",) and any(
+            w == "--contains" or w.startswith("--contains=") for w in a)]
+        return answer, calls, walks
+
+    @staticmethod
+    def visited(gitdir, walk):
+        """The refs one walk's argv SELECTS, asked of git itself: the same
+        argv with the reachability filter, the count and the format removed.
+        Git's own pattern and --exclude rules decide it, so the arm measures
+        what the walk visits and not what this file believes a pattern
+        means."""
+        argv, skip = [], False
+        for word in walk:
+            if skip:
+                skip = False
+            elif word == "--contains":
+                skip = True
+            elif not word.startswith(("--contains=", "--count", "--format")):
+                argv.append(word)
+        p = subprocess.run(["git", "--git-dir", gitdir, *argv,
+                            "--format=%(refname)"],
+                           capture_output=True, text=True, check=True)
+        return set(p.stdout.split())
+
+    def test_the_reachability_walk_never_visits_a_review_pin(self):
+        """task/3642. A pin is never a place work lives, so the walk must
+        not ask git to test a pin for the commit at all: `--contains` with no
+        pattern visits every ref, and each pin adds its cost to every call.
+        The walk selects every ref that is not a pin and no pin, and the ref
+        it names is the first non-pin ref in git's own order."""
+        tip, pins, others = self.pinned_world()
+        (ref, err), _calls, walks = self.walked(self.gitdir(), tip)
+        self.assertIsNone(err, err)
+        reaching = self.git("for-each-ref", "--format=%(refname)",
+                            "--contains", tip).split()
+        self.assertEqual(ref, [r for r in reaching if r not in pins][0])
+        self.assertEqual(len(walks), 1, walks)
+        seen = self.visited(self.gitdir(), walks[0])
+        self.assertEqual(sorted(seen), sorted(others))
+        self.assertIn("refs/helm-retired/reviewer", seen)
+        self.assertEqual(sorted(seen & pins), [])
+
+    def test_a_repository_holding_only_pins_is_asked_no_walk(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control is the ref-table read in `calls`, which proves the probe looked before `walks == []` is read
+        """When every ref is a pin there is nothing the walk may visit, and
+        no pattern list is empty in a way git reads as "nothing": a
+        `for-each-ref --contains` with no pattern walks EVERY ref. So the
+        answer is None without a walk. The positive control is the ref table
+        read, which proves the probe really looked."""
+        tip, pins, _others = self.pinned_world()
+        bare = os.path.join(self.tmp, "only-pins.git")
+        subprocess.run(["git", "clone", "-q", "--mirror", self.repo, bare],
+                       capture_output=True, check=True)
+
+        def bgit(*args, stdin=None):
+            return subprocess.run(["git", "--git-dir", bare, *args],
+                                  input=stdin, capture_output=True, text=True,
+                                  check=True).stdout
+
+        held = bgit("for-each-ref", "--format=%(refname)").split()
+        bgit("update-ref", "--stdin", stdin="".join(
+            "delete %s\n" % r for r in held if r not in pins))
+        self.assertEqual(
+            sorted(bgit("for-each-ref", "--format=%(refname)").split()),
+            sorted(pins))
+        (ref, err), calls, walks = self.walked(bare, tip)
+        self.assertEqual((ref, err), (None, None))
+        self.assertIn("for-each-ref", [c[0] for c in calls])
+        self.assertEqual(walks, [])
+
+    def test_an_unreadable_ref_table_is_err_and_asks_no_walk(self):
+        """The ref table is the first question this rung asks, so its
+        failure answers the way a failed walk does: `err`, never an empty
+        answer, which the ladder would read as ABANDONED."""
+        tip, _pins, _others = self.pinned_world()
+        calls = []
+
+        def refuse(where, *args, **kw):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 128, "",
+                                               "fatal: table refused")
+
+        with mock.patch.object(landreq, "_git", side_effect=refuse):
+            ref, err = landreq._reaching_ref(self.gitdir(), tip)
+        self.assertIsNone(ref)
+        self.assertIn("table refused", err or "")
+        self.assertIn(tip[:12], err or "")
+        self.assertEqual(len(calls), 1, calls)
+
+    def test_a_walk_git_refuses_is_err(self):
+        """The table reads and the walk itself fails: still `err`, never
+        None. The table read is real, so the refusal is the walk's alone."""
+        tip, _pins, _others = self.pinned_world()
+        real = landreq._git
+        asked = []
+
+        def refuse_walk(where, *args, **kw):
+            if "--contains" in args:
+                asked.append(args)
+                return subprocess.CompletedProcess(args, 128, "",
+                                                   "fatal: walk refused")
+            return real(where, *args, **kw)
+
+        with mock.patch.object(landreq, "_git", side_effect=refuse_walk):
+            ref, err = landreq._reaching_ref(self.gitdir(), tip)
+        self.assertEqual(len(asked), 1, asked)
+        self.assertIsNone(ref)
+        self.assertIn("walk refused", err or "")
+
+    def test_the_ref_table_carries_no_review_pin(self):
+        """task/3642, the per-row half. Every row's lane-family rung stems
+        every ref in this table, so each pin cost every row a stem and a
+        match. Measured on a mirror of helm's repository with 3,257 pins:
+        7.5 ms a row with them, 1.4 ms without, and no row's presence rested
+        on a pin. A pin is named by a row id, never by a lane, so the table
+        drops the two pin namespaces and keeps every other ref, lookalikes
+        included."""
+        _tip, _pins, others = self.pinned_world()
+        rows, err = landreq.ref_table(self.gitdir())
+        self.assertIsNone(err, err)
+        names = {name for name, _obj in rows}
+        self.assertEqual(sorted(names), sorted(others))
+        self.assertIn("refs/helm-reviewedx", names)
 
     def test_a_second_apply_writes_nothing_the_first_did_not(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control on the SECOND report is this row's id in its plan: the census still sees and classifies the row, so `closed == []` is a measurement and not the silence of a census that stopped looking
         """IDEMPOTENCE IS A PROPERTY OF THE POPULATION, not of a retry code

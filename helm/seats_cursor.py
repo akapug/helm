@@ -459,19 +459,6 @@ def _write_stop_latch(path, seat, value, session=None, incarnation=None):
         return True
 
 
-def _remove_stop_latch(path, seat, session=None, incarnation=None):
-    """Remove a keyed stop sidecar without crossing rename/key reuse."""
-    with seat_state_lock(seat, session=session,
-                         incarnation=incarnation) as current:
-        if not current:
-            return False
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        return True
-
-
 def _probe_stop_latch(path, seat, session=None):
     """Prove latch storage writable and return its identity generation."""
     with seat_state_lock(seat, session=session) as current:

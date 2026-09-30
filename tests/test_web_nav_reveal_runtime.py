@@ -17,6 +17,7 @@ Requires node; SKIPPED (never failed) where node is absent, like every other
 client-runtime harness in this suite."""
 import json
 import os
+import re
 import shutil
 import subprocess
 import unittest
@@ -53,7 +54,7 @@ class TestNavRevealSource(unittest.TestCase):
         src = web_ui_loader.read_text()
         body = _extract_fn(src, "showView")
         self.assertIn("revealActiveTab()", body)
-        self.assertLess(body.index('classList.toggle("on"'),
+        self.assertLess(body.index("navSelect(v)"),
                         body.index("revealActiveTab()"))
 
     def test_the_badge_writer_re_reveals_after_every_mutation(self):
@@ -65,7 +66,7 @@ class TestNavRevealSource(unittest.TestCase):
         self.assertNotIn('classList.contains("on")', body)
 
 
-    def test_showView_is_the_only_place_a_tab_becomes_selected(self):
+    def test_showView_is_the_only_place_a_tab_becomes_selected(self):  # noqa: VACUOUS_ASSERTION — the selection site is asserted counted exactly once and inside navSelect unconditionally, and the caller count is an equality
         """THE BOOT PATH IS COVERED BY CONSTRUCTION, WHICH IS WHY THIS ARM
         EXISTS. The harness never executes the initial `/#ledger`
         boot, and that boot is the ORIGINAL repro — the page OPENS on ledger
@@ -73,11 +74,13 @@ class TestNavRevealSource(unittest.TestCase):
         a function, so it cannot be spliced and run the way navBadge can.
 
         So pin the invariant instead: exactly ONE site in the whole assembled
-        UI selects a nav tab, and it lives in showView. Every selecting path —
-        boot, click, hashchange, the dregg strip, the note-tab links, the two
-        showView("ledger") calls — must therefore route through the function
-        that reveals. A new path that sets .on directly would bypass the reveal
-        silently, and this arm is what refuses it.
+        UI selects a nav tab, `navSelect`, and each of its callers reveals
+        after it: showView, and the Work page when a filter turns it into
+        another of its entries (`wkNavSync`, task/3643). Every selecting path
+        — boot, click, hashchange, the dregg strip, the note-tab links, the
+        two showView("ledger") calls — routes through them. A new path that
+        sets .on directly would bypass the reveal silently, and this arm is
+        what refuses it.
 
         Measured: 11 classList.toggle("on") sites in the UI, exactly one on
         .navtab. The others are .qtab, .chip and friends and are not tabs."""
@@ -85,8 +88,15 @@ class TestNavRevealSource(unittest.TestCase):
         sel = '$$(".navtab").forEach(t => t.classList.toggle("on"'
         self.assertEqual(src.count(sel), 1,
                          "a second nav-tab selection site would bypass the reveal")
-        body = _extract_fn(src, "showView")
-        self.assertIn(sel, body, "the only selection site is not inside showView")
+        self.assertIn(sel, _extract_fn(src, "navSelect"),
+                      "the only selection site is not navSelect")
+        callers = [m.start() for m in re.finditer(r"navSelect\((?!v\) \{)", src)]
+        self.assertEqual(len(callers), 2, "a new caller of navSelect")
+        for fn in ("showView", "wkNavSync"):
+            body = _extract_fn(src, fn)
+            self.assertIn("navSelect(", body, fn)
+            self.assertLess(body.index("navSelect("),
+                            body.index("revealActiveTab()"), fn)
 
     def test_the_boot_block_routes_a_hash_view_through_showView(self):
         """And the boot really does select that way. A boot that set the class
@@ -122,8 +132,10 @@ class TestNavRevealRuntime(unittest.TestCase):
         # area button. Splicing the real one rather than stubbing keeps this
         # harness honest about what navBadge actually executes.
         fn = "\n\n".join(_extract_fn(src, n) for n in
-                          ("revealActiveTab", "navBadge", "areaBadge",
-                           "canonView", "showView"))
+                          ("revealActiveTab", "navBadge", "navBadgeText", "areaBadge",
+                           "canonView", "viewHash", "hashView", "pageOf",
+                           "landY", "viewTarget", "goTarget", "navSelect",
+                           "showView"))
         cls.script = template.replace("/*__INJECT__*/", fn)
         # THE BOOT IS SPLICED AS A CALLABLE, not asserted about. It is a bare
         # block, so brace-match it from its banner and wrap it — that is the

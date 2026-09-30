@@ -83,6 +83,22 @@ import tempfile
 # this bootstrap has run and exercise the real suppression mechanism.
 os.environ.pop("HELM_HOOK_ALARM_DIR", None)
 
+# A durable Fab job's launch label belongs to the gate that runs this suite,
+# which has already minted it (gate.fab_job_label). Inherited, it makes every
+# arm that drives `gate run` without a label a train's land gate: 18 arms on
+# train209. gateshard.scrubbed_env drops both for the suite child; this covers
+# a suite started any other way inside such a job.
+for _key in ("FAB_GATE_LABEL", "FAB_GATE_GENERATION"):
+    os.environ.pop(_key, None)
+# A seat's launch stamps its model family and backend into its environment,
+# and a reader of a local family gets the short `helm chat read`
+# (helm/chatshort.py). Inherited from a local seat's pane, the pair would turn
+# every arm that reads chat short; an arm that needs a family sets one.
+for _key in ("HELM_MODEL_FAMILY", "MELD_MODEL_FAMILY", "HELM_MODEL_BACKEND",
+             "MELD_MODEL_BACKEND"):
+    os.environ.pop(_key, None)
+del _key
+
 
 def _identity_path_env_keys():
     """Load Helm's bounded path declaration without importing ``helm``.
@@ -573,6 +589,34 @@ PLANTED = {
     "ORCA_USER_DATA_PATH": _plant("ORCA_USER_DATA_PATH", "orca-user-data"),
 }
 
+# EXPLICIT ROOM FOR EVERY TEST PROCESS. chat.post's room default DERIVES (the
+# env seam, then the cwd's project) instead of hardcoding "main". A test
+# process's cwd is the REPO, so a bare default-relying post would derive the
+# repo's room, and the hermetic arms asserting #main would fail for a reason
+# unrelated to what they test. Tests therefore declare their room through the
+# same env seam every launched seat uses (launch.sh sets HELM_CHAT_ROOM).
+# Tests OF the derivation mock _default_post_room and are untouched by this.
+# PLANTED HERE, at the package import every runner makes before any test
+# module, and never at a helper module's first import: that import happens
+# inside whichever test module reaches the helper first, so the room appeared
+# mid-run, after every module that ran earlier, and a slice worker's leak audit
+# named that module for it. setdefault: a harness that exports a room keeps it.
+os.environ.setdefault("HELM_CHAT_ROOM", "main")
+
+# THE TREE UNDER TEST RUNS ITS OWN COORDINATION VERBS (task/3382). A process
+# entry of `bin/helm` or `python3 -m helm` hands a coordination verb (dispatch,
+# chat, work, ...) to the TRUNK checkout of its repository when that
+# repository declares one (`helm/trunkroute.py`). A suite is the one caller
+# whose whole point is this tree's code: an arm that spawns this tree's
+# `bin/helm chat` from a lane worktree of a declared repository would
+# otherwise test trunk's chat and pass or fail for trunk's reasons. The fab
+# rooms are worktrees of a bare mirror that declares nothing, so there the
+# route is never taken and the opt-in prints nothing; it is set here for
+# every other place a suite runs. Must equal trunkroute.OPT_IN;
+# tests/test_trunkroute.py pins it (this module may not import helm).
+os.environ["HELM_LANE_COORDINATION"] = "1"
+PLANTED["HELM_LANE_COORDINATION"] = "1"
+
 # Installed after PLANTED has minted the suite root the hook compares
 # against. THE REFUSAL, after socket_dir(), says what it refuses and why.
 if hasattr(socket, "AF_UNIX"):
@@ -696,6 +740,252 @@ PLANTED["HELM_QWEN27_FINDINGS"] = os.environ["HELM_QWEN27_FINDINGS"]
 # remove it inside mock.patch.dict and patch the writes and systemctl.
 os.environ["HELM_AUTOCOMPACT_TIMER"] = "0"
 PLANTED["HELM_AUTOCOMPACT_TIMER"] = os.environ["HELM_AUTOCOMPACT_TIMER"]
+# The same for the gate canary's nightly timer, which `helm work install-guard
+# --apply` installs with the rail: every arm that applies the rail would
+# otherwise write ~/.config/systemd/user units and run the real systemctl.
+# `0` is gatecanary.TIMER_ENV's production switch, set UNCONDITIONALLY; the
+# arms ABOUT the install remove it inside mock.patch.dict and patch the
+# writes and systemctl.
+os.environ["HELM_GATE_CANARY_TIMER"] = "0"
+PLANTED["HELM_GATE_CANARY_TIMER"] = os.environ["HELM_GATE_CANARY_TIMER"]
+# The same for the nightly release dry run's timer (releasenightly.TIMER_ENV),
+# which `helm release nightly --install-timer` installs; its arm ABOUT the
+# install sets the switch itself and patches systemctl.
+os.environ["HELM_RELEASE_NIGHTLY_TIMER"] = "0"
+PLANTED["HELM_RELEASE_NIGHTLY_TIMER"] = os.environ["HELM_RELEASE_NIGHTLY_TIMER"]
+# The same for the shared-checkout watch's timer (checkoutwatch.TIMER_ENV),
+# which `helm work checkout-watch --install-timer` installs; the arms ABOUT
+# the install remove it inside mock.patch.dict and install through
+# tests._tmphome.fake_user_systemd.
+os.environ["HELM_CHECKOUT_WATCH_TIMER"] = "0"
+PLANTED["HELM_CHECKOUT_WATCH_TIMER"] = os.environ["HELM_CHECKOUT_WATCH_TIMER"]
+
+# NO TEST MAY REACH THIS HOST'S SYSTEMD USER MANAGER OR ITS UNIT FILES
+# (task/3306).
+#
+# The four switches above each close ONE installer, in a tree that carries
+# the switch, while the environment keeps it. Twenty helm modules run
+# `systemctl`, each spelling its own call, and a fab job runs with the host's
+# own HOME, XDG_RUNTIME_DIR and session bus: fab's worker sets PATH, never
+# HOME or XDG_*. MEASURED on both fab gate hosts: their gate-canary and
+# autocompact units name a fab worktree as WorkingDirectory and are enabled,
+# so test runs wrote AND enabled them. The canary timer has fired there since,
+# running a serial and a sliced whole suite from a lane's worktree on a host
+# every land depends on, and one autocompact unit names a worktree that is
+# gone, so it fails every minute. A reviewed tip left `helm-test.timer`
+# behind the same way. Moving HOME would not have been enough:
+# `systemctl --user` reaches the manager over $XDG_RUNTIME_DIR/systemd/private
+# or the session bus, whatever HOME says.
+#
+# TWO LAYERS, both here because this is the one file every runner loads.
+#
+#   THE BUS IS DEAD for this process and every child that inherits its
+#   environment: XDG_RUNTIME_DIR names an empty directory under the suite root
+#   and DBUS_SESSION_BUS_ADDRESS a socket that does not exist, set
+#   UNCONDITIONALLY so an inherited value cannot re-arm the host's. Measured on
+#   both hosts (systemd 257): `systemctl --user` then fails "Failed to connect
+#   to user scope bus", and a cleared environment, with both unset, fails the
+#   same way. This is the only layer that reaches a CHILD -- a verb a test runs
+#   as a subprocess, a shell stage -- whatever path it spells systemctl by.
+#
+#   THE REFUSAL, an audit hook in this process, is what makes a missing fake
+#   LOUD instead of a "systemctl failed" the installer reports and the arm
+#   never reads. It refuses (1) an exec of any systemctl that does not resolve
+#   under this process's suite root, by argv, a wrapper, a shell string,
+#   os.system, os.exec* or posix_spawn: a fake a test built lives under the
+#   root, and anything else is the host's binary; and (2) a write, rename,
+#   removal, link or mkdir under the host's systemd directories. The host's
+#   home is its passwd entry, never $HOME, which is what a test moves.
+#
+# THE SEAM a test fakes is tests._tmphome.fake_user_systemd(self): HOME in a
+# temp dir, HELM_USER_UNIT_DIR at that home's unit directory, and a recording
+# systemctl first on PATH. A test may still mock the module's subprocess.run
+# instead; a mock execs nothing, so nothing here fires.
+#
+# WHAT THIS CANNOT SEE: a Python CHILD writing a unit under the owner's real
+# home. It inherits HOME and carries no audit hook. The dead bus keeps the test
+# from enabling or reloading that unit, but the file lands, and an overwrite of
+# a unit the host already enabled is live at the host's next reload.
+#
+# THE UNIT DIRECTORY IS THE ARM'S OWN (task/3307). Every helm installer and
+# reader asks timerhealth.user_unit_dir(), which answers HELM_USER_UNIT_DIR
+# before HOME. An inherited value belongs to whoever started the suite, and it
+# would outrank every temp HOME an arm moves to, in this process and in every
+# child the arm runs, so it is removed. It is not PLANTED under the suite
+# root: that would also outrank the temp HOME of every arm that moves HOME by
+# hand to hold its units, and those arms would share one directory.
+os.environ.pop("HELM_USER_UNIT_DIR", None)
+_HOST_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR")
+_DEAD_BUS = os.path.join(_testroot(), "run")
+os.makedirs(_DEAD_BUS, mode=0o700, exist_ok=True)
+os.environ["XDG_RUNTIME_DIR"] = _DEAD_BUS
+os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + os.path.join(
+    _DEAD_BUS, "bus")
+PLANTED["XDG_RUNTIME_DIR"] = os.environ["XDG_RUNTIME_DIR"]
+PLANTED["DBUS_SESSION_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
+# ADDITIVE ONLY: a directory named here is refused as the host's too, and the
+# passwd home stays refused whatever it says. tests/test_systemd_isolation.py
+# sets it in a child to prove the write refusal against a temp dir, so a
+# regression there writes that temp dir and never the real one.
+HOST_HOME_ENV = "HELM_SUITE_HOST_HOME"
+
+
+def _host_systemd_dirs():
+    """The directories the host's user manager reads its units and state from:
+    the config, data and runtime `systemd` trees of the passwd home."""
+    homes = [os.environ.get(HOST_HOME_ENV)]
+    try:
+        import pwd
+        homes.append(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):
+        pass
+    dirs = [os.path.join(os.environ[var], "systemd")
+            for var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME")
+            if os.environ.get(var)]
+    for home in filter(None, homes):
+        dirs += [os.path.join(home, ".config", "systemd"),
+                 os.path.join(home, ".local", "share", "systemd")]
+    for run in (_HOST_RUNTIME_DIR, "/run/user/%d" % os.getuid()):
+        if run and run != _DEAD_BUS:
+            dirs.append(os.path.join(run, "systemd"))
+    found = set()
+    for path in dirs:
+        if os.path.isabs(path):
+            found.update((os.path.abspath(path), os.path.realpath(path)))
+    return tuple(sorted(found))
+
+
+HOST_SYSTEMD_DIRS = _host_systemd_dirs()
+
+
+class SystemdRefused(BaseException):
+    """A test process reached the host's systemctl or its unit directories."""
+
+
+_SYSTEMD_EXEC_EVENTS = frozenset((
+    "subprocess.Popen", "os.system", "os.exec", "os.posix_spawn",
+    "os.posix_spawnp", "os.spawn"))
+_SYSTEMD_WRITE_EVENTS = frozenset((
+    "open", "os.rename", "os.remove", "os.rmdir", "os.mkdir", "os.symlink",
+    "os.link", "os.truncate", "shutil.rmtree"))
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+# A program that runs the next word as its own command: `env X=1 systemctl`.
+_EXEC_WRAPPERS = frozenset((
+    "env", "exec", "command", "nohup", "setsid", "nice", "ionice", "timeout",
+    "stdbuf", "sudo", "doas", "chrt", "taskset", "flock", "xargs", "time"))
+_SHELLS = frozenset(("sh", "bash", "dash", "zsh", "ksh"))
+# systemctl at a shell COMMAND position, after any assignments and wrappers.
+_SHELL_SYSTEMCTL = re.compile(
+    r"(?:^|[;&|(`{\n]|\$\()\s*"
+    r"(?:(?:[A-Za-z_]\w*=\S*|env|exec|command|nohup|setsid|nice|sudo"
+    r"|timeout\s+\S+|stdbuf\s+\S+)\s+)*"
+    r"((?:\S*/)?systemctl)(?=$|[\s;&|)`}])")
+
+
+def _text(value):
+    try:
+        return os.fsdecode(os.fspath(value))
+    except TypeError:
+        return None                 # a file descriptor, or not a path at all
+
+
+def _systemctl_spelled(argv, executable=None):
+    """The spelling of systemctl this command line would run, else None."""
+    words = [w for w in map(_text, argv or ()) if w is not None]
+    if executable is not None and os.path.basename(
+            _text(executable) or "") == "systemctl":
+        return _text(executable)
+    if not words:
+        return None
+    head = os.path.basename(words[0])
+    if head == "systemctl":
+        return words[0]
+    if head in _EXEC_WRAPPERS:
+        return next((w for w in words[1:]
+                     if os.path.basename(w) == "systemctl"), None)
+    if head in _SHELLS:
+        for i, word in enumerate(words[1:-1], 1):
+            if word[:1] == "-" and word[1:2] != "-" and "c" in word:
+                found = _SHELL_SYSTEMCTL.search(words[i + 1])
+                return found.group(1) if found else None
+    return None
+
+
+def _host_systemctl(spelled, env=None, cwd=None):
+    """The resolved host binary `spelled` would run, or None when it is a
+    suite-built fake or resolves to nothing (the exec then fails on its own)."""
+    if "/" in spelled:
+        path = os.path.join(_text(cwd) or os.getcwd(), spelled)
+    else:
+        path = shutil.which(spelled, path=os.pathsep.join(
+            os.get_exec_path(env)))
+    if not path:
+        return None
+    root = os.path.realpath(_testroot())
+    real = os.path.realpath(path)
+    return None if real.startswith(root + os.sep) else real
+
+
+def _under_host_systemd(value):
+    path = _text(value)
+    if path is None or ("systemd" not in path and os.path.isabs(path)):
+        return None
+    path = os.path.abspath(path)
+    return next((d for d in HOST_SYSTEMD_DIRS
+                 if path == d or path.startswith(d + os.sep)), None)
+
+
+def _systemd_refusal(event, args):
+    """The refusal text for one audited event, or None."""
+    if event in _SYSTEMD_EXEC_EVENTS:
+        if event == "subprocess.Popen":
+            spelled = _systemctl_spelled(args[1], args[0])
+            env, cwd = args[3], args[2]
+        elif event == "os.system":
+            found = _SHELL_SYSTEMCTL.search(_text(args[0]) or "")
+            spelled, env, cwd = found and found.group(1), None, None
+        else:                       # (path, argv, env), os.spawn leads with mode
+            path, argv, env = args[-3:]
+            spelled, cwd = _systemctl_spelled(argv, path), None
+        host = spelled and _host_systemctl(spelled, env, cwd)
+        if not host:
+            return None
+        return ("`%s` would run this host's systemctl (%s), which reaches its "
+                "real user manager whatever HOME says" % (spelled, host))
+    if event == "open":
+        if not (args[2] or 0) & _WRITE_FLAGS:
+            return None
+        paths = (args[0],)
+    elif event == "os.rename":
+        paths = args[:2]            # moving a unit OUT removes it too
+    elif event in ("os.symlink", "os.link"):
+        paths = (args[1],)          # only the new name is written
+    else:
+        paths = (args[0],)
+    for path in paths:
+        where = _under_host_systemd(path)
+        if where:
+            return ("%s %s writes under this host's %s, which its user "
+                    "manager reads units from" % (event, _text(path), where))
+    return None
+
+
+def _refuse_host_systemd(event, args):
+    if event not in _SYSTEMD_EXEC_EVENTS and event not in _SYSTEMD_WRITE_EVENTS:
+        return
+    try:
+        why = _systemd_refusal(event, args)
+    except Exception:               # noqa: BLE001 -- a hook that raised would
+        return                      # break the audited call itself, not refuse it
+    if why:
+        raise SystemdRefused(
+            "%s: refused by tests/__init__.py. Fake it with "
+            "tests._tmphome.fake_user_systemd(self), which moves HOME into a "
+            "temp dir and puts a recording systemctl first on PATH, or mock "
+            "the installer's subprocess.run." % why)
+
+
+sys.addaudithook(_refuse_host_systemd)
 
 # NO TEST MAY READ THIS BOX'S SEAT MEMORY UNLESS IT ASKS TO.
 #
@@ -719,6 +1009,24 @@ PLANTED["HELM_AUTOCOMPACT_TIMER"] = os.environ["HELM_AUTOCOMPACT_TIMER"]
 # its own and restores this one (tests/test_seat_pressure_hermetic.py).
 os.environ["HELM_SEAT_PRESSURE"] = "off"
 PLANTED["HELM_SEAT_PRESSURE"] = os.environ["HELM_SEAT_PRESSURE"]
+
+# NO TEST MAY READ THE OPERATOR'S MCP CREDENTIALS OR LINK HIS GLOBAL RULES.
+#
+# Every seat mint (`seat add`/`launch`/`resume`/`spawn`) and every `helm tidy`
+# now plans the canonical MCP servers and the global-instructions link for a
+# config dir (task/3089). Unset, the MCP resolution reads the operator's
+# private ~/.config/helm/mcps-canonical.json — concrete server configs that
+# carry an Authorization header — and would COPY them into every fixture seat's
+# .claude.json; the instructions link would point every fixture seat at his
+# real ~/.claude/CLAUDE.md. HELM_HOME moves neither path. `off` is each
+# variable's production switch (envtidy.private_mcps_path,
+# skillsync.instructions_canonical), not a test-only escape hatch, and it is
+# set UNCONDITIONALLY so an inherited value cannot re-arm the read. The arms
+# that are ABOUT these sources point them at fixtures and restore these values.
+os.environ["HELM_MCPS_PRIVATE"] = "off"
+PLANTED["HELM_MCPS_PRIVATE"] = os.environ["HELM_MCPS_PRIVATE"]
+os.environ["HELM_INSTRUCTIONS_CANONICAL"] = "off"
+PLANTED["HELM_INSTRUCTIONS_CANONICAL"] = os.environ["HELM_INSTRUCTIONS_CANONICAL"]
 
 # THE TRIPWIRE ON THAT DEFAULT. An env default is gone inside
 # `mock.patch.dict(os.environ, clear=True)` or after a test pops the key, and
@@ -757,6 +1065,16 @@ def _refuse_unasked_host_pressure(event, args):
 
 
 sys.addaudithook(_refuse_unasked_host_pressure)
+
+# ONE THREAD AT A TIME IN os.get_exec_path (task/3398). subprocess calls it for
+# every bare program name, and it reads PATH inside a warnings.catch_warnings()
+# window that is not thread-safe: two threads that leave theirs out of order
+# leave warnings.filters bound to one thread's copy, and the gate's leak audit
+# fails whichever unit started them ("warnings changed"). tests/_warnstate has
+# the race, the census of the suite and the cure (stdlib only, no helm import);
+# tests/test_warnings_isolation proves it.
+from tests import _warnstate
+_warnstate.serialize_exec_path()
 
 # The literal historical unittest CLI imports this package during discovery,
 # before its root TestProgram calls runTests. The opt-in arm wraps only that

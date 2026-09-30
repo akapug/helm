@@ -608,11 +608,10 @@ class StoreReviewQueueTest(BriefBase):
         self.assertNotIn("STORE REVIEW QUEUE", brief.render(b))
 
 
-class WhatWeBuiltTest(BriefBase):
-    """The gauge (owner directive: the brief answers 'what did we build?').
-    Fixture repos are REAL git: init -b main, empty commits with pinned
+class _Trunk(object):
+    """Fixture repos are REAL git: init -b main, empty commits with pinned
     committer dates, and origin/main planted as an actual remote-tracking ref
-    so the gauge reads the landedness ref, never local main."""
+    so a reader reads the landedness ref, never local main."""
 
     def _repo(self):
         r = self.j("repo")
@@ -632,6 +631,10 @@ class WhatWeBuiltTest(BriefBase):
     def _publish(self, repo):
         subprocess.run(("git", "update-ref", "refs/remotes/origin/main", "main"),
                        cwd=repo, check=True, capture_output=True)
+
+
+class WhatWeBuiltTest(_Trunk, BriefBase):
+    """The gauge (owner directive: the brief answers 'what did we build?')."""
 
     def test_a_local_only_ref_renders_commits_never_lands(self):
         """kimi's review finding (the landed-means-origin-main class): with no
@@ -761,6 +764,371 @@ class WhatWeBuiltTest(BriefBase):
         text = brief.render(b)
         self.assertEqual(text.count("land: change"), brief.MAX_BUILT)
         self.assertIn("(+3 more lands)", text)
+
+
+class PlainWordsTest(unittest.TestCase):
+    """What a trunk merge's subject says in plain words: the change, never
+    the mechanics that merged it or the provenance of who built and read it.
+    Each case is a subject shape trunk carries (names neutralised)."""
+
+    CASES = (
+        # the integrator's hand shape: the change inside the parenthesis
+        ("train418: merge lane fail-closed-3534 at e1bff4284b3 (task/3534, "
+         "P0: autocompact never acts on an unproven window; built by a "
+         "builder, reviewer patch by a reader, row e6b112891411)",
+         "task/3534, P0: autocompact never acts on an unproven window"),
+        # the change after the parenthesis, a reader's note trailing it
+        ("train376: merge lane context-measure (task/3453, P2, not a door; "
+         "built by a builder; owner-reported 10:09 PDT): the watchdog "
+         "divides by the served model's window (a reader read SOURCE-CLEAN "
+         "0ac75227c427)",
+         "task/3453, P2, not a door: the watchdog divides by the served "
+         "model's window"),
+        # a reader's clause inside the parenthesis, at a retip
+        ("train366: merge lane seat-pins at its retip 50ce4bdd1d9 (comments "
+         "only, recording the readings; a reader non-author read "
+         "SOURCE-CLEAN 0d33381521f2)",
+         "comments only, recording the readings"),
+        # auto-land's own subject, with the task's title
+        ("train9: merge lane one (task/3001: the fleet got lane one; P1, not "
+         "a door; author a; r (m) read SOURCE-CLEAN d1d1d1d1d1d1)",
+         "task/3001: the fleet got lane one"),
+        # a verdict in the title auto-land writes is the title's own words;
+        # the reader's verdict after it is still provenance
+        ("train9: merge lane one (task/3001: an APPROVE needs a gate; P1, "
+         "not a door; author a; r (m) read SOURCE-CLEAN d1d1d1d1d1d1)",
+         "task/3001: an APPROVE needs a gate"),
+        ("train9: merge lane two (task/3002: a SOURCE-CLEAN read is not an "
+         "approval; P2, not a door; author a; r (m) read APPROVE "
+         "d2d2d2d2d2d2)",
+         "task/3002: a SOURCE-CLEAN read is not an approval"),
+        ("train9: merge lane three (no task: an APPROVE names its gate; P?, "
+         "not a door; author a; r (m) read APPROVE d3d3d3d3d3d3)",
+         "no task: an APPROVE names its gate"),
+        # a hand subject's verdict note trails the words and is dropped
+        ("train410: merge lane guard (task/3511, P2): the send refuses a "
+         "stale ref (a reader APPROVE row 342714e10a82)",
+         "task/3511, P2: the send refuses a stale ref"),
+        # auto-land's own subject before it carried a title: labels only, so
+        # the lane leads
+        ("train415: merge lane filing-steer (no task, P?, a DOOR: guard; "
+         "author a-seat; r-seat (a-model) read SOURCE-CLEAN 825fee711fc3)",
+         "lane filing-steer: no task, P?, a DOOR: guard"),
+        # a priority that opens the words is not auto-land's label
+        ("train419: merge lane push-seam at b3bae6e0201 (P0, the first own "
+         "land: the rungs accept the exact pin; change 2 cut to task/3552; "
+         "built by a builder, row 53f728bc6940)",
+         "P0, the first own land: the rungs accept the exact pin; change 2 "
+         "cut to task/3552"),
+        ("train283: merge lane resume-refusal: the vetted bridge resumes",
+         "the vetted bridge resumes"),
+        ("train383 composition cure: the timer joins the drift census",
+         "train383 composition cure: the timer joins the drift census"),
+        # nothing but the mechanics: the lane is the only name it has
+        ("train9: merge lane bare", "lane bare"),
+    )
+
+    def test_each_subject_shape_reads_as_its_plain_words(self):
+        for subject, words in self.CASES:
+            self.assertEqual(brief.plain_words(subject), words, subject)
+
+
+class MorningReportTest(_Trunk, BriefBase):
+    """`helm brief --report` WRITES THE MORNING REPORT (task/3537): one plain
+    line per LAND, the words from trunk's first-parent subjects, the number
+    from the LAND counter's land log, the gate from the land's receipt; every
+    open owner ask; and a checklist that prints a MISSING line for every LAND
+    n..m no line carries and for trunk no LAND number records."""
+
+    def _trunk(self, subjects):
+        """A published trunk of `subjects`, oldest first -> their shas."""
+        r = self._repo()
+        shas = []
+        for i, subject in enumerate(subjects):
+            self._land(r, subject, self.now - 3600 + i)
+            shas.append(subprocess.run(
+                ("git", "rev-parse", "HEAD"), cwd=r, check=True,
+                capture_output=True, text=True).stdout.strip())
+        self._publish(r)
+        return r, shas
+
+    def _record(self, repo, n, sha, **kw):
+        from helm import autoland
+        self.assertTrue(autoland.record_land(os.path.realpath(repo), n, sha,
+                                             **kw))
+
+    def _report(self, repo, *extra):
+        out = io.StringIO()
+        transcripts._state.clear()
+        with contextlib.redirect_stdout(out):
+            rc = brief.cmd_brief(["--report", "--repo", repo] + list(extra))
+        return rc, out.getvalue()
+
+    @staticmethod
+    def _line(out, n):
+        got = [ln for ln in out.splitlines()
+               if ln.startswith("  LAND %d: " % n)]
+        return got[0] if len(got) == 1 else None
+
+    def test_one_plain_line_per_LAND_words_first_and_the_sha_last(self):
+        r, shas = self._trunk([
+            "train10: merge lane alpha at 1234567 (task/101, P1: the fleet "
+            "got alpha; built by a builder, row 0123456789ab)",
+            "train11: merge lane beta (task/102: the fleet got beta; P2, not "
+            "a door; author a; r (m) read SOURCE-CLEAN 0123456789ab)",
+            "train11: merge lane gamma (task/103, P1, not a door; built by "
+            "b): the fleet got gamma (r read SOURCE-CLEAN 0123456789ab)"])
+        self._record(r, 10, shas[0], gate="ab" * 8, ran=100)
+        self._record(r, 11, shas[2], gate="cd" * 8, ran=104)
+        rc, out = self._report(r, "--from", "10")
+        self.assertEqual(rc, 0, out)
+        ten, eleven = self._line(out, 10), self._line(out, 11)
+        self.assertTrue(ten and eleven, out)
+        self.assertIn("task/101, P1: the fleet got alpha", ten)
+        self.assertIn("gate:%s Ran 100" % ("ab" * 8), ten)
+        self.assertIn("gate:%s Ran 104" % ("cd" * 8), eleven)
+        # the owner reads plain words first; the sha trails them
+        self.assertTrue(ten.endswith(shas[0][:11]), ten)
+        self.assertTrue(eleven.endswith(shas[2][:11]), eleven)
+        self.assertLess(eleven.index("the fleet got beta"),
+                        eleven.index("the fleet got gamma"))
+        for noise in ("merge lane", "built by", "SOURCE-CLEAN", "author a"):
+            self.assertNotIn(noise, ten + eleven)
+        self.assertIn("every LAND from 10 to 11 present: OK", out)
+        self.assertNotIn("MISSING", out)
+
+    def test_a_LAND_number_no_record_carries_prints_MISSING(self):
+        """The hand copy's failure (it went 387 -> 389): a number between
+        the first and the last that no land-log line records is MISSING, and
+        its merges read under the next LAND the log does record."""
+        r, shas = self._trunk(["train386: merge lane a: the fleet got a",
+                               "train387: merge lane b: the fleet got b",
+                               "train388: merge lane c: the fleet got c",
+                               "train389: merge lane d: the fleet got d"])
+        self._record(r, 386, shas[0])
+        self._record(r, 387, shas[1])
+        self._record(r, 389, shas[3])
+        rc, out = self._report(r, "--from", "386")
+        self.assertEqual(rc, 1, out)
+        missing = [ln.strip() for ln in out.splitlines()
+                   if ln.strip().startswith("MISSING")]
+        self.assertEqual(len(missing), 1, out)
+        self.assertTrue(missing[0].startswith("MISSING LAND 388: "), missing)
+        self.assertIn("helm train auto seed 388 ", missing[0])
+        self.assertIsNone(self._line(out, 388), out)
+        line = self._line(out, 389)
+        self.assertIn("the fleet got c", line)
+        self.assertIn("the fleet got d", line)
+        self.assertNotIn("the fleet got b", line)
+        # the control: the same trunk with 388 recorded passes
+        self._record(r, 388, shas[2])
+        rc, out = self._report(r, "--from", "386")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("MISSING", out)
+        self.assertNotIn("the fleet got c", self._line(out, 389))
+
+    def _edge(self):
+        """The review's F1 trunk: LAND 387 20h ago, a hand land 5h ago that
+        was LAND 388, LAND 389 1h ago; the log records 387 and 389."""
+        r = self._repo()
+        shas = []
+        for n, ago in ((387, 20), (388, 5), (389, 1)):
+            self._land(r, "train%d: merge lane %s: the fleet got %s"
+                       % (n, "bcd"[n - 387], "bcd"[n - 387]),
+                       self.now - ago * 3600)
+            shas.append(subprocess.run(
+                ("git", "rev-parse", "HEAD"), cwd=r, check=True,
+                capture_output=True, text=True).stdout.strip())
+        self._publish(r)
+        self._record(r, 387, shas[0])
+        self._record(r, 389, shas[2])
+        return r, shas
+
+    def test_a_LAND_nobody_recorded_at_the_window_edge_prints_MISSING(self):
+        """The window's oldest recorded land is 389, but 388 is the land a
+        hand copy skips: the range opens after 387, the nearest lower land
+        trunk carries, so 388 reads MISSING and its merges read under 389,
+        never an OK over 389 alone."""
+        r, shas = self._edge()
+        rc, out = self._report(r)
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("every LAND from 389 to 389", out)
+        self.assertIn("every LAND from 388 to 389 present: MISSING 1", out)
+        missing = [ln.strip() for ln in out.splitlines()
+                   if ln.strip().startswith("MISSING")]
+        self.assertEqual(len(missing), 1, out)
+        self.assertTrue(missing[0].startswith("MISSING LAND 388: "), missing)
+        self.assertIn("helm train auto seed 388 ", missing[0])
+        # 387 is outside the window: the range opens after it, never at it
+        self.assertIsNone(self._line(out, 387), out)
+        self.assertIsNone(self._line(out, 388), out)
+        line = self._line(out, 389)
+        self.assertIn("the fleet got c", line)
+        self.assertIn("the fleet got d", line)
+        self.assertNotIn("the fleet got b", line)
+        self.assertNotIn("merges before its head not shown", line)
+
+    def test_the_window_edge_with_its_LAND_recorded_passes(self):
+        """The control: the same trunk with 388 seeded."""
+        r, shas = self._edge()
+        self._record(r, 388, shas[1], seeded=True)
+        rc, out = self._report(r)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("MISSING", out)
+        self.assertIn("every LAND from 388 to 389 present: OK", out)
+        self.assertIsNone(self._line(out, 387), out)
+        self.assertIn("the fleet got c", self._line(out, 388))
+        self.assertNotIn("the fleet got c", self._line(out, 389))
+
+    def test_trunk_past_the_last_numbered_LAND_prints_MISSING(self):
+        r, shas = self._trunk(["train10: merge lane a: the fleet got a",
+                               "train11: merge lane b: the fleet got b"])
+        self._record(r, 10, shas[0])
+        rc, out = self._report(r)
+        self.assertEqual(rc, 1, out)
+        missing = [ln.strip() for ln in out.splitlines()
+                   if ln.strip().startswith("MISSING")]
+        self.assertEqual(len(missing), 1, out)
+        self.assertTrue(missing[0].startswith("MISSING LAND 11: "), missing)
+        self.assertIn("the fleet got b", missing[0])
+        self.assertIn("helm train auto seed 11 %s" % shas[1][:12], missing[0])
+
+    def test_a_seeded_LAND_reads_its_gate_from_the_receipt_on_its_tree(self):
+        r, shas = self._trunk(["train10: merge lane a: the fleet got a"])
+        self._record(r, 10, shas[0], seeded=True)
+        tree = subprocess.run(("git", "rev-parse", shas[0] + "^{tree}"),
+                              cwd=r, check=True, capture_output=True,
+                              text=True).stdout.strip()
+        rows = [{"id": "12" * 8, "suite": False, "status": "OK", "ran": 9,
+                 "head": shas[0], "tree": tree, "ts": "2026-01-01T03:00:00Z"},
+                {"id": "34" * 8, "suite": True, "status": "FAILED", "ran": 8,
+                 "head": shas[0], "tree": tree, "ts": "2026-01-01T02:00:00Z"},
+                {"id": "ef" * 8, "suite": True, "status": "OK", "ran": 25390,
+                 "dirty": False, "head": "0" * 40, "tree": tree,
+                 "ts": "2026-01-01T01:00:00Z"}]
+        with mock.patch("helm.gate.receipts", return_value=(rows, None, 0)):
+            rc, out = self._report(r)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("gate:%s Ran 25390" % ("ef" * 8), self._line(out, 10))
+
+    def test_every_open_owner_ask_is_listed_and_checked(self):
+        r, shas = self._trunk(["train10: merge lane a: the fleet got a"])
+        self._record(r, 10, shas[0])
+        pk.write_json(os.environ["HELM_BOARD"], {"owner_gated_queue": [
+            {"ask": "owner ask number %d" % i, "why": "because %d" % i,
+             "state": "waiting-owner", "hold_kind": "owner-input",
+             "since": _iso(self.now - i * 3600)} for i in range(8)]})
+        rc, out = self._report(r)
+        self.assertEqual(rc, 0, out)
+        # the brief folds past six; the report names every one
+        for i in range(8):
+            self.assertIn("owner ask number %d" % i, out)
+        self.assertIn("every open owner ask present: OK (8)", out)
+
+    def test_an_unreadable_owner_queue_is_UNKNOWN_never_a_pass(self):
+        r, shas = self._trunk(["train10: merge lane a: the fleet got a"])
+        self._record(r, 10, shas[0])
+        with open(os.environ["HELM_BOARD"], "w") as f:
+            f.write("not-json")
+        rc, out = self._report(r)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("every open owner ask present: UNKNOWN", out)
+
+
+class ReportCheckTest(_Trunk, BriefBase):
+    """`helm brief --check FILE` holds a report written by hand to the same
+    checklist: every LAND from its first to its last (or the land log's last,
+    when that is later) and every open owner ask. The planted copy has the
+    shape of the integrator's hand copy, which went from LAND 387 to 389."""
+
+    HAND_COPY = """\
+# Overnight report
+
+## Landed on trunk
+
+| Land | Head | Gate | What |
+|---|---|---|---|
+| 381 | 0000381aaaa | 1111222233334444, Ran 25236 | the bridge no longer ends a run that is thinking |
+| 382 | 0000382aaaa | 2222333344445555, Ran 25249 | a reboot relaunches only the seats it saw live |
+
+## LAND 383 (19:44) and LAND 384 (20:20 PDT)
+- LAND 383 0000383aaaa (Ran 25268): pi seats take their window from the catalog.
+- LAND 384 0000384aaaa (Ran 25302): the argv guard refuses an unbounded grep.
+
+## LAND 385-387 (20:31-21:22 PDT)
+- LAND 386 0000386aaaa (Ran 25338): the bridge reports an estimate of the request.
+
+## LAND 389 (22:00 PDT)
+- **LAND 389 = 0000389aaaa** (gate 3333444455556666, Ran 25390): a seat stood down stays down.
+- **LAND 390 = 0000390aaaa** (gate 4444555566667777, Ran 25459): shared records are written by trunk code.
+
+## Needs you
+- renew the signing key before Friday
+"""
+
+    def _check(self, text, *extra):
+        path = self.j("report.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = brief.cmd_brief(["--check", path] + list(extra))
+        return rc, out.getvalue()
+
+    @staticmethod
+    def _missing(out):
+        return [ln for ln in out.splitlines() if ln.startswith("MISSING")]
+
+    def test_the_hand_copy_that_skipped_LAND_388_prints_MISSING(self):
+        rc, out = self._check(self.HAND_COPY)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self._missing(out), ["MISSING LAND 388"], out)
+
+    def test_the_same_copy_with_LAND_388_passes(self):
+        rc, out = self._check(self.HAND_COPY.replace(
+            "## LAND 389", "- LAND 388 0000388aaaa: a lane landed.\n\n"
+                           "## LAND 389"))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._missing(out), [], out)
+
+    def test_a_run_of_skipped_LANDs_is_one_MISSING_line(self):
+        rc, out = self._check("- LAND 10: one.\n- LAND 14: two.\n")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self._missing(out), ["MISSING LANDs 11-13"], out)
+
+    def test_a_MISSING_line_is_not_the_land_it_names(self):
+        rc, out = self._check(self.HAND_COPY + "MISSING LAND 388: no head\n"
+                              "  MISSING LAND 388\n")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self._missing(out), ["MISSING LAND 388"], out)
+
+    def test_the_land_log_carries_the_range_past_the_copy(self):
+        r = self._repo()
+        self._land(r, "train391: merge lane a: the fleet got a", self.now)
+        self._publish(r)
+        head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=r, check=True,
+                              capture_output=True, text=True).stdout.strip()
+        from helm import autoland
+        self.assertTrue(autoland.record_land(os.path.realpath(r), 391, head))
+        rc, out = self._check(self.HAND_COPY, "--repo", r)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self._missing(out),
+                         ["MISSING LAND 388", "MISSING LAND 391"], out)
+
+    def test_an_open_owner_ask_the_copy_does_not_name_is_MISSING(self):
+        pk.write_json(os.environ["HELM_BOARD"], {"owner_gated_queue": [
+            {"ask": "renew the signing key before Friday", "why": "",
+             "state": "waiting-owner", "hold_kind": "owner-input",
+             "since": _iso(self.now - 3600)},
+            {"ask": "decide the release date", "why": "two options",
+             "state": "waiting-owner", "hold_kind": "owner-input",
+             "since": _iso(self.now - 7200)}]})
+        rc, out = self._check(self.HAND_COPY.replace(
+            "## LAND 389", "- LAND 388 0000388aaaa: a lane landed.\n\n"
+                           "## LAND 389"))
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self._missing(out),
+                         ["MISSING owner ask: decide the release date"], out)
 
 
 class CmdBriefTest(BriefBase):

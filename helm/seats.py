@@ -41,8 +41,8 @@ The legs:
   * delegation-stop — SubagentStop hook: removes that exact agent's activity
               entry so the parent Claude pid cannot preserve completed work.
   * wait    — the beacon: block until a row addressed to the seat lands
-              (Monitor arms it). --follow keeps the room open and streams EACH
-              new matching row as one line (one line = one agent wake), never
+              (Monitor arms it). --follow keeps the room open and RINGS once per
+              burst (helm.beacon_doorbell; --per-row streams each row), never
               returning on a match — MENTION-ONLY by default (mentions/
               replies/DMs/@all; ambient home-room rows wake nobody — owner
               directive 2026-07-29, --ambient opts back in). NOTE (codex
@@ -162,7 +162,7 @@ from .seats_common import (  # noqa: F401
     UnresolvedRepo, _unresolved_repo_refusal,
     _flocked, roster_path, _seat_key, roster,
     canonical_keys, canonical_seat, seat_row,
-    declared_name, live_alias, rename_alias, rename_aliases, row_alias,
+    declared_name, live_alias, rename_aliases, row_alias,
     row_aliases, alias_names, names_match,
     RENAME_ALIAS_FIELD, RENAME_ALIAS_HOURS,
     _GONE, process_sid_scan, _sessions_with_a_process, dm_lane,
@@ -283,7 +283,7 @@ from .seats_stop_seam import (  # noqa: F401
 from .seats_ack import (  # noqa: F401
     _MENTION_TOKEN, _ts_epoch, _dm_lanes, _all_lanes,
     _seat_checked, _recipients, _row_offsets, _recipient_cursor,
-    consume_state, _locate_row, ack, pending,
+    consume_state, _locate_row, ack, ack_many, pending,
 )
 from .seats_receipts import (  # noqa: F401
     record_delivery_receipt, delivery_receipts, render_delivery_receipts,
@@ -624,10 +624,15 @@ OWNER_RAILS = ("web", "tui", "telegram")
 # which is a different bug wearing this fix's clothes. And `home`, an
 # imported MODULE rather than a moved function, is covered by exactly the
 # same rule: the siblings hold it, so a patch of it reaches them.
-_IMPL_MODULES = ("seats_common", "seats_gate_queue", "seats_identity",
+_IMPL_MODULES = ("seats_common", "seats_common_lock", "seats_gate_queue",
+                 "seats_identity",
                  "seats_roster", "seats_mute", "seats_incarnation",
                  "seats_lineage",
                  "seats_delivery",
+                 # the hook's scope (`boundary_scope`, task/3382) resolves
+                 # `seat_scope` here, so a patch of seats.seat_scope must
+                 # reach it as it reached deliver_any before.
+                 "seats_address",
                  # THE THIRD REGISTRY A MOVED FUNCTION OWES. The facade's
                  # patch fan-out is what lets a caller patch `seats.X` and have
                  # the implementation modules see it. `_scan_rooms` moved to
@@ -636,7 +641,15 @@ _IMPL_MODULES = ("seats_common", "seats_gate_queue", "seats_identity",
                  # longer resolves, and its home-room pin was silently ignored
                  # while every other assertion in the arm still passed.
                  "seats_roomscan",
+                 # compaction's hold-and-remap passes, split out of
+                 # seats_delivery: rotation_hold_offset resolves `roster` and
+                 # `runtime_for_session` here.
+                 "seats_rotation",
                  "seats_join", "seats_stop_signals",
+                 # the spiral and pair-meld rungs, split out of
+                 # seats_stop_signals: a patch of seats._melded_with must
+                 # reach the _spiral_gate that now resolves it here.
+                 "seats_stop_spiral",
                  "seats_ack", "seats_receipts", "seats_delegation",
                  "seats_claims", "seats_report",
                  "seats_gc",

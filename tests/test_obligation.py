@@ -344,7 +344,8 @@ class ParkedLaneSignalTests(unittest.TestCase):
         run("init", "-q")
         run("config", "user.email", author)
         run("config", "user.name", "fixture")
-        open(os.path.join(path, "f.txt"), "w").write("x")
+        with open(os.path.join(path, "f.txt"), "w") as fh:
+            fh.write("x")
         run("add", "-A")
         run("commit", "-q", "-m", subject)
         return path
@@ -1068,3 +1069,826 @@ class DeliveryIsIdempotentPerObligationTest(unittest.TestCase):
             good, _d = obligation.deliver(self._ob(oid="OB-GOOD"))
         self.assertEqual(good, obligation.DELIVERED_UNACKED)
         self.assertEqual(sent, ["some-seat"])
+
+
+class AConcurredContinuationAnswersTheFixTest(unittest.TestCase):
+    """A FIX IS ANSWERED ONCE ITS CURE HAS BEEN READ AND ENDORSED, and a
+    standing CONCUR on a row that continues the chain is exactly that.
+
+    MEASURED LIVE (2026-09-25T15:28Z). Chain 9203cacc97f9 ran FIX, then a FIX
+    whose reviewer committed the cure (patch tip 2e1263de966), then a CONCUR on
+    that exact patch tip. The owed-bot billed the middle FIX as UNANSWERED at
+    0h44m and `helm owed` listed the lane as waiting. Seats then re-dispatched
+    reviews of a patch its author had already adopted, only to silence the
+    bot, and each one joined the single local reader's backlog.
+
+    WHICH CONTINUATIONS ANSWER is one table, so a later change to the rule has
+    to edit a row: a CONCUR, an APPROVE and a source-clean hold (held or
+    landed) answer the FIX. An OPEN re-dispatch answers the AUTHOR's debt: the
+    reviewer owes the next move and the open frontier shows it. A FIX answers
+    its parent and bills the lane again on its OWN row, once. A continuation
+    that was RETRACTED, WITHDRAWN, STRANDED, EXPIRED or CANCELLED answered
+    nothing, so the parent bills. So does a CONCUR that read the FIX's own
+    uncured tip, or that records no tip: neither is a read of a cure.
+
+    The fixture gives every row its own `reviewed_tip` ("tip-<id>"), so a
+    concur in this table reads a commit other than the FIX's unless its row
+    says otherwise."""
+
+    # (the continuation `b` of FIX `a`, its fields, the rows the pass bills)
+    SHAPES = (
+        ("a standing CONCUR", {"polarity": "concur"}, []),
+        ("an APPROVE", {"polarity": "approve"}, []),
+        ("a source-clean HOLD", {"status": "held", "polarity": None,
+                                 "source_clean_tip": "tip-b"}, []),
+        ("a source-clean hold that LANDED",
+         {"status": "closed", "polarity": None,
+          "close_reason": "source-clean-landed"}, []),
+        ("an OPEN re-dispatch with no verdict yet",
+         {"status": "open", "polarity": None}, []),
+        ("a FIX, the next round", {"polarity": "fix"}, ["b"]),
+        ("a RETRACTED concur", {"polarity": "retracted",
+                                "verdict_retracted": True,
+                                "retracted_polarity": "concur"}, ["a"]),
+        ("a concur WITHDRAWN", {"polarity": "concur",
+                                "close_reason": "withdrawn"}, ["a"]),
+        ("a concur closed STRANDED", {"polarity": "concur",
+                                      "close_reason": "stranded"}, ["a"]),
+        ("a re-dispatch CANCELLED before any verdict",
+         {"status": "cancelled", "polarity": None}, ["a"]),
+        ("a concur on a FOREIGN chain", {"polarity": "concur",
+                                         "_root": "z"}, ["a"]),
+        ("a concur closed EXPIRED", {"polarity": "concur",
+                                     "close_reason": "expired"}, ["a"]),
+        ("a concur on the FIX's own uncured tip",
+         {"polarity": "concur", "reviewed_tip": "tip-a"}, ["a"]),
+        ("a concur that records no tip", {"polarity": "concur",
+                                          "reviewed_tip": None}, ["a"]),
+    )
+
+    def _specimen(self, concur=True):
+        rows = [row("r9203"), row("r7f9f", supersedes="r9203")]
+        if concur:
+            rows.append(row("rc803", supersedes="r7f9f", polarity="concur"))
+        return snap(*rows)
+
+    def test_the_specimen_chain_bills_nothing(self):
+        # CONTROL FIRST, same call: without the CONCUR the middle FIX IS owed,
+        # so the empty answer below is about the CONCUR and not a dead reader.
+        items, forks, un = obligation.unanswered_fixes(
+            self._specimen(concur=False), None)
+        self.assertIsNone(un)
+        self.assertEqual([i["row"] for i in items], ["r7f9f"])
+        items, forks, un = obligation.unanswered_fixes(self._specimen(), None)
+        self.assertIsNone(un)
+        self.assertEqual(forks, [])
+        self.assertEqual([i["row"] for i in items], [],
+                         "a FIX whose cure a continuation CONCURRED on was "
+                         "billed as unanswered: the 7f9fdca3c22a DM")
+
+    def test_each_continuation_answers_or_bills_as_its_table_row_says(self):  # noqa: VACUOUS_ASSERTION — the table carries its own positive rows: the FIX, retracted, withdrawn, stranded, cancelled and foreign continuations each bill a NON-empty list through the same assertion, in the same loop
+        for label, fields, billed in self.SHAPES:
+            with self.subTest(continuation=label):
+                b = row("b", supersedes="a")
+                b.update(fields)
+                items, forks, un = obligation.unanswered_fixes(
+                    snap(row("a"), b), None)
+                self.assertIsNone(un)
+                self.assertEqual(forks, [])
+                self.assertEqual(
+                    [i["row"] for i in items if i["kind"] ==
+                     obligation.UNANSWERED_FIX], billed,
+                    "a FIX continued by %s billed the wrong rows" % label)
+
+    def test_a_concur_beyond_a_rebinds_cancelled_head_answers_too(self):
+        """`rebind` cancels the old row and opens its replacement BENEATH it,
+        so a CONCUR one level below a cancelled head is the ordinary shape of
+        a re-dispatched review, not an edge case."""
+        dead = row("b", supersedes="a", status="cancelled", polarity=None)
+        alone, _f, _u = obligation.unanswered_fixes(snap(row("a"), dead), None)
+        self.assertEqual([i["row"] for i in alone], ["a"],
+                         "the control is not owed, so the empty answer below "
+                         "proves nothing about the CONCUR")
+        items, _f, _u = obligation.unanswered_fixes(
+            snap(row("a"), dead,
+                 row("c", supersedes="b", polarity="concur")), None)
+        self.assertEqual([i["row"] for i in items], [],
+                         "a CONCUR behind a rebind's cancelled head did not "
+                         "answer the FIX above it")
+
+    def test_an_UNDECLARED_verdict_a_continuation_concurred_on_is_answered(self):
+        """The undeclared bucket asks the same answered question: its remedy
+        is to re-dispatch with an explicit polarity, and a continuation that
+        recorded a CONCUR did exactly that."""
+        alone, _f, _u = obligation.unanswered_fixes(
+            snap(row("a", polarity=None)), None)
+        self.assertEqual([i["kind"] for i in alone],
+                         [obligation.UNDECLARED_VERDICT])
+        items, _f, _u = obligation.unanswered_fixes(
+            snap(row("a", polarity=None),
+                 row("b", supersedes="a", polarity="concur")), None)
+        self.assertEqual(items, [],
+                         "an undeclared verdict whose continuation concurred "
+                         "was still reported")
+
+    def test_an_UNDECLARED_verdict_is_answered_by_a_concur_on_its_own_tip(self):
+        """THE TIP RULE IS A FIX's RULE. A FIX names a defect, so a concur on
+        the FIX's own tip endorsed the uncured work. An UNDECLARED verdict
+        names none: its remedy is a re-dispatch with an explicit polarity on
+        the SAME work, so a concur on that very tip is the remedy done."""
+        def chain(polarity):
+            b = row("b", supersedes="a", polarity="concur")
+            b["reviewed_tip"] = "tip-a"
+            items, _f, _u = obligation.unanswered_fixes(
+                snap(row("a", polarity=polarity), b), None)
+            return [i["row"] for i in items]
+        # CONTROL: the same concur under a FIX still bills it.
+        self.assertEqual(chain("fix"), ["a"])
+        self.assertEqual(chain(None), [],
+                         "an undeclared verdict re-read on its own tip with a "
+                         "CONCUR was still reported, so the owed-bot keeps "
+                         "DMing after the remedy is done")
+
+    def test_a_concur_branch_behind_a_cancelled_head_is_a_LIVE_branch(self):
+        """A FORK ASKS THE SAME QUESTION: a branch is alive when it, or
+        something below it, answered. Two CONCUR branches directly under one
+        FIX are a fork; the same two, one of them re-dispatched through a
+        rebind, must read the same way, or the fork hides and the parent is
+        answered by whichever branch the walk reached first."""
+        direct = obligation.unanswered_fixes(
+            snap(row("a"),
+                 row("b", supersedes="a", polarity="concur"),
+                 row("c", supersedes="a", polarity="concur")), None)
+        self.assertEqual([f["branches"] for f in direct[1]], [["b", "c"]],
+                         "the control fork is not reported, so the arm below "
+                         "proves nothing about the rebind shape")
+        rebound = obligation.unanswered_fixes(
+            snap(row("a"),
+                 row("b", supersedes="a", polarity="concur"),
+                 row("c", supersedes="a", status="cancelled", polarity=None),
+                 row("d", supersedes="c", polarity="concur")), None)
+        self.assertEqual([f["branches"] for f in rebound[1]], [["b", "c"]],
+                         "a CONCUR branch behind a cancelled head was read as "
+                         "dead, so the fork was hidden")
+        self.assertEqual([i["row"] for i in rebound[0]], [])
+
+    def test_helm_owed_lists_no_lane_for_the_specimen(self):
+        """THE SURFACE, through the ledger read `helm owed` really makes."""
+        import contextlib
+        import io
+        import json
+        from unittest import mock
+        from helm import dispatches
+
+        def owed(ledger):
+            out = io.StringIO()
+            with mock.patch.object(dispatches, "snapshot",
+                                   return_value=(ledger, None)), \
+                    mock.patch.object(obligation, "_root_for_repo",
+                                      return_value=None), \
+                    contextlib.redirect_stdout(out):
+                rc = obligation.cmd_owed(["--json"])
+            self.assertEqual(rc, 0)
+            return [r["row"] for r in json.loads(out.getvalue())["owed"]]
+
+        self.assertEqual(owed(self._specimen(concur=False)), ["r7f9f"],
+                         "the control lane is not listed, so the empty list "
+                         "below proves nothing")
+        self.assertEqual(owed(self._specimen()), [],
+                         "`helm owed` still lists a lane whose cure was "
+                         "concurred on")
+
+
+def landed_patch_repo(test, trunk=True):
+    """(gitdir, reviewed, patch, stray) in a REAL repository whose trunk
+    carries a reviewer's cure.
+
+    `reviewed` is the tip a FIX read, `patch` the cure its reviewer committed
+    on top of it, and `refs/remotes/origin/main` points at `patch`: the lane
+    LANDED WITH THE CURE, so both tips are on trunk. `stray` is a second cure
+    off `reviewed` that never landed. `trunk=False` leaves the trunk ref unset,
+    which is the unreadable trunk the reader must fail closed on.
+
+    REAL GIT, NOT A FAKE, because the default reader is the thing owed-bot
+    runs every hour and an arm that only ever injects a double proves nothing
+    about it. SYNTHETIC PATHS ONLY, and the ambient GIT_* selection is
+    stripped so a caller standing in a hook cannot point these commands at
+    another repository."""
+    import shutil
+    import subprocess
+    git = shutil.which("git")
+    if not git:
+        test.skipTest("git not available")
+    tmp = tempfile.mkdtemp(prefix="oblig-landed-")
+    test.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+    def run(*args):
+        p = subprocess.run(
+            [git, "-C", tmp, "-c", "user.name=fixture",
+             "-c", "user.email=fixture@example.com",
+             "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+            + list(args), capture_output=True, text=True, env=env)
+        if p.returncode:
+            test.fail("fixture git %s failed: %s" % (args[0], p.stderr))
+        return p.stdout.strip()
+
+    run("init", "-q")
+    run("commit", "-q", "--allow-empty", "-m", "the reviewed tip")
+    reviewed = run("rev-parse", "HEAD")
+    run("commit", "-q", "--allow-empty", "-m", "the reviewer's cure")
+    patch = run("rev-parse", "HEAD")
+    run("checkout", "-q", "--detach", reviewed)
+    run("commit", "-q", "--allow-empty", "-m", "a cure that never landed")
+    stray = run("rev-parse", "HEAD")
+    if trunk:
+        run("update-ref", "refs/remotes/origin/main", patch)
+    return os.path.join(tmp, ".git"), reviewed, patch, stray
+
+
+def cured_fix(rid, gitdir, reviewed, patch, **fields):
+    """A FIX row whose reviewer named `patch` as the cure of `reviewed`."""
+    r = row(rid, **fields)
+    r.update(repo_id=gitdir, reviewed_tip=reviewed, patch_tip=patch)
+    return r
+
+
+class AFixAnsweredByItsLandedPatchTest(unittest.TestCase):
+    """A FIX WHOSE OWN CURE IS ON TRUNK IS ANSWERED (task/3357).
+
+    MEASURED 2026-09-26T21:45Z: owed-bot DMed one seat hourly about seven FIX
+    rows. Each had been carried by a source-clean hold that was cancelled as
+    moot once its lane landed, so nothing on the ledger continued the FIX any
+    more and it read as unanswered debt again. For four of the seven the
+    REVIEWER'S patch tip was already an ancestor of origin/main: the cure the
+    FIX asked for had landed. No close door takes such a row — `lr close
+    --reason carried` refuses an ancestor tip, `resolved` wants a later
+    verdict, and `close-landed` never takes a FIX — so the nag had no end.
+
+    THE LEDGER CANNOT SEE A LAND, so this is the one question the pass asks
+    git, through a reader the arms can inject. ONLY A MEASURED YES ANSWERS:
+    a reader that says no, cannot say, or raises keeps the FIX listed.
+
+    THE TABLE (task/3357's surface by state), one arm or subTest per cell:
+      FIX, own patch on trunk, nothing carrying it   -> not listed
+      FIX, own patch NOT on trunk                    -> listed
+      FIX, no patch, REVIEWED tip on trunk           -> listed (contrary debt)
+      FIX, patch named, reader errs / unknown repo   -> listed (fail closed)
+      SUPERSEDE with a patch on trunk                -> unchanged: not listed,
+                                                        and git is never asked
+      FIX already carried, retired or forked         -> unchanged, never asked
+      UNDECLARED polarity with a patch               -> unchanged, never asked
+    and two the brief did not name, found in the code:
+      a "patch" that IS the reviewed tip             -> listed, never asked
+      a patch beside a DESIGN finding                -> listed, never asked
+    """
+
+    def owed(self, *rows, reader=None):
+        """The FIX rows billed, and every question the reader was asked."""
+        asked = []
+
+        def fake(repo_id, sha):
+            asked.append((repo_id, sha))
+            return reader(repo_id, sha)
+
+        kw = {} if reader is None else {"on_trunk": fake}
+        items, _forks, un = obligation.unanswered_fixes(snap(*rows), None,
+                                                        **kw)
+        self.assertIsNone(un)
+        return [(i["row"], i["kind"]) for i in items], asked
+
+    # -- the default reader, against a real repository ----------------------
+
+    def test_a_FIX_whose_own_cure_LANDED_is_answered(self):  # noqa: VACUOUS_ASSERTION — the unconditional control runs FIRST through the same default reader on the same repository: the identical FIX naming a cure that never landed must bill before the landed cure is asked
+        gitdir, reviewed, patch, stray = landed_patch_repo(self)
+        # CONTROL FIRST, same reader, same repository: a cure that never
+        # landed is still owed, so the empty list below is about the land.
+        billed, _ = self.owed(cured_fix("a", gitdir, reviewed, stray))
+        self.assertEqual(billed, [("a", obligation.UNANSWERED_FIX)],
+                         "the control FIX is not owed, so the answer below "
+                         "proves nothing about the landed cure")
+        billed, _ = self.owed(cured_fix("a", gitdir, reviewed, patch))
+        self.assertEqual(billed, [],
+                         "a FIX whose reviewer's cure is an ancestor of "
+                         "origin/main is still billed: the hourly owed-bot "
+                         "DM of task/3357")
+
+    def test_a_FIX_with_no_patch_whose_REVIEWED_tip_is_on_trunk_stays_owed(self):
+        """CONTRARY DEBT. The tip the FIX found defective is on trunk and no
+        cure is named: the land went ahead over the FIX, which is the case a
+        reader most needs to see, not an answer."""
+        gitdir, reviewed, _patch, _stray = landed_patch_repo(self)
+        r = cured_fix("a", gitdir, reviewed, None)
+        del r["patch_tip"]
+        billed, _ = self.owed(r)
+        self.assertEqual(billed, [("a", obligation.UNANSWERED_FIX)])
+
+    def test_a_patch_that_IS_the_reviewed_tip_answers_nothing(self):
+        """The verdict door proves a patch DESCENDS from the reviewed tip,
+        and a commit descends from itself. Such a patch names no cure, and
+        reading it as one would retire exactly the contrary debt above."""
+        gitdir, reviewed, _patch, _stray = landed_patch_repo(self)
+        billed, _ = self.owed(cured_fix("a", gitdir, reviewed, reviewed))
+        self.assertEqual(billed, [("a", obligation.UNANSWERED_FIX)])
+
+    def test_an_UNREADABLE_trunk_keeps_the_FIX_listed(self):
+        gitdir, reviewed, patch, _stray = landed_patch_repo(self, trunk=False)
+        billed, _ = self.owed(cured_fix("a", gitdir, reviewed, patch))
+        self.assertEqual(billed, [("a", obligation.UNANSWERED_FIX)],
+                         "a repository with no origin/main to read answered "
+                         "the FIX: UNKNOWN was spent as a yes")
+
+    def test_an_UNKNOWN_or_RELATIVE_repository_keeps_the_FIX_listed(self):  # noqa: VACUOUS_ASSERTION — every row of the table asserts a NON-empty billed list through the same assertion; the relative form is proven to resolve by the unconditional isdir assertion before the loop
+        """A relative repo_id resolves against the PROCESS CWD, so it names a
+        different repository wherever the caller stands; the arm chdirs into
+        the parent of a real landed repository so the relative form WOULD
+        resolve to it."""
+        gitdir, reviewed, patch, _stray = landed_patch_repo(self)
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        os.chdir(os.path.dirname(os.path.dirname(gitdir)))
+        relative = os.path.relpath(gitdir)
+        self.assertTrue(os.path.isdir(relative),
+                        "the relative repo_id would not resolve, so its row "
+                        "below proves nothing about the cwd hazard")
+        for label, repo in (("absent", None), ("empty", ""),
+                            ("relative", relative),
+                            ("no such path", "/nonexistent/oblig/.git"),
+                            ("not a string", ["/x/.git"])):
+            with self.subTest(repo=label):
+                r = cured_fix("a", gitdir, reviewed, patch)
+                r["repo_id"] = repo
+                billed, _ = self.owed(r)
+                self.assertEqual(billed, [("a", obligation.UNANSWERED_FIX)],
+                                 "a FIX in a repository nobody can place "
+                                 "(%s) was answered" % label)
+
+    # -- the injected reader: what it is asked, and when -------------------
+
+    def test_only_a_measured_YES_answers_and_every_other_reading_keeps_it(self):  # noqa: VACUOUS_ASSERTION — the table carries its own positive rows: four of five readings bill a NON-empty list, and every row asserts the reader was asked, through the same assertions in the same loop
+        patch = "c" * 40
+        r = row("a")
+        r.update(repo_id="/r/.git", patch_tip=patch)
+
+        def boom(_repo, _sha):
+            raise OSError("git could not be spawned")
+
+        for label, reader, billed in (
+                ("yes", lambda _r, _s: True, []),
+                ("no", lambda _r, _s: False, [("a", obligation.UNANSWERED_FIX)]),
+                ("cannot say", lambda _r, _s: None,
+                 [("a", obligation.UNANSWERED_FIX)]),
+                ("truthy but not True", lambda _r, _s: "ancestor",
+                 [("a", obligation.UNANSWERED_FIX)]),
+                ("raises", boom, [("a", obligation.UNANSWERED_FIX)])):
+            with self.subTest(reader=label):
+                got, asked = self.owed(dict(r), reader=reader)
+                self.assertEqual(asked, [("/r/.git", patch)],
+                                 "the reader was not asked the row's OWN "
+                                 "repository and patch")
+                self.assertEqual(got, billed)
+
+    def test_SUPERSEDE_with_a_landed_patch_is_unchanged_and_never_asks(self):
+        """A SUPERSEDE was never billed here: its remedy is a replacement,
+        not a cure this pass could see land. It stays exactly as it was, and
+        it costs no git call. The control is the same row as a FIX, through
+        the same reader, which IS asked."""
+        yes = lambda _r, _s: True
+        r = row("a")
+        r.update(repo_id="/r/.git", patch_tip="c" * 40)
+        _got, asked = self.owed(dict(r), reader=yes)
+        self.assertEqual(len(asked), 1, "the control FIX never reached the "
+                                        "reader, so the zero below is empty")
+        got, asked = self.owed(dict(r, polarity="supersede"), reader=yes)
+        self.assertEqual((got, asked), ([], []))
+
+    def test_an_UNDECLARED_verdict_with_a_landed_patch_is_unchanged(self):
+        """An undeclared verdict demanded nothing, so a landed commit cannot
+        say what it meant; its remedy is still an explicit polarity or an
+        advisory close, and it stays in its own bucket."""
+        r = row("a", polarity=None)
+        r.update(repo_id="/r/.git", patch_tip="c" * 40)
+        got, asked = self.owed(r, reader=lambda _r, _s: True)
+        self.assertEqual(got, [("a", obligation.UNDECLARED_VERDICT)])
+        self.assertEqual(asked, [])
+
+    def test_a_FIX_already_carried_retired_or_forked_never_asks(self):  # noqa: VACUOUS_ASSERTION — the unconditional control runs FIRST on the same observables: the same cured FIX alone is billed and its reader asked once, before the settled shapes are asserted to bill and ask nothing
+        """The ledger's own answers come first and git is the last question,
+        so a row the ledger already settled costs nothing. Each shape is
+        pinned unchanged against a reader that would say NO, so a pass that
+        consulted it would bill the row."""
+        no = lambda _r, _s: False
+
+        def cured(rid="a", **fields):
+            r = row(rid, **fields)
+            r.update(repo_id="/r/.git", patch_tip="c" * 40)
+            return r
+
+        got, asked = self.owed(cured(), reader=no)
+        self.assertEqual((got, len(asked)),
+                         ([("a", obligation.UNANSWERED_FIX)], 1),
+                         "the control FIX was not billed and asked, so the "
+                         "empty answers below prove nothing")
+        retired = cured()
+        retired["discharged"] = True
+        for label, rows in (
+                ("carried by a live successor",
+                 (cured(), row("b", supersedes="a", status="open",
+                               polarity=None))),
+                ("retired by the ladder", (retired,)),
+                ("a branch of a fork",
+                 (row("p"), cured("b", supersedes="p"),
+                  cured("c", supersedes="p")))):
+            with self.subTest(shape=label):
+                got, asked = self.owed(*rows, reader=no)
+                self.assertEqual(got, [])
+                self.assertEqual(asked, [], "git was asked about a row the "
+                                            "ledger had already settled")
+
+    def test_a_patch_beside_a_DESIGN_finding_stays_owed_and_never_asks(self):
+        """A landed patch answers the MECHANICAL findings it cured. A design
+        finding recorded beside it is not answered by any commit — it goes to
+        a meld — so the FIX stays owed, and `review_door`'s all-mechanical
+        rule (a patch, no design finding, no reason for having no cure) is the
+        line this draws too. A patch beside a no-patch reason contradicts
+        itself (the verdict door takes one or the other) and fails closed."""
+        r = row("a")
+        r.update(repo_id="/r/.git", patch_tip="c" * 40,
+                 design_findings=["the API shape is wrong"])
+        got, asked = self.owed(r, reader=lambda _r, _s: True)
+        self.assertEqual(got, [("a", obligation.UNANSWERED_FIX)])
+        self.assertEqual(asked, [])
+        r = row("a")
+        r.update(repo_id="/r/.git", patch_tip="c" * 40,
+                 no_patch_because="a design disagreement")
+        got, asked = self.owed(r, reader=lambda _r, _s: True)
+        self.assertEqual(got, [("a", obligation.UNANSWERED_FIX)])
+        self.assertEqual(asked, [])
+
+    def test_a_patch_that_IS_the_reviewed_tip_never_asks(self):
+        r = row("a")
+        r.update(repo_id="/r/.git", patch_tip="c" * 40, reviewed_tip="c" * 40)
+        got, asked = self.owed(r, reader=lambda _r, _s: True)
+        self.assertEqual(got, [("a", obligation.UNANSWERED_FIX)])
+        self.assertEqual(asked, [])
+
+    def test_ONE_question_per_repository_and_patch_per_pass(self):
+        """owed-bot runs this over the whole ledger every hour, so the cost is
+        bounded by DISTINCT (repository, patch) pairs, never by rows. Three
+        chains naming one landed patch cost one question; a second patch, or
+        the same patch in another repository, costs one more each. The memo
+        lives for ONE pass: a second pass asks again, because trunk moves."""
+        def cured(rid, repo, patch):
+            r = row(rid)
+            r.update(repo_id=repo, patch_tip=patch)
+            return r
+        rows = (cured("a", "/r/.git", "c" * 40), cured("b", "/r/.git", "c" * 40),
+                cured("d", "/r/.git", "c" * 40), cured("e", "/r/.git", "d" * 40),
+                cured("f", "/s/.git", "c" * 40))
+        got, asked = self.owed(*rows, reader=lambda _r, _s: False)
+        self.assertEqual(len(got), 5, "the control rows are not all billed")
+        self.assertEqual(sorted(asked), [("/r/.git", "c" * 40),
+                                         ("/r/.git", "d" * 40),
+                                         ("/s/.git", "c" * 40)])
+        _got, again = self.owed(*rows, reader=lambda _r, _s: False)
+        self.assertEqual(len(again), 3, "the memo outlived its pass")
+
+    # -- the surface -------------------------------------------------------
+
+    def test_helm_owed_does_not_list_a_lane_whose_cure_landed(self):
+        """THE SURFACE, through the ledger read `helm owed` makes and the
+        reader it really uses."""
+        import contextlib
+        import io
+        import json
+        from unittest import mock
+        from helm import dispatches
+        gitdir, reviewed, patch, stray = landed_patch_repo(self)
+
+        def owed(ledger):
+            out = io.StringIO()
+            with mock.patch.object(dispatches, "snapshot",
+                                   return_value=(ledger, None)), \
+                    mock.patch.object(obligation, "_root_for_repo",
+                                      return_value=None), \
+                    contextlib.redirect_stdout(out):
+                rc = obligation.cmd_owed(["--json"])
+            self.assertEqual(rc, 0)
+            return [r["row"] for r in json.loads(out.getvalue())["owed"]]
+
+        self.assertEqual(owed(snap(cured_fix("a", gitdir, reviewed, stray))),
+                         ["a"], "the control lane is not listed, so the empty "
+                                "list below proves nothing")
+        self.assertEqual(owed(snap(cured_fix("a", gitdir, reviewed, patch))),
+                         [], "`helm owed` still lists a lane whose reviewer's "
+                             "cure is on trunk")
+
+
+def rebased_cure_repo(test, landed=2):
+    """(gitdir, reviewed, patch, first) in a REAL repository whose trunk
+    carries a reviewer's two-commit cure REBASED.
+
+    `reviewed` is the lane tip a FIX read, and `first` then `patch` are the
+    cure its reviewer committed on top of it. Trunk moved on, took the lane's
+    own commit REWORKED (other bytes, so no patch twin), then cherry-picked
+    the cure commits under new object ids. That is the shape of both live
+    specimens (task/3357): no cure commit is an ancestor of trunk, every cure
+    commit has a patch-identical twin there, and the lane's own commit has
+    none. `landed=1` cherry-picks `first` alone, which is a cure PARTLY
+    landed.
+
+    REAL FILE CONTENT, NEVER --allow-empty. An empty commit is
+    patch-identical to every other empty commit, so the instrument refuses
+    it (`vcs.landed_state`), and a fixture built of them tests that refusal
+    and nothing else."""
+    import shutil
+    import subprocess
+    git = shutil.which("git")
+    if not git:
+        test.skipTest("git not available")
+    tmp = tempfile.mkdtemp(prefix="oblig-rebased-")
+    test.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+    def run(*args):
+        p = subprocess.run(
+            [git, "-C", tmp, "-c", "user.name=fixture",
+             "-c", "user.email=fixture@example.com",
+             "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+            + list(args), capture_output=True, text=True, env=env)
+        if p.returncode:
+            test.fail("fixture git %s failed: %s" % (args[0], p.stderr))
+        return p.stdout.strip()
+
+    def commit(name, text, message):
+        with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+            f.write(text)
+        run("add", "-A")
+        run("commit", "-q", "-m", message)
+        return run("rev-parse", "HEAD")
+
+    run("init", "-q")
+    base = commit("base.txt", "base\n", "base")
+    reviewed = commit("lane.txt", "the lane's work\n", "the reviewed tip")
+    first = commit("cure-one.txt", "the first cure\n", "the first cure commit")
+    patch = commit("cure-two.txt", "the second cure\n",
+                   "the second cure commit")
+    run("checkout", "-q", "--detach", base)
+    commit("trunk.txt", "trunk moved on\n", "trunk moved on")
+    commit("lane.txt", "the lane's work, reworked when it landed\n",
+           "the lane, landed reworked")
+    for sha in (first, patch)[:landed]:
+        run("cherry-pick", sha)
+    run("update-ref", "refs/remotes/origin/main", "HEAD")
+    return os.path.join(tmp, ".git"), reviewed, patch, first
+
+
+class AFixAnsweredByItsRebasedPatchTest(unittest.TestCase):
+    """A FIX WHOSE CURE LANDED REBASED IS ANSWERED TOO (task/3357 remainder).
+
+    MEASURED 22:53Z with `helm owed --json`: FIX rows b18ca15245af (lane
+    remote-session-relay-3087) and a7c03bddf819 (or-free-is-one-model-class)
+    still billed their author. Neither patch tip is an ancestor of trunk, and
+    every commit each reviewer added (reviewed_tip..patch_tip) has a
+    patch-identical twin on trunk: the cures landed rebased. LAND 374's
+    ancestry reader answers that honestly with a no, so the debt never ends.
+
+    PATCH IDENTITY IS THE FALLBACK, AND ONLY A MEASURED NO FROM ANCESTRY
+    REACHES IT. An ancestry that cannot say is not a no, and an ancestor
+    patch needs no second question.
+
+    THE TABLE (task/3357's surface by state), one arm or subTest per cell:
+      rebased patch, every cure commit has a twin  -> not listed
+      partly landed (one cure commit has none)      -> listed
+      ancestry None                                 -> listed, identity never asked
+      identity raises                               -> listed
+      an ancestor patch                             -> not listed by ancestry,
+                                                       identity never asked
+    and three the brief did not name, found in the code:
+      an empty reviewed..patch range                -> listed
+      a reviewed tip that is not a full sha         -> listed, identity never asked
+      the same patch under two reviewed tips        -> two questions, because
+                                                       the range is the question
+    """
+
+    def owed(self, *rows, ancestry=None, identity=None):
+        """The rows billed, and every question each reader was asked."""
+        asked, identified = [], []
+
+        def on_trunk(repo_id, sha):
+            asked.append((repo_id, sha))
+            return ancestry(repo_id, sha)
+
+        def by_identity(repo_id, reviewed, patch):
+            identified.append((repo_id, reviewed, patch))
+            return identity(repo_id, reviewed, patch)
+
+        kw = {}
+        if ancestry is not None:
+            kw["on_trunk"] = on_trunk
+        if identity is not None:
+            kw["by_identity"] = by_identity
+        items, _forks, un = obligation.unanswered_fixes(snap(*rows), None, **kw)
+        self.assertIsNone(un)
+        return [(i["row"], i["kind"]) for i in items], asked, identified
+
+    # -- the default readers, against a real repository --------------------
+
+    def test_a_FIX_whose_cure_LANDED_REBASED_is_answered(self):  # noqa: VACUOUS_ASSERTION — the unconditional control runs FIRST through the same default readers on the same repository shape: a cure only PARTLY landed must bill before the fully landed one is asked
+        gitdir, reviewed, patch, _first = rebased_cure_repo(self, landed=1)
+        billed, _, _ = self.owed(cured_fix("a", gitdir, reviewed, patch))
+        self.assertEqual(billed, [("a", obligation.UNANSWERED_FIX)],
+                         "the control FIX (a cure only partly on trunk) is not "
+                         "owed, so the answer below proves nothing")
+        gitdir, reviewed, patch, _first = rebased_cure_repo(self)
+        billed, _, _ = self.owed(cured_fix("a", gitdir, reviewed, patch))
+        self.assertEqual(billed, [],
+                         "a FIX whose every cure commit is on origin/main "
+                         "under a new sha is still billed: b18ca15245af and "
+                         "a7c03bddf819 of task/3357")
+
+    def test_a_cure_only_PARTLY_landed_stays_owed(self):
+        """One cure commit has no twin on trunk, so the cure did not land."""
+        gitdir, reviewed, patch, _first = rebased_cure_repo(self, landed=1)
+        billed, _, _ = self.owed(cured_fix("a", gitdir, reviewed, patch))
+        self.assertEqual(billed, [("a", obligation.UNANSWERED_FIX)])
+
+    def test_the_cure_range_alone_is_judged_not_the_whole_lane(self):  # noqa: VACUOUS_ASSERTION — the unconditional git cherry read proves the lane's own commit has NO twin on trunk, so the whole-lane question would say no; the FIX must still be answered
+        """The lane's own commit landed REWORKED, so the whole lane is not on
+        trunk by any measure. The FIX asked for the CURE, and the cure is.
+        Asking the whole lane is what would keep both specimens billed: 3 of
+        6 and 3 of 14 of their lane commits read '+' against trunk."""
+        import subprocess
+        gitdir, reviewed, patch, _first = rebased_cure_repo(self)
+        cherry = subprocess.run(
+            ["git", "--git-dir", gitdir, "cherry", "refs/remotes/origin/main",
+             patch], capture_output=True, text=True,
+            env={k: v for k, v in os.environ.items()
+                 if not k.startswith("GIT_")})
+        self.assertIn("+ " + reviewed, cherry.stdout,
+                      "the fixture's lane commit has a twin on trunk, so this "
+                      "arm cannot tell the cure range from the whole lane")
+        billed, _, _ = self.owed(cured_fix("a", gitdir, reviewed, patch))
+        self.assertEqual(billed, [])
+
+    def test_an_EMPTY_cure_range_keeps_the_FIX_listed(self):  # noqa: VACUOUS_ASSERTION — the unconditional control answers the same repository through the same readers: the one-commit range reviewed..first IS answered, so the listing below is about the empty range
+        """A "patch" behind the reviewed tip names no cure commit at all, so
+        nothing can be measured and the FIX stays owed. The verdict door
+        refuses such a patch; a hand-edited or old row can still carry it."""
+        gitdir, reviewed, patch, first = rebased_cure_repo(self)
+        billed, _, _ = self.owed(cured_fix("a", gitdir, reviewed, first))
+        self.assertEqual(billed, [], "the control (a real one-commit cure "
+                                     "range) is not answered")
+        billed, _, _ = self.owed(cured_fix("a", gitdir, patch, first))
+        self.assertEqual(billed, [("a", obligation.UNANSWERED_FIX)],
+                         "a patch BEHIND its reviewed tip answered the FIX")
+
+    def test_helm_owed_does_not_list_a_lane_whose_cure_landed_rebased(self):
+        """THE SURFACE, through the ledger read `helm owed` makes and the
+        readers it really uses."""
+        import contextlib
+        import io
+        import json
+        from unittest import mock
+        from helm import dispatches
+        gitdir, reviewed, patch, _first = rebased_cure_repo(self, landed=1)
+        partly = cured_fix("a", gitdir, reviewed, patch)
+        gitdir, reviewed, patch, _first = rebased_cure_repo(self)
+        landed = cured_fix("a", gitdir, reviewed, patch)
+
+        def owed(ledger):
+            out = io.StringIO()
+            with mock.patch.object(dispatches, "snapshot",
+                                   return_value=(ledger, None)), \
+                    contextlib.redirect_stdout(out):
+                rc = obligation.cmd_owed(["--json"])
+            self.assertEqual(rc, 0)
+            return [r["row"] for r in json.loads(out.getvalue())["owed"]]
+
+        self.assertEqual(owed(snap(partly)), ["a"],
+                         "the control lane is not listed, so the empty list "
+                         "below proves nothing")
+        self.assertEqual(owed(snap(landed)), [],
+                         "`helm owed` still lists a lane whose reviewer's "
+                         "cure is on trunk rebased")
+
+    # -- the injected readers: what each is asked, and when ------------------
+
+    def cured(self, rid="a", reviewed="b" * 40, patch="c" * 40, repo="/r/.git"):
+        r = row(rid)
+        r.update(repo_id=repo, reviewed_tip=reviewed, patch_tip=patch)
+        return r
+
+    def test_only_a_measured_NO_from_ancestry_asks_patch_identity(self):  # noqa: VACUOUS_ASSERTION — the table carries its own positive rows: the ancestry-yes and identity-yes readings bill nothing while four others bill the row, and every row asserts both readers' questions exactly
+        """ANCESTRY SAYS NO, OR IT SAYS NOTHING. Only the first is a measured
+        absence that a rebased land explains; the second is a blind reader,
+        and asking a second instrument to overrule a blind first one would
+        answer a FIX nobody measured."""
+        fix = [("a", obligation.UNANSWERED_FIX)]
+        asked = [("/r/.git", "c" * 40)]
+        question = [("/r/.git", "b" * 40, "c" * 40)]
+
+        def boom(*_args):
+            raise OSError("git could not be spawned")
+
+        yes = lambda *_a: True
+        for label, ancestry, billed, identified in (
+                ("an ancestor patch", yes, [], []),
+                ("ancestry cannot say", lambda *_a: None, fix, []),
+                ("ancestry truthy but not True", lambda *_a: "ancestor",
+                 fix, []),
+                ("ancestry raises", boom, fix, []),
+                ("ancestry says no", lambda *_a: False, [], question)):
+            with self.subTest(ancestry=label):
+                got, a, i = self.owed(self.cured(), ancestry=ancestry,
+                                      identity=yes)
+                self.assertEqual(a, asked)
+                self.assertEqual(i, identified,
+                                 "patch identity was asked when ancestry had "
+                                 "not measured a no" if not identified else
+                                 "patch identity was not asked after a no")
+                self.assertEqual(got, billed)
+
+    def test_only_a_measured_YES_from_patch_identity_answers(self):  # noqa: VACUOUS_ASSERTION — the table carries its own positive row: the identity-yes reading bills nothing while every other reading bills the row, through the same assertions in the same loop
+        fix = [("a", obligation.UNANSWERED_FIX)]
+
+        def boom(*_args):
+            raise OSError("git cherry could not be spawned")
+
+        for label, identity, billed in (
+                ("yes", lambda *_a: True, []),
+                ("no", lambda *_a: False, fix),
+                ("cannot say", lambda *_a: None, fix),
+                ("truthy but not True", lambda *_a: "patch-equivalent", fix),
+                ("raises", boom, fix)):
+            with self.subTest(identity=label):
+                got, _a, i = self.owed(self.cured(),
+                                       ancestry=lambda *_a: False,
+                                       identity=identity)
+                self.assertEqual(i, [("/r/.git", "b" * 40, "c" * 40)])
+                self.assertEqual(got, billed)
+
+    def test_a_reviewed_tip_that_is_not_a_full_sha_never_asks_identity(self):  # noqa: VACUOUS_ASSERTION — the unconditional control before the loop runs the same readers on the same row with a full reviewed sha and must reach the identity reader and answer, so each empty identity list in the loop is about the malformed tip
+        """The cure is the range reviewed..patch, so a reviewed tip that names
+        no commit leaves nothing to measure. The FIX stays owed."""
+        got, _a, i = self.owed(self.cured(), ancestry=lambda *_a: False,
+                               identity=lambda *_a: True)
+        self.assertEqual((got, len(i)), ([], 1),
+                         "the control (a full reviewed sha) did not reach "
+                         "the identity reader, so the silence below is empty")
+        for label, reviewed in (("short", "b" * 12), ("absent", None),
+                                ("not hex", "tip-a")):
+            with self.subTest(reviewed=label):
+                r = self.cured(reviewed=reviewed)
+                if reviewed is None:
+                    del r["reviewed_tip"]
+                got, a, i = self.owed(r, ancestry=lambda *_a: False,
+                                      identity=lambda *_a: True)
+                self.assertEqual(len(a), 1, "ancestry was not asked, so the "
+                                            "silence below is empty")
+                self.assertEqual((got, i),
+                                 ([("a", obligation.UNANSWERED_FIX)], []))
+
+    def test_ONE_identity_question_per_repository_range_per_pass(self):
+        """owed-bot runs this every hour, so patch identity is bounded by
+        DISTINCT questions, never by rows: three chains naming one cure cost
+        one. The question is the RANGE reviewed..patch, so the same patch
+        under another reviewed tip, or in another repository, costs one more.
+        The memo lives for ONE pass: trunk moves."""
+        rows = (self.cured("a"), self.cured("b"), self.cured("d"),
+                self.cured("e", reviewed="e" * 40),
+                self.cured("f", repo="/s/.git"))
+        no = lambda *_a: False
+        got, _a, i = self.owed(*rows, ancestry=no, identity=no)
+        self.assertEqual(len(got), 5, "the control rows are not all billed")
+        self.assertEqual(sorted(i), [("/r/.git", "b" * 40, "c" * 40),
+                                     ("/r/.git", "e" * 40, "c" * 40),
+                                     ("/s/.git", "b" * 40, "c" * 40)])
+        _got, _a, again = self.owed(*rows, ancestry=no, identity=no)
+        self.assertEqual(len(again), 3, "the memo outlived its pass")
+
+    def test_the_ledger_answers_first_and_no_git_is_asked(self):  # noqa: VACUOUS_ASSERTION — the unconditional control runs FIRST on the same observables: the same cured FIX alone is billed and asks both readers once, before the settled shapes are asserted to ask neither
+        """A carried, retired or undeclared row, a SUPERSEDE and a design
+        finding never reach either reader, exactly as LAND 374 ruled for
+        ancestry: git is the last question."""
+        no = lambda *_a: False
+        got, a, i = self.owed(self.cured(), ancestry=no, identity=no)
+        self.assertEqual((got, len(a), len(i)),
+                         ([("a", obligation.UNANSWERED_FIX)], 1, 1),
+                         "the control FIX did not reach both readers")
+        retired = self.cured()
+        retired["discharged"] = True
+        design = self.cured()
+        design["design_findings"] = ["the API shape is wrong"]
+        for label, rows, billed in (
+                ("carried", (self.cured(), row("b", supersedes="a",
+                                               status="open", polarity=None)),
+                 []),
+                ("retired", (retired,), []),
+                ("supersede", (dict(self.cured(), polarity="supersede"),), []),
+                ("design finding", (design,),
+                 [("a", obligation.UNANSWERED_FIX)])):
+            with self.subTest(shape=label):
+                got, a, i = self.owed(*rows, ancestry=no, identity=no)
+                self.assertEqual(got, billed)
+                self.assertEqual((a, i), ([], []))

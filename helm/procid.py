@@ -72,6 +72,66 @@ def proc_root(proc=None):
             or os.environ.get("MELD_PROC") or "/proc")
 
 
+# /proc/locks writes the locked file's device as HEX major:minor and the
+# inode in DECIMAL after the second colon: "103:05:<ino>" (major 259, minor
+# 5) or "00:1b:<ino>" (/dev/shm, major 0, minor 27). int(..., 16) both halves
+# and os.makedev them gives back the st_dev integer exactly — measured
+# against os.stat on the same file. The field is found by shape,
+# not by position, because a blocked waiter's line carries an extra '->'
+# token that shifts every column after it (chatdebris.held_inodes, same
+# file, same problem).
+_DEV_INO = re.compile(r"^([0-9a-f]+):([0-9a-f]+):(\d+)$")
+
+
+def locks(path="/proc/locks"):
+    """One record per /proc/locks line, or None when the table cannot be read.
+
+    Each record is {"kind": "FLOCK" or "POSIX" etc., "pid": int,
+    "dev": st_dev-style int, "ino": int, "waiter": bool}. The kernel names
+    a locked file by its device AND its inode: an inode without its device
+    names a file on some OTHER filesystem that happens to carry the same
+    number, so a match on the inode alone names the wrong process. 'dev' is
+    os.makedev(major, minor), the same integer as st_dev; 'waiter' is True
+    when the line carries the extra '->' token that a BLOCKED flock gets,
+    which shifts the pid and the device field one column right.
+    None is unreadable, never empty: the callers here treat it as the table
+    declining to answer, so no caller can read a vanished /proc/locks as
+    'nobody holds this'.
+    """
+    try:
+        with open(path, encoding="ascii", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    out = []
+    for line in lines:
+        waiter = "->" in line
+        col = line.split()
+        # A line is "<n>: kind ..." or "<n>: -> kind ...": the kind sits one
+        # past the leading number, and the waiter's arrow pushes the pid
+        # right by one.
+        if len(col) < 6:
+            continue
+        kind = col[2] if waiter else col[1]
+        pid_tok = col[5] if waiter else col[4]
+        dev = ino = None
+        for tok in col:
+            m = _DEV_INO.match(tok)
+            if m:
+                dev = os.makedev(int(m.group(1), 16), int(m.group(2), 16))
+                ino = int(m.group(3))
+                break
+        if dev is None:
+            continue
+        try:
+            pid = int(pid_tok)
+        except ValueError:
+            continue
+        out.append({"kind": kind, "pid": pid, "dev": dev,
+                    "ino": ino, "waiter": waiter})
+    return out
+
+
 def exe_of(pid, proc=None):
     """The kernel's path for this pid's mapped binary, or None if it cannot be read.
 
@@ -154,6 +214,63 @@ def is_claude(pid, comm_raw=None, proc=None):
     if seen is not None:
         return seen
     return None if _comm_looks_versioned(comm_raw) else False
+
+
+def exe_is_node(pid, proc=None):
+    """True / False / None. None means the exe link could not be read."""
+    exe = exe_of(pid, proc)
+    if exe is None:
+        return None
+    return os.path.basename(exe) == "node"
+
+
+def _comm_text(raw):
+    if raw is None:
+        return ""
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+    return text.strip()
+
+
+def is_seat_process(pid, comm_raw=None, proc=None):
+    """True / False / None — is this pid the seat, not a tool it spawned?
+
+    Fleet and orcaadopt ask this. `is_claude` stays the tri-state identity
+    rung `who` and the false-DEAD pins use, and it must not grow a node
+    accept or lose its comm-OR. This predicate is the seat gate.
+
+    On this host `grep` is `exec -a ugrep` of the Claude binary, so an
+    orphan keeps a Claude exe and whatever HELM_CHAT_NAME it inherited.
+    Accepting every Claude exe counts that orphan as the seat. A seat
+    process is one whose comm is `claude` or a version string,
+    confirmed by the exe when the exe can be read. comm exactly `claude`
+    is the seat even when the exe is node: an npm install sets
+    process.title to claude and the binary is node. A node comm, or any
+    other comm whose exe is node, is not a seat. Those children inherit
+    the name and are tools, the same class as ugrep.
+
+    A versioned comm whose exe could not be read stays None: that is the
+    pane the wide rung exists to rescue, and False there is the false DEAD.
+    Any other unreadable exe is False, so the census can count it instead
+    of dropping it quietly. comm exactly `claude` with an unreadable exe
+    stays True — that is the rung that lets a known claude pid surface as
+    UNKNOWN when a later read fails, rather than as proven absence.
+    A readable exe that is neither Claude nor node refuses comm `claude`
+    (a sleep renamed claude is not the seat).
+    """
+    comm = _comm_text(comm_raw)
+    if comm == "claude":
+        seen = exe_is_claude(pid, proc)
+        if seen is not False:
+            return True
+        return exe_is_node(pid, proc) is True
+    if comm == "node" or exe_is_node(pid, proc) is True:
+        return False
+    if _comm_looks_versioned(comm_raw):
+        seen = exe_is_claude(pid, proc)
+        if seen is None:
+            return None
+        return bool(seen)
+    return False
 
 
 def _comm_looks_versioned(raw):

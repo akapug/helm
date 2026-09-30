@@ -1669,7 +1669,8 @@ class TheRpcDeadlineIsWallClockNotPerRecv(unittest.TestCase):
         import os as _os, sys as _sys, time as _t, types
         from unittest import mock
         from helm import harness
-        src = open(harness.__file__).read()          # DERIVED, never transcribed
+        with open(harness.__file__, encoding="utf-8") as fh:
+            src = fh.read()          # DERIVED, never transcribed
         mutant = src
         for site in ('conn.settimeout(_left("connect"))',
                      'conn.settimeout(_left("send"))',
@@ -1760,7 +1761,8 @@ class TheRpcDeadlineIsWallClockNotPerRecv(unittest.TestCase):
         import os as _os, sys as _sys, time as _t, types
         from unittest import mock
         from helm import harness
-        src = open(harness.__file__).read()
+        with open(harness.__file__, encoding="utf-8") as fh:
+            src = fh.read()
         mutant = (src
                   .replace('conn.settimeout(_left("connect"))',
                            'conn.settimeout(timeout)')

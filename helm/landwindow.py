@@ -70,26 +70,101 @@ THE FIRST APPROVE IS ALREADY IN. The fleet's rule is to gate a first-read tip
 only after its first approve is in the ledger, because a FIX would make that
 suite bind nothing. That rule is a stored heuristic
 (gate-after-the-first-approve-on-a-first-read), and `gatewindow.launch` does not
-check it. This verb holds it by construction instead: every car is READY, so
-each one carries its authorizing approve before the gate is spent.
+check it. This verb holds it by construction instead: every approve-ready car
+carries its authorizing approve before the gate is spent.
+
+AND A SOURCE-CLEAN CAR CARRIES ITS FINISHED READ INSTEAD (task/3053 F3). A
+reviewer who read the delta and found nothing cannot mint an approve, because
+an approve binds a whole-suite token only this gate produces, so it holds the
+row `--source-clean <tip>`. That row rides as a car at the HELD tip when
+`landreq.source_clean_car` admits it: the hold names a holder, the holder is
+the row's recipient and wrote no round of the lane, no unanswered FIX or
+SUPERSEDE from another row stands on the held tip (the CONTESTED rung an
+approve row answers to), the held tip descends from the dispatched ref, and
+the row is not terminal. Every other held source-clean row is listed as
+excluded with the predicate's reason — except the rows whose hold records NO
+HOLDER, a legacy backlog counted on ONE line that names the verb listing them.
+The read is finished and found nothing, so the suite is not spent ahead of a
+FIX. The merge keeps the held sha a parent, so after the gate passes and the
+train lands, `helm lr foldcheck <head> --gate G --apply` closes each such car
+as `source-clean-landed` on ancestry alone; no approve is minted.
+
+THIS VERB IS THE ONLY ONE THAT TAKES THEM (the author's ruling 1, round 4).
+`helm lr compose` asks the same predicate and refuses every source-clean
+candidate: it cherry-picks, and `source-clean-landed` closes on ancestry
+only, so a picked copy could never close.
+
+AN EJECTED TIP STAYS OUT. `helm train blame --apply` (helm/trainblame.py)
+ejects the car that broke a red train, and its row is still READY, so without
+a record the next plan would merge the same tip into the next train and the
+ejection would undo itself. The record is the EJECTION STORE: an append-only
+JSONL under the project's `.state` (`ejections_path`), one `eject` event per
+ejection bound to the car's EXACT TIP (the train, the red gate, the verdict,
+the evidence line and the failing tests), and one `readmit` event per hand
+clear, with who cleared it and why (`helm train readmit <tip> --reason R`,
+for a blame that was wrong). No existing door fits: a verdicted dispatch
+row takes no note (the findings-note admits open and held rows only).
+
+  THE TIP, NOT THE LANE. The plan leaves out a car whose CURRENT tip has an
+  ejection standing; a new tip on the same lane is a different sha and rides
+  again with nothing to clear.
+
+  AN UNREADABLE STORE GUESSES NEITHER WAY. It is read strictly, and a store
+  with a malformed row, a row with no tip or an event this helm does not know
+  is UNKNOWN: the plan keeps every car and marks its ejection UNKNOWN (so the
+  dry run still says what it would do), and `--apply` refuses by name,
+  because nothing can prove an ejected car is not in the train. A missing
+  store is an empty one.
+
+  AN EJECTION IS ORDERED AGAINST A PUSH (task/3265 races F2). `helm train
+  auto`'s last word reads the plan once more and pushes under the READINESS
+  LOCK (`readiness_lock`, the dispatch ledger's own lock, which every
+  verdict, hold and retip writer takes). Every write to this store takes that
+  lock first, then the store's own: an ejection lands before the last read
+  (which then leaves its car out) or waits until the push is done, and is
+  never written between the read and the push.
 """
+import binascii
+import getpass
 import os
 import re
 import sys
 
-from . import dispatches, gatewindow, landreq, rowworld, vcs
+from . import (dispatches, eventledger, gatewindow, home, landorder,
+               landreq, pk, rowworld, vcs)
 from .work import _lanes
 
 PROG = "helm train"
 USAGE = ("usage: helm train [--repo PATH] [--trunk REF] [--name TRAIN] "
-         "[--max-behind N] [--apply]")
+         "[--max-behind N] [--apply]\n"
+         "       helm train blame <train-room> [--gate gate:<id>] [--apply] "
+         "[--json]\n"
+         "       helm train readmit <tip> --reason TEXT [--repo PATH]\n"
+         "       helm train auto [--repo PATH] [--apply] [--status] "
+         "[--pause [--reason TEXT] | --resume | --abandon [--force] "
+         "--reason TEXT]\n"
+         "       helm train veto <train> --reason TEXT [--repo PATH]")
+READMIT_USAGE = "usage: helm train readmit <tip> --reason TEXT [--repo PATH]"
 BOX = "compose"
 
 # A merge that runs longer than this is a merge nobody is watching.
 MERGE_TIMEOUT_S = 300
 
+# How long `--apply` waits for auto-land's compose lock, which it holds only
+# from its last flight check to its move to COMPOSING.
+COMPOSE_LOCK_WAIT_S = 60
+
 # EVERY MERGE CARRIES THIS, including the abort. See the module docstring.
 NO_RERERE = ("-c", "rerere.enabled=false")
+
+# AND EVERY MERGE IS THE REPOSITORY'S OWN, never the caller's identity: a car
+# merge made from a seat's shell would otherwise carry whatever author that
+# shell exports, so the four identity variables are removed (the seam's None)
+# and the repository's configured author writes the merge. The integrator's
+# sanction rides the call, the same bit the room's mint carries.
+MERGE_ENV = {"GIT_AUTHOR_NAME": None, "GIT_AUTHOR_EMAIL": None,
+             "GIT_COMMITTER_NAME": None, "GIT_COMMITTER_EMAIL": None,
+             "HELM_WORK_INTEGRATOR": "1"}
 
 # How far back trunk's history is read for the last train number. The newest
 # train merges come first, so the window only has to reach the latest one.
@@ -122,6 +197,32 @@ DOOR_CAUTION = {
     "READY-CONTESTED": "an unanswered FIX stands on this tip",
 }
 UNVERIFIED = "READY-UNVERIFIED"
+# THE WORD A SOURCE-CLEAN CAR PRINTS in the READY word's column: no approve,
+# a finished read (task/3053 F3).
+SOURCE_CLEAN = "SOURCE-CLEAN"
+
+
+# THE EJECTION STORE (see the module docstring): its file under the project's
+# .state, its two events, and the word a car's ejection reads when the store
+# cannot be read.
+EJECTIONS = "train-ejections.jsonl"
+EJECTED = "eject"
+READMITTED = "readmit"
+UNKNOWN = "UNKNOWN"
+_TIP = re.compile(r"\A[0-9a-f]{40}\Z")
+_TIP_TOKEN = re.compile(r"\A[0-9a-f]{4,40}\Z")
+
+
+#: The one line `helm train` folds every NO HOLDER exclusion into (the
+#: author's ruling 6, round 4), and the verb that lists those rows.
+NO_HOLDER_LIST = "helm dispatch list --no-holder"
+
+
+def _source_clean_reason(lr):
+    """The clause beside a source-clean car's word: who read it clean, and
+    that no approve is owed. The close its land owes is printed once, below
+    the plan (`_source_clean_loop`)."""
+    return "held by @%s, no approve owed" % (lr.get("hold_actor") or "?")
 
 
 def _env():
@@ -143,14 +244,228 @@ def _short(sha):
     return (sha or "?")[:12]
 
 
+def ejections_path(root):
+    """The project's ejection store: `<helm home>/<project>/.state/`, the
+    project named as a lane claim names it (`_lanes.project_token`)."""
+    return os.path.join(home.project_dir(_lanes.project_token(root)),
+                        ".state", EJECTIONS)
+
+
+def read_ejections(root):
+    """(standing {tip: its eject record}, unavailable). A readmit after an
+    eject clears that tip. Read STRICTLY: a malformed row, a row with no tip
+    or an event this helm does not know makes the whole store UNKNOWN, and
+    `unavailable` says why; a missing store is an empty one."""
+    path = ejections_path(root)
+    rows, unavailable = eventledger.checked_events(path, strict=True)
+    if unavailable:
+        return None, "the ejection store %s could not be read (%s)" % (
+            path, unavailable)
+    standing = {}
+    for row in rows:
+        tip = row.get("tip")
+        if not isinstance(tip, str) or not _TIP.match(tip):
+            return None, ("the ejection store %s holds a record with no tip"
+                          % path)
+        if row.get("event") == EJECTED:
+            standing[tip] = row
+        elif row.get("event") == READMITTED:
+            standing.pop(tip, None)
+        else:
+            return None, ("the ejection store %s holds an event this helm "
+                          "cannot read (%r)" % (path, row.get("event")))
+    return standing, None
+
+
+def readiness_lock(timeout=None):
+    """THE READINESS LOCK: the dispatch ledger's own lock, which every
+    verdict, hold, retip and withdrawal writer takes. `helm train auto`
+    holds it from its last read of the plan through its push, and every
+    ejection-store write takes it before the store's own lock, so a car's
+    readiness never changes between that read and that push (the module
+    docstring, task/3265 races F2). Every other writer of a land veto or of
+    land authority takes it too (`landorder`, task/3265 races R2). It is let
+    go by closing, never by unlocking, and it is reentrant on one thread
+    (`landorder.locked`). Yields whether it was taken."""
+    return landorder.locked(timeout=timeout)
+
+
+def readiness_lock_path():
+    """The file `readiness_lock` holds its flock on: the sibling
+    `<ledger>.lock` `eventledger.locked` opens (a push inherits its
+    descriptor, `autoland.Ops.push`)."""
+    return landorder.path()
+
+
+def _append_ejection(root, row):
+    """(row, error): one event appended under the readiness lock, then
+    the store's own lock, in that order and never the other."""
+    path = ejections_path(root)
+    row = dict(row, v=1, ts=pk.now_ts(),
+               id=binascii.hexlify(os.urandom(8)).decode("ascii"))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as exc:
+        return None, "%s: %s" % (type(exc).__name__, exc)
+    with readiness_lock() as ready:
+        if not ready:
+            return None, ("the readiness lock (the dispatch ledger's, which "
+                          "a land holds from its last read through its push) "
+                          "was not taken, so the ejection store %s is not "
+                          "written" % path)
+        with eventledger.locked(path) as held:
+            if not held:
+                return None, "the ejection store %s is locked" % path
+            ok, why = eventledger.append_unlocked_checked(path, row)
+    return (row, None) if ok else (None, why)
+
+
+def record_ejection(root, record):
+    """(row, error): one EJECT record, bound to `record["tip"]`."""
+    if not _TIP.match(str(record.get("tip") or "")):
+        return None, "an ejection records the car's full tip"
+    return _append_ejection(root, dict(record, event=EJECTED))
+
+
+# A FLAKE is not an ejection. `read_ejections` is strict, so a flake row in that
+# store would make every `helm train` UNKNOWN, and a flake must never keep a
+# car out. Its own store records the tree and the tests blame saw flake.
+FLAKES = "flakes.jsonl"
+FLAKED = "FLAKED"
+
+
+def flakes_path(root):
+    """The project's flake store, beside the ejection store."""
+    return os.path.join(home.project_dir(_lanes.project_token(root)),
+                        ".state", FLAKES)
+
+
+def _flake_rows(root):
+    """(rows, unavailable). The strict read `read_flakes` and `flake_counts`
+    share. A missing store is an empty one; one malformed row makes the whole
+    store UNKNOWN."""
+    path = flakes_path(root)
+    rows, unavailable = eventledger.checked_events(path, strict=True)
+    if unavailable:
+        return None, "the flake store %s could not be read (%s)" % (
+            path, unavailable)
+    for row in rows:
+        if row.get("event") != FLAKED:
+            return None, ("the flake store %s holds an event this helm cannot "
+                          "read (%r)" % (path, row.get("event")))
+        tree = row.get("tree")
+        tests = row.get("tests")
+        if not isinstance(tree, str) or not _TIP.match(tree) \
+                or not isinstance(tests, list) \
+                or any(not isinstance(t, str) or not t for t in tests):
+            return None, ("the flake store %s holds a record with no tree or "
+                          "no tests" % path)
+    return rows, None
+
+
+def read_flakes(root):
+    """({tree: set(test ids)}, unavailable). Read STRICTLY, like the ejection
+    store: a malformed row or an event this helm does not know makes the whole
+    store UNKNOWN. A missing store is an empty one. Several FLAKED rows for one
+    tree union their tests."""
+    rows, unavailable = _flake_rows(root)
+    if unavailable:
+        return None, unavailable
+    standing = {}
+    for row in rows:
+        standing.setdefault(row["tree"], set()).update(row["tests"])
+    return standing, None
+
+
+def flake_counts(root):
+    """({tree: count of FLAKED rows}, unavailable). Read STRICTLY, like
+    `read_flakes`: the same row is one count, however many tests it names. A
+    missing store is an empty one."""
+    rows, unavailable = _flake_rows(root)
+    if unavailable:
+        return None, unavailable
+    counts = {}
+    for row in rows:
+        counts[row["tree"]] = counts.get(row["tree"], 0) + 1
+    return counts, None
+
+
+def record_flake(root, record):
+    """(row, error): one FLAKED record for `record["tree"]`, naming the tests
+    blame saw flake. The writer stamps the event; the caller does not."""
+    tree = str(record.get("tree") or "")
+    tests = record.get("tests")
+    if not _TIP.match(tree):
+        return None, "a flake records the red receipt's full tree"
+    if not isinstance(tests, list) or not tests \
+            or any(not isinstance(t, str) or not t for t in tests):
+        return None, "a flake records the failing test ids"
+    path = flakes_path(root)
+    row = dict(record, event=FLAKED, tree=tree, tests=list(tests), v=1,
+               ts=pk.now_ts(),
+               id=binascii.hexlify(os.urandom(8)).decode("ascii"))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as exc:
+        return None, "%s: %s" % (type(exc).__name__, exc)
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "the flake store %s is locked" % path
+        ok, why = eventledger.append_unlocked_checked(path, row)
+    return (row, None) if ok else (None, why)
+
+
+def readmit(root, token, reason, by):
+    """(row, error): clear the standing ejection of the one tip `token`
+    names (a unique prefix), recording who cleared it and why."""
+    token = str(token or "").strip().lower()
+    if not _TIP_TOKEN.match(token):
+        return None, "%r is not a tip (4 to 40 hex digits)" % token
+    standing, why = read_ejections(root)
+    if why:
+        return None, why
+    hits = [tip for tip in standing if tip.startswith(token)]
+    if not hits:
+        return None, ("no ejection stands on a tip %s: it was never ejected, "
+                      "or it was readmitted already" % token)
+    if len(hits) > 1:
+        return None, "%s names %d ejected tips; give more of it" % (
+            token, len(hits))
+    ejected = standing[hits[0]]
+    return _append_ejection(root, {
+        "event": READMITTED, "tip": hits[0], "by": by, "reason": reason,
+        "lr": ejected.get("lr"), "lane": ejected.get("lane"),
+        "train": ejected.get("train"), "gate": ejected.get("gate"),
+        "audits": ejected.get("audits")})
+
+
+def ejection_reason(record):
+    """The EXCLUDED line's clause for a car whose tip was ejected: from its
+    red gate, or from its train's red pre-gate audits (`audits`, the log
+    `trainblame.audit_red` read), which no gate names."""
+    tests = [str(t) for t in record.get("tests") or ()]
+    tip = _short(record.get("tip"))
+    return ("ejected from %s (%s) at %s: %s%s; re-tip the lane or "
+            "readmit this tip: `helm train readmit %s --reason ...`"
+            % (record.get("train") or "?", "its pre-gate audits"
+               if record.get("audits") else
+               "gate:%s" % (record.get("gate") or "?"), tip,
+               tests[0] if tests else "no failing test recorded",
+               " (+%d more)" % (len(tests) - 1) if len(tests) > 1 else "",
+               tip))
+
+
 def approve_ready(lrs, identity):
     """(cars, excluded) for one project, cars in MERGE ORDER.
 
     A car is a LIVE row the projection calls READY, bound to this repository,
-    with a reviewed tip. A row bound to ANOTHER repository is not this window's
-    business and is not listed. A READY row with no binding at all is listed as
-    excluded, because nothing places it here and merging it would make that
-    claim for it.
+    with a reviewed tip — or a HELD source-clean row that
+    `landreq.source_clean_car` admits, at its held tip (`basis` names which).
+    A row bound to ANOTHER repository is not this window's business and is
+    not listed. A READY row with no binding at all is listed as excluded,
+    because nothing places it here and merging it would make that claim for
+    it; so is every held source-clean row the predicate refuses, with its
+    reason.
 
     LIVE IS HALF OF THE WORD, AND THE FIRST DRY RUN ON THE REAL LEDGER IS WHY.
     The projection keeps the stored state READY on a row that has since CLOSED
@@ -163,19 +478,37 @@ def approve_ready(lrs, identity):
     train would have merged each old tip back in. Two were live.
 
     ORDER is the order the rows became READY, oldest first, so the train lands
-    work in the order it was approved. A row whose entry instant is unknown
-    sorts last; the row id breaks ties so two runs agree.
+    work in the order it was approved; a source-clean car is placed by the
+    instant its hold was recorded. A row whose entry instant is unknown sorts
+    last; the row id breaks ties so two runs agree.
     """
     cars, excluded = [], []
     for lr in (lrs or {}).values():
-        if not landreq.live_ready(lr):
-            continue
         bound = lr.get("repo_id")
         if bound and bound != identity:
             continue
+        # THE ONE PREDICATE, asked before the READY word because a held row
+        # is never READY: (None, None) is a row it has nothing to say about.
+        clean_tip, clean_why = landreq.source_clean_car(lr)
+        if clean_tip or clean_why:
+            car = {"id": lr.get("id") or "?", "lane": lr.get("lane") or "?",
+                   "tip": clean_tip or lr.get("source_clean_tip") or "",
+                   "entered": lr.get("hold_ts"), "lr": lr,
+                   "basis": "source-clean"}
+            if clean_why:
+                # THE REFUSAL'S KIND RIDES WITH IT, so `render` can fold the
+                # NO HOLDER backlog into one line without re-reading a hold.
+                excluded.append(dict(car, why=clean_why,
+                                     kind=getattr(clean_why, "kind", None)))
+            else:
+                cars.append(car)
+            continue
+        if not landreq.live_ready(lr):
+            continue
         car = {"id": lr.get("id") or "?", "lane": lr.get("lane") or "?",
                "tip": lr.get("reviewed_tip") or "",
-               "entered": lr.get("entered_ts"), "lr": lr}
+               "entered": lr.get("entered_ts"), "lr": lr,
+               "basis": "approved"}
         if not bound:
             excluded.append(dict(car, why="carries no repository binding, so "
                                           "nothing places it in this project"))
@@ -317,6 +650,7 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
     if rc != 0 or not sha:
         return None, "trunk %s does not resolve in %s" % (ref, root)
     authority = trunk_authority(root, identity)
+    ejected, ejections_unknown = read_ejections(root)
     lrs, unavailable = (project or landreq.project)()
     if unavailable:
         return None, "the land-request projection is unavailable: %s" \
@@ -325,7 +659,10 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
     cars, seen = [], {}
     for car in ready:
         tip = car["tip"]
-        word = landreq.ready_word(car["lr"])
+        clean = car.get("basis") == "source-clean"
+        # A SOURCE-CLEAN CAR HAS NO READY WORD TO READ: its admission is
+        # `landreq.source_clean_car`, already asked, and its line says so.
+        word = SOURCE_CLEAN if clean else landreq.ready_word(car["lr"])
         if word in DOOR_CAUTION:
             excluded.append(dict(car, why="is %s: %s. That is a door-caution "
                                           "rung of the READY word, and no "
@@ -334,12 +671,16 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
                                           "why" % (word, DOOR_CAUTION[word],
                                                    _short(car["id"]))))
             continue
-        reason = None
+        reason = (_source_clean_reason(car["lr"]) if clean else None)
         if word == UNVERIFIED:
             why, reason = _unverified(car["lr"])
             if why:
                 excluded.append(dict(car, why=why))
                 continue
+        if ejected is not None and tip in ejected:
+            # THE TIP, NOT THE LANE: a new tip on this lane rides again.
+            excluded.append(dict(car, why=ejection_reason(ejected[tip])))
+            continue
         if tip in seen:
             excluded.append(dict(car, why="has the same reviewed tip as %s, "
                                           "whose merge carries it"
@@ -352,9 +693,13 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
             continue
         state = be.ancestry(root, tip, sha)
         if state == vcs.ANCESTOR:
-            excluded.append(dict(car, why="reviewed tip %s is already on %s — "
-                                          "close it, do not compose it"
-                                 % (_short(tip), ref)))
+            excluded.append(dict(car, why=(
+                "held tip %s is already on %s — `helm lr foldcheck %s --gate "
+                "gate:<id> --apply` closes it on a verified whole-suite "
+                "receipt containing it; do not compose it"
+                % (_short(tip), ref, _short(sha))) if clean else
+                "reviewed tip %s is already on %s — close it, do not compose "
+                "it" % (_short(tip), ref)))
             continue
         if state != vcs.NOT_ANCESTOR:
             excluded.append(dict(car, why="git could not say whether %s is "
@@ -378,7 +723,10 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
                                     max_behind)))
             continue
         seen[tip] = car["id"]
-        cars.append(dict(car, word=word, reason=reason, behind=drift))
+        # UNKNOWN, never a guess, when the store cannot be read: the car
+        # stays listed and `--apply` refuses (`compose`).
+        cars.append(dict(car, word=word, reason=reason, behind=drift,
+                         ejection=UNKNOWN if ejections_unknown else None))
     if name is None:
         name, err = next_train(be, root, sha)
         if err:
@@ -388,6 +736,7 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
                       "dot, dash, underscore; it becomes a directory)" % name)
     return {"root": root, "identity": identity, "ref": ref, "trunk": sha,
             "authority": authority, "max_behind": max_behind,
+            "ejections_unknown": ejections_unknown,
             "train": name, "room": _lanes.lane_path(root,
                                                     os.path.join(BOX, name)),
             "cars": cars, "excluded": excluded}, None
@@ -406,20 +755,78 @@ def render(got):
              "  room: %s (detached at %s)" % (got["room"],
                                               _short(got["trunk"])),
              "  drift cap: a car more than %d commits behind %s is skipped "
-             "(--max-behind)" % (got["max_behind"], got["ref"]),
-             "  merge order, %d approve-ready row%s:"
-             % (len(got["cars"]), "" if len(got["cars"]) == 1 else "s")]
+             "(--max-behind)" % (got["max_behind"], got["ref"])]
+    if got.get("ejections_unknown"):
+        lines.append("  ejections: UNKNOWN — %s; every car's ejection is "
+                     "UNKNOWN and --apply refuses until the store reads"
+                     % got["ejections_unknown"])
+    lines.append(_order_header(got["cars"]))
     for i, car in enumerate(got["cars"], 1):
-        lines.append("    %d. %s  lane %s  reviewed tip %s  %s%s  (%d behind)"
-                     % (i, _short(car["id"]), car["lane"], _short(car["tip"]),
+        lines.append("    %d. %s  lane %s  %s tip %s  %s%s  (%d behind)%s"
+                     % (i, _short(car["id"]), car["lane"],
+                        "held" if car.get("basis") == "source-clean"
+                        else "reviewed", _short(car["tip"]),
                         car["word"], " — %s" % car["reason"]
-                        if car.get("reason") else "", car["behind"]))
+                        if car.get("reason") else "", car["behind"],
+                        "  ejection %s" % car["ejection"]
+                        if car.get("ejection") else ""))
     if not got["cars"]:
         lines.append("    (none)")
+    unheld = 0
     for car in got["excluded"]:
+        if car.get("kind") == landreq.SourceCleanRefusal.NO_HOLDER:
+            unheld += 1
+            continue
         lines.append("  EXCLUDED %s (lane %s): %s"
                      % (_short(car["id"]), car["lane"], car["why"]))
+    if unheld:
+        lines.append(_no_holder_line(unheld))
     return "\n".join(lines)
+
+
+def _no_holder_line(n):
+    """THE NO HOLDER BACKLOG AS ONE LINE (the author's ruling 6, round 4).
+
+    Every source-clean hold written before holds stamped their holder records
+    nobody — every held source-clean row on the live ledger, forty-odd
+    when measured — and each is refused by the same rung for the same reason
+    with the same cure: its recipient releases and re-holds it. One EXCLUDED line apiece buried the train's own plan under
+    them, so they are counted here once, with the verb that lists them.
+    Every other exclusion keeps its own line: each names a different cure."""
+    if n == 1:
+        return ("  EXCLUDED — 1 held source-clean row carries NO HOLDER and "
+                "cannot ride until its recipient re-holds; list it: `%s`"
+                % NO_HOLDER_LIST)
+    return ("  EXCLUDED — %d held source-clean rows carry NO HOLDER and cannot "
+            "ride until each recipient re-holds; list them: `%s`"
+            % (n, NO_HOLDER_LIST))
+
+
+def _order_header(cars):
+    """The merge-order line. Unchanged for a train of approve-ready rows; a
+    train carrying source-clean cars counts both kinds, because an
+    approve-ready count that included them would claim an approve nobody
+    wrote."""
+    clean = sum(1 for car in cars if car.get("basis") == "source-clean")
+    if not clean:
+        return "  merge order, %d approve-ready row%s:" % (
+            len(cars), "" if len(cars) == 1 else "s")
+    return "  merge order, %d car%s (%d approve-ready, %d source-clean):" % (
+        len(cars), "" if len(cars) == 1 else "s", len(cars) - clean, clean)
+
+
+def _source_clean_loop(cars, out):
+    """After the gate and the land, the close each source-clean car owes —
+    printed, never run: the land is the integrator's, and so is this."""
+    clean = [car for car in cars if car.get("basis") == "source-clean"]
+    if clean:
+        print("  source-clean car%s %s: once this train's whole-suite gate "
+              "passes and the train lands, `helm lr foldcheck <landed head> "
+              "--gate gate:<its receipt> --apply` closes %s as "
+              "source-clean-landed (no approve is minted)"
+              % ("" if len(clean) == 1 else "s",
+                 ", ".join(_short(car["id"]) for car in clean),
+                 "it" if len(clean) == 1 else "each"), file=out)
 
 
 def room_refusal(be, room, identity=None):
@@ -477,11 +884,16 @@ def merge_car(be, room, car, train, identity=None):
     REFUSED: the merge stopped, was aborted, and the room is exactly as it
     stood. STUCK: the room is not the room, or its state is unknown — the train
     stops there.
+
+    A car's `detail`, when it has one, rides in the subject after the lane,
+    in parentheses (`<train>: merge lane <lane> (<detail>)`), the shape the
+    integrator's hand-written merges take and `trainblame` reads; the body's
+    `land request` line is unchanged either way.
     """
     why = room_refusal(be, room, identity)
     if why:
         return STUCK, "the room assertion refused the merge: " + why, None
-    env = _env()
+    env = dict(_env(), **MERGE_ENV)
     rc, before, err = be.text(room, "rev-parse", "--verify", "-q", "HEAD",
                               env=env)
     if rc != 0 or not before:
@@ -490,10 +902,15 @@ def merge_car(be, room, car, train, identity=None):
     if be.ancestry(room, tip, before) == vcs.ANCESTOR:
         return CONTAINED, "the room already holds %s" % _short(tip), before
     message = "%s: merge lane %s" % (train, car["lane"])
+    detail = " ".join(str(car.get("detail") or "").split())
+    if detail:
+        message = "%s (%s)" % (message, detail)
     rc, out, err = be.text(
         room, *NO_RERERE, "merge", "--no-ff", "--no-edit", "--no-log",
-        "-m", message, "-m", "land request %s, reviewed tip %s"
-        % (car["id"], tip), tip, env=env, timeout=MERGE_TIMEOUT_S)
+        "-m", message, "-m", "land request %s, %s tip %s"
+        % (car["id"], "source-clean held" if car.get("basis") ==
+           "source-clean" else "reviewed", tip), tip, env=env,
+        timeout=MERGE_TIMEOUT_S)
     if rc == 0:
         rc, line, _err = be.text(room, "rev-list", "--parents", "-n", "1",
                                  "HEAD", env=env)
@@ -545,25 +962,73 @@ def compose(repo, trunk=None, name=None, apply=False, project=None, door=None,
         return 1
     print(render(got), file=out)
     if not apply:
+        _source_clean_loop(got["cars"], out)
         print("  dry run: nothing minted, merged or launched. `helm train "
               "--apply` composes this train and gates it through `helm gate "
               "window launch`.", file=out)
         return 0
+    # ONE TRAIN IN FLIGHT AT A TIME, shared with `helm train auto`: while its
+    # train is composing, gating, landing or STOPPED, a hand-composed train
+    # would race it for the same cars, the same window and the same trunk
+    # (a stopped train still holds its room and cars). The compose
+    # lock is held from this check through the launch, so auto-land cannot
+    # begin a compose between them (`autoland.compose_lock`).
+    from . import autoland
+    with autoland.compose_lock(got["root"], COMPOSE_LOCK_WAIT_S) as held:
+        if not held:
+            print("%s: REFUSED — another train is being composed (the compose "
+                  "lock stayed held for %d s). Nothing was minted, merged or "
+                  "launched." % (PROG, COMPOSE_LOCK_WAIT_S), file=out)
+            return 1
+        flying = autoland.flight_refusal(got["root"])
+        if flying:
+            print("%s: REFUSED — %s. Nothing was minted, merged or launched."
+                  % (PROG, flying), file=out)
+            return 1
+        return _compose_applied(got, out, door)
+
+
+def _compose_applied(got, out, door):
+    """`compose --apply` past the flight check: the trunk authority, the
+    ejection store and the cars, then the room. -> exit code."""
     stale = authority_refusal(got)
     if stale:
         print("%s: REFUSED — %s. Nothing was minted, merged or launched."
               % (PROG, stale), file=out)
         return 1
+    if got.get("ejections_unknown"):
+        print("%s: REFUSED — %s, so nothing can prove that no ejected car is "
+              "in this train. Nothing was minted, merged or launched."
+              % (PROG, got["ejections_unknown"]), file=out)
+        return 1
     if not got["cars"]:
-        print("%s: nothing is approve-ready in this project, so no room was "
-              "minted and nothing was launched" % PROG, file=out)
+        print("%s: nothing is approve-ready or held source-clean in this "
+              "project, so no room was minted and nothing was launched"
+              % PROG, file=out)
         return 1
+    return compose_room(got, out=out, door=door)
+
+
+def mint_and_merge(got, out=None):
+    """Mint `got`'s room on its trunk and merge every car in order, launching
+    nothing. -> {"head", "merged", "refused", "stuck"}.
+
+    THE COMPOSE HALF OF `compose_room`, apart so a caller can stand work
+    between the merges and the gate: `helm train auto` (helm/autoland.py)
+    runs the tree-wide audits on the composed room there, then launches the
+    same door. `head` is the room's head after the last merge (the trunk when
+    nothing merged); `merged` the cars merged, `refused` (car, cause) for
+    each merge that was aborted and NOT resolved; `stuck` the sentence that
+    stopped the train, None when it did not stop. `got` is `compose_room`'s."""
+    out = out if out is not None else sys.stdout
     room, root = got["room"], got["root"]
+    result = {"head": None, "merged": [], "refused": [], "stuck": None}
     if os.path.lexists(room):
-        print("%s: REFUSED — %s already exists. Its HEAD may be the only "
-              "anchor of an earlier train: land it or remove it, or name "
-              "another train with --name." % (PROG, room), file=out)
-        return 1
+        result["stuck"] = ("%s already exists. Its HEAD may be the only "
+                           "anchor of an earlier train: land it or remove "
+                           "it, or name another train with --name." % room)
+        print("%s: REFUSED — %s" % (PROG, result["stuck"]), file=out)
+        return result
     be = vcs.backend(root)
     os.makedirs(os.path.dirname(room), exist_ok=True)
     # THE SAME SANCTION `helm lr compose` HANDS THE REF GUARD: minting an
@@ -573,30 +1038,51 @@ def compose(repo, trunk=None, name=None, apply=False, project=None, door=None,
                             got["trunk"],
                             env=dict(_env(), HELM_WORK_INTEGRATOR="1"))
     if rc != 0:
-        print("%s: cannot mint the room %s: %s" % (PROG, room, _first(err)),
-              file=out)
-        return 1
-    merged, refused = [], []
+        result["stuck"] = "cannot mint the room %s: %s" % (room, _first(err))
+        print("%s: %s" % (PROG, result["stuck"]), file=out)
+        return result
+    result["head"] = got["trunk"]
     for car in got["cars"]:
         outcome, detail, head = merge_car(be, room, car, got["train"],
                                           identity=got["identity"])
         label = "%s (lane %s)" % (_short(car["id"]), car["lane"])
         if outcome == STUCK:
+            result["stuck"] = "%s: %s" % (label, detail)
             print("  STOPPED at %s: %s.\n  The room %s is left exactly as it "
                   "stands, and nothing was launched." % (label, detail, room),
                   file=out)
-            return 1
+            return result
         if outcome == REFUSED:
-            refused.append(car)
+            result["refused"].append((car, detail))
             print("  REFUSED %s: %s. The merge was aborted and NOT resolved; "
                   "this lane owes a tip that merges onto %s."
                   % (label, detail, _short(got["trunk"])), file=out)
         elif outcome == CONTAINED:
             print("  CONTAINED %s: %s" % (label, detail), file=out)
         else:
-            merged.append(car)
+            result["merged"].append(car)
+            result["head"] = head
             print("  MERGED %s at %s: %s" % (label, _short(head), detail),
                   file=out)
+    return result
+
+
+def compose_room(got, out=None, door=None):
+    """Mint `got`'s room on its trunk, merge every car in order, and launch
+    the gate through the door. Returns the exit code `compose` documents.
+
+    THE ONE COMPOSE PATH. `compose` reaches it after its plan and its trunk
+    authority check; `helm train blame` (helm/trainblame.py) reaches it to
+    compose a red train again without the car it ejected, so a train and its
+    ejection are minted, merged and gated by the same code. `got` carries
+    `root`, `identity`, `trunk` (the sha the room stands on), `train`, `room`
+    and `cars` (each with `id`, `lane`, `tip` and its `basis`)."""
+    out = out if out is not None else sys.stdout
+    room = got["room"]
+    composed = mint_and_merge(got, out=out)
+    if composed["stuck"]:
+        return 1
+    merged, refused = composed["merged"], composed["refused"]
     if not merged:
         print("%s: no car merged, so there is nothing to gate. The room %s "
               "stands at trunk %s; nothing was launched."
@@ -607,12 +1093,26 @@ def compose(repo, trunk=None, name=None, apply=False, project=None, door=None,
                                      **(door or {}))
     if rc:
         return rc
+    _source_clean_loop(merged, out)
     return 1 if refused else 0
 
 
 def cmd_train(args):
-    """helm train — the landing window composes itself (dry run by default)."""
+    """helm train — the landing window composes itself (dry run by default).
+    `helm train blame <room>` names a red train's culprit (helm/trainblame.py);
+    `helm train auto` drives a train from intent to land by itself, and `helm
+    train veto <train>` stops one inside its window (helm/autoland.py).
+    """
     from .cli import guard_tail
+    if args and args[0] == "blame":
+        from . import trainblame
+        return trainblame.cmd(args[1:])
+    if args and args[0] == "readmit":
+        return _cmd_readmit(args[1:])
+    if args and args[0] in ("auto", "veto"):
+        from . import autoland
+        return (autoland.cmd if args[0] == "auto"
+                else autoland.cmd_veto)(args[1:])
     valued = ("--repo", "--trunk", "--name", "--max-behind")
     rc = guard_tail(PROG, args, flags=("--apply",), valued=valued,
                     usage=USAGE)
@@ -626,3 +1126,46 @@ def cmd_train(args):
     return compose(opts.get("--repo") or os.getcwd(),
                    trunk=opts.get("--trunk"), name=opts.get("--name"),
                    apply="--apply" in args, max_behind=cap)
+
+
+def _cmd_readmit(args):
+    """helm train readmit <tip> --reason TEXT [--repo PATH] — clear one
+    standing ejection by hand, for a blame that was wrong. The record keeps
+    who cleared it (the seat's HELM_CHAT_NAME, else the OS user) and why."""
+    from .cli import guard_tail
+    prog = "helm train readmit"
+    args = list(args or ())
+    if args and args[0] in ("-h", "--help"):
+        print(READMIT_USAGE)
+        return 0
+    if not args or args[0].startswith("-"):
+        print("%s: name the ejected tip (%s)" % (prog, READMIT_USAGE),
+              file=sys.stderr)
+        return 2
+    token, rest = args[0], args[1:]
+    rc = guard_tail(prog, rest, valued=("--reason", "--repo"),
+                    usage=READMIT_USAGE)
+    if rc is not None:
+        return rc
+    opts = {a: rest[i + 1] for i, a in enumerate(rest)
+            if a in ("--reason", "--repo")}
+    reason = " ".join(str(opts.get("--reason") or "").split())
+    if not reason:
+        print("%s: a readmit records why the ejection was wrong: --reason "
+              "TEXT (%s)" % (prog, READMIT_USAGE), file=sys.stderr)
+        return 2
+    repo = opts.get("--repo") or os.getcwd()
+    root = _lanes.find_root(repo)
+    if not root:
+        print("%s: %s is not inside a git repository" % (prog, repo),
+              file=sys.stderr)
+        return 1
+    by = home.chat_name() or "user:%s" % getpass.getuser()
+    row, why = readmit(root, token, reason, by)
+    if why:
+        print("%s: REFUSED — %s" % (prog, why), file=sys.stderr)
+        return 1
+    print("%s: %s rides again (it was ejected from %s, gate:%s); recorded "
+          "by %s: %s" % (prog, _short(row["tip"]), row.get("train") or "?",
+                         row.get("gate") or "?", by, reason))
+    return 0

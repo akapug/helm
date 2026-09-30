@@ -99,7 +99,10 @@ def _dead_cursors():
     """Per-session chat read cursors whose session is dead (chat.dead_cursors).
     Liveness-gated, never age-gated: a pane thinking for an hour looks exactly
     like one that exited an hour ago, and dropping a LIVE cursor makes that seat
-    re-read its room and re-deliver what it already saw. Budget is count>0
+    re-read its room and re-deliver what it already saw. The one addition
+    is a seat-level cursor whose ROOM LOG is gone and whose seat the roster
+    no longer holds (task/3519), once untouched past chat.ROOMLESS_CURSOR_S;
+    a live seat's cursor is never reaped for its room. Budget is count>0
     because a dead session's cursor has no retention value at all — it is pure
     directory-entry tax on every list_rooms, which runs on every tool boundary.
 
@@ -123,6 +126,27 @@ def _dead_cursors():
     if err:
         raise RuntimeError("cursor liveness unprovable, reaped nothing: %s" % err)
     return victims
+
+
+def _dead_cursor_proof():
+    """-> the one-path re-proof for `chat-cursors`, run under
+    `_dead_cursor_lock`. OWNER-BOUND LIKE chat-cursor-locks, and for the
+    reason the review of task/3519 found: this row unlinked with no lock and
+    no re-check, so a cursor the scan named could be minted again, or its
+    seat rostered, before the unlink, and the unlink took the live one.
+
+    ARMED PER ROW, never in this module: `_still_victim` arms one on the row
+    at its first victim, so liveness is re-read once per reap and the roster
+    and room log per victim, and nothing outlives the row. A module global
+    held the last scan's re-proof past every gc run and every test that
+    scanned, which the land gate's fail-mode leak audit refused."""
+    from . import chat
+    return chat.still_dead_cursor()
+
+
+def _dead_cursor_lock(path):
+    from . import chat
+    return chat.cursor_reap_lock(path)
 
 
 def _cursor_sibling_locks():
@@ -258,7 +282,11 @@ _BUDGET_AXES = {
 # for live/mutable paths or an immutable owner-specific name.
 POLICIES = (
     {"stream": "chat-cursors", "cls": "exhaust", "act": "prune", "count": 0,
-     "find": _dead_cursors},
+     "find": _dead_cursors, "arm": _dead_cursor_proof,
+     "owner": "seats-cursor", "lock": _dead_cursor_lock,
+     "note": "cursors of dead sessions, and of seats the roster no longer "
+             "holds on rooms with no log — reap holds the cursor topology "
+             "lock and re-proves each one before it unlinks"},
     {"stream": "chat-unpaired-cursors", "cls": "exhaust", "act": "prune",
      "count": 0, "find": _unpaired_session_cursors},
     {"stream": "chat-cursor-locks", "cls": "exhaust", "act": "prune", "count": 0,
@@ -387,12 +415,16 @@ def _still_victim(row, path):
     if current != claim or claim[2] != stat.S_IFREG:
         return False
     p = row["policy"]
-    if "still" in p:
+    if "arm" in p and "still" not in row:
+        row["still"] = p["arm"]()
+    still = row.get("still") or p.get("still")
+    if still:
         # A PER-PATH RE-PROOF, for a count-0 row whose finder is a listing
         # of a whole directory. Re-running that listing once per victim is
         # quadratic in exactly the directory the row exists to shrink:
-        # 49,718 victims x a 108,177-entry listing.
-        return p["count"] == 0 and bool(p["still"](path))
+        # 49,718 victims x a 108,177-entry listing. `arm` mints one per row
+        # when the re-proof carries state from its first read.
+        return p["count"] == 0 and bool(still(path))
     found = p["find"]()
     if path not in found:
         return False
@@ -516,21 +548,24 @@ WantedBy=timers.target
 TIMER_INTERVAL_S = 3600
 
 
-def timer_units(interval=TIMER_INTERVAL_S):
+def timer_units(interval=TIMER_INTERVAL_S, inputs=None):
     """(service_path, service_text, timer_path, timer_text). WorkingDirectory is
     DERIVED, never a literal — an operator path baked into a tracked template is
     both a never-track needle and a machine identity this repo cannot carry.
     work.find_root folds a lane worktree back to the SHARED checkout so a
-    persistent unit never captures a disposable worktree as its cwd."""
+    persistent unit never captures a disposable worktree as its cwd.
+    `inputs` replaces per-install values (timerhealth.unit_values)."""
     helm_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "helm")
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    from . import timerhealth
+    udir = timerhealth.user_unit_dir()
     from . import work
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cwd = work.find_root(here) or here
     return (os.path.join(udir, "helm-gc.service"),
-            _SERVICE % {"helm": helm_bin, "cwd": cwd},
+            _SERVICE % timerhealth.unit_values({"helm": helm_bin, "cwd": cwd},
+                                               inputs),
             os.path.join(udir, "helm-gc.timer"),
-            _TIMER % {"interval": interval})
+            _TIMER % timerhealth.unit_values({"interval": interval}, inputs))
 
 
 def ensure_timer(interval=TIMER_INTERVAL_S):
@@ -538,8 +573,7 @@ def ensure_timer(interval=TIMER_INTERVAL_S):
     installer exactly, because the drain deserves the same shipping path the
     watchers already have."""
     import shutil
-    import subprocess
-    from . import pk
+    from . import timerhealth
     if interval < 1:
         return False, "interval must be at least 1 second"
     systemctl = shutil.which("systemctl")
@@ -548,17 +582,10 @@ def ensure_timer(interval=TIMER_INTERVAL_S):
                        "another scheduler (cron, a supervisor) — the drain "
                        "matters more than the mechanism")
     spath, service, tpath, timer = timer_units(interval)
-    try:
-        pk.atomic_write(spath, service)
-        pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    for cmd in ([systemctl, "--user", "daemon-reload"],
-                [systemctl, "--user", "enable", "--now", "helm-gc.timer"]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, "%s failed: %s" % (
-                " ".join(cmd), (r.stderr or r.stdout or "").strip()[:200])
+    error, _unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer)), ("helm-gc.timer",), systemctl)
+    if error:
+        return False, error
     return True, "timer enabled every %ds (%s)" % (interval, tpath)
 
 

@@ -29,8 +29,9 @@ def runtime_proof(session="session-ds4pro", observed=1000, route=None):
             "local_base_url": "http://127.0.0.1:8360",
             "proxy_pid": 4201, "proxy_identity": "proc:702",
             "proxy_config": "/safe/config.yaml", "config_sha256": "a" * 64,
-            "route": route or {"alias": "ds4-pro", "provider": "opencode-go",
+            "route": route or {"alias": "ds4-pro",
+                                "provider": "deepseek-direct",
                                 "upstream_model": "deepseek-v4-pro",
-                                "base_url": "https://opencode.ai/zen/go/v1"},
+                                "base_url": "https://api.deepseek.com/v1"},
             "observed_at": observed,
             "canary": {"state": "HEALTHY", "status": 200}}

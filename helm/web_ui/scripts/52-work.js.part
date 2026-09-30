@@ -1,0 +1,1531 @@
+/* ================= WORK, START TO FINISH (task/3643 slices 3-6) =================
+   The owner's two pages, Backlog and Pipeline, drew the same work two ways
+   and could not meet, and the console printed four different pipeline
+   numbers at one instant (walk 2: 36, 47, 81, 25). This is the ONE page that
+   replaces both: every piece of work is one card in one of five stages, To
+   do › Building › In review › Landing › Landed, left to right.
+
+   ONE READER, NO COUNT OF ITS OWN. The page reads `/api/work` and nothing
+   else for work (helm/work_model.py): the server joins the to-do list, the
+   pipeline reading, the work rooms and the trains ONCE, places each card in
+   its stage, names whose move it is, marks it stuck, and counts. This file
+   filters, words and draws those cards. The nav badge, Home's work tile and
+   each project's row read the same body (`wkBadge`, `wkHomeTile`,
+   `wkProjectCount`), so no surface can print a number the page does not.
+   A menu or chip count under a filter is the same cards, filtered here.
+
+   A SOURCE NOT READ IS NEVER A ZERO. The server says, per stage, whether
+   its number is exact, a floor ("at least": a project's pipeline was not
+   read) or a ceiling ("at most": To do, whose work may be further on), and
+   which projects it could not read. Every number here carries that word,
+   and a floor of nothing is "?", never 0.
+
+   THE VIEW IS THE ADDRESS (the retired backlog's idiom):
+   `#work/work?…`, with the drawer as `card=<key>`. Backlog and Pipeline
+   survive as pre-filtered entries into this one page (`WK_ENTRY`):
+   `#work/backlog` is To do in the List lens and `#work/pipeline` the three
+   stages under way, each its own tab in the section row, one page behind
+   them. A project's Work tab is this component locked to that project
+   (`WK.proj`), as its Tasks tab was the backlog locked to it.
+
+   PURE RENDERERS, ONE DELEGATED HANDLER. Every `wk…HTML` function returns a
+   string from its arguments, so the suite runs this exact source under
+   node; the DOM is touched only by `wkPaint`, the drawer's lazy reads and
+   the handlers at the bottom. */
+
+const WK_STAGES = [
+  {k: "todo", label: "To do", say: "the backlog: not started"},
+  {k: "building", label: "Building", say: "being written, or owes a fix"},
+  {k: "review", label: "In review", say: "a reviewer's move"},
+  {k: "landing", label: "Landing", say: "approved; waiting to merge"},
+  {k: "landed", label: "Landed", say: "in the shared code · last 24 h"}];
+const WK_SI = {todo: 0, building: 1, review: 2, landing: 3, landed: 4};
+/* the band over the stage row: which stages are the backlog, which the
+   pipeline, which are done — each a filter */
+const WK_SPANS = {backlog: ["todo"], pipeline: ["building", "review", "landing"], done: ["landed"]};
+const WK_RANKS = ["P0", "P1", "P2", "P3"];
+/* THE THREE ENTRIES INTO THE ONE PAGE, each a tab of Work's section row:
+   what a tap on it sets, and what its address leaves out (it is implied) */
+const WK_ENTRY = {flow: {stage: "", lens: "river"}, pipeline: {stage: "pipeline"},
+                  backlog: {stage: "todo", lens: "list"}};
+const WK_OMIT = {flow: [], pipeline: ["stage"], backlog: ["stage", "lens"]};
+const WK_GROUPS = [["stage", "stage"], ["move", "who has it"], ["project", "project"], ["one", "one list"]];
+const WK_SORTS = [["", "stage order"], ["recent", "most recent move"], ["longest", "longest in its stage"]];
+const WK_PER = 50;
+const WK_POLL_MS = 45000;
+const WK_FETCH_MS = 30000;
+
+/* 1409 -> "1,409". PURE. */
+function blN(n) {
+  return Number(n || 0).toLocaleString("en-US");
+}
+function wkPlural(n, one, many) {
+  return blN(n) + " " + (n === 1 ? one : many || one + "s");
+}
+
+/* ------------------------------------------------ the view, in the address */
+
+/* The default view: the whole river, every project. PURE. */
+function wkDefault() {
+  return {lens: "river", stage: "", project: "all", move: "", prio: "", q: "", stuck: false, back: false,
+          asked: false, notask: false, today: false, group: "stage", sort: "", page: 1, card: ""};
+}
+/* THE RANK FILTER IS A SET, kept as one comma list in rank order: the
+   backlog's "P0 and P1 first" is `prio=P0,P1`, two ranks OR'd, and a rank
+   no menu offers is dropped. PURE. */
+const WK_PRIOS = WK_RANKS.concat(["none", "notask"]);
+function wkPrioSet(s) {
+  const got = String(s || "").split(",").map(p => p.trim() === "unranked" ? "none" : p.trim());
+  return WK_PRIOS.filter(p => got.indexOf(p) >= 0).join(",");
+}
+/* One rank toggled in or out of the set; "" clears it. PURE. */
+function wkPrioToggle(set, k) {
+  if (!k) return "";
+  const on = String(set || "").split(",").filter(Boolean);
+  return wkPrioSet((on.indexOf(k) >= 0 ? on.filter(p => p !== k) : on.concat([k])).join(","));
+}
+/* A view from an address's query. A value no menu offers falls back to the
+   default. The OLD addresses keep working: the backlog's `priority` (every
+   rank it named), `owner` (when it names one seat: the move menu picks one)
+   and `group=none`, the land board's `only=stalled|@seat`. `qkey` names the
+   search's parameter (`wq` inside a project, whose page spends `q` on its
+   own filter). PURE. */
+function wkParse(query, qkey) {
+  const s = new URLSearchParams(query || ""), v = wkDefault();
+  const get = k => (s.get(k) || "").trim(), has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+  const stage = get("stage"), only = get("only"), group = get("group"), sort = get("sort");
+  const owner = get("owner").split(",").map(x => x.trim()).filter(Boolean);
+  return Object.assign(v, {
+    lens: get("lens") === "list" ? "list" : "river",
+    stage: has(WK_SI, stage) || has(WK_SPANS, stage) ? stage : "",
+    project: get("project") || "all",
+    move: get("move") || (only.charAt(0) === "@" ? only.slice(1) : "") || (owner.length === 1 ? owner[0] : ""),
+    prio: wkPrioSet(get("prio") || get("priority")),
+    q: get(qkey || "q"),
+    stuck: get("stuck") === "1" || ["stalled", "contrary", "alarm"].indexOf(only) >= 0,
+    back: get("back") === "1", asked: get("asked") === "1", notask: get("notask") === "1",
+    today: get("today") === "1",
+    group: group === "none" ? "one" : WK_GROUPS.some(g => g[0] === group) ? group : "stage",
+    sort: WK_SORTS.some(x => x[0] === sort) ? sort : "",
+    page: Math.max(1, parseInt(get("page"), 10) || 1),
+    card: get("card")});
+}
+/* The address query of a view: "?…" naming what differs from the default,
+   less what its entry implies and a locked project. PURE. */
+function wkQuery(view, entry, lock, qkey) {
+  const d = wkDefault(), s = new URLSearchParams(), omit = WK_OMIT[entry] || [];
+  Object.keys(d).forEach(k => {
+    if (omit.indexOf(k) >= 0 || view[k] === d[k] || (k === "project" && lock && lock.project)) return;
+    s.set(k === "q" ? qkey || "q" : k, view[k] === true ? "1" : String(view[k]));
+  });
+  const t = s.toString().split("%2F").join("/").split("%3A").join(":").split("%2C").join(",");
+  return t ? "?" + t : "";
+}
+/* Which of Work's three entries a view is: the backlog is To do as a list,
+   the pipeline the three stages under way, anything else the whole page. PURE. */
+function wkEntry(v) {
+  return v.stage === "pipeline" ? "pipeline"
+    : (v.stage === "todo" || v.stage === "backlog") && v.lens === "list" ? "backlog" : "flow";
+}
+function wkStagesOf(v) {
+  return WK_SPANS[v.stage] || (v.stage ? [v.stage] : WK_STAGES.map(s => s.k));
+}
+
+/* ------------------------------------------------ the cards, as the server sent them */
+
+/* A day in the owner's clock (the server's `zone`), as YYYY-MM-DD. PURE. */
+function wkDay(at, zone) {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {timeZone: zone || "America/Los_Angeles",
+      year: "numeric", month: "2-digit", day: "2-digit"}).format(new Date(at * 1000));
+  } catch (e) {
+    return null;
+  }
+}
+/* Whose move, as ONE key per card for the menu and the grouping: the seat,
+   or "nobody" (a role no seat holds is nobody's move too), "unowned",
+   "train", "done". One key per card, so no card counts under two. A to-do
+   card nobody owns that helm has not wholly read (`wkUnsure`) is "unread",
+   never "unowned": `wkCards` sets that key. PURE. */
+function wkMove(w) {
+  const k = (w && w.kind) || "nobody";
+  return k === "seat" ? (w.who || "nobody") : k === "role" ? "nobody" : k;
+}
+/* The server's cards with what every surface reads off them, once: the
+   stage index, whose-move key, the alarm (a fix owed on landed work is
+   `debt`, any other stuck mark `stuck`), the age at `nowS` and whether it
+   landed today in the owner's clock, and why a to-do card is only as far
+   as helm has read (`unsure`, "" when it is read whole: `wkUnsure`).
+   `nowS` is the server's clock moved on by how long the page has held the
+   body. PURE. */
+function wkCards(d, nowS) {
+  const zone = d && d.zone, today = wkDay(nowS, zone);
+  return ((d && d.cards) || []).map(c => {
+    const u = wkUnsure(c, d);
+    return Object.assign({}, c, {
+      i: WK_SI[c.stage] || 0,
+      unsure: u,
+      move: u && (c.whose || {}).kind === "unowned" ? "unread" : wkMove(c.whose),
+      alarm: c.stuck ? (c.stuck.why === "fix-owed" ? "debt" : "stuck") : "",
+      age: typeof c.since === "number" ? Math.max(0, nowS - c.since) : null,
+      lastMove: c.since || 0,
+      today: !!(c.stage === "landed" && c.land && c.land.at && today && wkDay(c.land.at, zone) === today)});
+  });
+}
+/* Is this card in the view (every filter but the stage, which the head row
+   and the columns split by)? PURE. */
+function wkPass(c, v, lock) {
+  const p = (lock && lock.project) || v.project;
+  if (p && p !== "all" && (c.project || "none") !== p) return false;
+  if (v.stuck && !c.stuck) return false;
+  if (v.back && !c.came_back) return false;
+  if (v.asked && !c.asked) return false;
+  if (v.notask && (c.task || c.stage === "todo")) return false;
+  if (v.move && c.move.toLowerCase() !== v.move.toLowerCase()) return false;
+  if (v.prio && v.prio.split(",").indexOf(c.rank || (c.task ? "none" : "notask")) < 0) return false;
+  if (v.today && c.stage === "landed" && !c.today) return false;
+  if (v.q) {
+    const hay = [c.key, c.task, c.title].concat(c.lanes || []).join(" ").toLowerCase();
+    if (v.q.toLowerCase().split(" ").some(w => w && hay.indexOf(w) < 0)) return false;
+  }
+  return true;
+}
+/* THE VIEW, SQUARED WITH THE READ (task/3482, D1 and D3): a project the
+   address names that neither the work nor the registry knows falls back to
+   every project and leaves the address, never kept and never added to the
+   menu; and a whose-move pick matches the cards' own seat whatever its case,
+   as the server's filters ignore case, so the menu never grows a second
+   entry that differs only in case. Before the work is read nothing is
+   dropped. PURE. */
+function wkNormalize(v, d, registered) {
+  if (!d || !d.counts) return v;
+  const bp = d.counts.by_project || {}, out = Object.assign({}, v), reg = registered || [];
+  if (v.project && v.project !== "all" && !bp[v.project] && reg.indexOf(v.project) < 0 && (reg.length || v.project !== "none"))
+    out.project = "all";
+  if (v.move) {
+    const want = v.move.toLowerCase(), hit = (d.cards || []).map(c => wkMove(c.whose)).find(k => k.toLowerCase() === want);
+    if (hit) out.move = hit;
+  }
+  return out;
+}
+/* THE COUNT of a set of cards, per stage and per mark. PURE. */
+function wkCount(cards) {
+  const n = {};
+  WK_STAGES.forEach(s => { n[s.k] = {all: 0, stuck: 0, back: 0, debt: 0, today: 0}; });
+  cards.forEach(c => {
+    const x = n[c.stage];
+    if (!x) return;
+    x.all++;
+    if (c.stuck) x.stuck++;
+    if (c.came_back) x.back++;
+    if (c.alarm === "debt") x.debt++;
+    if (c.today) x.today++;
+  });
+  return {n: n, stuck: cards.filter(c => c.stuck).length, back: cards.filter(c => c.came_back).length,
+          asked: cards.filter(c => c.asked).length, notask: cards.filter(c => !c.task && c.stage !== "todo").length};
+}
+/* The projects whose lands helm records (the train's; `counts.landed`). PURE. */
+function wkMeasured(d) {
+  const l = d && d.counts && d.counts.landed;
+  return l && Array.isArray(l.measured) ? l.measured : d && d.trains && d.trains.project ? [d.trains.project] : [];
+}
+/* THE BOUND ON ONE STAGE'S NUMBER, the server's (`counts.stages[s].bound`):
+   null (exact), "at_least", "at_most" or "unknown". Inside one project it
+   holds when the reason is global (the pipeline, the roster, the to-do list
+   or the trains not read) or that project is one the server names as not
+   read. A PROJECT THAT MERGES BY HAND IS "unmeasured" IN LANDED (task/3723,
+   walk 3 finding 1): helm records none of its lands, so its Landed is never
+   a 0; the train's own project is measured whatever its pipeline read, its
+   lands coming from the trains alone. PURE. */
+function wkBound(d, stage, project) {
+  const cs = d && d.counts && d.counts.stages;
+  if (!cs || !cs[stage]) return "unknown";
+  const b = cs[stage].bound || null, sc = d.scope || {};
+  if (stage === "landed" && project && project !== "all") {
+    if (project !== "none" && wkMeasured(d).indexOf(project) < 0) return "unmeasured";
+    return sc.trains_unavailable ? b : null;
+  }
+  if (!b || !project || project === "all") return b;
+  const global = stage === "todo" ? !!sc.tasks_unavailable : stage === "landed" ? !!sc.trains_unavailable
+    : !(d.reading && d.reading.read) || (stage === "building" && sc.rooms_read === false);
+  const missing = [].concat(sc.unread || [], sc.unknown || [], sc.partial || []);
+  return global || missing.indexOf(project) >= 0 ? b : null;
+}
+/* A number with its bound, in words a hover can carry (it holds no
+   markup): "?", "at least 45", "at most 3" or "45". A floor of nothing and
+   an unknown are "?", never a zero; a ceiling of nothing is just 0 ("at
+   most 0" read as a glitch); a count helm does not measure is "not
+   measured". PURE. */
+function wkNumWords(n, bound) {
+  if (bound === "unmeasured") return "not measured";
+  if (bound === "unknown" || n === null || n === undefined || (bound === "at_least" && !n)) return "?";
+  return (bound === "at_least" ? "at least " : bound === "at_most" && n ? "at most " : "") + blN(n);
+}
+/* A number with its bound, drawn: the same rule as `wkNumWords`. `words`
+   spells the bound ("at least 45") where there is room; a stage head prints
+   "≥ 45". PURE. */
+function wkNum(n, bound, words) {
+  if (bound === "unmeasured")
+    return '<span class="wkunk wknm" title="helm does not record this project’s merges as lands, so its Landed is not measured">not measured</span>';
+  if (wkNumWords(n, bound) === "?")
+    return '<span class="wkunk" title="not read, so this number is unknown">?</span>';
+  if (bound === "at_most" && n === 0) return blN(0);
+  const pre = bound === "at_least" ? (words ? "at least " : "≥ ") : bound === "at_most" ? (words ? "at most " : "≤ ") : "";
+  return (pre ? '<span class="wkbd" title="' + (bound === "at_least"
+    ? "a project's work was not read, so there may be more" : "a project's work was not read, so some of these may be further on")
+    + '">' + pre + "</span>" : "") + blN(n);
+}
+/* The projects the server could not read, by name. PURE. */
+function wkMissing(d) {
+  const sc = (d && d.scope) || {};
+  return [].concat(sc.unread || [], sc.unknown || [], sc.partial || []);
+}
+/* A TO-DO CARD IS ONLY AS FAR AS HELM HAS READ. The server draws every open
+   task in To do until a work room or a pipeline row moves it on, so while
+   the card's project's pipeline is not read (not yet, not at all, or only
+   in part), no project's pipeline is read, the pipeline reading is stale,
+   or the work rooms are not read (the page head's own reasons,
+   `wkReadWhys`), a card in To do may already be under way. This is why, as a clause ("" for a card read whole, and for
+   every card past To do): the ONE question every surface asks before it
+   says that nobody holds a to-do card, that it is not started or has no
+   work room, or that a seat may take it (NOW and NEXT, the card's whose
+   move, the drawer's task owner, the Whose move menu). PURE. */
+function wkUnsure(c, d) {
+  if (!c || c.stage !== "todo") return "";
+  const sc = (d && d.scope) || {}, p = c.project || "none";
+  if ((sc.partial || []).indexOf(p) >= 0) return "this project’s pipeline was read only in part";
+  if (wkMissing(d).indexOf(p) >= 0) return "this project’s pipeline is not read yet";
+  if (!(d && d.reading && d.reading.read)) return "no project’s pipeline is read yet";
+  const stale = wkStaleWords(d);
+  if (stale) return stale;
+  return sc.rooms_read === false ? "the work rooms are not read yet" : "";
+}
+/* THE STAGES A STUCK OR CAME-BACK MARK CAN BE ON: never Landed (a landed
+   card is neither stuck nor sent back), so those counts take no bound from
+   a Landed nobody measured. */
+const WK_MARKED = ["todo", "building", "review", "landing"];
+/* THE BOUND ON A COUNT OF CARDS (a chip, the "Showing" line, a menu) over
+   the stages it can count (`stages`, every stage by default): the body not
+   read is "unknown"; over every project it is the badge's own rule, so with
+   no filter the stuck chip IS the badge (a reading not whole is a floor),
+   and a count that takes landed cards is a floor while Landed is (a project
+   merges by hand); inside one project it is a floor when ANY of those
+   stages is not exact (unknown, a floor, a ceiling or not measured: the
+   to-do list, the trains or the rooms not read count as much as its
+   pipeline), since the cards seen are then only some of its cards. A count
+   that is a floor of nothing prints "?", never 0. PURE. */
+function wkCountBound(d, project, stages) {
+  if (!d || d.unavailable || !d.counts) return "unknown";
+  const ks = stages || WK_STAGES.map(s => s.k);
+  if (!project || project === "all")
+    return d.scope && d.scope.complete && !(ks.indexOf("landed") >= 0 && wkBound(d, "landed", "all")) ? null : "at_least";
+  return ks.some(k => wkBound(d, k, project)) ? "at_least" : null;
+}
+/* A STALE PIPELINE READING, in words: the server still serves a reading
+   past its bound while it rebuilds, and every surface that prints its
+   numbers says so, once, with its age; with no clock it names no age and
+   claims no bound (task/3632). "" when it is not stale. PURE. */
+function wkStaleWords(d) {
+  const rd = (d && d.reading) || {};
+  if (!rd.stale) return "";
+  const aged = typeof rd.age_s === "number";
+  return "the pipeline reading is stale, " + (aged ? lrDur(rd.age_s) + " old" : "age unknown")
+    + (aged && typeof rd.limit_s === "number" ? ", past its " + lrDur(rd.limit_s) + " bound" : "");
+}
+/* WHY THE READING IS NOT WHOLE, one plain reason each, as [text, hover]:
+   the read line prints them and the badge's hover says them, so the two
+   can never give different reasons. The names of the projects not read
+   ride the hover: the line is one count (task/3632: a strip that listed 238
+   names). PURE. */
+function wkReadWhys(d) {
+  const sc = (d && d.scope) || {}, rd = (d && d.reading) || {}, why = [];
+  const unread = [].concat(sc.unread || [], sc.unknown || []), part = sc.partial || [];
+  if (!rd.read) why.push(["no project’s pipeline was read yet, so the stages under way are unknown", ""]);
+  if (unread.length) why.push([wkPlural(unread.length, "project") + " not read yet"
+    + (rd.read ? ", so the stages under way are floors and To do a ceiling" : ""), unread.join(", ")]);
+  if (part.length) why.push([wkPlural(part.length, "project") + " read only in part, so "
+    + (part.length === 1 ? "its" : "their") + " stages under way are floors", part.join(", ")]);
+  const stale = wkStaleWords(d);
+  if (stale) why.push([stale + ", so the stages under way may have moved", ""]);
+  if (sc.tasks_unavailable) why.push(["the to-do list could not be read", ""]);
+  if (sc.trains_unavailable) why.push(["the trains could not be read, so Landed is a floor", ""]);
+  if (sc.rooms_read === false) why.push(["the work rooms were not read, so Building is a floor", ""]);
+  if (sc.dispatch_unavailable) why.push(["the review history could not be read, so where each card has been is not known", ""]);
+  return why;
+}
+/* An error as the owner reads it: the reader's own sentence, without the
+   endpoint `j` prefixes ("/api/work -> timed out after 30s"). PURE. */
+function wkWhy(s) {
+  return String(s || "").replace(/^\/api\/\S* -> /, "");
+}
+
+/* ------------------------------------------------ the same numbers elsewhere */
+
+/* THE NAV BADGE: the stuck count over every project, the stuck chip's own
+   number with no filter on, and THE SAME BOUND (`wkCountBound` over the
+   marked stages, the stuck chip's): "?" when the reader was not read; a
+   floor when not everything was read, never a zero over it, drawn "≥94"
+   by the one badge formatter (`navBadgeText`) on the nav, the fold and
+   Home's words alike (walk 3, finding 2: the badge said 94 beside the
+   chip's ≥94); its hover says why (`wkReadWhys`), and a stale reading
+   says so. PURE. */
+function wkBadge(d) {
+  if (!d || d.unavailable || !d.counts)
+    return {n: "?", bound: "unknown", title: "the work is not read" + (d && d.unavailable ? " (" + wkWhy(d.unavailable) + ")" : "")};
+  const n = d.counts.stuck, bound = wkCountBound(d, "all", WK_MARKED), whole = !bound, stale = wkStaleWords(d);
+  const why = wkReadWhys(d).map(w => w[0]).filter(w => !stale || w.indexOf(stale) !== 0);
+  const tail = (whole ? "" : "; not everything is read yet" + (why.length ? ": " + why.join("; ") : ""))
+    + (stale ? "; " + stale : "");
+  if (!whole && !n) return {n: "?", bound: "unknown", title: "the stuck count is unknown" + tail};
+  return {n: n, bound: bound, title: (whole ? "" : "at least ") + wkPlural(n, "piece of work is", "pieces of work are")
+    + " stuck, across all projects" + tail};
+}
+/* HOME'S WORK TILE: the stage row, word for word, and the stuck count.
+   It replaces the Pipeline and Backlog tiles. `ageS` is how long the page
+   has held the body. A READING PAST ITS BOUND KEEPS ITS NUMBERS, DATED
+   (walk 2, finding 21: a tile that said only "stale" was stale most of
+   every hour): "stale, 22m old", never passed off as current. PURE. */
+function wkHomeTile(d, ageS) {
+  if (!d || d.unavailable || !d.counts) return homeWord("not read");
+  const st = d.counts.stages, n = k => "<b>" + wkNum(st[k].n, st[k].bound, true) + "</b>";
+  const b = wkBadge(d), miss = wkMissing(d).length, rd = d.reading || {}, held = typeof ageS === "number" ? ageS : null;
+  const old = rd.stale ? (typeof rd.age_s === "number" ? rd.age_s + (held || 0) : null) : held;
+  const stale = rd.stale || cardStale(ageS, 45)
+    ? homeWord("stale, " + (typeof old === "number" ? lrDur(old) + " old" : "age unknown")) : "";
+  // LANDED NAMES ITS SCOPE (walk 3, finding 1): only the train's project's
+  // lands are measured, so over every project it is "at least", said as whose
+  const lm = d.counts.landed || {}, only = lm.others && wkMeasured(d).length ? "landed: " + wkMeasured(d).join(", ") + " only" : "";
+  return homeTile(n("todo") + " to do › " + n("building") + " building › " + n("review") + " in review › "
+      + n("landing") + " landing › " + n("landed") + " landed",
+    (b.n === "?" ? "stuck unknown" : b.n ? '<span class="dwarn">' + wkNum(b.n, b.bound, true) + " stuck</span>" : "0 stuck")
+      + " · all projects" + (only ? " · " + esc(only) : "") + (miss ? " · " + wkPlural(miss, "project") + " not read" : "")
+      + (stale ? " · " + stale : ""));
+}
+/* A PROJECT'S ROW on Work › projects: its to-do and under-way counts off
+   the same body (`counts.by_project`), with the same bounds, on the line
+   and in its hover alike. PURE. */
+function wkProjectCount(d, key) {
+  if (!d) return '<span class="bcount bmut" title="the work is not read yet">reading…</span>';
+  if (d.unavailable || !d.counts)
+    return '<span class="bcount bunk" title="the work is not read">? to do</span>';
+  const p = (d.counts.by_project || {})[key] || {todo: 0, building: 0, review: 0, landing: 0, landed: 0};
+  const b = s => wkBound(d, s, key), under = p.building + p.review + p.landing;
+  const ub = ["building", "review", "landing"].map(b).find(x => x) || null;
+  const w = s => wkNumWords(p[s], b(s));
+  const title = w("todo") + " to do · " + w("building") + " building · " + w("review") + " in review · "
+    + w("landing") + " landing · " + (b("landed") === "unmeasured" ? "landed not measured (" + key + " merges by hand)"
+      : w("landed") + " landed in the last 24 h");
+  // the landed count rides the hover: the row's land cell already says when
+  // it last landed, and the line has no room for a third number at 1440 px
+  return '<span class="bcount" title="' + esc(title) + '">' + wkNum(p.todo, b("todo"), true) + " to do"
+    + (under || ub ? " · " + wkNum(under, ub, true) + " under way" : "") + "</span>";
+}
+
+/* ------------------------------------------------ words: one sentence per fact */
+
+function wkSeat(s) {
+  return String(s || "").split(",").map(x => x.trim()).filter(Boolean).map(x => "@" + x).join(", ");
+}
+/* Why nobody has it, in the owner's words. PURE. */
+function wkNobodyWhy(w) {
+  if (w && w.kind === "role" && w.who) return "no seat holds the " + w.who + " role, so nobody will move it until one does";
+  const why = String((w && w.why) || "");
+  return !why || why.indexOf("the pipeline names") === 0 ? "no seat is named for the next move" : why;
+}
+/* WHOSE MOVE, as the card says it: a seat, the train, UNOWNED (in the pool
+   for any idle seat) or ONE phrase for a move nobody holds, "nobody has
+   it", with the reason in its hover. Never "@unknown" (walk 2, finding
+   19). A to-do card nobody owns that helm has not wholly read (`unsure`,
+   `wkUnsure`) is "not read", never UNOWNED: a seat may hold it. PURE. */
+function wkWho(c) {
+  const w = c.whose || {}, k = w.kind;
+  if (c.stage === "landed" || k === "done") return {text: "done", cls: "", title: "nothing is owed"};
+  if (k === "train") return {text: "the train’s move", cls: "", title: "auto-land takes it on its next run"};
+  if (k === "unowned" && c.unsure) return {text: "not read", cls: "", title: c.unsure + ", so whether a seat holds it is not known yet"};
+  if (k === "unowned") return {text: "UNOWNED", cls: "tqunowned", title: "no seat holds this item; any idle seat may take it"};
+  if (k === "seat" && w.who) return {text: wkSeat(w.who), cls: "", title: "whose move it is"};
+  return {text: "nobody has it", cls: "nobody", title: wkNobodyWhy(w)};
+}
+function wkMoveLabel(k) {
+  return k === "nobody" ? "nobody has it" : k === "train" ? "the train’s move" : k === "unowned" ? "UNOWNED"
+    : k === "unread" ? "not read" : k === "done" ? "done (landed)" : wkSeat(k);
+}
+/* A time in the owner's own clock: "3:05 PM" today, "Sep 28, 3:05 PM"
+   before. PURE but for the browser's zone. */
+function wkWhen(at, nowS) {
+  if (!at) return "";
+  const d = new Date(at * 1000), n = new Date((nowS || at) * 1000);
+  const same = d.toDateString() === n.toDateString();
+  return (same ? "" : d.toLocaleDateString(undefined, {month: "short", day: "numeric"}) + ", ")
+    + d.toLocaleTimeString(undefined, {hour: "numeric", minute: "2-digit"});
+}
+/* THE ONE LANDED TIME (walk 2, finding 17): every "landed" on this page is
+   the push time of the card's land proof; a task's close is "closed". */
+function wkLandedWords(c, nowS) {
+  return c.land && c.land.at ? "landed " + lrDur(Math.max(0, nowS - c.land.at)) + " ago" : "";
+}
+/* THE SHORT REASONS on a card, worst first: [css class, text]. PURE. */
+function wkWhys(c, d, nowS) {
+  const w = [], who = c.whose || {}, seat = who.kind === "seat" && who.who ? wkSeat(who.who) : "";
+  const train = c.project && d && d.trains && c.project === d.trains.project;
+  const noMove = c.stuck && c.stuck.why === "no-move";
+  if (c.sub === "fix-owed") {
+    const rv = c.debt && c.debt.reviewer;
+    w.push(["bad", "landed while " + (rv ? wkSeat(rv) + "’s" : "a") + " fix request stood unanswered"]);
+  } else if (c.stuck && c.stuck.why === "stalled") {
+    w.push(["warn", "no move for " + (lrDur(c.age) || "an unknown time") + ", longer than this stage should take"]);
+  } else if (noMove) {
+    w.push(["warn", "nobody has it for " + (lrDur(c.age) || "an unknown time") + ": " + wkNobodyWhy(who)]);
+  }
+  const say = {
+    asked: seat ? "asked " + seat + " to build it; nothing to review yet" : "a build was asked for; nothing to review yet",
+    writing: "work room open; not sent for review yet",
+    fix: "↩ a reviewer asked for a fix",
+    wait: seat ? "waiting for " + seat + "’s verdict" : "waiting for a verdict",
+    undecided: noMove ? "" : wkNobodyWhy(who),
+    clean: "reviewed clean; " + (train ? "waiting for the train" : "waiting to be merged"),
+    approved: "approved; " + (train ? "waiting for the train" : "waiting to be merged"),
+    merged: "merged here; waiting to reach the shared code",
+    "close-owed": "its work landed; closing its review is owed",
+    "rehold-owed": "its work landed; a fresh review hold is owed",
+    released: c.released ? "↩ handed back by " + wkSeat(c.released.by) + ", " + lrDur(Math.max(0, nowS - c.released.at))
+      + " ago; " + (c.unsure || "any seat may take it") : "",
+    paused: "‖ paused on purpose; offered to no seat",
+    claimed: "claimed; " + (c.unsure || "no work room yet"),
+    "landed-open": "its work landed; the whole ask is not re-read yet",
+    open: "landed, whole ask not yet re-read"}[c.sub] || "";
+  if (say) w.push([say.charAt(0) === "↩" ? "back" : c.sub === "open" || c.sub === "landed-open" ? "warn" : "mut", say]);
+  (c.rooms || []).filter(r => r.landed && c.stage === "landed").forEach(r => {
+    if ((r.seats || []).length) w.push(["mut", wkSeat(r.seats.join(",")) + " still holds its work room"]);
+  });
+  return w;
+}
+/* EVERY OTHER MOVE OWED ON THE CARD (the meld's ruling on one card with
+   several owed moves): each with its own stage and whose move, on the card
+   face, never only in the drawer. PURE. */
+function wkOthers(c) {
+  return (c.actions || []).filter(a => !a.primary).map(a => ({
+    stage: (WK_STAGES[WK_SI[a.stage]] || WK_STAGES[1]).label, lane: a.lane,
+    who: wkWho({stage: a.stage, whose: a.whose || {}}), sub: a.sub}));
+}
+/* NOW and NEXT, one sentence each. PURE. */
+function wkNowNext(c, d, nowS) {
+  const who = c.whose || {}, seat = who.kind === "seat" && who.who ? wkSeat(who.who) : "";
+  const a = c.age !== null && c.age !== undefined ? lrDur(c.age) : null;
+  const train = c.project && d && d.trains && c.project === d.trains.project;
+  const nobody = "Nobody has it: " + wkNobodyWhy(who) + ".";
+  switch (c.stage) {
+    case "todo": {
+      // A CARD HELM HAS NOT WHOLLY READ (`wkUnsure`) is on the to-do list only
+      // as far as helm has read: it may already be under way, so no sentence
+      // says nobody holds it, that it is not started or has no work room, or
+      // offers it to a seat; the next read settles it. An owner or a claim is
+      // a stored fact, and is still named.
+      const u = c.unsure, list = "On the to-do list" + (u ? " as far as helm has read" : "") + (c.rank ? ", ranked " + c.rank : ", not ranked yet");
+      const may = u ? " " + u.charAt(0).toUpperCase() + u.slice(1) + ", so it may already be under way." : "";
+      const settle = what => "The next read settles whether " + what + ".";
+      if (c.sub === "paused") return ["Paused on purpose. It stays on the to-do list, but no seat is offered it.", "It returns to the queue when the pause ends."];
+      if (c.sub === "released" && c.released) return ["Back on the to-do list" + (u ? " as far as helm has read" : "") + ": " + wkSeat(c.released.by)
+        + " handed it back to the pool " + lrDur(Math.max(0, nowS - c.released.at)) + " ago." + may, u ? settle("a seat already has it") : "Any idle seat may take it."];
+      if (c.sub === "claimed") return u ? ["Claimed by " + wkSeat(c.owner) + "." + may, settle(wkSeat(c.owner) + " has opened a work room")]
+        : ["Claimed by " + wkSeat(c.owner) + "; no work room yet.", wkSeat(c.owner) + " opens a work room and starts building."];
+      if (c.sub === "landed-open") return ["Its work landed more than a day ago, but the task is still open.", "Whoever owns the task re-reads the whole ask, then closes it or files what is left."];
+      if (c.owner) return u ? [list + ", assigned to " + wkSeat(c.owner) + "." + may, settle(wkSeat(c.owner) + " has started it")]
+        : [list + ", assigned to " + wkSeat(c.owner) + ". Not started.", wkSeat(c.owner) + " starts it."];
+      return u ? [list + "." + may, settle("a seat already has it")]
+        : [list + ". Nobody holds it.", c.rank ? "Any idle seat may take it." : "Someone ranks it; then a seat takes it."];
+    }
+    case "building":
+      if (c.sub === "fix-owed") {
+        const rv = c.debt && c.debt.reviewer, l = c.land || (c.debt && c.debt.land);
+        return ["It landed" + (l && l.train ? " in " + l.train + (l.at ? " on " + wkWhen(l.at, nowS) : "") : "") + " while "
+          + (rv ? wkSeat(rv) + "’s" : "a") + " fix request stood unanswered. The fix is still owed.",
+          who.kind === "seat" && who.who ? seat + " answers the fix: a follow-up fix, or a note on why none is needed."
+            : "The fix is answered by a follow-up fix or a note on why none is needed. " + nobody];
+      }
+      if (c.sub === "asked") return ["A build was asked for " + (a ? a + " ago" : "") + ". Nothing to review yet.", (seat || "The builder") + " builds it and sends it for review."];
+      if (c.sub === "writing") return [(seat || "A seat") + " is writing it" + ((c.rooms || [])[0] ? " in work room " + c.rooms[0].lane : "") + ".", (seat || "The seat") + " sends it for review."];
+      return ["Sent back: a reviewer asked for a fix" + (a ? " " + a + " ago" : "") + ".", (seat || "Its author") + " makes the fix and sends it back for review."];
+    case "review":
+      if (c.sub === "undecided") return ["It was reviewed" + (a ? " " + a + " ago" : "") + ", but " + wkNobodyWhy(who) + ".", "Nobody is named to move it. It needs a new review round with a clear yes or fix, or a close."];
+      return ["Waiting for " + (seat || "a reviewer") + "’s verdict" + (a ? " for " + a : "") + ".", (seat || "The reviewer") + " answers: yes, fix, or agree."];
+    case "landing": {
+      const said = {clean: "Reviewed clean", approved: "Approved", merged: "Merged here", "close-owed": "Its work landed", "rehold-owed": "Its work landed"}[c.sub] || "Approved";
+      if (c.sub === "close-owed" || c.sub === "rehold-owed") return [said + "; the review's " + (c.sub === "close-owed" ? "close" : "fresh hold") + " is owed.", seat ? seat + " does it." : nobody];
+      if (who.kind === "train") return [said + (a ? " " + a + " ago" : "") + "; waiting for the train." + (c.stuck ? " It has waited longer than a train takes." : ""), "The train picks it up, runs the whole test suite, then pushes it to the shared code."];
+      return [said + (a ? " " + a + " ago" : "") + "; waiting to be merged" + (train ? "" : " by hand") + ".", seat ? seat + " merges it." : nobody];
+    }
+    case "landed":
+      return ["In the shared code since " + wkWhen(c.land && c.land.at, nowS) + (c.land && c.land.n ? " (LAND " + c.land.n + ", " + c.land.train + ")" : "") + ".",
+        c.sub === "open" ? "Whoever owns " + (c.task || "the task") + " re-reads the whole ask, then closes it or files what is left." : "Nothing. It is done."];
+  }
+  return ["", ""];
+}
+/* HOW THE CARD IS LINKED TO ITS TASK, in one quiet line. PURE. */
+function wkLinkWords(c) {
+  const l = c.link || {};
+  if (c.stage === "todo" || l.how === "task") return "";
+  if (l.how === "stored") return "Linked by the task recorded for this work: " + c.task + ".";
+  if (l.how === "literal") return "Linked by the text “" + ((c.lanes || [])[0] || c.task) + "” in the work room’s name: it names " + c.task + ".";
+  return "No task on file: " + String(l.why || "this work names no to-do item") + ". Once a work room records its task, this card joins its to-do item.";
+}
+/* ONE CROSSING in words: [css class, text, is it a gap helm keeps no time
+   for], or null for one that only repeats another. `ev` is every crossing,
+   so a verdict can name the round's reviewer. PURE. */
+function wkEvWords(e, c, ev) {
+  const k = e[1], round = n => (ev || []).find(x => x[1] === "S" && x[2] === n) || [];
+  const rv = n => wkSeat(round(n)[5]) || "a reviewer", many = (c.lanes || []).length > 1;
+  switch (k) {
+    case "F": return e[2] === "owner" ? ["fwd", "You asked for it"]
+      : ["quiet", String(e[2] || "").indexOf("corpus") >= 0 || String(e[2] || "").indexOf("migration") >= 0
+        ? "Brought over from an older list" : "Written down" + (e[3] && e[3] !== c.project ? " on " + e[3] + "’s list" : "")];
+    case "R": return ["quiet", e[3] ? (e[2] ? "Re-ranked " + e[2] + " → " + e[3] : "Ranked " + e[3]) + (e[4] ? " by " + wkSeat(e[4]) : "") : "Rank cleared"];
+    case "A": return ["quiet", "Assigned to " + wkSeat(e[2])];
+    case "C": return ["fwd", "Claimed by " + wkSeat(e[2])];
+    case "H": return ["quiet", "Handed from " + wkSeat(e[2]) + " to " + wkSeat(e[3])];
+    case "B": return ["back", "↩ Handed back to the pool by " + wkSeat(e[2])];
+    case "s": return ["back", "↩ Set back to open; still assigned to " + wkSeat(e[2])];
+    case "O": return ["back", "↩ Reopened"];
+    case "P": return ["hold", "‖ Paused on purpose" + (e[2] ? " until " + String(e[2]) : "")];
+    case "Q": return ["fwd", "Unpaused"];
+    case "D": return ["ok", "Task closed" + (e[2] ? ", naming " + e[2] : "")];
+    case "W": return e[0] ? ["fwd", "Work room " + e[2] + " opened"] : ["gap", "Work room " + e[2] + " opened; helm does not record when", true];
+    case "S": return ["fwd", "Round " + e[2] + ": " + (e[3] === "build" ? wkSeat(e[4]) + " asked " + wkSeat(e[5]) + " to build it"
+      : e[4] === e[5] ? wkSeat(e[4]) + " read their own work" : wkSeat(e[4]) + " sent it to " + wkSeat(e[5]) + " for review")
+      + (many && e[6] ? " (in " + e[6] + ")" : "")];
+    case "V": return e[3] === "fix" ? ["back", "↩ " + rv(e[2]) + " asked for a fix" + (e[4] ? " and attached their own patch" : "")]
+      : e[3] === "approve" ? ["ok", "✓ " + rv(e[2]) + " approved it"]
+      : e[3] === "concur" ? ["hold", rv(e[2]) + " agreed, but said neither yes nor no"]
+      : ["hold", rv(e[2]) + " answered without a yes or no"];
+    case "Z": return ["quiet", rv(e[2]) + " read it (an advisory read, not a verdict)" + (e[3] === "fix" ? ": a fix is needed" : "")];
+    case "K": return e[3] ? ["fwd", "Reviewed clean; waiting for " + (c.project && ev && ev.some(x => x[1] === "J") ? "the train" : "a merge")]
+      : e[4] ? ["hold", "Held for you"] : ["hold", "Held: reviewed, waiting"];
+    case "X": return ["quiet", "Handed to " + wkSeat(e[3])];
+    case "Y": return ["quiet", "Round " + e[2] + " cancelled"];
+    case "T": return ["quiet", "Round " + e[2] + " retired as a leftover"];
+    case "E": return null;       // a round replaced by the next one: the next round's own line says it
+    case "k": return ["quiet", "Round " + e[2] + ": its seat let go of it"];
+    case "L":
+      if (String(e[3] || "").indexOf("landed") >= 0) return (ev || []).some(x => x[1] === "M") ? null : ["ok", "Round " + e[2] + " closed as landed"];
+      if (e[3] === "superseded") return null;
+      return ["quiet", "Round " + e[2] + " closed: " + ({carried: "carried into a later round", discharged: "a later round answered the fix",
+        withdrawn: "withdrawn", resolved: "resolved", stranded: "stranded"}[e[3]] || String(e[3] || "no reason given"))];
+    case "N": return ["quiet", "Round " + e[2] + ": " + ({withdraw: "withdrawn", discharge: "the fix was answered by a later round",
+      "verdict-retract": "the verdict was taken back"}[e[3]] || String(e[3] || ""))];
+    case "J": return ["fwd", "Boarded " + e[2]];
+    case "tr": return ["back", "↩ Thrown off " + e[2] + ": the whole-suite test went red"];
+    case "ta": return ["hold", e[2] + " was abandoned; it waited for the next train"];
+    case "tv": return ["hold", e[2] + " was vetoed; it waited for the next train"];
+    case "M": return ["ok", "Landed in " + e[2] + (e[3] ? " as LAND " + e[3] : "") + (e[4] ? " · " + blN(e[4]) + " tests passed" : "")];
+    case "G": return e[2] === "notask" ? ["gap", "No task to close: this work never named a to-do item", true]
+      : e[2] === "landed" ? ["gap", "Landed in the shared code (seen there); helm does not record which train or when", true] : null;
+  }
+  return null;
+}
+
+/* ------------------------------------------------ renderers: PURE, HTML strings */
+
+function wkTrackHTML(c) {
+  const lvl = c.stage === "landed" ? " d" : c.alarm === "debt" ? " b" : c.alarm ? " w" : "";
+  const reached = c.reached || [], hollow = c.hollow || [];
+  const left = hollow.map(s => (WK_STAGES[WK_SI[s]] || {}).label || s).map(s => s.toLowerCase());
+  const title = "now: " + WK_STAGES[c.i].label.toLowerCase() + (left.length ? " · reached " + left.join(", ") + ", then sent back" : "");
+  return '<span class="wktrack" title="' + esc(title) + '">' + WK_STAGES.map((s, j) => '<i class="'
+    + (j === c.i ? "n" + lvl : hollow.indexOf(s.k) >= 0 ? "r" : j < c.i && reached.indexOf(s.k) >= 0 ? "p" : "") + '"></i>').join("") + "</span>";
+}
+function wkRankHTML(c) {
+  return c.rank ? '<span class="otqrank otqrank' + esc(c.rank) + '" title="rank ' + esc(c.rank) + '">' + esc(c.rank) + "</span>" : "";
+}
+function wkIdHTML(c) {
+  return c.task ? '<span class="odqid">' + esc(c.task) + "</span>"
+    : '<span class="wknotask" title="this work names no to-do item, so helm cannot say which one it answers">no task on file</span>';
+}
+function wkBackHTML(c) {
+  if (c.sub === "released") return '<span class="wkback" title="a seat handed it back to the pool">↩ handed back</span>';
+  if (c.alarm === "debt") return '<span class="wkback bad" title="it landed while a fix was still owed">↩ fix owed</span>';
+  const n = c.fixes || 0;
+  return n ? '<span class="wkback" title="sent back for a fix ' + esc(wkPlural(n, "time")) + '">↩ ' + n + "</span>" : "";
+}
+function wkProjHTML(c) {
+  return '<span class="wkproj" title="where the work happens">' + esc(c.project || "no project") + "</span>";
+}
+function wkAll(v, lock) {
+  return !(lock && lock.project) && v.project === "all";
+}
+function wkAgeWord(c, nowS, inRiver) {
+  if (c.stage === "landed") return inRiver ? "" : wkLandedWords(c, nowS);
+  return c.age !== null && c.age !== undefined ? lrDur(c.age) : "";
+}
+/* ONE CARD: the backlog row's look, stacked for a column. */
+function wkCardHTML(c, v, lock, d, nowS) {
+  const lvl = c.alarm === "debt" ? "bad" : c.alarm ? "warn" : "", who = wkWho(c), open = v.card === c.key;
+  return '<article class="wkcard ' + lvl + (open ? " sel" : "") + '" tabindex="0" role="button" aria-expanded="' + open
+    + '" data-card="' + esc(c.key) + '">'
+    + '<div class="wkline1">' + wkRankHTML(c) + wkIdHTML(c) + (wkAll(v, lock) ? wkProjHTML(c) : "")
+    + (c.asked ? '<span class="otqasked" title="you asked for this">★</span>' : "")
+    + (c.paused ? '<span class="wkpause" title="paused on purpose">‖</span>' : "") + wkBackHTML(c) + "</div>"
+    + '<div class="wktitle">' + esc(c.title) + "</div>"
+    + '<div class="wkline3">' + wkTrackHTML(c) + '<span class="wkball ' + who.cls + '" title="' + esc(who.title) + '">' + esc(who.text) + "</span>"
+    + '<span class="wkage" title="' + (c.stage === "landed" ? "when it landed" : "time in this stage") + '">' + esc(wkAgeWord(c, nowS, true)) + "</span></div>"
+    + wkWhys(c, d, nowS).slice(0, 2).map(w => '<div class="wkwhy ' + w[0] + '">' + esc(w[1]) + "</div>").join("")
+    + wkOthers(c).map(o => '<div class="wkact" title="another move owed on this work' + (o.lane ? ", in " + esc(o.lane) : "") + '">+ '
+      + esc(o.stage) + ' · <span class="wkball ' + o.who.cls + '" title="' + esc(o.who.title) + '">' + esc(o.who.text) + "</span></div>").join("")
+    + "</article>";
+}
+/* THE LIST LENS'S ROW: the backlog's one line, with a Stage and a Whose
+   move column. */
+function wkRowHTML(c, v, lock, nowS) {
+  const lvl = c.alarm === "debt" ? "bad" : c.alarm ? "warn" : "", who = wkWho(c), open = v.card === c.key;
+  return '<div class="wkrow ' + lvl + (open ? " sel" : "") + '" tabindex="0" role="button" aria-expanded="' + open + '" data-card="' + esc(c.key) + '">'
+    + "<span>" + wkRankHTML(c) + "</span>" + wkIdHTML(c)
+    + '<span class="odqtitle">' + (c.asked ? '<span class="otqasked">★</span> ' : "") + esc(c.title) + "</span>"
+    + (wkAll(v, lock) ? '<span class="wkproj"><span class="lbl">in </span>' + esc(c.project || "no project") + "</span>" : "")
+    + '<span class="wkstage">' + wkTrackHTML(c) + "<span>" + esc(WK_STAGES[c.i].label.toLowerCase()) + "</span>" + wkBackHTML(c) + "</span>"
+    + '<span class="wkball ' + who.cls + '" title="' + esc(who.title) + '">' + esc(who.text) + "</span>"
+    + '<span class="wkage"><i>' + (c.stage === "landed" ? "" : "in stage ") + "</i>" + esc(wkAgeWord(c, nowS, false)) + "</span></div>";
+}
+/* The order inside a stage. To do keeps the backlog's order (came back,
+   rank, you asked, oldest); Landed is newest land first; the others put the
+   worst alarm first, then the most recent move. The Sort menu overrides.
+   PURE. */
+function wkSort(stage, sort) {
+  const rk = c => c.rank ? WK_RANKS.indexOf(c.rank) : 9, lv = c => c.alarm === "debt" ? 0 : c.alarm ? 1 : 2;
+  if (sort === "recent") return (a, b) => b.lastMove - a.lastMove;
+  if (sort === "longest") return (a, b) => (b.age === null ? -1 : b.age) - (a.age === null ? -1 : a.age);
+  if (stage === "todo") return (a, b) => (b.came_back ? 1 : 0) - (a.came_back ? 1 : 0) || rk(a) - rk(b)
+    || (b.asked ? 1 : 0) - (a.asked ? 1 : 0) || (a.since || 0) - (b.since || 0);
+  if (stage === "landed") return (a, b) => ((b.land || {}).at || 0) - ((a.land || {}).at || 0);
+  return (a, b) => lv(a) - lv(b) || b.lastMove - a.lastMove;
+}
+function wkMoreHTML(n, what, stage) {
+  return n > 0 ? '<button type="button" class="chip wkmore" data-more="' + esc(stage) + '">' + esc(what) + " →</button>" : "";
+}
+/* THE TRAIN'S OWN LINE atop Landing, for the project whose lands helm
+   records. */
+function wkTrainLineHTML(d, v, lock, nowS) {
+  const t = d && d.trains, p = (lock && lock.project) || v.project;
+  if (!t || !t.last || (p !== "all" && p !== t.project)) return "";
+  const l = t.last, st = String(l.state || "");
+  const said = st === "DONE" ? "landed" + (l.land ? " LAND " + l.land : "") : st === "VETOED" ? "was vetoed"
+    : st === "ABANDONED" ? "was abandoned" : "is running";
+  return '<div class="wkline">The last train, <b>' + esc(l.name) + "</b>, " + esc(said) + (l.at ? " at " + esc(wkWhen(l.at, nowS)) : "")
+    + ". Only " + esc(t.project) + " lands by train.</div>";
+}
+function wkOtherLandsHTML(d, v, lock) {
+  const un = ((d && d.counts && d.counts.landed) || {}).unmeasured || [], p = (lock && lock.project) || v.project;
+  const hand = un.filter(k => k !== "none" && (p === "all" || p === k));
+  if (!hand.length) return "";
+  return '<div class="wkline">' + (p === "all" ? "Other projects merge by hand, and helm does not record those merges as lands yet, so their Landed is unmeasured: "
+    + esc(hand.slice(0, 6).join(", ")) + (hand.length > 6 ? ", and " + (hand.length - 6) + " more" : "")
+    : esc(p) + " merges by hand, and helm does not record those merges as lands yet, so its Landed is unmeasured") + ".</div>";
+}
+/* The Landed window's two readings: the rolling 24 h, or today in the
+   owner's clock. */
+function wkTodayHTML(v) {
+  const b = (on, val, text) => '<button type="button" class="chip' + (on ? " on" : "") + '" data-today="' + val + '">' + text + "</button>";
+  return '<div class="wkline wktoday">' + b(!v.today, "0", "last 24 h") + b(v.today, "1", "today") + "</div>";
+}
+/* The lands, grouped by the train that carried them, newest first: the
+   proof of every land on the page, not in a hover. The drawer opens under
+   the card it belongs to. */
+function wkLandedHTML(inst, d, all, cap, nowS) {
+  const byTrain = new Map(), v = inst.view;
+  all.forEach(c => { const k = c.land && c.land.train || ""; if (!byTrain.has(k)) byTrain.set(k, []); byTrain.get(k).push(c); });
+  let shown = 0, html = "";
+  for (const [tn, cs] of byTrain) {
+    if (shown >= cap) break;
+    const l = cs[0].land || {};
+    html += '<div class="wktrainh">' + (tn ? "<b>" + esc(tn) + "</b>" + (l.n ? "<span>LAND " + esc(l.n) + "</span>" : "")
+      + "<span>" + esc(wkWhen(l.at, nowS)) + "</span>" + (l.ran ? "<span>" + blN(l.ran) + " tests passed</span>" : "")
+      : "<b>landed</b><span>no train named</span>") + "</div>";
+    html += cs.map(c => wkCardHTML(c, v, inst.lock, d, nowS) + (inst.inline && v.card === c.key ? wkDrawerHTML(inst, d, c, nowS) : "")).join("");
+    shown += cs.length;
+  }
+  return html;
+}
+/* Is any filter on (the stage is not one: it picks the columns)? PURE. */
+function wkFiltered(v) {
+  return !!(v.stuck || v.back || v.asked || v.notask || v.today || v.move || v.prio || v.q);
+}
+/* WHAT AN EMPTY STAGE SAYS. A stage nobody read is never drawn empty: under
+   a bound of "unknown" or "at least" it is "not read yet" (with how many
+   projects were not read); with no filter on it is "nothing here"; only a
+   filter that hid what was read is "none match". PURE. */
+function wkEmptyHTML(d, v, bound, cls) {
+  const miss = wkMissing(d).length, unread = bound === "unknown" || bound === "at_least";
+  const text = bound === "unmeasured" ? "not measured: this project merges by hand, and helm does not record those merges as lands yet"
+    : unread ? (wkFiltered(v) ? "none match these filters in what was read" : "not read yet")
+      + (miss ? " · " + wkPlural(miss, "project") + " not read" : "")
+    : wkFiltered(v) ? "none match these filters here" : "nothing here";
+  return '<div class="wkempty' + (cls ? " " + cls : "") + '">' + esc(text) + "</div>";
+}
+function wkColHTML(inst, d, s, cards, cap, nowS) {
+  const v = inst.view, all = cards.filter(c => c.stage === s.k).sort(wkSort(s.k, v.sort));
+  const head = '<div class="wksecthead">' + esc(s.label) + "<span>" + esc(s.say) + "</span></div>";
+  const card = c => wkCardHTML(c, v, inst.lock, d, nowS) + (inst.inline && v.card === c.key ? wkDrawerHTML(inst, d, c, nowS) : "");
+  const empty = all.length ? "" : wkEmptyHTML(d, v, wkBound(d, s.k, (inst.lock && inst.lock.project) || v.project));
+  let body;
+  if (s.k === "landed") body = wkTodayHTML(v) + wkLandedHTML(inst, d, all, cap, nowS)
+    + wkMoreHTML(all.length > cap ? 1 : 0, "all " + blN(all.length) + " landed", "landed") + wkOtherLandsHTML(d, v, inst.lock);
+  else if (s.k === "todo") body = all.slice(0, cap).map(card).join("") + wkMoreHTML(all.length, "all " + blN(all.length) + " to do, as a list", "todo");
+  else body = (s.k === "landing" ? wkTrainLineHTML(d, v, inst.lock, nowS) : "") + all.slice(0, cap).map(card).join("")
+    + wkMoreHTML(all.length - cap, "all " + blN(all.length) + " " + s.label.toLowerCase(), s.k);
+  if (s.k === "landing") body += empty;
+  else if (s.k !== "landed" && empty) body = empty;
+  return '<div class="wkcol" data-col="' + s.k + '">' + head + body + "</div>";
+}
+/* THE RIVER: five columns (or the stages the band picked), six cards each
+   and a door; one stage fills the width a page at a time. The drawer opens
+   across the full width under the columns, under its card when one stage
+   fills the width, and as a full-screen sheet on a phone. */
+function wkRiverHTML(inst, d, cards, nowS) {
+  const v = inst.view, keys = wkStagesOf(v);
+  const open = cards.find(c => c.key === v.card && keys.indexOf(c.stage) >= 0);
+  if (keys.length === 1) {
+    const s = WK_STAGES[WK_SI[keys[0]]], all = cards.filter(c => c.stage === s.k).sort(wkSort(s.k, v.sort)), cap = 60 * v.page;
+    const one = Object.assign({}, inst, {inline: true});
+    const lead = s.k === "landing" ? wkTrainLineHTML(d, v, inst.lock, nowS) : s.k === "landed" ? wkTodayHTML(v) : "";
+    const body = s.k === "landed" ? wkLandedHTML(one, d, all, 1e9, nowS) + wkOtherLandsHTML(d, v, inst.lock)
+      : all.slice(0, cap).map(c => wkCardHTML(c, v, inst.lock, d, nowS) + (v.card === c.key ? wkDrawerHTML(inst, d, c, nowS) : "")).join("");
+    return '<div class="wkfocus">' + (lead ? '<div class="wkwide">' + lead + "</div>" : "")
+      + (body || wkEmptyHTML(d, v, wkBound(d, s.k, (inst.lock && inst.lock.project) || v.project), "wkwide"))
+      + (s.k !== "landed" && all.length > cap ? '<div class="wkwide"><button type="button" class="chip wkmore" data-page="' + (v.page + 1)
+        + '">show ' + Math.min(60, all.length - cap) + " more of " + blN(all.length) + "</button></div>" : "") + "</div>";
+  }
+  const cap = inst.narrow ? 3 : 6;
+  return '<div class="wkriver" style="--cols:' + keys.length + '">' + keys.map(k => wkColHTML(inst, d, WK_STAGES[WK_SI[k]], cards, cap, nowS)).join("")
+    + "</div>" + (open ? wkDrawerHTML(inst, d, open, nowS) : "");
+}
+function wkPagerHTML(v, total, per) {
+  const pages = Math.max(1, Math.ceil(total / per));
+  if (pages < 2) return "";
+  return '<div class="blpager wkpager"><button type="button" class="chip" data-page="' + (v.page - 1) + '"' + (v.page <= 1 ? " disabled" : "")
+    + ">‹ prev</button><span>page " + v.page + " of " + pages + " · " + blN(total) + " items</span>"
+    + '<button type="button" class="chip" data-page="' + (v.page + 1) + '"' + (v.page >= pages ? " disabled" : "") + ">next ›</button></div>";
+}
+/* THE LIST LENS: the backlog's rows, grouped by stage (or by who has it, or
+   by project, or one list), fifty to a page. A stage group names no number:
+   the stage row above already says it; the other groupings count their own
+   rows. The drawer opens under its row. */
+function wkListHTML(inst, d, cards, nowS) {
+  const v = inst.view, lock = inst.lock, keys = wkStagesOf(v), all = wkAll(v, lock);
+  const row = c => wkRowHTML(c, v, lock, nowS) + (v.card === c.key ? wkDrawerHTML(inst, d, c, nowS) : "");
+  const head = '<div class="wkhdr" aria-hidden="true"><span>rank</span><span>id</span><span>title</span>' + (all ? "<span>project</span>" : "")
+    + "<span>stage</span><span>whose move</span><span>" + (v.sort === "recent" ? "moved" : "in stage") + "</span></div>";
+  const inStages = cards.filter(c => keys.indexOf(c.stage) >= 0), cls = '<div class="wklist' + (all ? " allp" : "") + '">';
+  // an empty list over a stage nobody read says so (`wkEmptyHTML`)
+  const bs = keys.map(k => wkBound(d, k, (lock && lock.project) || v.project));
+  const empty = wkEmptyHTML(d, v, bs.length === 1 ? bs[0] : bs.some(b => b && b !== "at_most") ? "at_least" : null);
+  if (v.group === "one" || (v.group === "stage" && keys.length === 1)) {
+    const s = inStages.slice().sort(wkSort(keys.length === 1 ? keys[0] : "", v.sort));
+    const note = keys.length === 1 && keys[0] === "todo" ? '<div class="wklistnote">This is the backlog: the same rows, menus and drawer, now showing where each item stands.</div>' : "";
+    return cls + head + note + (s.length ? s.slice((v.page - 1) * WK_PER, v.page * WK_PER).map(row).join("") + wkPagerHTML(v, s.length, WK_PER)
+      : empty) + "</div>";
+  }
+  const groups = new Map(), gkey = c => v.group === "move" ? c.move : v.group === "project" ? (c.project || "none") : c.stage;
+  inStages.forEach(c => { const k = gkey(c); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(c); });
+  const ks = v.group === "stage" ? keys.filter(k => groups.has(k))
+    : [...groups.keys()].sort((a, b) => (b === "nobody") - (a === "nobody") || groups.get(b).length - groups.get(a).length || String(a).localeCompare(String(b)));
+  const label = k => v.group === "stage" ? WK_STAGES[WK_SI[k]].label : v.group === "move" ? wkMoveLabel(k) : k === "none" ? "no project" : k;
+  // a group's count carries its bound: a project's own, or the view's; a
+  // seat's group holds no landed card ("done" does), as in the menu
+  const gb = k => wkCountBound(d, v.group === "project" ? k : (lock && lock.project) || v.project,
+    v.group === "move" && k !== "done" ? WK_MARKED : null);
+  const open = new Set(inst.open || []);
+  return cls + head + (ks.map(k => {
+    const xs = groups.get(k).sort(wkSort(v.group === "stage" ? k : "", v.sort)), sel = xs.some(c => c.key === v.card);
+    const shown = sel ? xs : xs.slice(0, open.has(k) ? xs.length : 5);
+    const door = v.group === "stage" ? "more" : v.group === "move" ? "movef" : "projf";
+    return '<details class="blgroup" data-g="' + esc(k) + '" open><summary class="blghead">' + esc(label(k))
+      + (v.group === "stage" ? ' <span class="cfgmut">' + esc(WK_STAGES[WK_SI[k]].say) + "</span>" : ' <span class="blcnt">' + wkNum(xs.length, gb(k), false) + "</span>")
+      + "</summary>" + shown.map(row).join("")
+      + (xs.length > shown.length ? '<button type="button" class="chip blgmore" data-' + door + '="' + esc(k) + '">all ' + blN(xs.length) + " "
+        + esc(v.group === "stage" ? label(k).toLowerCase() : "here") + " →</button>" : "") + "</details>";
+  }).join("") || empty) + "</div>";
+}
+/* THE STAGE TRACK IN WORDS, for the drawer. */
+function wkStageWordsHTML(c) {
+  const lvl = c.stage === "landed" ? " d" : c.alarm === "debt" ? " b" : c.alarm ? " w" : "", hollow = c.hollow || [];
+  return '<div class="wkstrack">' + WK_STAGES.map((s, j) => {
+    const cls = j === c.i ? "now" + lvl : hollow.indexOf(s.k) >= 0 ? "left" : j < c.i && (c.reached || []).indexOf(s.k) >= 0 ? "past" : "";
+    return '<span class="s ' + cls + '">' + (cls === "past" ? "✓ " : j === c.i ? "● " : cls === "left" ? "○ " : "") + esc(s.label) + "</span>";
+  }).join('<span class="a">→</span>')
+    + (c.fixes ? '<span class="bk">↩ sent back ' + esc(wkPlural(c.fixes, "time")) + "</span>" : c.came_back ? '<span class="bk">↩ came back</span>' : "") + "</div>";
+}
+/* WHERE IT HAS BEEN: every crossing the server kept, oldest first, in the
+   owner's clock. A crossing helm keeps no time for is a dashed gap, never
+   left out. A long path folds its quiet stretches; every backward move,
+   hold, land and gap stays in view. `got` is the drawer read
+   (`/api/work?key=`), or its state. */
+function wkSeamsHTML(c, got, expanded, nowS) {
+  const head = '<div class="wkseamh">Where it has been <span>your clock</span></div>';
+  if (!got || got.loading) return head + '<div class="wkempty">reading where it has been…</div>';
+  if (got.err) return head + '<div class="wkempty">✗ could not read where it has been: ' + esc(wkWhy(got.err)) + "</div>";
+  const ev = got.events || [];
+  const rows = ev.map(e => { const w = wkEvWords(e, c, ev); return w && {e: e, cls: w[0], text: w[1]}; }).filter(Boolean);
+  const li = r => '<li class="' + r.cls + '"><span>' + esc(r.text) + "</span>" + (r.e[0]
+    ? '<time title="' + esc(new Date(r.e[0] * 1000).toString()) + '">' + esc(wkWhen(r.e[0], nowS)) + " <small>" + esc(lrDur(Math.max(0, nowS - r.e[0]))) + " ago</small></time>"
+    : "<time></time>") + "</li>";
+  const who = wkWho(c);
+  const nowLi = '<li class="nowl"><span>Now: ' + esc(WK_STAGES[c.i].label.toLowerCase()) + " · " + esc(who.text)
+    + (c.age !== null && c.age !== undefined && c.stage !== "landed" ? " · for " + esc(lrDur(c.age)) : "") + "</span><time></time></li>";
+  const keep = r => ["back", "bad", "ok", "gap", "hold"].indexOf(r.cls) >= 0;
+  let body = "";
+  if (rows.length > 12 && !expanded) {
+    let run = [];
+    const flush = () => {
+      body += run.length > 2 ? li(run[0]) + '<li class="fold"><button type="button" data-expand="' + esc(c.key) + '">▸ '
+        + esc(wkPlural(run.length - 1, "more crossing")) + "</button></li>" : run.map(li).join("");
+      run = [];
+    };
+    rows.forEach((r, i) => { if (keep(r) || i < 2 || i >= rows.length - 2) { flush(); body += li(r); } else run.push(r); });
+    flush();
+  } else body = rows.map(li).join("");
+  return head + '<ol class="wktl">' + (body || '<li class="gap"><span>helm keeps no crossing for this work yet</span><time></time></li>') + nowLi + "</ol>";
+}
+/* THE DRAWER: the full title and facts, the track in words, Now and Next,
+   the alarm, the land proof, every other owed move, how it is linked, the
+   task's own notes and comments, and where it has been. */
+function wkDrawerHTML(inst, d, c, nowS) {
+  const nn = wkNowNext(c, d, nowS), got = inst.ev && inst.ev.key === c.key ? inst.ev : null;
+  const meta = [c.task ? esc(c.task) + (c.status ? " · " + esc(String(c.status).replace("_", " ")) : "") : "no task on file",
+    c.project ? "work in " + esc(c.project) : "no project", c.rank ? "rank " + esc(c.rank) : c.task ? "not ranked" : "",
+    c.asked ? '<span class="otqasked">★ you asked</span>' : "",
+    // the TASK's owner, beside the card's own whose-move: UNOWNED only in To
+    // do, where it is the move (walk 2, finding 19: one word per row), and
+    // only when helm has read the card whole (`wkUnsure`)
+    c.owner ? "task owner " + esc(wkSeat(c.owner)) : c.task && c.stage === "todo" ? (c.unsure
+      ? '<span title="' + esc(wkWho(c).title) + '">who holds it: not read yet</span>'
+      : '<span class="tqunowned">UNOWNED</span>') : "",
+    c.fixes ? esc(wkPlural(c.fixes, "fix", "fixes")) + " asked" : ""].filter(Boolean);
+  const alarm = c.alarm ? wkWhys(c, d, nowS)[0] : null, others = wkOthers(c), link = wkLinkWords(c);
+  const l = c.land;
+  const side = '<dl class="wknn"><dt>Now</dt><dd>' + esc(nn[0]) + '</dd><dt>Next</dt><dd class="next">' + esc(nn[1]) + "</dd></dl>"
+    + (alarm ? '<div class="wkalarm' + (c.alarm === "debt" ? " bad" : "") + '"><b>' + (c.alarm === "debt" ? "A fix is owed on landed work. " : "Stuck. ")
+      + "</b>" + esc(alarm[1].charAt(0).toUpperCase() + alarm[1].slice(1)) + ".</div>" : "")
+    + (l && l.at ? '<div class="wkfacts">Land proof: <b>' + esc(l.train || "a merge") + (l.n ? " · LAND " + esc(l.n) : "") + "</b>"
+      + (l.ran ? " · the whole suite ran " + blN(l.ran) + " tests first" : "") + " · pushed " + esc(wkWhen(l.at, nowS))
+      + (l.author ? " · built by " + esc(wkSeat(l.author)) + (l.reader ? ", read clean by " + esc(wkSeat(l.reader)) : "") : "") + "</div>"
+      // a fix debt's land with no train on file is still said, never left out
+      : c.debt && c.debt.landed ? '<div class="wkfacts">Land proof: seen in the shared code; no train or time is recorded for it</div>' : "")
+    + (others.length ? '<div class="wkfacts">Also owed on this work: ' + others.map(o => "<b>" + esc(o.stage) + "</b> · " + esc(o.who.text)
+      + (o.lane ? " (" + esc(o.lane) + ")" : "")).join("; ") + "</div>" : "")
+    + ((c.lanes || []).length ? '<div class="wkfacts">Work room' + (c.lanes.length > 1 ? "s" : "") + ": " + c.lanes.map(x => "<b>" + esc(x) + "</b>").join(", ") + "</div>" : "")
+    + (link ? '<div class="wkprov">' + esc(link) + "</div>" : "")
+    + (c.task ? '<details class="otqnotes wknotes" data-id="' + esc(c.task) + '"><summary>the task’s note and comments</summary>'
+      + '<div class="otqnotebody">…</div></details><div class="odqacts"><input class="odqcomment wkcomment" data-id="' + esc(c.task)
+      + '" placeholder="note for the fleet (annotates the task)…" aria-label="a note for the fleet on this task" autocomplete="off"><button type="button" class="chip wksay" data-id="'
+      + esc(c.task) + '">comment</button></div>' : "");
+  return '<div class="wkdrawer" role="region" aria-label="where this work has been" data-for="' + esc(c.key) + '">'
+    + '<div class="wkdtop"><div class="wkdt">' + esc(c.title) + '</div><button type="button" class="wkx" data-close title="close (Esc)" aria-label="close">×</button></div>'
+    + '<div class="wkdmeta">' + meta.map(x => "<span>" + x + "</span>").join("") + "</div>" + wkStageWordsHTML(c)
+    + '<div class="wkdbody"><div class="wkdside">' + side + "</div><div>"
+    + wkSeamsHTML(c, got, (inst.expanded || []).indexOf(c.key) >= 0, nowS) + "</div></div></div>";
+}
+/* THE BAND over the stage row, and the stage row: each number the count of
+   its stage and the switch for it, with its stuck and came-back marks. */
+function wkBracketsHTML(v, M, bound) {
+  const b = (cls, key, label, sub) => '<button type="button" class="wkbr ' + cls + (v.stage === key ? " on" : "") + '" data-stage="' + key
+    + '" aria-pressed="' + (v.stage === key) + '" title="show only ' + esc(label.toLowerCase()) + '"><span>' + label + (sub ? " <i>" + sub + "</i>" : "") + "</span></button>";
+  const pipe = M.n.building.all + M.n.review.all + M.n.landing.all;
+  return b("b1", "backlog", "Backlog", "") + b("b2", "pipeline", "Pipeline", "· " + wkNum(pipe, bound, false) + " under way") + b("b3", "done", "Done", "");
+}
+/* THE STAGE ROW: each head its stage's count with that stage's bound, and
+   its flags (stuck, came back, today) carry the same bound (walk 3,
+   finding 2: "44 stuck" under a Building of "≥ 50"). `says` overrides a
+   stage's line: Landed names the projects it measures. */
+function wkHeadsHTML(v, M, bounds, says) {
+  return WK_STAGES.map(s => {
+    const x = M.n[s.k], on = v.stage === s.k || (WK_SPANS[v.stage] || []).indexOf(s.k) >= 0, flags = [], b = bounds[s.k];
+    if (x.stuck) flags.push('<span class="' + (x.debt && x.debt === x.stuck ? "x" : "w") + '">' + wkNum(x.stuck, b, false) + " stuck</span>");
+    if (x.back) flags.push("↩ " + wkNum(x.back, b, false) + '<span class="lbl"> came back</span>');
+    if (s.k === "landed" && x.all) flags.push(wkNum(x.today, b, false) + '<span class="lbl"> today</span>');
+    const say = (says || {})[s.k] || (s.k === "landed" && v.today ? "in the shared code · today" : s.say);
+    return '<button type="button" class="wkhead' + (on ? " on" : "") + '" data-stage="' + s.k + '" aria-pressed="' + on + '" title="show only '
+      + esc(s.label.toLowerCase()) + '"><span class="wkhl">' + esc(s.label) + '</span><span class="wkhn">'
+      + wkNum(x.all, b, false) + "</span>"
+      + '<span class="wkhs">' + esc(say) + '</span><span class="wkhf">' + flags.join(" · ") + "</span></button>";
+  }).join("");
+}
+/* WHAT THE LANDED HEAD SAYS of its scope: a project that merges by hand is
+   not measured; over every project, the projects measured. {} when it is
+   the stage's own line. PURE. */
+function wkLandedSay(d, p, v) {
+  if (!d || !d.counts) return {};
+  if (wkBound(d, "landed", p) === "unmeasured") return {landed: "not measured: it merges by hand"};
+  const lm = d.counts.landed || {}, m = wkMeasured(d);
+  return (!p || p === "all") && lm.others && m.length
+    ? {landed: (v && v.today ? "today" : "last 24 h") + " · " + m.join(", ") + " only"} : {};
+}
+/* THE CHIPS, each a count of the cards in view with the count's bound
+   (`wkCountBound`): before the read and over a reading not whole, a floor
+   of nothing is "?", never 0 beside a "?" badge. `bound` is {live, all}:
+   stuck and came back count no landed card (`WK_MARKED`), so a Landed
+   nobody measured leaves them exact and the stuck chip stays the badge;
+   the others count landed cards too. One bound for both is accepted. */
+function wkChipsHTML(v, M, bound) {
+  const bs = bound && typeof bound === "object" ? bound : {live: bound || null, all: bound || null};
+  const chip = (f, on, label, n, hint, b) => '<button type="button" class="chip' + (on ? " on" : "") + '" data-chip="' + f
+    + '" aria-pressed="' + !!on + '" title="' + esc(hint) + '">' + label + ' <span class="blcnt">' + wkNum(n, b, false) + "</span></button>";
+  return chip("stuck", v.stuck, "stuck", M.stuck, "longer than its stage should take, nobody has it for over a day, or a fix still owed on landed work", bs.live)
+    + chip("back", v.back, "↩ came back", M.back, "sent back for a fix, thrown off a train, or handed back to the pool", bs.live)
+    + chip("asked", v.asked, "★ you asked", M.asked, "you asked for it", bs.all)
+    + chip("notask", v.notask, "no task on file", M.notask, "work under way that names no to-do item", bs.all);
+}
+function wkMenusHTML(inst, scoped, bound) {
+  const bs = bound && typeof bound === "object" ? bound : {live: bound || null, all: bound || null};
+  const v = inst.view, prios = String(v.prio || "").split(",").filter(Boolean);
+  const menu = (key, label, body, note) => '<details class="blmenu" data-m="' + key + '"' + (inst.menu === key ? " open" : "")
+    + '><summary class="chip">' + esc(label) + ' <span class="blcaret">▾</span></summary><div class="blpop">' + body
+    + (note ? '<div class="blpopnote">' + esc(note) + "</div>" : "") + "</div></details>";
+  // a seat's move is never a landed card's ("done" is), so only "done" and
+  // the ranks take Landed's bound
+  const opt = (f, val, text, on, n) => '<button type="button" class="blopt' + (on ? " on" : "") + '" data-f="' + f + '" data-v="' + esc(val)
+    + '"><span class="blchk">' + (on ? "✓" : "") + "</span>" + esc(text) + (typeof n === "number" ? '<span class="blcnt">'
+    + wkNum(n, f === "move" && val !== "done" ? bs.live : bs.all, false) + "</span>" : "") + "</button>";
+  const moves = {}, ranks = {};
+  scoped.forEach(c => {
+    moves[c.move] = (moves[c.move] || 0) + 1;
+    const k = c.rank || (c.task ? "none" : "notask");
+    ranks[k] = (ranks[k] || 0) + 1;
+  });
+  const moveOpts = opt("move", "", "anyone", !v.move) + Object.keys(moves)
+    .sort((a, b) => (b === "nobody") - (a === "nobody") || moves[b] - moves[a] || a.localeCompare(b))
+    .map(k => opt("move", k, wkMoveLabel(k), v.move === k, moves[k])).join("");
+  const rankWord = k => k === "none" ? "not ranked" : k === "notask" ? "no task on file" : k;
+  // THE RANK MENU TOGGLES: two ranks picked are both shown (P0 and P1 first)
+  const prioOpts = opt("prio", "", "any rank", !prios.length) + WK_PRIOS.filter(k => ranks[k] || k === "P0" || prios.indexOf(k) >= 0)
+    .map(k => opt("prio", k, rankWord(k), prios.indexOf(k) >= 0, ranks[k] || 0)).join("");
+  let html = menu("move", v.move ? "Whose move: " + wkMoveLabel(v.move) : "Whose move", moveOpts, "counts: every card in this view, every stage")
+    + menu("prio", prios.length ? "Rank: " + prios.map(rankWord).join(" or ") : "Rank", prioOpts, "counts: every card in this view; pick more than one rank to see them together");
+  if (v.lens === "list") html += menu("group", "Group: " + WK_GROUPS.find(x => x[0] === v.group)[1],
+    WK_GROUPS.map(g => opt("group", g[0], g[1], v.group === g[0])).join(""), "who has it replaces the old “who waits on whom”");
+  return html + menu("sort", "Sort: " + WK_SORTS.find(x => x[0] === v.sort)[1], WK_SORTS.map(x => opt("sort", x[0], x[1], v.sort === x[0])).join(""),
+    "stage order: to do keeps the backlog’s order; the rest put the stuck first");
+}
+/* THE PROJECT MENU (the whole page only): every project with work, with
+   its count and that project's bound (`wkCountBound`), and how many
+   registered projects have none. A project with any count not read (its
+   pipeline, or a source every project shares: the to-do list, the trains,
+   the rooms) is never counted as one with nothing in it: it is named
+   apart. */
+function wkScopeHTML(inst, d, registered) {
+  const v = inst.view, read = !!(d && !d.unavailable && d.counts), bp = (read && d.counts.by_project) || {};
+  const sum = k => WK_STAGES.reduce((s, x) => s + ((bp[k] || {})[x.k] || 0), 0);
+  const keys = Object.keys(bp).filter(k => k !== "none" && sum(k)).sort((a, b) => sum(b) - sum(a) || a.localeCompare(b));
+  // IDLE IS "nothing in either" — to do or under way — so a quiet project
+  // that merges by hand is idle; its Landed is not measured, not unread
+  const quiet = read ? (registered || []).filter(k => !sum(k)) : [];
+  const unread = quiet.filter(k => wkCountBound(d, k, WK_MARKED)), idle = quiet.length - unread.length;
+  const opt = (k, text, n) => '<button type="button" class="blopt' + (v.project === k ? " on" : "") + '" data-f="project" data-v="' + esc(k)
+    + '"><span class="blchk">' + (v.project === k ? "✓" : "") + "</span>" + esc(text) + '<span class="blcnt">' + wkNum(n, wkCountBound(d, k), false) + "</span></button>";
+  const label = v.project === "all" ? "All projects" : v.project === "none" ? "no project" : v.project;
+  return '<details class="blmenu" data-m="project"' + (inst.menu === "project" ? " open" : "") + '><summary class="chip">Project: ' + esc(label)
+    + ' <span class="blcaret">▾</span></summary><div class="blpop">' + opt("all", "All projects", read ? d.counts.cards : null)
+    + keys.map(k => opt(k, k, sum(k))).join("") + (sum("none") ? opt("none", "no project (filed before projects existed)", sum("none")) : "")
+    + '<div class="blpopnote"' + (unread.length ? ' title="' + esc("not read yet: " + unread.join(", ")) + '"' : "") + ">"
+    + (read ? "counts: to-do items plus work under way and landed in 24 h" : "the work is not read yet")
+    + (idle ? ". " + esc(wkPlural(idle, "registered project")) + " with nothing in either " + (idle === 1 ? "is" : "are") + " not listed" : "")
+    + (unread.length ? ". " + esc(wkPlural(unread.length, "registered project")) + " not read yet " + (unread.length === 1 ? "is" : "are") + " not listed" + (idle ? " either" : "") : "")
+    + ".</div></div></details>";
+}
+/* WHAT IS SHOWN, with each active filter a chip that removes it. The total
+   carries its bound: over the stages shown, one stage's own, else a floor
+   when any of them was not wholly read ("at least", or "?" before the
+   read), never a bare number beside a "?" head. */
+function wkLineHTML(inst, M, bounds, d) {
+  const v = inst.view, on = [];
+  if (v.stage) on.push(["stage", ({backlog: "the backlog", pipeline: "the pipeline", done: "what landed"}[v.stage] || WK_STAGES[WK_SI[v.stage]].label.toLowerCase())]);
+  if (v.stuck) on.push(["stuck", "stuck"]);
+  if (v.back) on.push(["back", "↩ came back"]);
+  if (v.asked) on.push(["asked", "★ you asked"]);
+  if (v.notask) on.push(["notask", "no task on file"]);
+  if (v.today) on.push(["today", "landed today"]);
+  if (v.move) on.push(["move", "whose move: " + wkMoveLabel(v.move)]);
+  if (v.prio) on.push(["prio", "rank: " + v.prio.split(",").map(k => k === "none" ? "not ranked" : k === "notask" ? "no task" : k).join(" or ")]);
+  if (v.q) on.push(["q", "“" + v.q + "”"]);
+  const p = (inst.lock && inst.lock.project) || v.project;
+  const scope = p === "all" ? "every project" : p === "none" ? "items with no project" : esc(p);
+  const keys = wkStagesOf(v), total = keys.reduce((s, k) => s + M.n[k].all, 0);
+  const bs = keys.map(k => (bounds || {})[k] || null);
+  // a stage not measured (Landed, in a project that merges by hand) leaves
+  // the total a floor, like one not read
+  const bound = !d || d.unavailable || !d.counts ? "unknown" : bs.length === 1 ? bs[0]
+    : bs.some(b => b === "unknown" || b === "at_least" || b === "unmeasured") ? "at_least" : null;
+  return "<span>" + (bound === "unmeasured"
+      ? "What landed in " + scope + " is <b>not measured</b>: it merges by hand, and helm does not record those merges as lands yet"
+      : "Showing <b>" + wkNum(total, bound, true) + "</b> " + (on.length ? "in " + scope + ", only" : "pieces of work in " + scope + ", from the to-do list to the shared code")) + "</span>"
+    + on.map(x => '<button type="button" class="chip" data-clear="' + x[0] + '" title="remove this filter">' + esc(x[1]) + " ×</button>").join("")
+    + (on.length ? '<button type="button" class="chip blclear" data-clear="all">clear</button>' : "");
+}
+/* THE STATE OF THE READ ITSELF, one line, only when it is not whole. */
+function wkReadLineHTML(d, ageS) {
+  if (!d) return "the work is not read yet";
+  if (d.unavailable || !d.counts) return '<span class="bunk">✗ the work could not be read: ' + esc(wkWhy(d.unavailable) || "the reader sent no counts") + "</span>";
+  const why = wkReadWhys(d).map(w => w[1] ? '<span title="' + esc(w[1]) + '">' + esc(w[0]) + "</span>" : esc(w[0]));
+  if (cardStale(ageS, 45)) why.push(esc(typeof ageS === "number" ? "this reading is " + lrDur(ageS) + " old" : "this reading is of unknown age"));
+  return why.length ? why.join("; ") + "." : "";
+}
+/* THE THREE FOLDS under the page. */
+/* A SOURCE NOT READ IS NEVER A ZERO HERE EITHER (task/3723): with no
+   pipeline read, what came back is not known (the to-do list alone said
+   "none"); over a reading not whole each stage's count is a floor, by the
+   came-back chip's own bound (`wkCountBound` over the marked stages): a
+   project not read or read in part, and the review history, the rooms or
+   the to-do list not read too, since the stages a card reached (what makes
+   it come back) are read off them; and with the trains not read in full
+   (the land log or the ejection store) the pieces thrown off a train are a
+   floor. */
+function wkFoldSeamsHTML(d, cards) {
+  if (!d || !d.counts) return '<div class="wkempty">not read yet</div>';
+  const t = d.trains, day = t && t.day, M = wkCount(cards || []), read = !!(d.reading && d.reading.read);
+  const floor = wkCountBound(d, "all", WK_MARKED) ? "at least " : "", tb = (d.scope || {}).trains_unavailable ? "at_least" : null;
+  const back = WK_STAGES.filter(s => M.n[s.k].back).map(s => s.label + " ↩ " + floor + blN(M.n[s.k].back));
+  return '<ul class="wklefts">'
+    + (day ? "<li>In the last 24 hours <b>" + blN(day.done) + "</b> " + esc(t.project) + " trains landed; <b>" + blN(day.abandoned) + "</b> were abandoned and <b>"
+      + blN(day.vetoed) + "</b> vetoed, and <b>" + wkNum(day.thrown, tb, true) + "</b> pieces of work were thrown off a train for a red test.</li>" : "")
+    + "<li>Came back, by the stage each card is in now: " + (!read ? "not known, no project’s pipeline was read yet"
+      : back.length ? esc(back.join(" · ")) : floor ? "none in what was read" : "none") + ".</li>"
+    + "<li>Not measured yet: how many pieces of work crossed each seam this week, forward and back. The work reader counts where each card is now, not a week of crossings.</li></ul>";
+}
+/* THE LEFTOVERS: three kinds of record, each counted and worded as what it
+   is. A review record left open on work a later round carried; a land
+   request a train already landed that the pipeline reading still shows
+   open (its settlement names the train); a work room whose work landed
+   while its seat still holds the room (the server's `ROOM` record). None
+   waits on the owner. NOT READ IS NEVER NONE (walk 3, finding 8): with no
+   body, or a read that failed, the fold says the records were not read,
+   never a count of 0 and never that nothing waits. THE RECORDS ARE TYPED
+   OFF THE ROWS OF THE PROJECTS READ, so a body with counts and no pipeline
+   read (a restart) typed none, which is not none either; with a project
+   not read or read in part each count is a floor, and the rooms' too while
+   the rooms were not read (`wkNum`: a floor of nothing is "?"). */
+function wkFoldLeftHTML(d, nowS) {
+  if (!d || d.unavailable || !d.counts)
+    return '<div class="wkempty">not read yet: the review records and work rooms left open were not read'
+      + (d && d.unavailable ? " (" + esc(wkWhy(d.unavailable)) + ")" : "") + "</div>";
+  if (!(d.reading && d.reading.read))
+    return '<div class="wkempty">not read yet: no project’s pipeline was read, so the review records and work rooms left open are not known</div>';
+  const pf = wkMissing(d).length ? "at_least" : null, rf = pf || ((d.scope || {}).rooms_read === false ? "at_least" : null);
+  const n = (k, b) => "<b>" + wkNum(k, b, true) + "</b>";
+  const recs = d.records || [], st = d.counts.settlement || {};
+  const trained = r => !!((r.settlement || {}).evidence || {}).train;
+  const rooms = recs.filter(r => r.state === "ROOM"), landed = recs.filter(r => r.state !== "ROOM" && trained(r));
+  const reviews = recs.filter(r => r.state !== "ROOM" && !trained(r));
+  const seats = r => wkSeat((r.whose || {}).who);
+  const row = (r, what) => '<div class="wkrow"><span class="odqid">' + esc(r.lane || "a work room") + "</span>"
+    + '<span class="odqtitle">' + esc(r.project || "no project") + '</span><span class="cfgmut">' + esc(what) + "</span>"
+    + '<span class="wkage"><i>open for </i>' + esc(lrDur(r.since ? Math.max(0, nowS - r.since) : r.age_s) || "?") + "</span></div>";
+  return '<ul class="wklefts"><li>' + n(reviews.length, pf) + " review record" + (reviews.length === 1 ? "" : "s")
+    + " left open on work that a later round already carried; an agent closes " + (reviews.length === 1 ? "it" : "them") + ".</li>"
+    + (landed.length ? "<li>" + n(landed.length, pf) + " land request" + (landed.length === 1 ? "" : "s")
+      + " a train already landed, still open in the pipeline reading; the work is on the river in Landed.</li>" : "")
+    + (rooms.length ? "<li>" + n(rooms.length, rf) + " work room" + (rooms.length === 1 ? " whose work landed; its seat" : "s whose work landed; their seat")
+      + " still holds the room and lets it go.</li>" : "")
+    + "<li>Nothing here waits on you.</li>"
+    + (typeof st["fix-owed"] === "number" ? "<li>" + n(st["fix-owed"], pf) + " landed over an unanswered fix: those are not leftovers, they are on the river in Building, marked ↩ fix owed.</li>" : "")
+    + "</ul>" + (recs.length ? '<div class="wklist wkrecs">'
+      + reviews.concat(landed).map(r => row(r, ((r.settlement || {}).why) || "")).join("")
+      + rooms.map(r => row(r, "its work landed; " + (seats(r) ? seats(r) + " still holds" : "its seat still holds") + " the room")).join("") + "</div>" : "");
+}
+/* THE SAME NUMBERS ELSEWHERE: the nav badge as the nav draws it
+   (`navBadgeText`: "99+" past 99, the exact number in its words), Home's
+   tile and the train project's row, each off this page's one body. */
+function wkFoldElseHTML(d, ageS) {
+  const b = wkBadge(d), tp = d && d.trains && d.trains.project;
+  return '<div class="wkelse"><section class="htile"><span class="hlab">nav badge</span><div class="hval hbig">Work <span class="navbadge mention">'
+    + esc(navBadgeText(b.n, b.bound)) + '</span></div><div class="hval">' + esc(b.title) + ". With no filter on, it is the stuck chip’s own number.</div></section>"
+    + '<section class="htile"><span class="hlab">Home · work tile</span>' + wkHomeTile(d, ageS) + "</section>"
+    + (tp ? '<section class="htile"><span class="hlab">Projects · ' + esc(tp) + " row</span><div class=\"hval hbig\">" + wkProjectCount(d, tp) + "</div>"
+      + '<div class="hval">A project’s Work tab is this page locked to that project.</div></section>' : "") + "</div>";
+}
+
+/* ------------------------------------------------ one page, two places */
+
+/* ONE COMPONENT PER SURFACE: the whole page (`main`) and the open
+   project's Work tab (`proj`, locked to it). Each holds its view, the menu
+   the reader has open, the drawer's read and the path folds he opened. */
+function wkInst(id, key, view) {
+  return {id: id, key: key || null, lock: key ? {project: key} : {}, view: view || wkDefault(),
+          menu: "", ev: null, expanded: [], open: [], narrow: false};
+}
+const WK = {main: wkInst("main"), proj: wkInst("proj")};
+let WORK = null;                 // {d, at}: the last /api/work body and when it arrived
+let WORK_GEN = 0;
+
+function wkRoot(inst) {
+  return inst.id === "main" ? $("#wkmain") : document.querySelector('.wk[data-wk="proj"]');
+}
+/* The server's clock now: its generated_at moved on by how long the page
+   has held the body. */
+function wkNowS() {
+  const d = WORK && WORK.d;
+  return d && typeof d.generated_at === "number" ? d.generated_at + (Date.now() - WORK.at) / 1e3 : Date.now() / 1e3;
+}
+/* WHAT WAITS ON HIM, in his own words: Home's strip names him in the third
+   person ("owner asks"), which the page says to him as "your asks". PURE
+   over `home`, Home's strip line. */
+function wkOnYouWords(home) {
+  return String(home || "")
+    .replace('owner asks <span class="hstale">not read</span>', 'your asks are <span class="hstale">not read yet</span>')
+    .replace('owner asks <span class="hstale">stale</span>', 'your asks <span class="hstale">may be out of date</span>')
+    .replace(/(\d[\d,]*) owner asks?\b/g, (m, n) => n + (n === "1" ? " ask of yours" : " asks of yours"));
+}
+function wkOnYouHTML() {
+  if (typeof onYouRead !== "function") return "";
+  const got = onYouRead(ONYOU.odq, ONYOU.lr);
+  return got.quiet ? '<span class="wkonyou" title="no decision and no hold needs your answer"><b>✓</b> nothing is waiting on you</span>'
+    : '<a class="wkonyou" href="#work/projects" title="what waits on you is on Work › projects">on you: ' + wkOnYouWords(got.home) + " →</a>";
+}
+/* EVERY PART OF ONE COMPONENT, as strings, from one body. */
+function wkParts(inst) {
+  const d = WORK && WORK.d, nowS = wkNowS(), ageS = WORK ? (Date.now() - WORK.at) / 1e3 : null;
+  const registered = (typeof projects !== "undefined" ? projects : []).map(pkey);
+  const v = inst.view, all = wkCards(d, nowS), scoped = all.filter(c => wkPass(c, v, inst.lock)), M = wkCount(scoped);
+  const p = (inst.lock && inst.lock.project) || v.project, bounds = {};
+  WK_STAGES.forEach(s => { bounds[s.k] = wkBound(d, s.k, p); });
+  const pb = ["building", "review", "landing"].map(k => bounds[k]).find(x => x) || null;
+  const cb = {live: wkCountBound(d, p, WK_MARKED), all: wkCountBound(d, p)};
+  const lens = ["river", "list"].map(k => '<button type="button" data-lens="' + k + '" class="' + (v.lens === k ? "on" : "") + '" aria-pressed="' + (v.lens === k)
+    + '" title="' + (k === "river" ? "one column per stage" : "the backlog’s rows, with a stage column") + '">' + (k === "river" ? "River" : "List") + "</button>").join("");
+  const body = !d ? '<div class="empty">not read yet</div>'
+    : d.unavailable || !d.counts ? '<div class="empty">✗ the work could not be read — ' + esc(wkWhy(d.unavailable) || "no counts") + "</div>"
+    : v.lens === "list" ? wkListHTML(inst, d, scoped, nowS) : wkRiverHTML(inst, d, scoped, nowS);
+  return {scope: inst.lock && inst.lock.project ? '<a class="dslink" href="#work/work?project=' + esc(encodeURIComponent(inst.lock.project))
+      + '">the whole Work page →</a>' : wkScopeHTML(inst, d, registered),
+    onyou: inst.id === "main" ? wkOnYouHTML() : "", lens: lens, menus: wkMenusHTML(inst, scoped, cb), chips: wkChipsHTML(v, M, cb),
+    line: wkLineHTML(inst, M, bounds, d), read: wkReadLineHTML(d, ageS), brackets: wkBracketsHTML(v, M, pb),
+    heads: wkHeadsHTML(v, M, bounds, wkLandedSay(d, p, v)), body: body};
+}
+const WK_SLOTS = ["scope", "onyou", "lens", "menus", "chips", "line", "read", "brackets", "heads", "body"];
+/* THE WHOLE COMPONENT in one string: the Work tab draws it inside the
+   project's row; the page's own section is drawn once and then painted in
+   place. */
+function wkShellHTML(inst, parts) {
+  const slot = (tag, k, cls) => "<" + tag + ' class="' + cls + '" data-slot="' + k + '">' + (parts ? parts[k] : "") + "</" + tag + ">";
+  return '<div class="wktop"><h1>' + (inst.lock && inst.lock.project ? "Work in " + esc(inst.lock.project) : "Work, start to finish") + "</h1>"
+    + slot("span", "scope", "blmenus") + slot("span", "onyou", "wkyou") + slot("span", "lens", "wklens") + "</div>"
+    + '<p class="wksay"><b>The backlog and the pipeline are one line of work.</b> An item waits in <b>To do</b> (the backlog), then moves right as a seat builds it,'
+    + " another model reviews it and it lands in the shared code (the pipeline). <b class=\"wkw\">↩</b> marks work that was sent back. Tap any card to see every crossing it made.</p>"
+    + '<div class="bltools"><input class="blq wkq" type="search" placeholder="search titles, task ids and work rooms" aria-label="search the work" autocomplete="off" value="'
+    + esc(inst.view.q) + '">' + slot("span", "menus", "blmenus") + "</div>"
+    + slot("div", "chips", "tqchips") + slot("div", "line", "blline") + slot("div", "read", "wkread")
+    + '<div class="wkstick">' + slot("div", "brackets", "wkbrackets") + slot("div", "heads", "wkheads") + "</div>"
+    + slot("div", "body", "wkbody");
+}
+function wkHTML(inst) {
+  return '<section class="wk" data-wk="' + esc(inst.id) + '">' + wkShellHTML(inst, wkParts(inst)) + "</section>";
+}
+/* IS A READER IN THE MIDDLE OF THIS DRAWER: its notes open, a comment
+   being written, or his caret inside it. The owner reported the wipe on the
+   backlog (#231): a refresh that redraws an open disclosure throws away the
+   fetched note, the draft and the scroll under a reader. */
+function wkDrawerBusy(d) {
+  return !!d && (!!d.querySelector(".wknotes[open]")
+    || [...d.querySelectorAll(".wkcomment")].some(x => x.value)
+    || d.contains(document.activeElement));
+}
+/* PAINT ONE COMPONENT IN PLACE: every part but the search box, so a
+   reader typing keeps his caret; a drawer a reader is in the middle of
+   (`wkDrawerBusy`) is carried over into the fresh paint whole — its fetched
+   note, its draft and his caret with it — rather than drawn again; and a
+   drawer open on a card asks for its crossings if this body's snapshot has
+   not given them yet. */
+function wkPaint(inst) {
+  const root = wkRoot(inst);
+  if (!root) return;
+  inst.narrow = typeof matchMedia === "function" && matchMedia("(max-width:680px)").matches;
+  const fixed = wkNormalize(inst.view, WORK && WORK.d, (typeof projects !== "undefined" ? projects : []).map(pkey));
+  if (fixed.project !== inst.view.project || fixed.move !== inst.view.move) {
+    inst.view = fixed;
+    if (inst.id === "main") wkNavSync();
+  }
+  if (!root.querySelector(".wkq")) root.innerHTML = wkShellHTML(inst, null);
+  const was = root.querySelector(".wkdrawer[data-for]");
+  const keep = was && was.dataset.for === inst.view.card && wkDrawerBusy(was) ? was : null;
+  const caret = keep && keep.contains(document.activeElement) ? document.activeElement : null;
+  const sel = caret && typeof caret.selectionStart === "number" ? [caret.selectionStart, caret.selectionEnd] : null;
+  // A PHONE'S DRAWER IS A SCROLLING SHEET: a reader down its path keeps his
+  // place across the poll's repaint
+  const top = was && was.dataset.for === inst.view.card ? was.scrollTop : 0;
+  // THE KEYBOARD KEEPS ITS PLACE: a focused card, stage, chip, lens or day
+  // switch is found again in the fresh paint
+  const ae = document.activeElement, fk = ae && ae !== document.body && root.contains(ae) && !(keep && keep.contains(ae)) && ae.dataset
+    ? ["card", "stage", "chip", "lens", "today"].filter(k => ae.dataset[k] !== undefined).map(k => [k, ae.dataset[k]])[0] : null;
+  const parts = wkParts(inst);
+  WK_SLOTS.forEach(k => { const el = root.querySelector('[data-slot="' + k + '"]'); if (el) el.innerHTML = parts[k]; });
+  if (keep) {
+    // A DRAWER THE READER IS IN IS NEVER DISCARDED BY A REPAINT: a failed
+    // read, a card moved out of the view or onto another page draws no fresh
+    // drawer, so the kept one goes back at the top of the body
+    const fresh = root.querySelector(".wkdrawer[data-for]"), slot = root.querySelector('[data-slot="body"]');
+    if (fresh) fresh.replaceWith(keep);
+    else if (slot) slot.prepend(keep);
+    if (caret) {
+      caret.focus();
+      if (sel) try { caret.setSelectionRange(sel[0], sel[1]); } catch (e) { /* not selectable */ }
+    }
+  } else if (top) {
+    const fr = root.querySelector(".wkdrawer[data-for]");
+    if (fr) fr.scrollTop = top;
+  }
+  if (fk && !root.contains(document.activeElement)) {
+    const el = root.querySelector("[data-" + fk[0] + '="' + CSS.escape(fk[1]) + '"]');
+    if (el && el.focus) el.focus({preventScroll: true});
+  }
+  const q = root.querySelector(".wkq");
+  if (q && document.activeElement !== q) q.value = inst.view.q;
+  const rev = WORK && WORK.d && WORK.d.rev, key = inst.view.card;
+  if (key && rev && !(inst.ev && inst.ev.key === key && inst.ev.rev === rev)) wkEvents(inst, key);
+  // A LINK TO ONE CARD LANDS ON ITS DRAWER (a desktop's drawer is drawn under
+  // the columns, far below the page top a new page lands on), once, after
+  // the first read that could draw it
+  if (inst.landCard && WORK && WORK.d && WORK.d.counts) {
+    const dr = root.querySelector(".wkdrawer[data-for]");
+    if (dr && !inst.narrow && typeof goTarget === "function") goTarget(showView.cur, dr);
+    inst.landCard = false;
+  }
+  if (inst.id === "main") {
+    const d = WORK && WORK.d, nowS = wkNowS(), ageS = WORK ? (Date.now() - WORK.at) / 1e3 : null;
+    const set = (id, html) => { const el = $("#" + id); if (el) el.innerHTML = html; };
+    set("wkseambody", wkFoldSeamsHTML(d, d ? wkCards(d, nowS) : []));
+    set("wkleftbody", wkFoldLeftHTML(d, nowS));
+    set("wkelsebody", wkFoldElseHTML(d, ageS));
+  }
+}
+/* The drawer's crossings, read once per card and reading: `/api/work?key=`
+   off the SAME snapshot the page was drawn from (`rev`). A reading the
+   server no longer keeps is read again with the page. */
+async function wkEvents(inst, key) {
+  const rev = WORK && WORK.d && WORK.d.rev;
+  if (!key || !rev) return;
+  inst.ev = {key: key, rev: rev, loading: true};
+  let got;
+  try {
+    got = await j("/api/work?key=" + encodeURIComponent(key) + "&rev=" + encodeURIComponent(rev), WK_FETCH_MS);
+  } catch (e) {
+    got = {unavailable: (e && e.message) || "the read failed", gone: / -> 410/.test(String(e && e.message))};
+  }
+  if (!inst.ev || inst.ev.key !== key || inst.ev.rev !== rev) return;
+  if (got && got.gone && !inst.retried) { inst.retried = true; inst.ev = null; wkLoad(); return; }
+  inst.retried = false;
+  inst.ev = got && !got.unavailable ? {key: key, rev: rev, events: got.events || [], timed: got.timed, gaps: got.gaps}
+    : {key: key, rev: rev, err: String((got && got.unavailable) || "not read")};
+  wkPaint(inst);
+}
+/* A READER'S CHANGE: the page goes back to 1 unless the change is the
+   page, the menus close, the address follows, and on the whole page the
+   section row lights the entry the view now is. */
+function wkSet(inst, patch) {
+  inst.view = Object.assign({}, inst.view, patch, "page" in patch ? {} : {page: 1});
+  inst.menu = "";
+  if (!("card" in patch)) inst.ev = inst.ev && inst.ev.key === inst.view.card ? inst.ev : null;
+  if (inst.id === "main") wkNavSync();
+  else if (typeof projHash === "function") projHash();
+  wkPaint(inst);
+}
+/* THE SECTION ROW FOLLOWS THE VIEW: a filter that turns the page into the
+   backlog lights "backlog", and the address becomes #work/backlog. */
+function wkNavSync() {
+  const cur = showView.cur;
+  if (cur !== "flow" && cur !== "pipeline" && cur !== "backlog") return;
+  const e = wkEntry(WK.main.view);
+  if (e !== cur) {
+    showView.cur = e;
+    AREA_LAST.work = e;
+    navSelect(e);
+    revealActiveTab();
+  }
+  viewHashSync(e);
+}
+/* Work's entries shown (`showView`): a tap on an entry's tab sets its
+   filter unless the view already is that entry. */
+function wkShow(v) {
+  if (wkEntry(WK.main.view) !== v) WK.main.view = Object.assign({}, WK.main.view, WK_ENTRY[v], {page: 1, card: ""});
+}
+/* An address's state (`viewRoute`): the query, with the entry's own
+   filter on top. */
+function wkRoute(v, query) {
+  WK.main.view = Object.assign(wkParse(query, "q"), v === "flow" ? {} : WK_ENTRY[v]);
+  WK.main.ev = null;
+  // an address naming a card lands on its drawer once it is drawn (`wkPaint`)
+  WK.main.landCard = !!WK.main.view.card;
+  wkPaint(WK.main);
+}
+/* THE PROJECT'S WORK TAB: its own component, locked to the project. */
+function wkProjFor(key, view) {
+  if (WK.proj.key !== key || view) WK.proj = wkInst("proj", key, view || wkDefault());
+}
+
+/* ------------------------------------------------ the one read */
+
+/* READ THE WORK: the page, the nav badge, Home's tile and every project's
+   row paint off this one body. A failed read REPLACES the last good one
+   with its UNKNOWN: numbers left standing after the read stopped answering
+   would say the work is what it was. A slow older read never overwrites a
+   newer one. */
+async function wkLoad() {
+  const gen = ++WORK_GEN;
+  let d;
+  try {
+    d = await j("/api/work", WK_FETCH_MS);
+  } catch (e) {
+    d = {unavailable: (e && e.message) || "the work read failed", counts: null, cards: [], records: []};
+  }
+  if (gen !== WORK_GEN) return;
+  WORK = {d: d, at: Date.now()};
+  wkPaintAll();
+}
+/* Every surface that reads the body. */
+function wkPaintAll() {
+  const b = wkBadge(WORK && WORK.d);
+  navBadge("flow", b.n, true, b.title, b.bound);
+  wkPaint(WK.main);
+  wkPaint(WK.proj);
+  if (typeof boardCountsPaint === "function") boardCountsPaint();
+  if (typeof homeRender === "function") homeRender();
+}
+/* THE TASK'S NOTE AND COMMENTS, read when the drawer's fold opens: the
+   prose the work reader never carries. A read that failed is CANNOT SEE,
+   never "no comments". */
+async function wkNotes(det) {
+  const body = det.querySelector(".otqnotebody");
+  if (!body || det.dataset.filled) return;
+  det.dataset.filled = "1";
+  let d;
+  try {
+    d = await j("/api/task/notes?id=" + encodeURIComponent(det.dataset.id), 8000);
+  } catch (e) {
+    d = {unavailable: e.message};
+  }
+  if (!d || d.unavailable || d.error) {
+    body.innerHTML = '<div class="empty">✗ CANNOT SEE this task’s note and comments' + (d && (d.why || d.unavailable || d.error)
+      ? " — " + esc(wkWhy(d.why || d.unavailable || d.error)) : "") + "</div>";
+    det.dataset.filled = "";
+    return;
+  }
+  const rows = Array.isArray(d.comments) ? d.comments : [];
+  body.innerHTML = (typeof d.note === "string" && d.note ? '<div class="otqnote"><span class="otqnoteby">the task’s note</span><div class="otqnotetext">'
+      + esc(d.note) + "</div></div>" : "")
+    + (rows.length ? rows.map(c => '<div class="otqnote"><span class="otqnoteby">' + esc(c.author || c.by || "unattributed") + '</span> <span class="odqid">'
+      + esc(c.ts_epoch ? wkWhen(c.ts_epoch, Date.now() / 1e3) : "date unknown") + '</span><div class="otqnotetext">' + esc(c.text || "") + "</div></div>").join("")
+      : '<div class="empty">no comments</div>');
+}
+/* A COMMENT, posted as the owner, the backlog's own door. The text is taken
+   before the await and put back if the post fails. */
+async function wkComment(btn) {
+  const box = btn.parentNode.querySelector(".wkcomment"), id = btn.dataset.id, text = box ? box.value.trim() : "";
+  if (!text) { toast("type the comment first"); return; }
+  box.value = "";
+  try {
+    const d = await post("/api/tasks/comment", {id: id, text: text});
+    toast(d && d.warning ? "commented on " + id + " — " + d.warning : "commented on " + id, d && d.warning ? 5000 : 2600);
+    const det = btn.closest(".wkdrawer") && btn.closest(".wkdrawer").querySelector(".wknotes");
+    if (det) { det.dataset.filled = ""; if (det.open) wkNotes(det); }
+  } catch (e) {
+    if (box.isConnected && !box.value) box.value = text;
+    toast("✗ " + e.message);
+  }
+}
+
+/* ------------------------------------------------ wiring: one delegated handler */
+
+document.addEventListener("click", ev => {
+  const t = ev.target;
+  document.querySelectorAll(".wk .blmenu[open]").forEach(m => { if (!m.contains(t)) m.open = false; });
+  const root = t.closest && t.closest(".wk[data-wk]"), inst = root && WK[root.dataset.wk];
+  if (!inst) return;
+  const hit = t.closest("[data-stage],[data-lens],[data-chip],[data-clear],[data-more],[data-movef],[data-projf],[data-page],[data-card],[data-close],[data-expand],[data-today],.blopt,.wksay");
+  if (!hit || (hit.dataset.card && t.closest(".wkdrawer"))) return;
+  if (hit.matches(".wksay")) { wkComment(hit); return; }
+  if (hit.matches(".blopt")) {
+    const f = hit.dataset.f, val = hit.dataset.v;
+    wkSet(inst, f === "project" || f === "group" || f === "sort" ? {[f]: val, card: ""}
+      : f === "prio" ? {prio: wkPrioToggle(inst.view.prio, val)} : {[f]: inst.view[f] === val ? "" : val});
+    return;
+  }
+  if (hit.dataset.close !== undefined) { wkSet(inst, {card: ""}); return; }
+  if (hit.dataset.expand) { inst.expanded = inst.expanded.concat([hit.dataset.expand]); wkPaint(inst); return; }
+  if (hit.dataset.card) {
+    wkSet(inst, {card: inst.view.card === hit.dataset.card ? "" : hit.dataset.card, page: inst.view.page});
+    const d = root.querySelector('.wkdrawer[data-for="' + CSS.escape(hit.dataset.card) + '"]');
+    if (d && !inst.narrow) d.scrollIntoView({block: "nearest", behavior: "smooth"});
+    return;
+  }
+  if (hit.dataset.lens) { wkSet(inst, {lens: hit.dataset.lens, card: ""}); return; }
+  if (hit.dataset.chip) { wkSet(inst, {[hit.dataset.chip]: !inst.view[hit.dataset.chip]}); return; }
+  if (hit.dataset.today) { wkSet(inst, {today: hit.dataset.today === "1"}); return; }
+  if (hit.dataset.page) { if (!hit.disabled) wkSet(inst, {page: Number(hit.dataset.page)}); return; }
+  if (hit.dataset.movef) { wkSet(inst, {move: hit.dataset.movef}); return; }
+  if (hit.dataset.projf) { if (inst.lock.project) { inst.open = inst.open.concat([hit.dataset.projf]); wkPaint(inst); } else wkSet(inst, {project: hit.dataset.projf}); return; }
+  if (hit.dataset.clear) {
+    const f = hit.dataset.clear, d = wkDefault();
+    wkSet(inst, f === "all" ? Object.assign(d, {lens: inst.view.lens, project: inst.view.project, group: inst.view.group})
+      : {[f]: typeof d[f] === "boolean" ? false : ""});
+    return;
+  }
+  if (hit.dataset.more) {
+    wkSet(inst, Object.assign({stage: hit.dataset.more, card: ""}, hit.dataset.more === "todo" ? {lens: "list", group: "stage"} : {}));
+    const stick = root.querySelector(".wkstick");
+    if (stick && stick.getBoundingClientRect().top < 0) root.scrollIntoView({block: "start"});
+    return;
+  }
+  if (hit.dataset.stage) wkSet(inst, {stage: inst.view.stage === hit.dataset.stage ? "" : hit.dataset.stage, card: ""});
+});
+document.addEventListener("keydown", ev => {
+  if (ev.key === "Escape") {
+    // only a drawer on screen closes: #wkmain is in the page even while
+    // another page is shown, and its hidden drawer is not the one he sees
+    const inst = [WK.main, WK.proj].find(i => { const r = i.view.card && wkRoot(i); return r && r.offsetParent !== null; });
+    if (inst && !(ev.target && ev.target.closest && ev.target.closest(".wkcomment"))) wkSet(inst, {card: ""});
+    return;
+  }
+  const t = ev.target.closest && ev.target.closest(".wk [data-card]");
+  const root = t && t.closest(".wk[data-wk]"), inst = root && WK[root.dataset.wk];
+  if (inst && (ev.key === "Enter" || ev.key === " ") && !t.closest(".wkdrawer")) {
+    ev.preventDefault();
+    wkSet(inst, {card: inst.view.card === t.dataset.card ? "" : t.dataset.card, page: inst.view.page});
+  }
+  if (ev.key === "Enter" && ev.target.closest && ev.target.closest(".wkcomment")) {
+    const btn = ev.target.parentNode.querySelector(".wksay");
+    if (btn) wkComment(btn);
+  }
+});
+document.addEventListener("toggle", ev => {
+  const det = ev.target;
+  if (!det || !det.classList) return;
+  if (det.classList.contains("wknotes") && det.open) { wkNotes(det); return; }
+  if (!det.classList.contains("blmenu")) return;
+  const root = det.closest(".wk[data-wk]"), inst = root && WK[root.dataset.wk];
+  if (!inst) return;
+  if (det.open) {
+    inst.menu = det.dataset.m;
+    root.querySelectorAll(".blmenu[open]").forEach(m => { if (m !== det) m.open = false; });
+  } else if (inst.menu === det.dataset.m) inst.menu = "";
+}, true);   /* capture: `toggle` does not bubble */
+let WK_TYPING = null;
+document.addEventListener("input", ev => {
+  const box = ev.target.closest && ev.target.closest(".wk .wkq");
+  const root = box && box.closest(".wk[data-wk]"), inst = root && WK[root.dataset.wk];
+  if (!inst) return;
+  clearTimeout(WK_TYPING);
+  WK_TYPING = setTimeout(() => { if (box.value.trim() !== inst.view.q) wkSet(inst, {q: box.value.trim()}); }, 250);
+});
+/* A PHONE AND A DESKTOP DRAW DIFFERENT COLUMNS: crossing the width redraws. */
+let WK_NARROW = typeof matchMedia === "function" && matchMedia("(max-width:680px)").matches;
+window.addEventListener("resize", () => {
+  const n = matchMedia("(max-width:680px)").matches;
+  if (n !== WK_NARROW) { WK_NARROW = n; wkPaint(WK.main); wkPaint(WK.proj); }
+});
+/* THE ENTRIES' TABS set their filter, then show the one page. */
+$$(".navtab[data-v]").forEach(t => {
+  if (t.dataset.v === "flow" || t.dataset.v === "pipeline" || t.dataset.v === "backlog")
+    t.onclick = () => { WK.main.view = Object.assign({}, WK.main.view, WK_ENTRY[t.dataset.v], {page: 1, card: ""}); showView(t.dataset.v); };
+});
+/* ALWAYS ON, every page: the nav badge has to reach him from any page. It
+   BOOTS AS "?", painted before the first read is asked: an absent badge
+   reads as nothing stuck for as long as a hung read takes (WK_FETCH_MS).
+   After the whole script ran, so every part the paint reads is declared. */
+setInterval(() => { if (!document.hidden) wkLoad(); }, WK_POLL_MS);
+setTimeout(wkPaintAll, 0);
+setTimeout(wkLoad, 0);

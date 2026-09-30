@@ -11,6 +11,7 @@ is invisible to every caller, and that neither import order deadlocks.
 """
 import importlib
 import inspect
+import os
 import subprocess
 import sys
 
@@ -79,19 +80,46 @@ class TheVerbTableIsReachableFromEitherSideTest(DispatchBase):
         """The cut was chosen because it has ZERO in-edges: the verb table is
         a leaf CONSUMER of the ledger. If the ledger grows a call INTO it the
         seam stops being a leaf and the next split gets harder, so the
-        property is pinned rather than remembered."""
-        src = inspect.getsource(dispatches)
+        property is pinned rather than remembered.
+
+        THE LEDGER IS EVERY FILE IT SPANS, BUT THIS ONE. task/3407 moved six
+        whole questions out of `dispatches.py` into satellites, and each still
+        answers as `dispatches.NAME`: a satellite that called a verb-table
+        helper would be the ledger calling back, so the read covers all of
+        them. `dispatches_cli.py` is left out because it IS the verb table:
+        its helpers calling one another is not an edge into it."""
+        from tests._satellite_resolution import ledger_sources
+        ledger = [(os.path.basename(path), source)
+                  for path, source in ledger_sources(dispatches)
+                  if os.path.basename(path) != "dispatches_cli.py"]
         owned = [n for n in dispatches_cli.owned() if n != "_cmd_dispatch"]
         self.assertTrue(owned, "no owned names to check")
-        for name in owned:
-            self.assertNotIn(name + "(", src,
-                             "dispatches calls %s, which the satellite owns" % name)
+
+        def calls(files):
+            return [(name, file) for file, source in files for name in owned
+                    if name + "(" in source]
+
+        self.assertEqual(calls(ledger), [],
+                         "the ledger calls names the verb table owns")
         # UNCONDITIONAL POSITIVE CONTROL on the SAME observable: the search
-        # really does find a call when one is there. Without it, a `src` that
-        # had come back empty would satisfy every assertion above.
-        self.assertIn("snapshot(", src,
+        # really does find a call when one is there. Without it, a source
+        # that had come back empty would satisfy the absence above.
+        self.assertIn("snapshot(", dict(ledger)["dispatches.py"],
                       "the source search found no call it certainly makes, so "
-                      "the absences above prove nothing")
+                      "the absence above proves nothing")
+        # POSITIVE CONTROL, REACH: every satellite but the verb table is read.
+        declared = {"%s.py" % satellite
+                    for satellite, _names in dispatches._OWNER_NAMES}
+        self.assertIn("dispatches_spiral.py", declared)
+        self.assertEqual({file for file, _source in ledger},
+                         (declared - {"dispatches_cli.py"}) | {"dispatches.py"})
+        # POSITIVE CONTROL, PREDICATE: a call planted in one satellite's text,
+        # and nowhere else, is found by the same search.
+        self.assertIn("patch_note", owned)
+        planted = [(file, source + "\npatch_note()\n"
+                    if file == "dispatches_spiral.py" else source)
+                   for file, source in ledger]
+        self.assertEqual(calls(planted), [("patch_note", "dispatches_spiral.py")])
 
 
     def test_the_declaration_and_the_binding_cannot_drift(self):

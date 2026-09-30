@@ -248,7 +248,10 @@ def _annotate_upstream_remediation(row, remediation):
               "action": "upstream_remediation_action"}
     row.update({dst: remediation.get(src) for src, dst in fields.items()
                 if remediation.get(src) is not None})
-    row["upstream_remediation_text"] = seatmod.remediation_text(remediation)
+    # THE OWNER'S SENTENCE: the badge's hover draws this line, and the
+    # console names no command (console walk 3); the action rides above.
+    row["upstream_remediation_text"] = seatmod.remediation_text(remediation,
+                                                                owner=True)
 
 
 
@@ -533,13 +536,20 @@ def _api_notes():
 def _api_storage_matrix():
     """The owner-facing storage benchmark snapshot. Read-only: the browser
     never measures or crosses SSH. Missing, stale, partial and unreadable are
-    data states, not server errors, so every one answers at HTTP 200."""
+    data states, not server errors, so every one answers at HTTP 200.
+
+    A MISSING SNAPSHOT SAYS SO IN THE OWNER'S WORDS. The page draws the
+    `message` as it comes, and the terminal's one names the verb that
+    measures; the console names no command (console walk 3)."""
     try:
         from . import storage_matrix
-        return storage_matrix.view()
+        value = storage_matrix.view()
     except Exception:
         return {"state": "unavailable", "message":
                 "measurement unavailable — the snapshot could not be read"}
+    if value.get("state") == "missing":
+        return dict(value, message="not measured yet on this machine")
+    return value
 
 
 

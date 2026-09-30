@@ -47,36 +47,11 @@ details.cfgsec>summary:hover{color:var(--fg)}
    urgent one", not four shades. An UNRANKED row draws no chip at all. */
 .otqrank{font-size:var(--f0);font-weight:700;border-radius:var(--r-sm,6px);padding:1px 6px;white-space:nowrap;color:var(--fg-mut,#888);border:1px solid var(--bd,#333)}
 .otqrankP0{color:var(--warn,#e5534b);border-color:var(--warn,#e5534b)}
-/* THE QUEUE HEADER (task/2622). Numbers first, big enough to read from the
-   pane split beside the integrator without leaning in — the owner reads
-   totals here, never row text. It renders in TWO places off one function
-   (this card's head and the board home's band cell), so the classes are
-   UNSCOPED: scoping them under #otq would style the card and leave the band
-   cell bare, which is how one headline becomes two. */
-.tqhead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin:0 0 9px;font-size:var(--f1)}
-.tqn{white-space:nowrap;color:var(--fg)}
-.tqn b{font-variant-numeric:tabular-nums;font-weight:700;font-size:var(--f2)}
-.tqmut{color:var(--mut)}
-.tqwarn{color:var(--warn,#e5534b)}
-/* UNKNOWN IS NOT A SMALL NUMBER. When a read fails, carries no totals, or goes
-   past this card's freshness bound, every field of the headline renders the
-   WORD — and it has to LOOK different from a count, because a reader scanning
-   for five numbers must not mistake "we cannot say" for "it is low". Same
-   class in both places the line renders, unscoped for the reason above. */
-.tqunk{color:var(--warn,#e5534b)}
-.tqunk b{font-variant-numeric:normal;font-size:var(--f1);letter-spacing:.02em}
 .tqchips{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0 0 10px}
-.tqchip.on{border-color:var(--accent);color:var(--accent);font-weight:700}
 /* UNOWNED IS LOUD BECAUSE IT IS ACTIONABLE, not because it is broken: the row
    is in the pool an idle seat may take. Warn colour, no background — an alarm
    chip on a third of a 477-row board would make the board itself read red. */
 .tqunowned{font-weight:700;color:var(--warn,#e5534b)}
-.tqstale{font-size:var(--f0);font-weight:700;color:var(--warn,#e5534b);border:1px solid var(--warn,#e5534b);border-radius:var(--r-sm,6px);padding:0 5px;white-space:nowrap}
-/* The row's own edge, not a fill: a stale row must be findable while scrolling
-   and must not shout over the rank chip that says how much it matters. */
-.tqstalerow{border-left:2px solid var(--warn,#e5534b)}
-.tqlastnote{color:var(--mut);font-size:var(--f1)}
-.tqlastnote b{color:var(--fg)}
 /* The comment disclosure. Prose is the point here, so the body gets reading
    width and preserved newlines rather than the meta row's terse flex. */
 .otqnotes{margin:6px 0 2px;font-size:var(--f1)}
@@ -96,6 +71,7 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .odqcomment{flex:1;min-width:140px;padding:5px 9px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:var(--f1)}
 .odqcomment:focus{border-color:var(--accent);outline:none}
 .odqundeliv{font-size:var(--f1);color:#b4442e;margin-top:6px}
+.odqrev{font-size:var(--f1);color:var(--accent);font-weight:600;margin:2px 0 4px}
 #storerev{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:14px 0 16px}
 #storerevhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
 #storerevlist{display:flex;flex-direction:column;gap:8px}
@@ -133,4 +109,42 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .cfgpick{padding:5px 10px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:var(--f1)}
 .cfgdiff{font:var(--f1) ui-monospace,Menlo,monospace;word-break:break-all;padding:2px 6px;border-radius:6px}
 .cfgdiff.add{color:var(--ok)}.cfgdiff.del{color:var(--bad)}.cfgdiff.chg{color:var(--warn)}
-
+/* ---------- THE BACKLOG'S CONTROLS, GitHub-Issues grade (task/3445 L1b) ----------
+   The search and a menu per facet, the quick chips, the line that says what
+   is shown and in which scope, the groups and the pager: the Work page's own
+   now (task/3643, 74-work), which draws the backlog as its List lens. */
+.bltools{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 8px}
+.blq{flex:1 1 220px;min-width:0;padding:6px 10px;border-radius:var(--r-sm,6px);border:1px solid var(--line2);background:var(--elev);color:var(--fg);font:inherit;font-size:var(--f1)}
+.blq:focus{border-color:var(--accent);outline:none}
+.blmenus{display:flex;flex-wrap:wrap;gap:6px}
+.blmenu{position:relative}
+.blmenu>summary{list-style:none;padding:4px 10px;font-size:var(--f1);white-space:nowrap}
+.blmenu>summary::-webkit-details-marker{display:none}
+.blmenu[open]>summary{border-color:var(--accent)}
+.blcaret{color:var(--mut);font-size:var(--f0)}
+.blpop{position:absolute;z-index:30;top:calc(100% + 4px);left:0;min-width:210px;max-width:min(320px,calc(100vw - 32px));max-height:340px;overflow:auto;background:var(--card);border:1px solid var(--line2);border-radius:var(--r-sm,6px);box-shadow:var(--shadow);padding:4px}
+.blopt{display:flex;align-items:baseline;gap:6px;width:100%;padding:6px 8px;border:0;border-radius:4px;background:none;color:var(--fg);font:inherit;font-size:var(--f1);text-align:left;cursor:pointer}
+.blopt:hover{background:var(--hover)}
+.blopt.on{font-weight:700}
+.blchk{flex:0 0 1em;color:var(--accent)}
+.blcnt{margin-left:auto;padding-left:10px;color:var(--mut);font-weight:400;font-variant-numeric:tabular-nums}
+.tqchips .chip .blcnt{margin-left:0;padding-left:4px}
+.tqchips .chip,.blline .chip,.blpager .chip{padding:3px 9px;font-size:var(--f1)}
+.blline{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 8px;font-size:var(--f1);color:var(--mut)}
+.blline b{color:var(--fg);font-variant-numeric:tabular-nums}
+.blclear{border-style:dashed}
+/* A GROUP: a header that folds, with its count */
+.blgroup{border-bottom:1px solid var(--line)}
+.blghead{display:flex;align-items:baseline;gap:6px;padding:9px 10px 7px;cursor:pointer;font-weight:700;font-size:var(--f2);color:var(--fg);background:var(--elev)}
+.blghead .blcnt{margin-left:0;padding-left:2px;font-weight:400}
+.blgroup[open]>.blghead{border-bottom:1px solid var(--line)}
+.blghead{list-style:none}
+.blghead::-webkit-details-marker{display:none}
+.blghead::before{content:"▸";color:var(--mut);font-size:var(--f0);width:1em}
+.blgroup[open]>.blghead::before{content:"▾"}
+.blgroup .blgmore{margin:6px 10px 10px;padding:3px 9px;font-size:var(--f1)}
+.blpager{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:12px 0 2px;font-size:var(--f1);color:var(--mut)}
+@media (max-width:680px){
+  .blpop{position:fixed;left:16px;right:16px;top:auto;max-width:none}
+}
+}

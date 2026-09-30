@@ -5,11 +5,16 @@ The harness ends every Monitor at a deadline it caps, and a re-arm mints a new
 ID. An instruction that promises a watch which never ends leaves a seat deaf
 the first time the deadline passes, and a seat that wrote the ID down hunts
 for a process that no longer exists.
+
+And the call is a WHOLE Monitor input (task/3435): the tool requires a
+description beside timeout_ms, so an instruction without one makes every seat
+that copies it invent one.
 """
 import os
 import unittest
 
 from helm import seat, seats_advice
+from tests._monitorcall import monitor_input
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RETIRED = "persistent: " + "true"   # split so this file is not its own hit
@@ -41,10 +46,23 @@ class TheArmingInstructionHasOneHome(unittest.TestCase):
         call = seats_advice.beacon_monitor("zed")
         self.assertEqual(
             call, 'Monitor(command: "helm chat wait --seat zed --follow", '
-                  'timeout_ms: 1800000)')
+                  'description: "inbox beacon", timeout_ms: 1800000)')
         self.assertIn("--follow --replace\"",
                       seats_advice.beacon_monitor("zed", replace=True))
         self.assertNotIn("persistent", call)
+
+    def test_the_call_is_a_complete_monitor_input(self):  # noqa: VACUOUS_ASSERTION — every arm of a finite tuple literal executes, and each asserts an exact non-empty dict
+        """Every field the Monitor tool requires (description, timeout_ms)
+        beside the command, each reading back through json as the value a
+        seat passes, and nothing else."""
+        for replace in (False, True):
+            with self.subTest(replace=replace):
+                self.assertEqual(
+                    monitor_input(seats_advice.beacon_monitor("zed", replace)),
+                    {"command": "helm chat wait --seat zed --follow"
+                                + (" --replace" if replace else ""),
+                     "description": seats_advice.BEACON_DESCRIPTION,
+                     "timeout_ms": seats_advice.BEACON_TIMEOUT_MS})
 
     def test_a_placeholder_seat_survives_a_later_format(self):
         """Callers embed the call in their own templates; a stray percent sign
@@ -54,7 +72,8 @@ class TheArmingInstructionHasOneHome(unittest.TestCase):
         self.assertEqual(seats_advice.beacon_monitor("%s") % "zed",
                          seats_advice.beacon_monitor("zed"))
         for sentence in (seats_advice.BEACON_EXPIRY,
-                         seats_advice.BEACON_EXPIRY_TERSE):
+                         seats_advice.BEACON_EXPIRY_TERSE,
+                         seats_advice.BEACON_DESCRIPTION):
             self.assertNotIn("%", sentence)
 
     def test_the_expiry_rule_says_the_three_things_a_seat_needs(self):

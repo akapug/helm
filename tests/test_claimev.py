@@ -1268,9 +1268,11 @@ class PublicationLocusTest(unittest.TestCase):
         text = ("helm x " * 35714)[:250000]
         t = {"name": "Bash", "succeeded": True, "resulted": True,
              "content": "", "input": text}
-        t0 = time.monotonic()
+        # task/3465: the bound is CPU time — under a loaded gate the wall
+        # clock grades the box, not the parse.
+        t0 = time.process_time()
         self.assertEqual(claimev.publications([t]), [])
-        self.assertLess(time.monotonic() - t0, 5.0)
+        self.assertLess(time.process_time() - t0, 5.0)
 
     def test_the_four_older_shapes_do_not_run_on_publications(self):
         """MEASURED before shipping: running shapes 1-4 over 882 real bodies

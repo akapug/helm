@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
-from helm import cli, handoff, hooks, inject, pk, record, resumeturn  # noqa: E402
+from helm import cli, handoff, hooks, inject, pk, record, resumeturn, session  # noqa: E402
 
 # HELM_CHAT_NAME is SET by the attribution tests, so it belongs here: setUp
 # pops this tuple and tearDown restores it, which means a key that is set but
@@ -362,6 +362,203 @@ class WriteTest(HandoffBase):
             "NEXT — verify\n")
         self.assertEqual(s, {"done": "shipped it", "remaining": "the hook",
                              "next": "verify"})
+
+    def test_write_entry_mints_registry_entry(self):
+        """a fresh handoff mints the registry entry: domain = project,
+        handoff = the returned path, and registered/last_refreshed stamped."""
+        path, miss = handoff.write_entry(PROSE, 'proj', 'reg1234')
+        self.assertEqual(miss, [])
+        self.assertIn('reg1234', path)  # sid8 in the filename
+        self.assertTrue(os.path.isfile(path))
+        e = session._experts()['reg1234']
+        self.assertEqual(e['domain'], 'proj')
+        self.assertEqual(e['handoff'], path)
+        self.assertEqual(e['note'], '')
+        self.assertIn('registered', e)
+        self.assertIn('last_refreshed', e)
+        self.assertIsNotNone(e['registered'])
+        self.assertIsNotNone(e['last_refreshed'])
+
+    def test_write_entry_refreshes_registry_entry(self):
+        """a second handoff for the same sid refreshes the registry: it
+        updates handoff and last_refreshed, and keeps domain, registered
+        and note."""
+        path1, _ = handoff.write_entry(PROSE, 'proj', 'reg1234')
+        # age the entry so the re-stamp is observable at second resolution:
+        # the go-live proof IS this re-stamp, so >= (which an unrefreshed
+        # entry also satisfies) cannot be the assertion
+        past = '2026-01-01T00:00:00Z'
+        ex = session._experts()
+        ex['reg1234'].update(last_refreshed=past, note='kept note')
+        session._write_experts(ex)
+        e1 = session._experts()['reg1234']
+        registered1 = e1['registered']
+        path2, _ = handoff.write_entry(PROSE, 'proj', 'reg1234')
+        e2 = session._experts()['reg1234']
+        self.assertEqual(e2['domain'], 'proj')              # kept
+        self.assertEqual(e2['registered'], registered1)     # kept
+        self.assertEqual(e2['note'], 'kept note')           # kept
+        self.assertEqual(e2['handoff'], path2)              # updated
+        self.assertNotEqual(e2['last_refreshed'], past)     # re-stamped
+        self.assertEqual(path2, path1)                     # same day, same path
+
+    def test_write_entry_stores_domain_lines_as_subdomains(self):
+        """handoff lines that start with 'domain:' are collected into the
+        registry entry's subdomains (value text only, order-independent);
+        an entry with no such lines carries an empty list."""
+        text = PROSE + 'domain: alpha\ndomain: bravo\n'
+        handoff.write_entry(text, 'proj', 'sub001')
+        e = session._experts()['sub001']
+        self.assertEqual(set(e['subdomains']), {'alpha', 'bravo'})
+        # a plain unindented 'domain:' line (not nested under a heading) is
+        # collected as a value too
+        text2 = 'Session wrap\n## DONE\n- ok\nREMAINING: x\nNEXT: y\n' \
+            'domain: inline\n'
+        handoff.write_entry(text2, 'proj', 'sub002')
+        e2 = session._experts()['sub002']
+        self.assertIn('inline', e2['subdomains'])
+        # no domain: line -> empty
+        handoff.write_entry(PROSE, 'proj', 'sub003')
+        self.assertEqual(session._experts()['sub003']['subdomains'], [])
+
+    def test_write_entry_fail_open_when_registry_path_is_a_directory(self):
+        """the registry must never fail the write itself. When the registry
+        path is a directory (so it cannot be written), write_entry still
+        lands the journal entry and returns the path — the refresh failure
+        is one stderr line, not a refused entry."""
+        reg = session._experts_path()
+        os.makedirs(os.path.dirname(reg), exist_ok=True)
+        if os.path.isfile(reg):
+            os.remove(reg)
+        os.makedirs(reg)  # make the registry path itself a DIRECTORY
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            path, miss = handoff.write_entry(PROSE, 'proj', 'fail001')
+        self.assertEqual(miss, [])
+        self.assertTrue(path is not None)
+        self.assertTrue(os.path.isfile(path))  # the journal entry still exists
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)  # ONE stderr line
+        self.assertIn('expert registry refresh failed', lines[0])
+
+    def test_write_entry_keeps_an_unreadable_registry(self):
+        """a registry that does not parse is left byte-for-byte alone: the
+        read-modify-write must not read it as empty and write back only the
+        new entry. The handoff still lands, with one stderr line."""
+        session._write_experts({'hand-registered': {
+            'domain': 'd', 'registered': '2026-01-01T00:00:00Z',
+            'last_refreshed': '2026-01-01T00:00:00Z', 'note': 'keep me'}})
+        with open(session._experts_path(), 'a') as f:
+            f.write('}')                      # one stray byte: invalid JSON
+        with open(session._experts_path()) as f:
+            before = f.read()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            path, miss = handoff.write_entry(PROSE, 'proj', 'new00001')
+        self.assertEqual(miss, [])
+        self.assertTrue(os.path.isfile(path))
+        with open(session._experts_path()) as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(len(err.getvalue().splitlines()), 1, err.getvalue())
+
+    def test_write_entry_without_session_registers_nothing(self):
+        """a handoff with no session id lands but mints no registry entry:
+        sessionless handoffs from every project would otherwise share one ''
+        key, and `ask` would route to a session that does not exist."""
+        path, miss = handoff.write_entry(PROSE, 'proj', '')
+        self.assertEqual(miss, [])
+        self.assertTrue(os.path.isfile(path))
+        handoff.write_entry(PROSE, 'other', None)
+        self.assertEqual(session._experts(), {})
+        # CONTROL: the same call with a session id does register
+        handoff.write_entry(PROSE, 'proj', 'withsid1')
+        self.assertEqual(list(session._experts()), ['withsid1'])
+
+    def test_write_entry_records_the_harness(self):
+        """each entry names the harness whose session var carries its id:
+        `ask` resumes with `claude --resume`, so a codex or unknown id must
+        be recognisable in the registry."""
+        ids = ('CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID',
+               'CODEX_SESSION_ID', 'CLAUDECODE', 'PI_CODING_AGENT',
+               'HELM_AGENT_HARNESS', 'HELM_MODEL_FAMILY',
+               'HELM_MODEL_BACKEND', 'HELM_MODEL_ID', 'ANTHROPIC_BASE_URL')
+        # a helm proxy seat's launch env (seat_launch_assets): claude-code
+        # pointed at CLIProxyAPI, so it carries CLAUDE_CODE_SESSION_ID too
+        proxy = {'HELM_AGENT_HARNESS': 'claude', 'HELM_MODEL_FAMILY': 'qwen27',
+                 'HELM_MODEL_BACKEND': 'proxy',
+                 'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8345'}
+        cases = (({'CLAUDE_CODE_SESSION_ID': 'cl000001-full'}, 'cl000001-full', 'claude'),
+                 ({'CLAUDE_CODE_SESSION_ID': 'nl000001-full',
+                   'HELM_MODEL_FAMILY': 'claude', 'HELM_MODEL_BACKEND': 'native'},
+                  'nl000001-full', 'claude'),
+                 (dict(proxy, CLAUDE_CODE_SESSION_ID='px000001-full'),
+                  'px000001-full', 'claude-proxy'),
+                 ({'CLAUDE_CODE_SESSION_ID': 'bu000001-full',
+                   'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8317'},
+                  'bu000001-full', 'claude-proxy'),
+                 ({'CODEX_SESSION_ID': 'cx000001-full'}, 'cx000001-full', 'codex'),
+                 ({}, 'other001-full', 'unknown'))
+        for env, sid, want in cases:
+            with mock.patch.dict(os.environ, {}):
+                for k in ids:
+                    os.environ.pop(k, None)
+                os.environ.update(env)
+                handoff.write_entry(PROSE, 'proj', sid)
+            self.assertEqual(session._experts()[sid]['harness'], want, sid)
+        # an unknown re-write never downgrades a known harness
+        handoff.write_entry(PROSE, 'proj', 'cl000001-full')
+        self.assertEqual(session._experts()['cl000001-full']['harness'],
+                         'claude')
+
+    def test_write_entry_fail_open_when_the_registry_lock_is_held(self):
+        """the handoff path takes the experts lock BOUNDED (LOCK_NB polled for
+        2 s), so a holder — a stale or live contender — can never block an
+        automated handoff. The journal entry (the durable record) still lands
+        and `write_entry` returns its path, but the registry is NOT updated
+        and ONE stderr line names the busy condition instead of a failure."""
+        lock = session._experts_path() + ".lock"
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        holder = open(lock, "a")
+        try:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)  # hold it
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                path, miss = handoff.write_entry(PROSE, 'proj', 'busy001')
+        finally:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+            holder.close()
+        self.assertEqual(miss, [])
+        self.assertTrue(path is not None)
+        self.assertTrue(os.path.isfile(path))  # the journal entry still exists
+        # the entry was minted, but the registry was NOT touched (no acquire)
+        self.assertNotIn('busy001', session._experts())
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)  # ONE stderr line
+        self.assertIn('experts registry busy; not refreshed', lines[0])
+        self.assertNotIn('expert registry refresh failed', lines[0])
+
+    def test_write_entry_stores_the_declared_seat(self):
+        """the registry entry stamps the writer's DECLARED seat so the list can
+        collapse one sid-per-seat-per-domain and the handoff shelf is
+        attributable; a handoff written from an undeclared seat still lands but
+        with no seat field."""
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop('HELM_CHAT_NAME', None)
+            self.assertEqual(session._experts(), {})
+        # declared: HELM_CHAT_NAME through the one validated seam
+        with mock.patch.dict(os.environ, {'HELM_CHAT_NAME': 'seat-a'}):
+            handoff.write_entry(PROSE, 'proj', 'seat0001')
+        self.assertEqual(session._experts()['seat0001']['seat'], 'seat-a')
+        # re-writing the SAME sid from a different declared seat updates the
+        # seat (the registry is a live registry, not a mint-only tombstone)
+        with mock.patch.dict(os.environ, {'HELM_CHAT_NAME': 'seat-b'}):
+            handoff.write_entry(PROSE, 'proj', 'seat0001')
+        self.assertEqual(session._experts()['seat0001']['seat'], 'seat-b')
+        # an UNDECLARED writer still lands with no seat field, and re-writing
+        # from an undeclared seat never clobbers a previously-declared one
+        with mock.patch.dict(os.environ, {'HELM_CHAT_NAME': ''}):
+            handoff.write_entry(PROSE, 'proj', 'seat0001')
+        self.assertEqual(session._experts()['seat0001']['seat'], 'seat-b')
 
 
 class CheckBase(HandoffBase):

@@ -6,9 +6,11 @@ Readers are data in ``READERS``: ``creds(families)``, ``probe(cred, now)`` and
 entry declares it, and only against credentials a minted seat holds, so a home
 with no such seat makes no network request.
 
-The one vendor reader is ``openrouter-key`` (task/2936): the OpenRouter account
-behind the openrouter, dots3 and ds4flash families, read with the key a seat's
-own config holds, plus the LEDGER minute its free-model rate needs.
+Two vendor readers: ``openrouter-key`` (task/2936), the OpenRouter account
+behind the openrouter and dots3 families, read with the key a seat's
+own config holds, plus the LEDGER minute its free-model rate needs; and
+``cursor-dashboard`` (task/2943), the owner's Cursor plan behind the cursor
+family, read with the token its bridge's credential store holds.
 
 A snapshot contains only the eight-hex credential join, allowlisted reading
 fields and already-redacted budget rows.  The opaque value on ``CredRef`` is
@@ -177,12 +179,22 @@ def reading_dict(reading):
     overflow = raw.get("overflow")
     # The overflow keeps its OWN age and status: a balance carried forward
     # from an earlier read is stale at the age it was measured, never now.
-    overflow = ({"kind": _word(overflow.get("kind"), "unknown"),
-                 "balance": _number(overflow.get("balance")),
-                 "measured_at": _number(overflow.get("measured_at")),
-                 "status": (overflow.get("status")
-                            if overflow.get("status") in OVERFLOW_STATUSES
-                            else "unread")}
+    # `bonus_spent` (dollars a vendor served past the included ones) and
+    # `bonus_left` (whether it says more remains) are kept only when a reader
+    # measured them, so no other reader's shape changes.
+    extra = {}
+    if isinstance(overflow, dict):
+        if _number(overflow.get("bonus_spent")) is not None:
+            extra["bonus_spent"] = overflow["bonus_spent"]
+        if isinstance(overflow.get("bonus_left"), bool):
+            extra["bonus_left"] = overflow["bonus_left"]
+    overflow = (dict({"kind": _word(overflow.get("kind"), "unknown"),
+                      "balance": _number(overflow.get("balance")),
+                      "measured_at": _number(overflow.get("measured_at")),
+                      "status": (overflow.get("status")
+                                 if overflow.get("status") in OVERFLOW_STATUSES
+                                 else "unread")},
+                     **extra)
                 if isinstance(overflow, dict) else None)
     return {"status": status, "measured_at": measured, "plan": plan,
             "overflow": overflow, "windows": list(windows),
@@ -667,8 +679,8 @@ def ledger_reading(now, limits, requests, completeness, anchor=None,
 
 # ------------------------------------------------ the openrouter-key reader
 #
-# ONE ACCOUNT, THREE FAMILIES (task/2936). OpenRouter's free-model caps and
-# its credit balance are account-wide ("additional accounts or API keys will
+# ONE ACCOUNT, EVERY FAMILY BOUND TO IT (task/2936). OpenRouter's free-model
+# caps and its credit balance are account-wide ("additional accounts or API keys will
 # not affect your rate limits", the vendor's limits page), so one read of the
 # key serves every family the catalog binds to this reader, and the key's
 # hash is the account join the proxy-usage ledger already writes.
@@ -682,8 +694,8 @@ def ledger_reading(now, limits, requests, completeness, anchor=None,
 #            the minute, so this window is derived.
 #
 # THE ROWS are per family, because the same account binds them differently:
-#   paid     (a pool leg at this vendor with rung "paid", i.e. ds4flash) spends
-#            credits: its budget is the prepaid window.
+#   paid     (a pool leg at this vendor with rung "paid") spends credits: its
+#            budget is the prepaid window.
 #   free     spends the free day. The balance binds a free family only when it
 #            is negative (the vendor answers 402 then, free models included)
 #            or unreadable; a positive balance is not a budget it spends.
@@ -732,21 +744,25 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _http_json(url, key, timeout=OPENROUTER_TIMEOUT_S):
+def _http_json(url, key, timeout=OPENROUTER_TIMEOUT_S, body=None,
+               headers=None, unwrap="data"):
     """(the reply's ``data`` object, None) or (None, failure class) for one
-    authenticated GET that spends no quota.
+    authenticated request that spends no quota: a GET, or a POST of `body`
+    (bytes) with `headers` added. `unwrap` names the envelope key the object
+    sits under, or None for a reply that IS the object (Cursor's).
 
     THE KEY TRAVELS IN ONE HEADER, TO ONE URL, AND NOWHERE ELSE: a redirect is
     refused, never followed. A failure is a fixed class word, never the
     exception's text, which can carry the request: auth (401, 403), rate
     (429), http-3xx (any redirect), network, schema (not JSON, or no ``data``
     object) or http-<code>."""
-    request = urllib.request.Request(url, headers={
-        "Authorization": "Bearer " + key, "Accept": "application/json"})
+    request = urllib.request.Request(url, data=body, headers=dict(
+        {"Authorization": "Bearer " + key, "Accept": "application/json"},
+        **(headers or {})))
     opener = urllib.request.build_opener(_RefuseRedirect)
     try:
         with opener.open(request, timeout=timeout) as reply:
-            body = reply.read(1 << 20)
+            reply_body = reply.read(1 << 20)
     except urllib.error.HTTPError as exc:
         code = exc.code if isinstance(exc.code, int) else 0
         try:
@@ -760,10 +776,11 @@ def _http_json(url, key, timeout=OPENROUTER_TIMEOUT_S):
             ValueError):
         return None, "network"
     try:
-        payload = json.loads(body.decode("utf-8"))
+        payload = json.loads(reply_body.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         return None, "schema"
-    data = payload.get("data") if isinstance(payload, dict) else None
+    data = payload if unwrap is None else \
+        payload.get(unwrap) if isinstance(payload, dict) else None
     return (data, None) if isinstance(data, dict) else (None, "schema")
 
 
@@ -941,8 +958,8 @@ def _openrouter_probe(cred, now):
       accounts, the day twice and the minute split per key (still a lower
       bound).
     - Prepaid is lifetime arithmetic: usage over every credit ever bought, so
-      the ceiling refuses ds4flash at a share of lifetime credits, not of the
-      balance."""
+      the ceiling refuses a paid family at a share of lifetime credits, not
+      of the balance."""
     value = cred.value if isinstance(cred, CredRef) \
         and isinstance(cred.value, dict) else {}
     secret = value.get("key")
@@ -1009,3 +1026,203 @@ def _openrouter_rows(reading, family):
 READERS[OPENROUTER_READER] = {"creds": _openrouter_creds,
                              "probe": _openrouter_probe,
                              "rows": _openrouter_rows}
+
+
+# ------------------------------------------------ the cursor-dashboard reader
+#
+# THE OWNER'S CURSOR PLAN (task/2943), read with the credential the cursor
+# family's bridge already holds, from the dashboard endpoint Cursor's own
+# settings page calls: POST DashboardService/GetCurrentPeriodUsage, body {}.
+# Unofficial, read-only and owner-approved; it spends nothing.
+#
+# THE READING holds three windows over the billing cycle, whatever they say:
+#   cycle-included  the plan's included dollars spent: includedSpend of limit,
+#                   in cents off planUsage. The remaining dollars ride the
+#                   overflow as the balance, and the bonus dollars Cursor
+#                   served past the included ones ride it as bonus_spent.
+#   cycle-auto      planUsage.autoPercentUsed, the "Auto" (Cursor models) pool.
+#   cycle-api       planUsage.apiPercentUsed, the API-priced pool.
+#
+# THE ROW takes the included window plus the ONE pool the family's catalog
+# entry declares it bills (`billing_pool`), and both pools when it declares
+# none. Pool membership is MEASURED, not read off the meter's own
+# autoBucketModels list: grok-4.7-high is absent from that list and every one
+# of its billed events moved autoPercentUsed and left apiPercentUsed at 0.
+#
+# WHICH WALL COMES FIRST, as measured on the first trial: each grok-4.7-high
+# cent spent one cent of the included dollars AND 1/450 of the Auto pool
+# (95 cents read autoPercentUsed 0.2111), so the $20 of included dollars run
+# out about 23x before the Auto pool does. Past them Cursor may serve more:
+# bonusSpend says how many dollars it served there this cycle and the
+# boolean remainingBonus whether more remains (its type MEASURED by a probe
+# that printed types only); the reading carries both (overflow bonus_spent,
+# bonus_left). With on-demand spend off, nothing past the included dollars
+# can be billed, so Cursor either keeps serving or refuses, and a refusal
+# reads on the reach axis, not as a money wall. While the family's catalog
+# `on_demand` claim is "off" with a basis (`_on_demand_is_off`), the included
+# window leaves the row whether or not bonus remains, and the pool the
+# family bills governs it. Any other claim, or none, keeps the included
+# dollars the wall, the direction that stops early rather than late.
+#
+# A ZERO FIELD IS OMITTED. MEASURED with a probe that printed key names only:
+# a live planUsage carried limit, includedSpend and bonusSpend but no
+# `remaining`, which is how the endpoint's JSON writes a zero (the reply drops
+# default values); requiring `remaining` read a spent plan as unread and the
+# family GREY. Inside a planUsage that carries its limit, an absent money field
+# is 0 (`_plan_cents`); a present one that is not a number stays unread.
+#
+# THE READER NEVER REFRESHES THE TOKEN. The bridge is the credential file's
+# only writer; an expired access token reads unread:credentials-expired.
+
+CURSOR_READER = "cursor-dashboard"
+CURSOR_API = "https://api2.cursor.sh"
+CURSOR_USAGE_PATH = "/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+INCLUDED, AUTO_POOL, API_POOL = "cycle-included", "cycle-auto", "cycle-api"
+_BILLING_POOLS = {"auto": AUTO_POOL, "api": API_POOL}
+
+
+def _jwt_claims(token):
+    """The unverified payload of a JWT, or {} (the reader only needs `sub`
+    for the account join and `exp` to refuse a dead token)."""
+    import base64
+    try:
+        seg = str(token).split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(seg.encode("ascii")))
+    except (IndexError, ValueError, UnicodeError, TypeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def _cursor_creds(families):
+    """One CredRef per credential store a minted seat of these families
+    names in its sidecar declaration, joined on the token's subject (stable
+    across the bridge's refreshes)."""
+    from . import seat
+    wanted = set(families)
+    stores = []
+    for family, _name in seat._minted_seats():
+        if family not in wanted:
+            continue
+        spec = (seat.FAMILIES.get(family) or {}).get("sidecar") or {}
+        path = spec.get("credentials")
+        if path and os.path.expanduser(path) not in stores:
+            stores.append(os.path.expanduser(path))
+    out = []
+    for path in stores:
+        try:
+            with pk.open_regular(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            continue
+        token = doc.get("access") if isinstance(doc, dict) else None
+        if not isinstance(token, str) or not token:
+            continue
+        claims = _jwt_claims(token)
+        out.append(cred_ref(claims.get("sub") or token,
+                            value={"token": _Secret(token),
+                                   "exp": _number(claims.get("exp"))}))
+    return out
+
+
+def _epoch_ms(value):
+    """Cursor's epoch-millisecond STRING (or number) as epoch seconds."""
+    try:
+        number = float(value) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _plan_cents(plan, key):
+    """planUsage[key] in cents, or None: an absent field is 0 beside a limit
+    (the endpoint omits a zero field), and nothing without one."""
+    if plan.get(key) is None:
+        return 0 if _number(plan.get("limit")) is not None else None
+    return _number(plan.get(key))
+
+
+def _cursor_probe(cred, now):
+    """POST GetCurrentPeriodUsage -> one Reading (the section comment above)."""
+    value = cred.value if isinstance(cred, CredRef) \
+        and isinstance(cred.value, dict) else {}
+    secret = value.get("token")
+    if not isinstance(secret, _Secret) or not secret.reveal():
+        return _unread("credentials-unavailable", now)
+    exp = value.get("exp")
+    if exp is not None and exp <= now:
+        return _unread("credentials-expired", now)
+    data, failure = _http_json(
+        CURSOR_API + CURSOR_USAGE_PATH, secret.reveal(), body=b"{}",
+        headers={"Connect-Protocol-Version": "1",
+                 "Content-Type": "application/json"}, unwrap=None)
+    if failure:
+        return _unread(failure, now)
+    plan = data.get("planUsage") if isinstance(data.get("planUsage"), dict) \
+        else {}
+    start = _epoch_ms(data.get("billingCycleStart"))
+    end = _epoch_ms(data.get("billingCycleEnd"))
+    seconds = end - start if start is not None and end is not None \
+        and end > start else None
+    limit = _number(plan.get("limit"))
+    spent, remaining, bonus = (_plan_cents(plan, key) for key in
+                               ("includedSpend", "remaining", "bonusSpend"))
+    included = (100.0 * spent / limit
+                if limit and limit > 0 and spent is not None else None)
+
+    def cycle(label, pct):
+        return {"label": label, "seconds": seconds, "used_percent": pct,
+                "reset_at": end, "unit": "percent", "source": "measured"}
+    extra = {} if bonus is None else {"bonus_spent": bonus / 100.0}
+    # a boolean the endpoint omits when false; anything else is unread
+    left = plan.get("remainingBonus", False if limit is not None else None)
+    if isinstance(left, bool):
+        extra["bonus_left"] = left
+    overflow = dict({"kind": "included-dollars", "balance": remaining / 100.0,
+                     "measured_at": now, "status": "ok"}
+                    if remaining is not None else
+                    {"kind": "included-dollars", "balance": None,
+                     "measured_at": None, "status": "unread"}, **extra)
+    return Reading("ok", now, overflow=overflow, expires_at=end,
+                   windows=(cycle(INCLUDED, included),
+                            cycle(AUTO_POOL, _number(plan.get("autoPercentUsed"))),
+                            cycle(API_POOL, _number(plan.get("apiPercentUsed")))))
+
+
+def _on_demand_is_off(fam):
+    """Does the family's catalog claim on-demand spend is off, with a basis?
+    Only then is anything past the included dollars unbilled. Anything else
+    fails closed and those dollars stay the wall."""
+    claim = (fam or {}).get("on_demand")
+    return isinstance(claim, dict) and claim.get("state") == "off" \
+        and isinstance(claim.get("basis"), str) and bool(claim["basis"].strip())
+
+
+def _cursor_rows(reading, family):
+    """One family's row: the included dollars and the pool it bills. While
+    on-demand is claimed off (`_on_demand_is_off`), the included window
+    leaves the row whether or not bonus remains: nothing past those dollars
+    can be billed, so they are no wall. A refusal is the reach axis."""
+    from . import seat
+    rec = reading_dict(reading)
+    if rec["status"] != "ok":
+        return reading_rows(rec, family)
+    by = {window["label"]: window for window in rec["windows"]}
+    fam = seat.FAMILIES.get(family) or {}
+    pool = fam.get("billing_pool")
+    drop_included = _on_demand_is_off(fam)
+    labels = (() if drop_included else (INCLUDED,)) + (
+        (_BILLING_POOLS[pool],) if pool in _BILLING_POOLS
+        else (AUTO_POOL, API_POOL))
+    chosen = [by.get(label) or {"label": label, "seconds": None,
+                                "used_percent": None, "reset_at": None,
+                                "unit": "percent", "source": "measured"}
+              for label in labels]
+    numbers = [w["used_percent"] for w in chosen if w["used_percent"] is not None]
+    return [{"state": "ok", "longest_pct": max(numbers) if numbers else None,
+             "source": "measured", "windows": chosen}]
+
+
+READERS[CURSOR_READER] = {"creds": _cursor_creds,
+                          "probe": _cursor_probe,
+                          "rows": _cursor_rows}

@@ -1472,3 +1472,53 @@ class DelegationHolderAncestryTest(SeatsBase):
         with mock.patch.object(seats, "_proc_stat_link", side_effect=changed):
             self.assertIsNone(seats._enclosing_claude_holder(
                 start_pid=100, proc_dir=self.proc))
+
+
+class ProcScanUnreadableCwdTest(SeatsBase):
+    """AN UNREADABLE CWD LINK IS NOT A LOCATION.
+
+    `proc_scan` files every same-uid pid under the directory its cwd link
+    names. `os.path.realpath` does not raise on a link it cannot read: it
+    answers with the link's own path, so a pid whose link is unreadable was
+    filed as standing in `<proc>/<pid>/cwd`, and both `except OSError` arms
+    (the scan's and the `candidates` re-read) could never run. The table here
+    is planted, never the host's: one pid whose cwd links into the room, one
+    whose cwd entry is not a link (readlink refuses it under any uid) and,
+    where this uid can be refused, one whose link into the room sits behind a
+    directory it cannot search, the shape a non-dumpable pid of the same user
+    has on a real box."""
+
+    def test_an_UNREADABLE_cwd_link_files_its_pid_in_no_room(self):
+        proc = os.path.join(self.tmp, "scan-proc")
+        room = os.path.join(self.tmp, "room")
+        os.makedirs(room)
+        os.makedirs(os.path.join(proc, "4194401"))
+        os.symlink(room, os.path.join(proc, "4194401", "cwd"))
+        os.makedirs(os.path.join(proc, "4194402", "cwd"))
+        unread = [4194402]
+        locked = os.path.join(proc, "4194403")
+        if os.geteuid() != 0:
+            os.makedirs(locked)
+            os.symlink(room, os.path.join(locked, "cwd"))
+            os.chmod(locked, 0)
+            unread.append(4194403)
+        try:
+            scan = seats.proc_scan(proc)
+            # each unreadable pid, asked about the place realpath would name
+            # for it; `candidates` re-reads live, so this runs while locked
+            own = {pid: scan.candidates(os.path.realpath(os.path.join(
+                proc, str(pid), "cwd")).rstrip(os.sep)) for pid in unread}
+        finally:
+            if os.path.isdir(locked):
+                os.chmod(locked, 0o700)
+        want = os.path.realpath(room).rstrip(os.sep)
+        self.assertTrue(scan.ok)
+        # CONTROL on the same scan: the readable link is found in its room,
+        # so the empty answers below are the unreadable links and not a scan
+        # that read nothing.
+        self.assertEqual(scan.candidates(want), [4194401])
+        self.assertEqual(own, {pid: [] for pid in unread},
+                         "an unreadable pid was filed as standing in its own "
+                         "cwd entry")
+        self.assertEqual(sorted(scan._by_cwd), [want],
+                         "the scan keyed a location no link was read for")

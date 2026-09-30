@@ -479,10 +479,14 @@ def _cotenancy_warn(rooms, mine, room, seat, session):
     understating a blind spot is the worse error and inventing precision about
     it is the other one.
 
-    Latched per (room, seat set) so a standing arrangement speaks once per
-    session and a NEW co-tenant re-arms it. An unwritable latch simply skips —
-    a disclosure that cannot remember must not become per-stop wallpaper, and
-    unlike a block there is nothing here to degrade TO.
+    Latched per ROOM, once per session (task/3696). It was latched per (room,
+    seat set) so a new co-tenant re-armed it, and on the integrator seat the
+    set churned all afternoon as seats appeared and vanished, so a line that
+    promised to speak once per arrangement printed on most stops. The blind
+    spot is a property of the room, not of who stands in it. An unwritable
+    latch simply skips — a disclosure that cannot remember must not become
+    per-stop wallpaper, and unlike a block there is nothing here to degrade
+    TO.
 
     THE LATCH IS ARMED HERE AND COMMITTED ONLY AFTER THE LINE IS SEEN
     (the reason is a composition of two correct
@@ -507,8 +511,8 @@ def _cotenancy_warn(rooms, mine, room, seat, session):
     names = [n for n in worst["seats"] if _SEAM_REF.fullmatch(str(n))]
     if len(names) < 2:
         return None           # cannot be quoted inertly -> not said at all
-    fp = hashlib.blake2b(("%s\x1f%s" % (worst["path"], "|".join(sorted(names))))
-                         .encode("utf-8"), digest_size=8).hexdigest()
+    fp = hashlib.blake2b(str(worst["path"]).encode("utf-8"),
+                         digest_size=8).hexdigest()
     path = _stop_fp_path(room, seat, session, kind=COTENANCY_LATCH)
     try:
         with open(path) as f:
@@ -532,7 +536,7 @@ def _cotenancy_warn(rooms, mine, room, seat, session):
             "branch, one authored set, one half. That is not a clean bill, it "
             "is a place the instrument cannot look: if you and a co-tenant "
             "have each banked a half here, nothing below will say so. Not "
-            "blocking. Said once per arrangement; a new co-tenant re-arms it."
+            "blocking. Said once per session for this room."
             % (len(names), _clip(_scrub(str(worst["path"])), STATUS_BYTES),
                _clip(_scrub(", ".join(names)), STATUS_BYTES)))
     _PENDING_DISCLOSURES.append(

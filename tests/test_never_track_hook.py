@@ -62,7 +62,25 @@ class HookBase(unittest.TestCase):
             f.write("# synthetic test needles\n%s\n" % NEEDLE)
         os.environ["HELM_PRIVATE_NEEDLES"] = self.needles
         self.root = os.path.join(self.tmp, "proj")
-        os.makedirs(self.root)
+        # THE SAME SEEDED REPOSITORY EVERY TIME, SO IT IS BUILT ONCE (task/3039):
+        # six git spawns per test across every HookBase arm. Each test gets
+        # its own whole copy (`HookBase._seeded`), so nothing it writes reaches
+        # the template or the next test. No hook is in the template: every
+        # arm installs its own guard into its own copy.
+        from tests._tmphome import repo_from_template
+        repo_from_template("ntk-hook-base", HookBase._seeded, self.root)
+
+    @staticmethod
+    def _seeded(root):
+        """The fixture repository at `root`: `main` holding one seed commit.
+        Run once per process; see setUp.
+
+        EACH STEP RAISES, NEVER A BARE `assert`: `python -O` strips an
+        assert, and a seed whose git step failed would then be the template
+        every later test in the process copies."""
+        def sh(*args):
+            return subprocess.run(list(args), cwd=root, capture_output=True,
+                                  text=True, timeout=60)
         for cmd in (("git", "init", "-q", "-b", "main"),
                     ("git", "config", "user.email", "t@example.com"),
                     ("git", "config", "user.name", "t"),
@@ -73,12 +91,16 @@ class HookBase(unittest.TestCase):
                     # a product-wide default.
                     ("git", "config", "--local",
                      "helm.guard.profile", "rail"),):
-            self.assertEqual(self.sh(self.root, *cmd).returncode, 0)
-        with open(os.path.join(self.root, "README"), "w") as f:
+            r = sh(*cmd)
+            if r.returncode != 0:
+                raise AssertionError((cmd, r.stderr))
+        with open(os.path.join(root, "README"), "w") as f:
             f.write("seed\n")
-        self.sh(self.root, "git", "add", "-A")
-        r = self.sh(self.root, "git", "commit", "-q", "-m", "seed")
-        self.assertEqual(r.returncode, 0, r.stderr)
+        sh("git", "add", "-A")
+        r = sh("git", "commit", "-q", "-m", "seed")
+        if r.returncode != 0:
+            raise AssertionError(r.stderr)
+        return {}
 
     def tearDown(self):
         for k, v in self.prior.items():
@@ -2210,8 +2232,8 @@ class APrintedRemedyNeverNarrowsTest(HookBase):
         self.rail_snapshots = [
             path for path in _guard._scanner_assets(self.root, "rail")
             if path not in _guard._scanner_assets(self.root, "leak")]
-        self.assertEqual(len(self.rail_snapshots), 12,
-                         "fixture: twelve snapshots are the rail's alone")
+        self.assertEqual(len(self.rail_snapshots), 13,
+                         "fixture: thirteen snapshots are the rail's alone")
         for path in self.rail_snapshots:
             self.assertTrue(os.path.isfile(path),
                             "fixture: the rail's shelf really is there")

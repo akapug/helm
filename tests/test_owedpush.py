@@ -204,6 +204,81 @@ class OwedPushTest(unittest.TestCase):
         # more, against a placeholder row, and that line is not a debt.
         self.assertEqual(text.count("--supersedes r"), 1)
 
+    def test_a_FIX_whose_continuation_CONCURRED_is_not_delivered(self):  # noqa: VACUOUS_ASSERTION — the unconditional control runs FIRST on the same observable: the identical chain without the CONCUR is swept through the same patched ledger read and must DM author-seat before `self.sent` is cleared
+        """THE MEASURED DM (2026-09-25T15:28Z): FIX 7f9fdca3c22a was billed
+        as unanswered while c8036f39eabe, continuing it, held a CONCUR on the
+        exact patch tip. Driven through the ledger read the bot really makes,
+        so the arm covers the pass the bot runs and not a list built for it.
+        The control is the same chain without the CONCUR, on the same path."""
+        from helm import dispatches
+        from tests.test_obligation import row, snap
+        chain = [row("r9203", lane="batch"),
+                 row("r7f9f", lane="batch", supersedes="r9203")]
+        concur = row("rc803", lane="batch", supersedes="r7f9f",
+                     polarity="concur")
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=(snap(*chain), None)):
+            owedpush.sweep(state_path=self.state + ".control")
+        self.assertEqual([s[0] for s in self.sent], ["author-seat"],
+                         "the control chain was not delivered, so the empty "
+                         "record below proves nothing")
+        self.sent = []
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=(snap(*chain, concur), None)):
+            rep = owedpush.sweep(state_path=self.state)
+        self.assertIsNone(rep.get("unavailable"))
+        self.assertEqual(self.sent, [],
+                         "the owed-bot DMed a FIX whose cure was concurred on")
+
+    def test_a_FIX_whose_reviewers_cure_LANDED_is_not_delivered(self):  # noqa: VACUOUS_ASSERTION — the unconditional control runs FIRST on the same observable: the identical FIX naming a cure that never landed is swept through the same patched ledger read and real git reader and must DM author-seat before `self.sent` is cleared
+        """THE MEASURED DM (task/3357, 2026-09-26T21:45Z): owed-bot DMed one
+        seat hourly about FIX rows whose REVIEWER'S patch tip was already an
+        ancestor of origin/main, after the holds carrying them were cancelled
+        as moot. Driven through the ledger read and the git reader the bot
+        really uses, against a real repository; the control is the same FIX
+        naming a cure that never landed, on the same path."""
+        from helm import dispatches
+        from tests.test_obligation import cured_fix, landed_patch_repo, snap
+        gitdir, reviewed, patch, stray = landed_patch_repo(self)
+        with mock.patch.object(dispatches, "snapshot", return_value=(snap(
+                cured_fix("r1", gitdir, reviewed, stray)), None)):
+            owedpush.sweep(state_path=self.state + ".control")
+        self.assertEqual([s[0] for s in self.sent], ["author-seat"],
+                         "the control FIX was not delivered, so the empty "
+                         "record below proves nothing")
+        self.sent = []
+        with mock.patch.object(dispatches, "snapshot", return_value=(snap(
+                cured_fix("r1", gitdir, reviewed, patch)), None)):
+            rep = owedpush.sweep(state_path=self.state)
+        self.assertIsNone(rep.get("unavailable"))
+        self.assertEqual(self.sent, [],
+                         "the owed-bot DMed a FIX whose cure is on trunk")
+
+    def test_a_FIX_whose_reviewers_cure_LANDED_REBASED_is_not_delivered(self):  # noqa: VACUOUS_ASSERTION — the unconditional control runs FIRST on the same observable: the identical FIX whose cure landed only in part is swept through the same patched ledger read and real git readers and must DM author-seat before `self.sent` is cleared
+        """THE MEASURED DM (task/3357 remainder, 22:53Z): owed-bot still
+        billed b18ca15245af and a7c03bddf819, whose reviewers' cures reached
+        origin/main REBASED, so ancestry says no. Driven through the ledger
+        read and the git readers the bot really uses, against a real
+        repository; the control is a cure only partly on trunk."""
+        from helm import dispatches
+        from tests.test_obligation import cured_fix, rebased_cure_repo, snap
+        gitdir, reviewed, patch, _first = rebased_cure_repo(self, landed=1)
+        with mock.patch.object(dispatches, "snapshot", return_value=(snap(
+                cured_fix("r1", gitdir, reviewed, patch)), None)):
+            owedpush.sweep(state_path=self.state + ".control")
+        self.assertEqual([s[0] for s in self.sent], ["author-seat"],
+                         "the control FIX was not delivered, so the empty "
+                         "record below proves nothing")
+        self.sent = []
+        gitdir, reviewed, patch, _first = rebased_cure_repo(self)
+        with mock.patch.object(dispatches, "snapshot", return_value=(snap(
+                cured_fix("r1", gitdir, reviewed, patch)), None)):
+            rep = owedpush.sweep(state_path=self.state)
+        self.assertIsNone(rep.get("unavailable"))
+        self.assertEqual(self.sent, [],
+                         "the owed-bot DMed a FIX whose cure is on trunk "
+                         "rebased")
+
     def test_independent_chains_sharing_a_lane_LABEL_both_bill(self):
         """The mirror, and the one obligation argues hardest for: a lane is
         FREE TEXT. Two independent --new-work chains may carry the same string,

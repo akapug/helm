@@ -1,0 +1,34 @@
+{
+ "_measured": "`orca terminal read --terminal <handle> --limit 200 --json`, result.terminal, on a throwaway pane running Claude Code 2.1.283 after /exit with one background shell (task/3201). The object carries NO `draft` key. Only the handle, the working directory and two plugin names are replaced.",
+ "terminal": {
+  "handle": "term_00000000-0000-4000-8000-000000000000",
+  "status": "running",
+  "tail": [
+   " ▐▛███▛█   Claude Code v2.1.283",
+   "▝▜██████▀  Haiku 4.5 · Claude Max",
+   " ▝▝   ▝▝   ~/dev/example/repo · /rc",
+   "  Get to finished work sooner with Opus 5.5. Switch anytime with /model.",
+   "● plugin-a: hooks.json: unknown keys \"$comment\", \"$comment\" in hooks.Stop[1] ignored",
+   "● plugin-b: hooks.json: unknown key \"$comment\" ignored",
+   "❯ run sleep 900 in the background with the Bash tool, then stop",
+   "  Ran 1 shell command",
+   "● Background sleep started (ID: bt0g30cdp, runs for 15 minutes).",
+   "✻ Sautéed for 10s · done 5:28 PM · 1 shell still running",
+   "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔",
+   "   Background work is running",
+   "   The following will stop when you exit:",
+   "   shell · sleep 900",
+   "   ❯ 1. Exit and stop tasks",
+   "     2. Move to background and exit",
+   "     3. Stay",
+   "   Enter to confirm · Esc to cancel"
+  ],
+  "truncated": false,
+  "limited": false,
+  "oldestCursor": "0",
+  "nextCursor": "1",
+  "latestCursor": "1",
+  "returnedLineCount": 18,
+  "source": "screen"
+ }
+}

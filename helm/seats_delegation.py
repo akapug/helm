@@ -580,10 +580,10 @@ class ProcScan:
         live = []
         for pid in self._by_cwd.get(want, ()):
             try:
-                cwd = os.path.realpath(
-                    os.path.join(self.proc_dir, str(pid), "cwd")).rstrip(os.sep)
+                cwd = os.path.realpath(os.readlink(
+                    os.path.join(self.proc_dir, str(pid), "cwd"))).rstrip(os.sep)
             except OSError:
-                continue          # exited since the scan: not proof
+                continue          # exited or unreadable since the scan: not proof
             if cwd == want:
                 live.append(pid)
         return live
@@ -618,9 +618,9 @@ def proc_scan(proc_dir=None):
         try:
             if pid in mine or os.stat(pdir).st_uid != me:
                 continue
-            cwd = os.path.realpath(os.path.join(pdir, "cwd")).rstrip(os.sep)
+            cwd = os.path.realpath(os.readlink(os.path.join(pdir, "cwd"))).rstrip(os.sep)
         except OSError:
-            continue              # exited between listdir and stat: not proof
+            continue              # exited, or its link is unreadable: not proof
         by_cwd.setdefault(cwd, []).append(pid)
     return ProcScan(True, proc_dir, uid=me, mine=mine, by_cwd=by_cwd)
 
@@ -759,19 +759,14 @@ def _gate_pending(resource, snap=None, cwd=None):
       * OPEN (stage "pending") — a reviewer holds the verdict, or
       * a VERDICT row with polarity=approve AND a bound gate token
         (stage "approved") — the review is DONE, the gate is proven, and
-        the only remaining verb is the INTEGRATOR's land.
+        the only remaining verb is the INTEGRATOR's land, or
+      * a HELD row with a recorded holder and a source-clean tip (stage
+        "source-clean", task/3097): its HELD tip is what must equal HEAD.
 
-    The second arm exists because the first died exactly one lifecycle
-    stage after it fired (bug class verb-designed-noun-lifecycle-holed,
-    measured live 2026-07-31 on lane lr-land-ack-deletions-reachable: the
-    moment the reviewer APPROVED — with a VERIFIED gate token — the row
-    left the OPEN set, the exemption lapsed, and the holder's every stop
-    exited 2 with "finish the work" while the work WAS finished and
-    landing was never the holder's verb). A FIX or SUPERSEDE verdict does
-    NOT exempt — the holder owes rework, so blocking is then the nudge
-    doing its job — and an UNGATED approve authorizes nothing (settled
-    law: mark_verdict refuses to write one, and historical replayed rows
-    without a bound token stay blocking).
+    Each later arm closes the hole its predecessor left one lifecycle stage
+    on (verb-designed-noun-lifecycle-holed): a finished review must not block
+    a holder whose only owed verb is someone else's. A FIX or SUPERSEDE verdict
+    does NOT exempt (rework is owed); an UNGATED approve authorizes nothing.
 
     Same verifiable-saturated-state law as _delegated_build, one lifecycle
     stage later (LEASE-HELD-WHILE-GATE-PENDING, measured live 2026-07-29:
@@ -854,7 +849,13 @@ def _gate_pending(resource, snap=None, cwd=None):
         if _lane_stem(row.get("lane")) != family:
             continue
         status = row.get("status")
-        if status in dispatches.CLOSED_STATES:
+        ref = str(row.get("ref") or "")
+        if status == "held":      # a plain or holderless hold keeps blocking
+            tip = str(row.get("source_clean_tip") or "")
+            if not (tip and row.get("hold_actor")):
+                continue
+            ref, row_stage = tip, "source-clean"
+        elif status in dispatches.CLOSED_STATES:
             # the APPROVED arm: only a polarity=approve verdict carrying a
             # BOUND gate token survives closure — cancelled rows, fix and
             # supersede verdicts (rework owed), and ungated approves (they
@@ -869,7 +870,6 @@ def _gate_pending(resource, snap=None, cwd=None):
             if not _is_owed(row):
                 continue          # a successor already carries this obligation
             row_stage = "pending"
-        ref = str(row.get("ref") or "")
         # the ledger stores the ref AS TYPED at dispatch time — full or
         # abbreviated; a match is exact-or-prefix in EITHER direction of
         # the head string, never a lane-name coincidence

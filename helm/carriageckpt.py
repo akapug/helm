@@ -89,10 +89,10 @@ FORMAT = "helm-carriage-replay-derivation"
 VERSION = 1
 DIRNAME = "carriage-replay"
 SUFFIX = ".json"
-# One file per CODE GENERATION, the newest KEEP kept — `foldckpt`'s own bound,
-# for its reason: a lane's `./bin/helm` and the hub binary each maintain their
-# own instead of invalidating the other's on every read.
-KEEP = 8
+# One file per CODE GENERATION, the newest GENERATIONS kept, so a lane's
+# `./bin/helm` and the hub binary each maintain their own instead of
+# invalidating the other's on every read.
+GENERATIONS = 8
 #: How many derivations one file may hold. The live census asks about 228
 #: placed rows in one repository; the bound is the estate's growth, not a page.
 ENTRY_CAP = 8192
@@ -101,7 +101,7 @@ ENTRY_CAP = 8192
 #: the witness's own "no witness affirmed" and is the expensive answer to lose.
 MISS = object()
 
-_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_OID = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 # PER-THREAD, like the fold's recorder and the projection memo: helm web reads
 # on several threads at once and one walk's region must never serve another's.
 _LOCAL = threading.local()
@@ -380,7 +380,7 @@ def _section_ok(section):
 
 
 def _prune(keep):
-    """Keep the newest KEEP files (one per code generation)."""
+    """Keep the newest GENERATIONS files (one per code generation)."""
     root = os.path.dirname(keep)
     try:
         paths = sorted((os.path.join(root, n) for n in os.listdir(root)
@@ -388,7 +388,7 @@ def _prune(keep):
                        key=lambda p: os.stat(p).st_mtime_ns, reverse=True)
     except OSError:
         return
-    for path in paths[KEEP:]:
+    for path in paths[GENERATIONS:]:
         if path != keep:
             try:
                 os.unlink(path)

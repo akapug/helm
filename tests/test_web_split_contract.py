@@ -42,7 +42,7 @@ _api_catalog _api_chat _api_chat_dm _api_chat_ids _api_chat_older _api_chat_post
 _api_chat_react _api_chat_read_post _api_chat_roster _api_chat_seat _api_cmd
 _api_config_injection _api_configs _api_configs_backups _api_configs_cascade _api_configs_entry_post
 _api_configs_file _api_configs_file_post _api_configs_homes _api_configs_resolve
-_api_configs_restore_post _api_configs_tree _api_creds _api_flags _api_cwd_post
+_api_configs_restore_post _api_configs_tree _api_creds _api_models _api_flags _api_cwd_post
 _api_decisions _api_decisions_comment _api_decisions_deliver
 _api_friction _api_friction_dial _POSTURE_SAID _api_posture _api_posture_post
 _api_decisions_verdict _api_history _api_homes _api_homes_post
@@ -50,7 +50,9 @@ _api_inject_act _api_inject_pack _api_ledger
 _api_ledger_native _api_ledger_turn _api_lr _api_mp_presence _api_mp_publish
 _api_mp_state _api_notes _api_physics _api_physics_diff _api_prune_post
 _api_board _api_owed _api_projects_state _api_quota_status _api_ready
-_api_registry
+_api_work
+_api_projects_team _forget_teams_leg _api_burn_declare DECLARE_FOR_S
+_api_registry _api_backlog
 _api_roster_git _api_search
 _api_session _api_sessions _api_skills _api_skills_delete _api_skills_toggle
 _api_storage_matrix _api_store _api_store_confirm _api_store_reject
@@ -301,11 +303,11 @@ class WebSplitContractTest(unittest.TestCase):
         self.assertEqual(len(current),
                          len(_BASELINE_SURFACE) + len(_BRIDGE_SURFACE))
 
-    def test_the_implementation_inventory_and_fanout_are_exact(self):  # noqa: VACUOUS_ASSERTION — exact 17-module inventory and exact non-empty 242-name fanout positively control the bridge-absence checks
+    def test_the_implementation_inventory_and_fanout_are_exact(self):  # noqa: VACUOUS_ASSERTION — exact 17-module inventory and exact non-empty 247-name fanout positively control the bridge-absence checks
         self.assertEqual(tuple(m.__name__ for m in web._WEB_IMPL_MODULES),
                          _IMPL_MODULE_NAMES)
         self.assertEqual(web._WEB_FANOUT_NAMES, _BASELINE_SURFACE)
-        self.assertEqual(len(web._WEB_FANOUT_NAMES), 242)
+        self.assertEqual(len(web._WEB_FANOUT_NAMES), 249)  # +_api_models (task/3448), +_api_backlog (task/3445 L1a), +_api_work (task/3643)
         for module in web._WEB_IMPL_MODULES:
             for name in _BRIDGE_SURFACE:
                 self.assertNotIn(name, module.__dict__)
@@ -410,13 +412,13 @@ assert not errors, errors
                     cwd=root, env=env, capture_output=True, text=True)
                 self.assertEqual(p.returncode, 0, (pair, p.stderr))
 
-    def test_facade_callables_unpickle_in_a_fresh_process(self):  # noqa: VACUOUS_ASSERTION — 159 exports plus 14 class methods are counted, canonically named, and rebound by identity in the child
+    def test_facade_callables_unpickle_in_a_fresh_process(self):  # noqa: VACUOUS_ASSERTION — 163 exports plus 14 class methods are counted, canonically named, and rebound by identity in the child
         from helm import web_compat
 
         root, env = _fresh_process()
         items = [(name, value) for name, value in web_compat.EXPORTS.items()
                  if inspect.isfunction(value) or inspect.isclass(value)]
-        self.assertEqual(len(items), 159)
+        self.assertEqual(len(items), 165)  # +_api_models (task/3448), +_api_backlog (task/3445 L1a), +_api_work (task/3643)
         self.assertEqual({value.__module__ for _name, value in items},
                          {"helm.web"})
         methods = [(cls.__name__ + "." + name, value)

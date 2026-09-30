@@ -208,6 +208,7 @@ let CHAT_DM_STATE = "ok";
 let CHAT_BY_ID = {}, CHAT_BY_KEY = {}, CHAT_REPLYN = {}, CHAT_KIDS = {}, CHAT_GONE = new Set();
 let CHAT_REACTS = {}, CHAT_DIVIDED = false, CHAT_AWAY = 0, CHAT_ROOM = "main", CHAT_ROSTER = [];
 let CHAT_OWNER = "";
+let CHAT_ACK_TAIL = null;   // the ack fold's receipt at the log's end (chatAckAppend)
 
 // ───────────────────────── faithful fake server (mirrors web.py) ─────────────────────────
 // `dm` is UNDEFINED by default, so the fake server is an OLD-SHAPE server by
@@ -279,6 +280,7 @@ function resetClient() {
   CHAT_BY_ID = {}; CHAT_BY_KEY = {}; CHAT_REPLYN = {}; CHAT_KIDS = {}; CHAT_GONE = new Set();
   CHAT_REACTS = {}; CHAT_DIVIDED = false; CHAT_AWAY = 0; CHAT_ROOM = "main"; CHAT_ROSTER = [];
   LOG = new El("div"); CHAT_OWNER = ""; NAMEBOX = {value: "", placeholder: ""}; ROW_SAW = [];
+  CHAT_ACK_TAIL = null;
 }
 const renderedIds = () => LOG.querySelectorAll(".chatmsg").map(el => el.getAttribute("data-id"));
 
@@ -450,7 +452,7 @@ async function scenario_a_read_that_answers_LATE_still_renders() {
     pass: JSON.stringify(ids) === JSON.stringify(["L0", "L1"])
           && DASH_CHAT_FAILED === 0 && DASH_ANSWERS_TS > 0
           && card.indexOf("answers for you") !== -1
-          && card.indexOf("helm chat read") !== -1
+          && card.indexOf("chat · read") !== -1
           && card.indexOf("the node is back") !== -1,
     detail: {rendered: ids, failedStamp: DASH_CHAT_FAILED,
              answeredStamp: DASH_ANSWERS_TS, card: card}};

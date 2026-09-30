@@ -38,6 +38,16 @@ cut of the `landreq` split missed: nine constants stayed bare, both modules
 parsed, both import orders worked, every name published, and it surfaced only
 as `NameError` when arms drove the code.
 
+A GATE RECEIPT IS CHECKED ON REPLAY FOR ITS SHAPE, NEVER AGAINST THE STORE
+(task/2770). A fold that reads gate receipts writes no checkpoint — the one
+close that does, compose-landed v3, taints its fold for exactly that — so a
+recorded receipt id rides replay as a shaped, anchored field: the verdict arm
+keeps an APPROVE's `gate` by `_GATE_ID` alone, and `_source_clean_landed_error`
+checks a source-clean close's gate half by shape and anchor alone. A forged
+event with a well-formed but nonexistent receipt and an anchor it computed
+itself binds on replay; the locked writer, which measured seconds before it
+appended, is the trust boundary for that half.
+
 THE CYCLE IS BROKEN THE WAY THIS PACKAGE ALREADY BREAKS IT: this module
 imports the ledger EAGERLY, and `dispatches` imports this one at the END of
 its own module body, after every name it needs exists. A module object is in
@@ -45,6 +55,7 @@ its own module body, after every name it needs exists. A module object is in
 resolves.
 """
 import os
+import re
 
 from . import dispatches
 from . import eventledger, foldckpt, pk
@@ -446,6 +457,7 @@ def _record_retire_proven(rid, reason, seat, note, measure):
                               "dispatch %s is UNCHANGED; this is a helm defect, not "
                               "a ledger repair" % row["id"])
             pk.event("dispatch-retire", row["id"], reason)
+            dispatches.retire_review_pins(out)
             return out, None
         return txn.then(finish)
     return dispatches._ledger_write(attempt, path)
@@ -517,6 +529,7 @@ def _record_close_landed_proven(rid, reviewed_tip, repo_id, trunk_ref,
         def finish():
             out = dispatches._apply(row, event)
             pk.event("dispatch-close-landed", row["id"], trunk_sha)
+            dispatches.retire_review_pins(out)
             return out, None
         return txn.then(finish)
     return dispatches._ledger_write(attempt, path)
@@ -1285,6 +1298,53 @@ def _carried_unverdicted(reason, state):
         and not state.get("reviewed_tip")
 
 
+def _patch_twins_error(event, state):
+    """None, or why a reviewed-patch-identity `carried` close does not bind.
+
+    THE LEDGER HALF OF THE RUNG (task/1484), and deliberately ALL of what
+    replay asks OF THE MAPPING. The git half — every cure commit has one
+    patch-identical trunk commit — is measured by the ladder and again under
+    the writer's lock (`landreq._reviewed_patch_twins`); replay asks no git of
+    the mapping, as `resolved` asks none, because a question the fold
+    checkpoint cannot re-verify would cost every fold its checkpoint for the
+    sake of two rows. What replay CAN hold is the binding: the row is a FIX
+    whose verdict named this cure, the pair is exactly (reviewed tip, patch
+    tip), and the mapping is one-to-one, full shas throughout, ending at the
+    patch tip itself. The TRUNK the mapping names is bound separately, by
+    carried's own `_measured_trunk_is_history` in `_close_event_error`, which
+    the fold checkpoint already re-verifies (the codex review's P2)."""
+    reviewed = str(state.get("reviewed_tip") or "")
+    patch = str(state.get("patch_tip") or "")
+    if state.get("polarity") != "fix" \
+            or not dispatches._FULL_TIP.fullmatch(patch) or patch == reviewed:
+        return ("the reviewed-patch rung closes only a FIX whose verdict named "
+                "a patch tip")
+    if event.get("carried_base") != reviewed \
+            or event.get("carried_tip") != patch:
+        return ("carried base/tip must be the reviewed tip and the FIX's "
+                "patch tip")
+    from . import vcs                   # function-scope by module convention
+    twins = event.get("patch_twins")
+    if not isinstance(twins, list) or not twins \
+            or len(twins) > vcs.PATCH_SEQUENCE_CAP:
+        return "patch twins must be the non-empty, bounded cure mapping"
+    for twin in twins:
+        if not isinstance(twin, dict) \
+                or set(twin) != {"reviewed", "trunk", "patch_id"} \
+                or not all(dispatches._FULL_TIP.fullmatch(str(twin[key]))
+                           for key in twin):
+            return "patch twin schema violation"
+    mine = [twin["reviewed"] for twin in twins]
+    theirs = [twin["trunk"] for twin in twins]
+    if len(set(mine)) != len(mine) or len(set(theirs)) != len(theirs) \
+            or set(mine) & set(theirs):
+        return ("patch twins must map distinct reviewed commits to distinct "
+                "trunk commits")
+    if mine[-1] != patch:
+        return "patch twins must end at the FIX's patch tip"
+    return None
+
+
 #: The advisory-read polarities that NAME A FINDING. A CONCUR blocks nothing
 #: and names none; a FIX or a SUPERSEDE is a finding by definition.
 _FINDING_READ_POLARITIES = ("fix", "supersede")
@@ -1338,11 +1398,115 @@ def held_rung_remedy(row):
                 "`helm dispatch release %s` returns the row to the fleet"
                 % rid)
     return ("its holder records the read as a verdict: `helm dispatch "
-            "release %s`, then `helm dispatch verdict %s %s --fix ...`, "
+            "release %s`, then `helm dispatch verdict %s %s --fix "
+            "--finding-count N --prior-relation RELATION ...`, "
             "which closes as `superseded` once a later APPROVE on its chain "
             "has reached trunk; a read that found nothing is held again with "
             "`--source-clean %s` and closes as `discharged`"
             % (rid, rid, tip, tip[:12]))
+
+
+#: A minted gate receipt's id — the SIXTEEN hex characters `gate._receipt_id`
+#: produces. `dispatches._GATE_ID` spans 4..32 because it also serves verdict
+#: tokens typed by hand; a source-clean close records a receipt the ladder
+#: FOUND in the store, so nothing here justifies the wider shape.
+_SOURCE_CLEAN_RECEIPT = re.compile(r"[0-9a-f]{16}\Z")
+
+#: What the source-clean anchor binds, in one tuple for the writer that
+#: stamps it and the replay that re-derives it.
+_SOURCE_CLEAN_ANCHORED = (
+    "reviewed_tip", "source_clean_hold_actor", "source_clean_hold_ts",
+    "source_clean_gate", "source_clean_gate_head", "source_clean_gate_tree",
+    "closing_repo_id", "closing_trunk_ref", "closing_trunk_sha")
+
+
+def _source_clean_anchor(event):
+    """The anchor over a source-clean close's WHOLE evidence (task/3053).
+
+    THE TWO HALVES ARE ONE CLAIM. A hold proves somebody independent read
+    the tip clean; a gate proves a whole suite passed on a tree containing
+    it. Either alone is the state this door exists to refuse, so a record
+    whose hold came from one close and whose gate came from another must not
+    replay — and without an anchor over both, swapping one half of a real
+    event for a real half of another would pass every field check."""
+    return dispatches._proof_anchor(
+        "source-clean-landed-v1",
+        {key: event.get(key) for key in _SOURCE_CLEAN_ANCHORED})
+
+
+def _source_clean_landed_error(event, state, current):
+    """Why a `source-clean-landed` close may NOT bind, or None (task/3053).
+
+    THE SAME RULE FOR THE WRITER, UNDER THE LOCK, AND FOR REPLAY. Replay never
+    probes Git and never reads the receipt store — a fold that read gate
+    receipts could write no fold checkpoint (task/2770) — so the two live
+    measurements (the tip is an ANCESTOR of the pinned trunk; the receipt is
+    a verified whole-suite pass on a commit whose history contains the tip)
+    are the ladder's, taken seconds before the lock, over immutable objects:
+    a pinned sha's ancestry and a content-hashed receipt cannot change after
+    they were read. What CAN change is the LEDGER, so this re-derives the
+    ledger half here: the hold still stands at the recorded tip, it was
+    recorded by the recorded hand, that hand is the row's recipient, and it
+    wrote no round of the lane. The gate half is checked for SHAPE and bound
+    by the anchor, so an event missing either piece of evidence, or carrying
+    a half from another close, is inert.
+
+    WHAT THAT LEAVES UNPROVED, STATED RATHER THAN IMPLIED (task/2770): replay
+    never asks whether the recorded receipt EXISTS, passed, or ran on the
+    recorded head and tree — nor whether the held tip descends from the
+    dispatched ref (the lineage rung, task/3053), nor whether trunk contains
+    it. A hand-written event carrying a well-formed but nonexistent receipt id,
+    head and tree, with an anchor it computed itself, binds on replay. The
+    APPROVE a `landed` close rests on has the same limit for the same reason
+    — replay keeps its `gate` by shape (`_GATE_ID`), never by the store — and
+    the WRITER, under the lock and seconds after the ladder measured, is the
+    trust boundary for every live measurement."""
+    from . import landreq                # DEFERRED — landreq imports us.
+    repo, err = dispatches._clean(event.get("closing_repo_id"),
+                                  "closing repo id", 4096)
+    if err or not os.path.isabs(str(repo or "")):
+        return "closing repo id must be an absolute path"
+    if state.get("repo_id") and repo != state.get("repo_id"):
+        return ("closing repo id must be the row's own repository — a "
+                "source-clean close is never proved in another clone")
+    if not dispatches._valid_trunk_ref(event.get("closing_trunk_ref")):
+        return "closing trunk ref must be the ref the ancestry was proved against"
+    if not dispatches._FULL_TIP.fullmatch(
+            str(event.get("closing_trunk_sha") or "")):
+        return "closing trunk sha must be the full trunk object pinned"
+    merr = dispatches._close_mode_error("source-clean-landed", event)
+    if merr:
+        return merr
+    # THE HOLD HALF — condition 1 of the ruling.
+    actor = event.get("source_clean_hold_actor")
+    if not isinstance(actor, str) or not dispatches._TOKEN.fullmatch(actor):
+        return ("a source-clean close must record the seat that held the row "
+                "— the hold half of its evidence is missing")
+    if actor != state.get("hold_actor"):
+        return ("the recorded holder %r is not the hand the standing hold "
+                "records (%r)" % (actor, state.get("hold_actor")))
+    if event.get("source_clean_hold_ts") != state.get("hold_ts"):
+        return ("the recorded hold instant is not the standing hold's — this "
+                "close is about a different hold")
+    if current is None:
+        return ("source-clean-landed needs the full ledger to judge whether "
+                "the holder wrote any round of this lane")
+    herr = landreq.source_clean_holder_error(state, current)
+    if herr:
+        return herr
+    # THE GATE HALF — condition 3's record. Its measurement is the ladder's.
+    if not _SOURCE_CLEAN_RECEIPT.fullmatch(
+            str(event.get("source_clean_gate") or "")):
+        return ("a source-clean close must record the gate receipt it landed "
+                "under — the gate half of its evidence is missing")
+    for key in ("source_clean_gate_head", "source_clean_gate_tree"):
+        if not dispatches._FULL_TIP.fullmatch(str(event.get(key) or "")):
+            return ("%s must be the full object the receipt names — the gate "
+                    "half of its evidence is incomplete" % key)
+    if event.get("source_clean_anchor") != _source_clean_anchor(event):
+        return ("the source-clean anchor does not bind this hold and this gate "
+                "— one half of the evidence is not the half that was proved")
+    return None
 
 
 
@@ -1408,7 +1572,11 @@ def _close_event_error(event, state, current=None, verdicts=None,
             return "compose-land proof does not bind the close"
     elif "compose_land_proof" in event or "compose_land_anchor" in event:
         return "compose-land proof belongs only to landed proof version 3"
-    if reason in ("subsumed", "resolved"):
+    # `source-clean-landed` JOINS THE WHOLE-OBJECT RULE (task/3053): its
+    # proof is two pieces of evidence — the hold and the gate token — and an
+    # event missing EITHER must refuse by name here rather than bind on its
+    # base gates. Every field is required; nothing on it is optional.
+    if reason in ("subsumed", "resolved", "source-clean-landed"):
         expected = dispatches._CLOSE_EVENT_BASE_FIELDS | set(dispatches._CLOSE_STATE_FIELDS[reason])
         got = set(event) - {dispatches.CLOSE_ACTOR_FIELD}
         if reason == "resolved":
@@ -1452,8 +1620,27 @@ def _close_event_error(event, state, current=None, verdicts=None,
                 return "discharged refuses this HELD row: %s" % herr
         elif state.get("status") != "open":
             return "discharged closes an OPEN build row, never a verdict"
+    # task/3053 — THE SAME ORDERING LAW, for the same reason: a landed
+    # source-clean hold is a HELD row, and the domain gate stands before the
+    # verdict gate so a verdicted, open or already-closed row never reaches
+    # the hold-and-gate arm below at all. The hold must also record ZERO
+    # findings, which is `held_discharge_error`'s question and the same one
+    # `discharged` asks of a held rung: an owner-gated hold, an ordinary hold,
+    # and a hold beside an advisory read that names a finding all keep the
+    # row, because a close reason is not a verdict.
+    if reason == "source-clean-landed":
+        if state.get("status") != "held":
+            return ("source-clean-landed closes a HELD source-clean row, and "
+                    "this row is %s" % (state.get("status") or "in no state"))
+        herr = dispatches.held_discharge_error(state)
+        if herr:
+            return "source-clean-landed refuses this HELD row: %s" % herr
     if state.get("status") != "verdict":
-        if reason == "discharged":
+        if reason == "source-clean-landed":
+            # ADMITTED BY THE DOMAIN GATE ABOVE; its own arm below binds the
+            # hold and the gate token, so nothing here is left ungated.
+            pass
+        elif reason == "discharged":
             # #177 — the ONE door a polarity-less row has. The writer and this
             # replay arm re-derive the discharge from the SAME ledger read
             # rather than trusting the event's say-so: the recorded
@@ -1556,7 +1743,16 @@ def _close_event_error(event, state, current=None, verdicts=None,
     # NARROW: the check still binds a carried close on a row that DOES carry
     # a verdict, so the regression control one class up keeps its meaning.
     carried_unverdicted = dispatches._carried_unverdicted(reason, state)
-    if reason != "discharged" and not carried_unverdicted \
+    if reason == "source-clean-landed":
+        # A HELD ROW HAS NO STANDING VERDICT TO MATCH, and the tip this close
+        # is about is the one its HOLD declared clean — so that is what the
+        # event's reviewed tip must equal, exactly. A close naming any other
+        # commit is a claim about a tree nobody read.
+        if not dispatches._FULL_TIP.fullmatch(reviewed) \
+                or reviewed != dispatches._clean_tip_of(state):
+            return ("reviewed tip does not match the tip the source-clean "
+                    "hold declared clean")
+    elif reason != "discharged" and not carried_unverdicted \
             and (not dispatches._FULL_TIP.fullmatch(reviewed)
                  or reviewed != state.get("reviewed_tip")):
         return "reviewed tip does not match the standing verdict"
@@ -1768,6 +1964,10 @@ def _close_event_error(event, state, current=None, verdicts=None,
                     "own immutable verdict evidence says %r — a capture that "
                     "names an allowed word without binding the record is not "
                     "a proof" % (event.get("close_hold_kind"), want))
+    elif reason == "source-clean-landed":
+        serr = _source_clean_landed_error(event, state, current)
+        if serr:
+            return serr
     elif reason == "subsumed":
         if not state.get("verdict_ref") or not state.get("repo_id"):
             return "subsumed needs an approved verdict on a readable repository"
@@ -1804,9 +2004,11 @@ def _close_event_error(event, state, current=None, verdicts=None,
         if not dispatches._TOKEN.fullmatch(confirmation_recipient):
             return "confirmation recipient binding is malformed"
         if not dispatches._TOKEN.fullmatch(original_family) \
-                or not dispatches._TOKEN.fullmatch(confirmation_family) \
-                or original_family == confirmation_family:
+                or not dispatches._TOKEN.fullmatch(confirmation_family):
             return "subsumed needs two distinct canonical identity families"
+        # ONE FAMILY IS DECIDED BELOW, once the confirmation is read off the
+        # ledger: only the non-author rule admits it.
+        same_family = original_family == confirmation_family
         err = dispatches._family_evidence_error(
             event.get("original_family_evidence"), original_author,
             original_family, event.get("original_family_anchor"))
@@ -1872,6 +2074,18 @@ def _close_event_error(event, state, current=None, verdicts=None,
                 or confirmation.get("verdict_ref") != confirmation_ref:
             return "confirmation fields do not match the standing review verdict"
         from . import landreq
+        # A SAME-FAMILY CONFIRMATION REPLAYS ONLY BY THE NON-AUTHOR RULE: the
+        # standing verdict's recorded tier admitted its reader by its model,
+        # and the reader wrote no round of this chain, over this fold. Replay
+        # reads the recorded tier and no policy; the writer re-derives it.
+        # Every confirmation recorded under a family-only policy is refused
+        # here exactly as before.
+        if same_family:
+            why = landreq.non_author_error(confirmation, (state,), current,
+                                           verdicts, verify=verify_families)
+            if why:
+                return ("subsumed needs two distinct canonical identity "
+                        "families, or a non-author's confirmation: %s" % why)
         epoch = dispatches.gate_epoch(current, verdicts)
         requirement = landreq.gate_requirement(
             confirmation, index=confirmation_index, epoch=epoch)
@@ -1997,9 +2211,71 @@ def _close_event_error(event, state, current=None, verdicts=None,
         row = (current or {}).get(event.get("id"))
         if not isinstance(row, dict):
             return "carried names a row this ledger does not carry"
+        # THE REVIEWED-PATCH RUNG (task/1484) records a MAPPING, not a
+        # witness, and its ledger half is judged by its own rule: its pair is
+        # (reviewed tip, patch tip), which the work-tip rungs below would read
+        # as a foreign tip, and carried's witnesses are never re-derived for
+        # it — their `git cherry` over the whole lane is exactly what these
+        # lanes fail. Its TRUNK binding is carried's, below. The mapping
+        # belongs to that mode alone.
+        twinned = event.get("close_proof_mode") \
+            == dispatches.REVIEWED_PATCH_IDENTITY
+        if twinned:
+            terr = dispatches._patch_twins_error(event, state)
+            if terr:
+                return terr
+        elif "patch_twins" in event:
+            return ("patch twins belong only to the %s mode"
+                    % dispatches.REVIEWED_PATCH_IDENTITY)
+        # THE CLOSE IS REPLAYED AGAINST THE TRUNK IT WAS MEASURED AGAINST,
+        # WHILE THAT TRUNK IS STILL HISTORY OF THIS ONE (task/3056). The
+        # recorded `closing_trunk_sha` is an immutable commit, so replaying the
+        # row's work onto it re-asks the question the close answered rather
+        # than a new one about whatever trunk became since -- which is what
+        # made every land re-run every carried close's `merge-tree`. Only a
+        # trunk that no longer HOLDS the measured commit (rewritten,
+        # force-moved) sends the close back to the head, exactly as before.
+        # The witnesses and their order are unchanged, so the proof-mode rung
+        # below still compares against the first witness that answered.
+        measured = str(event.get("closing_trunk_sha"))
+        held = dispatches._measured_trunk_is_history(
+            gitdir, measured, event.get("closing_trunk_ref"))
+        if held is None:
+            # AN UNREADABLE ANSWER REFUSES BY NAME and never picks a trunk for
+            # the row: guessing "still history" would keep a close whose trunk
+            # may be gone, and guessing "not" would re-derive it against a
+            # head the question was never about. A measured commit a COMPLETE
+            # repository no longer holds does not reach here -- it cannot be
+            # history, so it came back False and goes to the head. What
+            # refuses is git failing to answer, or an object an incomplete
+            # repository (shallow, partial, promisor) may never have fetched.
+            return ("carried could not ask whether %s, the trunk this close "
+                    "was measured against, is still history of %s — that "
+                    "answer is no longer readable here, which is not a "
+                    "finding that the work is absent"
+                    % (measured[:12], event.get("closing_trunk_ref")))
+        if twinned:
+            # THE MAPPING IS LIVE WHILE ITS TRUNK IS HISTORY, and only then
+            # (the codex review's P2 on task/1484). Every twin names a commit
+            # of the measured trunk, so while that commit is history of this
+            # trunk the recorded answer stands exactly as a carried witness's
+            # does. Once it is not — trunk moved or rewritten past it —
+            # carried falls back to the head; this rung cannot, because
+            # replay asks no git of the mapping, so the close is refused in
+            # carried's own words and a re-run measures the trunk that
+            # stands.
+            if held:
+                return None
+            return ("trunk no longer affirms it carries this cure — %s, the "
+                    "trunk this close was measured against, is no longer "
+                    "history of %s, and the patch twins name commits of that "
+                    "trunk alone, so they are not re-derived at the head; a "
+                    "carried close is live while its measured trunk is still "
+                    "history of this trunk"
+                    % (measured[:12], event.get("closing_trunk_ref")))
         carried, detail = dispatches.carriage_proof(
             row, current, dispatches._CarrierView(current), gitdir,
-            event.get("closing_trunk_ref"))
+            event.get("closing_trunk_ref"), measured=measured if held else None)
         if carried is not True:
             # A PROVEN CARRIED CLOSE STAYS PROVEN WHEN ITS OWN WORK REACHES
             # TRUNK (task/2863). The witnesses go silent for an ancestor tip
@@ -2011,14 +2287,14 @@ def _close_event_error(event, state, current=None, verdicts=None,
             # WEAKER STATE: the work is now literally in trunk's history and
             # the row returns to OPEN.
             #
-            # MEASURED BEFORE IT WAS BUILT: of the whole board, this is the
-            # ONLY mechanism that moves a carried close's fold answer. Every
-            # content-level advance -- trunk editing, deleting, re-adding or
-            # REVERTING a path the row touched -- leaves the answer alone,
-            # because the fallthrough to the history family catches it. And
-            # the trigger is not "this lane landed": anything DESCENDING from
-            # the reviewed tip reaching trunk makes that tip an ancestor, so
-            # a rule keyed on the lane would miss it.
+            # WHERE IT IS STILL REACHED. Replayed against its measured trunk, a
+            # close re-asks exactly the question it answered when it was
+            # minted, so trunk reaching the tip LATER cannot silence it there.
+            # This rung carries the rows that replay does not affirm: a close
+            # sent back to the head because trunk no longer holds its measured
+            # commit, and a close whose objects or view changed since. Anything
+            # DESCENDING from the reviewed tip reaching trunk makes that tip an
+            # ancestor, so a rule keyed on the lane would miss it.
             #
             # ONE PROBE, AND ONLY FOR A ROW THE WITNESSES COULD NOT AFFIRM.
             # It asks the recorded tip against the CURRENT trunk, so the cost
@@ -2042,8 +2318,9 @@ def _close_event_error(event, state, current=None, verdicts=None,
                     # as one would un-close a good row on a git that failed
                     # to run.
                     return ("carried could not re-ask whether %s has since "
-                            "become history of %s — the probe did not run, "
-                            "which is not a finding that the work is absent"
+                            "become history of %s — that answer is no longer "
+                            "readable here, which is not a finding that the "
+                            "work is absent"
                             % (pinned_tip[:12],
                                event.get("closing_trunk_ref")))
                 if reached is True:
@@ -2056,8 +2333,17 @@ def _close_event_error(event, state, current=None, verdicts=None,
                         return ("carried proof mode must name a witness (%s)"
                                 % "/".join(dispatches.CARRIED_WITNESSES))
                     return None
+            if not held:
+                return ("trunk no longer affirms it carries this work (%s) — "
+                        "%s, the trunk this close was measured against, is no "
+                        "longer history of %s, so it was re-derived at the "
+                        "head, and a carried close is live while its measured "
+                        "trunk is still history of this trunk"
+                        % (detail if isinstance(detail, str) else carried,
+                           measured[:12], event.get("closing_trunk_ref")))
             return ("trunk no longer affirms it carries this work (%s) — a "
-                    "carried close is only as live as its measurement"
+                    "carried close is live while its measured trunk is still "
+                    "history of this trunk"
                     % (detail if isinstance(detail, str) else carried))
         # The recorded pair must be the pair the re-derivation USED, or the
         # event is describing a different measurement than the one that
@@ -2103,8 +2389,10 @@ def _close_event_error(event, state, current=None, verdicts=None,
         # contains both halves of. `subsumed` captures its tier/gate answers and
         # re-verifies them live only at the writer, because "mutable roster or
         # policy drift must not resurrect an already-recorded terminal";
-        # `carried` re-measures on every replay because "a carried close is only
-        # as live as its measurement". chain-proof belongs with `carried`: its
+        # `carried` re-derives on every replay because "a carried close is live
+        # while its measured trunk is still history of this trunk" (task/3056:
+        # it is re-derived against that recorded trunk, and against the head
+        # once trunk no longer holds it). chain-proof belongs with `carried`: its
         # entire claim is that the DURABLE chain-plus-verdict record is the
         # proof, so a record the ledger no longer supports is not a stale
         # measurement, it is a false statement. The drift exposure is also
@@ -2335,6 +2623,20 @@ def _close_idempotent(reason, row, event):
         return row.get("closing_repo_id") == event.get("closing_repo_id") \
             and row.get("closing_trunk_ref") == event.get("closing_trunk_ref") \
             and row.get("close_evidence") == event.get("close_evidence")
+    if reason == "source-clean-landed":
+        # THE RETRY DOOR, WRITTEN AT BIRTH (task/3053), for the reason the
+        # two arms above record as the hole they shipped with. THE CLOSURE IS
+        # ITS EVIDENCE: the same repository and trunk ref, the same tip, the
+        # same hold and the same gate receipt. The moving trunk SHA is
+        # excluded as `landed` excludes it, and so is the evidence LINE — the
+        # ladder derives it from a measurement that names the pinned trunk,
+        # so a retry after trunk moved would otherwise read as a different
+        # closure. A retry naming a DIFFERENT gate or hold is one.
+        stable = ("closing_repo_id", "closing_trunk_ref", "reviewed_tip",
+                  "source_clean_hold_actor", "source_clean_hold_ts",
+                  "source_clean_gate", "source_clean_gate_head",
+                  "source_clean_gate_tree")
+        return all(row.get(key) == event.get(key) for key in stable)
     if reason == "subsumed":
         stable = ("confirmation_id", "confirmation_tip", "confirmation_ref",
                   "original_author", "confirmation_recipient",
@@ -2412,7 +2714,10 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
                          chain_gate_requirement=None, chain_attestation=None,
                          chain_authority_anchor=None,
                          compose_manifest=None, compose_gate=None,
-                         compose_landed_by=None, dry_run=False):
+                         compose_landed_by=None, source_clean_gate=None,
+                         source_clean_gate_head=None,
+                         source_clean_gate_tree=None, patch_twins=None,
+                         dry_run=False):
     """Append ONE proven `close` event without rewriting its verdict.
 
     landreq owns every live Git/liveness proof; this boundary re-validates
@@ -2585,7 +2890,17 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
                        ("report_ref", report_ref),
                        ("discharging_id", discharging_id),
                        ("discharging_tip", discharging_tip),
-                       ("discharge_tier", discharge_tier)):
+                       ("discharge_tier", discharge_tier),
+                       # THE GATE HALF of a source-clean close (task/3053):
+                       # the receipt the ladder found and the commit and tree
+                       # it names. The HOLD half is the lock's, stamped below
+                       # from the row it is holding.
+                       ("source_clean_gate", source_clean_gate),
+                       ("source_clean_gate_head", source_clean_gate_head),
+                       ("source_clean_gate_tree", source_clean_gate_tree),
+                       # THE REVIEWED-PATCH RUNG'S MAPPING (task/1484), which
+                       # the lock re-measures below before it binds.
+                       ("patch_twins", patch_twins)):
         if key in dispatches._CLOSE_STATE_FIELDS[reason] and value is not None:
             candidate[key] = value
     # The contradicted-withdrawal discharge proof, captured whole from the
@@ -2723,6 +3038,17 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
             from . import landreq        # DEFERRED — landreq imports us.
             candidate["close_hold_kind"] = landreq.recorded_hold_kind(row)
 
+        if reason == "source-clean-landed":
+            # THE HOLD IS THE LOCK'S, NEVER THE CALLER'S (task/3053) — the
+            # law `discharged` states about its tier. The ladder read the
+            # hold outside the lock; a release and a re-hold by another hand
+            # can land in between, and the terminal must record the hold that
+            # stands at the write. The anchor is stamped from the same bytes
+            # the validator below judges, so it cannot bind a stale half.
+            candidate["source_clean_hold_actor"] = row.get("hold_actor")
+            candidate["source_clean_hold_ts"] = row.get("hold_ts")
+            candidate["source_clean_anchor"] = _source_clean_anchor(candidate)
+
         # VALIDATE BEFORE RECONCILE. The idempotence
         # check below is an IDENTITY test, not a validator, and it used to be
         # the FIRST thing a retry met — so a payload the open-row door refuses
@@ -2815,6 +3141,47 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
                     str(candidate.get("discharging_tip") or ""):
                 return None, ("close does not bind: discharging tip does not "
                               "match the discharging row's reviewed tip")
+        if reason == "carried" and candidate.get("close_proof_mode") \
+                == dispatches.REVIEWED_PATCH_IDENTITY:
+            # THE MAPPING IS RE-MEASURED UNDER THE LOCK, the `discharged`
+            # shape: replay holds only the mapping's ledger half (and the
+            # trunk binding below), so this is the one place after the ladder
+            # where the twins are asked of git again, against the pinned trunk
+            # and the row as this lock reads it. A caller's mapping that
+            # differs from the measurement never binds.
+            if not dry_run and not txn.lock():
+                return None, "ledger unwritable (%s) — close NOT recorded" % path
+            # THE PIN IS PROVEN STILL TRUNK'S FIRST (the codex review's P2).
+            # The twins are measured against `closing_trunk_sha` alone, and a
+            # trunk moved or force-rewritten since the ladder pinned it no
+            # longer holds that commit: measured there, they would bind a
+            # cure trunk does not carry now. The proof is carried's replay
+            # binding, asked here under the lock rather than trusted from the
+            # pin.
+            held = dispatches._measured_trunk_is_history(
+                closing_repo_id, closing_trunk_sha, closing_trunk_ref)
+            if held is None:
+                return None, ("close does not bind: could not ask whether %s, "
+                              "the pinned trunk, is still history of %s — the "
+                              "reviewed-patch rung closes nothing on an "
+                              "unknown" % (str(closing_trunk_sha)[:12],
+                                           closing_trunk_ref))
+            if not held:
+                return None, ("close does not bind: %s, the trunk the patch "
+                              "twins were pinned to, is no longer history of "
+                              "%s — trunk moved or was rewritten after the "
+                              "pin, so re-run the close against the trunk "
+                              "that stands" % (str(closing_trunk_sha)[:12],
+                                               closing_trunk_ref))
+            from . import landreq        # DEFERRED — landreq imports us.
+            twins, why = landreq._reviewed_patch_twins(
+                closing_repo_id, row, closing_trunk_sha)
+            if twins is None:
+                return None, ("close does not bind: %s" % (
+                    why or "the reviewed-patch rung does not apply to this row"))
+            if twins != candidate.get("patch_twins"):
+                return None, ("close does not bind: the recorded patch twins "
+                              "are not the mapping git measures under the lock")
         err = dispatches._close_event_error(
             event, row, current=current, verdicts=verdicts,
             verify_families=reason == "subsumed" or build_landed)
@@ -2859,6 +3226,7 @@ def _record_close_proven(rid, reason, reviewed_tip, evidence=None,
         def finish():
             out = dispatches._apply(row, event, current=current, verdicts=verdicts)
             pk.event("dispatch-close", row["id"], reason)
+            dispatches.retire_review_pins(out)
             return out, None
         return txn.then(finish)
     return dispatches._ledger_write(attempt, path)

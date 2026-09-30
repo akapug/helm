@@ -146,6 +146,28 @@ class SilentDropTest(unittest.TestCase):
         f = silent_drop.scan_seat("codex")
         self.assertEqual(f["output_tokens"], 77)
         self.assertEqual(f["ts"], new_ts)
+        # the finding names the seat's own family, which the alert prints
+        self.assertEqual(f["family"], seat._seat_family("codex")[0])
+
+    def test_alert_text_names_family_not_codex(self):
+        """Defect 2: the alert text carries the seat's FAMILY (codex/gemini/etc),
+        not a hardcoded 'codex'. A gemini seat's drop must say "gemini
+        produced" not "codex produced"."""
+        f = {"seat": "gemini-2", "family": "gemini", "output_tokens": 40,
+             "session": SID, "ts": "2026-07-23T10:00:00Z"}
+        txt = silent_drop._alert_text(f)
+        self.assertIn("gemini produced 40 output_tokens", txt)
+        self.assertNotIn("codex produced", txt)
+
+    def test_alert_text_falls_back_when_the_family_is_unknown(self):
+        """A finding with no family still reads as a sentence and names no
+        vendor it cannot know."""
+        f = {"seat": "s", "output_tokens": 33,
+             "session": SID, "ts": "2026-07-23T10:00:00Z"}
+        txt = silent_drop._alert_text(f)
+        self.assertIn("this seat's model produced 33 output_tokens", txt)
+        self.assertNotIn("codex produced", txt)
+
 
     # -- the latch ----------------------------------------------------------
 
@@ -156,6 +178,48 @@ class SilentDropTest(unittest.TestCase):
         r2 = silent_drop.check(seats=["codex"], post=False)
         self.assertEqual(len(r2["alerted"]), 0)
         self.assertTrue(r2["findings"][0]["latched"])
+
+    def test_session_dedupe_same_drop_after_latch_expires(self):
+        """The silent-drop watchdog drops the SAME row twice (session "s1",
+        ts=T): once at 04:02Z and again at 04:17Z
+        identical event that should be deduped when the latch expires."""
+        # Mock scan() to return controlled findings with known session+ts.
+        finding_s1 = {
+            "seat": "codex", "output_tokens": 50,
+            "session": "s1", "ts": "2026-09-26T04:02:00Z",
+        }
+        def fake_scan(seats=None):
+            return [finding_s1]
+        # fake the clock: pass 1 at T (inside LATCH_TTL_S); pass 2 at T+TTL
+        T = 1_700_000_000   # literal epoch-seconds
+        TTL = 16 * 60       # literal: 16 minutes past LATCH_TTL_S (15 min)
+        call_no = [0]
+        def fake_time():
+            call_no[0] += 1
+            return T if call_no[0] == 1 else T + TTL
+        with mock.patch.object(silent_drop, 'scan', fake_scan), \
+                mock.patch.object(silent_drop.time, 'time', fake_time):
+            r1 = silent_drop.check(seats=["codex"], post=False)
+            self.assertEqual(len(r1["alerted"]), 1)   # first pass: alerts
+            r2 = silent_drop.check(seats=["codex"], post=False)
+            self.assertEqual(len(r2["alerted"]), 0)   # same drop, deduped
+            self.assertTrue(r2["findings"][0]["latched"])
+
+    def test_a_new_drop_in_the_same_session_still_alerts_after_the_latch(self):
+        """The dedupe is on the drop, not the session: a second, distinct drop
+        (a later ts) in the same session, found once the latch has expired,
+        is a new drop and alerts."""
+        drops = [{"seat": "codex", "output_tokens": 50, "session": "s1",
+                  "ts": "2026-09-26T04:01:02Z"}]
+        clock = [1_700_000_000]
+        with mock.patch.object(silent_drop, "scan", lambda seats=None: drops), \
+                mock.patch.object(silent_drop.time, "time", lambda: clock[0]):
+            r1 = silent_drop.check(seats=["codex"], post=False)
+            drops[0] = dict(drops[0], ts="2026-09-26T04:39:30Z")
+            clock[0] += 16 * 60
+            r2 = silent_drop.check(seats=["codex"], post=False)
+        self.assertEqual([len(r1["alerted"]), len(r2["alerted"])], [1, 1])
+        self.assertEqual(r2["alerted"][0]["ts"], "2026-09-26T04:39:30Z")
 
     def test_storm_suppresses_distinct_drops_per_seat(self):
         # attention-budget: a drop-STORM (distinct-ts drops within LATCH_TTL)
@@ -178,8 +242,11 @@ class SilentDropTest(unittest.TestCase):
         self.assertEqual(len(r["alerted"]), 1)          # would alert
         self.assertFalse(r["findings"][0]["latched"])
         st = silent_drop._state_path()
-        self.assertFalse(os.path.exists(st) and
-                         json.load(open(st)).get("codex"),
+        latch = None
+        if os.path.exists(st):
+            with open(st, encoding="utf-8") as fh:
+                latch = json.load(fh).get("codex")
+        self.assertFalse(os.path.exists(st) and latch,
                          "a dry run wrote the latch")
 
     def test_a_real_alert_still_fires_after_a_dry_run(self):
@@ -201,7 +268,8 @@ class SilentDropTest(unittest.TestCase):
         silent_drop.check(seats=["codex"], post=False)   # real latch
         silent_drop.check(seats=["codex"], dry=True)
         silent_drop.check(seats=["codex"], dry=True)
-        st = json.load(open(silent_drop._state_path()))
+        with open(silent_drop._state_path(), encoding="utf-8") as fh:
+            st = json.load(fh)
         self.assertEqual(st["codex"].get("suppressed", 0), 0,
                          "dry passes inflated the storm count")
 
@@ -223,12 +291,23 @@ class SilentDropTest(unittest.TestCase):
              "ts": "2026-07-23T10:00:00Z", "suppressed_since_last": 7}
         self.assertIn("+7 more drops", silent_drop._alert_text(f))
 
+    def test_alert_text_does_not_self_wake(self):
+        """Defect 3: the alert must NOT wake the dropped seat. A "@<seat>" in
+        the alert text wakes every @name in it, so a dropped seat gets woken
+        by its own alert and can drop again: a wake loop. The alert stays
+        addressed to the integrator (integrator_addressed handles that)."""
+        f = {"seat": "gemini-2", "family": "gemini", "output_tokens": 40,
+             "session": SID, "ts": "2026-07-23T10:00:00Z"}
+        txt = silent_drop._alert_text(f)
+        self.assertNotIn("@gemini-2", txt)
+        self.assertIn("SILENT-DROP detected on gemini-2:", txt)
+
     def test_alert_text_names_seat_tokens_and_integrator(self):
         with _integrator_env(None), _roster(DEFAULT, "codex"):
             txt = silent_drop._alert_text(
                 {"seat": "codex", "output_tokens": 103, "session": SID,
                  "ts": "2026-07-23T10:00:00Z"})
-        self.assertIn("@codex", txt)
+        self.assertIn("detected on codex:", txt)
         self.assertIn("@" + DEFAULT, txt)
         self.assertIn("103", txt)
         self.assertIn("SILENT-DROP", txt)
@@ -290,21 +369,23 @@ class TheAlertAddressesTheResolvedIntegratorTest(unittest.TestCase):
         with _integrator_env("seat-lead"), \
                 _roster("seat-lead", DEFAULT, "codex"):
             txt = silent_drop._alert_text(self.F)
-        self.assertTrue(txt.startswith("@seat-lead @codex SILENT-DROP"), txt)
+        self.assertTrue(txt.startswith("@seat-lead SILENT-DROP detected on codex:"), txt)
         self.assertNotIn("@" + DEFAULT, txt)
         self.assertNotIn("UNROSTERED", txt)
 
     def test_the_DEFAULT_applies_when_none_is_configured(self):
         with _integrator_env(None), _roster(DEFAULT, "codex"):
             txt = silent_drop._alert_text(self.F)
-        self.assertTrue(txt.startswith("@%s @codex SILENT-DROP" % DEFAULT),
+        self.assertTrue(txt.startswith("@%s SILENT-DROP detected on codex:"
+                        % DEFAULT),
                         txt)
 
     def test_NOTHING_resolves_the_alert_still_goes_and_says_so(self):
         with _integrator_env(None), _roster("codex"):
             txt = silent_drop._alert_text(self.F)
-        # POSITIVE CONTROL: the whole alert is there, addressed to the seat
-        self.assertTrue(txt.startswith("@codex SILENT-DROP detected"), txt)
+        # POSITIVE CONTROL: the whole alert is there, addressed to the integrator
+        # (or [UNROSTERED] when none resolves) and names the seat without an @
+        self.assertTrue(txt.startswith("SILENT-DROP detected on codex:"), txt)
         self.assertIn("[UNROSTERED: no integrator could be addressed", txt)
         self.assertNotIn("-integrator ", txt)
 

@@ -567,6 +567,27 @@ def _own_seat():
         return ""                     # unproven authorship, never a traceback
 
 
+def _expert_harness(sid):
+    """The harness stamp for this handoff's registry entry: "claude" ONLY for
+    a native-Claude runtime, because `helm session ask` prints a bare
+    `claude --resume <sid>`. A CLAUDE session var names the claude-code
+    HARNESS, not the model behind it: every helm proxy seat (codex, qwen27,
+    bonsai, kimi, ...) runs claude-code pointed at CLIProxyAPI with its own
+    CLAUDE_CONFIG_DIR, so it carries CLAUDE_CODE_SESSION_ID too: every live
+    proxy-seat process does, and none carries CODEX_SESSION_ID. The runtime
+    seam's native-Claude derivation is the one predicate that tells them apart.
+    """
+    h = home.session_harness(sid)
+    if h != "claude":
+        return h
+    from . import seats_runtime
+    rt = seats_runtime._runtime_environment()
+    if rt.get("family") == "claude" and rt.get("backend") == "native":
+        return "claude"
+    return "claude-proxy" if rt.get("backend") == "proxy" or \
+        os.environ.get("ANTHROPIC_BASE_URL") else None
+
+
 def _matches_own_seat(path, own, text=None):
     """True when one journal snapshot carries a matching frontmatter seat."""
     try:
@@ -667,6 +688,33 @@ def write_entry(text, project, sid):
         "---", "", text.rstrip(), ""]
     pk.atomic_write(path, "\n".join(body))
     pk.event("handoff.write", sid or project, project + " — " + head)
+    # The registry must never fail the write itself: the handoff is the
+    # durable record, and a registry hiccup (a path that is a directory,
+    # an unwritable _global, or a contended lock) is one stderr line,
+    # never a refused entry. The handoff path takes the experts lock BOUNDED
+    # (LOCK_NB polled for 2 s) so a stale or contended holder can never
+    # block an automated handoff — a lost race degrades to one line and the
+    # journal entry (the durable record) still lands, `write_entry` returning
+    # its path either way.
+    subdomains = [ln[7:].strip()
+                  for ln in (line.lstrip() for line in text.splitlines())
+                  if ln.startswith("domain:")]
+    lock_fd = None
+    try:
+        from . import session
+        harness, seat = _expert_harness(sid), _own_seat()
+        with session._experts_lock_bounded() as lock_fd:
+            if lock_fd is not None:
+                ex = session._experts(strict=True)
+                session._upsert_expert_body(ex, sid, project, path,
+                                            subdomains, harness, seat)
+    except Exception as e:
+        print("helm handoff: expert registry refresh failed: " +
+              str(e), file=sys.stderr)
+    else:
+        if lock_fd is None:
+            print("helm handoff: experts registry busy; not refreshed",
+                  file=sys.stderr)
     return path, []
 
 

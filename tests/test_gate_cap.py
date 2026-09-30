@@ -41,7 +41,7 @@ class WorldNarrativeGuardTest(unittest.TestCase):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         paths = (
             "helm/gate.py", "tests/test_gate_cap.py", "helm/notify.py",
-            "helm/telegram.py", "docs/VERBS.md", "helm/cli.py",
+            "helm/telegram.py", "docs/VERBS.md", "helm/cli_help.py",
         )
         texts = {}
         for path in paths:
@@ -123,14 +123,12 @@ class WorldNarrativeGuardTest(unittest.TestCase):
             "helm/telegram.py": texts["helm/telegram.py"].split('"""', 2)[1],
             "docs/VERBS.md": between(
                 "docs/VERBS.md", "### `helm telegram", "\n### "),
-            # LAST occurrence, named rather than defaulted: both markers appear
-            # twice in cli.py — once in a short registry three hundred lines
-            # above, once around the verb help text WORLD actually translated.
-            # `split(...,1)` took the first pair and produced a SEVENTY-FIVE
-            # character region, so the anchor missed and the arm blamed the file.
-            "helm/cli.py": between(
-                "helm/cli.py", '    "telegram":', '\n    "dispatch":',
-                occurrence="last"),
+            # The verb help text WORLD translated lives in cli_help.py, where
+            # each marker occurs once. cli.py's dispatch table spells the same
+            # two keys, so the region is read from the help module by name and
+            # `between` still refuses a marker that appears twice.
+            "helm/cli_help.py": between(
+                "helm/cli_help.py", '    "telegram":', '\n    "dispatch":'),
         }
         # CONTROL: every bounded site must keep its translated topology or
         # uncertainty. This proves the scan saw the intended narrative.
@@ -166,8 +164,8 @@ class WorldNarrativeGuardTest(unittest.TestCase):
                                  "one daemon common to every pane"),
             "docs/VERBS.md": ("may span daemon generations",
                               "no single daemon is assumed"),
-            "helm/cli.py": ("may span daemon generations",
-                            "not one daemon common to every pane"),
+            "helm/cli_help.py": ("may span daemon generations",
+                                 "not one daemon common to every pane"),
         }
         # NARRATIVE MATCHING IS WHITESPACE-INSENSITIVE, and both directions of
         # this check needed it. Prose in a docstring is WRAPPED, so a phrase
@@ -848,6 +846,52 @@ class PerHostCapTest(CapBase):
             self.pane(90007)
             with mock.patch("builtins.open", denied):
                 self.assertEqual(gate._agent_pane_pids(self.proc), [90007])
+                self.assertEqual(gate.suite_cap(self.proc), gate.SUITE_CAP)
+
+    def _print_agent(self, pid, argv):
+        """A claude agent in print mode, in the shape an overnight eval runs
+        inside a container: comm claude, argv carrying -p or --print."""
+        self.pane(pid)
+        with open(os.path.join(self.proc, str(pid), "cmdline"), "wb") as f:
+            f.write(b"".join(a.encode() + b"\0" for a in argv))
+
+    def test_a_PRINT_MODE_agent_is_a_job_not_a_pane(self):
+        """MEASURED: `claude -p` eval agents in containers made a
+        build host read "carries agent panes", cutting its whole-suite cap
+        from 16 to 2 and refusing a land gate five times. A print-mode agent
+        has no one at its keyboard, so it does not hold the pane cap."""
+        self.paneless()
+        with mock.patch.object(gate, "_online_cpu_count", return_value=32):
+            self.assertEqual(gate.suite_cap(self.proc), 16)          # control
+            for pid, argv in (
+                    (90201, ("claude", "--model", "local", "-p", "task")),
+                    (90202, ("claude", "--print", "task")),
+                    (90203, ("claude", "--print=task"))):
+                self._print_agent(pid, argv)
+            self.assertEqual(gate._agent_pane_pids(self.proc), [])
+            self.assertEqual(gate.suite_cap(self.proc), 16)
+            # an interactive agent on the same box still pins the cap
+            self.pane(90204)
+            self.assertEqual(gate._agent_pane_pids(self.proc), [90204])
+            self.assertEqual(gate.suite_cap(self.proc), gate.SUITE_CAP)
+
+    def test_an_agent_whose_argv_cannot_be_read_stays_a_pane(self):
+        """The fail direction: argv that won't read proves nothing about the
+        mode, so the agent keeps the pane cap rather than releasing it."""
+        self.paneless()
+        self._print_agent(90211, ("claude", "-p", "task"))
+        real_open = open
+
+        def denied(path, *a, **kw):
+            if str(path).endswith("90211/cmdline"):
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_open(path, *a, **kw)
+
+        self.assertTrue(gate._print_mode_agent(90211, self.proc))   # control
+        with mock.patch.object(gate, "_online_cpu_count", return_value=32):
+            self.assertEqual(gate.suite_cap(self.proc), 16)          # control
+            with mock.patch("builtins.open", denied):
+                self.assertFalse(gate._print_mode_agent(90211, self.proc))
                 self.assertEqual(gate.suite_cap(self.proc), gate.SUITE_CAP)
 
     def test_a_build_host_full_of_protected_STRANGERS_still_raises(self):

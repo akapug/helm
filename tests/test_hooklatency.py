@@ -38,12 +38,14 @@ class HookLatencyTest(unittest.TestCase):
     def pair(self, milliseconds=1, outcome="completed"):
         rows = []
         ticks = iter([1_000_000, 1_000_000 + int(milliseconds * 1_000_000)])
-        # THE FIXTURE CAPTURES ROWS INSTEAD OF WRITING THEM, so it holds BOTH
-        # writers: an incident outcome is also copied to the incidents stream
-        # (`_retain`), and a copy on disk of rows an arm then edits would be a
+        # THE FIXTURE CAPTURES ROWS INSTEAD OF WRITING THEM, so it holds EVERY
+        # writer: an incident outcome is also copied to the incidents stream
+        # (`_retain`), every kept END to the window stream (`_window`,
+        # task/3259), and a copy on disk of rows an arm then edits would be a
         # second, contradicting witness the arm never asked for.
         with patch.object(latency, "append", lambda row: rows.append(dict(row)) or True), \
              patch.object(latency, "_retain", lambda start, end: None, create=True), \
+             patch.object(latency, "_window", lambda end, box: None, create=True), \
              patch.object(latency.time, "monotonic_ns", lambda: next(ticks)):
             with latency.event_scope("standalone"):
                 latency.bind("fake-session")
@@ -436,6 +438,7 @@ class HookLatencyTest(unittest.TestCase):
         legacy = [dict(r) for r in rows]
         for r in legacy:
             del r["blocked_in"]
+            del r["fold_miss"]
             r["schema"] = 1
         self.put(legacy)
         got = latency.report()
@@ -582,20 +585,21 @@ class HookLatencyTest(unittest.TestCase):
         # UNCONDITIONAL: the loops below assert nothing if this table is
         # empty or loses a site, and losing a site is exactly the regression
         # this arm exists to catch.
+        # FIVE SITES: the two handler docstrings are the internal synopses,
+        # and each names every window flag, as the public ones do.
         sites = {
             "cli.py verb help": cli._VERB_HELP["hooks"],
             "hooks.py usage": hooks._USAGE,
             "hooks latency usage": latency.cmd.__doc__ or "",
+            "cmd_hooks docstring": hooks.cmd_hooks.__doc__ or "",
             "docs/VERBS.md": doc,
         }
-        self.assertEqual(len(sites), 4,
+        self.assertEqual(len(sites), 5,
                          "the synopsis table changed size, so this arm is no "
                          "longer checking the population it was written for")
         # MUST-HIT: every site must mention the verb at all, or an empty
         # string would satisfy the flag check below by containing nothing.
         for name, text in sites.items():
-            if name == "hooks latency usage":
-                continue
             # SPELLED PER SITE, deliberately: cli.py renders the subverb
             # inside a `hooks [a|b|latency ...]` alternation while hooks.py
             # and the docs write it out. The must-hit asks that each site
@@ -604,13 +608,59 @@ class HookLatencyTest(unittest.TestCase):
             self.assertIn("latency", text,
                           "%s does not document the verb at all" % name)
         for name, text in sites.items():
-            if name == "hooks latency usage":
-                continue
-            for flag in ("--since", "--until"):
+            for flag in ("--since", "--until", "--hours"):
                 self.assertIn(flag, text,
                               "%s does not name %s, so a reader who checks "
                               "that surface learns the verb has no window"
                               % (name, flag))
+
+    def test_EVERY_HOOKS_SUBVERB_the_entry_names_is_named_at_every_site(self):
+        """`helm hooks` bare refuses with hooks._USAGE, so that text is the
+        grammar a caller who typed the verb bare reads, and it named five of
+        the entry's six subverbs: `run <EVENT>` was in the entry alone. Every
+        subverb the entry's usage names is named by that bare usage, by the
+        handler's docstring and by docs/VERBS.md as well.
+
+        The subverbs are read off the entry HERE, by regex, and not through
+        the root listing's own head parser, so this arm does not only agree
+        with the helper whose output it would be checking."""
+        import re
+        from helm import cli, hooks
+        root = os.path.dirname(os.path.dirname(os.path.abspath(hooks.__file__)))
+        with io.open(os.path.join(root, "docs", "VERBS.md"),
+                     encoding="utf-8") as fh:
+            doc = fh.read()
+        usage, flat = cli._VERB_HELP["hooks"].split(" — ", 1)[0], None
+        while flat != usage:
+            flat, usage = usage, re.sub(r"\[[^][]*\]", "", usage)
+        subs = [form.split()[0]
+                for form in re.sub(r"^hooks ", "", usage).split("|")]
+        # MUST-HIT: the subverb this arm was written for, and the one the
+        # docs named nowhere, are in the population; none is read twice
+        self.assertIn("run", subs)
+        self.assertIn("preflight", subs)
+        self.assertEqual(len(subs), len(set(subs)), subs)
+        sites = {"hooks._USAGE": hooks._USAGE,
+                 "cmd_hooks docstring": hooks.cmd_hooks.__doc__ or "",
+                 "docs/VERBS.md": doc}
+
+        def unnamed(sub, name, text):
+            if name == "cmd_hooks docstring":   # `hooks a | b`, no `helm`
+                return not re.search(r"(?:^hooks|\|)\s+%s(?![\w-])"
+                                     % re.escape(sub), text)
+            return "helm hooks %s" % sub not in text
+
+        # POSITIVE CONTROL on the check itself, per site: a text that names
+        # only `install` reports `run` unnamed and `install` named
+        for name, spelled in (("hooks._USAGE", "helm hooks install [--dry]"),
+                              ("cmd_hooks docstring", "hooks install [--dry]"),
+                              ("docs/VERBS.md", "`helm hooks install`")):
+            self.assertEqual((unnamed("run", name, spelled),
+                              unnamed("install", name, spelled)),
+                             (True, False), name)
+        missing = [(name, sub) for sub in subs
+                   for name, text in sites.items() if unnamed(sub, name, text)]
+        self.assertEqual(missing, [])
 
     def test_native_report_rejects_unrepresentable_numeric_rows_without_mutation(self):
         cases = []
@@ -1306,3 +1356,56 @@ class HookLatencyTest(unittest.TestCase):
         later = (datetime.datetime.fromtimestamp(now / 1e9, datetime.timezone.utc)
                  - datetime.timedelta(hours=22)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.assertEqual(0, latency.report(since=later)["counts"]["timeout"])  # control
+
+    def test_the_hours_window_keeps_two_hours_and_the_raw_readings_at_END(self):  # noqa: VACUOUS_ASSERTION — the unconditional positives are the reach past 2 h, the three Stop counts and the exact two timed-out stages; the loop only types the readings of those two rows
+        """task/3259 -- THE RAW STREAM KEEPS MINUTES. Its three generations
+        hold minutes at fleet rate, so a question over two hours of hooks had
+        no rows to be answered from. Three simulated hours of Stop hooks, one
+        every ten minutes, go through the REAL writer with the raw stream
+        shrunk so it holds minutes, then one timed-out Stop on a box whose cpu
+        count is no real count. `helm hooks latency --hours 2` reaches back
+        past two hours, counts each of the twelve Stops inside them, and lists
+        the timeout's two rows (its stop-guard span and the event span) with
+        the three raw readings, each typed or null."""
+        start = time.time_ns() - 185 * 60 * 10**9
+        stamp, mono = [start], [10**12]
+
+        def monotonic():
+            mono[0] += 1_000_000                # every reading 1 ms later
+            return mono[0]
+
+        with patch.object(latency, "MAX_BYTES", 2048), \
+                patch.object(latency.time, "time_ns", lambda: stamp[0]), \
+                patch.object(latency.time, "monotonic_ns", monotonic):
+            for step in range(19):              # minutes 0 .. 180
+                stamp[0] = start + step * 600 * 10**9
+                with latency.event_scope("standalone", "Stop"), \
+                        latency.stage("stop-guard"):
+                    pass
+            stamp[0] = start + 184 * 60 * 10**9
+            with patch.object(os, "cpu_count", lambda: 1 << 70):
+                self._timeout_event()
+            raw = latency.report()["coverage"]["retained_time_range_hours"]
+        self.assertLess(raw, 1.0, "fixture: the raw stream kept the whole "
+                                  "run, so this arm shows nothing about "
+                                  "retention")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(0, cli.main(["hooks", "latency", "--hours", "2",
+                                          "--json"]))
+        got = json.loads(out.getvalue())
+        self.assertGreaterEqual(got["reach_hours"], 2.0, got)
+        table = {(g["event"], g["stage"]): g for g in got["hooks"]}
+        # MINUTES 70 .. 180 are the last two hours: twelve completed Stops,
+        # and the timed-out one is a thirteenth row that is not measured.
+        self.assertEqual((12, 13, 12),
+                         (table["Stop", "event"]["n"],
+                          table["Stop", "event"]["rows"],
+                          table["Stop", "stop-guard"]["n"]))
+        self.assertEqual(["event", "stop-guard"],
+                         sorted(t["stage"] for t in got["timeouts"]))
+        for t in got["timeouts"]:
+            self.assertIsNone(t["cpus"], "a cpu count no box has was stored")
+            self.assertIn(type(t["load1"]), (float, int, type(None)))
+            self.assertIn(type(t["psi_cpu_some_avg10"]),
+                          (float, int, type(None)))

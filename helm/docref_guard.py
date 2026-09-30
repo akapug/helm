@@ -100,6 +100,12 @@ def _added_path(line):
 
 
 LEDGER_CITED = {
+    "11a9a9574b18": "land-request row id (a DeepSeek review row HELD at "
+                "2026-09-24T18:58:02Z by a call that started 171 s before the "
+                "hold and was moved to the background) — cited in "
+                "helm/holdbackfill.py and tests/test_hold_actor_backfill.py as "
+                "the measured case that neither the window nor a success line "
+                "can rule a rival writer out. task/3131.",
     "e43ec4309e89": "land-request row id (codex-3 FIX verdict 2026-08-12 on "
                 "lane store-keys-stay-discriminating; CLOSED_WITHDRAWN "
                 "2026-09-13, its reviewed tip never reached origin/main) — "
@@ -513,9 +519,9 @@ LEDGER_CITED = {
                 "helm/wiring.py",
     "97d8899a": "FIX dispatch id (contrary-honored-on-every-surface "
                 "lane) — the composite honored+stalled row that split the "
-                "surfaces again; cited by landreq.honored_display and its JS "
-                "twin lrHonored as the incident the shared predicate exists "
-                "to end",
+                "surfaces again; cited by landreq.honored_display (and, until "
+                "task/3643 retired it, its JS twin lrHonored) as the incident "
+                "the shared predicate exists to end",
     "d0c72ad9": "land-request row id (chat-restore-journal-r1) — a #177 "
                 "ladder CONFIRMATION round the contrary classifier stamped "
                 "CONTRARY (the hydra); cited by "
@@ -546,8 +552,6 @@ LEDGER_CITED = {
                     "CONFIRMATION_POLARITIES constant it forced",
     "9e237a33": "dispatch row id (sender-attribution incident)",
     "1bc1b2c2": "dispatch row id (aspublic-test-fixtures lane)",
-    "5aa24f98": "land-request row id — the predecessor the superseded ladder "
-                "refused even with its chain head LANDED (chain-folding lane)",
     "c3b19436": "land-request row id — the unmeasurable parent of the "
                 "chain-folding lane's live fixture",
     "f5436c21": "land-request row id — the gated child of that same fixture",
@@ -609,6 +613,18 @@ LEDGER_CITED = {
                         "lane (exact tip f7f4ede7, 13 blockers) — cited by "
                         "rowstate's lifecycle vocabulary as the verdict whose "
                         "blockers this cure round answers",
+    "b336dfb43845": "dispatch row id (review send, task/3511 incident) — the "
+                    "FIRST row that named lane 'claude' when its tip sat on "
+                    "a different lane's branch; cited in "
+                    "helm/dispatches.py `_review_lane_refusal` as the first "
+                    "measured case where the lane field was wrong for "
+                    "anything keyed by lane, motivating the tip-holds-lane "
+                    "guard. A ROW id, never a commit.",
+    "04a7cfe64327": "dispatch row id (review send, task/3511 incident) — the "
+                    "SECOND row of the same incident, same wrong lane name, "
+                    "cited beside b336dfb43845 in "
+                    "helm/dispatches.py `_review_lane_refusal`. A ROW id, "
+                    "never a commit.",
 }
 
 # Load-bearing CONTENT identities. Each key is the exact 40-hex value from
@@ -636,6 +652,15 @@ PATCH_IDS = {
 # matching any scanned token is a stale exemption and fails the suite, so the
 # list cannot accrete.
 SKIP = {
+    "6bbd95ee977941e497c48be27c254128": "NOT A SHA — systemd's catalogued "
+        "MESSAGE_ID for SD_MESSAGE_SLEEP_START (the record systemd-sleep "
+        "writes just before the host sleeps). helm/proxywatch.py matches the "
+        "journal on it to place a host suspend against a seat's turn window "
+        "(task/3693); it is a 128-bit id that happens to be hex.",
+    "8811e6df2a8e40f58a94cea26f8ebf14": "NOT A SHA — systemd's catalogued "
+        "MESSAGE_ID for SD_MESSAGE_SLEEP_STOP (the record systemd-sleep "
+        "writes on the way back from a sleep), matched by helm/proxywatch.py "
+        "beside SLEEP_START (task/3693).",
     "7f454c46": "NOT A SHA AT ALL — the four ELF MAGIC BYTES, cited in "
                 "helm/hooks.py's `_elf_launch` as the literal header a file "
                 "must start with. It matches the rung's 7-40 hex pattern by "
@@ -697,6 +722,12 @@ SKIP = {
     # trunk permanently and needs no exemption.)
     "5905f65": "landed_state exhibit: the lane tip whose patch landed as "
                "ba5e740 under a different sha",
+    # a DATA VALUE the supervisor compares, not a citation: the commit of the
+    # cursor bridge checkout (its own repository, never this one) that the
+    # catalog vetted; seat_sidecar.vetting_gaps reads it off the checkout.
+    "a34a5ad34790c19646edd246c2d44dcb7efb637f": "the cursor family's "
+        "sidecar `pin` in seat_catalog: a commit in the vendored bridge "
+        "checkout's repository, compared against that checkout's HEAD",
 }
 
 

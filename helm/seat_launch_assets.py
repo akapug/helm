@@ -1249,13 +1249,12 @@ def disqualified_route_reason(block, fam):
     """Why this config maps a model the family REFUSES, else None.
 
     THE DISQUALIFICATION LIST IS ONLY A LIST UNTIL SOMETHING READS IT AGAINST
-    THE FILE. Four ids were refused for reasons no pricing field and no
-    latency table carries — two train on submitted data, one routes to a
-    RANDOM free model per call (which makes the reviewing family unknowable
-    and silently voids the cross-family guarantee a review lane exists to
-    provide), one cannot call a tool. A reader who re-adds one off a benchmark
-    ranking would get a config that starts, answers, and quietly does the
-    thing the list was written to prevent.
+    THE FILE. Its ids are refused for reasons no pricing field and no latency
+    table carries — some train on submitted data, one cannot call a tool, one
+    admits only listed apps. A reader who re-adds one off a benchmark ranking
+    would get a config that starts, answers, and quietly does the thing the
+    list was written to prevent. (The free-models router is not on it: it is
+    the or-free model class, mapped as a route — `seat_catalog.model_class`.)
 
     The reason is carried verbatim from the catalog, because the refusal has
     to teach or the next reader deletes the row instead of the route.
@@ -1399,6 +1398,8 @@ def family_start_refusal(family, fam, config_text, listing=_UNPROBED):
     without a network.
     """
     from .seat_catalog import zero_cost_refusal
+    if fam.get("activation_refusal"):
+        return fam["activation_refusal"], ()
     if not fam.get("model_providers"):
         return None, ()
     _prefix, blocks = _top_blocks(config_text)
@@ -1447,9 +1448,31 @@ def proxy_config_plan(path, family, seat=None):
         # serve what it is selected for. One merge per eligible provider, each
         # targeting its own name; every other block is identical across the
         # passes, so they compose and the result does not depend on order.
-        eligible = _eligible_providers(
-            by_key.get("openai-compatibility", ""), family, fam)
-        merged = old
+        # THE OFF-PEAK GATE IS PART OF THE DESIRED STATE (helm/offpeak.py): a
+        # provider whose pool row declares a billing window carries the
+        # gate's marked `disabled: true` while its vendor's peak is on and
+        # loses it when the window opens, so every door that plans a config
+        # -- `seat up`, the */3 reconciler, a reboot's respawn -- starts the
+        # proxy on the flag the clock calls for. A closed provider is not a
+        # route, so when the gate has closed EVERY route the plan is the
+        # gated text itself, and the refusal an empty route set raises is
+        # kept for a config that is broken with every gate open.
+        from . import offpeak
+        gated = offpeak.apply_gate(old, family, fam)
+        compat = dict(_top_blocks(gated)[1]).get("openai-compatibility", "")
+        try:
+            eligible = _eligible_providers(compat, family, fam)
+        except ValueError:
+            reopened = offpeak.apply_gate(old, family, fam, closed=())
+            if reopened == gated:
+                raise
+            _eligible_providers(dict(_top_blocks(reopened)[1]).get(
+                "openai-compatibility", ""), family, fam)
+            return {"old": old, "text": gated, "changed": old != gated,
+                    "alias_drift": None,
+                    "opaque": opaque_provider_sections(compat)}
+        by_key["openai-compatibility"] = compat
+        merged = gated
         for info, _item, index in eligible:
             generated = _config_yaml_key(
                 port, token, info["provider"], info["base_url"],
@@ -1702,7 +1725,7 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     IS the mixed-fleet mechanism; the probe agents minted beside this line
     carry the per-model pins instead."""
     from .seat_catalog import (denied_tools, feedback_env_words,
-                               instance_launch_model, taught_window,
+                               instance_launch_model, launch_window,
                                workflow_cap_env_words)
     from . import seats_identity
     fam = FAMILIES[family]
@@ -1778,8 +1801,9 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     # the family max_context stays the default for every unlisted model.
     # A family `context_budget` then narrows that window (kimi 1M -> 380k,
     # task/2944), through the one helper the autocompact gauge reads too.
-    _ctx = taught_window(fam, fam.get("model_context", {}).get(model)
-                         or fam.get("max_context"))
+    # launch_window is that reading, shared with the lite profile's
+    # settings.json pin (seat_catalog.profile_env).
+    _ctx = launch_window(fam, model)
     if _ctx:
         ctxenv += " CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d" % _ctx
         ctxenv += " CLAUDE_CODE_AUTO_COMPACT_WINDOW=%d" % _ctx
@@ -1805,6 +1829,15 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     # FEEDBACK_ENV): the pair rides AFTER ctxenv so the signing env and the
     # window knobs above stay byte-identical, and BEFORE ` claude` so it is
     # environment, never an argument the variadic --disallowedTools could eat.
+    # NO SEAT MINTS A TRAFFIC SWITCH. CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+    # and DISABLE_TELEMETRY on its own, remove the Monitor tool from the tool
+    # list Claude Code sends (measured at claude 2.1.284 by capturing the
+    # request body: 124 tools with neither, 121 with either, Monitor and
+    # PushNotification among the three missing), and a seat without Monitor
+    # can arm no beacon, so nothing wakes it. What the switch would spare a
+    # per-request-billed family is unmeasured (the allowlist entry in
+    # tests/test_seat_env_allowlist.py says so), so it cannot buy that loss.
+    # tests/test_seat.py pins the absence on every family's launch line.
     ctxenv += feedback_env_words()
     # A FAMILY-DECLARED SYSTEM LINE, for a model whose defect is in what it
     # WRITES rather than in what it costs (seat_catalog `system_line`).
@@ -1916,6 +1949,61 @@ def _link_skills(cdir):
     elif action == "unavailable":
         print("helm seat: skills hub unavailable (%s) — %s has NO skills "
               "until it is restored" % (detail, cdir), file=sys.stderr)
+
+
+def _seat_label(family, d):
+    """The census label of the seat whose dir is `d` — the exact spelling
+    skillsync.config_dirs gives it ('seat:<family>' or
+    'seat:<family>/<instance>'), so the mint door and `helm tidy` plan one
+    seat under one name."""
+    if os.path.basename(os.path.dirname(d)) == "instances":
+        return "seat:%s/%s" % (family, os.path.basename(d))
+    return "seat:" + family
+
+
+def _seat_full_agent(cdir, label, workdir=None):
+    """A seat is a full agent (task/3089): its config dir gets the host's
+    global instructions, the approval of its workdir's project `.mcp.json`
+    servers (projectmcp.reconcile, task/2698: Claude Code runs none of them
+    until approved, and a seat has nobody to answer the prompt) and the
+    canonical MCP servers at birth, through the
+    SAME primitives `helm tidy` reconciles with (skillsync.link_instructions,
+    envtidy.plan_mcp_home + apply_mcp_home) — so a new seat is born full, and
+    tidy's dry run of a just-minted seat reports nothing to do.
+
+    Best-effort like the skills link: every miss is ONE stderr line naming
+    the dir and the repair, never fatal, and the quiet answers stay quiet (no
+    global instructions file on this host, no canonical servers, an excluded
+    family). A canonical MCP file others can read is REFUSED here too, by
+    name, and nothing is written from it."""
+    from . import envtidy, projectmcp, registry, skillsync
+    try:
+        wd = workdir or os.getcwd()
+    except OSError:               # a deleted cwd: nothing to approve for
+        wd = None
+    for line in (projectmcp.reconcile(cdir, wd) if wd else ()):
+        print("helm seat: %s" % line, file=sys.stderr)
+    ins = skillsync.link_instructions(cdir)
+    if ins.action in ("real", "blocked"):
+        print("helm seat: global instructions NOT linked into %s — %s"
+              % (cdir, ins.detail), file=sys.stderr)
+    elif ins.action in ("unavailable", "error"):
+        print("helm seat: global instructions NOT linked into %s (%s); "
+              "`helm tidy --apply` links them once the source is back"
+              % (cdir, ins.detail), file=sys.stderr)
+    try:
+        plan = envtidy.plan_mcp_home(label, cdir)
+    except (envtidy.MCPSourceRefused, registry.AuthoredUnreadable, OSError,
+            ValueError) as e:
+        print("helm seat: MCP servers NOT written into %s — %s"
+              % (cdir, e), file=sys.stderr)
+        return
+    if not plan["adds"] and not plan.get("tighten"):
+        return
+    verdict, detail = envtidy.apply_mcp_home(plan, envtidy.BACKUP_ROOT)
+    if verdict == "FAIL":
+        print("helm seat: MCP servers NOT written into %s (%s); `helm mcp "
+              "sync --apply` closes it" % (cdir, detail), file=sys.stderr)
 
 
 # The onboarding state that, if absent, makes CC run its first-run wizard (theme
@@ -2145,7 +2233,7 @@ def _deny_record(value):
     return None, "not a list of strings (%s)" % type(value).__name__
 
 
-def _seed_seat_settings(cdir, family=None):
+def _seed_seat_settings(cdir, family=None, workdir=None, model=None):
     """CC 2.1.216 records bypass-permissions acceptance in settings.json
     (skipDangerousModePermissionPrompt), NOT .claude.json — so a launched
     --dangerously-skip-permissions seat stalls at the bypass warning without it
@@ -2161,7 +2249,12 @@ def _seed_seat_settings(cdir, family=None):
     launch/resume` — so the rule is re-asserted on the same cadence launch.sh
     is re-minted, and a seat cannot drift out of it while sitting still.
     Additive: permissions.allow (the beacon permits hooks.install_home just
-    merged) and every sibling key survive byte-identical."""
+    merged) and every sibling key survive byte-identical.
+
+    A family with a launch profile (seat_catalog PROFILES) also gets that
+    profile's env pins and claudeMdExcludes here (_seed_profile): `model` is
+    the model the launch line stamps, and `workdir` the cwd the pane will run
+    in, when the caller knows it."""
     from . import pk
     from .seat_catalog import FEEDBACK_DRAFTS_SETTING
     p = os.path.join(cdir, "settings.json")
@@ -2266,6 +2359,8 @@ def _seed_seat_settings(cdir, family=None):
         if env.get(k) != v:
             env[k] = v
             changed = True
+    if family and _seed_profile(s, family, model=model, workdir=workdir):
+        changed = True
     if not changed:
         return
     try:
@@ -2275,6 +2370,169 @@ def _seed_seat_settings(cdir, family=None):
               "in %s (%s); a launched seat may stall at the bypass dialog or at "
               "a plan-mode approval prompt no human is watching, and may draft "
               "helm feedback into Claude Code's own queue" % (p, e), file=sys.stderr)
+
+
+def _seed_profile(s, family, model=None, workdir=None):
+    """The launch profile's half of _seed_seat_settings (task/3253,
+    seat_catalog PROFILES): True when it changed the parsed settings `s`.
+    Nothing at all for a family whose profile pins no env and excludes no
+    rules, so every other family's file stays byte-identical.
+
+    Two parts, on the deny set's cadence and for its reason (this file is
+    what a resume or an orca relaunch inherits):
+      the ENV PINS — profile_env: the window and output cap the launch line
+        stamps for `model`, and the family's `lite_env`. A pin here outranks
+        the launch stamp (envtidy.seat_stamp), and authorship decides what a
+        re-seed does to it (seat_catalog pin_action): helm's own pin follows
+        the catalog both ways, an operator's pin BELOW the catalog is kept
+        and never raised (the hot-fix for a stale-high catalog), and one
+        above it is lowered. Every other key survives.
+      claudeMdExcludes — _lite_md_excludes(workdir), ADDITIVE like the deny
+        list: an entry is appended and never removed, and the operator's own
+        entries keep their place. A value that is not a list of strings is
+        replaced, as a deny list that is not a list is.
+    Each part keeps a record under helm's key: SEED_RECORD_ENV maps each pin
+    helm wrote to the value it wrote, and SEED_RECORD_EXCLUDES lists the
+    excludes, as seeded_denies does. Each names only what THIS seeder wrote
+    (a pin the operator had already set to the same value is not helm's) and
+    never an entry the file does not carry."""
+    from .seat_catalog import (SEED_RECORD_ENV, SEED_RECORD_EXCLUDES,
+                               SEED_RECORD_KEY, launch_profile, pin_action,
+                               profile_env)
+    prof = launch_profile(family)
+    if not (prof.get("pin_window") or prof.get("exclude_rules")):
+        return False
+    changed = False
+    rec = s.get(SEED_RECORD_KEY)
+    if not isinstance(rec, dict):
+        rec = s[SEED_RECORD_KEY] = {}
+        changed = True
+    env = s.get("env")
+    pins = profile_env(family, model)
+    if pins and not isinstance(env, dict):
+        env = s["env"] = {}
+        changed = True
+    # THE PIN RULE (seat_catalog pin_action): helm's own pin follows the
+    # catalog both ways; an operator's pin below the catalog is kept and
+    # never raised, and one above it is lowered and becomes helm's. The
+    # record is rebuilt to name exactly helm's pins at the value it wrote,
+    # plus any it wrote earlier for a key the profile no longer pins, while
+    # the file still carries that value (so a later change can retire it).
+    old_env = _env_record(rec.get(SEED_RECORD_ENV))
+    mine = {}
+    for k, v in pins:
+        act = pin_action(env.get(k), v, old_env.get(k))
+        if act == "write":
+            env[k] = v
+            changed = True
+        if act == "write" or (act == "keep" and old_env.get(k) == v):
+            mine[k] = v
+    carried = env if isinstance(env, dict) else {}
+    mine.update((k, v) for k, v in old_env.items()
+                if k not in dict(pins) and carried.get(k) == v)
+    if prof.get("pin_window") and rec.get(SEED_RECORD_ENV) != mine:
+        rec[SEED_RECORD_ENV] = mine
+        changed = True
+    want = _lite_md_excludes(workdir) if prof.get("exclude_rules") else []
+    excl = s.get("claudeMdExcludes")
+    if want and not (isinstance(excl, list)
+                     and all(isinstance(x, str) for x in excl)):
+        excl = s["claudeMdExcludes"] = []
+        changed = True
+    # ADDITIVE ACROSS SEEDS, NEVER INSIDE THE PROJECT: an earlier seed from a
+    # room nested in this checkout (`<root>/.claude/worktrees/<x>`, a
+    # submodule) named this checkout's own rule files, rightly for that
+    # session. When this seed knows its workdir, an entry helm itself recorded
+    # at or below the project's top level leaves; the operator's never do.
+    if want and workdir:
+        wd = os.path.realpath(workdir)
+        top = (_git_toplevel(wd) or wd).rstrip(os.sep) + os.sep
+        old, _why = _deny_record(rec.get(SEED_RECORD_EXCLUDES))
+        # an entry this seed wants again (the home's file under a $HOME
+        # checkout, an authored source inside the repo) is not retired, so
+        # a second seed stays at rest
+        inside = [x for x in (old or []) if x in excl and x.startswith(top)
+                  and x not in want]
+        if inside:
+            excl[:] = [x for x in excl if x not in inside]
+            changed = True
+    added = []
+    for x in want:
+        if x not in excl:
+            excl.append(x)
+            added.append(x)
+            changed = True
+    if prof.get("exclude_rules"):
+        old, _why = _deny_record(rec.get(SEED_RECORD_EXCLUDES))
+        have = excl if isinstance(excl, list) else []
+        kept = [x for x in (old or []) + [x for x in added if x not in (old or [])]
+                if x in have]
+        if kept != old:
+            rec[SEED_RECORD_EXCLUDES] = kept
+            changed = True
+    return changed
+
+
+def _env_record(value):
+    """{name: value} from helm's env record, or {} for an absent or malformed
+    one: a record that is not a map of strings names no pin as helm's, so
+    every pin then reads as the operator's and is never raised (the safe
+    reading), and the seeder rewrites its own record."""
+    if isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str)
+                                       for k, v in value.items()):
+        return dict(value)
+    return {}
+
+
+#: The memory files Claude Code reads from EACH directory it walks, from the
+#: cwd up to the filesystem root, the root itself excluded (READ in the 2.1.283
+#: bundle: `CLAUDE.md` and `.claude/CLAUDE.md` as Project memory,
+#: `CLAUDE.local.md` as Local memory, each matched against claudeMdExcludes by
+#: absolute path). A lite seat names them for every directory above its
+#: project.
+_ANCESTOR_MEMORY_FILES = ("CLAUDE.md", os.path.join(".claude", "CLAUDE.md"),
+                          "CLAUDE.local.md")
+
+
+def _lite_md_excludes(workdir=None):
+    """[path]: what a lite seat's `claudeMdExcludes` names, in order.
+
+    FIRST the host operator's global instructions, whatever the workdir: the
+    default home's CLAUDE.md (a seat whose cwd sits under the home reads it
+    as an ancestor's `.claude/CLAUDE.md`) and the file the seat's `rules/`
+    link points at (skillsync.instructions_canonical) when that is another.
+    THEN, when the caller knows the cwd the pane will run in, every memory
+    file of every directory above its PROJECT: the workdir's git top level,
+    or the workdir itself outside a repository. Only a spawn and a resume
+    know that cwd; a mint and a pasted launch pass none and get the first
+    part alone, which is why the entries are additive and an earlier
+    spawn's stay.
+
+    Each path as written and, where a link resolves elsewhere, as resolved
+    too: Claude Code matches the ancestor walk on the path it built and a
+    rules link on the file it resolves to. No path here is a literal: every
+    one derives from the home, the authored instructions source, or the
+    workdir."""
+    from . import homes as credhomes, registry, skillsync
+    found = [os.path.join(credhomes.DEFAULTS["claude"], "CLAUDE.md")]
+    try:
+        src, _named = skillsync.instructions_canonical()
+    except registry.AuthoredUnreadable:
+        src = None      # the home's file above is still named
+    if src:
+        found.append(src)
+    if workdir:
+        wd = os.path.realpath(workdir)
+        d = os.path.dirname(_git_toplevel(wd) or wd)
+        while d != os.path.dirname(d):
+            found += [os.path.join(d, name) for name in _ANCESTOR_MEMORY_FILES]
+            d = os.path.dirname(d)
+    out = []
+    for path in found:
+        for q in (path, os.path.realpath(path)):
+            if q not in out:
+                out.append(q)
+    return out
 
 
 RETIRE_DENY_USAGE = (
@@ -2394,11 +2652,14 @@ def cmd_retire_deny(rest):
     the named entry, from exactly those files, appending nothing to
     helm.seeded_denies, never touching an entry helm.operator_denies names,
     never a non-proxy seat. A tool the current table still denies is refused
-    (a refresh would re-seed it). Exit 1 whenever a candidate could not be
-    judged, so a fleet run never reports clean over a file it did not read."""
+    (a refresh would re-seed it); a tool only a launch profile denies leaves
+    that profile's families out of the sweep and refuses a --seat of one.
+    Exit 1 whenever a candidate could not be judged, so a fleet run never
+    reports clean over a file it did not read."""
     from . import pk
     from .cli import guard_tail
-    from .seat_catalog import PROXY_MODES, SPAWN_DENIED_TOOLS, denied_tools
+    from .seat_catalog import (PROXY_MODES, SPAWN_DENIED_TOOLS, denied_tools,
+                               profile_denied_tools)
     rest = list(rest)
     tool = rest.pop(0) if rest and not rest[0].startswith("-") else None
     rc = guard_tail("helm seat retire-deny", rest, flags=("--apply", "--all"),
@@ -2413,7 +2674,14 @@ def cmd_retire_deny(rest):
         print("helm seat retire-deny: --seat and --all are two answers to one "
               "question; pass one", file=sys.stderr)
         return 2
-    if tool in SPAWN_DENIED_TOOLS or any(tool in denied_tools(f) for f in FAMILIES):
+    # A LAUNCH PROFILE'S DENY SCOPES THE SWEEP instead of refusing the verb
+    # (task/3253): Workflow is denied again on a lite family and retirable on
+    # every other proxy family, so a family whose CURRENT set carries the
+    # tool is simply not a candidate (its refresh would seed it straight
+    # back), and every other deny keeps the refusal it always had.
+    if tool in SPAWN_DENIED_TOOLS or any(
+            tool in denied_tools(f) and tool not in profile_denied_tools(f)
+            for f in FAMILIES):
         print("helm seat retire-deny: %r is in the current deny set, so a "
               "refresh would seed it straight back; retire it from "
               "seat_catalog first" % tool, file=sys.stderr)
@@ -2430,6 +2698,12 @@ def cmd_retire_deny(rest):
             print("helm seat retire-deny: %s is not a proxy-family seat; nothing "
                   "here touches a native seat" % name, file=sys.stderr)
             return 2
+        if tool in denied_tools(family):
+            print("helm seat retire-deny: %r is in %s's current deny set (its "
+                  "%s launch profile), so a refresh would seed it straight "
+                  "back" % (tool, family, FAMILIES[family].get("profile")),
+                  file=sys.stderr)
+            return 2
         rows = [(name, family, os.path.join(_instance_dir(family, name),
                                             "claude", "settings.json"))]
     else:
@@ -2437,6 +2711,7 @@ def cmd_retire_deny(rest):
         if err:
             print("helm seat retire-deny: " + err, file=sys.stderr)
             return 1
+        rows = [row for row in rows if tool not in denied_tools(row[1])]
     # PHASE ONE AND TWO: every candidate judged, nothing written
     judged = [(label, path) + _classify_retire_candidate(label, family, path, tool)
               for label, family, path in rows]
@@ -2727,6 +3002,9 @@ def _launch_surface_refusal(family, seat, d, fatal_shortened=True):
     ownership = _seat_surface_error(family, seat, d)
     if ownership:
         return ownership, ()
+    activation = (FAMILIES.get(family) or {}).get("activation_refusal")
+    if activation:
+        return "REFUSED — %s" % activation, ()
     # BEFORE THE FIRST WRITE, not after: makedirs(exist_ok=True) follows an
     # existing symlink, so by the time anything below cdir is written the
     # damage is already in another seat's tree.
@@ -2808,21 +3086,37 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
     os.makedirs(cdir, exist_ok=True)
     _link_skills(cdir)       # seat agents get the host's /learn, /premise, /afk, …
     _seed_onboarding(cdir, workdir, family)  # onboarding/trust + feature cache
-    from . import hooks
+    from . import hooks, record
     res = hooks.install_home(cdir, specs=hooks.SEAT_SPECS)
     action, detail = res
+    # THE RECORDER RIDES THE SAME BIRTH (task/3089). It has its own installer
+    # (record.install_home, the one `helm record install` runs for a home), so
+    # hooks.SEAT_SPECS alone left every seat without the PostToolUse /
+    # PostToolUseFailure recorder legs that every home carries. Installed after
+    # the spec set so the recorder and delivery fold into one PostToolUse
+    # dispatcher entry, exactly as they do in a home.
+    raction, rdetail = record.install_home(cdir)
+    if raction == "fail":
+        print("helm seat: WARNING — %s tool-outcome recorder not installed "
+              "(%s); `helm tidy --apply` closes it" % (seat, rdetail),
+              file=sys.stderr)
     if action == "fail":
         print("helm seat: WARNING — %s hook contract not installed (%s); "
               "`helm hooks install` closes it" % (seat, detail),
               file=sys.stderr)
-    elif action != "ok" and not short:
+    elif (action != "ok" or raction not in ("ok", "fail")) and not short:
         # `and not short` — a nonfatal mint already said SHORTENED above, and
         # falling through to this line would have it claim the full contract in
         # the very next breath. Never two sentences about one write.
         print("helm seat: %s claude dir wired for full hook contract (%s: "
-              "inject + delivery + handoff + resume + beacon permit)"
-              % (seat, action), file=sys.stderr)
-    _seed_seat_settings(cdir, family)   # bypass dialog + the family deny set (settings.json)
+              "inject + delivery + recorder + handoff + resume + beacon permit)"
+              % (seat, action if action != "ok" else raction), file=sys.stderr)
+    # bypass dialog + the family deny set (settings.json); a launch profile's
+    # pins name the model launch_line resolves below, and its excludes the
+    # cwd the pane will run in, when this caller knows it
+    from .seat_catalog import instance_launch_model
+    _seed_seat_settings(cdir, family, workdir=workdir,
+                        model=model or instance_launch_model(FAMILIES[family], seat))
     _seed_seat_rules(cdir)              # feedback goes to helm rows, never CC /feedback (CLAUDE.md)
     if multi:
         _mint_probe_agents(cdir, family)   # per-model frontmatter pins ride here
@@ -2850,6 +3144,10 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
                             family, room=room, seat=seat, identity=identity,
                             room_source=room_source, multi=multi,
                             model=model), cdir=cdir)))
+    # AFTER launch.sh: the MCP plan budgets servers by the window this script
+    # stamps, so planning first read no stamp on a first mint and the OLD
+    # stamp on a re-mint.
+    _seat_full_agent(cdir, _seat_label(family, d), workdir)   # instructions + MCP servers + project approvals
 
 
 def _write_launch_sh(path, text):

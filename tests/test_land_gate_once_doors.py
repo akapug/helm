@@ -31,8 +31,8 @@ import unittest
 from unittest import mock
 
 from tests import _tmphome
-from helm import (dispatches, gate, gateaudits, gatewindow, landreq,
-                  landwindow, lane_discipline, saguide)
+from helm import (dispatches, eventledger, gate, gateaudits, gatewindow,
+                  landreq, landwindow, lane_discipline, saguide)
 from tests import test_gate_focus as _focus
 from tests import test_landreq as _landreq
 from tests.test_landreq import run as _lr_run
@@ -72,14 +72,17 @@ class NonPythonFocusArms(_focus.FocusBase):
     `test_env_hygiene` and `test_scratch`) plus every test module whose
     source names the changed path.
 
-    The fixture tree ships the whole audit list as stub modules, because the
-    path leg applies only to a tree that ships the list. A tree that does not
+    The fixture tree ships the audit list and its modules as stubs, because
+    the path leg applies only to a tree that ships the list. A tree that does not
     (an adopter project) keeps the old refusal; `FocusPlanArms.
     test_a_non_python_change_refuses` in test_gate_focus pins that."""
 
     def setUp(self):
         super().setUp()
         self._git("checkout", "-q", "main")
+        # The list is read from the tree it selects in (`gate._tree_audits`).
+        with open(gateaudits.__file__, encoding="utf-8") as fh:
+            self._write("helm/gateaudits.py", fh.read())
         for name in gateaudits.AUDITS:
             self._write("tests/%s.py" % name, STUB_TEST)
         self._write("docs/GUIDE.md", "the guide\n")
@@ -578,6 +581,50 @@ class ComposeDoorArms(DoorBase):
         self.assertIn("helm gate window launch --repo %s" % self.compose,
                       answer["reason"])
 
+    def window_lock(self):
+        return os.path.join(os.path.dirname(gatewindow.runs_path()),
+                            gatewindow.LOCK_NAME)
+
+    def test_the_windows_own_sizing_question_is_answered(self):  # noqa: VACUOUS_ASSERTION — the empty spy list stands beside a plan answer asserted non-null with its slice field, and a control refusal naming the window
+        """task/3463 item 14: `fab gate submit` asks this plan question to
+        size a SLICED land gate, from inside the landing-window door's own
+        dispatch, while that door holds the window lock. Refused as a
+        compose room that must go through the window, it refused the window
+        itself: every sliced gate of a compose room exited 4 with nothing
+        dispatched, auto-land's train398 twice. Asked from the lineage that
+        holds the lock, the question is answered."""
+        with gatewindow._Lock(self.window_lock()):
+            rc, out, err = self.verb("--repo", self.compose, "--plan",
+                                     "--json", "--sliced")
+        answer = json.loads(out)
+        self.assertIsNotNone(answer["plan"], (rc, answer, err))
+        self.assertIn("slice", answer, answer)
+        self.assertEqual(self.ran, [], "the plan question ran a suite")
+        # CONTROL, the same question with the window free: refused, and the
+        # refusal still names the window (the plain `fab gate` bypass).
+        rc, out, _err = self.verb("--repo", self.compose, "--plan", "--json",
+                                  "--sliced")
+        self.assertEqual(rc, 1)
+        self.assertIsNone(json.loads(out)["plan"])
+        self.assertIn("helm gate window launch --repo %s" % self.compose,
+                      json.loads(out)["reason"])
+
+    def test_the_windows_relaunch_of_a_red_tree_is_sized_too(self):
+        """A relaunch through the window of a tree whose last suite is red
+        (auto-land's flake retry, `helm gate run --again` handed to the
+        window) asks the same question, where no `--again` rides: the window
+        already decided, so the tree door does not decide it again."""
+        row = self.plant(self.compose, status="FAILED")
+        rc, out, _err = self.verb("--repo", self.compose, "--plan", "--json",
+                                  "--sliced")
+        self.assertEqual(rc, 1)
+        self.assertIsNone(json.loads(out)["plan"])
+        self.assertIn(row["id"], json.loads(out)["reason"])
+        with gatewindow._Lock(self.window_lock()):
+            rc, out, err = self.verb("--repo", self.compose, "--plan",
+                                     "--json", "--sliced")
+        self.assertIsNotNone(json.loads(out)["plan"], (rc, out, err))
+
     def test_the_compose_container_is_helm_trains_own(self):
         """One container: the rooms `helm train` stands are the rooms this
         door hands to the window."""
@@ -590,6 +637,140 @@ class ComposeDoorArms(DoorBase):
         rc, _out, err = self.verb("--repo", self.root, "--supersede")
         self.assertEqual(rc, 2)
         self.assertIn("compose room", err)
+
+
+class LandAuthorityDoorArms(DoorBase):
+    """task/3323 and task/3589, two faces of one predicate: a green tree is
+    "already gated" only by a receipt that can authorize a LAND of it, and
+    that is `foldcheck`'s tree-vs-gate rung at land strength, imported by the
+    door (`foldcheck.land_authority`), never restated."""
+
+    def plan(self, repo, env=None):
+        rc, out, err = self.verb("--repo", repo, "--plan", "--json", env=env)
+        return rc, json.loads(out), err
+
+    def import_only(self, where):
+        """A green no authenticated door placed, after the provenance flip:
+        it binds every lane-level purpose and no land."""
+        from helm import gateimport
+        _record, err = gateimport.activate(ts="2000-01-01T00:00:00Z")
+        self.assertIsNone(err, err)
+        return self.plant(where)
+
+    def test_a_tree_whose_only_green_cannot_land_gets_a_plan(self):
+        """3323: the shared checkout's only green is import-only. Refused as
+        "a green tree is never re-gated", the tree could never get the
+        receipt a land needs."""
+        row = self.import_only(self.root)
+        rc, answer, err = self.plan(self.root)
+        self.assertEqual(rc, 0, (answer, err))
+        self.assertIsNotNone(answer["plan"], answer)
+        self.assertIn(row["id"], answer["note"])
+        self.assertIn("cannot authorize a land", answer["note"])
+        # and the local run is admitted, naming the same receipt
+        rc, _out, err = self.verb("--repo", self.root)
+        self.assertEqual(len(self.ran), 1, err)
+        self.assertIn(row["id"], err)
+
+    def test_a_compose_rooms_import_only_green_is_sent_to_the_window(self):
+        row = self.import_only(self.compose)
+        rc, answer, _err = self.plan(self.compose)
+        self.assertEqual(rc, 1)
+        self.assertIsNone(answer["plan"])
+        self.assertIn("helm gate window launch --repo %s" % self.compose,
+                      answer["reason"])
+        self.assertNotIn("GREEN", answer["reason"])
+        self.assertNotIn(row["id"], answer["reason"])
+
+    def test_a_lane_holding_a_landable_green_is_refused_a_second_suite(self):
+        """3589: the lane-suite escape does not buy a second suite of a tree
+        whose green can land, and neither does `--again` (RED only)."""
+        row = self.plant(self.lane)
+        env = {"HELM_GATE_LANE_SUITE": "one more"}
+        rc, answer, _err = self.plan(self.lane, env=env)
+        self.assertEqual(rc, 1)
+        self.assertIsNone(answer["plan"])
+        self.assertIn("gate:" + row["id"], answer["reason"])
+        self.assertIn("authorize a land", answer["reason"])
+        rc, _out, err = self.verb("--repo", self.lane, "--lane-suite",
+                                  "--why", "one more", "--again")
+        self.assertEqual((rc, self.ran), (1, []), err)
+        self.assertIn(row["id"], err)
+
+    def test_a_later_green_that_cannot_land_does_not_hide_one_that_can(self):
+        """Every green is asked, not the last: a landable green followed by
+        an import-only rerun of the same tree still refuses, naming the
+        landable one."""
+        landable = self.plant(self.root, ts="2026-09-23T00:00:00Z")
+        later = self.import_only(self.root)
+        rc, answer, _err = self.plan(self.root)
+        self.assertEqual(rc, 1, answer)
+        self.assertIn("gate:" + landable["id"], answer["reason"])
+        self.assertNotIn(later["id"], answer["reason"])
+
+    def test_a_red_last_receipt_re_gates_with_again(self):
+        """The last receipt decides a red: a landable green, then a red rerun
+        of the same tree, runs again with `--again` (a suspected flake)."""
+        self.plant(self.root, ts="2026-09-23T00:00:00Z")
+        red = self.plant(self.root, status="FAILED")
+        rc, answer, _err = self.plan(self.root)
+        self.assertEqual(rc, 1)
+        self.assertIn(red["id"], answer["reason"])
+        self.assertIn("--again", answer["reason"])
+        rc, answer, err = self.plan(self.root, env={"HELM_GATE_AGAIN": "1"})
+        self.assertEqual(rc, 0, (answer, err))
+        self.assertIsNotNone(answer["plan"])
+
+    def test_an_unreadable_receipt_store_is_UNKNOWN_and_no_plan(self):
+        with mock.patch.object(gate, "receipts",
+                               lambda: ([], "PLANTED-TORN-LEDGER", 0)):
+            rc, answer, _err = self.plan(self.root)
+            self.assertEqual(rc, 1)
+            self.assertIsNone(answer["plan"])
+            self.assertIn("UNKNOWN", answer["reason"])
+            self.assertIn("PLANTED-TORN-LEDGER", answer["reason"])
+            rc, _out, err = self.verb("--repo", self.root)
+        self.assertEqual((rc, self.ran), (1, []), err)
+        self.assertIn("PLANTED-TORN-LEDGER", err)
+
+    def test_an_UNKNOWN_rung_is_no_plan_and_names_its_reason(self):
+        from helm import foldcheck
+        self.plant(self.root)
+        rung = foldcheck.Rung("tree-vs-gate", foldcheck.UNKNOWN,
+                              "PLANTED-UNKNOWN-RUNG")
+        with mock.patch.object(foldcheck, "_tree_matches_gate",
+                               lambda *a, **kw: rung):
+            rc, answer, _err = self.plan(self.root)
+        self.assertEqual(rc, 1)
+        self.assertIsNone(answer["plan"])
+        self.assertIn("UNKNOWN", answer["reason"])
+        self.assertIn("PLANTED-UNKNOWN-RUNG", answer["reason"])
+
+    def test_the_door_follows_foldchecks_land_rung_not_a_copy(self):
+        """One predicate: patch the fold's tree-vs-gate rung and the door
+        follows it both ways, and asks it at LAND strength."""
+        from helm import foldcheck
+        row = self.plant(self.root)
+        seen = []
+
+        def rung(verdict, text):
+            def fake(backend, repo, tip, gate_ref, land=True):
+                seen.append((gate_ref, land))
+                return foldcheck.Rung("tree-vs-gate", verdict, text)
+            return fake
+        with mock.patch.object(foldcheck, "_tree_matches_gate",
+                               rung(foldcheck.REFUSE, "PINNED-REFUSE")):
+            rc, answer, _err = self.plan(self.root)
+        self.assertEqual(rc, 0, answer)
+        self.assertIn("PINNED-REFUSE", answer["note"])
+        self.assertEqual(seen, [("gate:" + row["id"], True)])
+        later = self.import_only(self.root)
+        with mock.patch.object(foldcheck, "_tree_matches_gate",
+                               rung(foldcheck.PASS, "PINNED-PASS")):
+            rc, answer, _err = self.plan(self.root)
+        self.assertEqual(rc, 1, answer)
+        self.assertIn("PINNED-PASS", answer["reason"])
+        self.assertIn(later["id"], answer["reason"])
 
 
 class AdopterDoorArms(DoorBase):
@@ -623,16 +804,20 @@ class ApproveRefusalTextArms(unittest.TestCase):
         self.assertNotIn("run `helm gate run` on the reviewed tip", why)
 
 
-# ---------------------------------- a source-clean hold is no car, on trunk
+# ------------------- a source-clean hold that records NO HOLDER is no car
 
 class HeldSourceCleanIsNoCarArms(_landreq.LandReqBase):
-    """Row: a HELD source-clean row meets both train composers. A hold
-    records no actor, and `dispatch hold --source-clean` is open to any seat
-    on any open row, so a hold admits nothing: `helm train` and `lr compose`
-    take LIVE READY rows only, exactly as on trunk. Source-clean cars are
-    task/3053, which first stamps the hold's actor."""
+    """Row: a HELD source-clean row whose hold records NO HOLDER meets both
+    train composers. task/3039's QC (be1ce1b43579) took source-clean cars out
+    because a hold recorded no actor and any seat could write one on any open
+    row. task/3053 stamps the holder at the hold door and refuses every hand
+    but the row's recipient, so an unstamped hold is now only one written
+    before that door, and it still admits nothing: `helm train` counts it on
+    its one NO HOLDER line and names no car for it, and `lr compose` refuses
+    every source-clean row. A stamped recipient's hold riding `helm train` is
+    pinned in test_source_clean_landed.SourceCleanCarsTest."""
 
-    def test_a_held_source_clean_row_is_not_a_car(self):  # noqa: VACUOUS_ASSERTION — each absence sits beside a positive on the same observable: the dry run lists the approved row as car 1, and the members list equals exactly the approved row
+    def test_a_held_source_clean_row_with_no_holder_is_not_a_car(self):  # noqa: VACUOUS_ASSERTION — each absence sits beside a positive on the same observable: the dry run lists the approved row as car 1 and counts the held row on its NO HOLDER line, and the members list equals exactly the approved row
         ready = self.dispatch(lane="lane/ready")
         _row, err = self.mark_verdict(ready["id"], self.side, "ok",
                                       polarity="approve")
@@ -641,20 +826,27 @@ class HeldSourceCleanIsNoCarArms(_landreq.LandReqBase):
         clean_tip = self.commit("clean", path="h")
         self.git("checkout", "-q", self.main)
         held = self.dispatch(ref=clean_tip, lane="lane/clean")
-        row, err = dispatches.mark_hold(held["id"], "read clean, owes the "
-                                        "land gate", source_clean_tip=clean_tip)
-        self.assertIsNone(err, err)
-        self.assertEqual(row["source_clean_tip"], clean_tip)
+        # AN UNSTAMPED HOLD, appended as a hold written before the door
+        # stamped its holder reads: the door now refuses an unproven hand, so
+        # the ledger is the only way this shape exists.
+        rows, unavailable = dispatches.snapshot()
+        self.assertIsNone(unavailable, unavailable)
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), {
+            "v": 3, "event": "hold", "seq": int(rows[held["id"]]["seq"]) + 1,
+            "id": held["id"], "ts": dispatches.pk.now_ts(),
+            "reason": "read clean, owes the land gate", "owner_gated": False,
+            "source_clean_tip": clean_tip}))
         # CONTROL, on the real projection: the held row is visible, carries
-        # its source-clean tip and is not READY, and the approved row IS
-        # READY, so each verb below reads the word and sees both rows.
+        # its source-clean tip and no holder and is not READY, and the
+        # approved row IS READY, so each verb below reads both rows.
         lrs, unavailable = landreq.project()
         self.assertIsNone(unavailable)
         self.assertEqual(lrs[held["id"]]["source_clean_tip"], clean_tip)
+        self.assertIsNone(lrs[held["id"]].get("hold_actor"))
         self.assertNotEqual(lrs[held["id"]]["state"], "READY")
         self.assertTrue(landreq.live_ready(lrs[ready["id"]]))
-        # helm train: the approved row is the one car; the held row is not
-        # listed at all.
+        # helm train: the approved row is the one car; the held row is only
+        # counted on the NO HOLDER line, which names the verb that lists it.
         out = io.StringIO()
         rc = landwindow.compose(self.repo, trunk=self.main, out=out)
         text = out.getvalue()
@@ -662,9 +854,11 @@ class HeldSourceCleanIsNoCarArms(_landreq.LandReqBase):
         self.assertIn("merge order, 1 approve-ready row:", text)
         self.assertIn("1. %s  lane ready  reviewed tip %s"
                       % (ready["id"][:12], self.side[:12]), text)
+        self.assertIn("1 held source-clean row carries NO HOLDER", text)
+        self.assertIn(landwindow.NO_HOLDER_LIST, text)
         self.assertNotIn(held["id"][:12], text)
-        # lr compose: the approved row composes, the held row is refused by
-        # name as a row that is not live READY.
+        # lr compose: the approved row composes, and the held row is refused
+        # by name as a source-clean row, with the train's own reason after it.
         rc, text, err = _lr_run(["compose", ready["id"][:12],
                                  held["id"][:12], "--dry-run", "--json"])
         self.assertEqual(rc, 0, err + text)
@@ -673,7 +867,9 @@ class HeldSourceCleanIsNoCarArms(_landreq.LandReqBase):
                          [(ready["id"], self.side)], err + text)
         self.assertNotIn("basis", got["members"][0])
         self.assertEqual([x["id"] for x in got["excluded"]], [held["id"]])
-        self.assertIn("READY", got["excluded"][0]["reason"])
+        self.assertIn("a source-clean car rides only `helm train`",
+                      got["excluded"][0]["reason"])
+        self.assertIn("NO HOLDER", got["excluded"][0]["reason"])
 
 
 # ------------------------------------------- F5: one process text, agreeing

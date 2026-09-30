@@ -101,5 +101,57 @@ class TheDispatchDoorObeysTheProjectLightTest(td.DispatchBase):
         self.assertIsNotNone(row, err)
 
 
+class TheShareNoteCountsTheRowItFiledOnceTest(td.DispatchBase):
+    """The project-share NOTE at the dispatch door (task/3156) is built AFTER
+    the row it admits is appended, so that row is ALREADY one of the lanes the
+    ledger fold counts. `teams.door_note` assumed the opposite ("the row being
+    sent is not in the ledger yet") and added one more on top: the door said
+    QUEUED for the row that took the project's LAST slot, and for a build row,
+    which holds no lane at all (`teams.NOT_A_LANE`).
+
+    Real rows through the real door, the real ledger fold: a local-style
+    family with 2 recorded lanes and a 100% share is 2 slots."""
+
+    def setUp(self):
+        super().setUp()
+        from helm import home, pk, teams
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "proj": {"name": "proj", "path": self.repo, "kind": "git",
+                     "status": "dormant", "sessions": {}}}})
+        pk.write_json(home.authored_path(), {"version": 1, "projects": {}})
+        _row, problem, _code = teams.write(
+            "proj", {"members": [{"seat": "grok", "family": "grok",
+                                  "role": "reviewer"}],
+                     "shares": {"grok": 100}}, 0, by="owner",
+            reason="the lanes arm", apply=True, post=lambda body, room: None)
+        self.assertIsNone(problem)
+        _row, problem = teams.set_capacity("grok", 2, by="seat-m",
+                                           reason="2 lanes measured",
+                                           apply=True)
+        self.assertIsNone(problem)
+
+    def queued(self, kind, lane):
+        from tests._tmphome import dispatch_home
+        with dispatch_home(self.repo):
+            row, err = dispatches.add(recipient="grok", lane=lane,
+                                      ref=self.a, repo=self.repo,
+                                      notify=False, _reason=True, kind=kind,
+                                      new_work=True)
+        self.assertIsNotNone(row, err)
+        return [n for n in row.get(dispatches._ADMISSION_NOTES, ())
+                if "QUEUED" in n]
+
+    def test_the_row_that_takes_the_last_slot_is_not_queued(self):
+        self.assertEqual(self.queued("review", "lane-one"), [])
+        # the second review takes the second of 2 slots: nothing waits
+        self.assertEqual(self.queued("review", "lane-two"), [])
+        # a build row holds no lane, so it can never wait for one
+        self.assertEqual(self.queued("build", "lane-build"), [])
+        # CONTROL: the third review is past the slots, and the door says so
+        notes = self.queued("review", "lane-three")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("3 in use", notes[0])
+
+
 if __name__ == "__main__":
     unittest.main()

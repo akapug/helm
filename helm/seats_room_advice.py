@@ -250,7 +250,33 @@ def _room_unfinished(resource, snap=None, ledger_note=None, cwd=None):
             except Exception:
                 state = word = None
             if state is None or state == vcs.UNKNOWN:
-                unknowns.append("landedness: %s" % (word or "unreadable"))
+                # A TIP THAT DESCENDS FROM THE TRUNK IS AHEAD OF IT BY
+                # ANCESTRY ALONE. A lane stacked on an unlanded train carries
+                # the train's merges, `git cherry` skips merges, and the
+                # content answer is rightly UNKNOWN; but every commit in
+                # trunk..HEAD is absent from the trunk as itself, so the room
+                # holds work and the advice can say so instead of asking for
+                # a hand check at every stop. A tip that diverged stays
+                # unknown: ancestry says nothing about content there.
+                try:
+                    v = vcs.backend(room)
+                    trunk = _gc._trunk(room)
+                    ahead = None
+                    if v.ancestry(room, trunk, head) == vcs.ANCESTOR:
+                        rc, out, _err = v.text(room, "rev-list", "--count",
+                                               "%s..%s" % (trunk, head))
+                        if rc == 0 and out.strip().isdigit():
+                            ahead = int(out.strip()) or None
+                except projscope.Expired:
+                    return findings, unknowns + _clock_lost(reads_owed)
+                except Exception:
+                    ahead = None
+                if ahead:
+                    findings.append("the room's tip %s is %d commit(s) ahead "
+                                    "of the trunk it descends from"
+                                    % (head[:12], ahead))
+                else:
+                    unknowns.append("landedness: %s" % (word or "unreadable"))
             elif state == vcs.NOT_ANCESTOR:
                 findings.append("the room's tip %s is %s vs the trunk"
                                 % (head[:12], word))
@@ -396,21 +422,39 @@ def _room_unfinished(resource, snap=None, ledger_note=None, cwd=None):
     return findings, unknowns
 
 
+#: What a `dispatch:` claim's row has become, the ruling `dispatch_reading`
+#: returns beside its sentence: still OWED by the holder, STALE (answered,
+#: cancelled, rebound, retired, carried, or no such row, so the claim marks
+#: nothing), or UNKNOWN.
+OWED, STALE, UNKNOWN = "owed", "stale", "unknown"
+
+
 def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
-    """The sentence for one `dispatch:` claim — what the ROW has become.
+    """The sentence for one `dispatch:` claim: `dispatch_reading`'s short
+    spelling when `brief`, else its long one."""
+    got = dispatch_reading(resource, seat, snap, ledger_note)
+    return got[1] if brief else got[2]
 
-    `brief` PICKS THE SHORT SPELLING OF THE SAME SENTENCE, for the same reason
-    `_room_advice` takes it: a blocked Stop prints the short form — the owner
-    reads it in his terminal every time a seat is held — and `helm chat
-    stop-guard --detail` prints the long one. Every branch chooses through
-    `_say`, so the two spellings of one ruling stay side by side.
 
-    IT RETURNS A SENTENCE AND NOT A RULING, unlike `_room_advice`. A lane
+def dispatch_reading(resource, seat, snap=None, ledger_note=None):
+    """(ruling, short, long) for one `dispatch:` claim: what its ROW became.
+
+    THE SHORT SPELLING AND THE LONG ONE, for the same reason `_room_advice`
+    has both: a blocked Stop prints the short form — the owner reads it in his
+    terminal every time a seat is held — and `helm chat stop-guard --detail`
+    prints the long one. Every branch returns through `_say`, so the ruling
+    and its two spellings stay side by side.
+
+    THE RULING DECIDES NO RELEASE COMMAND, unlike `_room_advice`'s. A lane
     lease's release can strand a delegate's unwritten work, so that helper may
     revoke its release command. Releasing a dispatch CLAIM removes the claim
     and its delegation-activity markers, not the dispatch row: its recipient,
     status and owed work are unchanged. The sentence RIDES the holder's
-    release command rather than deciding whether to offer it.
+    release command rather than deciding whether to offer it. What the ruling
+    decides is whether the Stop owes that release at all (task/3696): a claim
+    on a row still OWED is the in-progress mark the owed-row rung asks a seat
+    to take, and only a STALE one is an act a stop may refuse over
+    (`seats_stop_owed.lease_in_progress`).
 
     The offer layer can take a dispatch claim on the holder's behalf. Some
     lifecycle doors release the caller's own claim, but a rebound or otherwise
@@ -447,18 +491,19 @@ def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
     from . import query
     from .dispatches import CLOSED_STATES, carrier
 
-    def _say(short, long_):
-        """The two spellings of ONE branch, chosen here so they cannot drift.
+    def _say(ruling, short, long_):
+        """The ruling and the two spellings of ONE branch, kept together so
+        they cannot drift.
 
         A brief sentence kept anywhere but beside the long one is a second
         account of the same ruling, free to say something else the day one of
         them is edited."""
-        return short if brief else long_
+        return ruling, short, long_
 
     rid8 = str(resource or "").split(":", 1)[-1].strip().lower()
     if not rid8:
         return _say(
-            " — this claim names no row",
+            UNKNOWN, " — this claim names no row",
             "   — this claim names no row, so whether it is still "
             "owed cannot be read here")
     # THE PRODUCER RETURNS A PAIR, AND AN UNREADABLE LEDGER IS AN EMPTY DICT
@@ -472,6 +517,7 @@ def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
     note = str(ledger_note or "").strip()
     if note or not isinstance(snap, dict):
         return _say(
+            UNKNOWN,
             " — the dispatch ledger is unreadable, so what you owe is UNKNOWN",
             "   — the dispatch ledger could not be read (%s), so "
             "whether this row is still owed is UNKNOWN"
@@ -479,7 +525,10 @@ def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
     matches = [row for rid, row in snap.items()
                if str(rid).lower().startswith(rid8)]
     if len(matches) != 1:
+        # NO ROW IN A LEDGER THAT WAS READ IS A CLAIM THAT MARKS NOTHING;
+        # SEVERAL ARE A CLAIM THAT CANNOT BE BOUND, which is not a proof.
         return _say(
+            UNKNOWN if matches else STALE,
             " — %s matching row%s, so this claim binds to no one obligation"
             % (len(matches) or "NO", "s" if len(matches) != 1 else ""),
             "   — %s row%s in the ledger match this claim, so it "
@@ -494,7 +543,7 @@ def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
 
     if recipient and not mine:
         return _say(
-            " — REBOUND to @%s; your claim is STALE" % recipient,
+            STALE, " — REBOUND to @%s; your claim is STALE" % recipient,
             "   — this row now names @%s, not you: it was REBOUND and "
             "your claim is STALE. Only you can clear it, because a "
             "lease is released by its holder" % recipient)
@@ -502,7 +551,7 @@ def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
     # about BEFORE the status word is read at all.
     if query.query_is_retired_admin(row):
         return _say(
-            " — %s was RETIRED at the door; your claim is STALE" % lane,
+            STALE, " — %s was RETIRED at the door; your claim is STALE" % lane,
             "   — %s was RETIRED at the door: the obligation is "
             "discharged and your claim is STALE, whatever its "
             "status word still says. Only you can clear it, because "
@@ -511,6 +560,7 @@ def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
         kid = carrier(row, snap)
         if kid is not None:
             return _say(
+                STALE,
                 " — %s is CARRIED by dispatch %s; this parent is not itself "
                 "owed" % (lane, str(kid.get("id") or "?")[:12]),
                 "   — %s is CARRIED by dispatch %s: this parent row is "
@@ -521,6 +571,7 @@ def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
             # A HOLD IS A PAUSE, NOT AN ENDING. With no carrier, the row
             # remains owed. Claim release still leaves that obligation alone.
             return _say(
+                OWED,
                 " — %s is HELD, a PAUSE and not a discharge; still yours "
                 "(helm dispatch release %s when it clears)" % (lane, rid8),
                 "   — %s is HELD: a hold is an acknowledged PAUSE, "
@@ -530,12 +581,13 @@ def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
                 "clears" % (lane, rid8))
         if mine:
             return _say(
-                " — %s is OPEN and yours: helm dispatch triage %s"
+                OWED, " — %s is OPEN and yours: helm dispatch triage %s"
                 % (lane, rid8),
                 "   — %s is OPEN and addressed to you: this is a "
                 "LIVE obligation, not a stale claim. Answer it "
                 "with `helm dispatch triage %s`" % (lane, rid8))
         return _say(
+            UNKNOWN,
             " — %s is OPEN with no recipient this surface can read; UNKNOWN"
             % lane,
             "   — %s is OPEN but names no recipient this surface can "
@@ -543,11 +595,12 @@ def _dispatch_advice(resource, seat, snap=None, ledger_note=None, brief=False):
             % lane)
     if status in CLOSED_STATES:
         return _say(
-            " — %s is %s; your claim is STALE" % (lane, status.upper()),
+            STALE, " — %s is %s; your claim is STALE" % (lane, status.upper()),
             "   — %s is %s: the obligation is discharged and your "
             "claim is STALE. Only you can clear it, because a lease "
             "is released by its holder" % (lane, status.upper()))
     return _say(
+        UNKNOWN,
         " — %s records no status this surface can classify; UNKNOWN" % lane,
         "   — %s records no status this surface can classify (%s), "
         "so whether it is still owed is UNKNOWN"

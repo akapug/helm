@@ -197,6 +197,23 @@ class RecipientGateTest(SeatIdentityBase):
         self.assertEqual(to, "future-seat")
         self.assertIsNone(err)
 
+    def test_unreadable_spawn_register_refuses_not_crashes(self):
+        """task/2516: when the spawn register read raises, the DM/dispatch
+        addressing path answers a refusal naming the register, not a
+        traceback. Before the cure, `helm_spawned` was an unguarded read in
+        _canonical_sources() and this call raised OSError."""
+        from unittest import mock
+        from helm import seats
+        self.plant_roster("alice")
+        with mock.patch(
+                "helm.orcaadopt.helm_spawned",
+                side_effect=OSError(
+                    "[Errno 2] No such file or directory: "
+                    "/tmp/claude-test/helm-home/.orchestrator/seats")):
+            to, err = seats.resolve_recipient("future-seat")
+        self.assertIsNone(to)
+        self.assertIsNotNone(err)
+        self.assertIn("spawn register", err)
 
     def test_open_world_near_miss_of_a_roster_seat_stays_legal(self):
         """A token one edit from a ROSTER seat is still a legal future

@@ -29,11 +29,13 @@ import threading
 import time
 from unittest import mock
 
+from tests import _lockwait
 from tests.test_seats import SeatsBase, THREAD_TIMEOUT
 
 from helm import (actors, beacons, chat, home, pathenv, pk, seats, seats_cursor,
                   seats_delivery, seats_join, seats_receipts, seats_rename, seats_report,
-                  seats_stop_claims, seats_stop_seam, seats_stop_signals, web)
+                  seats_stop_claims, seats_stop_seam, seats_stop_signals,
+                  seats_stop_spiral, web)
 from helm import seat as seatmod
 from helm import seat_lifecycle_runtime as seat_runtime
 from helm import seats_roster as seatmod_roster
@@ -412,21 +414,27 @@ class RenameTest(SeatsBase):
                                          name="new-name-reader")
                 worker.append(probe)
                 probe.start()
-                self.assertTrue(attempted.wait(3),
+                self.assertTrue(attempted.wait(THREAD_TIMEOUT),
                                 "positive control: resolver tried to bind")
-                self.assertFalse(
-                    finished.wait(.2),
+                # Held back on the actor store lock the rename holds, which
+                # is what it did; a short wait for `finished` would only say
+                # the host had not run it yet.
+                self.assertIsNotNone(
+                    waits.wait_blocked(probe),
                     "the new roster name minted an actor before relabel")
+                self.assertFalse(finished.is_set())
             return replay(expected, *args, **kwargs)
 
         try:
             with mock.patch.object(actors, "replay_rename",
                                    side_effect=during_replay), \
-                    mock.patch.object(actors, "_store_lock", side_effect=actor_lock):
+                    mock.patch.object(actors, "_store_lock",
+                                      side_effect=actor_lock), \
+                    _lockwait.observed() as waits:
                 ok, note = seats.rename_seat("actor-old", "actor-new")
         finally:
             for probe in worker:
-                probe.join(3)
+                probe.join(THREAD_TIMEOUT)
         self.assertTrue(ok, note)
         self.assertTrue(finished.wait(0), "positive control: resolver completed")
         self.assertIsNone(outcome[0][1], outcome[0])
@@ -725,7 +733,7 @@ class RenameTest(SeatsBase):
         def writer():
             with _flocked(seats.roster_path() + ".lock"):
                 entered.set()
-                if not release.wait(2):
+                if not release.wait(THREAD_TIMEOUT):
                     raise RuntimeError("roster writer seam was never released")
 
         @contextlib.contextmanager
@@ -741,25 +749,24 @@ class RenameTest(SeatsBase):
 
         owner = threading.Thread(target=writer)
         owner.start()
-        self.assertTrue(entered.wait(1))
+        self.assertTrue(entered.wait(THREAD_TIMEOUT))
         with mock.patch("helm.seats_rename._existing_roster_scope",
-                        observed_scope):
+                        observed_scope), _lockwait.observed() as waits:
             reader = threading.Thread(target=recover)
             reader.start()
-            self.assertTrue(attempting.wait(1))
-            # A BOUNDED WAIT, NOT AN INSTANT. is_set() samples one moment, and
-            # against a NON-blocking implementation attempting.set() and
-            # acquired.set() are a few instructions apart — so the sample can
-            # land in that window and the arm passes a broken build on
-            # scheduling luck. wait() turns the instant into an interval: it
-            # returns the flag, so False means the lock was still unacquired
-            # for the whole window, which is the property being claimed.
-            self.assertFalse(acquired.wait(0.25),
-                             "recovery crossed an active roster writer")
+            self.assertTrue(attempting.wait(THREAD_TIMEOUT))
+            # WHAT THE READER DID, NOT HOW LONG IT TOOK. An instant sample
+            # (is_set) passes a non-blocking build on scheduling luck, and a
+            # bounded interval (wait(0.25)) passes one whenever a loaded host
+            # has not yet run it. The reader is held back only if it is
+            # blocked taking the roster lock the writer holds.
+            self.assertIsNotNone(waits.wait_blocked(reader),
+                                 "recovery crossed an active roster writer")
+            self.assertFalse(acquired.is_set())
             release.set()
-            self.assertTrue(acquired.wait(1))
-            reader.join(2)
-        owner.join(2)
+            self.assertTrue(acquired.wait(THREAD_TIMEOUT))
+            reader.join(THREAD_TIMEOUT)
+        owner.join(THREAD_TIMEOUT)
         self.assertTrue(done.is_set())
         self.assertEqual(recovered, [True])
 
@@ -776,7 +783,7 @@ class RenameTest(SeatsBase):
             if first[0]:
                 first[0] = False
                 entered.set()
-                if not release.wait(2):
+                if not release.wait(THREAD_TIMEOUT):
                     raise RuntimeError("writer seam was never released")
             return real_journal()
 
@@ -797,21 +804,23 @@ class RenameTest(SeatsBase):
         with mock.patch("helm.seats_rename._journal", side_effect=paused_journal):
             writer = threading.Thread(target=move)
             writer.start()
-            self.assertTrue(entered.wait(1))
+            self.assertTrue(entered.wait(THREAD_TIMEOUT))
             with mock.patch("helm.seats_rename._existing_roster_scope",
-                            observed_scope):
+                            observed_scope), _lockwait.observed() as waits:
                 reader = threading.Thread(target=recover)
                 reader.start()
-                self.assertTrue(attempting.wait(1))
-                # A direct mover now owns roster then actor before its journal
+                self.assertTrue(attempting.wait(THREAD_TIMEOUT))
+                # A direct mover owns roster then actor before its journal
                 # window. Recovery must wait at that outer boundary rather than
-                # reaching the rename directory lock out of order.
-                self.assertFalse(acquired.wait(0.25),
-                                 "recovery crossed the pre-journal writer")
+                # reaching the rename directory lock out of order: it is
+                # blocked on a lock the mover holds, and has not acquired.
+                self.assertIsNotNone(waits.wait_blocked(reader),
+                                     "recovery crossed the pre-journal writer")
+                self.assertFalse(acquired.is_set())
                 release.set()
-                self.assertTrue(acquired.wait(1))
-                reader.join(2)
-            writer.join(2)
+                self.assertTrue(acquired.wait(THREAD_TIMEOUT))
+                reader.join(THREAD_TIMEOUT)
+            writer.join(THREAD_TIMEOUT)
         self.assertTrue(done.is_set())
         self.assertEqual((moved, recovered), ([True], [True]))
         self.assertTrue(os.path.exists(seats.seen_path("bar")))
@@ -824,11 +833,11 @@ class RenameTest(SeatsBase):
                            side_effect=({}, None)):
             self.assertTrue(seats_rename.recover_seat_rename())
 
-    def test_rename_moves_every_stop_marker_family(self):
+    def test_rename_moves_every_stop_marker_family(self):  # noqa: VACUOUS_ASSERTION — the loop walks a literal non-empty kind tuple and asserts the new path exists for each
         seats.join(session="s-a", seat="alice", cwd="/tmp/p")
         kinds = ("stopfp", "stopbeacon", "stopwhisper", "stopclaime",
                  "stopwiring", "stoppunt", "stoplease", "stopndp",
-                 "stopseam", "stopseamshare", "stopspiral")
+                 "stopseam", "stopseamshare", "stopspiral", "stopowed")
         paths = [seats._stop_fp_path("main", "alice", "s-a", kind=kind)
                  for kind in kinds]
         for path in paths:
@@ -860,7 +869,8 @@ class RenameTest(SeatsBase):
 
         with mock.patch("helm.seats_delivery.record_delivery_receipt",
                         side_effect=blocked_record), mock.patch(
-                "helm.seats_receipts.move_room_receipts", side_effect=marked_move):
+                "helm.seats_receipts.move_room_receipts",
+                side_effect=marked_move), _lockwait.observed() as waits:
             delivery = threading.Thread(target=lambda: delivered.append(
                 seats.deliver_any(session="s-a", seat="alice",
                                   emit=lambda _line: None, channel="hook")))
@@ -869,7 +879,9 @@ class RenameTest(SeatsBase):
             renamer = threading.Thread(target=lambda: renamed.append(
                 seats.rename_seat("alice", "renamed")))
             renamer.start()
-            self.assertFalse(staged.wait(0.05))
+            self.assertIsNotNone(waits.wait_blocked(renamer),
+                                 "rename was not held back by the delivery")
+            self.assertFalse(staged.is_set())
             release.set()
             delivery.join(THREAD_TIMEOUT)
             renamer.join(THREAD_TIMEOUT)
@@ -892,15 +904,16 @@ class RenameTest(SeatsBase):
                 self.assertTrue(release.wait(THREAD_TIMEOUT))
             return real_utime(path, *args, **kwargs)
 
-        with mock.patch("helm.seats_roster.os.utime", side_effect=blocked):
+        with mock.patch("helm.seats_roster.os.utime", side_effect=blocked), \
+                _lockwait.observed() as waits:
             writer = threading.Thread(target=lambda: seats.touch_seen("alice"))
             writer.start()
             self.assertTrue(entered.wait(THREAD_TIMEOUT))
             renamer = threading.Thread(target=lambda: renamed.append(
                 seats.rename_seat("alice", "renamed")))
             renamer.start()
-            renamer.join(0.05)
-            self.assertTrue(renamer.is_alive())
+            self.assertIsNotNone(waits.wait_blocked(renamer),
+                                 "rename was not held back by the writer")
             release.set()
             writer.join(THREAD_TIMEOUT)
             renamer.join(THREAD_TIMEOUT)
@@ -925,7 +938,7 @@ class RenameTest(SeatsBase):
             return real(path, value)
 
         with mock.patch("helm.seats_stop_signals.pk.atomic_write",
-                        side_effect=blocked):
+                        side_effect=blocked), _lockwait.observed() as waits:
             writer = threading.Thread(target=lambda: wrote.append(
                 seats_cursor._write_stop_latch(
                     old, "alice", "first", session="s-a")))
@@ -934,8 +947,8 @@ class RenameTest(SeatsBase):
             renamer = threading.Thread(target=lambda: renamed.append(
                 seats.rename_seat("alice", "renamed")))
             renamer.start()
-            renamer.join(0.05)
-            self.assertTrue(renamer.is_alive())
+            self.assertIsNotNone(waits.wait_blocked(renamer),
+                                 "rename was not held back by the writer")
             release.set()
             writer.join(THREAD_TIMEOUT)
             renamer.join(THREAD_TIMEOUT)
@@ -1035,27 +1048,37 @@ class RenameTest(SeatsBase):
         import inspect
         from helm import (seats_catchup, seats_delegation, seats_roomscan,
                           seats_roster, seats_stop_claims, seats_stop_guard,
-                          seats_stop_ndp, seats_work_offer)
+                          seats_stop_ndp, seats_stop_owed, seats_work_offer)
 
         cases = {
             seats_catchup.catchup: ("seat_state_lock",),
             seats_stop_guard._ndp_gate: ("_write_stop_latch",),
             # MOVED, NOT DROPPED: the claims rung left _stop_guard for
-            # seats_stop_claims and took `_remove_stop_latch` with it, so the
-            # name is asserted where the writer now lives. The SET of asserted
-            # names is conserved across the two entries — losing one here
-            # while adding none there is how this check would quietly stop
-            # covering a latch writer.
+            # seats_stop_claims, so its guard is asserted where it now lives.
+            # Since task/3123 the rung proves the latch writable through the
+            # seam's guarded probe and QUEUES the remembering write, which
+            # `commit_disclosures` (below, `_write_stop_latch` with the proven
+            # incarnation) makes once the print is on the stream. Its one
+            # direct `_write_stop_latch` FORGETS each moved lease before the
+            # print is decided, so a discarded print cannot leave a lapsed
+            # exemption compared equal. `_remove_stop_latch` lost its one
+            # caller on the way and was deleted rather than kept as dead code.
             seats_stop_guard._stop_guard: (
                 "_write_stop_latch", "seat_state_lock"),
             seats_stop_claims.claims_rung: (
-                "_write_stop_latch", "_remove_stop_latch"),
+                "_write_stop_latch", "_latch_dir_writable",
+                "_PENDING_DISCLOSURES"),
             seats_stop_signals._beacon_block: ("seat_state_lock",),
-            seats_stop_signals._spiral_gate: ("_write_stop_latch",),
+            # MOVED, NOT DROPPED: the spiral rung left seats_stop_signals for
+            # seats_stop_spiral with the pair-meld turn rung beside it.
+            seats_stop_spiral._spiral_gate: ("_write_stop_latch",),
+            seats_stop_spiral._pair_turn_gate: ("_write_stop_latch",),
+            seats_stop_owed._owed_rung: ("_write_stop_latch",),
             seats_stop_seam._latch_dir_writable: ("_probe_stop_latch",),
             seats_stop_seam.commit_disclosures: ("_write_stop_latch",),
             seats_work_offer._stop_whisper: ("seat_state_lock",),
             seats_delegation._claim_evidence_warning: ("seat_state_lock",),
+            seats_roomscan._give_back: ("seat_state_lock",),
         }
         for fn, owners in cases.items():
             source = inspect.getsource(fn)
@@ -1069,7 +1092,8 @@ class RenameTest(SeatsBase):
         modules = (seats_catchup, seats_cursor, seats_delegation,
                    seats_delivery, seats_roomscan, seats_roster,
                    seats_stop_claims, seats_stop_guard, seats_stop_ndp,
-                   seats_stop_seam, seats_stop_signals, seats_work_offer)
+                   seats_stop_owed, seats_stop_seam, seats_stop_signals,
+                   seats_stop_spiral, seats_work_offer)
         calls = []
         for module in modules:
             tree = ast.parse(inspect.getsource(module))
@@ -1084,7 +1108,23 @@ class RenameTest(SeatsBase):
                               {kw.arg for kw in node.keywords}))
         # 17, not 16: the clean-stop line gained a same-state latch, which is a
         # seventeenth writer and is exactly what this census exists to notice.
-        self.assertEqual(len(calls), 17, "void/drifted guard census, not clean")
+        # 18: the owed-row rung's once-per-owed-set latch for a seat busy on
+        # other work (`_owed_rung`, kind stopowed), session-keyed like the rest.
+        # 19: the rotation's give-back rewrites the same `.scan.` ring file
+        # the slice writes, under the same session-keyed rename guard.
+        # 20: the pair-meld turn rung's once-per-owed-set latch (kind
+        # stoppair), session-keyed like the rest.
+        # 19 (task/3123): `_remove_stop_latch` in seats_cursor lost its one
+        # caller and its guarded `seat_state_lock` call left with it; the
+        # claims rung's remembering write became a queued one that
+        # `commit_disclosures`' existing call makes, and its forgetting write
+        # (moved leases dropped before the print is decided) is its own call.
+        # 20 (task/3338): _beacon_block retires a stale beacon latch for a
+        # pane-woken family under the session-keyed guard.
+        # 21 (task/3696): the owed-row rung RECORDS the set an idle stop named
+        # (kind stopowed), so a busy stop after it does not name it again;
+        # session-keyed like the rest.
+        self.assertEqual(len(calls), 21, "void/drifted guard census, not clean")
         self.assertEqual([
             (module, line) for module, line, keywords in calls
             if not keywords.intersection(("session", "incarnation"))], [])
@@ -2045,14 +2085,16 @@ class RenameSpawnRegisterTest(SeatsBase):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write("{not json at all")
-        before = open(path, "rb").read()
+        with open(path, "rb") as fh:
+            before = fh.read()
 
         would, _marked, unread = seatmod_roster.migrate_incarnations()
         # THE PATH AND THE BYTES, not merely "no incarnation appeared": an
         # absence-of-marker oracle passes over a cure that moved the file.
         self.assertTrue(os.path.exists(path), "the dry run MOVED the roster")
-        self.assertEqual(open(path, "rb").read(), before,
-                         "the dry run rewrote the canonical bytes")
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), before,
+                             "the dry run rewrote the canonical bytes")
         self.assertEqual(would, [])
         # AND UNREADABLE IS ITS OWN ANSWER — reporting [] with no reason is
         # indistinguishable from a fully migrated fleet.

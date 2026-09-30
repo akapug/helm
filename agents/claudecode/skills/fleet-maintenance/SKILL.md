@@ -73,6 +73,11 @@ Before ANY kill/relaunch/swap/inject (fleet rule, no exceptions):
   settings rather than nursing a sick pane; preserve gpt-5.5 model pin on
   codex restart.
 
+A rescue you repeat by hand is a friction tax on the maintenance seat. Count
+it (steps x times per day, from the room or the ledger) and file the fix that
+removes it, as `helm seat doctor --ensure` on a cron does for proxy
+respawns. A fix that pays back within about 2 days goes ahead of new features.
+
 ## 3. Ground truth — what is the fleet, actually
 
 Never from memory. A row you can't prove is UNKNOWN, not alive.
@@ -131,14 +136,32 @@ which every agent may run.
 
 ## 6. Cross-family gating
 
-A fix's reviewer must be a **different model family** than its author (see
-`reviewer-implements-own-findings`). Route gates in **parallel across families** — never serialize the whole
+A fix's reviewer must be **independent** of its author, and the author never
+picks its own reviewer. Independence is MODEL (a different model than the
+author's) or CONTEXT (a fresh session that never saw the author's context, such
+as a cloud session on another account that `helm remote` drives), scaled by
+reversibility. A fresh-context Opus read is the default, and on a lane one
+revert undoes a context-independent read by the author's own model is a full
+review leg. Irreversible work (prod, migrations, deletions, money,
+credentials, killing processes, public pushes, and changes to a door that
+decides safety) needs ONE approval-tier read by a reader that is not the
+author: a different family is not required for that one read (the owner
+confirmed it, room row 2217), and the review ladder in `/build` names the
+tier, the park when no tier reader can take it, and when Fable reads (max QC
+only). The `helm remote` relay's table (helm/remote_policy.py) still classes
+a same-model read of irreversible work as CONCUR-class; that table has not
+yet taken the ruling. Falsifier: the same-model arm is withdrawn when such
+readers find less than half of the blocking findings a different-model reader
+records on the same tips, or when another family's finding contradicts two of
+their approvals within a week; the relay reverts it on its own (see
+`reviewer-implements-own-findings` and docs/REMOTE_SESSIONS.md). Route gates in
+**parallel across families** — never serialize the whole
 fleet's merges on one family's remaining budget. The families are equal
 counterparts, not a writer tier and a witness tier: a reviewer of any family
 commits its own mechanical cures off the reviewed tip and records them with
-`--patch-tip`, so lanes routinely carry several authors. The gate that stays
-non-negotiable is the RE-READ — someone who wrote none of the composed tip
-reads it once before the land gate.
+`--patch-tip`, so lanes routinely carry several authors. When agreement lands
+the chain and when the composed tip owes a re-read is decided by Protocol step 7
+of that skill.
 
 ## 7. Re-grounding a confused (not dead) seat
 
@@ -343,11 +366,3 @@ one present by name. `daemon-init.ts:718` states the property this rests on —
 old generations linger: they are HOLDING your agents, correctly refusing to
 die. Upgrade while ONE generation is live rather than after several stack; the
 cost of waiting is a bigger visibility gap, not a smaller one.
-
-## Prior art
-
-Fresh helm-native write (an earlier harness's maintenance skill and its
-credential-rescue runbook are the ancestors — reboot tiers,
-monitored-pair relaunch, cred/session decoupling all inherited as principles;
-their verbs were specific to that harness, so none port literally). Seat-level
-mechanics: the `seat-relaunch-playbook` maintenance memory.

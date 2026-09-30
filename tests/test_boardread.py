@@ -62,7 +62,8 @@ class BoardReadBase(unittest.TestCase):
 class RecordTest(BoardReadBase):
     def test_a_failed_read_is_written_counted_and_named(self):
         self.assertTrue(boardread.record("failed", reason="the ledger refused"))
-        rec = json.load(open(boardread.path()))
+        with open(boardread.path(), encoding="utf-8") as fh:
+            rec = json.load(fh)
         self.assertEqual(rec["outcome"], "failed")
         self.assertEqual(rec["reason"], "the ledger refused")
         self.assertEqual(rec["failures"], 1)
@@ -78,7 +79,8 @@ class RecordTest(BoardReadBase):
         self.assertTrue(boardread.record("ok", now=1000.0 + boardread.HEARTBEAT_S))
         self.assertTrue(boardread.record("failed", reason="X", now=1000.1))
         self.assertTrue(boardread.record("failed", reason="X", now=1000.2))
-        self.assertEqual(json.load(open(boardread.path()))["failures"], 2)
+        with open(boardread.path(), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["failures"], 2)
 
     def test_a_recorder_that_cannot_write_answers_False_and_never_raises(self):
         with mock.patch.object(boardread.pk, "atomic_write",

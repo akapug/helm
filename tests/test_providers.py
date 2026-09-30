@@ -202,6 +202,70 @@ class AccountsTest(NativeBase):
         self.assertEqual(rows["cx"]["email"], "c@x.example")
         self.assertTrue(rows["(default-claude)"]["usable"])
 
+    def test_the_default_codex_home_carries_its_login_like_every_codex_home(self):
+        """task/3635: a default home is a pointer at a subscription, never one
+        of its own, and it collapses onto the row it points at only when its
+        login is read. The claude default's login always was; the codex
+        default's was not, so it minted a second codex account on the credit
+        table with the same numbers as the home it points at."""
+        from helm import accounts
+        self.codex_home("cx", "c@x.example")
+        d = os.path.join(self.tmp, ".codex")
+        os.makedirs(d)
+        with open(os.path.join(d, "auth.json"), "w") as f:
+            json.dump({"tokens": {"access_token": "FAKE-default",
+                                  "id_token": fake_jwt("c@x.example")}}, f)
+        rows = {r["name"]: r for r in self.p.accounts()}
+        self.assertEqual(rows["(default-codex)"]["email"], "c@x.example")
+        keys = {n: accounts.subscription_key(accounts.measured_identity(r))
+                for n, r in rows.items()}
+        self.assertIsNotNone(keys["cx"])
+        self.assertEqual(keys["(default-codex)"], keys["cx"])
+
+    def _default_codex_auth(self, body):
+        """The default codex home holding `body` as its auth.json, beside a
+        scanned codex home that reads fine; -> the provider's rows by name."""
+        self.codex_home("cx", "c@x.example")
+        d = os.path.join(self.tmp, ".codex")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "auth.json"), "w") as f:
+            f.write(body)
+        return {r["name"]: r for r in self.p.accounts()}
+
+    def test_a_default_codex_auth_that_is_a_list_fails_closed_for_that_home(self):
+        """Review F3: the default codex home's auth.json is read now, so valid
+        JSON that is not an object must cost THAT home its login — named —
+        and never raise through accounts(), which the web reads as the whole
+        measured census being unreadable."""
+        rows = self._default_codex_auth('["not", "an", "object"]')
+        self.assertEqual(rows["cx"]["email"], "c@x.example")   # census stands
+        self.assertIn("(default-codex)", rows)
+        self.assertIsNone(rows["(default-codex)"]["email"])
+        self.assertIn("auth.json", rows["(default-codex)"]["login_unknown"])
+
+    def test_a_default_codex_auth_that_is_a_string_fails_closed_for_that_home(self):
+        rows = self._default_codex_auth('"just a string"')
+        self.assertEqual(rows["cx"]["email"], "c@x.example")
+        self.assertIsNone(rows["(default-codex)"]["email"])
+        self.assertIn("auth.json", rows["(default-codex)"]["login_unknown"])
+
+    def test_a_malformed_default_codex_auth_fails_closed_for_that_home(self):
+        rows = self._default_codex_auth('{"tokens": ')
+        self.assertEqual(rows["cx"]["email"], "c@x.example")
+        self.assertIsNone(rows["(default-codex)"]["email"])
+        self.assertIn("auth.json", rows["(default-codex)"]["login_unknown"])
+
+    def test_a_scanned_codex_auth_that_is_a_list_fails_closed_for_that_home(self):
+        """The same read on a scanned codex home: one home, never the census."""
+        d = self.codex_home("cx-bad")
+        with open(os.path.join(d, "auth.json"), "w") as f:
+            f.write("[1, 2]")
+        self.codex_home("cx", "c@x.example")
+        rows = {r["name"]: r for r in self.p.accounts()}
+        self.assertEqual(rows["cx"]["email"], "c@x.example")
+        self.assertIsNone(rows["cx-bad"]["email"])
+        self.assertIn("auth.json", rows["cx-bad"]["login_unknown"])
+
     def test_same_identity_two_homes_disambiguated_never_dropped(self):
         self.claude_home("one", "same@x.example")
         self.claude_home("two", "same@x.example")
@@ -231,9 +295,11 @@ class ProbeTest(NativeBase):
 
     def _set_expiry(self, home, expires_at_ms):
         p = os.path.join(home, ".credentials.json")
-        creds = json.load(open(p))
+        with open(p, encoding="utf-8") as fh:
+            creds = json.load(fh)
         creds["claudeAiOauth"]["expiresAt"] = expires_at_ms
-        json.dump(creds, open(p, "w"))
+        with open(p, "w") as fh:
+            json.dump(creds, fh)
 
     def test_expired_token_is_its_own_state_not_api_error(self):  # noqa: VACUOUS_ASSERTION — three positive assertions (state==expired-token, status contains reauth-needed + 15d); the fn.assert_not_called() absence has its unconditional positive control in the sibling test_live_token_still_probes_the_network (fn.assert_called_once)
         """task/381: a present-but-EXPIRED token is its own state and never
@@ -1275,6 +1341,32 @@ class CodexBudgetReaderTest(unittest.TestCase):
         self.assertIn("5h-gpt-5.3-codex-spark", labels)
         self.assertIn("7d-gpt-5.3-codex-spark", labels)
         self.assertEqual(row["binding_gauge"]["label"], "7d")
+
+    def test_the_reset_credit_balance_rides_the_usage_body_already_read(self):  # noqa: VACUOUS_ASSERTION — the parsed counts on the row and in the snapshot are exact positives; the Nones are the unread-never-0 law
+        """MEASURED on six pooled accounts: the usage body carries
+        `rate_limit_reset_credits` with exactly `available_count` and
+        `applicable_available_count` (the recorded fixture predates the read
+        and dropped that block). The runway takes the held count from this
+        probe, so no second vendor call is made for it."""
+        body = dict(recorded("pro"), rate_limit_reset_credits={
+            "available_count": 1, "applicable_available_count": 0})
+        row, get = self.probe(body)
+        self.assertEqual(get.call_count, 1, "one GET per account")
+        self.assertEqual(row["reset_credits"], {"available": 1,
+                                                "applicable": 0})
+        # the snapshot the dispatch gate and `helm codex resets` read keeps it
+        self.mod.write_snapshot([row], now=self.now)
+        cached, _age = self.mod.cached_budget(now=self.now)
+        self.assertEqual(cached[0]["reset_credits"], {"available": 1,
+                                                      "applicable": 0})
+        # an absent or junk block is an UNREAD balance, never 0
+        for block in (None, {}, {"available_count": True},
+                      {"available_count": "1"}, {"available_count": -1}, [1]):
+            junk = dict(recorded("pro"))
+            if block is not None:
+                junk["rate_limit_reset_credits"] = block
+            self.assertIsNone(self.probe(junk)[0]["reset_credits"], block)
+        self.assertIsNone(self.probe(error=OSError("down"))[0]["reset_credits"])
 
     def test_a_REJECTED_token_is_unknown_and_never_zero(self):
         row, _ = self.probe(error=self.http_error(401))

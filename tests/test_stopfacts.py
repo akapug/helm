@@ -45,13 +45,25 @@ cell names its arm (this file unless marked), or the reason it has none.
                       write is onto no file)
     older code ...... test_a_process_whose_code_was_replaced_does_not_write,
                       test_a_changed_tree_re_execs_ONCE_with_this_processs_own_argv,
-                      test_the_poll_re_execs_before_it_kicks_a_refresh,
+                      test_the_legs_own_poll_never_execs,
                       test_a_tree_that_does_not_import_is_never_exec_d_onto
     mid-exec ........ test_a_snapshot_write_in_flight_finishes_before_the_exec,
                       test_the_image_after_the_exec_marks_the_facts_refolding
     two residents ... test_ONE_writer_and_the_loser_never_writes,
                       test_a_second_resident_still_loses_the_lock_after_the_exec
     malformed row ... test_a_malformed_snapshot_on_disk_costs_a_recompute_not_a_wedge
+  the follow thread (F), every `helm web` — FollowTest (task/3132)
+    console port .... test_on_the_console_the_leg_is_the_one_follower_and_execs_ONCE
+    tree unchanged .. test_another_port_re_execs_ONCE_after_the_settle_with_its_own_argv
+                      (its control polls)
+    tree changed .... test_another_port_re_execs_ONCE_after_the_settle_with_its_own_argv
+    broken tree ..... test_a_tree_that_does_not_import_keeps_the_board_serving_once,
+                      test_a_web_family_that_does_not_import_is_never_exec_d_onto,
+                      test_the_import_check_covers_every_module_the_web_entry_imports
+    switched off .... test_HELM_WEB_FOLLOW_0_starts_no_follow_thread_and_says_so
+    other port ...... test_another_port_starts_no_stop_facts_computation
+    not a server .... test_a_process_that_is_not_a_helm_web_never_follows
+    --open .......... test_a_re_exec_opens_no_second_browser_tab
 
 NEVER WAITS, for every surface at once: ReaderTest.
 test_nothing_in_the_reader_can_wait_on_state — the reader every rung reads
@@ -78,14 +90,22 @@ from helm import (dispatches, doctor, pk, seats, stopfacts,
 # source-driven audits read THIS one (the scratch reaper and env hygiene each
 # parse a module on its own). So the reaper is disabled HERE too, and put back.
 _ENV_PRIOR = {}
+_PENDING_PRIOR = []
 
 
 def setUpModule():
+    # helm.seats_stop_seam._PENDING_DISCLOSURES is a process-wide queue a
+    # stop-guard pass fills; this module puts back what it found, so no
+    # later unit reads its disclosures (the sliced gate's leak audit)
+    from helm import seats_stop_seam
+    _PENDING_PRIOR[:] = list(seats_stop_seam._PENDING_DISCLOSURES)
     _ENV_PRIOR["HELM_SCRATCH_GC"] = os.environ.get("HELM_SCRATCH_GC")
     os.environ["HELM_SCRATCH_GC"] = "0"
 
 
 def tearDownModule():
+    from helm import seats_stop_seam
+    seats_stop_seam._PENDING_DISCLOSURES[:] = _PENDING_PRIOR
     for key, was in _ENV_PRIOR.items():
         if was is None:
             os.environ.pop(key, None)
@@ -519,17 +539,25 @@ class ResidentTest(LaneWorld, SeatsBase):
         execv.assert_called_once_with(sys.executable, argv)
         self.assertIsNone(leg._fd, "the writer lock was not released first")
 
-    def test_the_poll_re_execs_before_it_kicks_a_refresh(self):
+    def test_the_legs_own_poll_never_execs(self):
+        """THE FOLLOW THREAD IS THE PROCESS'S ONE EXEC PATH (task/3132). The
+        leg's poll only kicks its refreshes, which refuse to write on a
+        changed tree (`_refused`); the follow poll on the same leg is what
+        re-execs it."""
         leg = self.leg()
-        calls = []
+        self.addCleanup(leg.release)
+        reads = []
         with mock.patch.object(leg, "code_moved", return_value="d" * 32), \
-                mock.patch.object(leg, "reexec", side_effect=lambda d:
-                                  calls.append(("reexec", d))), \
+                mock.patch.object(leg, "reexec") as reexec, \
                 mock.patch.object(web_cache, "_read_behind",
                                   side_effect=lambda key, *_a, **_k:
-                                  calls.append(("read", key))):
+                                  reads.append(key)):
             stopfacts_resident.tick(leg)
-        self.assertEqual(calls[0], ("reexec", "d" * 32), calls)
+            reexec.assert_not_called()
+            stopfacts_resident.follow_tick(leg)
+        self.assertIn(stopfacts_resident.KEY, reads,
+                      "control: the leg's poll ran")
+        reexec.assert_called_once_with("d" * 32)
 
     def test_a_tree_that_does_not_import_is_never_exec_d_onto(self):  # noqa: VACUOUS_ASSERTION — the real import check answering None and the refusal naming SyntaxError are unconditional positives on the same call
         """A BROKEN TREE LEAVES THE CONSOLE SERVING. The import check runs in
@@ -666,6 +694,300 @@ class ResidentTest(LaneWorld, SeatsBase):
         self.assertTrue(leg.refresh()["written"])
         self.assertTrue(leg.seam_refresh()["written"])
         self.assertTrue(stopfacts.read().lease(self.RES)[1].exact)
+
+
+class FollowTest(SeatsBase):
+    """EVERY `helm web` FOLLOWS ITS CODE (task/3132). A board on any port
+    re-execs onto a changed tree from its follow thread; on the console port
+    the stop-facts leg IS that thread's follower, so a process has one exec
+    path. Threads are captured at `_spawn` and never run: each arm drives the
+    polls itself, on the clock it names."""
+
+    BOARD = [sys.executable, "/x/bin/helm", "web", "--port", "7481"]
+    CONSOLE = [sys.executable, "/x/bin/helm", "web", "--port", "7433"]
+    SWITCHES = ("HELM_WEB_FOLLOW", "MELD_WEB_FOLLOW", "HELM_STOP_FACTS_LEG",
+                "MELD_STOP_FACTS_LEG")
+
+    def start(self, port, argv, env=None):
+        """`start` as `helm web` calls it, with this command line.
+        -> ({thread name: (target, args)}, its return, its stderr)."""
+        import io
+        spawned = {}
+
+        def spawn(name, target, *args):
+            spawned[name] = (target, args)
+            return name
+
+        env = dict(env or {})
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(stopfacts_resident, "ARGV", argv), \
+                mock.patch.object(stopfacts_resident, "_spawn",
+                                  side_effect=spawn), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            for key in self.SWITCHES:
+                if key not in env:
+                    os.environ.pop(key, None)
+            got = stopfacts_resident.start(port=port)
+        for _target, args in spawned.values():
+            if isinstance(args[0], stopfacts_resident.Leg):
+                self.addCleanup(args[0].release)
+        return spawned, got, err.getvalue()
+
+    def test_another_port_re_execs_ONCE_after_the_settle_with_its_own_argv(self):
+        """OTHER PORT, TREE CHANGED: one exec, only once the new digest has
+        read the same for REEXEC_SETTLE_S, on this interpreter with this
+        process's own command line (so the same port), and the line says so.
+        TREE UNCHANGED: the control polls exec nothing."""
+        import io
+        spawned, _got, _err = self.start(7481, self.BOARD)
+        target, (follower, _poll) = spawned["helm-web-follow"]
+        self.assertIs(target, stopfacts_resident._follow_loop)
+        settle = stopfacts_resident.REEXEC_SETTLE_S
+        with mock.patch.object(stopfacts_resident, "ARGV", self.BOARD), \
+                mock.patch.object(stopfacts_resident, "_preflight",
+                                  return_value=None) as preflight, \
+                mock.patch.object(stopfacts_resident.os, "execv") as execv, \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            for now in (0.0, settle, 3 * settle):
+                stopfacts_resident.follow_tick(follower, now=now)
+            self.assertEqual(execv.call_count, 0,
+                             "control: the tree is the code it loaded")
+            with mock.patch.object(stopfacts_resident, "LOADED_POLICY",
+                                   "0" * 32):
+                stopfacts_resident.follow_tick(follower, now=10.0)
+                stopfacts_resident.follow_tick(follower,
+                                               now=10.0 + settle / 2)
+                self.assertEqual(execv.call_count, 0,
+                                 "a tree still settling was exec'd onto")
+                for now in (10.0 + settle, 10.0 + 2 * settle, 30.0):
+                    stopfacts_resident.follow_tick(follower, now=now)
+        execv.assert_called_once_with(sys.executable, self.BOARD)
+        preflight.assert_called_once_with()
+        self.assertIn("the tree changed; re-exec'ing onto it", err.getvalue())
+
+    def test_a_tree_that_does_not_import_keeps_the_board_serving_once(self):
+        """BROKEN TREE: no exec, one stderr line, and the digest is recorded
+        in `no_exec`, so the next poll on it neither execs nor asks the
+        import check again."""
+        import io
+        import subprocess
+        follower = stopfacts_resident.Follower()
+        broken = subprocess.CompletedProcess(
+            [], 1, b"", b"Traceback (most recent call last):\n"
+                        b"SyntaxError: invalid syntax\n")
+        settle = stopfacts_resident.REEXEC_SETTLE_S
+        with mock.patch.object(stopfacts_resident, "ARGV", self.BOARD), \
+                mock.patch.object(stopfacts_resident.subprocess, "run",
+                                  return_value=broken) as run, \
+                mock.patch.object(stopfacts_resident.os, "execv") as execv, \
+                mock.patch.object(stopfacts_resident, "LOADED_POLICY",
+                                  "0" * 32), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            stopfacts_resident.follow_tick(follower, now=0.0)
+            stopfacts_resident.follow_tick(follower, now=settle)
+            digest = stopfacts.code_policy(fresh=True)
+            self.assertIn("does not import (SyntaxError: invalid syntax)",
+                          follower.no_exec.get(digest, ""))
+            for now in (2 * settle, 3 * settle, 10 * settle):
+                stopfacts_resident.follow_tick(follower, now=now)
+        execv.assert_not_called()
+        run.assert_called_once()
+        said = [ln for ln in err.getvalue().splitlines() if "re-exec" in ln]
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("not re-exec'ing onto the changed tree", said[0])
+
+    def test_a_web_family_that_does_not_import_is_never_exec_d_onto(self):  # noqa: VACUOUS_ASSERTION — the control's None and every refusal come from the same shipped `_preflight`, one fake tree apiece, and each refusal is asserted positively on its SyntaxError
+        """THE IMPORT CHECK IMPORTS WHAT `helm web` IMPORTS. The verb reaches
+        the server through `helm.web` (the cli's lazy leg), which pulls in the
+        web family; `helm.web_server` alone does not. MEASURED on a live
+        board (task/3132): a syntax error in helm/web_common.py passed the
+        check, and the exec died on import, leaving no server. The process
+        entry also imports `helm.trunkroute` before it dispatches, and the
+        stale-tree line imports `helm.selfrepo` when the cwd is inside the
+        tree (the integrator's board), both unguarded. A tree where any of
+        them does not import is refused, so the board keeps serving."""
+        import shutil
+        import tempfile
+
+        def preflight(broken=None):
+            """`_preflight` over a fresh fake package whose `broken` module
+            does not import (None: every module imports)."""
+            root = tempfile.mkdtemp(prefix="helm-follow-preflight-")
+            self.addCleanup(shutil.rmtree, root, True)
+            pkg = os.path.join(root, "helm")
+            os.makedirs(pkg)
+            for name, body in (("__init__.py", ""), ("cli.py", ""),
+                               ("trunkroute.py", ""), ("selfrepo.py", ""),
+                               ("web_server.py", ""), ("webserve.py", ""),
+                               ("stopfacts_resident.py", ""),
+                               ("web.py", "from . import web_common\n"),
+                               ("web_common.py", "BIND = '127.0.0.1'\n")):
+                with open(os.path.join(pkg, name), "w") as f:
+                    f.write(body + ("def broken(:\n" if name == broken
+                                    else ""))
+            with mock.patch.object(stopfacts, "code_root", return_value=pkg):
+                return stopfacts_resident._preflight()
+
+        self.assertIsNone(preflight(), "control: the whole family imports")
+        for broken in ("web_common.py", "trunkroute.py", "selfrepo.py"):
+            with self.subTest(broken):
+                self.assertIn("does not import (SyntaxError",
+                              str(preflight(broken)))
+
+    def test_the_import_check_covers_every_module_the_web_entry_imports(self):  # noqa: VACUOUS_ASSERTION — the empty difference is held beside positive controls on both of its sets (helm.web loaded in each) and on the entry's own port refusal, so an entry or a check that loaded nothing cannot pass it
+        """THE CHECK'S MODULES ARE THE ONES THE REAL ENTRY LOADS BEFORE IT
+        SERVES, MEASURED. `bin/helm web` runs `cli.main` as the process entry:
+        it imports `helm.trunkroute` before it dispatches, and the stale-tree
+        line imports `helm.selfrepo` when the cwd is inside the tree (the
+        integrator's board), both unguarded. Neither was in the check, so a
+        land that broke either would have exec'd a board into a crash. Here
+        the real entry runs in a child interpreter from the tree's root up to
+        `cmd_web`'s own refusal of `--port x` (before anything binds), and
+        every helm module it loaded must be one the shipped check's own import
+        line loads. `helm.hooks` is stubbed in that child: `_main` imports it
+        under `except Exception`, so a hooks module that does not import runs
+        the verb anyway and is no reason to keep a board on older code."""
+        import json
+        import subprocess
+        parent = os.path.dirname(stopfacts.code_root())
+        asked = []
+        with mock.patch.object(
+                stopfacts_resident.subprocess, "run",
+                side_effect=lambda argv, **_kw: asked.append(argv)
+                or subprocess.CompletedProcess(argv, 0, b"", b"")):
+            stopfacts_resident._preflight()
+        self.assertEqual(len(asked), 1, asked)
+        self.assertEqual(asked[0][:2], [sys.executable, "-c"])
+        env = dict(os.environ)
+        for key in ("HELM_NO_TREE_WARNING", "HELM_HOOK_INTERP_RECORD",
+                    "HELM_HOOK_INTERP_KEY"):
+            env.pop(key, None)
+        loaded = ("print(json.dumps([rc, sorted(m for m in sys.modules "
+                  "if m.split('.')[0] == 'helm')]))")
+
+        def child(code):
+            r = subprocess.run([sys.executable, "-c", code], cwd=parent,
+                               env=env, stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=120)
+            err = r.stderr.decode("utf-8", "replace")
+            self.assertEqual(r.returncode, 0, err[-2000:])
+            return (json.loads(r.stdout.decode("utf-8").splitlines()[-1]),
+                    err)
+
+        (_rc, checked), _err = child(
+            "%s\nimport json; rc = None; %s" % (asked[0][2], loaded))
+        (rc, entry), err = child(
+            "import json, sys, types; sys.path.insert(0, %r); "
+            "hooks = types.ModuleType('helm.hooks'); "
+            "hooks.hook_skips_here = lambda verb, rest: False; "
+            "sys.modules['helm.hooks'] = hooks; "
+            "sys.argv = [%r, 'web', '--port', 'x']; "
+            "from helm.cli import main; rc = main(); %s"
+            % (parent, os.path.join(parent, "bin", "helm"), loaded))
+        self.assertEqual(rc, 2, err[-2000:])
+        self.assertIn("--port wants an integer", err,
+                      "control: the entry reached cmd_web's own parse")
+        self.assertIn("helm.web", entry, "control: the verb was dispatched")
+        self.assertIn("helm.web", checked, "control: the check ran its line")
+        self.assertEqual(
+            sorted(set(entry) - set(checked) - {"helm.hooks"}), [],
+            "the real `helm web` entry loads these before it serves, and the "
+            "re-exec's import check does not")
+
+    def test_on_the_console_the_leg_is_the_one_follower_and_execs_ONCE(self):
+        """CONSOLE PORT: the leg runs as it always has, and it is the follow
+        thread's follower — so the leg's poll and the follow poll, run
+        together over a changed tree, make exactly one exec."""
+        import io
+        from helm.web_common import DEFAULT_PORT
+        spawned, got, _err = self.start(DEFAULT_PORT, self.CONSOLE)
+        self.assertEqual(sorted(spawned), ["helm-stop-facts",
+                                           "helm-web-follow"])
+        target, (leg, _poll) = spawned["helm-stop-facts"]
+        self.assertIs(target, stopfacts_resident._leg_loop)
+        self.assertIsInstance(leg, stopfacts_resident.Leg)
+        self.assertIs(spawned["helm-web-follow"][1][0], leg,
+                      "two followers in one process are two exec paths")
+        self.assertEqual(got, {"follow": "helm-web-follow",
+                               "leg": "helm-stop-facts"})
+        settle = stopfacts_resident.REEXEC_SETTLE_S
+        reads = []
+        with mock.patch.object(stopfacts_resident, "ARGV", self.CONSOLE), \
+                mock.patch.object(stopfacts_resident, "_preflight",
+                                  return_value=None), \
+                mock.patch.object(stopfacts_resident.os, "execv") as execv, \
+                mock.patch.object(stopfacts_resident, "LOADED_POLICY",
+                                  "0" * 32), \
+                mock.patch.object(web_cache, "_read_behind",
+                                  side_effect=lambda key, *_a, **_k:
+                                  reads.append(key)), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            for now in (0.0, settle / 2, settle, 2 * settle, 5 * settle):
+                stopfacts_resident.tick(leg)
+                stopfacts_resident.follow_tick(leg, now=now)
+        self.assertIn(stopfacts_resident.KEY, reads,
+                      "control: the leg's poll ran alongside")
+        execv.assert_called_once_with(sys.executable, self.CONSOLE)
+
+    def test_another_port_starts_no_stop_facts_computation(self):  # noqa: VACUOUS_ASSERTION — the same start is asserted to spawn the follow thread with a plain Follower, the unconditional positive on what it started
+        """OTHER PORT: the follow thread starts with a follower of its own,
+        and the stop-facts leg does not start (unchanged)."""
+        self.assertFalse(stopfacts_resident.enabled(7481))
+        spawned, got, _err = self.start(7481, self.BOARD)
+        self.assertEqual(sorted(spawned), ["helm-web-follow"])
+        follower = spawned["helm-web-follow"][1][0]
+        self.assertIsInstance(follower, stopfacts_resident.Follower)
+        self.assertNotIsInstance(follower, stopfacts_resident.Leg)
+        self.assertEqual(got, {"follow": "helm-web-follow", "leg": None})
+
+    def test_HELM_WEB_FOLLOW_0_starts_no_follow_thread_and_says_so(self):
+        """SWITCHED OFF: no follow thread, and stderr says so at start. The
+        console's leg is not switched off with it: facts from older code are
+        refused, so it follows as it always has, and says that instead."""
+        from helm.web_common import DEFAULT_PORT
+        spawned, _got, err = self.start(7481, self.BOARD)
+        self.assertIn("helm-web-follow", spawned, "control: it follows")
+        self.assertNotIn("not following", err)
+        spawned, got, err = self.start(7481, self.BOARD,
+                                       env={"HELM_WEB_FOLLOW": "0"})
+        self.assertEqual(spawned, {})
+        self.assertEqual(got, {"follow": None, "leg": None})
+        self.assertIn("not following code changes", err)
+        self.assertIn("HELM_WEB_FOLLOW=0", err)
+        spawned, _got, err = self.start(DEFAULT_PORT, self.CONSOLE,
+                                        env={"HELM_WEB_FOLLOW": "0"})
+        self.assertIs(spawned["helm-web-follow"][1][0],
+                      spawned["helm-stop-facts"][1][0])
+        self.assertIn("HELM_WEB_FOLLOW=0 is not honoured", err)
+
+    def test_a_process_that_is_not_a_helm_web_never_follows(self):  # noqa: VACUOUS_ASSERTION — the control start before the loop spawns the follow thread, and every subTest asserts the refusal line present on the same start
+        """Running this process's command line again is this server only
+        when that line IS a `helm web` on a port it keeps: a test runner
+        that calls `cmd_web`, or `--port 0`, is never exec'd."""
+        spawned, _got, _err = self.start(7481, self.BOARD)
+        self.assertIn("helm-web-follow", spawned, "control: it follows")
+        for label, argv in (
+                ("a test runner", [sys.executable, "-m", "unittest",
+                                   "tests.test_stopfacts"]),
+                ("an ephemeral port", self.BOARD[:-1] + ["0"])):
+            with self.subTest(label):
+                spawned, got, err = self.start(7481, argv)
+                self.assertEqual(spawned, {})
+                self.assertIsNone(got["follow"])
+                self.assertIn("not following code changes", err)
+
+    def test_a_re_exec_opens_no_second_browser_tab(self):
+        """`helm web --open` re-execs as the same server, without `--open`:
+        a land never opens another tab."""
+        follower = stopfacts_resident.Follower()
+        with mock.patch.object(stopfacts_resident, "ARGV",
+                               self.BOARD + ["--open"]), \
+                mock.patch.object(stopfacts_resident, "_preflight",
+                                  return_value=None), \
+                mock.patch.object(stopfacts_resident.os, "execv") as execv, \
+                mock.patch("sys.stderr"):
+            follower.reexec("d" * 32)
+        execv.assert_called_once_with(sys.executable, self.BOARD)
 
 
 class SurfaceByStateTest(LaneWorld, SeatsBase):

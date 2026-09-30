@@ -1,0 +1,887 @@
+/* ================= PROJECT TEAMS (task/3156) =================
+   The owner's words: "fuck yes i cannot wait to try out this ui for real".
+   Each project's open row carries its TEAM beside its light: the seats, the
+   family and role of each, and the share of each short family the project
+   may spend. The family sheet, on the Families card at the head of Fleet ›
+   credit (task/3445), carries the shares ACROSS projects, the reset credits
+   in hand, and the declare control. The two link both ways: a budget row
+   opens its family there, and each share opens its project's Team tab.
+
+   A LOCAL FAMILY IS MEASURED IN LANES: its sheet carries the recorded lane capacity and one bar of
+   every project's slot share and the lanes it holds, and a card's slot share
+   is share × capacity slots — YELLOW inside them, ORANGE over them, and a
+   route preview that marks the seat QUEUED, never refused. With no capacity
+   recorded it says "capacity not measured", never a number.
+
+   THE SERVER DECIDES, THE PAGE PREVIEWS. The saved team, its budgets and
+   colours, the lead's drift list and the history all come from the board's
+   `teams` leg (`teams.board_model`). An unsaved edit is re-folded here the
+   same way `teams.allocation` folds a saved one — the same readings, the
+   same rule — so a − or + moves the budget, the colour and the route preview
+   at once, and a save sends the draft to POST /api/projects/team, which
+   writes through `teams.write` exactly as `helm team set --apply` does.
+
+   COMPARE-AND-SET. A save carries the version the card was showing; a team
+   another tab or a seat moved since answers 409 and writes nothing, and the
+   card says so and keeps the edits. Nothing here writes on its own: every
+   change waits for a reason and the save button. */
+
+/* The page's own state, one declaration a line (the tests lift each one):
+   the owner's unsaved edits by registry key, what the last save said, the
+   kind each card's route preview shows, the family the burn card's sheet
+   shows, and what the last declare said ({family, text, err}). */
+const TEAM_DRAFT = new Map();
+const TEAM_MSG = new Map();
+const TEAM_KIND = new Map();
+let FAM_SEL = null;
+let FAM_MSG = null;
+const TEAM_KINDS = ["review", "build", "verify", "research", "council"];
+const TEAM_RANK = {GREEN: 0, YELLOW: 1, GREY: 1, ORANGE: 2, RED: 3};
+const TEAM_PALETTE = ["var(--codex)", "var(--opencode)", "var(--claude)", "var(--pi)", "var(--accent)", "var(--ok)", "var(--warn)"];
+
+/* 13.9M / 640k — half up on the printed digit, as `teams.tokens` prints. */
+function teamTokens(n) {
+  if (typeof n !== "number" || !isFinite(n)) return "?";
+  if (n >= 1e9) return (Math.floor(n / 1e8 + 0.5) / 10).toFixed(1) + "B";
+  if (n >= 1e6) return (Math.floor(n / 1e5 + 0.5) / 10).toFixed(1) + "M";
+  if (n >= 1e3) return Math.floor(n / 1e3 + 0.5) + "k";
+  return String(Math.floor(n + 0.5));
+}
+
+function teamRatio(r) {
+  if (r === null || r === undefined) return "?";
+  if (r === Infinity) return "no budget";
+  return (r < 1 ? r.toFixed(2) : r.toFixed(1)) + "×";
+}
+
+/* THE RULE, written once on this side: RED stays RED; GREY, GREEN and YELLOW
+   are not rationed; ORANGE reads YELLOW inside the budget, ORANGE up to twice
+   it and RED past twice it. `teams.effective_colour` is the same table. It
+   applies only to a family SHORT ON MONEY (`teamShort`). */
+function teamEff(famColour, r) {
+  if (famColour === "RED") return "RED";
+  if (famColour !== "ORANGE" || r === null || r === undefined) return famColour;
+  return r <= 1 ? "YELLOW" : r <= 2 ? "ORANGE" : "RED";
+}
+
+/* Is this family short in the sense a share rations (`teams.short`)? ORANGE,
+   and the axis that set it is one the server names in `ration_axes` (money,
+   or an owner declaration). An ORANGE that reach set rations nobody. */
+function teamShort(fl, sec) {
+  return !!fl && fl.colour === "ORANGE"
+    && (((sec && sec.ration_axes) || []).indexOf(fl.axis) >= 0);
+}
+
+/* which reading a family's share is measured against (`teams.mode_of`) */
+function teamMode(fam, sec) {
+  if (fam === "anthropic") return "accounts";
+  const pace = ((sec && sec.pace) || {})[fam];
+  if (pace && typeof pace.sustainable_per_h === "number") return "rate";
+  if (teamLane(fam, sec)) return "slots";
+  const b = ((sec && sec.burn) || {})[fam];
+  if (b && typeof b.per_hour === "number") return "relative";
+  return "slots";
+}
+
+/* Is this family measured in LANES — local, or with a recorded capacity? */
+function teamLane(fam, sec) {
+  return ((((sec && sec.slots) || {}).families) || []).indexOf(fam) >= 0;
+}
+
+/* 1.2 / 3 / ? — a project's slots, as `teams.slots_text` prints them. */
+function teamSlots(n) {
+  if (typeof n !== "number" || !isFinite(n)) return "?";
+  return Math.abs(n - Math.round(n)) < 1e-9 ? String(Math.round(n)) : n.toFixed(1);
+}
+
+/* A colour as a word with a dot before it — never a fill behind text. */
+function teamWord(colour) {
+  const c = colour || "GREY";
+  return '<span class="tcw" style="--cc:' + (FLAGCOL[c] || FLAGCOL.GREY) + '">'
+    + esc(c === "GREY" ? "NOT MEASURED" : c) + "</span>";
+}
+
+/* What the card edits: the draft when there is one, else the saved team. */
+function teamCurrent(key, j) {
+  if (TEAM_DRAFT.has(key)) return TEAM_DRAFT.get(key);
+  const t = j && j.team;
+  if (!t) return null;
+  return {base_v: t.v, authored: !!t.authored, reason: "",
+          members: (t.members || []).map(m => Object.assign({}, m)),
+          shares: Object.assign({}, t.shares || {})};
+}
+
+/* The draft, made from the saved team on the first edit. */
+function teamDraft(key, j) {
+  if (!TEAM_DRAFT.has(key)) {
+    const cur = teamCurrent(key, j);
+    if (!cur) return null;
+    TEAM_DRAFT.set(key, cur);
+  }
+  return TEAM_DRAFT.get(key);
+}
+
+/* Is this project's light an AUTHORED red? Then its shares are released. */
+function teamLightRed(p) {
+  const lit = (p && p.light) || {};
+  return !!lit.authored && lit.colour === "red";
+}
+
+/* A row's burn as its line prints it (`teams.burning`): a burn whose reader
+   RAISED is FAILED, never unmeasured. */
+function teamBurning(a) {
+  if (a.measured) return teamTokens(a.burn) + "/h";
+  return a.burnFailed ? "FAILED (" + a.burnFailed + ")" : "unmeasured";
+}
+
+/* burn (ValueError), pace (KeyError) — the readers that raised, as
+   `teams.failed_text` names them. */
+function teamFailedText(failed) {
+  return Object.keys(failed || {}).sort().map(k => k + " (" + failed[k] + ")").join(", ");
+}
+
+/* A share as a person reads it (`teams.pct`): an UNSET share is not 0%. */
+function teamPct(v) {
+  return typeof v === "number" ? v + "%" : "unset";
+}
+
+/* ONE PROJECT'S BUDGETS FOR A TEAM `cur`, folded as `teams.allocation` folds
+   them: every other BINDING team's share is in the sum, a seat on another
+   team is shared and billed to nobody, a red light releases the share, and
+   a family the team spends with NO share is unrationed — the family's own
+   colour, no budget, and no part of the family's total. PURE. */
+function teamAlloc(key, cur, d, lightRed) {
+  const sec = (d && d.sections && d.sections.teams) || {};
+  const flags = ((d && d.sections && d.sections.flags) || {}).families || {};
+  const projs = (d && d.projects) || {};
+  const live = ((cur && cur.members) || []).filter(m => !m.gone);
+  const others = [], onOther = new Set();
+  Object.keys(projs).forEach(k => {
+    const t = projs[k] && projs[k].team;
+    if (k === key || !t || !t.binding) return;
+    others.push(t);
+    (t.members || []).forEach(m => onOther.add(m.seat));
+  });
+  // A MEMBER IS BILLED TO THE FAMILY IT SPENDS: the server sends the family
+  // door's answer as `spends` beside the typed family (`teams.allocation`).
+  const spends = m => m.spends || m.family;
+  const fams = new Set(live.map(spends));
+  Object.keys((cur && cur.shares) || {}).forEach(f => fams.add(f));
+  const out = {};
+  Array.from(fams).sort().forEach(f => {
+    const colour = (flags[f] || {}).colour || "GREY";
+    const short = teamShort(flags[f], sec);
+    const mode = teamMode(f, sec);
+    const own = (cur.shares || {})[f];
+    const share = lightRed ? 0 : (typeof own === "number" ? own : null);
+    const total = others.reduce((a, t) => {
+      const got = ((t.allocation || {})[f] || {}).share;
+      const v = got !== undefined ? got : (t.shares || {})[f];
+      return a + (typeof v === "number" ? v : 0);
+    }, share === null ? 0 : share);
+    const b = (sec.burn || {})[f];
+    const measured = !!b && typeof b.per_hour === "number";
+    // a burn whose reader RAISED is FAILED, never unmeasured (`teams.allocation`)
+    const burnFailed = measured ? null : ((sec.failed || {}).burn || null);
+    const mine = live.filter(m => spends(m) === f).map(m => m.seat);
+    const burn = measured ? mine.filter(s => !onOther.has(s))
+      .reduce((a, s) => a + (((b.seats || {})[s]) || 0), 0) : null;
+    const scale = Math.max(100, total);
+    let budget = null, ratio = null;
+    if (share === null) {
+      // unrationed: the family's own colour stands
+    } else if (mode === "rate") {
+      budget = share / scale * sec.pace[f].sustainable_per_h;
+      ratio = burn === null ? null : budget > 0 ? burn / budget : burn > 0 ? Infinity : 0;
+    } else if (mode === "relative") {
+      const part = burn === null ? null : b.per_hour > 0 ? burn / b.per_hour : 0;
+      const s = share / scale;
+      ratio = part === null ? null : s > 0 ? part / s : part > 0 ? Infinity : 0;
+    }
+    const rated = mode === "rate" || mode === "relative";
+    let eff = rated && short && share !== null ? teamEff(colour, ratio) : colour;
+    // THE LANES (`teams._slot_row`): slots = share × capacity; in use is the
+    // rows this project holds on the family's seats; one more past the
+    // slots QUEUES. A draft moves the share, never the rows in use.
+    const lane = mode === "slots" && teamLane(f, sec);
+    const sl = sec.slots || {}, cap = ((sl.capacity || {})[f] || {}).lanes;
+    const use = lane && sl.in_use ? sl.in_use[f] : null;
+    const inUse = use ? ((use.by_project || {})[key] || 0) : null;
+    const slots = lane && typeof cap === "number" && share !== null ? share / scale * cap : null;
+    if (lane) {
+      ratio = inUse === null || slots === null ? null : slots > 0 ? inUse / slots : inUse > 0 ? Infinity : 0;
+      if (colour !== "RED" && slots !== null && inUse !== null) eff = inUse <= slots ? "YELLOW" : "ORANGE";
+    }
+    out[f] = {mode, share, total, over: total > 100, budget, burn, ratio,
+              colour: eff, famColour: colour, measured, burnFailed,
+              rationed: short && rated && ratio !== null,
+              shared: mine.filter(s => onOther.has(s)),
+              lane, capacity: lane && typeof cap === "number" ? cap : null, slots, inUse,
+              fleet: use ? (use.total || 0) : null,
+              queued: slots !== null && inUse !== null && colour !== "RED" && inUse + 1 > slots + 1e-9};
+  });
+  return out;
+}
+
+/* `teams.line`, for the card: share codex 30% → 13.9M/h budget, burning
+   32.9M/h (2.4×) → RED for helm */
+function teamLine(key, fam, a) {
+  if (a.share === null && (a.mode === "rate" || a.mode === "relative"))
+    return "no share for " + fam + " on this team, so it is unrationed here, burning "
+      + teamBurning(a) + " → " + a.colour + " for " + key
+      + " (the family's own colour)";
+  if (a.share === null && a.lane)
+    return "no share of " + fam + "'s lanes on this team, so nothing queues here, "
+      + (a.inUse === null ? "?" : a.inUse) + " in use → " + a.colour + " for " + key;
+  if (a.mode === "rate")
+    return "share " + fam + " " + a.share + "% → " + teamTokens(a.budget) + "/h budget, burning "
+      + teamBurning(a) + " (" + teamRatio(a.ratio) + ") → "
+      + a.colour + " for " + key;
+  if (a.mode === "relative")
+    return "share " + fam + " " + a.share + "% of the family's burn, burning "
+      + teamBurning(a) + " (" + teamRatio(a.ratio) + ") → "
+      + a.colour + " for " + key;
+  if (a.lane && a.capacity !== null)
+    return "slots " + fam + " " + a.share + "% of " + a.capacity + " lanes → " + teamSlots(a.slots) + " slots, "
+      + (a.inUse === null ? "?" : a.inUse) + " in use (fleet " + (a.fleet === null ? "?" : a.fleet) + " of " + a.capacity
+      + ") → " + a.colour + " for " + key + (a.queued ? "; QUEUED — new work waits for a lane, it is not refused" : "");
+  if (a.lane)
+    return "slots " + fam + " " + a.share + "%: capacity not measured, " + (a.inUse === null ? "?" : a.inUse)
+      + " in use here → " + a.colour + " for " + key;
+  return fam + ": " + (a.mode === "accounts" ? "each seat spends its own home's account; no percent share"
+    : "not measured; a share here is advisory seat count") + " → " + a.colour + " for " + key;
+}
+
+/* The two links between a project's team and its family (task/3445): a
+   project's Team tab on Work, and a family's sheet on Fleet › credit. */
+function teamTabHref(key) {
+  return "#work/projects?" + new URLSearchParams({open: key, tab: "team"}).toString();
+}
+function famHref(fam) {
+  return "#quota?" + new URLSearchParams({family: fam}).toString();
+}
+
+/* THE SHARES OF ONE FAMILY ACROSS PROJECTS: one stacked bar and its legend.
+   Binding teams, with an open draft in place of its saved team so a − or +
+   shows here at once; over-promised shares scale every budget down, and a
+   sum under 100 is held back. PURE. */
+function shareBar(fam, d) {
+  const projs = (d && d.projects) || {};
+  const sec = (d && d.sections && d.sections.teams) || {};
+  const keys = Object.keys(projs).filter(k => projs[k] && projs[k].team
+    && (projs[k].team.binding || TEAM_DRAFT.has(k))).sort();
+  const segs = keys.map(k => {
+    const cur = teamCurrent(k, projs[k]);
+    return [k, ((cur && cur.shares) || {})[fam] || 0];
+  }).filter(x => x[1] > 0);
+  if (!segs.length) {
+    if (sec.unavailable)
+      return '<div class="tsum bunk">' + esc(fam) + ' shares UNKNOWN: ' + esc(sec.unavailable) + '</div>';
+    if (sec.loading)
+      return '<div class="tsum bmut">' + esc(fam) + ' shares not read yet</div>';
+    return '<div class="tsum bmut">No project has a ' + esc(fam) + " share yet: while it is short, every project reads the family's own colour.</div>";
+  }
+  const sum = segs.reduce((a, x) => a + x[1], 0), scale = Math.max(100, sum);
+  const pace = (sec.pace || {})[fam];
+  const colour = k => TEAM_PALETTE[keys.indexOf(k) % TEAM_PALETTE.length];
+  return '<div class="tstack" role="img" aria-label="' + esc(fam + " shares: "
+      + segs.map(x => x[0] + " " + x[1] + "%").join(", ")) + '">'
+    + segs.map(x => '<span style="width:' + (x[1] / scale * 100) + "%;background:" + colour(x[0])
+      + '" title="' + esc(x[0] + " " + x[1] + "%") + '">' + (x[1] >= 9 ? x[1] + "%" : "") + "</span>").join("")
+    + '</div><div class="tlegend">'
+    + segs.map(x => '<a class="tgo" href="' + esc(teamTabHref(x[0])) + '" title="open ' + esc(x[0]) + '\'s team"><i style="background:' + colour(x[0]) + '"></i>' + esc(x[0]) + " " + x[1] + "%"
+      + (pace && typeof pace.sustainable_per_h === "number"
+        ? " = " + teamTokens(x[1] / scale * pace.sustainable_per_h) + "/h" : "")
+      + (TEAM_DRAFT.has(x[0]) ? " (unsaved)" : "") + "</a>").join("")
+    + (sum < 100 ? '<span class="bmut">unallocated ' + (100 - sum) + "% (held back)</span>" : "")
+    + (sum > 100 ? '<span class="bunk">over-promised: shares add to ' + sum + "%, so every budget is scaled down</span>" : "")
+    + "</div>";
+}
+
+/* THE LANES OF ONE LOCAL FAMILY ACROSS PROJECTS: the recorded capacity, then
+   each project's slot share with the lanes it holds drawn inside it, the
+   lanes held by a project with no share, and the rows on no project. With no
+   capacity recorded the shares are drawn as percents and no slot count is
+   printed. An open draft stands in for its saved team, as on the shares bar.
+   PURE. */
+function slotBar(fam, d) {
+  const projs = (d && d.projects) || {};
+  const sec = (d && d.sections && d.sections.teams) || {};
+  const sl = sec.slots || {}, cap = ((sl.capacity || {})[fam] || {}).lanes;
+  const use = sl.in_use ? (sl.in_use[fam] || {by_project: {}, unplaced: 0, total: 0}) : null;
+  const held = (use && use.by_project) || {};
+  const keys = Object.keys(projs).filter(k => projs[k] && projs[k].team
+    && (projs[k].team.binding || TEAM_DRAFT.has(k))).sort();
+  const segs = keys.map(k => {
+    const cur = teamCurrent(k, projs[k]);
+    return [k, ((cur && cur.shares) || {})[fam] || 0];
+  }).filter(x => x[1] > 0);
+  const sum = segs.reduce((a, x) => a + x[1], 0), scale = Math.max(100, sum);
+  const measured = typeof cap === "number";
+  const colour = k => TEAM_PALETTE[keys.indexOf(k) % TEAM_PALETTE.length];
+  const slotsOf = n => n / scale * cap;
+  let h = '<div class="tnums">' + (measured
+    ? "<b>" + cap + " lane" + (cap === 1 ? "" : "s") + "</b> in all"
+      + (use ? " · <b>" + use.total + "</b> in use · " + Math.max(0, cap - use.total) + " free" : " · lanes in use unread")
+    : "<b>capacity not measured</b>" + (use ? " · <b>" + use.total + "</b> in use" : " · lanes in use unread")) + "</div>";
+  if (!segs.length)
+    h += '<div class="tsum bmut">No project has a ' + esc(fam) + " slot share yet: every team that holds this family's seat is offered it, and nothing queues.</div>";
+  else
+    h += '<div class="tstack tslots" role="img" aria-label="' + esc(fam + " slots: " + segs.map(x => x[0] + " " + x[1] + "%"
+        + (held[x[0]] ? ", " + held[x[0]] + " in use" : "")).join("; ")) + '">'
+      + segs.map(x => {
+        const n = held[x[0]] || 0, s = measured ? slotsOf(x[1]) : null;
+        const fill = s === null ? 0 : s > 0 ? Math.min(100, n / s * 100) : n > 0 ? 100 : 0;
+        return '<span class="' + (s !== null && n > s ? "over" : "") + '" style="width:' + (x[1] / scale * 100) + "%;background:" + colour(x[0])
+          + '" title="' + esc(x[0] + " " + x[1] + "%" + (s === null ? "" : " = " + teamSlots(s) + " slots") + ", " + n + " in use") + '">'
+          + '<b style="width:' + fill + '%"></b>' + (x[1] >= 9 ? "<em>" + x[1] + "%</em>" : "") + "</span>";
+      }).join("") + "</div>";
+  const legend = segs.map(x => {
+    const n = held[x[0]] || 0, s = measured ? slotsOf(x[1]) : null;
+    return '<a class="tgo" href="' + esc(teamTabHref(x[0])) + '" title="open ' + esc(x[0]) + '\'s team"><i style="background:' + colour(x[0]) + '"></i>' + esc(x[0]) + " " + x[1] + "%"
+      + (s === null ? "" : " = " + teamSlots(s) + " slots") + " · " + n + " in use"
+      + (s !== null && n > s ? ' <b class="bunk">over</b>' : "") + (TEAM_DRAFT.has(x[0]) ? " (unsaved)" : "") + "</a>";
+  });
+  Object.keys(held).sort().filter(k => !segs.some(x => x[0] === k)).forEach(k =>
+    legend.push('<span class="bmut">' + esc(k) + ": " + held[k] + " in use, no share</span>"));
+  if (use && use.unplaced) legend.push('<span class="bmut">on no project: ' + use.unplaced + " in use</span>");
+  if (segs.length && sum < 100) legend.push('<span class="bmut">unallocated ' + (100 - sum) + "%" + (measured ? " = " + teamSlots(slotsOf(100 - sum)) + " slots" : "") + "</span>");
+  if (sum > 100) legend.push('<span class="bunk">over-promised: shares add to ' + sum + "%, so every project's slots are scaled down</span>");
+  return h + (legend.length ? '<div class="tlegend">' + legend.join("") + "</div>" : "");
+}
+
+/* THE CREDITS LINE: the reset credits in hand, and how many accounts were
+   not asked for a balance (a credit lifts every weekly wall the rung meets). */
+function teamCredits(cr) {
+  if (!cr) return "";
+  return '<div class="tcredits"><b>Reset credits:</b> ' + esc(cr.usable) + " usable"
+    + (cr.why ? ' <span class="bmut">— ' + esc(cr.why) + "</span>" : "") + "</div>";
+}
+
+/* THE ACCOUNTS THAT BILL A FAMILY, on its sheet (task/3445, task/3461): the
+   seat catalog's account groups for it in ROUTE ORDER (`bills` on the flag,
+   the one reading the seeder mints its rows from) — "billed to A first, then
+   B". EACH GROUP IS A LINK ONLY WHERE THE ACCOUNTS TABLE CARRIES IT
+   (`QUOTA_GROUPS`: null until that table is read, or while a source of it
+   could not be read; empty when it was read and has no rows). [] is a family served from the operator's own GPUs, which has
+   no bill; null a family the catalog names no bill for; an older server that
+   sent no list draws nothing. */
+function famBilled(fl) {
+  const bills = fl ? fl.bills : undefined;
+  if (bills === undefined) return "";
+  const line = h => '<div class="gmeta twrap">' + h + "</div>";
+  if (bills === null) return line("the seat catalog names no account that bills it");
+  if (!bills.length) return line("local GPU, no bill");
+  const inOrder = parts => parts[0] + (parts.length > 1 ? " first, then " + parts.slice(1).join(", then ") : "");
+  const groups = typeof QUOTA_GROUPS === "undefined" ? null : QUOTA_GROUPS;
+  if (groups === null) return line("billed to " + inOrder(bills.map(esc)) + " — accounts not read yet");
+  if (!groups.size) return line("billed to " + inOrder(bills.map(esc)) + " — no accounts declared");
+  return line("billed to " + inOrder(bills.map(g => groups.has(g)
+    ? '<button type="button" class="tlink" data-qfam="' + esc(g) + '">' + esc(g) + " accounts ↓</button>"
+    : esc(g) + ' <span class="bmut">(no account on this page carries that name)</span>')));
+}
+
+/* THE FAMILY SHEET: one family's reading, what lasts, the shares across
+   projects, the credits and the declare control. */
+function famSheet(fam, fl, d) {
+  if (!fam || !fl) return "";
+  const sec = (d && d.sections && d.sections.teams) || {};
+  const mode = teamMode(fam, sec), pace = (sec.pace || {})[fam];
+  const failedHere = ["pace", "burn"].filter(k => (sec.failed || {})[k]);
+  let h = '<div class="tsheet"><div class="tfamtop"><b class="tfn">' + esc(fam) + "</b>" + teamWord(fl.colour)
+    + ' <span class="gmeta">' + esc(fl.axis ? fl.axis + " axis" : "no axis") + " · changes " + esc(flagWhen(fl.expires_at)) + "</span></div>"
+    + '<div class="gmeta twrap">' + esc(fl.cause || "")
+    + (fl.provenance === "owner-declared" ? " · <b>DECLARED by the owner, not measured</b>" : "")
+    + (fl.money_provenance === "certified-local" ? " · <b>money CERTIFIED by the seat that runs the local hardware, not a vendor measurement</b>" : "") + "</div>"
+    + (failedHere.length ? '<div class="gmeta twrap bunk">readings FAILED: '
+      + esc(failedHere.map(k => k + " (" + sec.failed[k] + ")").join(", ")) + " — not unmeasured</div>" : "")
+    + famBilled(fl);
+  if (mode === "rate" && pace) {
+    const rate = pace.tokens_per_hour, s = pace.sustainable_per_h;
+    h += '<div class="tnums">Lasts to the reset only at <b>' + teamTokens(s) + "/h</b> or less · the fleet burns <b>"
+      + teamTokens(rate) + "/h</b>" + (s > 0 && typeof rate === "number" ? " (" + (rate / s).toFixed(2) + "× what lasts)" : "") + "</div>";
+  } else if (mode === "accounts") {
+    h += '<div class="tnums">Each claude seat spends the account its own home holds, so a project\'s share is the accounts homed to its seats, not a percent.</div>';
+  } else if (mode === "relative") {
+    h += '<div class="tnums">Burn per seat is measured; how much is left is not read. A share here is the project\'s slice of the family\'s burn.</div>';
+  } else if (teamLane(fam, sec)) {
+    const cap = ((sec.slots || {}).capacity || {})[fam];
+    h += '<div class="tnums">Served from the operator\'s own GPUs: what runs short is concurrent <b>lanes</b>, not money. '
+      + (cap ? "Capacity " + esc(cap.lanes) + " lane" + (cap.lanes === 1 ? "" : "s") + ", measured by " + esc(cap.by || "an unnamed terminal")
+        + (cap.ts ? " " + esc(ago(cap.ts)) : "") + (cap.reason ? " — " + esc(cap.reason) : "") + "."
+        : "Capacity not measured: until the seat that measures the lanes records it, a slot share is a percent and no project queues.") + "</div>"
+      + slotBar(fam, d);
+  } else {
+    h += '<div class="tnums">Not measured: a share here is advisory (how many of this family\'s seats a project may hold), never money.</div>';
+  }
+  if (mode === "rate" || mode === "relative") h += shareBar(fam, d);
+  h += teamCredits(fl.credits);
+  const msg = FAM_MSG && FAM_MSG.family === fam ? FAM_MSG : null;
+  h += '<details class="tdeclare"><summary>declare a colour for ' + esc(fam) + "</summary>"
+    + '<div class="gmeta twrap">A declaration may only make a measured colour <b>worse</b>, and it expires when you say. To let one project run lighter, give it a bigger share instead: that is measured, not declared.</div>'
+    + '<div class="trow2"><select data-declare-colour aria-label="declared colour"><option>YELLOW</option><option selected>ORANGE</option><option>RED</option></select>'
+    + '<select data-declare-until aria-label="until"><option value="24h">for 24h</option><option value="reset" selected>until the reset</option><option value="7d">for 7 days</option></select>'
+    + '<input type="text" data-declare-why autocomplete="off" placeholder="why (required)" aria-label="why">'
+    + '<button type="button" class="tbtn" data-declare="' + esc(fam) + '">declare</button></div>'
+    + '<div class="tmsg' + (msg && msg.err ? " err" : "") + '" role="status">' + esc(msg ? msg.text : "") + "</div></details></div>";
+  return h;
+}
+
+/* The row's own mark: for an AUTHORED team, each family its share rations,
+   in the project's colour; for a proposal, one quiet word. */
+function teamMini(p, j, d) {
+  const t = j && j.team;
+  if (!t) return "";
+  if (!t.binding) return '<span class="tmini tprop" title="helm proposes a team from today\'s seats; it binds nothing until accepted">team proposed</span>';
+  const a = teamAlloc(pkey(p), teamCurrent(pkey(p), j), d, teamLightRed(p));
+  return Object.keys(a).filter(f => a[f].rationed || a[f].queued).map(f =>
+    '<span class="tmini" style="--cc:' + (FLAGCOL[a[f].colour] || FLAGCOL.GREY) + '" title="'
+    + esc(teamLine(pkey(p), f, a[f])) + '"><i></i>' + esc(f) + " " + esc(a[f].colour) + " "
+    + esc(a[f].lane ? a[f].inUse + " of " + teamSlots(a[f].slots) + " slots, queued" : teamRatio(a[f].ratio)) + "</span>").join("");
+}
+
+/* ONE FAMILY'S BUDGET ROW on the card, with its − and + for a measured one. */
+function teamFamRow(key, f, a, fl, lightRed, homes, say) {
+  const rated = a.mode === "rate" || a.mode === "relative" || a.lane;
+  let h = '<div class="tfam"><div class="tfamtop"><a class="tfn" href="' + esc(famHref(f))
+    + '" title="' + esc(f) + ' on Fleet › credit: its sheet, every project\'s share and its accounts">' + esc(f) + "</a>"
+    + '<span class="gmeta">family</span>' + teamWord(a.famColour) + '<span class="gmeta">→ here</span>' + teamWord(a.colour);
+  if (rated)
+    h += '<span class="tstep" role="group" aria-label="' + esc(f + " share") + '">'
+      + '<button type="button" data-team-step="-5" data-fam="' + esc(f) + '" data-key="' + esc(key) + '" aria-label="less">−</button>'
+      + "<output>" + teamPct(a.share) + "</output>"
+      + '<button type="button" data-team-step="5" data-fam="' + esc(f) + '" data-key="' + esc(key) + '" aria-label="more">+</button></span>';
+  h += "</div>";
+  if (rated && lightRed) h += '<div class="tnums">The light is red, so this project\'s share is released and its '
+    + (a.lane ? "slots are" : "budget is") + " 0.</div>";
+  if (rated && a.share === null) {
+    h += '<div class="tnums">' + (a.lane
+      ? "No share of these lanes on this team: nothing queues here; + sets a slot share."
+      : "No share on this team: <b>unrationed</b> here" + (a.measured ? ", burning <b>" + teamTokens(a.burn) + "/h</b>" : "")
+        + ". While " + esc(f) + " is short this project reads the family's own colour; + sets a share.") + "</div>";
+  } else if (a.mode === "rate") {
+    if (a.measured) {
+      const scale = Math.max((a.budget || 0) * 2.2, (a.burn || 0) * 1.08, 1);
+      h += '<div class="tnums">Share <b>' + a.share + "%</b> → budget <b>" + teamTokens(a.budget) + "/h</b> · burning <b>"
+        + teamTokens(a.burn) + "/h</b> · <b>" + esc(teamRatio(a.ratio)) + "</b>" + (a.ratio === Infinity ? "" : " budget") + "</div>"
+        + '<div class="tbar" style="--cc:' + (FLAGCOL[a.colour] || FLAGCOL.GREY) + '" role="img" aria-label="'
+        + esc("burn " + teamTokens(a.burn) + " per hour against a budget of " + teamTokens(a.budget)) + '"><b style="width:'
+        + Math.min(100, a.burn / scale * 100) + '%"></b><u style="left:' + Math.min(100, a.budget / scale * 100)
+        + '%" title="budget"></u></div><div class="tscale"><span>0</span><span>▲ budget ' + teamTokens(a.budget)
+        + "/h</span><span>" + teamTokens(scale) + "/h</span></div>";
+    } else {
+      h += '<div class="tnums">Share <b>' + a.share + "%</b> → budget <b>" + teamTokens(a.budget)
+        + (a.burnFailed ? "/h</b> · burn per seat <b>FAILED</b> (" + esc(a.burnFailed) + "): its reading raised, so nothing here is measured</div>"
+          : '/h</b> · burn per seat not measured yet (the posting watchdog pass writes it)</div>');
+    }
+  } else if (a.mode === "relative") {
+    h += '<div class="tnums">Share <b>' + a.share + "%</b> of the family's burn · burning <b>"
+      + esc(teamBurning(a)) + "</b> · <b>" + esc(teamRatio(a.ratio)) + "</b></div>";
+  } else if (a.lane && a.capacity !== null) {
+    const scale = Math.max(a.capacity, a.inUse || 0, 1);
+    h += '<div class="tnums">Share <b>' + a.share + "%</b> of <b>" + a.capacity + " lanes</b> → <b>" + teamSlots(a.slots)
+      + " slot" + (a.slots === 1 ? "" : "s") + "</b> · <b>" + (a.inUse === null ? "?" : a.inUse) + "</b> in use here · fleet "
+      + (a.fleet === null ? "?" : a.fleet) + " of " + a.capacity + "</div>"
+      + '<div class="tbar" style="--cc:' + (FLAGCOL[a.colour] || FLAGCOL.GREY) + '" role="img" aria-label="'
+      + esc((a.inUse === null ? "?" : a.inUse) + " lanes in use against " + teamSlots(a.slots) + " slots") + '"><b style="width:'
+      + Math.min(100, (a.inUse || 0) / scale * 100) + '%"></b><u style="left:' + Math.min(100, a.slots / scale * 100)
+      + '%" title="slots"></u></div><div class="tscale"><span>0</span><span>▲ slots ' + teamSlots(a.slots)
+      + "</span><span>" + scale + " lane" + (scale === 1 ? "" : "s") + "</span></div>";
+    if (a.queued)
+      h += '<div class="twhy bunk">QUEUED: one more row here waits for a lane. Route still offers the seat; nothing is refused.</div>';
+  } else if (a.lane) {
+    h += '<div class="tnums">Share <b>' + a.share + "%</b> · <b>capacity not measured</b> · " + (a.inUse === null ? "?" : a.inUse)
+      + " in use here. Until the lanes are measured, nothing queues.</div>";
+  } else if (a.mode === "accounts") {
+    h += '<div class="tnums">' + esc(homes) + " · " + esc((fl || {}).cause || "") + "</div>";
+  }
+  h += '<div class="twhy">' + esc((say || {})[a.colour] || "") + (a.famColour === "ORANGE" && a.colour === "YELLOW"
+    ? " — inside its budget while " + esc(f) + " is short" : "")
+    + (a.over ? ' <span class="bunk">· over-promised: shares add to ' + a.total + "%</span>" : "") + "</div>";
+  if (a.shared.length)
+    h += '<div class="gmeta">shared, billed to no project: ' + esc(a.shared.join(", ")) + "</div>";
+  if (a.mode === "rate" && fl && fl.credits)
+    h += '<div class="gmeta">reset credits: ' + esc(fl.credits.usable) + " usable"
+      + (fl.credits.unread ? " · " + esc(fl.credits.unread) + " account(s) not asked" : "") + "</div>";
+  return h + "</div>";
+}
+
+/* ONE MEMBER: its state, name, the teams it also serves, role and remove. */
+function teamMemberRow(key, m, i, roles) {
+  const sname = m.state === "wanted" ? "wanted: the lead starts it" : (m.state || "absent");
+  const shared = (m.shared || []).filter(x => x !== key);
+  return '<div class="tmem' + (m.gone ? " gone" : "") + '"><span class="tst ' + esc(m.state || "absent") + '" title="' + esc(sname) + '"></span>'
+    + '<span class="tsn"><a href="' + esc("#models?" + new URLSearchParams({seat: m.seat}).toString())
+    + '" title="how this seat\'s model does on our lanes — Fleet › models">' + esc(m.seat) + "</a>" + (shared.length ? '<span class="tbadge" title="this seat is on more than one team; its spend is billed to none">shared · '
+      + esc(shared.join(", ")) + "</span>" : "") + "</span>"
+    + '<select data-team-role="' + i + '" data-key="' + esc(key) + '" aria-label="' + esc("role of " + m.seat) + '"' + (m.gone ? " disabled" : "") + ">"
+    + Object.keys(roles).map(r => '<option value="' + esc(r) + '"' + (r === m.role ? " selected" : "")
+      + ' title="' + esc("takes " + (roles[r] || []).join(", ")) + '">' + esc(r) + "</option>").join("") + "</select>"
+    + '<button type="button" class="trm" data-team-rm="' + i + '" data-key="' + esc(key) + '" aria-label="' + esc((m.gone ? "keep " : "remove ") + m.seat)
+    + '" title="' + (m.gone ? "undo" : "remove from team") + '">' + (m.gone ? "↺" : "×") + "</button>"
+    + '<span class="tsd">' + esc(m.family) + (m.spends && m.spends !== m.family ? ' <b class="bunk">spends ' + esc(m.spends) + "</b>" : "")
+    + " · " + esc(sname) + (m.added ? " · added, not saved" : "") + "</span></div>";
+}
+
+/* THE ADD ROW: a seat already running, or a new seat this project's lead
+   would start (`helm seat spawn <project>-<family>`). */
+function teamAddRow(key, cur, sec, flagFams) {
+  const have = new Set((cur.members || []).filter(m => !m.gone).map(m => m.seat));
+  const seats = (sec.seats || []).filter(s => !have.has(s.seat));
+  const fams = Object.keys(flagFams || {}).sort();
+  const word = f => f === "anthropic" ? "claude" : f;
+  const fresh = fams.filter(f => !have.has(key + "-" + word(f)))
+    .map(f => '<option value="' + esc("new:" + f) + '">new seat ' + esc(key + "-" + word(f)) + " (" + esc(f) + ")</option>");
+  const roles = Object.keys(sec.roles || {});
+  return '<div class="taddrow"><select data-team-addseat aria-label="seat to add">'
+    + '<optgroup label="seats running now">' + seats.map(s => '<option value="' + esc("seat:" + s.seat + ":" + (s.family || "")) + '">'
+      + esc(s.seat) + " (" + esc(s.family || "?") + ", " + esc(s.presence || "?") + (s.project ? ", on " + esc(s.project) : "") + ")</option>").join("")
+    + '</optgroup><optgroup label="start a new seat for this project">' + fresh.join("") + "</optgroup></select>"
+    + '<select data-team-addrole aria-label="role for the new seat">' + roles.map(r => '<option' + (r === "reviewer" ? " selected" : "") + ">" + esc(r) + "</option>").join("")
+    + '</select><button type="button" class="tbtn" data-team-add="' + esc(key) + '">add seat</button></div>';
+}
+
+/* THE CHANGE THE SAVE WOULD MAKE, as the lines the room notice carries. */
+function teamDiff(saved, cur) {
+  const out = [], was = {};
+  ((saved && saved.members) || []).forEach(m => { was[m.seat] = m; });
+  (cur.members || []).forEach(m => {
+    if (m.gone && was[m.seat]) out.push("− " + m.seat);
+    else if (!m.gone && !was[m.seat]) out.push("+ " + m.seat + " (" + m.role + ", " + m.family + ")");
+    else if (!m.gone && was[m.seat] && was[m.seat].role !== m.role) out.push(m.seat + " role " + was[m.seat].role + " → " + m.role);
+  });
+  const a = (saved && saved.shares) || {}, b = cur.shares || {};
+  Array.from(new Set(Object.keys(a).concat(Object.keys(b)))).sort().forEach(f => {
+    if (a[f] !== b[f]) out.push(f + " share " + teamPct(a[f]) + " → " + teamPct(b[f]));
+  });
+  return out;
+}
+
+/* WHAT THE LEAD WILL DO: the server's drift for the saved team, plus what
+   this draft would change, in the owner's words (console walk 3, #7): a
+   drift row's `say` is its line without the lead's verb, and a row that
+   names no verb sends none. */
+function teamDriftLines(key, t, cur) {
+  const live = (cur.members || []).filter(m => !m.gone), names = new Set(live.map(m => m.seat));
+  const out = [];
+  const leads = live.filter(m => m.role === "lead");
+  if (!leads.length) out.push("No lead: somebody must own this team and fix its drift.");
+  if (leads.length > 1) out.push("Two leads (" + leads.map(m => m.seat).join(", ") + "): pick one.");
+  ((t && t.drift) || []).forEach(dr => {
+    if (dr.kind === "no-lead" || dr.kind === "two-leads") return;
+    if (dr.seat && dr.kind !== "unlisted" && !names.has(dr.seat)) return;
+    if (dr.kind === "unlisted" && names.has(dr.seat)) return;
+    if (dr.kind === "no-share" && typeof (cur.shares || {})[dr.family] === "number") return;
+    out.push(dr.say || dr.text);
+  });
+  live.filter(m => m.added && m.state === "wanted").forEach(m =>
+    out.push("Start " + m.seat + ": once the team is saved, the lead starts this new seat."));
+  (cur.members || []).filter(m => m.gone).forEach(m =>
+    out.push(m.seat + " leaves: it keeps its lanes until it releases them, and gets no new work here."));
+  return out;
+}
+
+/* WHAT AGENTS HEAR: a preview of `helm route <kind> --project <key>` for
+   this draft — the owner's approval tier, the role filter, each family's
+   colour here, the light, and a local lane past its slots marked QUEUED.
+   The verb itself answers from the SAVED team. */
+function teamRoute(key, cur, alloc, kind, lightRed, flagFams, roles, say, tier) {
+  if (lightRed && (kind === "build" || kind === "delegate"))
+    return '<div class="ttake">none: ' + esc(key) + " is RED — start nothing new here.</div>";
+  const rows = (cur.members || []).filter(m => !m.gone).map(m => {
+    // benched on the family it SPENDS, as route benches it (the family door)
+    const fam = m.spends || m.family;
+    const e = (alloc[fam] || {}).colour || (flagFams[fam] || {}).colour || "GREY";
+    let why = null;
+    if (fam === "anthropic" && kind !== "verify") why = "a claude seat is the asker: route offers other families for " + kind + " (E9)";
+    else if (tier && (tier.kinds || []).indexOf(kind) >= 0 && (tier.families || []).indexOf(fam) < 0)
+      why = fam + " is not in the owner's approval tier, which decides who may close a " + kind + " (E3)";
+    else if ((roles[m.role] || []).indexOf(kind) < 0) why = "role " + m.role + " does not take " + kind;
+    else if (m.state === "wanted") why = "not started yet";
+    else if (m.state === "absent") why = "absent";
+    else if (e === "RED") why = fam + " is RED here" + ((alloc[fam] || {}).rationed
+      ? " (" + teamRatio(alloc[fam].ratio) + " budget)" : "");
+    return {m, fam, e, why};
+  });
+  const queued = r => (alloc[r.fam] || {}).queued ? 1 : 0;
+  const ok = rows.filter(r => !r.why).sort((a, b) => (queued(a) - queued(b)) || (TEAM_RANK[a.e] - TEAM_RANK[b.e]));
+  say = say || {};
+  return (ok.length ? ok.map((r, i) => '<div class="' + (i ? "" : "ttake") + '">' + (i ? "then " : "TAKE ") + "@" + esc(r.m.seat)
+      + " " + teamWord(r.e) + " " + esc(say[r.e] || "")
+      + (queued(r) ? ' <b class="bunk">QUEUED</b> — ' + esc(teamLine(key, r.fam, alloc[r.fam]).split("; ")[0]) : "") + "</div>").join("")
+    : '<div class="ttake">no other family on this team can take ' + esc(kind) + " right now — the claude seats do it themselves</div>")
+    + rows.filter(r => r.why).map(r => '<div class="bmut">not @' + esc(r.m.seat) + ": " + esc(r.why) + "</div>").join("");
+}
+
+function teamHistory(t) {
+  const rows = ((t && t.history) || []).slice().reverse();
+  if (!rows.length) return '<div class="bmut">nothing authored yet</div>';
+  return rows.map(r => "<div><b>" + (r.kind === "team" ? "v" + esc(r.v) : "light") + "</b> · " + esc(r.by || "an unnamed terminal")
+    + " · " + esc(r.ts ? ago(r.ts) : "no time recorded") + " — " + esc(r.reason || "no reason recorded")
+    + '<div class="bmut">' + esc((r.diff || []).join(" · ")) + "</div></div>").join("");
+}
+
+/* THE TEAM'S PARTS, one HTML string each, for the two surfaces that draw a
+   team: the open row on Work (`teamSection`) and the project card on the
+   Teams page (`teamsCard`), which lays the same parts out after the approved
+   mockup. `p` is the registry row, `j` the board's join for it. When the team
+   cannot be drawn — its leg not read, or no team at all — the answer is
+   `{line}`, the one line that says why. PURE. */
+function teamParts(p, j, d) {
+  const sec = boardSec(d, "teams"), st = boardSecState(sec);
+  if (st !== "ok" && st !== "stale") return {line: esc("team " + boardSecWord(sec))};
+  const key = pkey(p), t = j && j.team;
+  if (!t) return {line: "no team: no seat seen in the last three days works here, and none is authored for this project"};
+  const cur = teamCurrent(key, j), lightRed = teamLightRed(p);
+  const flagFams = ((boardSec(d, "flags") || {}).families) || {};
+  const roles = sec.roles || {};
+  const alloc = teamAlloc(key, cur, d, lightRed);
+  const dl = teamDiff(t, cur), kind = TEAM_KIND.get(key) || "review";
+  const live = (cur.members || []).filter(m => !m.gone);
+  const natives = live.filter(m => (m.spends || m.family) === "anthropic").length;
+  const homes = natives + " claude seat" + (natives === 1 ? "" : "s") + ", each on its own credential home";
+  const famOrder = Object.keys(alloc).sort((a, b) => (alloc[b].rationed - alloc[a].rationed) || (a < b ? -1 : 1));
+  const x = {t, cur, dl, stale: st === "stale" ? boardSecWord(sec) : ""};
+  x.head = "<div class='thead'><b>" + (t.authored ? "team v" + esc(t.v) : "proposed team") + "</b>"
+    + (t.authored ? " <span class='bmut'>set by " + esc(t.by || "an unnamed terminal") + (t.ts ? " " + esc(ago(t.ts)) : "")
+      + (t.reason ? " — " + esc(t.reason) : "") + "</span>" : "")
+    + (x.stale ? " <span class='bunk'>" + esc(x.stale) + "</span>" : "") + "</div>";
+  x.problem = t.problem ? "<div class='dline bunk'>" + esc(t.problem) + "</div>" : "";
+  x.failed = Object.keys(sec.failed || {}).length
+    ? "<div class='dline bunk'>readings FAILED: " + esc(teamFailedText(sec.failed))
+      + " — a reading that raised is not unmeasured; the budgets below say FAILED where it mattered</div>" : "";
+  x.banner = t.authored ? ""
+    : "<div class='tbanner'>This team is <b>proposed</b>: helm built it from today's seats (home room, spawn register, working directory) and today's measured burn split. Until you accept it, agents behave exactly as they do now."
+      + (dl.length ? "" : "<br><button type='button' class='tbtn pri' data-team-accept='" + esc(key) + "'>accept this team</button>") + "</div>";
+  // WHAT THIS PROJECT DOES NOT USE FOLDS (task/3475): the Team tab listed a
+  // budget row for every family any member names and every absent seat,
+  // most of a 4,443 px tab. A family with no share here and no seat present
+  // folds behind one "N other families", an absent seat behind "N absent".
+  const split = teamSplit(cur, famOrder);
+  const famRow = f => teamFamRow(key, f, alloc[f], flagFams[f], lightRed, homes, sec.say);
+  x.budgets = "<div class='tsec'><h5>budgets · supply, per family this team uses</h5>"
+    + (split.used.length ? split.used.map(famRow).join("") : "<div class='bmut'>no family yet</div>")
+    + teamFold(key, "fams", split.other.length + " other famil" + (split.other.length === 1 ? "y" : "ies"),
+      split.other.map(famRow).join(""), split.other.length) + "</div>";
+  const member = i => teamMemberRow(key, cur.members[i], i, roles);
+  x.roster = "<div class='tsec'><h5>team · " + live.length + " seat" + (live.length === 1 ? "" : "s") + "</h5>"
+    + split.here.map(member).join("")
+    + teamFold(key, "absent", split.absent.length + " absent", split.absent.map(member).join(""), split.absent.length)
+    + teamAddRow(key, cur, sec, flagFams) + "</div>";
+  const drift = teamDriftLines(key, t, cur);
+  x.drift = "<div class='tsec'><h5>what the lead will do</h5>" + (drift.length
+    ? "<ul class='tdrift'>" + drift.map(r => "<li>" + esc(r) + "</li>").join("") + "</ul>"
+    : "<div class='bmut'>Nothing: the running seats match the team.</div>") + "</div>";
+  x.route = "<div class='tsec'><h5>what agents hear</h5>"
+    + "<div class='tkinds' role='group' aria-label='kind of work'>" + TEAM_KINDS.map(k => "<button type='button' class='tbtn"
+      + (k === kind ? " on" : "") + "' data-team-kind='" + esc(k) + "' data-key='" + esc(key) + "'>" + esc(k) + "</button>").join("") + "</div>"
+    + "<div class='troute'>" + teamRoute(key, cur, alloc, kind, lightRed, flagFams, roles, sec.say, sec.tier) + "</div>"
+    + (dl.length ? "<div class='gmeta twrap'>a preview of this draft; agents hear the saved team until you save</div>" : "") + "</div>";
+  x.history = "<div class='tsec'><h5>history</h5><div class='thist'>" + teamHistory(t) + "</div></div>";
+  const msg = TEAM_MSG.get(key);
+  x.save = "<div class='tsave" + (dl.length ? " dirty" : "") + "'><div class='tdiff'>" + (dl.length ? "Not saved: " + esc(dl.join(" · ")) : "No changes.") + "</div>"
+    + "<div class='trow2'><input type='text' data-team-why='" + esc(key) + "' value='" + esc(cur.reason || "") + "' placeholder='reason for this change (required)' autocomplete='off' aria-label='reason'>"
+    + "<button type='button' class='tbtn pri' data-team-save='" + esc(key) + "'" + (dl.length ? "" : " disabled") + ">save team "
+    + (t.authored ? "v" + esc(t.v) + " → v" + (t.v + 1) : "v1") + "</button>"
+    + (dl.length ? "<button type='button' class='tbtn' data-team-discard='" + esc(key) + "'>discard</button>" : "") + "</div>"
+    + "<div class='tmsg" + (msg && msg.err ? " err" : "") + "' role='status'>" + esc(msg ? msg.text : "") + "</div></div>";
+  return x;
+}
+
+/* WHICH FAMILIES AND SEATS A TEAM TAB SHOWS OPEN (task/3475). A seat is
+   absent when its state says so and no unsaved edit touches it; a family is
+   used when this project gives it a share or a present seat spends it.
+   -> {used, other: family names in `famOrder`'s order; here, absent: member
+   indexes}. PURE. */
+function teamSplit(cur, famOrder) {
+  const members = (cur && cur.members) || [];
+  const away = m => (m.state || "absent") === "absent" && !m.added && !m.gone;
+  const here = [], absent = [];
+  members.forEach((m, i) => (away(m) ? absent : here).push(i));
+  const spends = new Set(here.map(i => members[i]).filter(m => !m.gone).map(m => m.spends || m.family));
+  const shares = (cur && cur.shares) || {};
+  const used = (famOrder || []).filter(f => typeof shares[f] === "number" || spends.has(f));
+  return {used, other: (famOrder || []).filter(f => used.indexOf(f) < 0), here, absent};
+}
+/* ONE FOLD with its count on its face; nothing at all when it holds none.
+   Its open state is the reader's and survives the card's redraws. */
+const TEAM_FOLDS = new Set();
+function teamFold(key, what, label, body, n) {
+  if (!n) return "";
+  const id = key + ":" + what;
+  return '<details class="tfold" data-team-fold="' + esc(id) + '"' + (TEAM_FOLDS.has(id) ? " open" : "")
+    + "><summary>" + esc(label) + "</summary>" + body + "</details>";
+}
+document.addEventListener("toggle", ev => {
+  const f = ev.target && ev.target.dataset && ev.target.dataset.teamFold;
+  if (f) { if (ev.target.open) TEAM_FOLDS.add(f); else TEAM_FOLDS.delete(f); }
+}, true);
+
+/* THE TEAM, in Work's open row: budgets, members, what the lead does, what
+   agents hear, history, and the save bar, in `teamParts`' own order. */
+function teamSection(p, j, d) {
+  const box = body => "<div class='dsec dteam'><h4>team</h4>" + body + "</div>";
+  const x = teamParts(p, j, d);
+  if (x.line !== undefined) return box("<div class='dline'>" + x.line + "</div>");
+  return box(x.head + x.problem + x.failed + x.banner + x.budgets + x.roster
+    + x.drift + x.route + x.history + x.save);
+}
+
+/* ---------- the doors ---------- */
+
+/* Redraw one project's row (and the family sheet, whose shares bar moves
+   with it) from what the page holds — the board read and the drafts. */
+function teamRefresh(key) {
+  const p = projects.find(x => pkey(x) === key);
+  const row = document.querySelector('.brow[data-key="' + CSS.escape(key) + '"]');
+  if (p && row) row.outerHTML = boardRowHTML(p, BOARD, BOARD_OPEN.has(key), PROJ_TAB);
+  famRender();
+}
+
+/* THE FAMILIES CARD, redrawn from the board read. A declare he has open, and
+   what he typed into it, survive the redraw (the board is read every minute
+   while credit is on screen), and a declare he is TYPING IN is not redrawn at
+   all: the sheet waits until the caret leaves it, unless `force` (his own
+   press) asks for the answer now. An unknown family falls back to the
+   default, and the address says so. */
+function famRender(force) {
+  const head = $("#flagoverall"), rows = $("#flagrows");
+  if (!head || !rows) return;
+  const flags = boardSec(BOARD, "flags");
+  if (FAM_SEL && boardSecState(flags) === "ok" && !(FAM_SEL in (flags.families || {}))) {
+    FAM_SEL = null;
+    viewHashSync("quota");
+  }
+  const f = flagsHTML(flags, BOARD);
+  head.innerHTML = f.head;
+  const act = document.activeElement;
+  if (!force && act && act !== document.body && rows.contains(act) && act.closest(".tdeclare")) return;
+  const box = rows.querySelector(".tdeclare"), keep = box && box.open ? {
+    fam: (box.querySelector("[data-declare]") || {dataset: {}}).dataset.declare,
+    vals: [...box.querySelectorAll("select, input")].map(x => x.value)} : null;
+  rows.innerHTML = f.rows;
+  const again = keep && rows.querySelector(".tdeclare");
+  if (!again || (again.querySelector("[data-declare]") || {dataset: {}}).dataset.declare !== keep.fam) return;
+  again.open = true;
+  [...again.querySelectorAll("select, input")].forEach((x, i) => { if (i < keep.vals.length) x.value = keep.vals[i]; });
+}
+
+async function teamSave(key, accept) {
+  const j = BOARD && BOARD.projects ? BOARD.projects[key] : null;
+  const t = j && j.team;
+  if (!t) return;
+  const cur = accept ? teamCurrent(key, j) : TEAM_DRAFT.get(key);
+  if (!cur) return;
+  const reason = accept ? "accepted the proposed team" : String(cur.reason || "").trim();
+  if (!reason) {
+    TEAM_MSG.set(key, {text: "Say why: the reason rides the room notice and the history.", err: true});
+    teamRefresh(key);
+    const input = document.querySelector("[data-team-why='" + CSS.escape(key) + "']");
+    if (input) input.focus();
+    return;
+  }
+  const body = {name: key, expected: cur.base_v, reason,
+    team: {members: (cur.members || []).filter(m => !m.gone).map(m => ({seat: m.seat, family: m.family, role: m.role})),
+           shares: cur.shares || {}}};
+  TEAM_MSG.set(key, {text: "saving…"});
+  teamRefresh(key);
+  try {
+    const r = await post("/api/projects/team", body);
+    TEAM_DRAFT.delete(key);
+    TEAM_MSG.set(key, {text: "Saved as v" + r.v + "." + (r.posted === false ? " The TEAM-CHANGED notice to #" + key + " did not post."
+      : " TEAM-CHANGED went to #" + key + ".")});
+    await boardReload();
+  } catch (e) {
+    const b = e.body || {};
+    TEAM_MSG.set(key, {err: true, text: e.status === 409
+      ? "Not saved — " + String(b.error || "the team moved while this was open").replace(/[.\s]*$/, ".")
+        + " Your edits are kept here; discard them to see the team as it stands."
+      : "Not saved — " + (b.error || e.message)});
+    teamRefresh(key);
+  }
+}
+
+async function famDeclare(fam, box) {
+  const colour = box.querySelector("[data-declare-colour]").value;
+  const until = box.querySelector("[data-declare-until]").value;
+  const reason = box.querySelector("[data-declare-why]").value.trim();
+  try {
+    const r = await post("/api/burn/declare", {family: fam, colour, until, reason});
+    FAM_MSG = {family: fam, text: r.note || "Declared."};
+  } catch (e) {
+    FAM_MSG = {family: fam, err: true, text: (e.body && e.body.error) || e.message};
+  }
+  famRender(true);
+  const open = document.querySelector("#flagrows .tdeclare");
+  if (open) open.open = true;
+}
+
+document.addEventListener("click", ev => {
+  const t = ev.target.closest("button");
+  if (!t) return;
+  const d = t.dataset;
+  if (d.famSel !== undefined) {
+    FAM_SEL = d.famSel;
+    famRender();
+    viewHashSync("quota");
+    return;
+  }
+  if (d.qfam !== undefined) { quotaGoFam(d.qfam); return; }
+  if (d.declare !== undefined) { famDeclare(d.declare, t.closest(".tdeclare")); return; }
+  const key = d.key || d.teamAdd || d.teamAccept || d.teamSave || d.teamDiscard;
+  if (!key || !BOARD || !BOARD.projects) return;
+  const j = BOARD.projects[key];
+  if (d.teamStep !== undefined) {
+    const dr = teamDraft(key, j);
+    if (!dr) return;
+    dr.shares[d.fam] = Math.max(0, Math.min(100, (dr.shares[d.fam] || 0) + Number(d.teamStep)));
+    TEAM_MSG.delete(key);
+    teamRefresh(key);
+  } else if (d.teamRm !== undefined) {
+    const dr = teamDraft(key, j), i = Number(d.teamRm), m = dr && dr.members[i];
+    if (!m) return;
+    if (m.added) dr.members.splice(i, 1); else m.gone = !m.gone;
+    TEAM_MSG.delete(key);
+    teamRefresh(key);
+  } else if (d.teamAdd !== undefined) {
+    const row = t.closest(".taddrow"), dr = teamDraft(key, j);
+    const v = row.querySelector("[data-team-addseat]").value, role = row.querySelector("[data-team-addrole]").value;
+    if (!v || !dr) return;
+    const parts = v.split(":");
+    const word = f => f === "anthropic" ? "claude" : f;
+    const m = parts[0] === "seat"
+      ? {seat: parts[1], family: parts[2], role, state: "live", added: true}
+      : {seat: key + "-" + word(parts[1]), family: parts[1], role, state: "wanted", added: true};
+    if (!m.family) return;
+    dr.members.push(m);
+    TEAM_MSG.delete(key);
+    teamRefresh(key);
+  } else if (d.teamKind !== undefined) {
+    TEAM_KIND.set(key, d.teamKind);
+    teamRefresh(key);
+  } else if (d.teamAccept !== undefined) {
+    teamSave(key, true);
+  } else if (d.teamSave !== undefined) {
+    teamSave(key, false);
+  } else if (d.teamDiscard !== undefined) {
+    TEAM_DRAFT.delete(key);
+    TEAM_MSG.delete(key);
+    teamRefresh(key);
+  }
+});
+document.addEventListener("change", ev => {
+  const s = ev.target;
+  if (!s || !s.dataset || s.dataset.teamRole === undefined || !BOARD || !BOARD.projects) return;
+  const key = s.dataset.key, dr = teamDraft(key, BOARD.projects[key]);
+  const m = dr && dr.members[Number(s.dataset.teamRole)];
+  if (!m) return;
+  m.role = s.value;
+  TEAM_MSG.delete(key);
+  teamRefresh(key);
+});
+document.addEventListener("input", ev => {
+  const s = ev.target;
+  if (!s || !s.dataset || s.dataset.teamWhy === undefined || !BOARD || !BOARD.projects) return;
+  const dr = teamDraft(s.dataset.teamWhy, BOARD.projects[s.dataset.teamWhy]);
+  if (dr) dr.reason = s.value;
+});

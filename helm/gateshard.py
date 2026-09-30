@@ -183,14 +183,6 @@ def _tests(suite):
             yield test
 
 
-def module_groups(suite):
-    """Group an arbitrary suite by the module that defines each test class."""
-    grouped = collections.OrderedDict()
-    for test in _tests(suite):
-        name = getattr(test.__class__, "__module__", "") or "unittest.loader"
-        grouped.setdefault(name, []).append(test)
-    return list(grouped.items())
-
 
 class _PlanningLoader(unittest.TestLoader):
     """Record which module exported every test instance discovery collected."""
@@ -589,7 +581,22 @@ _TEST_ENV_KEYS = ("HELM_CONFIG_ROOTS", "HELM_METAHARNESS",
                   "MELD_TURNSTAMP_DIR", "HELM_MULTIPLAYER_DIR",
                   "MELD_MULTIPLAYER_DIR")
 
-_ROLE_ENV_KEYS = ("HELM_GATESHARD_PLANNER", "HELM_GATESHARD_WORKER")
+# EVERY RUNNER ROLE, the slice worker's included. A test running inside a
+# slice worker sees HELM_GATESLICE_WORKER=1, and a suite that test starts
+# (a serial child through gate._suite_env, or another runner's workers) must
+# start without it. Otherwise a fixture that waits for a second worker only
+# when that marker is set waits in a nested SERIAL run too and fails there,
+# and the arm that holds it fails sliced while it passes serial.
+# `_fresh_env(marker)` drops every role and then sets its own.
+_ROLE_ENV_KEYS = ("HELM_GATESHARD_PLANNER", "HELM_GATESHARD_WORKER",
+                  "HELM_GATESLICE_WORKER")
+# A DURABLE FAB JOB'S LAUNCH IDENTITY (task/3066). The job's own `helm gate
+# run` reads the label its launch carried (gate.fab_job_label) and mints it
+# into the receipt; the suite it spawns must not read it again. Measured on
+# train209, the first labelled window gate: every arm that drives `gate run`
+# without a label inherited 'train209', took the train rule (serial, a land's
+# receipt) and 18 of them failed on a tree whose lanes touch none of them.
+_LAUNCH_ENV_KEYS = ("FAB_GATE_LABEL", "FAB_GATE_GENERATION")
 _PATH_ENV_KEYS = None
 
 # THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
@@ -640,7 +647,7 @@ def scrubbed_env(base):
     """
     env = dict(base)
     keys = (_TEST_ENV_KEYS + _identity_path_env_keys()
-            + _ROLE_ENV_KEYS + _MEASURE_ENV_KEYS)
+            + _ROLE_ENV_KEYS + _MEASURE_ENV_KEYS + _LAUNCH_ENV_KEYS)
     for key in keys:
         env.pop(key, None)
     # EVERY SPELLING OF THE CONFIG ROOTS. helm/configs reads a declared

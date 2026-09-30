@@ -13,6 +13,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import signal
 import stat
@@ -25,7 +26,8 @@ import unittest
 from unittest import mock
 
 from tests._tmphome import pin_suite_guard
-from helm import pk, projscope, seat, seat_health, seat_usability
+from helm import (pk, projscope, seat, seat_catalog, seat_health,
+                  seat_usability)
 
 
 def _b64seg(obj):
@@ -596,6 +598,1073 @@ class SeatTest(unittest.TestCase):
         self.assertIn('api-key: "fake-keyed-control"', keyed)
         self.assertNotIn(seat_catalog.KEYLESS_API_KEY_PLACEHOLDER, keyed)
 
+    # -- cursor: grok-4.7-high through the owner's Cursor plan (task/2634) ----
+    #: What the hand-made live seat serves, read off its config.yaml and
+    #: launch.sh. The mint must reproduce each of these, because
+    #: `helm seat launch` and `seat doctor --ensure` rewrite both files from
+    #: the catalog and a value helm does not own is lost at the next pass.
+    _CURSOR_LIVE = {"port": 8315, "provider": "cursor-bridge",
+                    "base_url": "http://127.0.0.1:18315/v1",
+                    "upstream": "grok-4.7-high"}
+
+    def test_add_cursor_mints_the_route_the_live_seat_serves(self):  # noqa: VACUOUS_ASSERTION — the assertIn words on the same launch.sh are the unconditional positive control for its cursor-grok absence
+        """`helm seat add cursor` with no key anywhere writes the live route:
+        proxy 8315, the bridge on 18315, grok-4.7-high behind the alias the
+        owner named (`cursor`), and the keyless placeholder as the one key.
+        launch.sh points claude at 8315 with the same alias, and teaches the
+        110000 context_budget narrowed from the 225000 max_context
+        (task/3652), which itself is derived from Cursor's 256000 probe
+        (task/3616)."""
+        from helm import seat_catalog
+        live = self._CURSOR_LIVE
+        rc, out, err = self._add(("add", "cursor"))  # noqa: SEAT_NAME — the catalog FAMILY key the mint verb takes
+        self.assertEqual(rc, 0, err)
+        d = seat.seat_dir("cursor")  # noqa: SEAT_NAME — the catalog FAMILY key
+        with open(os.path.join(d, "config.yaml")) as f:
+            cfg = f.read()
+        self.assertIn("port: %d\n" % live["port"], cfg)
+        self.assertIn('  - name: "%s"\n    base-url: "%s"\n'
+                      % (live["provider"], live["base_url"]), cfg)
+        self.assertIn('      - name: "%s"\n        alias: "cursor"\n'
+                      % live["upstream"], cfg)
+        self.assertIn('api-key: "%s"' % seat_catalog.KEYLESS_API_KEY_PLACEHOLDER,
+                      cfg)
+        self.assertEqual(cfg.count("api-key:"), 1)
+        with open(os.path.join(d, "launch.sh")) as f:
+            launch = f.read()
+        for word in ("ANTHROPIC_BASE_URL=http://127.0.0.1:%d" % live["port"],
+                     "CLAUDE_CODE_SUBAGENT_MODEL=cursor",
+                     "HELM_MODEL_FAMILY=cursor",
+                     "CLAUDE_CODE_MAX_CONTEXT_TOKENS=110000",
+                     "--model cursor"):
+            self.assertIn(word, launch)
+        # NO TRAFFIC SWITCH ON ANY SEAT: either one takes Monitor out of the
+        # seat's tool list (measured at claude 2.1.284), and a seat without
+        # Monitor can arm no beacon. The cursor launch line above is the
+        # measured case; every family's line is swept, each with a presence
+        # on the same line before its absences.
+        self.assertNotIn("DISABLE_NONESSENTIAL_TRAFFIC", launch)
+        self.assertNotIn("DISABLE_TELEMETRY", launch)
+        for fam in seat.FAMILIES:
+            with self.subTest(family=fam):
+                line = seat.launch_line(fam, room="r")
+                self.assertIn("HELM_MODEL_FAMILY=%s" % fam, line)
+                self.assertNotIn("DISABLE_NONESSENTIAL_TRAFFIC", line)
+                self.assertNotIn("DISABLE_TELEMETRY", line)
+        self.assertNotIn("cursor-grok", launch)
+        # the proxy verdict reads the family it now resolves: a rung and a
+        # route, where the hand-made seat rendered `unknown family`
+        self.assertEqual(seat_catalog.provider_rung("cursor", live["provider"]),  # noqa: SEAT_NAME — the catalog FAMILY key
+                         "free")
+
+    def test_the_reconcile_keeps_the_hand_made_alias_and_takes_custody(self):
+        """THE RENAME DOES NOT BREAK A PANE ON THE OLD ALIAS. The live config
+        carries `cursor-grok` and a non-placeholder key entry. One reconcile
+        writes the catalog's alias and the declared placeholder, KEEPS the
+        `cursor-grok` row (a model row helm does not own is retained), and
+        names the custody drift; a second pass finds nothing to change."""
+        from helm import seat_catalog, seat_launch_assets
+        live = self._CURSOR_LIVE
+        d = seat.seat_dir("cursor")  # noqa: SEAT_NAME — the catalog FAMILY key
+        os.makedirs(d)
+        path = os.path.join(d, "config.yaml")
+        hand = seat_launch_assets._config_yaml_key(
+            live["port"], "inbound-token", live["provider"], live["base_url"],
+            "cursor-grok", "cursor-local-bridge-placeholder", live["upstream"],
+            frontmatter=False)
+        with open(path, "w") as f:
+            f.write(hand)
+        plan = seat_launch_assets.proxy_config_plan(path, "cursor")  # noqa: SEAT_NAME — the catalog FAMILY key
+        self.assertTrue(plan["changed"])
+        self.assertIn("keyless custody", plan["alias_drift"])
+        self.assertIn('alias: "cursor"\n', plan["text"])
+        self.assertIn('alias: "cursor-grok"\n', plan["text"])
+        self.assertIn('api-key: "%s"' % seat_catalog.KEYLESS_API_KEY_PLACEHOLDER,
+                      plan["text"])
+        self.assertNotIn("cursor-local-bridge-placeholder", plan["text"])
+        with open(path, "w") as f:
+            f.write(plan["text"])
+        again = seat_launch_assets.proxy_config_plan(path, "cursor")  # noqa: SEAT_NAME — the catalog FAMILY key
+        self.assertFalse(again["changed"], again["alias_drift"])
+        self.assertIsNone(again["alias_drift"])
+
+    def test_a_one_provider_keyless_family_keeps_the_endpoint_floor(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the refusal sentence are the unconditional positive control for the absent config
+        """The floor the pool branch asks of a row holds for a keyless family
+        with no pool: a public plain-http endpoint refuses the mint, and the
+        loopback bridge (the control, minted above) is admitted."""
+        # a NAME, never an address: `_safe_endpoint` admits plain http only to
+        # a literal private or loopback address
+        bad = dict(seat.FAMILIES["cursor"],  # noqa: SEAT_NAME — the catalog FAMILY key
+                   base_url="http://bridge.example.com:18315/v1")
+        with mock.patch.dict(seat.FAMILIES, {"cursor": bad}):  # noqa: SEAT_NAME — the catalog FAMILY key
+            rc, _out, err = self._add(("add", "cursor"))  # noqa: SEAT_NAME — the catalog FAMILY key the mint verb takes
+        self.assertEqual(rc, 1)
+        self.assertIn("not an endpoint a keyless seat may use", err)
+        self.assertFalse(os.path.exists(os.path.join(
+            seat.seat_dir("cursor"), "config.yaml")))  # noqa: SEAT_NAME — the catalog FAMILY key
+
+    def test_a_family_level_rung_answers_only_for_its_own_provider(self):
+        from helm import seat_catalog
+        table = {"solo": {"provider": "solo-vendor", "rung": "paid"},
+                 "odd": {"provider": "odd-vendor", "rung": "cheap"},
+                 "bare": {"provider": "bare-vendor"}}
+        self.assertEqual(seat_catalog.provider_rung("solo", "solo-vendor",
+                                                    table), "paid")
+        self.assertIsNone(seat_catalog.provider_rung("solo", "other", table))
+        self.assertIsNone(seat_catalog.provider_rung("odd", "odd-vendor",
+                                                     table))
+        self.assertIsNone(seat_catalog.provider_rung("bare", "bare-vendor",
+                                                     table))
+
+    # -- the second local family: qwenlocal, the 35B on the same box ----------
+    #: The FAMILY key, named once for the same reason `_KEYLESS_FAMILY` is.
+    _LOCAL_VLLM_FAMILY = "qwenlocal"  # noqa: SEAT_NAME — the catalog FAMILY key, never a seat
+    #: Its endpoint in these arms: the same documentation-range host as the
+    #: qwen27 endpoint above, on another port, because that is the shape of
+    #: the operator's box (two served models, one host).
+    _LOCAL_VLLM_ENDPOINT = "http://192.0.2.10:8081/v1"
+
+    def test_qwenlocal_is_a_keyless_free_family_whose_window_is_split(self):
+        """The entry's contract, each field against the reason it holds.
+
+        THE ARITHMETIC IS THE CLAIM, NOT THE NUMBERS. Input and output share
+        one served window, so the pinned max_context is the window less the
+        output cap less a compaction margin (task/3184), and the output cap
+        is the makers' own thinking-on max_tokens. A later re-probe that
+        moves the window must move the pin with it, and this arm then still
+        holds.
+
+        The launch line is where the two numbers reach Claude Code, so it is
+        asserted too. The control is kimi's line, which has no output cap:
+        the word below is about this family's declaration, not about every
+        launch line."""
+        from helm import seat_catalog
+        family = self._LOCAL_VLLM_FAMILY
+        fam = seat.FAMILIES[family]
+        self.assertEqual(fam["mode"], "proxy-key")
+        self.assertIs(fam["keyless"], True)
+        self.assertNotIn("key_env", fam)
+        self.assertEqual(fam["model"], family)
+        self.assertEqual(fam["probe_models"], (family,))
+        # ONE pool row, and it is the default
+        self.assertEqual(list(fam["pool_providers"]), [fam["pool_default"]])
+        row = fam["pool_providers"][fam["pool_default"]]
+        self.assertEqual(row["base_url_from"], family)
+        self.assertEqual(row["upstream_model"], family)
+        self.assertNotIn("base_url", row)   # the tree names no LAN host
+        self.assertEqual(
+            seat_catalog.provider_rung(family, fam["pool_default"]), "free")
+        # ITS OWN PROVIDER NAME, named for the server and not the box. It is
+        # not qwen27's, so an operator's rename of qwen27's provider (a local
+        # name) cannot rename this block under a seat minted with it.
+        self.assertEqual(fam["pool_default"], "local-vllm")
+        self.assertNotEqual(fam["pool_default"],
+                            seat.FAMILIES["qwen27"]["pool_default"])
+        # one llama-server slot's window since the task/3363 cutover (2
+        # slots x 196,608 on the operator's box); the vLLM server before it
+        # admitted 262,144
+        self.assertEqual(fam["probed_context_length"], 262144)
+        self.assertEqual(fam["max_output_tokens"], 32768)
+        # the slot less the output cap less exactly the compaction floor, as
+        # bonsai's: 212,992 (262,144 - 32,768 - 16,384). It kept one more output
+        # cap (131,072) while a Read result could reach 25,000 tokens; its lite
+        # profile caps a Read at 8,000, which the floor holds. Each compaction
+        # costs tokens, re-briefing and rediscovery, so the window sits at the
+        # rule's edge.
+        self.assertEqual(fam["max_context"],
+                         fam["probed_context_length"] - fam["max_output_tokens"]
+                         - seat_catalog.LOCAL_COMPACTION_MARGIN)
+        self.assertLessEqual(fam["lite_env"]["CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"],
+                             seat_catalog.LOCAL_COMPACTION_MARGIN)
+        _configure_endpoints({"qwen27": _KEYLESS_ENDPOINT,  # noqa: SEAT_NAME — catalog FAMILY keys the endpoints file is keyed by, never seats
+                              family: self._LOCAL_VLLM_ENDPOINT})
+        line = seat.launch_line(family, room="r")
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=212992", line)
+        self.assertIn("CLAUDE_CODE_MAX_OUTPUT_TOKENS=32768", line)
+        self.assertNotIn("CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+                         seat.launch_line("kimi", room="r"))
+
+    def test_qwenlocal_mints_its_own_block_and_its_route_is_its_own(self):
+        """Two local families on one box: each mints its own block at its own
+        endpoint, and a proof measured on either route resolves to that family
+        alone.
+
+        THE CONTROL IS qwen27, configured in the same helm home. With both
+        endpoints present, "the route resolves to exactly one family" is a
+        claim about two live routes and not about one route with no rival."""
+        from helm import seat_catalog
+        family = self._LOCAL_VLLM_FAMILY
+        _configure_endpoints({"qwen27": _KEYLESS_ENDPOINT,  # noqa: SEAT_NAME — catalog FAMILY keys the endpoints file is keyed by, never seats
+                              family: self._LOCAL_VLLM_ENDPOINT})
+        rc, _out, err = self._add(("add", family))
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir(family), "config.yaml")) as f:
+            config = f.read()
+        self.assertIn("port: %d\n" % seat.FAMILIES[family]["port"], config)
+        self.assertIn('name: "local-vllm"', config)
+        self.assertIn('base-url: "%s"' % self._LOCAL_VLLM_ENDPOINT, config)
+        self.assertNotIn(_KEYLESS_ENDPOINT, config)   # not qwen27's endpoint
+        self.assertIn('alias: "%s"' % family, config)
+        self.assertIn('api-key: "%s"'
+                      % seat_catalog.KEYLESS_API_KEY_PLACEHOLDER, config)
+        self.assertEqual(config.count("api-key:"), 1)
+        urls = set()
+        for fam in (family, "qwen27"):  # noqa: SEAT_NAME — catalog FAMILY keys, and the pair of local families IS this arm's subject
+            routes = seat_catalog.proxy_routes(fam)
+            self.assertEqual(len(routes), 1, fam)
+            self.assertEqual(seat_catalog.proxy_route_family(dict(routes[0])),
+                             (fam, None))
+            urls.add(routes[0]["base_url"])
+        self.assertEqual(urls, {self._LOCAL_VLLM_ENDPOINT, _KEYLESS_ENDPOINT})
+
+    # -- the third local family: bonsai, the 1-bit 27B on the CUDA box --------
+    #: The FAMILY key, named once for the same reason `_KEYLESS_FAMILY` is.
+    _LOCAL_CUDA_FAMILY = "bonsai"  # noqa: SEAT_NAME — the catalog FAMILY key, never a seat
+    #: Its endpoint in these arms: a SECOND documentation-range host, because
+    #: this model is served from a different box than the other two.
+    _LOCAL_CUDA_ENDPOINT = "http://192.0.2.11:8098/v1"
+
+    def test_bonsai_is_a_keyless_free_family_whose_window_fits_ONE_slot(self):
+        """The entry's contract, each field against the reason it holds.
+
+        ONE SLOT IS THE WHOLE KV POOL. The server reports one slot of 131,072
+        tokens, so the lead and its subagents never share the pool at once:
+        they take turns on the one slot. qwen27's budget (163,840 of a
+        212,992 slot) left room for a concurrent subagent; scaled to this
+        slot that ratio lands ABOVE the slot less one turn's output, so the
+        ceiling binds and no narrower budget is declared.
+
+        The launch line is where the numbers reach Claude Code, so it is
+        asserted too."""
+        from helm import seat_catalog
+        family = self._LOCAL_CUDA_FAMILY
+        fam = seat.FAMILIES[family]
+        self.assertEqual(fam["mode"], "proxy-key")
+        self.assertIs(fam["keyless"], True)
+        self.assertNotIn("key_env", fam)
+        self.assertEqual(fam["model"], family)
+        self.assertEqual(fam["probe_models"], (family,))
+        # ONE pool row, and it is the default
+        self.assertEqual(list(fam["pool_providers"]), [fam["pool_default"]])
+        row = fam["pool_providers"][fam["pool_default"]]
+        # the endpoint resolves through `base_url_from` (`pool_base_url`).
+        # The MCP floor is NOT keyed on it: envtidy.mcp_withheld reads the
+        # window launch.sh stamps, and 32,000 of schemas exceed 15% of 98,304
+        self.assertEqual(row["base_url_from"], family)
+        self.assertEqual(row["upstream_model"], family)
+        self.assertNotIn("base_url", row)   # the tree names no LAN host
+        self.assertEqual(
+            seat_catalog.provider_rung(family, fam["pool_default"]), "free")
+        # ITS OWN PROVIDER NAME, neither local sibling's, so no rename of
+        # theirs renames this block
+        self.assertEqual(fam["pool_default"], "local-llamacpp-cuda")
+        for sibling in ("qwen27", "qwenlocal"):  # noqa: SEAT_NAME — catalog FAMILY keys, the local siblings this provider name must differ from
+            self.assertNotEqual(fam["pool_default"],
+                                seat.FAMILIES[sibling]["pool_default"], sibling)
+        self.assertEqual(fam["probed_context_length"], 262144)
+        # 16,384, the output cap the operator of the local boxes pinned live
+        # (task/3184), so the window keeps room beside the margin
+        self.assertEqual(fam["max_output_tokens"], 16384)
+        # the slot less the output cap less exactly the compaction floor:
+        # 262,144 - 16,384 - 16,384 = 229,376
+        self.assertEqual(fam["max_context"],
+                         fam["probed_context_length"] - fam["max_output_tokens"]
+                         - seat_catalog.LOCAL_COMPACTION_MARGIN)
+        # qwen27's formula, scaled: the ceiling now binds, so context_budget
+        q = seat.FAMILIES["qwen27"]
+        scaled = (fam["probed_context_length"] * q["context_budget"]
+                  // q["probed_context_length"])
+        self.assertLess(scaled, fam["max_context"])
+        self.assertEqual(fam["context_budget"], 196608)
+        self.assertEqual(seat_catalog.taught_window(fam, fam["max_context"]),
+                         196608)
+        _configure_endpoints({family: self._LOCAL_CUDA_ENDPOINT})
+        line = seat.launch_line(family, room="r")
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=196608", line)
+        self.assertIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW=196608", line)
+        self.assertIn("CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384", line)
+        self.assertIn("--model bonsai", line)
+        # the taught window plus one turn's output plus the compaction margin
+        # fits the one slot (the measured wedge was window + output == slot)
+        self.assertLessEqual(196608 + fam["max_output_tokens"]
+                             + seat_catalog.LOCAL_COMPACTION_MARGIN,
+                             fam["probed_context_length"])
+
+    def test_bonsai_mints_its_own_block_and_each_local_route_is_its_own(self):
+        """Three local families, two boxes: each mints its own block at its
+        own endpoint, and a proof measured on any of the three routes
+        resolves to that family alone. The two vLLM-era siblings are
+        configured in the same helm home, so "one family per route" is a
+        claim about three live routes and not about one with no rival."""
+        from helm import seat_catalog
+        family = self._LOCAL_CUDA_FAMILY
+        _configure_endpoints({"qwen27": _KEYLESS_ENDPOINT,  # noqa: SEAT_NAME — catalog FAMILY keys the endpoints file is keyed by, never seats
+                              "qwenlocal": self._LOCAL_VLLM_ENDPOINT,  # noqa: SEAT_NAME — catalog FAMILY keys the endpoints file is keyed by, never seats
+                              family: self._LOCAL_CUDA_ENDPOINT})
+        rc, _out, err = self._add(("add", family))
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir(family), "config.yaml")) as f:
+            config = f.read()
+        self.assertIn("port: 8349\n", config)
+        self.assertIn('name: "local-llamacpp-cuda"', config)
+        self.assertIn('base-url: "%s"' % self._LOCAL_CUDA_ENDPOINT, config)
+        self.assertNotIn(_KEYLESS_ENDPOINT, config)
+        self.assertNotIn(self._LOCAL_VLLM_ENDPOINT, config)
+        self.assertIn('alias: "%s"' % family, config)
+        self.assertIn('api-key: "%s"'
+                      % seat_catalog.KEYLESS_API_KEY_PLACEHOLDER, config)
+        self.assertEqual(config.count("api-key:"), 1)
+        urls = set()
+        for fam in (family, "qwen27", "qwenlocal"):  # noqa: SEAT_NAME — catalog FAMILY keys, and the three local families ARE this arm's subject
+            routes = seat_catalog.proxy_routes(fam)
+            self.assertEqual(len(routes), 1, fam)
+            self.assertEqual(seat_catalog.proxy_route_family(dict(routes[0])),
+                             (fam, None))
+            urls.add(routes[0]["base_url"])
+        self.assertEqual(urls, {self._LOCAL_CUDA_ENDPOINT,
+                                self._LOCAL_VLLM_ENDPOINT, _KEYLESS_ENDPOINT})
+
+    # -- a local window leaves a compaction margin (task/3184) --------------
+    # MEASURED on a live qwenlocal seat: a turn died on API 400
+    # at 229,377 input + 32,768 output = 262,145, one token over the 262,144
+    # server maximum, because the taught window (229,376) plus the output cap
+    # EQUALLED the maximum. The compaction call that followed sent the same
+    # context and died the same way, so one large tool result wedged the seat
+    # until a /clear. bonsai had the same zero margin (99,072 + 32,000 =
+    # 131,072, its whole slot).
+
+    def test_every_local_family_leaves_the_compaction_margin(self):
+        """Every window a family served from the operator's own box teaches,
+        plus its output cap, plus LOCAL_COMPACTION_MARGIN, fits the server
+        slot, and the launch line stamps the window the arithmetic checked.
+
+        NOT VACUOUS: the scope is read off the catalog through the predicate
+        the guard itself uses, and each of the three local families must be
+        in it, so a predicate that matched nothing fails here. The floor is
+        pinned at 16,384, the one the operator of the local boxes set, so it
+        cannot be lowered in passing."""
+        from helm import seat_catalog
+        margin = seat_catalog.LOCAL_COMPACTION_MARGIN
+        self.assertGreaterEqual(margin, 16384)
+        local = sorted(n for n, f in seat.FAMILIES.items()
+                       if seat_catalog.own_box(f))
+        for family in (self._KEYLESS_FAMILY, self._LOCAL_VLLM_FAMILY,
+                       self._LOCAL_CUDA_FAMILY):
+            self.assertIn(family, local)
+        _configure_endpoints({self._KEYLESS_FAMILY: _KEYLESS_ENDPOINT,
+                              self._LOCAL_VLLM_FAMILY: self._LOCAL_VLLM_ENDPOINT,
+                              self._LOCAL_CUDA_FAMILY: self._LOCAL_CUDA_ENDPOINT})
+        for family in local:
+            fam = seat.FAMILIES[family]
+            taught = seat_catalog.taught_window(fam, fam["max_context"])
+            self.assertLessEqual(
+                taught + fam["max_output_tokens"] + margin,
+                fam["probed_context_length"], family)
+            self.assertEqual(seat_catalog.compaction_margin_error(family, fam),
+                             "", family)
+            line = seat.launch_line(family, room="r")
+            self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d " % taught, line)
+            self.assertIn("CLAUDE_CODE_MAX_OUTPUT_TOKENS=%d"
+                          % fam["max_output_tokens"], line)
+        self.assertIsNone(seat_catalog._incoherent_compaction_margin())
+
+    def test_a_local_family_with_no_compaction_margin_is_refused(self):
+        """The guard refuses the measured wedge's own shape, and only on a
+        family served from the operator's own box.
+
+        Planted copies of the qwenlocal entry go through the real predicate;
+        the live FAMILIES is never mutated. Each refusal is paired with an
+        accepted neighbour on the same numbers, so no arm passes by refusing
+        everything:
+          * window + output == slot (the measured shape) is refused, and the
+            reason names the family, the floor and the tokens left;
+          * one token under the floor is refused, and exactly at it passes
+            (the boundary is <=);
+          * the guard reads the TAUGHT window: a zero-margin max_context under
+            a budget that leaves the margin passes (qwen27's shape), and the
+            same entry without that budget is refused;
+          * every model_context window is taught too, so one bad model window
+            is refused beside a good family window;
+          * a local family with no output cap, or with no recorded slot, is
+            refused: its margin cannot be computed;
+          * a local family with no max_context is taught Claude Code's 200k
+            default, which a 131,072 slot cannot hold;
+          * CONTROL: the zero-margin numbers on a family that is NOT served
+            from the operator's box are outside this guard's scope.
+        The table-level door returns the planted refusal and passes a
+        coherent table."""
+        import copy
+        from helm import seat_catalog
+        margin = seat_catalog.LOCAL_COMPACTION_MARGIN
+        base = copy.deepcopy(seat.FAMILIES[self._LOCAL_VLLM_FAMILY])
+        base.pop("context_budget", None)
+        slot, out = base["probed_context_length"], base["max_output_tokens"]
+        zero = dict(base, max_context=slot - out)
+        why = seat_catalog.compaction_margin_error("seat-under-test", zero)
+        self.assertIn("seat-under-test", why)
+        self.assertIn("LOCAL_COMPACTION_MARGIN", why)
+        self.assertIn("leaves 0 ", why)
+        at = dict(base, max_context=slot - out - margin)
+        self.assertEqual(seat_catalog.compaction_margin_error("seat-a", at), "")
+        under = dict(base, max_context=slot - out - margin + 1)
+        self.assertIn("leaves {:,} ".format(margin - 1),
+                      seat_catalog.compaction_margin_error("seat-a", under))
+        budgeted = dict(zero, context_budget=slot - out - margin)
+        self.assertEqual(
+            seat_catalog.compaction_margin_error("seat-a", budgeted), "")
+        self.assertNotEqual(
+            seat_catalog.compaction_margin_error("seat-a", zero), "")
+        per_model = dict(at, model_context={"seat-b-model": slot - out})
+        self.assertNotEqual(
+            seat_catalog.compaction_margin_error("seat-a", per_model), "")
+        for key in ("max_output_tokens", "probed_context_length"):
+            missing = dict(at)
+            missing.pop(key)
+            self.assertIn(key, seat_catalog.compaction_margin_error(
+                "seat-a", missing))
+        unpinned = dict(base, probed_context_length=131072)
+        unpinned.pop("max_context")
+        self.assertIn("200,000", seat_catalog.compaction_margin_error(
+            "seat-a", unpinned))
+        remote = dict(zero, pool_default="vendor",
+                      pool_providers={"vendor": {
+                          "base_url": "http://192.0.2.99/v1", "rung": "paid"}})
+        self.assertFalse(seat_catalog.own_box(remote))
+        self.assertEqual(
+            seat_catalog.compaction_margin_error("seat-a", remote), "")
+        self.assertEqual(
+            seat_catalog._incoherent_compaction_margin({"seat-a": zero}),
+            seat_catalog.compaction_margin_error("seat-a", zero))
+        self.assertIsNone(
+            seat_catalog._incoherent_compaction_margin({"seat-a": at}))
+
+    def test_seat_doctor_flags_a_local_seat_whose_effective_window_has_no_margin(self):  # noqa: VACUOUS_ASSERTION — between the two empty readings the planted pin's ONE row is pinned by count, family, sources and 'leaves 0', and the doctor's rc 1 on it precedes the rc 0
+        """`helm seat doctor` reads each minted local seat's EFFECTIVE window
+        and output cap and flags one that leaves less than
+        LOCAL_COMPACTION_MARGIN of its server slot. It is read-only.
+
+        EFFECTIVE, because a settings.json `env` pin outranks the launch
+        stamp (the envtidy arm pins that precedence). The arms: the catalog's
+        own mint passes; a settings.json pin that puts back the measured shape
+        is flagged, names the file it came from, and fails the doctor's exit
+        status; the doctor leaves both files byte-identical; and removing the
+        pin clears the flag."""
+        from helm import autocompact
+        family = self._LOCAL_CUDA_FAMILY
+        fam = seat.FAMILIES[family]
+        _configure_endpoints({family: self._LOCAL_CUDA_ENDPOINT})
+        rc, _out, err = self._add(("add", family))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(seat_health._window_margin_lines(), [])
+        cdir = os.path.join(seat.seat_dir(family), "claude")
+        settings = os.path.join(cdir, "settings.json")
+        launch = os.path.join(seat.seat_dir(family), "launch.sh")
+        with open(settings) as f:
+            kept = json.load(f)
+        # the lite profile pins both numbers in settings.json (task/3253);
+        # the output pin comes out here so each number keeps its own source
+        env = dict(kept.get("env") or {})
+        env.pop("CLAUDE_CODE_MAX_OUTPUT_TOKENS", None)
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(
+            fam["probed_context_length"] - fam["max_output_tokens"])
+        pinned = dict(kept, env=env)
+        with open(settings, "w") as f:
+            json.dump(pinned, f)
+        def raw(path):
+            with open(path, "rb") as f:
+                return f.read()
+
+        before = {p: raw(p) for p in (settings, launch)}
+        lines = seat_health._window_margin_lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn(family, lines[0])
+        # each number's own source, not the bare filename: the cure clause
+        # names settings.json on every NO MARGIN line, so that alone would
+        # pass a line that credited the pinned window to launch.sh
+        self.assertIn("window from settings.json, output cap from launch.sh",
+                      lines[0])
+        self.assertIn("leaves 0 ", lines[0])
+
+        def doctor():
+            out = io.StringIO()
+            with mock.patch.object(seat_health, "_proxy_bin",
+                                   return_value="/nonexistent/proxy"), \
+                    mock.patch.object(
+                        seat_health, "_proxy_binary_probe",
+                        return_value=(True, "", "CLIProxyAPI Version: test")), \
+                    mock.patch.object(seat_health.shutil, "which",
+                                      return_value="/usr/bin/claude"), \
+                    mock.patch.object(seat_health, "codex_cred_state",
+                                      return_value=("valid", None, "fixture")), \
+                    mock.patch.object(seat_health, "_status"), \
+                    mock.patch.object(seat_health, "_running_pid",
+                                      return_value=None), \
+                    mock.patch.object(seat_health, "_config_drift_lines",
+                                      return_value=[]), \
+                    mock.patch.object(autocompact, "report_lines",
+                                      return_value=[]), \
+                    contextlib.redirect_stdout(out):
+                return seat_health._doctor([]), out.getvalue()
+
+        rc, text = doctor()
+        self.assertEqual(rc, 1)
+        self.assertIn(lines[0], text)
+        self.assertEqual(before, {p: raw(p) for p in (settings, launch)})
+        with open(settings, "w") as f:
+            json.dump(kept, f)
+        self.assertEqual(seat_health._window_margin_lines(), [])
+        rc, text = doctor()
+        self.assertEqual(rc, 0, text)
+
+    # -- the lite launch profile (task/3253) ---------------------------------
+    # ONE table (seat_catalog PROFILES) says what `"profile": "lite"` means,
+    # and every surface reads its switch there: the deny set, the MCP floor,
+    # the settings.json env pins and claudeMdExcludes. These arms SWEEP every
+    # family the catalog declares lite, never a literal tuple, so a family
+    # that opts in later is measured the day it does, and they judge each
+    # surface against the catalog's DECLARATIONS (its tool constants, the
+    # launch stamp), never against denied_tools or profile_env, the doors
+    # under test.
+
+    def _lite_families(self):
+        """Every lite family, read through the predicate the surfaces use.
+        NOT VACUOUS: v1 of the profile is the local seam, so every family
+        served from the operator's own box must be in it, and a predicate
+        that matched nothing fails here."""
+        lite = sorted(f for f in seat.FAMILIES if seat_catalog.lite(f))
+        local = [f for f, fam in seat.FAMILIES.items()
+                 if seat_catalog.own_box(fam)]
+        self.assertTrue(local)
+        for family in local:
+            self.assertIn(family, lite)
+        return lite
+
+    def _mint_lite(self):
+        """Mint every lite family under a planted canonical MCP set of two
+        servers (the floor and one above it); -> (families, canon path).
+        Each family's endpoint key is its default pool row's own
+        `base_url_from`, read off the catalog."""
+        lite = self._lite_families()
+        table = {}
+        for i, family in enumerate(lite):
+            fam = seat.FAMILIES[family]
+            row = (fam.get("pool_providers") or {}).get(fam.get("pool_default"))
+            if isinstance(row, dict) and row.get("base_url_from"):
+                table[row["base_url_from"]] = "http://192.0.2.%d:8081/v1" % (20 + i)
+        _configure_endpoints(table)
+        canon = os.path.join(self.tmp, "mcps-canonical.json")
+        with open(canon, "w") as f:
+            json.dump({"exa": {"command": "exa"},
+                       "alpha-mcp": {"command": "alpha"}}, f)
+        os.chmod(canon, 0o600)
+        with mock.patch.dict(os.environ, {"HELM_MCPS_CANONICAL": canon}):
+            for family in lite:
+                rc, _out, err = self._add(("add", family))
+                self.assertEqual(rc, 0, (family, err))
+        return lite, canon
+
+    @staticmethod
+    def _stamp(argv, name):
+        """The one value launch.sh's argv gives `name`, or None."""
+        found = {a.split("=", 1)[1] for a in argv if a.startswith(name + "=")}
+        return found.pop() if len(found) == 1 else None
+
+    def test_every_lite_family_mints_its_profile_on_every_surface(self):  # noqa: VACUOUS_ASSERTION — _lite_families asserts a non-empty sweep holding every own-box family and _mint_lite asserts each add's rc 0 before the loop; in each iteration the superset and equality presences on settings.json and argv precede the Workflow and cap absences
+        """A fresh mint of EVERY lite family, read back off the files the
+        seat runs from:
+          * DENY — settings.json and launch.sh's argv both carry a SUPERSET
+            of plan entry, the family's own context, push and unserved sets
+            (task/3242: WebSearch), the spawn pair and LITE_UNUSED_TOOLS. A
+            superset, so a later measured deny passes without editing this
+            arm. Workflow goes unless the family declares a same-family
+            delegate tier (task/2559 reconciled), and its cap goes with it:
+            no cap word on the line and no cap in settings.json.
+          * ENV PINS — settings.json carries the very numbers launch.sh
+            stamps for both window knobs and the output cap, those numbers
+            are the catalog's taught window and output cap, the family's
+            lite_env rides beside them, and the effective reading (a settings
+            pin outranks the stamp) is therefore the stamp.
+          * EXCLUDES — claudeMdExcludes names the default home's CLAUDE.md
+            on a mint that knows no workdir.
+          * RECORDS — helm's key names exactly what this seeder wrote.
+          * MCP FLOOR — the seat is given the floor and nothing above it."""
+        from helm import envtidy
+        lite, _canon = self._mint_lite()
+        home_md = os.path.join(os.path.expanduser("~"), ".claude", "CLAUDE.md")
+        for family in lite:
+            with self.subTest(family=family):
+                fam = seat.FAMILIES[family]
+                d = seat.seat_dir(family)
+                cdir = os.path.join(d, "claude")
+                with open(os.path.join(cdir, "settings.json")) as f:
+                    got = json.load(f)
+                with open(os.path.join(d, "launch.sh")) as f:
+                    argv = ProxySeatCannotSpawnThroughASkill.child_argv(f.read())
+                tiered = bool(fam.get("subagent_tiers"))
+                want = {seat.PLAN_ENTRY_TOOL}
+                for key in ("context_denied_tools", "push_denied_tools",
+                            "unserved_tools"):
+                    want.update(fam.get(key, ()))
+                want.update(seat_catalog.SPAWN_DENIED_TOOLS)
+                want.update(t for t in seat_catalog.LITE_UNUSED_TOOLS
+                            if not (tiered and t == "Workflow"))
+                deny = got["permissions"]["deny"]
+                denied = argv[argv.index("--disallowedTools") + 1:
+                              argv.index("--dangerously-skip-permissions")]
+                self.assertLessEqual(want, set(deny))
+                self.assertLessEqual(want, set(denied))
+                self.assertEqual("Workflow" in deny, not tiered)
+                self.assertEqual("Workflow" in denied, not tiered)
+                cap = seat_catalog.WORKFLOW_CAP_VAR
+                self.assertEqual(self._stamp(argv, cap) is not None, tiered)
+                self.assertEqual(cap in got["env"], tiered)
+                # the pins ARE the stamps, and the stamps are the catalog's
+                env = got["env"]
+                knobs = ("CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+                         "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                         "CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+                for name in knobs:
+                    self.assertIsNotNone(self._stamp(argv, name), name)
+                    self.assertEqual(env[name], self._stamp(argv, name), name)
+                self.assertEqual(env[knobs[0]], str(seat_catalog.taught_window(
+                    fam, fam["max_context"])))
+                self.assertEqual(env[knobs[2]], str(fam["max_output_tokens"]))
+                for name, value in (fam.get("lite_env") or {}).items():
+                    self.assertEqual(env[name], str(value), name)
+                self.assertEqual(envtidy.seat_stamp(cdir, knobs[0]),
+                                 (int(self._stamp(argv, knobs[0])),
+                                  "settings.json"))
+                # the excludes, and the records of what helm wrote
+                self.assertIn(home_md, got["claudeMdExcludes"])
+                self.assertEqual(got["helm"]["seeded_excludes"],
+                                 got["claudeMdExcludes"])
+                self.assertEqual(got["helm"]["seeded_env"],
+                                 {k: env[k] for k in knobs
+                                  + tuple(fam.get("lite_env") or ())})
+                # the MCP floor, and nothing above it
+                with open(os.path.join(cdir, ".claude.json")) as f:
+                    servers = json.load(f).get("mcpServers") or {}
+                self.assertEqual(sorted(servers), sorted(envtidy.MCP_FLOOR))
+        # CONTROL: a proxy family with no profile carries none of it, and
+        # keeps its capped Workflow
+        plain = os.path.join(self.tmp, "cfg-kimi")
+        os.makedirs(plain)
+        seat._seed_seat_settings(plain, "kimi")
+        with open(os.path.join(plain, "settings.json")) as f:
+            kimi = json.load(f)
+        self.assertNotIn("claudeMdExcludes", kimi)
+        self.assertEqual(sorted(kimi["helm"]), ["seeded_denies"])
+        self.assertEqual(kimi["env"], {seat_catalog.WORKFLOW_CAP_VAR: "4"})
+        self.assertIn("Skill", kimi["permissions"]["deny"])
+        self.assertNotIn("Workflow", kimi["permissions"]["deny"])
+
+    def test_a_lite_seats_excludes_name_every_rule_file_above_its_project(self):
+        """claudeMdExcludes is DERIVED, never a literal: the default home's
+        CLAUDE.md always, and with a known workdir every memory file Claude
+        Code reads (CLAUDE.md, .claude/CLAUDE.md, CLAUDE.local.md) of every
+        directory ABOVE the workdir's git top level, up to and not including
+        the filesystem root. The project's own files, at its top level and
+        below it, are never named: the workdir here is a subdirectory, so a
+        derivation that started from the cwd instead of the top level would
+        name the project's own CLAUDE.md and fail. ADDITIVE: an operator's
+        entry keeps its place, and a later seed that knows no workdir keeps
+        what the earlier one wrote. Recorded under helm's key. The control
+        is a family with no profile: no excludes, no record."""
+        family = self._lite_families()[0]
+        base = os.path.realpath(self.tmp)
+        estate = os.path.join(base, "estate")
+        project = os.path.join(estate, "project")
+        sub = os.path.join(project, "sub")
+        os.makedirs(sub)
+        subprocess.run(["git", "init", "-q", project], check=True,
+                       capture_output=True)
+        own = os.path.join(base, "operator-own", "CLAUDE.md")
+        cdir = os.path.join(base, "cfg")
+        os.makedirs(cdir)
+        settings = os.path.join(cdir, "settings.json")
+        with open(settings, "w") as f:
+            json.dump({"claudeMdExcludes": [own]}, f)
+        seat._seed_seat_settings(cdir, family, workdir=sub)
+        with open(settings) as f:
+            got = json.load(f)
+        excl = got["claudeMdExcludes"]
+        self.assertEqual(excl[0], own)                        # kept in place
+        self.assertIn(os.path.join(os.path.expanduser("~"), ".claude",
+                                   "CLAUDE.md"), excl)
+        names = ("CLAUDE.md", os.path.join(".claude", "CLAUDE.md"),
+                 "CLAUDE.local.md")
+        above = os.path.dirname(project)
+        while above != os.path.dirname(above):
+            for name in names:
+                self.assertIn(os.path.join(above, name), excl)
+            above = os.path.dirname(above)
+        for name in names:
+            self.assertNotIn(os.path.join(above, name), excl)  # the root
+            for mine in (project, sub):
+                self.assertNotIn(os.path.join(mine, name), excl)
+        self.assertEqual(got["helm"]["seeded_excludes"], excl[1:])
+        # a seed that knows no workdir (a mint, a pasted launch) keeps them
+        seat._seed_seat_settings(cdir, family)
+        with open(settings) as f:
+            self.assertEqual(json.load(f)["claudeMdExcludes"], excl)
+        # CONTROL: no profile, no excludes and no record
+        plain = os.path.join(base, "cfg-plain")
+        os.makedirs(plain)
+        seat._seed_seat_settings(plain, "kimi", workdir=sub)
+        with open(os.path.join(plain, "settings.json")) as f:
+            got = json.load(f)
+        self.assertNotIn("claudeMdExcludes", got)
+        self.assertEqual(sorted(got["helm"]), ["seeded_denies"])
+
+    def test_a_lite_seats_env_pins_follow_the_stamp_and_record_only_helms(self):
+        """THE PIN RULE (seat_catalog pin_action), each leg on one seed:
+          * an operator's pin ABOVE the catalog (the task/3184 wedge's own
+            number) is lowered to the catalog's, the safe direction, and is
+            then helm's, recorded with the value helm wrote;
+          * an absent pin is written and recorded;
+          * an operator's pin already AT the catalog's value is left alone
+            and NOT recorded as helm's;
+          * an operator's other key survives;
+          * a second seed is at rest (no write at all).
+        The record maps each pin helm wrote to the value it wrote."""
+        family = self._lite_families()[0]
+        fam = seat.FAMILIES[family]
+        window = str(seat_catalog.taught_window(fam, fam["max_context"]))
+        output = str(fam["max_output_tokens"])
+        cdir = os.path.join(self.tmp, "cfg-env")
+        os.makedirs(cdir)
+        p = os.path.join(cdir, "settings.json")
+        with open(p, "w") as f:
+            json.dump({"env": {"KEEP": "1",
+                               "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "229376",
+                               "CLAUDE_CODE_MAX_OUTPUT_TOKENS": output}}, f)
+        seat._seed_seat_settings(cdir, family)
+        with open(p) as f:
+            got = json.load(f)
+        self.assertEqual(got["env"]["KEEP"], "1")
+        self.assertEqual(got["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], window)
+        self.assertEqual(got["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], window)
+        self.assertEqual(got["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], output)
+        self.assertEqual(got["helm"]["seeded_env"], dict(
+            [("CLAUDE_CODE_MAX_CONTEXT_TOKENS", window),
+             ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window)]
+            + [(k, str(v)) for k, v in (fam.get("lite_env") or {}).items()]))
+        st = os.stat(p)
+        seat._seed_seat_settings(cdir, family)
+        self.assertEqual((os.stat(p).st_mtime_ns, os.stat(p).st_ino),
+                         (st.st_mtime_ns, st.st_ino))
+
+    def test_a_reseed_never_raises_an_operators_lower_pin(self):  # noqa: VACUOUS_ASSERTION — the written output pin is asserted before the kept window pins, and the hand-lowered cap's kept value before its absence from the record
+        """The task/3184 recovery shape: the catalog's window is a reading with an expiry, stale-HIGH until a lane
+        lands, and the operator of the box hot-fixes the live seat with a
+        LOWER settings.json pin. A re-seed (every `seat resume`, every reboot
+        `resume --all`) must never raise it back, or the seat re-wedges at
+        the slot edge. So an operator's pin below the catalog is KEPT, on
+        the window knobs and the output caps alike, and is not recorded as
+        helm's; the seed is then at rest. A HIGHER operator pin is still
+        lowered (the arm above). The positive control: the seeder ran on
+        this very file and wrote the pin it lacked."""
+        family = self._lite_families()[0]
+        fam = seat.FAMILIES[family]
+        window = seat_catalog.taught_window(fam, fam["max_context"])
+        low = str(window - 16384)
+        cap = str(fam["max_output_tokens"] - 1024)
+        cdir = os.path.join(self.tmp, "cfg-hotfix")
+        os.makedirs(cdir)
+        p = os.path.join(cdir, "settings.json")
+        with open(p, "w") as f:
+            json.dump({"env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": low,
+                               "CLAUDE_CODE_AUTO_COMPACT_WINDOW": low}}, f)
+        seat._seed_seat_settings(cdir, family)
+        with open(p) as f:
+            got = json.load(f)
+        self.assertEqual(got["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"],
+                         str(fam["max_output_tokens"]))
+        self.assertEqual(got["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], low)
+        self.assertEqual(got["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], low)
+        self.assertEqual(sorted(got["helm"]["seeded_env"]), sorted(
+            ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] + list(fam.get("lite_env") or ())))
+        st = os.stat(p)
+        seat._seed_seat_settings(cdir, family)
+        self.assertEqual((os.stat(p).st_mtime_ns, os.stat(p).st_ino),
+                         (st.st_mtime_ns, st.st_ino))
+        # a pin helm wrote and the operator then LOWERED by hand is the
+        # operator's from that edit on: kept, and it leaves helm's record
+        got["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = cap
+        with open(p, "w") as f:
+            json.dump(got, f)
+        seat._seed_seat_settings(cdir, family)
+        with open(p) as f:
+            again = json.load(f)
+        self.assertEqual(again["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], cap)
+        self.assertNotIn("CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+                         again["helm"]["seeded_env"])
+
+    def test_helms_own_pin_follows_the_catalog_both_ways(self):  # noqa: VACUOUS_ASSERTION — both arms assert the pin's value by equality (raised vs kept) before the record membership equality, and the arm tuple is a literal of two
+        """A pin helm's record names AT ITS CURRENT VALUE is helm's own: it
+        follows the catalog down and UP, so a catalog that moved raises the
+        pin helm wrote under the old number. The control on the same seed:
+        the same number with no record is the operator's and is kept."""
+        family = self._lite_families()[0]
+        fam = seat.FAMILIES[family]
+        window = str(seat_catalog.taught_window(fam, fam["max_context"]))
+        old = str(int(window) - 16384)
+        for record, want in (({"CLAUDE_CODE_MAX_CONTEXT_TOKENS": old}, window),
+                             ({}, old)):
+            with self.subTest(recorded=bool(record)):
+                cdir = tempfile.mkdtemp(dir=self.tmp)
+                p = os.path.join(cdir, "settings.json")
+                with open(p, "w") as f:
+                    json.dump({"env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": old},
+                               "helm": {"seeded_env": record}}, f)
+                seat._seed_seat_settings(cdir, family)
+                with open(p) as f:
+                    got = json.load(f)
+                self.assertEqual(
+                    got["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], want)
+                self.assertEqual(
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS" in got["helm"]["seeded_env"],
+                    bool(record))
+
+    def test_every_profile_refusal_is_driven(self):  # noqa: VACUOUS_ASSERTION — two coherent tables are asserted to pass unconditionally, and each refusal is an assertIn of its reason over a literal table of seven, never an absence
+        """The refusals profile_error names, each driven through the real
+        predicate on a planted table (the `table` door _incoherent_profile
+        was given for exactly this), beside coherent tables that pass.
+        Without this arm every refusal can be deleted and the suite stays
+        green: the import-time assert only ever reads the live table, which
+        passes."""
+        ok = {"mode": "proxy-key", "profile": "lite",
+              "lite_env": {"BASH_MAX_OUTPUT_LENGTH": 20000}}
+        self.assertIsNone(seat_catalog._incoherent_profile({"f": ok}))
+        self.assertIsNone(seat_catalog._incoherent_profile(
+            {"f": {"mode": "proxy-key"}}))
+        for bad, word in (
+                ({"profile": "lyte"}, "PROFILES does not define"),
+                ({"lite_env": {"X": 1}}, "pins no env"),
+                ({"profile": "lite", "lite_env": ["X"]}, "must be a map"),
+                ({"profile": "lite",
+                  "lite_env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": 1}},
+                 "derives from"),
+                ({"profile": "lite", "lite_env": {"X": 0}}, "positive count"),
+                ({"profile": "lite", "lite_env": {"X": True}}, "positive count"),
+                ({"profile": "lite", "lite_env": {"X": "8000"}},
+                 "positive count")):
+            with self.subTest(bad=bad):
+                self.assertIn(word,
+                              seat_catalog._incoherent_profile({"f": bad}) or "")
+
+    def test_a_seed_in_the_project_drops_helms_exclude_of_its_own_rules(self):
+        """A harness room (`<root>/.claude/worktrees/<x>`, a registered
+        linked worktree the spawn door admits) has its git top level INSIDE
+        the main checkout, so a seed there names the checkout's own
+        CLAUDE.md, correctly for that session. The entries are additive, so
+        when the same seat is later seeded with the checkout itself as its
+        workdir, helm's own entry must leave: the profile promises the seat
+        reads its project's rules. The operator's entry inside the project
+        stays."""
+        family = self._lite_families()[0]
+        base = os.path.realpath(self.tmp)
+        project = os.path.join(base, "estate", "project")
+        os.makedirs(project)
+
+        def git(*a):
+            subprocess.run(["git", "-C", project, "-c", "user.name=t",
+                            "-c", "user.email=t@t", "-c",
+                            "core.hooksPath=/dev/null"] + list(a),
+                           check=True, capture_output=True)
+        git("init", "-q")
+        with open(os.path.join(project, "CLAUDE.md"), "w") as f:
+            f.write("project rules\n")
+        git("add", "CLAUDE.md")
+        git("commit", "-qm", "init")
+        room = os.path.join(project, ".claude", "worktrees", "agent-x")
+        git("worktree", "add", "-q", "--detach", room)
+        cdir = os.path.join(base, "cfg")
+        os.makedirs(cdir)
+        p = os.path.join(cdir, "settings.json")
+        own = os.path.join(project, "CLAUDE.md")
+        operator = os.path.join(project, "CLAUDE.local.md")
+        with open(p, "w") as f:
+            json.dump({"claudeMdExcludes": [operator]}, f)
+        seat._seed_seat_settings(cdir, family, workdir=room)
+        with open(p) as f:
+            first = json.load(f)["claudeMdExcludes"]
+        # positive control: the room's session excludes the checkout above it
+        self.assertIn(own, first)
+        seat._seed_seat_settings(cdir, family, workdir=project)
+        with open(p) as f:
+            got = json.load(f)
+        self.assertIn(os.path.join(os.path.dirname(project), "CLAUDE.md"),
+                      got["claudeMdExcludes"])
+        self.assertIn(operator, got["claudeMdExcludes"])   # the operator's stays
+        self.assertNotIn(own, got["claudeMdExcludes"])
+        self.assertNotIn(own, got["helm"]["seeded_excludes"])
+
+    def test_a_wanted_entry_inside_the_project_keeps_the_seed_at_rest(self):
+        """The retirement above leaves an entry THIS seed wants again: an
+        authored instructions source that lives inside the repository is
+        named by every seed, and dropping it only to append it again would
+        rewrite settings.json on every resume. Two seeds in the project: the
+        source stays excluded and the second seed writes nothing."""
+        family = self._lite_families()[0]
+        base = os.path.realpath(self.tmp)
+        project = os.path.join(base, "estate2", "project")
+        os.makedirs(project)
+        subprocess.run(["git", "init", "-q", project], check=True,
+                       capture_output=True)
+        source = os.path.join(project, "docs", "GLOBAL.md")
+        os.makedirs(os.path.dirname(source))
+        with open(source, "w") as f:
+            f.write("global rules\n")
+        cdir = os.path.join(base, "cfg2")
+        os.makedirs(cdir)
+        p = os.path.join(cdir, "settings.json")
+        with mock.patch.dict(os.environ,
+                             {"HELM_INSTRUCTIONS_CANONICAL": source}):
+            seat._seed_seat_settings(cdir, family, workdir=project)
+            with open(p) as f:
+                self.assertIn(source, json.load(f)["claudeMdExcludes"])
+            st = os.stat(p)
+            seat._seed_seat_settings(cdir, family, workdir=project)
+        with open(p) as f:
+            self.assertIn(source, json.load(f)["claudeMdExcludes"])
+        self.assertEqual((os.stat(p).st_mtime_ns, os.stat(p).st_ino),
+                         (st.st_mtime_ns, st.st_ino))
+
+    def _seat_doctor(self):
+        """`helm seat doctor` with every probe but the seat rows stubbed:
+        (exit status, printed text)."""
+        from helm import autocompact
+        out = io.StringIO()
+        with mock.patch.object(seat_health, "_proxy_bin",
+                               return_value="/nonexistent/proxy"), \
+                mock.patch.object(
+                    seat_health, "_proxy_binary_probe",
+                    return_value=(True, "", "CLIProxyAPI Version: test")), \
+                mock.patch.object(seat_health.shutil, "which",
+                                  return_value="/usr/bin/claude"), \
+                mock.patch.object(seat_health, "codex_cred_state",
+                                  return_value=("valid", None, "fixture")), \
+                mock.patch.object(seat_health, "_status"), \
+                mock.patch.object(seat_health, "_running_pid",
+                                  return_value=None), \
+                mock.patch.object(seat_health, "_config_drift_lines",
+                                  return_value=[]), \
+                mock.patch.object(autocompact, "report_lines",
+                                  return_value=[]), \
+                contextlib.redirect_stdout(out):
+            return seat_health._doctor([]), out.getvalue()
+
+    def test_seat_doctor_reads_every_lite_seat_against_its_profile(self):  # noqa: VACUOUS_ASSERTION — the OK rows are pinned by equality over the non-empty lite sweep, and the DRIFT row's True and each named difference are asserted before the UNKNOWN row's False
+        """`helm seat doctor` prints one profile row per minted lite seat.
+        The catalog's own mint of every lite family reads OK and passes. On
+        one seat, each hand edit that re-opens what the profile closed is
+        named in ONE DRIFT row that fails the exit status: the global
+        CLAUDE.md dropped from claudeMdExcludes (the regression the owner's
+        seats lived through, when the two big rule files loaded again), the
+        profile's deny entries removed, a stale window pin, and an MCP server
+        above the floor. The doctor writes neither file. An unparseable
+        settings.json reads UNKNOWN and does not fail the exit status.
+        Restoring the files reads OK again."""
+        lite, _canon = self._mint_lite()
+        rows = seat_health._profile_rows()
+        self.assertEqual(rows, [(False, "profile lite: %-9s OK" % f)
+                                for f in lite])
+        rc, text = self._seat_doctor()
+        self.assertEqual(rc, 0, text)
+        family = lite[0]
+        fam = seat.FAMILIES[family]
+        cdir = os.path.join(seat.seat_dir(family), "claude")
+        settings = os.path.join(cdir, "settings.json")
+        state = os.path.join(cdir, ".claude.json")
+
+        def raw(path):
+            with open(path, "rb") as f:
+                return f.read()
+
+        kept = {p: raw(p) for p in (settings, state)}
+        got = json.loads(kept[settings])
+        home_md = os.path.join(os.path.expanduser("~"), ".claude", "CLAUDE.md")
+        got["claudeMdExcludes"] = [x for x in got["claudeMdExcludes"]
+                                   if x != home_md]
+        dropped = [t for t in seat_catalog.LITE_UNUSED_TOOLS
+                   if t in got["permissions"]["deny"]]
+        self.assertTrue(dropped)
+        got["permissions"]["deny"] = [t for t in got["permissions"]["deny"]
+                                      if t not in dropped]
+        got["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "229376"
+        with open(settings, "w") as f:
+            json.dump(got, f)
+        st = json.loads(kept[state])
+        st["mcpServers"] = dict(st.get("mcpServers") or {},
+                                **{"alpha-mcp": {"command": "alpha"}})
+        with open(state, "w") as f:
+            json.dump(st, f)
+        planted = {p: raw(p) for p in (settings, state)}
+        rows = dict((line.split()[2], (failed, line))
+                    for failed, line in seat_health._profile_rows())
+        failed, line = rows[family]
+        self.assertTrue(failed, line)
+        self.assertIn("profile lite: %-9s DRIFT" % family, line)
+        self.assertIn("claudeMdExcludes lacks %s" % home_md, line)
+        self.assertIn("deny lacks %s" % ", ".join(dropped), line)
+        self.assertIn("env CLAUDE_CODE_MAX_CONTEXT_TOKENS is 229376, the "
+                      "catalog says %d" % seat_catalog.taught_window(
+                          fam, fam["max_context"]), line)
+        self.assertIn("MCP servers above the floor (exa): alpha-mcp", line)
+        for other in lite[1:]:
+            self.assertEqual(rows[other],
+                             (False, "profile lite: %-9s OK" % other))
+        rc, text = self._seat_doctor()
+        self.assertEqual(rc, 1)
+        self.assertIn(line, text)
+        self.assertEqual({p: raw(p) for p in (settings, state)}, planted)
+        # an unparseable settings.json is UNKNOWN, loud and not a verdict
+        with open(settings, "w") as f:
+            f.write("{not json")
+        rows = dict((line.split()[2], (failed, line))
+                    for failed, line in seat_health._profile_rows())
+        self.assertEqual(rows[family][0], False)
+        self.assertIn("UNKNOWN", rows[family][1])
+        self.assertIn("settings.json", rows[family][1])
+        # restored, the row reads OK again
+        for p, body in kept.items():
+            with open(p, "wb") as f:
+                f.write(body)
+        self.assertEqual(seat_health._profile_lines(),
+                         ["profile lite: %-9s OK" % f for f in lite])
+        # AN OPERATOR'S PIN BELOW THE CATALOG (the F1 hot-fix shape) is kept
+        # by every resume (pin_action), so it is never DRIFT and never
+        # prescribed a resume: it is named, the row stays OK, and the doctor
+        # passes. Beside a real DRIFT it is its own line.
+        catalog_window = seat_catalog.taught_window(fam, fam["max_context"])
+        low = str(catalog_window - 16384)
+        got = json.loads(kept[settings])
+        got["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = low
+        with open(settings, "w") as f:
+            json.dump(got, f)
+        note = ("operator pin CLAUDE_CODE_MAX_CONTEXT_TOKENS=%s below the "
+                "catalog %d kept; lower the catalog if it is right"
+                % (low, catalog_window))
+        mine = [row for row in seat_health._profile_rows()
+                if row[1].split()[2] == family]
+        self.assertEqual(mine, [(False, "profile lite: %-9s OK, %s"
+                                 % (family, note))])
+        rc, text = self._seat_doctor()
+        self.assertEqual(rc, 0, text)
+        got["permissions"]["deny"] = [t for t in got["permissions"]["deny"]
+                                      if t != dropped[0]]
+        with open(settings, "w") as f:
+            json.dump(got, f)
+        mine = [row for row in seat_health._profile_rows()
+                if row[1].split()[2] == family]
+        self.assertEqual(len(mine), 2, mine)
+        self.assertTrue(mine[0][0])
+        self.assertIn("DRIFT — deny lacks %s (" % dropped[0], mine[0][1])
+        self.assertNotIn("operator pin", mine[0][1])
+        self.assertEqual(mine[1], (False, "profile lite: %-9s %s"
+                                   % (family, note)))
+
     # -- keyless custody: the reconcile's OWN desired state ------------------
     # The mint arm above proves helm WRITES the declared endpoint and
     # placeholder. Reconciliation is the other half and it had no desired state
@@ -949,7 +2018,8 @@ class SeatTest(unittest.TestCase):
         with open(seat.OPENCODE_AUTHSTORE, "w") as f:
             json.dump(store, f)
 
-    def _plant_pool(self, opencode=None, openrouter=None, extra=None):
+    def _plant_pool(self, opencode=None, openrouter=None, extra=None,
+                    deepseek=None):
         """A fake ~/.hermes/auth.json shaped like the real one: a
         credential_pool of provider -> LIST of bearer entries. Defaults plant
         BOTH ds4pro providers with the live bearer at priority 0 (last_status
@@ -966,6 +2036,11 @@ class SeatTest(unittest.TestCase):
                             "label": "OPENROUTER_API_KEY",
                             "last_status": "ok", "priority": 0,
                             "auth_type": "api_key"}],
+            "deepseek": [{"access_token": deepseek or self._LIVE,
+                          "base_url": "https://api.deepseek.com/v1",
+                          "label": "DEEPSEEK_API_KEY",
+                          "last_status": "ok", "priority": 0,
+                          "auth_type": "api_key"}],
         }
         for prov, entries in (extra or {}).items():
             pool.setdefault(prov, []).extend(entries)
@@ -1004,8 +2079,9 @@ class SeatTest(unittest.TestCase):
         # whose number nothing had checked. Uniqueness is not headroom, twice
         # over now. 8400 is also the HIGHEST base the table admits: the
         # project-instance block starts at 8500 and `_project_port_block_is_clear`
-        # demands 100 clear below it, so the next family belongs in the
-        # unclaimed 8319-8349 gap rather than above this one.
+        # demands 100 clear below it, so the next family belonged in the
+        # unclaimed 8319-8349 gap rather than above this one, until that gap
+        # was spent (the residue set at the end of this arm is now empty).
         # ds4flash owns 8330-8344, drawn from the unclaimed 8319-8349 gap this
         # comment already names as where the next family belongs — above
         # kimi's 8318 and clear of ds4pro's 8350 floor. Uniqueness is not
@@ -1045,7 +2121,13 @@ class SeatTest(unittest.TestCase):
         # and moving it must show up here; and the side of the codex base it
         # is on, because that is the property and the number is its instance.
         self.assertEqual(ports["dots3"], 8316)  # noqa: SEAT_NAME — the configured family's port IS the subject, exactly as the arms above
-        self.assertLess(ports["dots3"], min(p for f, p in ports.items() if f != "dots3"))  # noqa: SEAT_NAME — the configured family's port IS the subject
+        # cursor takes the next port down for the same reason, and the pair
+        # are the only bases under codex's: the property is the side of the
+        # codex base, and the two numbers are its instances.
+        self.assertEqual(ports["cursor"], 8315)  # noqa: SEAT_NAME — the configured family's port IS the subject
+        self.assertEqual(sorted(f for f, p in ports.items()
+                                if p < ports["codex"]),
+                         ["cursor", "dots3"])  # noqa: SEAT_NAME — catalog FAMILY keys, and the set under the codex base IS the subject
         # THE TWO ANTIGRAVITY-GROUP FAMILIES GET A PORT EACH AND NO BAND, for
         # the reason the local family's arm above states and this table now
         # applies uniformly: headroom exists to hold room for base+N, and the
@@ -1059,7 +2141,19 @@ class SeatTest(unittest.TestCase):
         # codex's own base+N range grows into.
         self.assertEqual(ports["opus46"], 8346)  # noqa: SEAT_NAME — the configured family's port IS the subject, exactly as the grok and gemini arms above
         self.assertEqual(ports["gptoss"], 8348)  # noqa: SEAT_NAME — the configured family's port IS the subject
-        for family in ("opus46", "gptoss", "qwen27", "dots3"):  # noqa: SEAT_NAME — catalog FAMILY keys, and the set of single-socket families IS this arm's subject
+        # qwenlocal TAKES 8347, the lower of the two residue ports the set
+        # below names as free. A socket census on this host found nothing
+        # listening there, and the port sits outside every band above. codex-30
+        # derives it, and `_numbered_port_collision` refuses that instance
+        # because 8347 is now a declared port. The derivation sweep below
+        # proves that for the whole catalog.
+        self.assertEqual(ports["qwenlocal"], 8347)  # noqa: SEAT_NAME — the configured family's port IS the subject
+        # bonsai TAKES 8349, the other residue port, by the same census: no
+        # listener there, outside every band. codex-32 derives it and is
+        # refused by name, as codex-30 is for 8347.
+        self.assertEqual(ports["bonsai"], 8349)  # noqa: SEAT_NAME — the configured family's port IS the subject
+        for family in ("opus46", "gptoss", "qwen27", "dots3", "qwenlocal",
+                       "bonsai", "cursor"):  # noqa: SEAT_NAME — catalog FAMILY keys, and the set of single-socket families IS this arm's subject
             self.assertIn("mode=proxy",
                           seat._instance_gate(family, "%s-2" % family),
                           "%s mints numbered instances, so a one-port band "
@@ -1075,10 +2169,13 @@ class SeatTest(unittest.TestCase):
         # table had not yet spent. `_project_port_block_is_clear` caps a base
         # at PROJECT_PORT_BASE - 100, so the whole range is bounded above;
         # this names every band inside it and then says what remains.
-        bands = {"dots3": (8316, 8316), "codex": (8317, 8317),
+        bands = {"cursor": (8315, 8315),
+                 "dots3": (8316, 8316), "codex": (8317, 8317),
                  "kimi": (8318, 8318), "ds4flash": (8330, 8344),
                  "qwen27": (8345, 8345), "opus46": (8346, 8346),
-                 "gptoss": (8348, 8348), "ds4pro": (8350, 8370),
+                 "qwenlocal": (8347, 8347),
+                 "gptoss": (8348, 8348), "bonsai": (8349, 8349),
+                 "ds4pro": (8350, 8370),
                  "grok": (8371, 8385), "gemini": (8386, 8399),
                  "openrouter": (8400, 8414)}  # noqa: SEAT_NAME — catalog FAMILY keys, and the map from family to band IS this arm's subject
         self.assertEqual(set(bands), set(ports),
@@ -1108,19 +2205,19 @@ class SeatTest(unittest.TestCase):
         # while the lowest base WAS 8317, and a family declared below it would
         # have sat outside the sweep entirely — which is exactly where the
         # single-socket family beneath the codex base now lives.
-        self.assertLessEqual(
+        self.assertEqual(
             {p for p in range(min(ports.values()), cap + 1)
              if p not in claimed},
-            {8347, 8349},
+            set(),
             "a port below the family-base cap is unclaimed and unexplained: "
             "assign it or say whose it is, rather than leaving the next "
             "family to rediscover the gap")
-        # 8347 AND 8349 ARE THE WHOLE RESIDUE and they are free, not
-        # forgotten: they are the odd numbers between the two antigravity
-        # sockets, left over because neither of those families reserves the
-        # number above its base. A subset bound rather than an equality,
-        # because the next family to take one of them must go red HERE — on
-        # the line that says what is left — and not on the compose.
+        # THE RESIDUE IS SPENT. 8347 and 8349 were the two odd numbers beside
+        # the antigravity sockets; qwenlocal took 8347 and bonsai took 8349.
+        # Every port from the lowest base to the cap is now a base, a band or
+        # codex's growth, so the next single-socket family has no free port
+        # here: it must take one out of a band a socket census shows unused,
+        # and shrink that band on this map in the same commit.
 
 
     # A DECLARED PORT AND A DERIVED ONE ARE THE SAME NAMESPACE, and the arm
@@ -1196,7 +2293,10 @@ class SeatTest(unittest.TestCase):
         colliding = sorted(port - base for port in declared
                            if port > base + 1
                            and port < seat.PROJECT_PORT_BASE)
-        self.assertEqual(colliding, [13, 28, 29, 31, 43, 63, 73, 83])
+        # 30 is qwenlocal's 8347 and 32 is bonsai's 8349: this line went red
+        # when each family was declared, which is what the docstring promises
+        # of a new port.
+        self.assertEqual(colliding, [13, 28, 29, 30, 31, 32, 43, 63, 73, 83])
         for n in colliding:
             name = "codex-%d" % n
             why = seat._instance_endpoint_error("codex", name)
@@ -1249,7 +2349,7 @@ class SeatTest(unittest.TestCase):
                       seat._numbered_port_reservations_are_disjoint(shared))
 
     # The one number in this table whose ERROR DIRECTION is not symmetric.
-    CODEX_TOTAL_WINDOW = 272000     # gpt-6-astra's total, input + output (the default)
+    CODEX_TOTAL_WINDOW = 272000     # gpt-6.1-sol and previous default gpt-6-sol total
     SOL_TOTAL_WINDOW = 372000       # gpt-5.6-sol's total; the wedge below was measured on sol
     CODEX_SEAT_MAX_TOKENS = 32000   # output the seats request
     CC_RESERVE = 20000              # what CC holds back for itself
@@ -1303,6 +2403,54 @@ class SeatTest(unittest.TestCase):
                              - self.CC_RESERVE)
         self.assertGreater(got, seat.FAMILIES["codex"]["max_context"],
                            "sol's window is larger than astra's by the catalogue")
+
+    def test_gpt61_sol_is_the_default_and_gpt6_sol_is_its_probe_fallback(self):
+        """The Codex rotation is one bounded two-model declaration:
+        new gpt-6.1-sol is the pane and worker default, old gpt-6-sol remains
+        probed as the fallback, and both use the independently measured Codex
+        CLI 0.159.2 272k route window's safe 220k input ceiling."""
+        from helm import seat_catalog as c
+        fam = seat.FAMILIES["codex"]
+        self.assertEqual(c.CODEX_MODEL_RULING["model"], "gpt-6.1-sol")
+        self.assertEqual(fam["model"], "gpt-6.1-sol")
+        self.assertEqual(fam["probe_models"], ("gpt-6.1-sol", "gpt-6-sol"))
+        self.assertEqual(fam["probe_models"],
+                         (c.CODEX_MODEL_RULING["model"],
+                          c.CODEX_MODEL_RULING["fallback"]))
+        # the owner's own sentence (19:04 PDT), never the brief's paraphrase,
+        # and the store id of the ruling this one replaces
+        self.assertIn("sol 6.1 is out now", c.CODEX_MODEL_RULING["verbatim"])
+        self.assertEqual(c.CODEX_MODEL_RULING["supersedes"],
+                         "codex-runs-gpt-6-sol-everywhere")
+        self.assertEqual(set(fam["subagent_tiers"].values()), {"gpt-6.1-sol"})
+        ceiling = (self.CODEX_TOTAL_WINDOW - self.CODEX_SEAT_MAX_TOKENS
+                   - self.CC_RESERVE)
+        windows = fam["model_context"]
+        for model in fam["probe_models"]:
+            with self.subTest(model=model):
+                published = c.PUBLISHED_ROUTE_WINDOWS[("codex", model)]
+                self.assertEqual(published["context_length"],
+                                 self.CODEX_TOTAL_WINDOW)
+                self.assertIn("272000", published["source"])
+                self.assertIn("872000", published["source"])
+                self.assertEqual(windows[model], ceiling)
+        self.assertIn("Codex CLI 0.159.2",
+                      c.PUBLISHED_ROUTE_WINDOWS[("codex", "gpt-6.1-sol")]["source"])
+        # the plan sections in `route` come from models.json, so cite it
+        self.assertIn("models.json",
+                      c.PUBLISHED_ROUTE_WINDOWS[("codex", "gpt-6.1-sol")]["source"])
+        self.assertEqual(fam["max_context"], ceiling)
+        from helm.seat_launch_assets import launch_line
+        default = launch_line("codex")
+        self.assertIn("--model gpt-6.1-sol", default)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d " % ceiling, default)
+        fallback = launch_line("codex", model="gpt-6-sol")
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d " % ceiling, fallback)
+        # CONTROL on the same resolver: a 5.6-sol pane still reads its own
+        # larger window, so the equality above is not a resolver that answers
+        # one number for every codex model.
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=320000 ",
+                      launch_line("codex", model="gpt-5.6-sol"))
 
     def test_codex_max_context_is_an_input_ceiling_not_the_total_window(self):
         """max_context must leave room for the output that shares the window.
@@ -1362,30 +2510,24 @@ class SeatTest(unittest.TestCase):
         # two legible apart.
         self.assertNotIn("owner_stated_window", fam)
         self.assertIn("owner_stated_window", seat.FAMILIES["gemini"])
-        # multi-provider: opencode-go is the owner's long-term default, and
-        # every row carries the REAL model id that provider's own /models
-        # advertises, plus the cost RUNG, which is what lets a surface say
-        # free or paid without guessing from a name.
+        # ONE TOKEN SOURCE PER SEAT: the DeepSeek direct key is this
+        # family's only route, carries the REAL model id the vendor's own
+        # /models advertises plus the cost RUNG, and is OFF-PEAK-ONLY through
+        # the declared billing window. The flat OpenCode Go subscription and
+        # the flash model are the ds4flash family, asserted below.
         #
-        # THE POOL SERVES ONE MODEL, and the flash route is NOT in it. A pool
-        # is one model across vendors; a second, weaker model here resolved to
-        # THIS family and carried its approval identity, which is the identity
-        # collapse the split cured. Its own family is asserted below.
-        self.assertEqual(fam["pool_default"], "opencode-go")
-        self.assertEqual(fam["pool_providers"]["opencode-go"],
-                         {"base_url": "https://opencode.ai/zen/go/v1",
-                          "upstream_model": "deepseek-v4-pro",
-                          "rung": "free",
-                          "authstore": "opencode-go"})
         # native DeepSeek: the owner-facing selector stays `deepseek`, while the
         # proxy's loaded provider identity is `deepseek-direct`; /v1 is part of
         # the exact endpoint tuple proved at runtime.
+        self.assertEqual(fam["pool_default"], "deepseek")
+        self.assertEqual(set(fam["pool_providers"]), {"deepseek"})
         self.assertEqual(fam["pool_providers"]["deepseek"],
                          {"proxy_provider": "deepseek-direct",
                           "base_url": "https://api.deepseek.com/v1",
                           "upstream_model": "deepseek-v4-pro",
                           "rung": "paid",
-                          "authstore": "deepseek"})
+                          "authstore": "deepseek",
+                          "billing_window": seat_catalog.DEEPSEEK_BILLING_WINDOW})
         direct = {"alias": "ds4-pro", "provider": "deepseek-direct",
                   "upstream_model": "deepseek-v4-pro",
                   "base_url": "https://api.deepseek.com/v1"}
@@ -1397,14 +2539,19 @@ class SeatTest(unittest.TestCase):
                          {"deepseek-v4-pro"},
                          "a pool is ONE model offered by several vendors")
         flash = seat.FAMILIES["ds4flash"]
-        self.assertEqual(flash["pool_providers"]["openrouter"],  # noqa: SEAT_NAME — the catalog's own provider block name, which this row IS
-                         {"base_url": "https://openrouter.ai/api/v1",
-                          "upstream_model": "deepseek/deepseek-v4-flash",
-                          "rung": "paid",
-                          "authstore": "openrouter"})
-        flash_route = {"alias": "deepseek-v4-flash", "provider": "openrouter",  # noqa: SEAT_NAME — the provider block the route names
-                       "upstream_model": "deepseek/deepseek-v4-flash",
-                       "base_url": "https://openrouter.ai/api/v1"}
+        self.assertEqual(flash["pool_default"], "opencode-go")
+        self.assertEqual(flash["pool_providers"],
+                         {"opencode-go": {
+                             "base_url": "https://opencode.ai/zen/go/v1",
+                             "upstream_model": "deepseek-v4.1-flash",
+                             "rung": "free",
+                             "authstore": "opencode-go",
+                             # OpenCode bills the Go subscription (task/3461)
+                             "vendor": "opencode"}})
+        self.assertNotIn("money_reader", flash)
+        flash_route = {"alias": "deepseek-v4-flash", "provider": "opencode-go",
+                       "upstream_model": "deepseek-v4.1-flash",
+                       "base_url": "https://opencode.ai/zen/go/v1"}
         self.assertEqual(seat.proxy_route_family(flash_route),
                          ("ds4flash", None))
         self.assertNotEqual(seat.proxy_route_family(flash_route)[0], "ds4pro")  # noqa: SEAT_NAME — configured family identity is the property under test
@@ -1562,16 +2709,16 @@ class SeatTest(unittest.TestCase):
         self._plant_pool()          # hermes _LIVE also present
         rc, out, err = self._add(("add", "ds4pro"))
         self.assertEqual(rc, 0, err)
-        self.assertNotIn(self._AS_OC, out + err)   # secret: never printed
+        self.assertNotIn(self._AS_DS, out + err)   # secret: never printed
         self.assertNotIn(self._LIVE, out + err)
         d = seat.seat_dir("ds4pro")
         with open(os.path.join(d, "config.yaml")) as f:
             cfg = f.read()
-        self.assertIn('api-key: "%s"' % self._AS_OC, cfg)   # authstore won
+        self.assertIn('api-key: "%s"' % self._AS_DS, cfg)   # authstore won
         self.assertNotIn(self._LIVE, cfg)                   # not hermes
-        self.assertIn('base-url: "https://opencode.ai/zen/go/v1"', cfg)
+        self.assertIn('base-url: "https://api.deepseek.com/v1"', cfg)
         with open(os.path.join(d, "launch.sh")) as f:
-            self.assertNotIn(self._AS_OC, f.read())         # never in launch.sh
+            self.assertNotIn(self._AS_DS, f.read())         # never in launch.sh
 
     def test_add_ds4pro_deepseek_provider_from_authstore(self):
         """--provider deepseek emits the direct provider's exact /v1 route."""
@@ -1595,12 +2742,12 @@ class SeatTest(unittest.TestCase):
         with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
             self.assertIn('api-key: "%s"' % self._LIVE, f.read())
 
-    def test_add_ds4pro_default_provider_is_opencode_go(self):
+    def test_add_ds4pro_default_provider_is_the_direct_key(self):
         self._plant_pool()
         rc, out, err = self._add(("add", "ds4pro"))
         self.assertEqual(rc, 0, err)
         self.assertNotIn(self._LIVE, out + err)   # secret: never printed
-        self.assertIn("provider opencode-go", out)
+        self.assertIn("provider deepseek-direct", out)
         d = seat.seat_dir("ds4pro")
         for p, want in ((os.path.join(d, "token"), 0o600),
                         (os.path.join(d, "config.yaml"), 0o600),
@@ -1609,62 +2756,59 @@ class SeatTest(unittest.TestCase):
         with open(os.path.join(d, "config.yaml")) as f:
             cfg = f.read()
         self.assertIn('api-key: "%s"' % self._LIVE, cfg)     # baked 0600
-        self.assertIn('name: "opencode-go"', cfg)
-        self.assertIn('base-url: "https://opencode.ai/zen/go/v1"', cfg)
-        self.assertIn('- name: "deepseek-v4-pro"', cfg)      # opencode's id
+        self.assertIn('name: "deepseek-direct"', cfg)
+        self.assertNotIn("opencode", cfg)                     # one token source
+        self.assertIn('base-url: "https://api.deepseek.com/v1"', cfg)
+        self.assertIn('- name: "deepseek-v4-pro"', cfg)      # the vendor's id
         self.assertIn('alias: "ds4-pro"', cfg)
         self.assertIn("port: 8360", cfg)
         self.assertNotIn("auth-dir", cfg)     # no OAuth dir for proxy-key
 
-    def test_add_flash_provider_openrouter_route_under_its_OWN_family(self):
-        """The flash route mints a seat, and NOT under the pro family's name.
-
-        Minting it here was the identity collapse in its most concrete form:
-        a `ds4pro` seat whose config served the pro alias off the cheap model,
-        indistinguishable on every surface from one on the real pro route.
+    def test_flash_stays_unmintable_until_its_session_header_is_supported(self):
+        """OpenCode Go rejects a request without x-opencode-session, and Helm
+        cannot yet give each conversation a stable distinct value. A staged
+        family must refuse before writing a runnable credential-bearing config.
         """
         self._plant_pool()
-        rc, out, err = self._add(("add", "ds4flash", "--provider",  # noqa: SEAT_NAME — the catalog family whose seat is being minted
-                                  "openrouter"))
-        self.assertEqual(rc, 0, err)
-        self.assertIn("provider openrouter", out)
-        with open(os.path.join(seat.seat_dir("ds4flash"),  # noqa: SEAT_NAME — the catalog family whose seat directory this is
-                               "config.yaml")) as f:
-            cfg = f.read()
-        self.assertIn('name: "openrouter"', cfg)
-        self.assertIn('base-url: "https://openrouter.ai/api/v1"', cfg)
-        self.assertIn('- name: "deepseek/deepseek-v4-flash"', cfg)  # the catalog's openrouter id
+        rc, out, err = self._add(("add", "ds4flash", "--provider",  # noqa: SEAT_NAME — the staged family whose activation door is under test
+                                  "opencode-go"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("x-opencode-session", err)
+        self.assertIn("not yet activatable", err)
+        self.assertFalse(os.path.exists(os.path.join(
+            seat.seat_dir("ds4flash"), "config.yaml")))  # noqa: SEAT_NAME — the staged family's config must not exist
         self.assertNotIn(self._LIVE, out + err)
-        # CONTROL, and the property the split exists for: the same provider
-        # is no longer mintable under the PRO family, and the refusal names
-        # the providers that family really has.
+        # CONTROL: staging the flash family never makes its subscription
+        # selectable under the direct-key pro family.
         rc, _out, err = self._add(("add", "ds4pro", "--provider",  # noqa: SEAT_NAME — the two catalog names whose SEPARATION is the property under test
-                                   "openrouter"))
+                                   "opencode-go"))
         self.assertEqual(rc, 2)
-        self.assertIn("no provider 'openrouter'", err)
+        self.assertIn("no provider 'opencode-go'", err)
+        self.assertIn("deepseek", err)
 
     def test_add_ds4pro_unknown_provider_refused(self):
         self._plant_pool()
         rc, _, err = self._add(("add", "ds4pro", "--provider", "bogus"))
         self.assertEqual(rc, 2)
         self.assertIn("no provider 'bogus'", err)
-        self.assertIn("opencode-go", err)     # names the valid choices
+        self.assertIn("deepseek", err)        # names the valid choice
 
     def test_add_ds4pro_pool_entry_base_url_wins(self):
         """The credential_pool entry's own base_url overrides the family
         default, so the seat rides exactly the endpoint the cred was minted
         for (owner moves a gateway without a code change)."""
-        self._plant_pool(opencode=self._LIVE)
+        self._plant_pool(deepseek=self._LIVE)
         with open(seat.HERMES_AUTH) as f:
             data = json.load(f)
-        data["credential_pool"]["opencode-go"][0]["base_url"] = \
-            "https://opencode.ai/zen/go/v2"
+        data["credential_pool"]["deepseek"][0]["base_url"] = \
+            "https://api.deepseek.com/v2"
         with open(seat.HERMES_AUTH, "w") as f:
             json.dump(data, f)
         rc, _, err = self._add(("add", "ds4pro"))
         self.assertEqual(rc, 0, err)
         with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
-            self.assertIn('base-url: "https://opencode.ai/zen/go/v2"', f.read())
+            self.assertIn('base-url: "https://api.deepseek.com/v2"', f.read())
 
     def test_add_ds4pro_env_var_beats_pool(self):
         self._plant_pool()
@@ -1680,7 +2824,7 @@ class SeatTest(unittest.TestCase):
         self.assertIn("DS4PRO_API_KEY", err)
         self.assertIn("--key-from", err)
         self.assertIn(seat.HERMES_AUTH, err)  # names the credential_pool source
-        self.assertIn("opencode-go", err)     # names the selected provider
+        self.assertIn("deepseek", err)        # names the selected provider
         self.assertFalse(os.path.exists(os.path.join(seat.seat_dir("ds4pro"),
                                                      "config.yaml")))
 
@@ -1708,31 +2852,35 @@ class SeatTest(unittest.TestCase):
         # told CC nothing for this family and CC used its hardcoded 200k.
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d"
                       % seat.FAMILIES["ds4pro"]["max_context"], line)
-        # GROK IS THE ONLY UNPINNED FAMILY LEFT, and it is what keeps this
-        # from proving merely that the emitter always mints. It read
-        # `for fam in ("gemini", "grok")` until gemini took an owner-stated
-        # window, and ds4pro joined the pinned side the same day.
-        # POSITIVE CONTROL ON grok's OWN LINE, unconditional and sharing the
-        # root object of the absence below: a sibling family's launch_line is
-        # a DIFFERENT observable and could not tell an empty grok line from a
-        # windowless one. This membership proves the line is real first.
-        grok_line = seat.launch_line("grok")
-        self.assertIn("HELM_CHAT_NAME=grok", grok_line)
-        self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", grok_line)
+        # DS4FLASH IS THE ONLY UNPINNED FAMILY LEFT, and it is what keeps
+        # this from proving merely that the emitter always mints. The control
+        # read grok until grok pinned the 256000 its xai route publishes; its
+        # OpenCode Go route publishes no window, so ds4flash stays unpinned.
+        # POSITIVE CONTROL ON ds4flash's OWN LINE, unconditional and sharing
+        # the root object of the absence below: a sibling family's
+        # launch_line is a DIFFERENT observable and could not tell an empty
+        # line from a windowless one. This membership proves the line is real.
+        unpinned_line = seat.launch_line("ds4flash")
+        self.assertIn("HELM_CHAT_NAME=ds4flash", unpinned_line)
+        self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", unpinned_line)
         # The window knob is gated on the same max_context, so it stays away
         # too. A family that gained one without the other would mint a window
         # CC then clamps to its 200k default — the #182 shape in reverse.
-        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", grok_line)
-        # POSITIVE CONTROLS ON THE SAME OBSERVABLE, unconditional: two other
-        # families mint the variable too, so grok's silence above is a
-        # decision and not a dead emitter.
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", unpinned_line)
+        # POSITIVE CONTROLS ON THE SAME OBSERVABLE, unconditional: other
+        # families mint the variable too, grok among them now, so the
+        # silence above is a decision and not a dead emitter.
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS",
                       seat.launch_line("kimi"))
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS",
                       seat.launch_line("gemini"))
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=204000",
+                      seat.launch_line("grok"))
+        # WebSearch: its route cannot serve the tool (task/3242, measured)
         self.assertTrue(line.endswith(
             "claude --disallowedTools %s --dangerously-skip-permissions"
-            " --model ds4-pro" % ("EnterPlanMode " + "Skill 'Agent(fork)'")))
+            " --model ds4-pro" % ("EnterPlanMode WebSearch "
+                                  + "Skill 'Agent(fork)'")))
         self.assertNotIn("deepseek", line)    # alias on the wire, not the id
         self.assertNotIn(self._LIVE, line)     # the outbound bearer never rides
 
@@ -1766,7 +2914,7 @@ class SeatTest(unittest.TestCase):
         self.assertNotIn(token, line)
         self.assertIn("ANTHROPIC_AUTH_TOKEN=$(cat ", line)
         self.assertIn(os.path.join(seat.seat_dir("codex"), "token"), line)
-        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-6-astra", line)
+        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-6.1-sol", line)
         # The eval-arm seam (§C pilot FINDING 5): the config dir rides as a
         # shell default so an eval arm can substitute a per-run HOOK-STRIPPED
         # copy while shelling this exact script; a plain seat launch leaves
@@ -1782,7 +2930,7 @@ class SeatTest(unittest.TestCase):
         self.assertIn("--dangerously-skip-permissions", line)  # canonical seat
         self.assertTrue(line.endswith(
             "claude --disallowedTools %s --dangerously-skip-permissions"
-            " --model gpt-6-astra" % ("EnterPlanMode Artifact " + "Skill 'Agent(fork)'")))
+            " --model gpt-6.1-sol" % ("EnterPlanMode Artifact " + "Skill 'Agent(fork)'")))
         self.assertNotIn("ANTHROPIC_API_KEY=", line)  # unset, never set
         # --model override rides both slots
         out = io.StringIO()
@@ -2038,6 +3186,56 @@ class SeatTest(unittest.TestCase):
         self.assertEqual(autocompact._window("kimi"),
                          (380000, "FAMILIES.context_budget"))
 
+    def test_cursor_launch_assets_teach_the_budget_the_watchdog_reads(self):  # noqa: VACUOUS_ASSERTION — positive launch.sh model and two knob matches, plus live watchdog window
+        """task/3652: cursor stops making any tool call the moment Cursor's own
+        (3-6x the bridge's) token count of the Claude Code history crosses
+        Cursor's 256k window — every run at/under 91k estimated still made tool
+        calls, the first failure was at 98.9k — and Claude Code compacted
+        near 164k with the old 225k setting, so the seat went silent first.
+        The GENERATED launch.sh now teaches the cursor family's 110000
+        context_budget on BOTH CC knobs. The watchdog's 80% threshold is 88k;
+        Claude Code's native threshold is near 72k after its 20k output
+        reserve. The watchdog reads the SAME taught window, so the two readers
+        of one window cannot drift. The measured
+        256k probe and 225k max_context stay in the catalog: the budget narrows
+        what the seat is taught, and does not rewrite the evidence for the
+        model's capacity."""
+        from helm import autocompact
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        fam = seat.FAMILIES["cursor"]
+        self.assertEqual(fam["max_context"], 225000)
+        self.assertEqual(fam["context_budget"], 110000)
+        inst = seat._instance_dir("cursor", "cursor")
+        os.makedirs(inst, exist_ok=True)
+        seat._write_launch_assets("cursor", inst, seat="cursor")
+        with open(os.path.join(inst, "launch.sh")) as f:
+            text = f.read()
+        self.assertIn("--model cursor", text)
+        self.assertEqual(
+            re.findall(r"CLAUDE_CODE_MAX_CONTEXT_TOKENS=(\d+)", text),
+            ["110000"])
+        self.assertEqual(
+            re.findall(r"CLAUDE_CODE_AUTO_COMPACT_WINDOW=(\d+)", text),
+            ["110000"])
+        self.assertIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80", text)
+        self.assertEqual(autocompact._window("cursor"),
+                         (110000, "FAMILIES.context_budget"))
+
+    def test_a_minted_seat_carries_no_ai_attribution_before_its_first_session(self):
+        """task/3591: the seat path writes the estate defaults at mint
+        (`_write_launch_assets` runs hooks.install_home), so a spawned or
+        added seat carries no AI authoring line before it launches. A pin:
+        this path already held when the credential-home path did not."""
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        inst = seat._instance_dir("kimi", "kimi")
+        os.makedirs(inst, exist_ok=True)
+        seat._write_launch_assets("kimi", inst, seat="kimi")
+        with open(os.path.join(inst, "claude", "settings.json")) as f:
+            got = json.load(f).get("attribution")
+        self.assertEqual(got, {"commit": "", "pr": "", "sessionUrl": False})
+
     # -- the child-stamp guard (child-stamp-kills-seat-persistence) ---------
     def test_launch_line_strips_child_stamp(self):
         """A pane minted by a daemon born inside a Claude session inherits
@@ -2061,7 +3259,7 @@ class SeatTest(unittest.TestCase):
         self.assertIn("DREGG_PROFILE=codex CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80", line)
         self.assertTrue(line.endswith(
             "claude --disallowedTools %s --dangerously-skip-permissions"
-            " --model gpt-6-astra" % ("EnterPlanMode Artifact " + "Skill 'Agent(fork)'")))
+            " --model gpt-6.1-sol" % ("EnterPlanMode Artifact " + "Skill 'Agent(fork)'")))
 
     def test_spawn_model_flag_mints_a_non_default_window(self):
         """task/381 (b-wiring): spawn --model gpt-5.3-codex-spark must write a
@@ -2086,7 +3284,7 @@ class SeatTest(unittest.TestCase):
         seat._write_launch_assets("codex", inst2, seat="codex-sol")
         with open(os.path.join(inst2, "launch.sh")) as f:
             default = f.read()
-        self.assertIn("--model gpt-6-astra", default)
+        self.assertIn("--model gpt-6.1-sol", default)
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=220000", default)
         self.assertNotIn("76000", default)
 
@@ -2338,12 +3536,484 @@ class SeatTest(unittest.TestCase):
                                presence_beat=False)
         return d
 
+    def test_spawn_refuses_before_reaping_when_paid_proxy_close_is_unproved(self):
+        with mock.patch("helm.hooks.helm_bin",
+                        return_value="/srv/helm/bin/helm"):
+            self._seat_ready(None, None)
+        adapter = self._pane_seam()
+        with mock.patch.object(seat, "_gated_proxy_before_pane",
+                               return_value=("unknown", "close failed")), \
+                mock.patch.object(seat, "_spawn_reap") as reap:
+            rc, _out, err, _ad = self._run_seat(
+                ("spawn", "codex"), adapter=adapter)
+        self.assertEqual(rc, 1)
+        self.assertIn("paid proxy closure is unproved", err)
+        reap.assert_not_called()
+        self.assertEqual(adapter.spawned, [])
+
+    def test_resume_never_creates_a_pane_when_paid_proxy_close_is_unproved(self):
+        with mock.patch("helm.hooks.helm_bin",
+                        return_value="/srv/helm/bin/helm"):
+            self._seat_ready(None, None)
+        adapter = self._pane_seam()
+        with mock.patch("helm.hooks.helm_bin",
+                        return_value="/srv/helm/bin/helm"), \
+                mock.patch.object(seat, "_gated_proxy_before_pane",
+                                  return_value=("unknown", "close failed")):
+            rc, _out, err, _ad = self._run_seat(
+                ("resume", "codex"), adapter=adapter)
+        self.assertEqual(rc, 1)
+        self.assertIn("paid proxy closure is unproved", err)
+        self.assertEqual(adapter.spawned, [])
+
+    # -- task/3208: a resume right after /clear -----------------------------
+    # MEASURED twice on a fleet host (row b07de796): `/clear`,
+    # then `helm seat resume <seat>` at once, came back on the PRE-clear
+    # session at 85% full. MEASURED again on a scratch config dir against
+    # claude 2.1.283 (stub endpoint, no account): the process's own presence
+    # record <config>/sessions/<pid>.json names the NEW session the instant
+    # /clear lands, while the transcripts disagree two ways depending on the
+    # claude — no transcript for the new session yet (that host's), or one that
+    # holds only the /clear command records and no assistant turn (2.1.283's),
+    # which the reboot-stub ranking then puts BELOW the old session's real
+    # turns. Either way the newest-transcript pick answers the OLD session.
+    _OLD = "aaaaaaaa-0000-4000-8000-000000000001"
+    _NEW = "bbbbbbbb-0000-4000-8000-000000000002"
+    _LIVE_PID = 7300001
+    _TURNS = ('{"type":"user","message":{"role":"user","content":"hi"}}\n'
+              '{"type":"assistant","message":{"role":"assistant",'
+              '"content":[{"type":"text","text":"x"}]}}\n')
+    # The measured shape of a just-cleared session's transcript (2.1.283):
+    # the /clear command's own records, and no assistant turn at all.
+    _CLEARED = ('{"type":"user","message":{"role":"user","content":'
+                '"<command-name>/clear</command-name>"}}\n'
+                '{"type":"system","subtype":"local_command"}\n')
+
+    def _plant_transcript(self, d, sid, body, age_s):
+        proj = os.path.join(d, "claude", "projects", "-p")
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, sid + ".jsonl")
+        with open(path, "w") as f:
+            f.write(body)
+        t = time.time() - age_s
+        os.utime(path, (t, t))
+        return path
+
+    def _plant_live_record(self, d, sid, pid=None):
+        """Claude Code's presence record, in the shape 2.1.283 writes it:
+        the live process's pid, birth stamp and CURRENT session."""
+        pid = pid or self._LIVE_PID
+        root = os.path.join(d, "claude", "sessions")
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "%d.json" % pid), "w") as f:
+            json.dump({"pid": pid, "sessionId": sid, "procStart": "4242",
+                       "kind": "interactive", "entrypoint": "cli",
+                       "status": "idle"}, f)
+
+    def _alive(self, *pids):
+        """Only the planted pids read as live claude processes; every other
+        pid keeps the real answer, so no host process is lent a record."""
+        from helm import sessions
+        real = sessions._pid_is_claude
+        live = set(pids or (self._LIVE_PID,))
+        return mock.patch.object(
+            sessions, "_pid_is_claude",
+            side_effect=lambda pid, start=None:
+                int(pid) in live or real(pid, start))
+
+    def _resumed_tail(self, adapter):
+        """The continuity flag and session the relaunch line carries."""
+        self.assertEqual(len(adapter.spawned), 1, adapter.spawned)
+        return shlex.split(adapter.spawned[0][0])[-2:]
+
+    def test_a_resume_right_after_clear_never_takes_the_OLD_session(self):
+        """THE BRIEF'S ARM, in the fleet host's shape: the /clear'd process
+        names a NEW session that has no transcript yet, and the OLD session's
+        transcript is the newest by mtime. `--resume <new>` is refused by
+        claude for a session with no transcript (MEASURED: "No conversation
+        found", exit 1), and `--continue` takes the newest transcript, which
+        is the old one again; so the pane starts FRESH under the live id
+        (MEASURED: claude accepts `--session-id` for an id with no
+        transcript)."""
+        d = self._seat_ready(None, None)
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_live_record(d, self._NEW)
+        adapter = self._pane_seam()
+        with self._alive():
+            rc, out, err, _ad = self._run_seat(("resume", "codex"),
+                                               adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        tail = self._resumed_tail(adapter)
+        self.assertNotIn(self._OLD, adapter.spawned[0][0],
+                         "the relaunch resumed the pre-/clear session")
+        self.assertIn(self._NEW, adapter.spawned[0][0])
+        self.assertEqual(tail, ["--session-id", self._NEW])
+        self.assertIn("starts FRESH", out + err)
+
+    def test_a_cleared_session_with_its_clear_records_is_RESUMED(self):
+        """2.1.283's shape: the NEW session's transcript exists and is the
+        newest, but holds only the /clear records, so the stub ranking puts
+        the OLD session's real turns above it. The live record names NEW, and
+        claude resumes a transcript with no assistant turn (MEASURED)."""
+        d = self._seat_ready(None, None)
+        self._plant_transcript(d, self._OLD, self._TURNS, 5)
+        self._plant_transcript(d, self._NEW, self._CLEARED, 0)
+        # THE PREMISE, asserted: today's ranking alone answers OLD here.
+        self.assertEqual(seat._newest_seat_session(d)[0], self._OLD)
+        self._plant_live_record(d, self._NEW)
+        adapter = self._pane_seam()
+        with self._alive():
+            rc, _out, err, _ad = self._run_seat(("resume", "codex"),
+                                                adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertIn(self._NEW, adapter.spawned[0][0])
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", self._NEW])
+
+    def test_with_no_live_process_the_newest_transcript_still_decides(self):
+        """THE CONTROL: no live claude process holds a presence record here —
+        a stale record of a DEAD pid stays on disk after a kill (MEASURED) and
+        names nothing — so the resume keeps today's newest-transcript pick."""
+        d = self._seat_ready(None, None)
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_live_record(d, self._NEW)
+        adapter = self._pane_seam()
+        with self._alive(self._LIVE_PID + 1):
+            rc, _out, err, _ad = self._run_seat(("resume", "codex"),
+                                                adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", self._OLD])
+
+    def test_a_first_transcript_written_before_the_reap_is_resumed(self):
+        """The live read and the reap are two moments: a session that takes
+        its first message between them has a transcript by the time the pane
+        relaunches, and `--session-id` on an id with a transcript is refused
+        ("already in use", MEASURED). The flag is asked again after the
+        reap, which is the last moment the old process could write."""
+        d = self._seat_ready(None, None)
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_live_record(d, self._NEW)
+        real_reap = seat._reap_stale
+
+        def reap_after_a_first_message(*a, **k):
+            self._plant_transcript(d, self._NEW, self._TURNS, 0)
+            return real_reap(*a, **k)
+
+        adapter = self._pane_seam()
+        with self._alive(), mock.patch.object(
+                seat, "_reap_stale", side_effect=reap_after_a_first_message):
+            rc, out, err, _ad = self._run_seat(("resume", "codex"),
+                                               adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("starts FRESH", out)        # the read said fresh ...
+        self.assertIn("resuming it instead", out)  # ... the reap said not
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", self._NEW])
+
+    def test_live_sessions_the_register_cannot_choose_between_refuse(self):  # noqa: VACUOUS_ASSERTION — no reap and no pane IS the refusal's contract; the same run's refusal text names both live sessions, and the register-pin arm below spawns exactly one pane over the identical fixture
+        """Two live claude processes in one seat's config home naming two
+        sessions — the pane and a `claude -p` child it runs, which writes a
+        record there too while it runs (MEASURED) — and no register bound to
+        either: which session the seat holds is UNKNOWN, and a resume refuses
+        before anything is reaped instead of picking one."""
+        d = self._seat_ready(None, None)
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_live_record(d, self._NEW)
+        self._plant_live_record(d, self._OLD, pid=self._LIVE_PID + 1)
+        adapter = self._pane_seam()
+        with self._alive(self._LIVE_PID, self._LIVE_PID + 1), \
+                mock.patch.object(seat, "_reap_stale") as reap:
+            rc, _out, err, _ad = self._run_seat(("resume", "codex"),
+                                                adapter=adapter)
+        self.assertEqual(rc, 1)
+        self.assertIn("is UNKNOWN", err)
+        self.assertIn(self._NEW[:8], err)
+        self.assertIn(self._OLD[:8], err)
+        reap.assert_not_called()
+        self.assertEqual(adapter.spawned, [])
+
+    def test_the_register_bound_pid_chooses_between_live_sessions(self):
+        """THE SAME TWO PROCESSES, and the spawn register bound one of them at
+        its SessionStart (`session_pid` + `session_pid_identity`): that one
+        is the seat, and its session is resumed."""
+        d = self._seat_ready(None, None, worktree=self.tmp)
+        path = os.path.join(d, "spawn.json")
+        with open(path) as f:
+            rec = json.load(f)
+        rec.update(session_pid=self._LIVE_PID,
+                   session_pid_identity="proc:4242")
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_transcript(d, self._NEW, self._CLEARED, 0)
+        self._plant_live_record(d, self._NEW)
+        self._plant_live_record(d, self._OLD, pid=self._LIVE_PID + 1)
+        adapter = self._pane_seam()
+        with self._alive(self._LIVE_PID, self._LIVE_PID + 1):
+            rc, _out, err, _ad = self._run_seat(("resume", "codex"),
+                                                adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", self._NEW])
+
+    def test_a_pruned_copy_of_the_live_walled_session_is_still_the_rescue(self):
+        """THE 2026-08-04 SHAPE UNDER THE LIVE RUNG. The seat is walled at
+        context-full and its claude is still ALIVE (the walled original keeps
+        growing until its pane is reaped), a `cv prune` minted a copy whose
+        head carries the lineage stamp, and the operator runs the BARE resume
+        autocompact's own manual-recovery line names ("run `helm seat resume
+        <seat>` after inspecting the pane"). Trunk's ranking resumes the
+        pruned copy (rank 3); the live process naming its own walled session
+        must not outrank that rescue, or the seat comes back walled."""
+        d = self._seat_ready(None, None, worktree=self.tmp)
+        reg = "11111111-1111-4111-8111-111111111111"
+        copy = "dddddddd-0000-4000-8000-000000000004"
+        self._plant_transcript(d, reg, self._TURNS, 0)          # growing
+        self._plant_transcript(
+            d, copy,
+            '{"type":"user","sessionId":"%s","session_id":"%s","message":'
+            '{"role":"user","content":"hi"}}\n{"type":"assistant","sessionId":'
+            '"%s","session_id":"%s","message":{"role":"assistant","content":'
+            '[{"type":"text","text":"x"}]}}\n' % (copy, reg, copy, reg), 60)
+        self._plant_live_record(d, reg)          # the walled claude, alive
+        adapter = self._pane_seam()
+        with self._alive():
+            rc, _out, err, _ad = self._run_seat(("resume", "codex"),
+                                                adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", copy])
+
+    def test_an_unreadable_session_record_refuses_before_the_reap(self):  # noqa: VACUOUS_ASSERTION — no reap and no pane IS the refusal's contract; the same run's refusal text names the unreadable record, and the fresh-session arm above spawns one pane over the same live record
+        """The census cannot say which session the seat holds when one record
+        in its home cannot be read — that record may be the seat's own — so
+        the resume refuses before anything is reaped, even though another
+        record reads cleanly. Nothing else pins this rung: the multi-session
+        refusal above reaches UNKNOWN by a different branch."""
+        d = self._seat_ready(None, None)
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_live_record(d, self._NEW)
+        with open(os.path.join(d, "claude", "sessions", "corrupt.json"),
+                  "w") as f:
+            f.write("{")
+        adapter = self._pane_seam()
+        with self._alive(), mock.patch.object(seat, "_reap_stale") as reap:
+            rc, _out, err, _ad = self._run_seat(("resume", "codex"),
+                                                adapter=adapter)
+        self.assertEqual(rc, 1)
+        self.assertIn("could not all be read", err)
+        self.assertIn("corrupt.json", err)
+        reap.assert_not_called()
+        self.assertEqual(adapter.spawned, [])
+
+    def test_a_lone_helper_claude_never_hands_the_seat_its_session(self):
+        """The seat's own claude is GONE — its record stays on disk naming the
+        registered session (MEASURED: a killed session's record outlives it) —
+        and one `claude -p` helper it started still runs in the same config
+        home, holding its own session (MEASURED: kind interactive, entrypoint
+        sdk-cli). No live process holds the SEAT's session, so the resume must
+        keep the register/newest-transcript pick, which answers the registered
+        session (rank 2). Resuming the helper's session brings the seat back
+        as a stranger."""
+        d = self._seat_ready(None, None, worktree=self.tmp)
+        reg = "11111111-1111-4111-8111-111111111111"
+        helper = "cccccccc-0000-4000-8000-000000000003"
+        self._plant_transcript(d, reg, self._TURNS, 60)
+        self._plant_transcript(d, helper, self._TURNS, 0)
+        self._plant_live_record(d, reg)          # the seat's own, pid dead
+        root = os.path.join(d, "claude", "sessions")
+        with open(os.path.join(root, "%d.json" % (self._LIVE_PID + 1)),
+                  "w") as f:
+            json.dump({"pid": self._LIVE_PID + 1, "sessionId": helper,
+                       "procStart": "4243", "kind": "interactive",
+                       "entrypoint": "sdk-cli", "status": "busy"}, f)
+        adapter = self._pane_seam()
+        with self._alive(self._LIVE_PID + 1):
+            rc, _out, err, _ad = self._run_seat(("resume", "codex"),
+                                                adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", reg])
+
+    # -- F3's rule: a live record speaks for the seat only on the register's
+    # evidence — its session is the register's, the register pins its exact
+    # pid + birth stamp, or the register holds no session.
+    _REG = "11111111-1111-4111-8111-111111111111"   # `_seat_ready`'s session
+
+    def _register(self, d, **fields):
+        path = os.path.join(d, "spawn.json")
+        with open(path) as f:
+            rec = json.load(f)
+        rec.update(fields)
+        with open(path, "w") as f:
+            json.dump(rec, f)
+
+    def _plant_helper(self, d, sid, pid):
+        """A `claude -p` child's record, in the shape 2.1.283 writes one while
+        it runs (MEASURED: kind interactive, entrypoint sdk-cli)."""
+        with open(os.path.join(d, "claude", "sessions", "%d.json" % pid),
+                  "w") as f:
+            json.dump({"pid": pid, "sessionId": sid, "procStart": "4243",
+                       "kind": "interactive", "entrypoint": "sdk-cli",
+                       "status": "busy"}, f)
+
+    def test_a_helper_beside_a_PINNED_dead_seat_never_names_the_session(self):
+        """The orca shape of the helper case: the register PINS the seat's own
+        claude (session_pid + session_pid_identity), that claude is dead, and
+        a sdk-cli helper it started still runs in its home. The pin names
+        another process and the helper's session is not the register's, so
+        nothing speaks for the seat, and the ranking answers the registered
+        session as trunk did."""
+        d = self._seat_ready(None, None, worktree=self.tmp)
+        self._register(d, session_pid=self._LIVE_PID,
+                       session_pid_identity="proc:4242")
+        helper = "cccccccc-0000-4000-8000-000000000003"
+        self._plant_transcript(d, self._REG, self._TURNS, 60)
+        self._plant_transcript(d, helper, self._TURNS, 0)
+        self._plant_live_record(d, self._REG)       # the seat's own, pid dead
+        self._plant_helper(d, helper, self._LIVE_PID + 1)
+        adapter = self._pane_seam()
+        with self._alive(self._LIVE_PID + 1):
+            rc, out, err, _ad = self._run_seat(("resume", "codex"),
+                                               adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("none speaks for the seat", out)
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", self._REG])
+
+    def test_a_LIVE_seat_beside_a_live_helper_resumes_the_seats_session(self):
+        """The seat's own claude is ALIVE on the registered session and a
+        helper runs beside it on another. Only the seat's record is admitted,
+        so the helper neither names the session nor makes it UNKNOWN."""
+        d = self._seat_ready(None, None, worktree=self.tmp)
+        helper = "cccccccc-0000-4000-8000-000000000003"
+        self._plant_transcript(d, self._REG, self._TURNS, 60)
+        self._plant_transcript(d, helper, self._TURNS, 0)
+        self._plant_live_record(d, self._REG)
+        self._plant_helper(d, helper, self._LIVE_PID + 1)
+        adapter = self._pane_seam()
+        with self._alive(self._LIVE_PID, self._LIVE_PID + 1):
+            rc, out, err, _ad = self._run_seat(("resume", "codex"),
+                                               adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("presence record names session %s" % self._REG, out)
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", self._REG])
+
+    def test_a_clear_the_register_recorded_is_the_live_session(self):
+        """Rule (a): a non-orca SessionStart bind of source `clear` moved the
+        register to the NEW session, which has no transcript yet, and the OLD
+        transcript is the newest. The record's session IS the register's."""
+        d = self._seat_ready(None, None, worktree=self.tmp)
+        self._register(d, session=self._NEW)
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_live_record(d, self._NEW)
+        adapter = self._pane_seam()
+        with self._alive():
+            rc, _out, err, _ad = self._run_seat(("resume", "codex"),
+                                                adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._resumed_tail(adapter),
+                         ["--session-id", self._NEW])
+
+    def test_a_clear_on_the_PINNED_process_is_the_live_session(self):
+        """Rule (b), the orca /clear shape before its SessionStart rebind has
+        landed: the register still records the OLD session but pins the live
+        process by pid and birth stamp, and that process names NEW."""
+        d = self._seat_ready(None, None, worktree=self.tmp)
+        self._register(d, session=self._OLD, session_pid=self._LIVE_PID,
+                       session_pid_identity="proc:4242")
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_live_record(d, self._NEW)
+        adapter = self._pane_seam()
+        with self._alive():
+            rc, _out, err, _ad = self._run_seat(("resume", "codex"),
+                                                adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._resumed_tail(adapter),
+                         ["--session-id", self._NEW])
+
+    # -- a register with NO session: only the seat's interactive claude
+    # speaks. A review (row 7744dc85daa8, F1) measured the admission of every
+    # live record there handing a dead seat a `claude -p` helper's session.
+    _HELPER = "cccccccc-0000-4000-8000-000000000003"
+
+    def _unregistered_with_helper(self):
+        """A seat with no spawn register, so no session to contradict a live
+        record (a register that names a pane but no session is refused
+        earlier, by the reap's exit-owner proof); two transcripts with real
+        turns (the OLD one newest, so the ranking answers it); the seat's own
+        interactive record naming NEW; and a `claude -p` helper's record
+        naming its own session."""
+        d = self._seat_ready(None, None)
+        self._plant_transcript(d, self._NEW, self._TURNS, 120)
+        self._plant_transcript(d, self._HELPER, self._TURNS, 60)
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_live_record(d, self._NEW)
+        self._plant_helper(d, self._HELPER, self._LIVE_PID + 1)
+        return d
+
+    def test_a_lone_helper_never_speaks_for_a_register_with_no_session(self):
+        """F1. The seat's claude is dead, its register holds no session, and
+        an orphaned `claude -p` helper still runs in its home. Trunk resumed
+        the newest transcript with real turns (OLD); the helper's session is
+        not the seat's conversation, so the resume must still take OLD."""
+        self._unregistered_with_helper()
+        adapter = self._pane_seam()
+        with self._alive(self._LIVE_PID + 1):
+            rc, out, err, _ad = self._run_seat(("resume", "codex"),
+                                               adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(self._HELPER, adapter.spawned[0][0],
+                         "the relaunch resumed a helper's session")
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", self._OLD])
+        self.assertIn("none speaks for the seat", out)
+
+    def test_a_live_cli_record_speaks_for_a_register_with_no_session(self):
+        """THE CONTROL on the same fixture: the seat's interactive claude is
+        ALIVE beside the helper, so its record names the session (NEW), over
+        the ranking's OLD and without the helper making the read UNKNOWN."""
+        self._unregistered_with_helper()
+        adapter = self._pane_seam()
+        with self._alive(self._LIVE_PID, self._LIVE_PID + 1):
+            rc, out, err, _ad = self._run_seat(("resume", "codex"),
+                                               adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("presence record names session %s" % self._NEW, out)
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", self._NEW])
+
+    def test_a_live_cli_record_alone_speaks_for_a_register_with_no_session(self):
+        """The same control with no helper at all: the one live record is the
+        seat's interactive claude, and it names the session."""
+        d = self._seat_ready(None, None)
+        self._plant_transcript(d, self._NEW, self._TURNS, 120)
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_live_record(d, self._NEW)
+        adapter = self._pane_seam()
+        with self._alive():
+            rc, _out, err, _ad = self._run_seat(("resume", "codex"),
+                                                adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._resumed_tail(adapter), ["--resume", self._NEW])
+
+    def test_the_resumed_line_names_the_flag_the_relaunch_used(self):
+        """A relaunch under `--session-id` (a live session with no transcript
+        yet) reported "(--resume)" in its closing line. The line names the
+        flag the relaunch line carried."""
+        d = self._seat_ready(None, None, worktree=self.tmp)
+        self._register(d, session=self._NEW)
+        self._plant_transcript(d, self._OLD, self._TURNS, 0)
+        self._plant_live_record(d, self._NEW)
+        adapter = self._pane_seam()
+        with self._alive():
+            rc, out, err, _ad = self._run_seat(("resume", "codex"),
+                                               adapter=adapter)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._resumed_tail(adapter),
+                         ["--session-id", self._NEW])
+        self.assertIn("session %s… (--session-id)" % self._NEW[:8], out)
+        self.assertNotIn("(--resume)", out)
+
     def test_a_cwd_MOVE_writes_the_TARGET_room_into_every_surface(self):
         """MEASURED LIVE ON ANOTHER PROJECT, 2026-08-15: a seat re-spawned with
-        --cwd into playapal kept HELM_CHAT_ROOM=helm (SOURCE=derived) from its
-        previous mint, did playapal's work homed in #helm, and playapal's
-        conversation split across two rooms for a day. A DERIVED room is a
-        function of the cwd; moving the cwd makes it stale by definition.
+        --cwd into another project's checkout kept HELM_CHAT_ROOM=helm
+        (SOURCE=derived) from its previous mint, did that project's work
+        homed in #helm, and its conversation split across two rooms for a
+        day. A DERIVED room is a function of the cwd; moving the cwd makes it
+        stale by definition.
 
         THE AMBIENT ROOM IS SET TO THE WRONG ANSWER, deliberately: spawns
         happen from inside helm seats, so the SPAWNING process's own
@@ -3151,7 +4821,7 @@ class SeatTest(unittest.TestCase):
         d = seat.seat_dir("codex")
         with open(os.path.join(d, "launch.sh")) as f:
             fresh = f.read()
-        self.assertIn("--model gpt-6-astra", fresh)          # the control
+        self.assertIn("--model gpt-6.1-sol", fresh)          # the control
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=220000", fresh)
         with open(os.path.join(d, "spawn.json"), "w") as f:
             json.dump({"v": 1, "seat": "codex",
@@ -3211,10 +4881,13 @@ import sys
 import time
 
 nonce = os.environ["HELM_TEST_NONCE"].encode()
+# STDERR BEFORE READY: a test signals the owner the moment READY arrives,
+# and a harness killed between the two writes left stderr empty (seen once
+# on a loaded build node: the TERM arm red with an empty stderr).
+os.write(2, b"STDERR:" + nonce + b"\\n")
 if os.environ.get("HELM_TEST_ARM") == "1":
     os.write(1, b"\\033[?1003h\\033[?1006h")
 os.write(1, b"READY:" + nonce + b" PID:" + str(os.getpid()).encode() + b"\\n")
-os.write(2, b"STDERR:" + nonce + b"\\n")
 if os.environ.get("HELM_TEST_REPORT_ARGV") == "1":
     os.write(1, b"ARGV:" + json.dumps(sys.argv[1:]).encode() + b"\\n")
 mode = os.environ.get("HELM_TEST_MODE", "exit")
@@ -4449,11 +6122,19 @@ class SeatBornWiredTest(unittest.TestCase):
         self._plant("home-a")
         rc, _out, err = self._add()
         self.assertEqual(rc, 0, err)
-        from helm import hooks
+        from helm import hooks, record
         got = self._settings()
+        # LIVE, not "its command string appears": the recorder is born beside
+        # delivery now (task/3089), and the two fold into ONE PostToolUse
+        # dispatcher entry exactly as in a home, so delivery's standalone
+        # command is gone while its lane is live. _lane_live is the one check
+        # that knows that fold.
+        self.assertEqual(len(hooks.resolved_specs(hooks.SEAT_SPECS)),
+                         len(hooks.SEAT_SPECS))       # the fixture guard resolves
         for s in hooks.SEAT_SPECS:
-            self.assertIn(hooks.spec_command(s),
-                          hooks._hook_cmds(got, s["event"]), s["name"])
+            self.assertTrue(hooks._lane_live(got, s), s["name"])
+        for ev in record.HOOK_EVENTS:                  # both recorder legs
+            self.assertTrue(record._leg_live(got, ev), ev)
         for rule in hooks.PERMIT_RULES:
             self.assertIn(rule, got["permissions"]["allow"])
         self.assertIn("inject --hook-json",
@@ -4583,6 +6264,179 @@ class SeatBornWiredTest(unittest.TestCase):
         self.assertIn("Bash(rm -rf:*)", deny)                  # operator's rule kept
 
 
+class SeatBornFullAgentTest(unittest.TestCase):
+    """task/3089: a seat is a full agent from birth. The mint door
+    (seat_launch_assets._write_launch_assets, reached by add, launch, resume
+    and spawn) gives the new config dir the canonical MCP servers, the full
+    helm hook set including both recorder legs, and the host's global
+    instructions — through the SAME primitives `helm tidy` reconciles with, so
+    tidy's plan for a just-minted seat is empty. qwen27 is the family (keyless
+    here); a codex-family seat is born the same way, because its launch runs
+    the claude harness."""
+    setUp = SeatTest.setUp
+    tearDown = SeatTest.tearDown
+    _add = SeatTest._add
+    _plant = SeatTest._plant
+
+    SECRET = "FIXTURE-BEARER-SENTINEL-3089"  # gitleaks:allow (a test fixture, not a credential)
+
+    def _sources(self):
+        """A private (0600) canonical MCP file and a global CLAUDE.md, both
+        fixtures, plus a tmp backup root — nothing of this host is read."""
+        from helm import envtidy
+        priv = os.path.join(self.tmp, "mcps-canonical.json")
+        with open(priv, "w") as f:
+            json.dump({"alpha-mcp": {"command": "alpha"},
+                       "beta-mcp": {"type": "http", "url": "https://x.invalid/m",
+                                    "headers": {"Authorization": "Bearer " + self.SECRET}},
+                       "exa": {"command": "exa"}}, f)
+        os.chmod(priv, 0o600)
+        rules = os.path.join(self.tmp, "owner-home", "CLAUDE.md")
+        os.makedirs(os.path.dirname(rules))
+        with open(rules, "w") as f:
+            f.write("# the host's global rules\n")
+        # ONLY THESE TWO KEYS, set and restored one by one — never a
+        # mock.patch.dict over the whole environ here: its stop() runs as a
+        # cleanup AFTER SeatTest.tearDown and would restore the whole dict to
+        # its mid-test snapshot, re-planting this arm's HELM_HOME/HELM_PROC
+        # (a deleted tmp) into every later test in the process.
+        for key, value in zip(self.SOURCE_KEYS, (priv, rules)):
+            self.addCleanup(self._restore_key, key, os.environ.get(key))
+            os.environ[key] = value
+        backup = mock.patch.object(envtidy, "BACKUP_ROOT",
+                                   os.path.join(self.tmp, "env-backup"))
+        backup.start()
+        self.addCleanup(backup.stop)
+        return priv, rules
+
+    SOURCE_KEYS = ("HELM_MCPS_PRIVATE", "HELM_INSTRUCTIONS_CANONICAL")
+
+    @staticmethod
+    def _restore_key(key, prior):
+        if prior is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = prior
+
+    def test_a_new_seat_is_born_with_servers_full_hooks_and_instructions(self):  # noqa: VACUOUS_ASSERTION — the server list, recorder legs, empty tidy plans and the link target are unconditional positives; the absence checks read the same outputs
+        from helm import envtidy, record, skillsync
+        _priv, rules = self._sources()
+        rc, _out, err = self._add(("add", "qwen27"))
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(self.SECRET, _out + err)             # configs never printed
+        cdir = os.path.join(seat.seat_dir("qwen27"), "claude")
+        label = "seat:qwen27"
+        # servers: qwen27 is served from the operator's own box, so it is
+        # born with the web-search floor only whatever its window
+        # (envtidy._own_box), in a private state file, and the rest are
+        # withheld by name
+        state = os.path.join(cdir, ".claude.json")
+        with open(state) as f:
+            got = json.load(f)
+        self.assertEqual(sorted(got["mcpServers"]), ["exa"])
+        self.assertEqual(sorted(n for n, _ in envtidy.plan_mcp_home(
+            label, cdir)["withheld"]), ["alpha-mcp", "beta-mcp"])
+        self.assertTrue(got.get("hasCompletedOnboarding"))    # onboarding kept
+        self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
+        # hooks: the recorder legs every home carries, and nothing left to sync
+        with open(os.path.join(cdir, "settings.json")) as f:
+            settings = json.load(f)
+        for ev in record.HOOK_EVENTS:
+            self.assertTrue(record._leg_live(settings, ev), ev)
+        plan = envtidy.plan_hooks_home(label, cdir)
+        self.assertEqual(plan["verdict"], "ok", plan.get("actions"))
+        self.assertEqual(envtidy.plan_mcp_home(label, cdir)["verdict"], "ok")
+        # instructions: the link, and the seat's own rules file still its own
+        link = os.path.join(cdir, "rules", "global-instructions.md")
+        self.assertEqual(os.readlink(link), os.path.realpath(rules))
+        self.assertEqual(skillsync.link_instructions(cdir).action, "ok")
+        self.assertEqual(skillsync.claude_md_state(cdir), "real")
+        with open(os.path.join(cdir, "CLAUDE.md")) as f:
+            self.assertEqual(f.read().count(seat.FEEDBACK_RULE), 1)
+        # a relaunch re-asserts without a new warning and keeps every piece
+        out, err2 = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err2):
+            self.assertEqual(seat.cmd_seat(["launch", "qwen27"]), 0, err2.getvalue())
+        self.assertNotIn("NOT written", err2.getvalue())
+        self.assertNotIn("NOT linked", err2.getvalue())
+        with open(state) as f:
+            self.assertEqual(sorted(json.load(f)["mcpServers"]), ["exa"])
+        self.assertEqual(os.readlink(link), os.path.realpath(rules))
+
+    def test_a_codex_family_seat_on_the_claude_harness_is_born_with_the_servers(self):  # noqa: VACUOUS_ASSERTION — the harness stamp, the three-server list and the ok plan are unconditional positives; the secret check reads the same outputs
+        """A codex-family seat is Claude Code on a codex model: its minted
+        launch stamps the claude harness, so it takes the servers like any
+        other seat — the family name excludes nothing."""
+        from helm import envtidy
+        self._sources()
+        self._plant("home-a")
+        rc, _out, err = self._add()                       # add codex
+        self.assertEqual(rc, 0, err)
+        d = seat.seat_dir("codex")
+        cdir = os.path.join(d, "claude")
+        with open(os.path.join(d, "launch.sh")) as f:
+            self.assertIn("HELM_AGENT_HARNESS=claude", f.read())
+        self.assertEqual(envtidy.seat_harness(cdir), "claude")
+        self.assertIsNone(envtidy.mcp_exclusion("seat:codex", cdir))
+        with open(os.path.join(cdir, ".claude.json")) as f:
+            self.assertEqual(sorted(json.load(f)["mcpServers"]),
+                             ["alpha-mcp", "beta-mcp", "exa"])    # a wide window
+        self.assertEqual(envtidy.plan_mcp_home("seat:codex", cdir)["verdict"], "ok")
+        self.assertNotIn(self.SECRET, _out + err)
+
+    def test_mutation_control_without_the_birth_wiring_the_seat_is_short(self):
+        """Take the new birth steps away and the SAME observables go short —
+        so the green arm above observes the mint door, not a coincidence."""
+        from helm import envtidy, record, seat_launch_assets
+        self._sources()
+        with mock.patch.object(seat_launch_assets, "_seat_full_agent"), \
+                mock.patch.object(record, "install_home", return_value=("ok", "")):
+            rc, _out, err = self._add(("add", "qwen27"))
+        self.assertEqual(rc, 0, err)
+        cdir = os.path.join(seat.seat_dir("qwen27"), "claude")
+        self.assertEqual(envtidy.plan_mcp_home("seat:qwen27", cdir)["verdict"], "change")
+        self.assertEqual(envtidy.plan_hooks_home("seat:qwen27", cdir)["verdict"], "change")
+        self.assertFalse(os.path.lexists(os.path.join(cdir, "rules",
+                                                      "global-instructions.md")))
+
+    def test_a_refused_canonical_file_is_loud_and_the_seat_still_mints(self):
+        priv, _rules = self._sources()
+        os.chmod(priv, 0o644)                           # THE VIOLATION
+        rc, _out, err = self._add(("add", "qwen27"))
+        self.assertEqual(rc, 0, err)                    # never fatal to the mint
+        self.assertIn("MCP servers NOT written", err)
+        self.assertIn(priv, err)
+        self.assertIn("REFUSED", err)
+        self.assertNotIn(self.SECRET, err)
+        cdir = os.path.join(seat.seat_dir("qwen27"), "claude")
+        with open(os.path.join(cdir, ".claude.json")) as f:
+            self.assertNotIn("mcpServers", json.load(f))
+        # positive control: the global instructions still landed on this mint
+        self.assertTrue(os.path.islink(os.path.join(cdir, "rules",
+                                                    "global-instructions.md")))
+
+    def test_an_existing_real_claude_md_is_kept(self):
+        """The seat's own CLAUDE.md is its own: the global instructions arrive
+        beside it, never over it, and every byte the operator wrote stays."""
+        _priv, rules = self._sources()
+        d = seat.seat_dir("qwen27")
+        cdir = os.path.join(d, "claude")
+        os.makedirs(cdir)
+        own = os.path.join(cdir, "CLAUDE.md")
+        mine = b"# this seat's own rules\r\nkeep this line\r\n"
+        with open(own, "wb") as f:
+            f.write(mine)
+        rc, _out, err = self._add(("add", "qwen27"))
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.islink(own))
+        with open(own, "rb") as f:
+            body = f.read()
+        self.assertTrue(body.startswith(mine), body)          # the operator's bytes
+        self.assertEqual(os.readlink(os.path.join(cdir, "rules",
+                                                  "global-instructions.md")),
+                         os.path.realpath(rules))
+
+
 class SeatMultiTest(unittest.TestCase):
     """--multi (0.2 mixed-model fleets, premise multimodel-one-cc-proven-
     per-agent-frontmatter-no-fork): the launch line/env DROP the
@@ -4602,12 +6456,12 @@ class SeatMultiTest(unittest.TestCase):
         line = seat.launch_line("codex", multi=True)
         self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", line)  # the proven law
         base = seat.launch_line("codex")
-        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-6-astra", base)  # default intact
+        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-6.1-sol", base)  # default intact
         # everything else is byte-identical: removing the pin is the ONLY delta
-        self.assertEqual(base.replace(" CLAUDE_CODE_SUBAGENT_MODEL=gpt-6-astra", ""),
+        self.assertEqual(base.replace(" CLAUDE_CODE_SUBAGENT_MODEL=gpt-6.1-sol", ""),
                          line)
         # parent --model still rides; identity + scrub + ctx env intact
-        self.assertIn("--model gpt-6-astra", line)
+        self.assertIn("--model gpt-6.1-sol", line)
         # launch_line itself is the env/claude command (no token, no export —
         # the export prefix is added by the stdout print / launch.sh caller)
         self.assertTrue(line.startswith("env -u ANTHROPIC_API_KEY "), line)
@@ -4616,10 +6470,18 @@ class SeatMultiTest(unittest.TestCase):
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d"
                       % seat.FAMILIES["codex"]["max_context"], line)
 
+    #: The shipped Codex two-model probe order: new default, retained fallback.
+    PLANTED_PROBES = ("gpt-6.1-sol", "gpt-6-sol")
+
+    def _two_probe_codex(self):
+        return mock.patch.dict(seat.FAMILIES["codex"],
+                               {"probe_models": self.PLANTED_PROBES})
+
     def test_probe_agents_names_and_frontmatter(self):
-        probes = seat.probe_agents("codex")
-        self.assertEqual(probes, [("helm-probe-gpt-6-astra", "gpt-6-astra"),
-                                  ("helm-probe-gpt-5-6-sol", "gpt-5.6-sol")])
+        # THE SHIPPED CATALOG: new Codex default first, old default fallback.
+        probes = [("helm-probe-gpt-6-1-sol", "gpt-6.1-sol"),
+                  ("helm-probe-gpt-6-sol", "gpt-6-sol")]
+        self.assertEqual(seat.probe_agents("codex"), probes)
         self.assertEqual(seat.probe_agents("kimi"),
                          [("helm-probe-kimi-k3", "kimi-k3")])
         cdir = os.path.join(self.tmp, "cfg")
@@ -4635,7 +6497,7 @@ class SeatMultiTest(unittest.TestCase):
         seat._mint_probe_agents(cdir, "codex")
         self.assertEqual(len(os.listdir(os.path.join(cdir, "agents"))), 2)
 
-    def test_launch_verb_multi_mints_agents_and_launch_sh(self):
+    def test_launch_verb_multi_mints_agents_and_launch_sh(self):  # noqa: VACUOUS_ASSERTION — the exact two-file agent list is a positive control before the launch-line pin absence
         self._plant("home-a")
         self.assertEqual(self._add()[0], 0)
         out = io.StringIO()
@@ -4646,8 +6508,8 @@ class SeatMultiTest(unittest.TestCase):
         self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", line)
         d = seat.seat_dir("codex")
         agents = sorted(os.listdir(os.path.join(d, "claude", "agents")))
-        self.assertEqual(agents, ["helm-probe-gpt-5-6-sol.md",
-                                  "helm-probe-gpt-6-astra.md"])
+        self.assertEqual(agents, ["helm-probe-gpt-6-1-sol.md",
+                                  "helm-probe-gpt-6-sol.md"])
         with open(os.path.join(d, "launch.sh")) as f:
             sh = f.read()
         self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", sh)  # preset matches
@@ -4655,9 +6517,9 @@ class SeatMultiTest(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(seat.cmd_seat(["launch", "codex"]), 0)
-        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-6-astra", out.getvalue())
+        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-6.1-sol", out.getvalue())
         with open(os.path.join(d, "launch.sh")) as f:
-            self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-6-astra", f.read())
+            self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-6.1-sol", f.read())
 
     def test_resume_preserves_multi_shape(self):
         """A --multi seat re-minted on resume must NOT regain the pin — the pin's
@@ -4746,7 +6608,7 @@ class SeatMultiTest(unittest.TestCase):
             self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", env)
             # default (pinned) shape: the seat's OWN pin, never the ambient one
             env = seat._seat_env("codex", os.path.join(self.tmp, "smoke"))
-            self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "gpt-6-astra")
+            self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "gpt-6.1-sol")
 
     def test_smoke_multi_leg_skips_single_model_family(self):
         """kimi has one probe model — the fan-out leg SKIPs loudly and passes,
@@ -4823,9 +6685,13 @@ class SeatMultiTest(unittest.TestCase):
                          kwargs={"poll_interval": 0.05}, daemon=True).start()
         old_port = seat.FAMILIES["codex"]["port"]
         seat.FAMILIES["codex"]["port"] = proxy.server_address[1]
+        # codex ships two probe models; the patch pins this arm to the pair
+        # its wire_models literals name, so a later rotation cannot move it
+        planted = self._two_probe_codex()
+        planted.start()
         try:
             # leg 1: wire carries BOTH probe models -> PASS
-            calls["wire_models"] = ["gpt-6-astra", "gpt-5.6-sol"]
+            calls["wire_models"] = ["gpt-6.1-sol", "gpt-6-sol"]
             with mock.patch.object(seat.subprocess, "run", fake_run):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
@@ -4837,13 +6703,13 @@ class SeatMultiTest(unittest.TestCase):
             # the leg ran claude with NO pin and Task allowed, through its router
             self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", calls["env"])
             self.assertIn("Task", calls["cmd"])
-            self.assertIn("helm-probe-gpt-5-6-sol",
+            self.assertIn("helm-probe-gpt-6-sol",
                           calls["cmd"][calls["cmd"].index("-p") + 1])
             # probe agents were minted into the smoke config dir
             self.assertTrue(os.path.exists(os.path.join(
-                smoke_dir, "agents", "helm-probe-gpt-6-astra.md")))
+                smoke_dir, "agents", "helm-probe-gpt-6-1-sol.md")))
             # leg 2: reply perfect but the wire saw ONE model -> FAIL
-            calls["wire_models"] = ["gpt-5.6-sol"]
+            calls["wire_models"] = ["gpt-6-sol"]
             with mock.patch.object(seat.subprocess, "run", fake_run):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
@@ -4852,6 +6718,7 @@ class SeatMultiTest(unittest.TestCase):
             self.assertFalse(passed)
             self.assertIn("conductor log saw", out.getvalue())
         finally:
+            planted.stop()
             seat.FAMILIES["codex"]["port"] = old_port
             proxy.shutdown()
             proxy.server_close()
@@ -4920,7 +6787,11 @@ class LaunchAutocompactTimerSwitchTest(unittest.TestCase):
         line = out.strip()
         self.assertTrue(line.startswith("ANTHROPIC_AUTH_TOKEN=$(cat "), line)
         self.assertNotIn("\n", line)
-        self.assertNotIn("autocompact", out)
+        # The note never reaches stdout. Asserted on the note's own words: the
+        # launch line carries HELM_CHAT_ROOM, derived from the checkout's
+        # directory name, and a lane named for autocompact put the bare word
+        # there (task/3534's lane failed this arm on the room alone).
+        self.assertNotIn("autocompact timer", out)
         self.assertIn("helm seat: NOTE — autocompact timer not armed: install "
                       "skipped by HELM_AUTOCOMPACT_TIMER=0", err)
         self.assertNotIn("WARN — autocompact", err)
@@ -5384,10 +7255,12 @@ class SeatCpuCanaryTest(unittest.TestCase):
 
     # -- the surface: --ensure rows carry the canary, rc semantics ----------
     def _ensure_with(self, row, canary, args=(), pid=4321):
+        from helm import proxywatch
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(seat, "_ensure_row", return_value=row), \
                 mock.patch.object(seat, "_running_pid", return_value=pid), \
                 mock.patch.object(seat, "_cpu_canary", return_value=canary), \
+                mock.patch.object(proxywatch, "host_suspend_gap_s", return_value=0), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = seat._ensure(list(args))
         return rc, out.getvalue(), err.getvalue()
@@ -5501,10 +7374,14 @@ class SeatCpuCanaryTest(unittest.TestCase):
                 "seat": "codex", "family": "codex", "state": "healthy",
                 "shown": "healthy",
                 "detail": "pid 4321 port 8317 — cpu 3% over 60s",
+                # the seat's desired-down record (helm/seat_down.py) and why
+                # it could not be read: both absent for a supervised seat
+                "desired_down": None, "marker_error": None,
                 "cpu": {"state": "ok", "pct": 3.0, "window_s": 60.0,
                         "note": ""},
             }],
             "unknown": 0, "thrashing": 0, "cpu_unknown": 0, "rc": 0,
+            "down": 0, "marker_unreadable": 0,
             # the orca cred-follow rung rides every --ensure pass; the
             # MACHINE-read contract carries its verdict even when the human
             # surface stays silent about a steady state (task/2478). The
@@ -6015,7 +7892,8 @@ class ArtifactDenyIsMeasuredPerFamily(unittest.TestCase):
             with open(os.path.join(d, "settings.json"), "w") as fh:
                 fh.write('{"permissions":{"deny":[]}}')
             seat._seed_seat_settings(d, fam) if fam else seat._seed_seat_settings(d)
-            deny = json.load(open(os.path.join(d, "settings.json")))["permissions"]["deny"]
+            with open(os.path.join(d, "settings.json"), encoding="utf-8") as fh:
+                deny = json.load(fh)["permissions"]["deny"]
             self.assertIn(seat.PLAN_ENTRY_TOOL, deny, fam)
             self.assertEqual("Artifact" in deny, want, fam)
 
@@ -6028,6 +7906,84 @@ class ArtifactDenyIsMeasuredPerFamily(unittest.TestCase):
         self.assertEqual(seat.denied_tools("kimi"),
                          (seat.PLAN_ENTRY_TOOL,) + seat.SPAWN_DENIED_TOOLS)
         self.assertEqual(seat.denied_tools("not-a-family"), (seat.PLAN_ENTRY_TOOL,))
+
+
+class AnUnservedToolIsDeniedWhereItsFailureWasMeasured(unittest.TestCase):
+    """task/3242. Claude Code's WebSearch asks the UPSTREAM to run a server
+    search tool (`web_search_20250305`, read in the 2.1.283 bundle), and one
+    probe per family measured it failing on seven routes, the
+    local ones silently (zero links, then an instruction to cite sources that
+    invites invented ones), and working on native claude seats, on the codex
+    models and on gemini. A measured family declares `unserved_tools` and
+    loses WebSearch on both deny surfaces; every other family keeps it,
+    kimi and grok included until a probe measures them. The families are
+    read off the catalog's declarations, never a literal list, and each
+    absence is paired with a presence on the same surface."""
+
+    def test_every_measured_family_denies_it_on_both_surfaces(self):  # noqa: VACUOUS_ASSERTION — the count equality on `declared` runs unconditionally before the loop, so a sweep that found no family fails before any presence is read, and each presence below is an assertIn, never an absence
+        declared = sorted(f for f, fam in seat.FAMILIES.items()
+                          if fam.get("unserved_tools"))
+        self.assertEqual(len(declared), 7, declared)     # the seven measured
+        for fam in declared:
+            with self.subTest(family=fam):
+                tools = seat.FAMILIES[fam]["unserved_tools"]
+                self.assertEqual(tuple(tools), seat_catalog.UNSERVED_WEB_SEARCH)
+                deny = ProxySeatCannotSpawnThroughASkill._seeded_deny(fam)
+                argv = AProxySeatAdmitsACappedWorkflowOnItsOwnTier._denied_argv(
+                    seat.launch_line(fam))
+                for tool in tools:
+                    self.assertIn(tool, deny)
+                    self.assertIn(tool, argv)
+
+    def test_a_native_seat_and_a_measured_working_route_keep_it(self):  # noqa: VACUOUS_ASSERTION — the native list is pinned whole by equality before its absences, and inside the loop each surface's Artifact presence is asserted on the same list and argv before its WebSearch absence
+        # positive controls on the very surfaces the absences read: each
+        # seeded list and argv carries its own measured deny
+        native = ProxySeatCannotSpawnThroughASkill._seeded_deny(None)
+        self.assertEqual(native, [seat.PLAN_ENTRY_TOOL])
+        self.assertNotIn("WebSearch", native)
+        self.assertNotIn("WebSearch", seat.denied_tools(None))
+        for fam in ("gemini", "codex"):
+            with self.subTest(family=fam):
+                deny = ProxySeatCannotSpawnThroughASkill._seeded_deny(fam)
+                argv = AProxySeatAdmitsACappedWorkflowOnItsOwnTier._denied_argv(
+                    seat.launch_line(fam))
+                self.assertIn("Artifact", deny)
+                self.assertIn("Artifact", argv)
+                self.assertNotIn("WebSearch", deny)
+                self.assertNotIn("WebSearch", argv)
+
+    def test_exit_plan_mode_leaves_the_local_seats_only(self):
+        """task/3242's second half: 77 ExitPlanMode calls in one day were
+        one degenerate loop of "You are not in plan mode" refusals on the
+        local seats, so it joins LOCAL_UNUSED_TOOLS; every other seat keeps
+        it, because the owner may put a pane into plan mode by hand."""
+        self.assertIn("ExitPlanMode", seat_catalog.LOCAL_UNUSED_TOOLS)
+        local = [f for f, fam in seat.FAMILIES.items()
+                 if seat_catalog.own_box(fam)]
+        self.assertTrue(local)
+        for fam in local:
+            self.assertIn("ExitPlanMode", seat.denied_tools(fam), fam)
+        self.assertIn("Artifact", seat.denied_tools("codex"))
+        self.assertNotIn("ExitPlanMode", seat.denied_tools("codex"))
+        self.assertNotIn("ExitPlanMode", seat.denied_tools(None))
+
+    def test_the_artifact_push_and_question_tools_leave_the_local_seats(self):
+        """task/3382: ~17k tokens of schema on every local request and zero
+        calls; a local seat has no human at its keyboard to answer
+        AskUserQuestion. A native claude seat keeps every one of them."""
+        gone = ("Artifact", "ArtifactComments", "ArtifactData",
+                "PushNotification", "AskUserQuestion")
+        local = [f for f, fam in seat.FAMILIES.items()
+                 if seat_catalog.own_box(fam)]
+        self.assertTrue(local)
+        for tool in gone:
+            self.assertIn(tool, seat_catalog.LOCAL_UNUSED_TOOLS)
+            for fam in local:
+                self.assertIn(tool, seat.denied_tools(fam), (fam, tool))
+            self.assertNotIn(tool, seat.denied_tools(None), tool)
+        self.assertNotIn("AskUserQuestion", seat.denied_tools("codex"))
+        self.assertEqual(len(set(seat_catalog.LOCAL_UNUSED_TOOLS)),
+                         len(seat_catalog.LOCAL_UNUSED_TOOLS))
 
 
 class ProxySeatCannotSpawnThroughASkill(unittest.TestCase):
@@ -6044,7 +8000,8 @@ class ProxySeatCannotSpawnThroughASkill(unittest.TestCase):
     # the FAMILY catalog keys, spelled out so the arms cannot shrink with
     # the catalog they measure
     PROXY = ("codex", "kimi", "ds4pro", "ds4flash", "gemini", "grok",  # noqa: SEAT_NAME — family keys, the subject of the roster pin
-             "openrouter", "qwen27", "dots3", "opus46", "gptoss")
+             "openrouter", "qwen27", "dots3", "opus46", "gptoss",
+             "qwenlocal", "bonsai", "cursor")  # noqa: SEAT_NAME — family keys, the subject of the roster pin
 
     @staticmethod
     def child_payload(body):
@@ -6086,6 +8043,43 @@ class ProxySeatCannotSpawnThroughASkill(unittest.TestCase):
                                         "Artifact", "Skill", "Agent(fork)",
                                         "--dangerously-skip-permissions"])
         self.assertEqual(got[-1], "trailing-positional")
+
+    def test_the_local_seats_carry_the_land_path_on_every_turn(self):  # noqa: VACUOUS_ASSERTION — the loop is over a literal three-family tuple, so its assertIn positive controls always run
+        """The local families' `system_line` states the land path an
+        apprentice seat missed on its first assignment: no pull request, no
+        push, the tip goes to the mentor or integrator through helm dispatch,
+        tests only through fab, and never self-close. It rides the launch line
+        as --append-system-prompt, the argv word that reaches every turn; the
+        dots3 arm below proves such a line survives both shells as one
+        token."""
+        import shlex
+        from helm import seat_catalog
+        for fam in ("qwen27", "qwenlocal", "bonsai"):  # noqa: SEAT_NAME — catalog FAMILY keys, the local families this arm is about
+            line = seat.FAMILIES[fam]["system_line"]
+            self.assertTrue(line.isascii(), fam)
+            for phrase in ("pull request", "git push", "helm dispatch send",
+                           "--supersedes", "fab", "Never close your own task"):
+                self.assertIn(phrase, line, fam)
+            self.assertIn(" --append-system-prompt %s" % shlex.quote(line),
+                          seat.launch_line(fam), fam)
+            # THE CONTEXT DENY: the 12 unused tools leave, and so do the lite
+            # profile's four (task/3253: Workflow among them, since no local
+            # family declares a same-family delegate tier); everything a
+            # local reviewer or builder uses stays.
+            denied = seat_catalog.denied_tools(fam)
+            for tool in (seat_catalog.LOCAL_UNUSED_TOOLS
+                         + seat_catalog.LITE_UNUSED_TOOLS):
+                self.assertIn(tool, denied, fam)
+            for tool in ("Agent", "Bash", "Read", "Edit", "Write", "TaskStop"):
+                self.assertNotIn(tool, denied, fam)
+            # THE PUSH DENY: each rule rides the pane as ONE quoted token.
+            for rule in seat_catalog.LOCAL_PUSH_DENIES:
+                self.assertIn(rule, denied, fam)
+                self.assertIn(" %s" % shlex.quote(rule),
+                              seat.launch_line(fam), fam)
+        # the control: a family that declares neither deny keeps its list
+        self.assertNotIn("Workflow", seat_catalog.denied_tools("codex"))
+        self.assertNotIn("Bash(git push:*)", seat_catalog.denied_tools("codex"))
 
     def test_a_declared_system_line_arrives_as_ONE_argv_token(self):  # noqa: VACUOUS_ASSERTION — `got.index(...)` plus `assertEqual(got[i + 1], want)` is the unconditional positive control: a line that never reached the binary raises ValueError before the closing absence assertion is read
         """The same two-shell payload, for the family that declares a
@@ -6174,7 +8168,7 @@ class ProxySeatCannotSpawnThroughASkill(unittest.TestCase):
         with open(os.path.join(d, "settings.json")) as fh:
             return json.load(fh)["permissions"]["deny"]
 
-    def test_every_proxy_family_seeds_the_deny_and_claude_does_not(self):
+    def test_every_proxy_family_seeds_the_deny_and_claude_does_not(self):  # noqa: VACUOUS_ASSERTION — the codex seeded list is pinned whole by equality before the loop, and each iteration asserts plan entry present before any membership equality
         # unconditional positive control on the seeded file itself
         self.assertEqual(self._seeded_deny("codex"),
                          [seat.PLAN_ENTRY_TOOL, "Artifact", "Skill",
@@ -6184,7 +8178,11 @@ class ProxySeatCannotSpawnThroughASkill(unittest.TestCase):
                 deny = self._seeded_deny(fam)
                 self.assertIn(seat.PLAN_ENTRY_TOOL, deny)
                 self.assertEqual("Skill" in deny, want)
-                self.assertNotIn("Workflow", deny)   # task/2559: admitted, capped
+                # task/2559 admits Workflow, capped, everywhere but on a lite
+                # family with no same-family delegate tier (task/3253)
+                self.assertEqual("Workflow" in deny,
+                                 AProxySeatAdmitsACappedWorkflowOnItsOwnTier
+                                 .denies_workflow(fam))
                 self.assertEqual("Agent(fork)" in deny, want)
 
     def test_a_native_claude_seat_is_untouched(self):
@@ -6231,17 +8229,52 @@ class AProxySeatAdmitsACappedWorkflowOnItsOwnTier(unittest.TestCase):
     `env` map, the surface a resume inherits. The TIER is the proxy config's
     existing alias block: a workflow agent's model is sent upstream as a
     claude id and lands on the seat's own launch model or the family's tier
-    for that id, so an astra pane bursts into sol agents and a sol pane never
-    reaches astra. Literal spellings are pinned (the Artifact class says why);
+    for that id, so on a codex seat every agent runs gpt-6.1-sol, the model the
+    owner's ruling puts every codex on. Literal spellings are pinned (the
+    Artifact class says why);
     the last arm patches the cap and the door and shows the shipped producers
     follow, which is what proves the arms above observe them."""
 
     PROXY = ProxySeatCannotSpawnThroughASkill.PROXY
+
+    @staticmethod
+    def denies_workflow(family):
+        """The task/3253 reconciliation, spelled from the DECLARATIONS rather
+        than read back through denied_tools: a lite family with no
+        same-family delegate tier denies Workflow; every other family keeps
+        the capped tool this class pins."""
+        return bool(family) and seat_catalog.lite(family) \
+            and not seat.FAMILIES[family].get("subagent_tiers")
+
+    #: the proxy families the arms below measure: every one task/2559 still
+    #: admits Workflow on (the lite families that deny it are the lite
+    #: profile's arms, which pin the inverse)
+    ADMITS = tuple(filter(lambda f, denies=denies_workflow.__func__: not denies(f),
+                          PROXY))
     VAR = "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS"
     CAP = " CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS=4"
+
+    def test_the_admitting_set_is_the_catalog_less_the_lite_deniers(self):  # noqa: VACUOUS_ASSERTION — codex and kimi membership and a non-empty dropped list are asserted unconditionally, and each dropped family's Workflow presence precedes its two cap absences
+        """ADMITS narrows the loops below, so it is pinned: it is PROXY less
+        exactly the families that deny Workflow, it keeps the families the
+        literal controls name, and each family it drops denies Workflow on
+        the door and carries no cap, so nothing leaves these arms
+        unmeasured."""
+        self.assertIn("codex", self.ADMITS)
+        self.assertIn("kimi", self.ADMITS)
+        dropped = [f for f in self.PROXY if f not in self.ADMITS]
+        self.assertTrue(dropped, "no lite family denies Workflow")
+        for fam in dropped:
+            with self.subTest(family=fam):
+                self.assertIn("Workflow", seat.denied_tools(fam))
+                self.assertEqual(seat_catalog.workflow_cap_env(fam), ())
+                self.assertNotIn(self.VAR, seat.launch_line(fam))
     PAIR = " DISABLE_FEEDBACK_COMMAND=1 DISABLE_BUG_COMMAND=1"
-    ASTRA = "gpt-6-astra"
-    SOL = "gpt-5.6-sol"
+    #: the model every codex seat runs (CODEX_MODEL_RULING)
+    CODEX_DEFAULT = "gpt-6.1-sol"
+    #: a model a pane runs only when an operator pins it with --model: codex
+    #: still catalogues it (model_context), and no seat declares it
+    PINNED = "gpt-5.6-sol"
 
     @staticmethod
     def _frontmatter_deny(body):
@@ -6285,10 +8318,10 @@ class AProxySeatAdmitsACappedWorkflowOnItsOwnTier(unittest.TestCase):
         cdir = tempfile.mkdtemp(prefix="helm-tier-deny-codex-")
         seat._mint_probe_agents(cdir, "codex")
         with open(os.path.join(cdir, "agents",
-                               "helm-probe-gpt-6-astra.md")) as fh:
+                               "helm-probe-gpt-6-1-sol.md")) as fh:
             self.assertIn('disallowedTools: ["EnterPlanMode", "Artifact",'
                           ' "Skill", "Agent(fork)"]\n', fh.read())
-        for fam in self.PROXY:
+        for fam in self.ADMITS:
             with self.subTest(family=fam):
                 argv = self._denied_argv(seat.launch_line(fam))
                 self.assertEqual(argv[-2:], ["Skill", "Agent(fork)"])
@@ -6320,8 +8353,8 @@ class AProxySeatAdmitsACappedWorkflowOnItsOwnTier(unittest.TestCase):
         self.assertIn(" CLAUDE_CODE_AUTO_COMPACT_WINDOW=220000" + self.CAP
                       + self.PAIR + " claude --disallowedTools EnterPlanMode"
                       " Artifact Skill 'Agent(fork)' --dangerously-skip-permissions"
-                      " --model gpt-6-astra", seat.launch_line("codex"))
-        for fam in self.PROXY:
+                      " --model gpt-6.1-sol", seat.launch_line("codex"))
+        for fam in self.ADMITS:
             with self.subTest(family=fam):
                 line = seat.launch_line(fam)
                 head, sep, tail = line.partition(" claude --disallowedTools ")
@@ -6376,7 +8409,7 @@ class AProxySeatAdmitsACappedWorkflowOnItsOwnTier(unittest.TestCase):
     def test_the_seeded_settings_carry_the_cap_for_a_proxy_seat_and_not_for_claude(self):  # noqa: VACUOUS_ASSERTION — the codex equality on the first line is an unconditional positive on the seeded file; the native-door absence is a whole-file equality, not a lone assertNotIn
         # unconditional positive control on the seeded file itself
         self.assertEqual(self._seeded("codex")[0]["env"], {self.VAR: "4"})
-        for fam in self.PROXY:
+        for fam in self.ADMITS:
             with self.subTest(family=fam):
                 got, _p = self._seeded(fam)
                 self.assertEqual(got["env"], {self.VAR: "4"})
@@ -6400,16 +8433,16 @@ class AProxySeatAdmitsACappedWorkflowOnItsOwnTier(unittest.TestCase):
         got, _p = self._seeded("kimi", '{"env": "junk", "permissions": {"deny": []}}')
         self.assertEqual(got["env"], {self.VAR: "4"})
 
-    def test_a_workflow_agents_model_resolves_on_the_seats_own_tier(self):  # noqa: VACUOUS_ASSERTION — the astra table is pinned value-by-value before the sol seat's "never astra" absence, and the sol rows are pinned in full beside it
+    def test_a_workflow_agents_model_resolves_on_the_seats_own_tier(self):
         """Driven through the SHIPPED generator and read back through the
         SHIPPED block splitter and row reader — the path proxy_config_plan
-        walks — for the two panes the fleet mints: an astra seat and a sol
-        instance. The words a script writes (`opus`, `sonnet`, `fable`) are
-        resolved by CC's own table before they reach the wire — read in the
-        2.1.272 bundle: opus -> claude-opus-5, and in the 2.1.280 bundle
-        opus -> claude-opus-5-5; sonnet -> claude-sonnet-5, fable ->
-        claude-fable-5-1 in both — and those ids are the catalogued ones, so
-        what the rows say about them is what the upstream sees."""
+        walks — for the panes the fleet mints: every codex instance, each on
+        gpt-6.1-sol by the owner's ruling. The words a script writes (`opus`,
+        `sonnet`, `fable`) are resolved by CC's own table before they reach
+        the wire — read in the 2.1.272 bundle: opus -> claude-opus-5, and in
+        the 2.1.280 bundle opus -> claude-opus-5-5; sonnet -> claude-sonnet-5,
+        fable -> claude-fable-5-1 in both — and those ids are the catalogued
+        ones, so what the rows say about them is what the upstream sees."""
         from helm import seat_launch_assets as a, seat_catalog as c
         for word_id in ("claude-opus-5", "claude-opus-5-5", "claude-sonnet-5",
                         "claude-fable-5-1"):
@@ -6425,36 +8458,34 @@ class AProxySeatAdmitsACappedWorkflowOnItsOwnTier(unittest.TestCase):
             return [(row["alias"], row["name"])
                     for row in a._oauth_rows(blocks[0], "codex")]
 
-        # an astra seat: judgement ids stay on the pane, workers burst to sol
-        self.assertEqual(rows(self.ASTRA),
-                         [("claude-opus-5", self.ASTRA),
-                          ("claude-sonnet-5", self.SOL),
-                          ("claude-haiku-4-5-20251001", self.SOL),
-                          ("claude-fable-5-1", self.ASTRA),
-                          ("claude-haiku-4-5", self.SOL),
-                          ("claude-opus-5-5", self.ASTRA)])
-        # a sol-launched instance: one the shipped table declares (the fleet
-        # has such seats, or this control fails), the model the shipped
-        # instance mint hands the generator for it (the same call
-        # _mint_instance_proxy makes), and then every id is sol — a sol seat
-        # never escalates itself to astra
-        sol_seat = next((name for name, model in fam["instance_models"].items()
-                         if model == self.SOL), None)
-        self.assertIsNotNone(sol_seat, fam.get("instance_models"))
-        self.assertEqual(c.instance_launch_model(fam, sol_seat), self.SOL)
-        sol_rows = rows(c.instance_launch_model(fam, sol_seat))
-        self.assertEqual(sol_rows, [("claude-opus-5", self.SOL),
-                                    ("claude-sonnet-5", self.SOL),
-                                    ("claude-haiku-4-5-20251001", self.SOL),
-                                    ("claude-fable-5-1", self.SOL),
-                                    ("claude-haiku-4-5", self.SOL),
-                                    ("claude-opus-5-5", self.SOL)])
-        self.assertNotIn(self.ASTRA, [name for _alias, name in sol_rows])
-        # and the launch line of that instance pins the pane to sol too, so
-        # an agent that names no model inherits sol
-        line = seat.launch_line("codex", seat=sol_seat)
-        self.assertTrue(line.endswith(" --model " + self.SOL), line)
-        self.assertIn(" CLAUDE_CODE_SUBAGENT_MODEL=" + self.SOL + " ", line)
+        every_id_on_sol6 = [(alias, self.CODEX_DEFAULT)
+                            for alias in c.CC_AGENT_FRONTMATTER_MODELS]
+        # EVERY INSTANCE THE FLEET MINTS, through the model the shipped
+        # instance mint hands the generator (the same call
+        # _mint_instance_proxy makes): the family seat, the numbered seats
+        # the old table named, and one nobody ever named
+        instances = ("codex", "codex-2", "codex-4", "codex-7", "codex-97")  # noqa: SEAT_NAME — the codex instances whose launch model is this arm's subject
+        for seat_name in instances:
+            with self.subTest(seat=seat_name):
+                model = c.instance_launch_model(fam, seat_name)
+                self.assertEqual(model, self.CODEX_DEFAULT)
+                self.assertEqual(rows(model), every_id_on_sol6)
+                # and its launch line pins the pane to gpt-6.1-sol too, so an
+                # agent that names no model inherits it
+                line = seat.launch_line("codex", seat=seat_name)
+                self.assertTrue(line.endswith(" --model " + self.CODEX_DEFAULT), line)
+                self.assertIn(" CLAUDE_CODE_SUBAGENT_MODEL=" + self.CODEX_DEFAULT + " ",
+                              line)
+        # A PANE AN OPERATOR PINNED with --model: the judgement ids follow
+        # the pane, and the workers the tier table names still go to
+        # gpt-6.1-sol. That is the one place the table departs from the pane.
+        self.assertEqual(rows(self.PINNED),
+                         [("claude-opus-5", self.PINNED),
+                          ("claude-sonnet-5", self.CODEX_DEFAULT),
+                          ("claude-haiku-4-5-20251001", self.CODEX_DEFAULT),
+                          ("claude-fable-5-1", self.PINNED),
+                          ("claude-haiku-4-5", self.CODEX_DEFAULT),
+                          ("claude-opus-5-5", self.PINNED)])
 
     # the old helm carrier beside an operator env entry
     OLD_CARRIER = '{"permissions": {"deny": ["EnterPlanMode", "Artifact", "Skill", ' \
@@ -6504,7 +8535,7 @@ class AProxySeatAdmitsACappedWorkflowOnItsOwnTier(unittest.TestCase):
         fresh = self._seeded("codex")[0]
         self.assertEqual(fresh["permissions"]["deny"], self.HELM_SET)
         self.assertEqual(fresh["helm"], {"seeded_denies": self.HELM_SET})
-        for fam in self.PROXY:
+        for fam in self.ADMITS:
             with self.subTest(family=fam):
                 prior = json.dumps({"permissions": {"deny": ["EnterPlanMode", "Skill",
                                                              "Agent(fork)", "Workflow",
@@ -6516,11 +8547,15 @@ class AProxySeatAdmitsACappedWorkflowOnItsOwnTier(unittest.TestCase):
                 got, p, err = self._seeded_err(fam, prior)
                 deny = got["permissions"]["deny"]
                 self.assertNotIn("Workflow", deny)
+                # the family's own denies past the shared three (Artifact on
+                # codex, the context and push denies on the local families)
+                # land after the kept entries, in denied_tools order
+                extra = [t for t in seat.denied_tools(fam)
+                         if t not in ("EnterPlanMode", "Skill", "Agent(fork)")]
                 self.assertEqual(deny, ["EnterPlanMode", "Skill", "Agent(fork)", "WebFetch"]
-                                 + (["Artifact"] if "Artifact" in seat.denied_tools(fam) else []))
+                                 + extra)
                 self.assertEqual(got["helm"]["seeded_denies"],
-                                 ["EnterPlanMode", "Skill", "Agent(fork)"]
-                                 + (["Artifact"] if "Artifact" in seat.denied_tools(fam) else []))
+                                 ["EnterPlanMode", "Skill", "Agent(fork)"] + extra)
                 self.assertEqual(got["helm"]["note"], "kept")
                 self.assertEqual(got["env"], {"KEEP": "1", self.VAR: "4"})
                 self.assertEqual(err, "")            # a recorded retirement is silent
@@ -6852,6 +8887,31 @@ class RetireDenyIsTheDeliberateDoor(unittest.TestCase):
         self.assertIn("OWNER decision", out)
         self.assertIn("nothing in deploy or doctor runs it", out)
         self.assertEqual(self._bytes(*self.all), before)
+
+    def test_a_lite_family_that_denies_workflow_is_outside_the_sweep(self):  # noqa: VACUOUS_ASSERTION — the codex WOULD-REMOVE row on the same listing precedes the lite file's absence, and the apply's one REMOVED line precedes the byte equality
+        """task/3253: a lite family with no delegate tier denies Workflow
+        again, so its seats are not retirement candidates (a refresh would
+        seed the entry straight back) while every other proxy family's still
+        are, exactly as before: the verb is not refused, the sweep lists the
+        codex file and never the lite one, --apply leaves the lite file
+        byte-identical, and a --seat of the lite family is refused by name."""
+        lite = next(f for f in seat.FAMILIES
+                    if AProxySeatAdmitsACappedWorkflowOnItsOwnTier
+                    .denies_workflow(f))
+        mine = self._mint(lite, lite, {"permissions": {"deny": ["Workflow"]}})
+        before = self._bytes(mine)
+        rc, out, err = self._run(["Workflow"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn(self.row("WOULD-REMOVE", "codex", self.unrecorded), out)
+        self.assertNotIn(mine, out)
+        rc, out, err = self._run(["Workflow", "--apply"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.count("REMOVED"), 1)
+        self.assertEqual(self._bytes(mine), before)
+        rc, _out, err = self._run(["Workflow", "--seat", lite])
+        self.assertEqual(rc, 2)
+        self.assertIn("in %s's current deny set" % lite, err)
+        self.assertEqual(self._bytes(mine), before)
 
     def test_a_native_seat_is_outside_the_sweep(self):
         rc, _out, err = self._run(["Workflow", "--seat", "claude"])
@@ -7299,20 +9359,54 @@ class ProxyRoutesCoverEveryCataloguedModel(unittest.TestCase):
     """A seat still running a pre-rotation model attests against the same
     catalogue as the new default. codex-4, 2026-09-09: sol measured live on
     three seats in the hour astra became the default, and a default-only
-    route tuple would have dropped every one of their proxy proofs."""
+    route tuple would have dropped every one of their proxy proofs.
+
+    CODEX_MODEL_RULING rotates the default to gpt-6.1-sol while retaining
+    gpt-6-sol as the fallback probe; a running pane can still be on
+    gpt-6-astra or gpt-5.6-sol until relaunch. So the routes are every
+    CATALOGUED model, the
+    model_context keys included, not the probe list."""
     FAMILY = "codex"  # noqa: SEAT_NAME — configured family identity is the property under test
 
-    def test_default_leads_and_every_probe_model_is_an_exact_route(self):
+    def test_default_leads_and_every_catalogued_model_is_an_exact_route(self):
         routes = seat.proxy_routes(self.FAMILY)
         self.assertEqual(routes[0]["alias"], seat.FAMILIES[self.FAMILY]["model"])
         self.assertEqual([r["alias"] for r in routes],
-                         ["gpt-6-astra", "gpt-5.6-sol"])
+                         ["gpt-6.1-sol", "gpt-6-sol",
+                          "gpt-5.3-codex-spark", "gpt-6-astra",
+                          "gpt-5.6-sol"])
+        self.assertEqual([r["alias"] for r in routes],
+                         list(seat.family_catalogued_models(
+                             seat.FAMILIES[self.FAMILY])))
         for route in routes:
             self.assertEqual(route, {"alias": route["alias"],
                                      "provider": self.FAMILY,
                                      "upstream_model": route["alias"]})
             self.assertEqual(seat.proxy_route_family(route),
                              (self.FAMILY, None))
+
+    def test_a_pane_on_a_model_the_ruling_moved_off_keeps_its_proof(self):
+        """The rotation's own case: neither retired id is a probe model any
+        more, and each still resolves to exactly this family, so a pane
+        running it until its relaunch is attested rather than refused as
+        "unknown or ambiguous"."""
+        fam = seat.FAMILIES[self.FAMILY]
+        # POSITIVE CONTROL on the same tuple: it names the default and fallback,
+        # so the absences below are measured non-membership.
+        self.assertEqual(fam["probe_models"], ("gpt-6.1-sol", "gpt-6-sol"))
+        for model in ("gpt-6-astra", "gpt-5.6-sol"):
+            with self.subTest(model=model):
+                self.assertNotIn(model, fam["probe_models"])
+                self.assertIn(model, fam["model_context"])
+                route = {"alias": model, "provider": self.FAMILY,
+                         "upstream_model": model}
+                self.assertEqual(seat.proxy_route_family(route),
+                                 (self.FAMILY, None))
+        # CONTROL on the same resolver: an id codex does not catalogue at all
+        # is still no route, so the union did not become "any codex-ish id"
+        self.assertIsNone(seat.proxy_route_family(
+            {"alias": "gpt-6-luna", "provider": self.FAMILY,
+             "upstream_model": "gpt-6-luna"})[0])
 
     def test_the_union_widens_the_model_list_never_the_match(self):
         exact = {"alias": "gpt-5.6-sol", "provider": self.FAMILY,
@@ -7489,7 +9583,7 @@ class TheOpusFiveFiveIdRoutesWhereClaudeOpusFiveRoutes(unittest.TestCase):
         port = seat._instance_port("codex", "seat-under-test")
         with mock.patch.object(c, "CC_AGENT_FRONTMATTER_MODELS", self.BEFORE):
             old = a._config_yaml(port, auth, "inbound-secret", channel="codex",
-                                 model="gpt-6-astra", family="codex")
+                                 model="gpt-6.1-sol", family="codex")
         self.assertNotIn(self.NEW, old)
         with open(path, "w", encoding="utf-8") as f:
             f.write(old)
@@ -7501,7 +9595,7 @@ class TheOpusFiveFiveIdRoutesWhereClaudeOpusFiveRoutes(unittest.TestCase):
         by = {row["alias"]: row["name"]
               for row in a._oauth_rows(blocks[0], "codex")}
         self.assertEqual(by[self.NEW], by["claude-opus-5"])
-        self.assertEqual(by[self.NEW], "gpt-6-astra")
+        self.assertEqual(by[self.NEW], "gpt-6.1-sol")
         # the earlier rows keep their order and the new row is the block's last
         self.assertEqual(list(by), list(self.BEFORE) + [self.NEW])
         self.assertTrue(plan["text"].startswith(old.split("oauth-model-alias:")[0]))
@@ -7511,16 +9605,19 @@ class TheOpusFiveFiveIdRoutesWhereClaudeOpusFiveRoutes(unittest.TestCase):
         self.assertFalse(settled["changed"])
         self.assertIsNone(settled["alias_drift"])
         _route, token, _indexes, why = proxywatch._proxy_config_route(
-            path, "gpt-6-astra")
+            path, "gpt-6.1-sol")
         self.assertIsNone(why)
         self.assertEqual(token, "inbound-secret")
 
 
 class AProxyFamilyDeclaresAModelPerSubagentTier(unittest.TestCase):
-    """Owner shape: "one codex TLA pane should burst into
-    gpt-5.6-sol WORKERS and gpt-6-astra CHECKERS ... without a second pane, and
-    the same knob must let a new family (kimi) map everything to its one
-    model".
+    """The knob that routes a subagent by its frontmatter id, and the
+    same knob must let a new family (kimi) map everything to its one model.
+    Codex declares it for its WORKERS (sonnet, haiku): gpt-6.1-sol, the model
+    the owner's ruling puts every codex on (CODEX_MODEL_RULING). On a
+    gpt-6.1-sol pane every row is gpt-6.1-sol; the table departs from the pane
+    only on a pane an operator pinned to another model with --model, which
+    is why these arms drive such a pane.
 
     The knob is seat_catalog's per-family `subagent_tiers` table. A subagent's
     model is decided by ITS OWN frontmatter id (task/1948: the
@@ -7531,14 +9628,19 @@ class AProxyFamilyDeclaresAModelPerSubagentTier(unittest.TestCase):
     `seat doctor --ensure` decides STALE with, and the catalog's own validator.
     """
 
-    ASTRA = "gpt-6-astra"
-    SOL = "gpt-5.6-sol"
+    #: a pane an operator pinned with --model: a model codex still
+    #: catalogues (model_context) and no seat declares
+    PANE = "gpt-5.6-sol"
+    #: the worker tier, which is the model every codex seat runs
+    TIER = "gpt-6.1-sol"
+    #: what a codex config minted before the ruling names on every row
+    RETIRED = "gpt-6-astra"
     SEAT = "seat-under-test"
 
     def _codex_config(self):
         from helm import seat_launch_assets as a
         return a._config_yaml(8317, "/auth", "tok", channel="codex",
-                              model=self.ASTRA, family="codex")
+                              model=self.PANE, family="codex")
 
     def _rows(self, text, channel="codex"):
         """The rows the SHIPPED reader reads back, through the SHIPPED block
@@ -7556,23 +9658,27 @@ class AProxyFamilyDeclaresAModelPerSubagentTier(unittest.TestCase):
         y = self._codex_config()
         rows = self._rows(y)
         # THE MAPPING IS TRANSCRIBED ON PURPOSE, once: it is the owner's
-        # sentence, not a value to be derived from the table under test (a
+        # ruling, not a value to be derived from the table under test (a
         # derived expectation would pass just as happily with the tiers
         # swapped, which is the failure this arm exists to catch).
-        # TWO OF THESE FOUR ROWS COME FROM THE TABLE and two from the
-        # DEFAULT: only sonnet and haiku declare a tier, while opus and fable
-        # follow the seat's launch model — which is `model=self.ASTRA` here,
-        # so this pane's rows are unchanged, and a sol pane's opus row is sol
-        # (AnInstanceDeclaresItsOwnLaunchModel).
+        # THREE OF THESE ROWS COME FROM THE TABLE and three from the
+        # DEFAULT: only sonnet and the two haiku ids declare a tier, while
+        # opus and fable follow the seat's launch model — which is
+        # `model=self.PANE` here, a pinned pane, so the two sources are told
+        # apart on this pane and nowhere else.
         self.assertEqual([(row["name"], row["alias"], row["fork"]) for row in rows],
-                         [(self.ASTRA, "claude-opus-5", "true"),
-                          (self.SOL, "claude-sonnet-5", "true"),
-                          (self.SOL, "claude-haiku-4-5-20251001", "true"),
-                          (self.ASTRA, "claude-fable-5-1", "true"),
-                          (self.SOL, "claude-haiku-4-5", "true"),
-                          (self.ASTRA, "claude-opus-5-5", "true")])
-        # the burst is REAL: checkers and workers are two different models
-        self.assertNotEqual(self.ASTRA, self.SOL)
+                         [(self.PANE, "claude-opus-5", "true"),
+                          (self.TIER, "claude-sonnet-5", "true"),
+                          (self.TIER, "claude-haiku-4-5-20251001", "true"),
+                          (self.PANE, "claude-fable-5-1", "true"),
+                          (self.TIER, "claude-haiku-4-5", "true"),
+                          (self.PANE, "claude-opus-5-5", "true")])
+        # the table is REAL on this pane: its rows and the pane's are two
+        # different models
+        self.assertNotEqual(self.PANE, self.TIER)
+        # and the table itself names gpt-6.1-sol on every row it declares
+        self.assertEqual(set(c.FAMILIES["codex"]["subagent_tiers"].values()),
+                         {c.CODEX_MODEL_RULING["model"]})
         # one row per catalogued id, in the catalogue's order, nothing more
         self.assertEqual([row["alias"] for row in rows],
                          list(c.CC_AGENT_FRONTMATTER_MODELS))
@@ -7679,12 +9785,12 @@ class AProxyFamilyDeclaresAModelPerSubagentTier(unittest.TestCase):
         from helm import seat_catalog as c
         rows = self._rows(self._codex_config())
         by_alias = {row["alias"]: row["name"] for row in rows}
-        self.assertEqual(by_alias, {"claude-opus-5": self.ASTRA,
-                                    "claude-fable-5-1": self.ASTRA,
-                                    "claude-sonnet-5": self.SOL,
-                                    "claude-haiku-4-5-20251001": self.SOL,
-                                    "claude-haiku-4-5": self.SOL,
-                                    "claude-opus-5-5": self.ASTRA})
+        self.assertEqual(by_alias, {"claude-opus-5": self.PANE,
+                                    "claude-fable-5-1": self.PANE,
+                                    "claude-sonnet-5": self.TIER,
+                                    "claude-haiku-4-5-20251001": self.TIER,
+                                    "claude-haiku-4-5": self.TIER,
+                                    "claude-opus-5-5": self.PANE})
         self.assertEqual(len(by_alias), len(c.CC_AGENT_FRONTMATTER_MODELS))
         # the two models are read back DISTINCT — a parser that kept only the
         # first name would satisfy every other assertion here
@@ -7695,9 +9801,10 @@ class AProxyFamilyDeclaresAModelPerSubagentTier(unittest.TestCase):
         seat_launch_assets.proxy_config_plan (seat_health._config_drift_lines
         and the ensure sweep both read `changed`; seat_proxy._up regenerates
         from the same plan before starting the sidecar). So the arm drives THAT
-        function, over a file holding what every minted codex instance carries
-        on disk today — the same generator with no family named, which is the
-        pre-table shape every minted codex config on this host carries."""
+        function, over a file a codex instance minted on gpt-6-astra carries —
+        the same generator with no family named, every row on that pane's
+        model. The owner's ruling moves that seat to gpt-6.1-sol, so the plan
+        must read it stale and rewrite every row, the tiered ones included."""
         import tempfile
         from helm import seat                      # seeds the impl modules
         from helm import seat_launch_assets as a
@@ -7713,20 +9820,21 @@ class AProxyFamilyDeclaresAModelPerSubagentTier(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             f.write(a._config_yaml(seat._instance_port("codex", self.SEAT),
                                    auth, "inbound-secret", channel="codex",
-                                   model=self.ASTRA))
+                                   model=self.RETIRED))
         plan = a.proxy_config_plan(path, "codex", self.SEAT)
         self.assertTrue(plan["changed"])
-        # the reason NAMES a tiered row, so an operator reading the doctor line
-        # learns which id moved rather than "policy differs"
-        self.assertIn("claude-sonnet-5", plan["alias_drift"])
+        # the reason NAMES the first row that moved, so an operator reading
+        # the doctor line learns which id moved rather than "policy differs"
+        self.assertIn("claude-opus-5", plan["alias_drift"])
         self.assertEqual([(row["name"], row["alias"])
                           for row in self._rows(plan["text"])],
-                         [(self.ASTRA, "claude-opus-5"),
-                          (self.SOL, "claude-sonnet-5"),
-                          (self.SOL, "claude-haiku-4-5-20251001"),
-                          (self.ASTRA, "claude-fable-5-1"),
-                          (self.SOL, "claude-haiku-4-5"),
-                          (self.ASTRA, "claude-opus-5-5")])
+                         [(self.TIER, "claude-opus-5"),
+                          (self.TIER, "claude-sonnet-5"),
+                          (self.TIER, "claude-haiku-4-5-20251001"),
+                          (self.TIER, "claude-fable-5-1"),
+                          (self.TIER, "claude-haiku-4-5"),
+                          (self.TIER, "claude-opus-5-5")])
+        self.assertNotIn(self.RETIRED, plan["text"])
         # custody survived the rewrite: the inbound bearer and the auth-dir are
         # the file's, not the generator's idea of them
         self.assertIn('  - "inbound-secret"', plan["text"])
@@ -7758,7 +9866,7 @@ class AProxyFamilyDeclaresAModelPerSubagentTier(unittest.TestCase):
         # module proxywatch itself imports, and identical to the catalog's.
         self.assertIs(seat.family_catalogued_models,
                       seat_catalog.family_catalogued_models)
-        self.assertIn(self.SOL,
+        self.assertIn(self.TIER,
                       seat.family_catalogued_models(seat.FAMILIES["codex"]))
         # and proxywatch really does reach it by that spelling — read off the
         # shipped source, so a rename to a direct import updates this arm
@@ -7775,63 +9883,66 @@ class AProxyFamilyDeclaresAModelPerSubagentTier(unittest.TestCase):
         # generator, whose tier rows come from subagent_tier_model, and pin the
         # module its call site imports from.
         y = seat_launch_assets._config_yaml(
-            8317, "/auth", "tok", channel="codex", model=self.ASTRA,
+            8317, "/auth", "tok", channel="codex", model=self.PANE,
             family="codex")
-        self.assertIn('    - name: "%s"\n' % self.SOL, y)
+        self.assertIn('    - name: "%s"\n' % self.TIER, y)
         self.assertIn("from .seat_catalog import",
                       inspect.getsource(
                           seat_launch_assets._frontmatter_alias_yaml))
 
 
 class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
-    """Owner: "we may want to consider using sol agents as the standard and
-    only 1 astra for planning/landing" (canon
-    sol-is-the-codex-standard-one-astra-plans-and-lands).
+    """One family entry, one OAuth cred pool, two models across panes:
+    `instance_models` (seat_catalog) names a model per instance.
 
-    THE SENTENCE NEEDS A KNOB THE FAMILY MODEL CANNOT BE. `seat doctor
-    --ensure` regenerates every instance's config.yaml and launch.sh from the
-    generator on a cron, so a hand edit is reverted within the minute and only
-    a declaration the generator READS can say "this seat runs sol". Without
-    one, `proxy_config_plan` and `launch_line` answer for two codex instances
-    exactly as they answer for one: gpt-6-astra on the opus row, changed=False,
-    `CLAUDE_CODE_SUBAGENT_MODEL=gpt-6-astra CLAUDE_CODE_MAX_CONTEXT_TOKENS=220000`
-    — measured on the live configs of both seats before this table existed.
+    THE SHIPPED CATALOG DECLARES NO TABLE. Codex once split instances across
+    gpt-5.6-sol and gpt-6-astra; CODEX_MODEL_RULING supersedes that split: the
+    family model is gpt-6.1-sol and every codex instance launches on it. The
+    first arm pins that.
 
-    `instance_models` (seat_catalog) is the declaration, and every arm here
-    drives a SHIPPED producer through it: the desired-state planner
-    `seat doctor --ensure` decides STALE with, the config generator, the
-    launch line, and the catalog's own import gate.
+    THE MECHANISM STAYS, because a declaration is the only knob `seat doctor
+    --ensure` cannot revert: it regenerates every instance's config.yaml and
+    launch.sh from the generator on a cron, so a hand edit is gone within the
+    minute. The arms that drive it PLANT a table on codex's entry for the
+    arm's duration (`_planted`), naming gpt-5.6-sol, a model codex still
+    catalogues (model_context), and every arm drives a SHIPPED producer
+    through it: the desired-state planner `seat doctor --ensure` decides
+    STALE with, the config generator, the launch line, and the catalog's own
+    import gate.
     """
 
-    ASTRA = "gpt-6-astra"
-    SOL = "gpt-5.6-sol"
-    # REAL SEAT IDENTITIES, DELIBERATELY: this class is about what the SHIPPED
-    # catalog declares, and the owner's sentence names these seats -- a house
-    # fixture name here would assert a world no seat runs in. They are named
-    # ONCE, so every arm below reads the declaration through these two.
-    SOL_SEATS = ("codex-4", "codex-5", "codex-8", "codex-9")  # noqa: SEAT_NAME — the shipped declaration is this class's subject
-    ASTRA_SEAT = "codex-7"  # noqa: SEAT_NAME — the planning and landing seat is this class's subject
+    #: the model every codex instance runs (CODEX_MODEL_RULING)
+    FAMILY_MODEL = "gpt-6.1-sol"
+    #: the model the planted table names: catalogued, and wider than the
+    #: family model, so the window an instance is taught tells them apart
+    DECLARED = "gpt-5.6-sol"
+    # REAL SEAT IDENTITIES, DELIBERATELY: the superseded declaration named
+    # these seats, and the first arm asks the shipped catalog about exactly
+    # them -- a house fixture name there would assert a world no seat runs
+    # in. The planted table names the same seats, so the mechanism arms ask
+    # about the shape the fleet ran.
+    DECLARED_SEATS = ("codex-4", "codex-5", "codex-8", "codex-9")  # noqa: SEAT_NAME — the superseded declaration is this class's subject
+    PLAIN_SEAT = "codex-7"  # noqa: SEAT_NAME — the seat the superseded declaration left on the family model is this class's subject
     # a codex instance NOBODY declares: the house fixture spelling this suite
     # already uses for a minted codex instance, so the fallback arm asks about
     # an undeclared seat without naming a live one.
     UNDECLARED_SEAT = "codex-97"
-    # TODAY'S BYTES: the tail of the file `seat doctor --ensure` last wrote
-    # for the astra seat on this host, pinned rather than
+    # TODAY'S BYTES for a seat on the family model, pinned rather than
     # derived from the table under test -- a derived expectation would follow
     # `instance_models` wherever it moved, and following it is the one thing
-    # this control exists to refuse. That seat is the planning and landing one
-    # and declares NOTHING, so its config must not move by a byte.
-    TODAYS_ASTRA_TAIL = (
+    # this control exists to refuse. A seat that declares NOTHING must not
+    # move by a byte when a sibling declares a model.
+    TODAYS_TAIL = (
         "# built-in subagent frontmatter ids -> this family's model (task/1948)\n"
         "# (per id where the family declares subagent_tiers: one pane, two models)\n"
         "oauth-model-alias:\n"
         "  codex:\n"
-        '    - name: "gpt-6-astra"\n      alias: "claude-opus-5"\n      fork: true\n'
-        '    - name: "gpt-5.6-sol"\n      alias: "claude-sonnet-5"\n      fork: true\n'
-        '    - name: "gpt-5.6-sol"\n      alias: "claude-haiku-4-5-20251001"\n      fork: true\n'
-        '    - name: "gpt-6-astra"\n      alias: "claude-fable-5-1"\n      fork: true\n'
-        '    - name: "gpt-5.6-sol"\n      alias: "claude-haiku-4-5"\n      fork: true\n'
-        '    - name: "gpt-6-astra"\n      alias: "claude-opus-5-5"\n      fork: true\n')
+        '    - name: "gpt-6.1-sol"\n      alias: "claude-opus-5"\n      fork: true\n'
+        '    - name: "gpt-6.1-sol"\n      alias: "claude-sonnet-5"\n      fork: true\n'
+        '    - name: "gpt-6.1-sol"\n      alias: "claude-haiku-4-5-20251001"\n      fork: true\n'
+        '    - name: "gpt-6.1-sol"\n      alias: "claude-fable-5-1"\n      fork: true\n'
+        '    - name: "gpt-6.1-sol"\n      alias: "claude-haiku-4-5"\n      fork: true\n'
+        '    - name: "gpt-6.1-sol"\n      alias: "claude-opus-5-5"\n      fork: true\n')
 
     def setUp(self):
         from helm import seat_catalog
@@ -7840,6 +9951,12 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.d, True)
         self.auth = os.path.join(self.d, "auth")
         os.makedirs(self.auth)
+
+    def _planted(self):
+        """The mechanism's table, on codex's live entry for one arm: every
+        DECLARED_SEATS instance on DECLARED, restored when the arm ends."""
+        return mock.patch.dict(self.fam, {"instance_models": {
+            name: self.DECLARED for name in self.DECLARED_SEATS}})
 
     def _rows(self, text, channel="codex"):
         """The rows the SHIPPED reader reads back — `_top_blocks` then
@@ -7859,36 +9976,37 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             f.write(a._config_yaml(seat._instance_port("codex", seat_name),
                                    self.auth, "inbound-secret", channel="codex",
-                                   model=self.ASTRA, family="codex"))
+                                   model=self.FAMILY_MODEL, family="codex"))
         return path
 
-    def test_the_shipped_catalog_declares_sol_seats_and_leaves_one_on_astra(self):
-        """The declaration itself, read through the resolver every producer
-        below uses. The owner's sentence is transcribed once — a set derived
-        from the table would pass just as happily with the astra seat on sol."""
+    def test_the_shipped_catalog_puts_every_codex_instance_on_gpt61_sol(self):  # noqa: VACUOUS_ASSERTION — the absent table sits beside the resolver answering gpt-6.1-sol for every transcribed instance, which is the positive reading of the same declaration
+        """The owner's ruling, read through the resolver every producer
+        below uses. The seats are transcribed -- the ones the superseded
+        declaration split, the seat it left on astra, the family seat and one
+        nobody named -- so a table that put any of them back on another model
+        reddens here."""
         from helm import seat_catalog as c
-        for seat_name in self.SOL_SEATS:
+        self.assertEqual(c.CODEX_MODEL_RULING["model"], self.FAMILY_MODEL)
+        self.assertEqual(self.fam["model"], self.FAMILY_MODEL)
+        self.assertIsNone(self.fam.get("instance_models"))
+        others = ("codex", "codex-2", "codex-3", "codex-6")  # noqa: SEAT_NAME — the codex instances the superseded declaration left undeclared are this arm's subject
+        for seat_name in others + (self.PLAIN_SEAT, self.UNDECLARED_SEAT) \
+                + self.DECLARED_SEATS:
             with self.subTest(seat=seat_name):
                 self.assertEqual(c.instance_launch_model(self.fam, seat_name),
-                                 self.SOL)
-        # THE ONE ASTRA SEAT, and the family default it inherits by declaring
-        # nothing -- so the planning seat cannot be moved by an edit to the
-        # instance table alone. The POSITIVE CONTROL is unconditional and on
-        # the same mapping: it is a table that DOES name seats, so the absence
-        # below is a measured non-membership rather than an empty dict.
-        declared = self.fam.get("instance_models")
-        self.assertIn(self.SOL_SEATS[0], declared)
-        self.assertNotIn(self.ASTRA_SEAT, declared)
-        self.assertEqual(c.instance_launch_model(self.fam, self.ASTRA_SEAT), self.ASTRA)
-        self.assertEqual(self.fam["model"], self.ASTRA)
-        # a seat of ANOTHER family, and a seat name nobody declared: the
-        # family model, which is byte-for-byte what every caller passed before
-        # this table existed
+                                 self.FAMILY_MODEL)
+        # Every declared tier names the default; the probe list also retains
+        # the superseded default as its fallback.
+        self.assertEqual(self.fam["probe_models"],
+                         (self.FAMILY_MODEL, "gpt-6-sol"))
+        self.assertEqual(set(self.fam["subagent_tiers"].values()),
+                         {self.FAMILY_MODEL})
+        # a seat of ANOTHER family: the family model, which is byte-for-byte
+        # what every caller passed before the table existed
         self.assertEqual(c.instance_launch_model(c.FAMILIES["kimi"], "kimi"),
                          c.FAMILIES["kimi"]["model"])
-        self.assertEqual(c.instance_launch_model(self.fam, self.UNDECLARED_SEAT), self.ASTRA)
 
-    def test_doctor_desired_state_moves_a_declared_seat_to_sol_and_leaves_the_astra_one(self):
+    def test_doctor_desired_state_moves_a_declared_seat_and_leaves_an_undeclared_one(self):
         """`helm seat doctor --ensure` decides STALE with
         `proxy_config_plan` (seat_health._config_drift_lines and the ensure
         sweep read `changed`; seat_proxy._up regenerates from the same plan
@@ -7897,69 +10015,78 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
         next sweep."""
         from helm import seat, seat_launch_assets as a   # seeds the impl modules
         del seat
-        # THE CONTROL, and it is this arm's whole premise: the same file shape
-        # for the seat that declares NOTHING is already the desired state, so
-        # every difference below is attributable to the declaration.
-        settled = a.proxy_config_plan(self._todays_config(self.ASTRA_SEAT), "codex", self.ASTRA_SEAT)
-        self.assertFalse(settled["changed"])
-        self.assertIsNone(settled["alias_drift"])
-        self.assertTrue(settled["old"].endswith(self.TODAYS_ASTRA_TAIL),
-                        settled["old"][-600:])
+        with self._planted():
+            # THE CONTROL, and it is this arm's whole premise: the same file
+            # shape for the seat that declares NOTHING is already the desired
+            # state, so every difference below is attributable to the
+            # declaration.
+            settled = a.proxy_config_plan(self._todays_config(self.PLAIN_SEAT),
+                                          "codex", self.PLAIN_SEAT)
+            self.assertFalse(settled["changed"])
+            self.assertIsNone(settled["alias_drift"])
+            self.assertTrue(settled["old"].endswith(self.TODAYS_TAIL),
+                            settled["old"][-600:])
 
-        path = self._todays_config(self.SOL_SEATS[0])
-        plan = a.proxy_config_plan(path, "codex", self.SOL_SEATS[0])
-        self.assertTrue(plan["changed"])
-        # the reason NAMES the id that moved, so an operator reading the
-        # doctor line learns which row changed rather than "policy differs"
-        self.assertIn("claude-opus-5", plan["alias_drift"])
-        # EVERY row is sol: the judgement ids follow the seat's own launch
-        # model, which is what stops a sol seat escalating its own checkers
-        # back to the model the owner moved off.
-        self.assertEqual(self._rows(plan["text"]),
-                         [(self.SOL, "claude-opus-5"),
-                          (self.SOL, "claude-sonnet-5"),
-                          (self.SOL, "claude-haiku-4-5-20251001"),
-                          (self.SOL, "claude-fable-5-1"),
-                          (self.SOL, "claude-haiku-4-5"),
-                          (self.SOL, "claude-opus-5-5")])
-        self.assertNotIn(self.ASTRA, plan["text"])
-        # custody survived the rewrite: the inbound bearer and the auth-dir
-        # are the file's, not the generator's idea of them
-        self.assertIn('  - "inbound-secret"', plan["text"])
-        self.assertIn(self.auth, plan["text"])
-        # AND IT SETTLES -- a plan that stayed `changed` would respawn the
-        # sidecar every three minutes forever
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(plan["text"])
-        again = a.proxy_config_plan(path, "codex", self.SOL_SEATS[0])
-        self.assertFalse(again["changed"])
-        self.assertIsNone(again["alias_drift"])
+            path = self._todays_config(self.DECLARED_SEATS[0])
+            plan = a.proxy_config_plan(path, "codex", self.DECLARED_SEATS[0])
+            self.assertTrue(plan["changed"])
+            # the reason NAMES the id that moved, so an operator reading the
+            # doctor line learns which row changed rather than "policy differs"
+            self.assertIn("claude-opus-5", plan["alias_drift"])
+            # the judgement ids follow the seat's own launch model and the
+            # workers keep the family's tier: the table moves the PANE, and
+            # the tier table still decides where its workers go
+            self.assertEqual(self._rows(plan["text"]),
+                             [(self.DECLARED, "claude-opus-5"),
+                              (self.FAMILY_MODEL, "claude-sonnet-5"),
+                              (self.FAMILY_MODEL, "claude-haiku-4-5-20251001"),
+                              (self.DECLARED, "claude-fable-5-1"),
+                              (self.FAMILY_MODEL, "claude-haiku-4-5"),
+                              (self.DECLARED, "claude-opus-5-5")])
+            # custody survived the rewrite: the inbound bearer and the
+            # auth-dir are the file's, not the generator's idea of them
+            self.assertIn('  - "inbound-secret"', plan["text"])
+            self.assertIn(self.auth, plan["text"])
+            # AND IT SETTLES -- a plan that stayed `changed` would respawn the
+            # sidecar every three minutes forever
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(plan["text"])
+            again = a.proxy_config_plan(path, "codex", self.DECLARED_SEATS[0])
+            self.assertFalse(again["changed"])
+            self.assertIsNone(again["alias_drift"])
 
     def test_the_launch_line_carries_the_instance_model_and_its_window(self):
         """The pane's own model and the window CC is told, from
         `launch_line` -- the function `seat launch` prints and
         `_write_launch_assets` bakes into launch.sh."""
         from helm import seat
-        sol = seat.launch_line("codex", seat=self.SOL_SEATS[0])
-        astra = seat.launch_line("codex", seat=self.ASTRA_SEAT)
-        self.assertIn(" CLAUDE_CODE_SUBAGENT_MODEL=%s " % self.SOL, sol)
-        self.assertIn(" CLAUDE_CODE_MAX_CONTEXT_TOKENS=320000 ", sol)
-        # THE CONTROL on the same observable: the undeclared seat is today's
-        # line, window included -- 220000 is astra's model_context entry and
-        # 320000 is sol's, so the window follows the INSTANCE model rather
-        # than the family's max_context.
-        self.assertIn(" CLAUDE_CODE_SUBAGENT_MODEL=%s " % self.ASTRA, astra)
-        self.assertIn(" CLAUDE_CODE_MAX_CONTEXT_TOKENS=220000 ", astra)
-        self.assertNotIn(self.SOL, astra)
-        # AN EXPLICIT CHOICE STILL OUTRANKS THE DECLARATION for that pane:
-        # `seat launch --model` and the persisted choice seat.py re-derives
-        # both arrive as this argument.
-        pinned = seat.launch_line("codex", model="gpt-5.3-codex-spark",
-                                  seat=self.SOL_SEATS[0])
+        with self._planted():
+            declared = seat.launch_line("codex", seat=self.DECLARED_SEATS[0])
+            plain = seat.launch_line("codex", seat=self.PLAIN_SEAT)
+            # AN EXPLICIT CHOICE STILL OUTRANKS THE DECLARATION for that pane:
+            # `seat launch --model` and the persisted choice seat.py
+            # re-derives both arrive as this argument.
+            pinned = seat.launch_line("codex", model="gpt-5.3-codex-spark",
+                                      seat=self.DECLARED_SEATS[0])
+        self.assertIn(" CLAUDE_CODE_SUBAGENT_MODEL=%s " % self.DECLARED, declared)
+        self.assertIn(" CLAUDE_CODE_MAX_CONTEXT_TOKENS=320000 ", declared)
+        # THE CONTROL on the same observable: the undeclared seat is the
+        # family model's line, window included -- 220000 is gpt-6.1-sol's
+        # model_context entry and 320000 is gpt-5.6-sol's, so the window
+        # follows the INSTANCE model rather than the family's max_context.
+        self.assertIn(" CLAUDE_CODE_SUBAGENT_MODEL=%s " % self.FAMILY_MODEL, plain)
+        self.assertIn(" CLAUDE_CODE_MAX_CONTEXT_TOKENS=220000 ", plain)
+        self.assertNotIn(self.DECLARED, plain)
         self.assertIn(" CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.3-codex-spark ", pinned)
         self.assertIn(" CLAUDE_CODE_MAX_CONTEXT_TOKENS=76000 ", pinned)
+        # AND WITH NOTHING PLANTED, the shipped catalog: the same seat is on
+        # the family model, so the mechanism above is what moved it
+        shipped = seat.launch_line("codex", seat=self.DECLARED_SEATS[0])
+        self.assertIn(" CLAUDE_CODE_SUBAGENT_MODEL=%s " % self.FAMILY_MODEL,
+                      shipped)
+        self.assertIn(" CLAUDE_CODE_MAX_CONTEXT_TOKENS=220000 ", shipped)
 
-    def test_an_undeclared_family_mints_todays_bytes_for_every_instance(self):  # noqa: VACUOUS_ASSERTION — the grok block is pinned byte-for-byte and codex's instance table is asserted present before grok's is asserted None
+    def test_an_undeclared_family_mints_todays_bytes_for_every_instance(self):  # noqa: VACUOUS_ASSERTION — the grok block is pinned byte-for-byte and a planted codex table is asserted present before grok's is asserted None
         """A family with no `instance_models` at all: its instances are the
         family model, byte-identical to before the table existed. A config's
         bytes ARE its desired state, so a needless difference here would
@@ -7975,19 +10102,20 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
             '    - name: "grok-build-0.1"\n      alias: "claude-haiku-4-5"\n      fork: true\n'
             '    - name: "grok-build-0.1"\n      alias: "claude-opus-5-5"\n      fork: true\n')
         grok = c.FAMILIES["grok"]
-        # POSITIVE CONTROL on the same key, unconditional and first: a family
-        # DOES declare this table, so grok's None is a measured absence rather
-        # than a key nothing in the catalog ever sets.
-        self.assertTrue(self.fam.get("instance_models"))
         self.assertIsNone(grok.get("instance_models"))          # the reason
         y = a._config_yaml(1, "/a", "t", channel="xai",
                            model=c.instance_launch_model(grok, "grok-2"),
                            family="grok")
         self.assertTrue(y.endswith(TODAYS_XAI), y[-600:])
-        # POSITIVE CONTROL on the same observable: the family that DOES
-        # declare a table answers something else for the same question.
-        self.assertNotEqual(c.instance_launch_model(self.fam, self.SOL_SEATS[0]),
-                            self.fam["model"])
+        # POSITIVE CONTROL on the same observable: a family that DOES declare
+        # a table answers something else for the same question, so grok's
+        # answer is a measured absence rather than a resolver that ignores
+        # the table.
+        with self._planted():
+            self.assertTrue(self.fam.get("instance_models"))
+            self.assertNotEqual(
+                c.instance_launch_model(self.fam, self.DECLARED_SEATS[0]),
+                self.fam["model"])
 
     def test_a_launch_model_outside_the_family_catalogue_is_refused(self):
         """The REAL validator, on tables that are not in FAMILIES -- the
@@ -8066,19 +10194,24 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
         `launched` overclaimed in the same direction, one step smaller."""
         from helm import seat_catalog as c, seat_health as h
         spark = "gpt-5.3-codex-spark"
-        seat_name = self.SOL_SEATS[0]
+        seat_name = self.DECLARED_SEATS[0]
+        planted = self._planted()
+        planted.start()
+        self.addCleanup(planted.stop)
         pinned = self._mint_launch_sh(seat_name, model=spark)
         self.assertEqual(h._minted_model(pinned), spark)
-        self.assertEqual(c.instance_launch_model(self.fam, seat_name), self.SOL,
+        self.assertEqual(c.instance_launch_model(self.fam, seat_name),
+                         self.DECLARED,
                          "the DECLARATION is unmoved by a pinned launch")
         # THE CONTROL, and it is what proves the reader reads the FILE: the
         # same seat minted with no explicit model launches on its declaration,
-        # so both answers are sol. BLAST RADIUS: this arm alone -- a
+        # so both answers are the declared model. BLAST RADIUS: this arm
+        # alone -- a
         # `_minted_model` that returned the declaration (or that dropped the
         # nested re-split and answered None) reddens the assertion above while
         # this one stays green, so the pair cannot both pass by accident.
         default = self._mint_launch_sh(seat_name)
-        self.assertEqual(h._minted_model(default), self.SOL)
+        self.assertEqual(h._minted_model(default), self.DECLARED)
         # NEVER THE DECLARATION REPEATED: a seat with no launch.sh has nothing
         # on disk recording what a spawn of it would use.
         absent = os.path.join(self.d, "absent.sh")
@@ -8100,7 +10233,8 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
         # command with its trailing `--model <model>` cut off is the shape a
         # pre-model-pin or hand-edited launch.sh has.
         modelless = os.path.join(self.d, "modelless.sh")
-        text = open(pinned).read()
+        with open(pinned) as fh:
+            text = fh.read()
         cut = text.replace(" --model " + spark, "")
         self.assertNotEqual(cut, text, "the pin must actually have been cut")
         with open(modelless, "w") as f:
@@ -8113,7 +10247,8 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
         # token at all. This is a claim about the SHIPPED file, and it is why
         # the reader re-splits.
         import shlex
-        flat = shlex.split(open(pinned).read(), comments=True)
+        with open(pinned) as fh:
+            flat = shlex.split(fh.read(), comments=True)
         self.assertNotIn("--model", flat)
         self.assertTrue([t for t in flat if "--model" in t], flat)
 
@@ -8128,7 +10263,7 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
         goes on the screen so the operator knows which repair to make."""
         from helm import seat_health as h
         spark = "gpt-5.3-codex-spark"
-        pinned = self._mint_launch_sh(self.SOL_SEATS[0], model=spark)
+        pinned = self._mint_launch_sh(self.DECLARED_SEATS[0], model=spark)
         # AN UNREADABLE PARENT DIRECTORY. The SHIPPED artifact is moved into a
         # directory with no search permission, so the failing call is the same
         # open the reader makes on a real seat. Guarded rather than asserted
@@ -8333,7 +10468,7 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
         """
         from helm import seat_health as h, seats
         spark = "gpt-5.3-codex-spark"
-        seat_name = self.SOL_SEATS[0]
+        seat_name = self.DECLARED_SEATS[0]
         row = seats.write_roster(
             seat_name, presence_beat=False,
             runtime={"family": "codex",
@@ -8442,16 +10577,17 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
 
         The seat_catalog comment and docs/VERBS.md stated this backwards
         ("no tier may name a model LARGER than the launch model's"), which
-        permitted exactly the sol-pane/astra-tier pane the same paragraph
-        calls unrecoverable and banned the astra-pane/sol-tier shape that
-        ships. No shipped helper computes the minimum, so the code cure is the
-        prose; this arm is what pins the direction against real numbers."""
+        permitted exactly the wide-pane/narrow-tier pane the same paragraph
+        calls unrecoverable and banned the narrow-pane/wide-tier shape. No
+        shipped helper computes the minimum, so the code cure is the prose;
+        this arm is what pins the direction against real numbers."""
         def safe(pane_model, child_model):
             return self._advertised(model=pane_model) \
                 <= self._advertised(model=child_model)
         # THE SHIPPED FLEET HOLDS IT: every codex seat, on its own declared
         # launch model, against every tier model it routes children to.
-        for seat_name in (self.ASTRA_SEAT,) + self.SOL_SEATS:
+        for seat_name in (self.PLAIN_SEAT, self.UNDECLARED_SEAT) \
+                + self.DECLARED_SEATS:
             pane = self._advertised(seat_name=seat_name)
             for alias, child in self.fam["subagent_tiers"].items():
                 with self.subTest(seat=seat_name, alias=alias):
@@ -8459,13 +10595,13 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
         # THE TWO DIRECTIONS, the journal's falsifier verbatim: advertising
         # 320000 with a 220000 child is REFUSED, 220000 with a 320000 child is
         # accepted. The old sentence answered these the other way round.
-        self.assertEqual(self._advertised(model=self.SOL), 320000)
-        self.assertEqual(self._advertised(model=self.ASTRA), 220000)
-        self.assertFalse(safe(self.SOL, self.ASTRA),
-                         "a sol pane with an astra tier overstates its "
+        self.assertEqual(self._advertised(model=self.DECLARED), 320000)
+        self.assertEqual(self._advertised(model=self.FAMILY_MODEL), 220000)
+        self.assertFalse(safe(self.DECLARED, self.FAMILY_MODEL),
+                         "a 5.6-sol pane with a gpt-6.1-sol tier overstates its "
                          "children by 100k -- the unrecoverable direction")
-        self.assertTrue(safe(self.ASTRA, self.SOL),
-                        "the shipped astra pane with sol tiers understates "
+        self.assertTrue(safe(self.FAMILY_MODEL, self.DECLARED),
+                        "a gpt-6.1-sol pane with a 5.6-sol child understates "
                         "them, which compacts early rather than wedging")
 
     def test_the_context_safety_rule_is_written_in_the_safe_direction(self):
@@ -8479,9 +10615,10 @@ class AnInstanceDeclaresItsOwnLaunchModel(unittest.TestCase):
         this arm and nothing else in the suite."""
         from helm import seat_catalog as c
         root = os.path.dirname(os.path.dirname(os.path.abspath(c.__file__)))
-        catalog = open(c.__file__, encoding="utf-8").read()
-        verbs = open(os.path.join(root, "docs", "VERBS.md"),
-                     encoding="utf-8").read()
+        with open(c.__file__, encoding="utf-8") as fh:
+            catalog = fh.read()
+        with open(os.path.join(root, "docs", "VERBS.md"), encoding="utf-8") as fh:
+            verbs = fh.read()
         # the REVERSED sentence, in the spelling each file carried
         self.assertNotIn("model_context IS LARGER THAN THE LAUNCH MODEL'S",
                          catalog)

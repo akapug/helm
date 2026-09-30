@@ -189,6 +189,18 @@ MISROUTED = "MISROUTED"
 # for about 30 seconds every half hour. It is outside the alarm class, the
 # re-arm nudge never types into it, and it becomes DEAF once the grace ends.
 WAKING = "WAKING"
+# RESTING is not a softer DEAF either, and it is the one verdict that is an
+# INTENT rather than a measurement (task/3280). The owner paused the seat
+# (`helm seat rest`, helm/seat_rest.py): its beacon is off on purpose and only
+# an explicit resume wakes it. It REPLACES the verdicts that describe the
+# wake path (covered, WAKING, DEAF, DEAF-IN-EFFECT) for as long as the rest
+# holds, because a beacon left armed on a resting seat is held by the
+# delivery pause and wakes nothing; the fault verdicts (VACANT, MISROUTED,
+# UNPROVEN) stand. It is outside the alarm class and never typed into, and
+# the repair a DEAF spell would owe waits for the rest to end, when the next
+# pass reads the seat as it is. A rest record helm cannot read makes nothing
+# RESTING: the verdict stands and names the record.
+RESTING = "RESTING"
 #: WHICH CONVERSATION armed a beacon. Named rather than spelled inline so the
 #: producer and every consumer share ONE spelling -- this module has already
 #: been bitten once by a second module-level binding of a verdict word, where
@@ -664,6 +676,14 @@ _PY_ARGS = ("WX", ("--check-hash-based-pycs",))
 #: filter one generation above the waiter's own siblings).
 _HOPS = 8
 _NEAR_ANCESTORS = 4
+#: One bounded settle, in SECONDS, between a walk's first reading of a
+#: reader it classified as a wrapper and its one re-read (and one re-descent
+#: of that wrapper). Under gate load the reader's own exec — or the
+#: wrapper's own fork — lands inside that window; a pid's argv changes in
+#: place exactly once (at that exec), so one re-read is the whole race.
+#: Bounded: the walk may add this at most once per hop, and a hop runs this
+#: at most once.
+_SETTLE_S = 0.25
 _READER_MEMO = {}
 
 # THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
@@ -952,14 +972,51 @@ def line_holder(pid, fd=1, proc_dir=None):
     seen = set()
     for _hop in range(_HOPS):
         nxt = []
+        settle = None
         for st in frontier:
             key = (st.st_dev, st.st_ino)
             if not stat.S_ISFIFO(st.st_mode) or key in seen:
                 continue
             seen.add(key)
-            for reader in _readers(key, chain, proc_dir):
+            found = _readers(key, chain, proc_dir)
+            for reader in found:
                 argv = proc_argv(reader, proc_dir) or []
                 if not _is_shell(reader, argv, proc_dir) \
+                        and not _passes(reader, argv, proc_dir):
+                    return _holder_name(argv)
+                if settle is None:
+                    settle = (reader, found, key)
+                try:
+                    nxt.append(os.stat(os.path.join(root, str(reader),
+                                                    "fd", "1")))
+                except OSError:
+                    continue
+        if settle is not None:
+            # THE SETTLE (task/3411, measured under the 57-module sliced
+            # gate): the reader this hop classified as a wrapper may be a
+            # pipeline stage that has FORKED but not yet EXECD its filter
+            # — the fork lands after this walk's first reading of it, and a
+            # pid's argv changes in place exactly once, at that exec. One
+            # bounded wait, then one re-read: a reader that has execed its
+            # filter is judged by the landed argv, and a reader that is
+            # still its fork — or whose re-read is unreadable — is followed
+            # as before, never named. The descent is re-run once from the
+            # pre-descent found, in case the wrapper has since forked the
+            # reader it waits on. One settle per hop is the budget: the
+            # walk is asked again at the next poll, and what has not
+            # settled by the re-read is still a wrapper, which that walk
+            # sees.
+            time.sleep(_SETTLE_S)
+            reader, found, key = settle
+            argv = proc_argv(reader, proc_dir)
+            if argv is not None and not _is_shell(reader, argv, proc_dir) \
+                    and not _passes(reader, argv, proc_dir):
+                return _holder_name(argv)
+            for reader in _through_wrappers(key, found, set(chain), root,
+                                           proc_dir):
+                argv = proc_argv(reader, proc_dir)
+                if argv is not None and not _is_shell(reader, argv,
+                                                       proc_dir) \
                         and not _passes(reader, argv, proc_dir):
                     return _holder_name(argv)
                 try:
@@ -1071,6 +1128,8 @@ def waiter_spec(pid, proc_dir=None, argv=None, env=None, row=None):
     saved = (row or {}).get("waiter")
     stable = {"follow": "--follow" in sub, "any": "--any" in sub,
               "ambient": "--ambient" in sub, "timeout": timeout}
+    if "--per-row" in sub:           # the doorbell (the default) sets no key
+        stable["per_row"] = True
     if not room and isinstance(saved, dict) \
             and all(saved.get(k) == v for k, v in stable.items()):
         room = saved.get("room")
@@ -1086,10 +1145,19 @@ def waiter_spec(pid, proc_dir=None, argv=None, env=None, row=None):
 
 
 def requested_waiter_spec(room="main", any_row=False, ambient=False,
-                          timeout=None):
-    """Canonical behavior value for a CLI waiter before it mutates anything."""
-    return {"follow": True, "room": room or "main", "any": bool(any_row),
+                          timeout=None, per_row=False):
+    """Canonical behavior value for a CLI waiter before it mutates anything.
+
+    `--per-row` changes what the waiter emits (one line per row instead of the
+    doorbell's one ring per burst), so it is part of the behavior an incumbent
+    must share. The key exists only when it is set, so a doorbell waiter's
+    value, and every registry row written before the flag existed, are
+    unchanged."""
+    spec = {"follow": True, "room": room or "main", "any": bool(any_row),
             "ambient": bool(ambient), "timeout": timeout}
+    if per_row:
+        spec["per_row"] = True
+    return spec
 
 
 def waiter_seat(pid, proc_dir=None, argv=None, env=None):
@@ -2765,6 +2833,23 @@ def _verdict(live_, unknown, unlistable, agent, agent_why, undrained=None,
     return DEAF, "no live beacon: helm cannot wake it"
 
 
+def _rested(seat, verdict, why):
+    """(verdict, why) with the owner's rest applied: a seat helm cannot wake
+    because the OWNER paused it reads RESTING, not DEAF (see RESTING)."""
+    if verdict not in (COVERED, DEAF, WAKING, DEAF_IN_EFFECT):
+        return verdict, why
+    from . import seat_rest
+    rec, err = seat_rest.read(seat)
+    if rec is not None:
+        return RESTING, "%s; %s" % (seat_rest.phrase(rec),
+                                    seat_rest.end_hint(seat))
+    if err:
+        return verdict, "; ".join(
+            part for part in (why, seat_rest.unreadable_text(seat, err))
+            if part)
+    return verdict, why
+
+
 def repair_argv(seat):
     """THE ONE COMMAND THAT REPAIRS A DEAF-IN-EFFECT SEAT, spelled once.
 
@@ -2869,255 +2954,6 @@ def drain_proven(owed, crow):
     if owed in seen:
         return consumption.refuted(DRAIN_Q, *looked, answer=owed)
     return consumption.proven(DRAIN_Q, True, *looked)
-
-
-# THE LEXER DECIDES WHAT IS SYNTAX; NOTHING DOWNSTREAM RE-DECIDES IT.
-#
-# Every earlier shape of this reader asked a LATER stage to recover something
-# the tokenizer had already thrown away, and each time the missing thing was
-# the same: whether a delimiter-shaped value was an OPERATOR or DATA, and how
-# much of the command a conditional owns.
-#
-#   * a separator split over raw text called a quoted `;` an operator;
-#   * POSIX `shlex` grouped quoted runs correctly but handed back BARE values,
-#     so a consumer matching `>` against a token could not tell `'>'` (an
-#     argument) from `>` (a redirection);
-#   * composing the two fixed the separators and left the word consumer still
-#     pattern-matching values, so `helm '>' out chat wait` had its quoted
-#     argument and the word after it DELETED, manufacturing a waiter;
-#   * matching a redirection only at the START of a word missed one attached to
-#     the command word, so `false>/dev/null` arrived as a single token whose
-#     basename is `null` and the known-dead `false` was lost;
-#   * matching operators without longest-first ordering split `>|` at its `|`,
-#     turning a clobber redirection into a pipe and its FILENAME into a
-#     command;
-#   * and splitting the conditional chain per SEGMENT rather than per PIPELINE
-#     let `false && printf x | W` skip only `printf x`, because the `|` that
-#     introduced the waiter carries no conditional rule of its own.
-#
-# So the tokenizer emits OPERATORS AS THEIR OWN TOKENS, longest match first,
-# recognized only outside quotes, and marks each word with whether any part of
-# it was quoted. Redirections then consume their operand uniformly (the
-# operator and its target are always separate tokens, so an "attached" target
-# is not a special case), and the parser groups tokens into an AND-OR list
-# whose ELEMENTS ARE WHOLE PIPELINES, so a dead branch skips all of one.
-#
-# Operators are ordered longest-first: `&>>` before `&>` before `&&`, `<<<`
-# before `<<` before `<`, and `>|`/`>&`/`>>` before `>`.
-_OPERATORS = tuple(sorted(
-    ("&>>", "<<<", "<<-", ";;&", "&&", "||", ";;", ";&", "&>", ">>", ">|",
-     ">&", "<<", "<&", "<>", ";", "|", "&", ">", "<", "\n", "(", ")"),
-    key=len, reverse=True))
-#: THE CASE TERMINATORS ARE NOT SEPARATORS, THEY ARE A SYNTAX ERROR HERE.
-#: `;;` sat in `_SEPARATORS` and `;&`/`;;&` lexed as two ordinary operators,
-#: so `<wait>;; true` read as a plain list and the wait was PROVEN -- while
-#: bash rejects the whole command with rc 2 and runs NOTHING (measured, all
-#: three spellings). They are only legal inside a `case`, and a `case` needs
-#: a `)`, which this lexer already refuses -- so any of them reaching here is
-#: in a command bash would not run. Found by a cross-family read, round 8.
-_CASE_TERMINATORS = frozenset((";;", ";&", ";;&"))
-#: `|&` IS ABSENT FROM THE TABLE ABOVE AND THAT IS CURRENTLY CORRECT BY
-#: ACCIDENT, WHICH IS WHY IT IS WRITTEN DOWN. It is bash's shorthand for
-#: `2>&1 |`; this lexer reads it as `|` then `&`, a different parse. Measured
-#: over 16 commands -- 8 plain and 8 conditional, the latter being where a
-#: wrong pipeline split would flip the answer because `&&` and `||` test the
-#: PIPELINE's status -- the reader agrees with bash on every one, because the
-#: `&` opens a new list item and the remainder parses identically. Adding the
-#: operator would CHANGE a parse that currently answers correctly, so the gap
-#: is documented rather than closed; anyone closing it owes those 16 cases
-#: again.
-_HEREDOCS = frozenset(("<<", "<<-"))
-_GROUPING = frozenset(("(", ")"))
-
-
-# THE STATUS OF A LIST IS A SET OF POSSIBILITIES, NEVER ONE VALUE, and holding
-# one value is precisely how a conditionally-executed literal got laundered
-# into an unconditional predecessor.
-_SUCCESS = "success"
-_FAILURE = "failure"
-
-
-def _match_operator(text, i):
-    """The longest operator spelling starting at `i`, or None.
-
-    LONGEST FIRST IS NOT A MICRO-OPTIMISATION, IT IS THE MEANING. `>|` read as
-    `>` followed by `|` turns one clobber redirection into a redirection plus a
-    PIPE, and everything after the operand then reads as a new command — which
-    is how `printf x >| helm chat wait` credited a waiter that never runs, its
-    `helm` being the output FILENAME."""
-    for op in _OPERATORS:
-        if text.startswith(op, i):
-            return op
-    return None
-
-
-def _skip_expansion(text, i):
-    """Index just past a `$(...)`, `${...}` or backtick expansion at `i`.
-
-    AN EXPANSION IS OPAQUE, NOT STRUCTURE. Its text is whatever it produces at
-    runtime, so this reader keeps it inside the word it appeared in and never
-    looks for operators or commands inside it: a substitution that happens to
-    contain `&&` did not put a conditional in THIS command. Returns None when
-    the construct is unterminated, which makes the whole command unparseable."""
-    if text[i] == "`":
-        j = i + 1
-        while j < len(text):
-            if text[j] == "\\":
-                j += 2
-                continue
-            if text[j] == "`":
-                return j + 1
-            j += 1
-        return None
-    opener, closer = ("(", ")") if text[i + 1] == "(" else ("{", "}")
-    depth, j = 0, i + 1
-    while j < len(text):
-        c = text[j]
-        if c == "\\":
-            j += 2
-            continue
-        if c in "'\"":
-            end = text.find(c, j + 1)
-            if end < 0:
-                return None
-            j = end + 1
-            continue
-        if c == opener:
-            depth += 1
-        elif c == closer:
-            depth -= 1
-            if depth == 0:
-                return j + 1
-        j += 1
-    return None
-
-
-def _lex(command):
-    """The command text -> [(kind, value, quoted)], or None when unmodelled.
-
-    `kind` is `"word"` or `"op"`; `quoted` says whether any part of a word came
-    out of quotes or an escape, which is THE fact every earlier shape of this
-    reader discarded.
-
-    It tracks single quotes, double quotes with backslash escapes, an unquoted
-    backslash escape, and `$(...)`/`${...}`/backtick expansions, which it keeps
-    whole inside the word they belong to. A `#` that begins a word starts a
-    comment to end of line.
-
-    AN FD PREFIX BELONGS TO THE OPERATOR IT PRECEDES: in `2> err.log` the `2`
-    is not an argument and `err.log` is not a command, so a pending word that
-    is entirely unquoted digits is absorbed into a following `<`/`>` operator.
-
-    Returns None — unparseable, which names nobody — for an unbalanced quote or
-    expansion, for a HEREDOC, whose body this reader does not model and could
-    otherwise read as commands, and for the GROUPING operators `(` and `)`,
-    which put a whole list under one condition."""
-    tokens = []
-    word, quoted, open_ = [], False, False
-    i, n = 0, len(command)
-
-    def flush():
-        if open_:
-            tokens.append(("word", "".join(word), quoted))
-
-    while i < n:
-        c = command[i]
-        if c == "\\" and command[i + 1:i + 2] == "\n":
-            # A LINE CONTINUATION, AND BOTH CHARACTERS VANISH. Treating the
-            # escaped newline as an ordinary escape appended a REAL newline to
-            # the pending word, which is wrong three ways at once: it opened a
-            # word where the shell has none, so the `#` that may follow was
-            # read as text instead of starting a comment; it displaced the
-            # command head, so `false && \\<nl> <wait>` answered "not a wait"
-            # for the wrong reason; and when a blank or comment line followed,
-            # the NEXT newline arrived with a word in front of it, so it read
-            # as a separator and the gate in front of the wait was discarded.
-            # That last one invents an owner on an ordinary two-line command.
-            i += 2
-            continue
-        if c == "\\" and i + 1 < n:
-            word.append(command[i + 1])
-            quoted, open_ = True, True
-            i += 2
-            continue
-        if c == "'":
-            end = command.find("'", i + 1)
-            if end < 0:
-                return None
-            word.append(command[i + 1:end])
-            quoted, open_ = True, True
-            i = end + 1
-            continue
-        if c == '"':
-            j = i + 1
-            while j < n and command[j] != '"':
-                j += 2 if command[j] == "\\" else 1
-            if j >= n:
-                return None
-            word.append(command[i + 1:j].replace("\\", ""))
-            quoted, open_ = True, True
-            i = j + 1
-            continue
-        if c == "`" or (c == "$" and command[i + 1:i + 2] in ("(", "{")):
-            end = _skip_expansion(command, i)
-            if end is None:
-                return None
-            word.append(command[i:end])
-            open_ = True
-            i = end
-            continue
-        if c == "#" and not open_:
-            while i < n and command[i] != "\n":
-                i += 1
-            continue
-        if c.isspace() and c != "\n":
-            flush()
-            word, quoted, open_ = [], False, False
-            i += 1
-            continue
-        op = _match_operator(command, i)
-        if op is not None:
-            if op in _HEREDOCS or op in _GROUPING \
-                    or op in _CASE_TERMINATORS:
-                return None
-            emit = op
-            if open_ and not quoted and op[0] in "<>" \
-                    and all(ch.isdigit() for ch in word) and word:
-                emit = "".join(word) + op     # the fd prefix is the operator's
-            else:
-                flush()
-            word, quoted, open_ = [], False, False
-            tokens.append(("op", emit, False))
-            i += len(op)
-            continue
-        word.append(c)
-        open_ = True
-        i += 1
-    flush()
-    return tokens
-
-
-#: The wait itself is three words, not a builtin, and is recognised positionally
-#: by `_holds_the_wait`.
-
-
-#: THE `+` DIRECTION IS READ THE SAME AS `-`, WHICH IS SAFE AND LOSSY, AND
-#: THE OBVIOUS OPTIMISATION IS A TRAP. Measured: `set +n`, `set +u`,
-#: `set +o noexec`, `set +o nounset` and `set -u; set +u` all RUN the wait
-#: while this reader answers None -- five conservative misses, no false
-#: credit. Whitelisting the `+` forms as harmless would recover them AND
-#: BREAK THIS, also measured:
-#:
-#:     set -n; set +n; <wait>              bash runs NOTHING
-#:     set -o noexec; set +o noexec        bash runs NOTHING
-#:
-#: Once noexec is on the shell PARSES without executing, so the `set +n` that
-#: would turn it off is itself never executed and the option never comes back.
-#: The misses stay.
-
-
-def _row_stamp(row):
-    return row.get("timestamp") if isinstance(row, dict) else None
 
 
 def unreachable(row):
@@ -3457,9 +3293,9 @@ def seat_census(seat, live=None, proc_dir=None, records=None, agents=_UNPROBED,
             unstamped += origin_unstamped(row)
             owner_reasons.append(owner_why or "unattributed, no reason given")
     sidechain = bool(live_) and all(o == OWNER_SUBAGENT for o in owners)
-    verdict, why = _verdict(live_, unknown, unlistable, agent, agent_why,
-                            undrained=waited, sidechain=sidechain,
-                            expired=expired)
+    verdict, why = _rested(seat, *_verdict(
+        live_, unknown, unlistable, agent, agent_why, undrained=waited,
+        sidechain=sidechain, expired=expired))
     return {"seat": seat, "verdict": verdict, "why": why, "agent": agent,
             "owners": owners, "unattributed": unattributed,
             "unstamped": unstamped, "owner_reasons": owner_reasons,
@@ -3708,6 +3544,7 @@ def census(seats=None, proc_dir=None):
         "waking": [r for r in rows if r["verdict"] == WAKING],
         "deaf": [r for r in rows if r["verdict"] == DEAF],
         "deaf_in_effect": [r for r in rows if r["verdict"] == DEAF_IN_EFFECT],
+        "resting": [r for r in rows if r["verdict"] == RESTING],
         "vacant": [r for r in rows if r["verdict"] == VACANT],
         "unproven": [r for r in rows if r["verdict"] == UNPROVEN],
         "misrouted": [r for r in rows if r["verdict"] == MISROUTED],
@@ -3872,16 +3709,15 @@ def attend(rep, now=None):
         # the outer lock while it revalidates, delivers and acks; attendance
         # must enter that SAME serialization domain or it can commit a newer
         # verdict after revalidation but before the old sentence leaves.
-        with seats_mod._flocked(path + ".escalate.lock") as edge_lock:
+        with seats_mod._flocked(path + ".escalate.lock", check=True) as edge_lock:
             if edge_lock.f is None:
                 out["error"] = ("escalation lock unavailable — attendance "
                                 "pass SKIPPED rather than crossing delivery")
                 return out
-            with seats_mod._flocked(path + ".lock") as lock:
-                # _flocked FAILS OPEN BY DESIGN: on OSError it sets .f = None
-                # and still returns, so `with` alone acquires nothing and the
-                # body runs UNLOCKED. REFUSE, never degrade: a skipped pass
-                # self-heals, while a clobbered roster does not.
+            with seats_mod._flocked(path + ".lock", check=True) as lock:
+                # CHECKED (task/2520): `check=True` yields .f None instead of
+                # raising, and this pass REFUSES, never degrades: a skipped
+                # pass self-heals, while a clobbered roster does not.
                 if lock.f is None:
                     out["error"] = ("roster lock unavailable — attendance "
                                     "pass SKIPPED rather than writing unlocked")
@@ -4010,8 +3846,8 @@ def _ack_alerts(rows, chat_leg=False, push_leg=False):
     from . import chat, seats as seats_mod
     try:
         chat._ensure_dir()
-        with seats_mod._flocked(seats_mod.roster_path() + ".lock") as lock:
-            # Same fail-open helper, same refusal. An ack that writes unlocked
+        with seats_mod._flocked(seats_mod.roster_path() + ".lock", check=True) as lock:
+            # Checked (check=True), same refusal. An ack that writes unlocked
             # can clobber a concurrent attendance transition, and the docstring
             # above promises "ack merely re-posts an edge, it never loses one"
             # — a promise only the lock can keep.
@@ -4100,7 +3936,7 @@ def _rebucket(rep, was, now_row):
             bucket.append(now_row)
 
     for key, verdict in (("covered", COVERED), ("waking", WAKING),
-                         ("deaf", DEAF),
+                         ("deaf", DEAF), ("resting", RESTING),
                          ("vacant", VACANT), ("unproven", UNPROVEN),
                          ("deaf_in_effect", DEAF_IN_EFFECT)):
         _swap(rep.get(key), now_row["verdict"] == verdict)
@@ -4173,7 +4009,7 @@ def install_repair(seat, att, now, detail="", kind=None):
     if spell is None:
         return None
     try:
-        with seats_mod._flocked(seats_mod.roster_path() + ".lock") as lock:
+        with seats_mod._flocked(seats_mod.roster_path() + ".lock", check=True) as lock:
             if lock.f is None:
                 return None                  # the next pass re-derives it
             r = seats_mod.roster()
@@ -4239,7 +4075,7 @@ def settle_repair(seat, outcome, detail="", attempt=None):
     behaviour rather than being refused."""
     from . import pk, seats as seats_mod
     try:
-        with seats_mod._flocked(seats_mod.roster_path() + ".lock") as lock:
+        with seats_mod._flocked(seats_mod.roster_path() + ".lock", check=True) as lock:
             if lock.f is None:
                 return False
             r = seats_mod.roster()
@@ -4281,7 +4117,7 @@ def _record_repairs(repaired, now):
     than silently closing the obligation."""
     from . import pk, seats as seats_mod
     try:
-        with seats_mod._flocked(seats_mod.roster_path() + ".lock") as lock:
+        with seats_mod._flocked(seats_mod.roster_path() + ".lock", check=True) as lock:
             if lock.f is None:
                 return                       # the next pass re-derives it
             r = seats_mod.roster()
@@ -4504,7 +4340,7 @@ def escalate(transitions, rep, now=None):
     # replaces this with the count that actually reached a channel.
     out["alarms"] = sum(1 for _s, att, _p in transitions if att["alarm"])
     with seats_mod._flocked(
-            seats_mod.roster_path() + ".escalate.lock") as lock:
+            seats_mod.roster_path() + ".escalate.lock", check=True) as lock:
         if lock.f is None:
             # Contention is not what lands here — the lock BLOCKS; only a
             # lock file that cannot be opened at all does. Deliver nothing:
@@ -4653,6 +4489,8 @@ def _deliver_legs(out, chat_rows, push_rows, rep, now):
                 lines.append(_alarm_line(seat, att))
             else:
                 what = "answers again" if att["state"] == COVERED \
+                    else "is %s, and nothing is typed into it" % att.get(
+                        "why") if att["state"] == RESTING \
                     else "is no longer PROVEN unreachable (%s)" % att["state"]
                 lines.append("%s %s — was unreachable for %s."
                              % (label(seat), what,
@@ -4745,9 +4583,11 @@ WantedBy=timers.target
 """
 
 
-def timer_units(interval=INTERVAL_S):
+def timer_units(interval=INTERVAL_S, inputs=None):
+    """`inputs` replaces per-install values (timerhealth.unit_values)."""
     helm_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "helm")
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    from . import timerhealth
+    udir = timerhealth.user_unit_dir()
     # WorkingDirectory is DERIVED, never a literal — proxywatch's rebind-unit
     # law: an operator path baked into a tracked template is a machine
     # identity this repo cannot carry, and work.find_root folds a lane
@@ -4757,15 +4597,16 @@ def timer_units(interval=INTERVAL_S):
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cwd = work.find_root(here) or here
     return (os.path.join(udir, "helm-beacons.service"),
-            _SERVICE % {"helm": helm_bin, "cwd": cwd},
+            _SERVICE % timerhealth.unit_values({"helm": helm_bin, "cwd": cwd},
+                                               inputs),
             os.path.join(udir, "helm-beacons.timer"),
-            _TIMER % {"interval": interval})
+            _TIMER % timerhealth.unit_values({"interval": interval}, inputs))
 
 
 def ensure_timer(interval=INTERVAL_S):
     """(ok, detail) — install + enable the cadence."""
     import shutil
-    import subprocess
+    from . import timerhealth
     if interval < 1:
         return False, "interval must be at least 1 second"
     systemctl = shutil.which("systemctl")
@@ -4773,17 +4614,11 @@ def ensure_timer(interval=INTERVAL_S):
         return False, ("systemctl unavailable; run `helm beacons --post` "
                        "from another scheduler")
     spath, service, tpath, timer = timer_units(interval)
-    try:
-        pk.atomic_write(spath, service)
-        pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    for cmd in ([systemctl, "--user", "daemon-reload"],
-                [systemctl, "--user", "enable", "--now", "helm-beacons.timer"]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, "%s failed: %s" % (
-                " ".join(cmd), (r.stderr or r.stdout or "").strip()[:200])
+    error, _unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer)), ("helm-beacons.timer",),
+        systemctl)
+    if error:
+        return False, error
     return True, "timer enabled every %ds (%s)" % (interval, tpath)
 
 
@@ -4938,14 +4773,16 @@ def _summary(rep):
     # because a report built before the bucket existed, or by a caller that
     # never asked for it, has no WAKING seat to count.
     own = _ownership_of(rep)
+    # RESTING JOINS IT (task/3280), read with `.get` like WAKING.
     return ("helm beacons: %d seat%s, %d covered, %d WAKING, %d DEAF, "
-            "%d DEAF-IN-EFFECT, "
+            "%d DEAF-IN-EFFECT, %d RESTING, "
             "%d MISROUTED, %d VACANT, %d UNPROVEN, %d ghost waiter%s, "
             "%d beacon%s (%d surplus); %s" % (
                 len(rep["seats"]), "s"[:len(rep["seats"]) != 1],
                 len(rep["covered"]), len(rep.get("waking") or ()),
                 len(rep["deaf"]),
-                len(rep["deaf_in_effect"]), len(own["misrouted"]),
+                len(rep["deaf_in_effect"]), len(rep.get("resting") or ()),
+                len(own["misrouted"]),
                 len(rep["vacant"]),
                 len(rep["unproven"]),
                 len(rep["ghosts"]), "s"[:len(rep["ghosts"]) != 1],
@@ -5059,6 +4896,11 @@ def _print_census(rep):
               "lease deadline is the seat's check-in, and nothing is typed "
               "into it; it reads DEAF only if the grace passes with no "
               "re-arm." % (label(row["seat"]), row["why"]))
+    for row in rep.get("resting") or ():
+        print("  RESTING SEAT %s — %s. Not DEAF: the owner paused it, so no "
+              "beacon is owed, nothing is typed into it and no work is "
+              "offered to it until the rest ends." % (label(row["seat"]),
+                                                      row["why"]))
     for row in rep["deaf"]:
         print("  DEAF SEAT %s — no live beacon: helm cannot wake it. It must "
               "re-arm `helm chat wait --seat %s --follow` to be reachable "
@@ -5120,7 +4962,10 @@ def _prompt_stall_leg(seat):
     pass names only that consequence and prescribes a re-arm the frozen seat
     cannot perform, while the prompt that caused it goes unnamed.
     planprompt.stall_pass reads the vendor's own presence record for every
-    Claude seat and posts the prompt LOUDLY; it types nothing.
+    Claude seat, ANSWERS a memory-write or routine tool prompt itself (one
+    keypress through resumeturn's delivery transaction, proven by the pane
+    moving), and pages the owner only for his named exceptions or a freeze.
+    A stall it answered is not a fault this pass found.
 
     FLEET-WIDE AND REAL-HOST ONLY. A `--seat` read is one seat's question, and
     a pass pointed at another proc tree (HELM_PROC) has no prompt state to
@@ -5137,7 +4982,8 @@ def _prompt_stall_leg(seat):
         return []
     for line in got["lines"]:
         print("helm beacons: %s" % line, file=sys.stderr)
-    return got["stalls"]
+    answered = got.get("answered") or []
+    return [r for r in got["stalls"] if r not in answered]
 
 
 def cmd_beacons(args):

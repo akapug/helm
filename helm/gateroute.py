@@ -271,6 +271,11 @@ FOCUS_RUNNER_OWNING_PATHS = (
     # writing a runner and must run its own code
     "helm/gaterunner.py",
     "helm/gateshard.py",
+    # the recorded-loads planner (task/3039): it chooses the selection
+    "helm/gateloads.py",
+    # the sliced focused runner, and the file gateshard loads by path
+    "helm/gateslice.py",
+    "helm/pathenv.py",
 )
 
 # In-band remote failures, named. The script exits 0 on these — the ERROR is

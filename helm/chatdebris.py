@@ -40,9 +40,9 @@ gc paths at once. Neither is small. Bounding what the directory holds is: the
 sibling locks go (gc's `chat-cursor-locks` row), cursors of a seat session
 that is over go (`chat-cursors` for dead sessions, `chat-unpaired-cursors`
 for a live session its seat no longer runs), and a meld room idle past the
-bound is archived off the bus with every cursor it carried
-(`helm chat retire-rooms`). The restore honours the retirement, so a reboot
-does not bring the rooms back. `helm doctor` counts entries per room and
+bound, or a finished meld a day after its last post, is archived off the bus
+with every cursor it carried (`helm chat retire-rooms`). The restore honours
+the retirement, so a reboot does not bring the rooms back. `helm doctor` counts entries per room and
 names the commands when the directory grows past its budget again.
 """
 import json
@@ -57,7 +57,9 @@ from . import chat, pk
 LOCK_EXT = ".lock"
 DAY = 86400
 IDLE_DAYS = 7                 # a meld room this long without a post is over
+CLOSED_IDLE_DAYS = 1          # a FINISHED meld's room this long quiet is over
 RETIRE_PREFIX = "meld-"       # the only room kind retirement may touch
+KEEP_PREFIX = "meld-0-standing-"  # a pair's standing room stays open (task/3560)
 PER_ROOM_WARN = 200           # healthy: 2 x (rostered seats + live sessions)
 ENTRIES_WARN = 20000          # ~2.6us/entry measured: 20k is ~50ms a listing
 ARCHIVE_DIR = "retired-rooms"
@@ -283,15 +285,38 @@ def retired_through():
             if isinstance(entry, dict) and isinstance(entry.get("through"), str)}
 
 
-def retirable_rooms(idle_days=IDLE_DAYS, now=None):
-    """[(room, idle_seconds)] — meld rooms with no append for `idle_days`.
+def _standing_pair_is_kept(room):
+    """Does this standing room's pair name only known seats?
 
-    WHY NOT THE LANE. A meld room records its topic, its epoch and its pinned
-    pair; it records no lane and no branch, so "the lane landed" is not a
-    fact any meld can be asked. The room's own clock is: every post appends,
-    and a restore rewrites the file, so its mtime is the last time anything
-    happened in it -- conservative in exactly the direction that keeps a
-    room."""
+    A room is kept while BOTH members are seats — the same known-seat test the
+    standing verb uses to open with them, so a room the verb would open the
+    verb keeps, and a room it refuses a flag or an absent seat for is one the
+    sweep may clear. UNREADABLE and NON-TWO-MEMBER pairs fail closed to KEPT: I
+    cannot prove the pair, so I do not retire on the guess (a real room whose
+    OPEN row rotated out stays rather than vanishing)."""
+    from . import meld_standing
+    try:
+        pair = meld_standing._read(room)[2]["pair"]
+    except Exception:                                   # noqa: BLE001
+        return True
+    if len(pair) != 2:
+        return True
+    return all(meld_standing.known_seat(p) for p in pair)
+
+
+def _finished(room):
+    """meld.finished, and any failure to answer is NOT finished."""
+    from . import meld
+    try:
+        return meld.finished(room)
+    except Exception:
+        return False
+
+
+def _retirable(idle_days=IDLE_DAYS, now=None):
+    """[(room, idle_seconds, bound_days, finished)] — the bound each room is
+    retired under and whether it was the finished-meld one; `retire_room`
+    re-proves both under the room lock."""
     now = time.time() if now is None else now
     out = []
     for room in chat.list_rooms():
@@ -301,9 +326,41 @@ def retirable_rooms(idle_days=IDLE_DAYS, now=None):
             idle = now - os.stat(chat.room_path(room)).st_mtime
         except OSError:
             continue
+        if room.startswith(KEEP_PREFIX) and _standing_pair_is_kept(room):
+            continue
         if idle >= idle_days * DAY:
-            out.append((room, idle))
+            out.append((room, idle, idle_days, False))
+        elif idle >= CLOSED_IDLE_DAYS * DAY and _finished(room):
+            out.append((room, idle, CLOSED_IDLE_DAYS, True))
     return out
+
+
+def retirable_rooms(idle_days=IDLE_DAYS, now=None):
+    """[(room, idle_seconds)] — meld rooms with no append for `idle_days`,
+    and FINISHED melds with none for CLOSED_IDLE_DAYS.
+
+    WHY NOT THE LANE. A meld room records its topic, its epoch and its pinned
+    pair; it records no lane and no branch, so "the lane landed" is not a
+    fact any meld can be asked. The room's own clock is: every post appends,
+    and a restore rewrites the file, so its mtime is the last time anything
+    happened in it -- conservative in exactly the direction that keeps a
+    room. A pair's standing room (KEEP_PREFIX) is the one kind that outlives
+    idle: it stays open while both of its pair are seats, and only a room
+    whose pair names a flag or a seat the roster has no row for is swept.
+
+    WHY A FINISHED MELD GOES SOONER (task/3519). Measured on the live bus:
+    272 of 306 room logs were meld rooms, carrying about 22,000 cursors, and
+    about 20,600 of those sat on melds idle over a day. Every cursor a listed
+    room loses, the delivery pass mints again, so the ROOM has to leave, not
+    its cursors. Whether a meld is over is the meld's own fact
+    (`meld.finished`: every member of its newest round closed its side), so
+    the shorter bound keys on that and never on quiet alone -- an open meld
+    as quiet waits for the idle bound. The day of quiet is the grace in which
+    a closer's countersign read and the owner's last look still find the
+    room on the bus. NOT AT THE CLOSE ITSELF: the second DONE lands while
+    the first closer has yet to read it, so retiring there would take the
+    countersign off the bus before its reader arrives."""
+    return [(room, idle) for room, idle, _b, _f in _retirable(idle_days, now)]
 
 
 def _through(path, mtime):
@@ -362,7 +419,7 @@ def _record(room, entry):
     _fsync_dir(chat.journal_dir())
 
 
-def retire_room(room, idle_days=IDLE_DAYS, now=None):
+def retire_room(room, idle_days=IDLE_DAYS, now=None, closed=False):
     """Archive one idle meld room off the live bus. -> (report, refusal)
 
     ARCHIVE, NEVER DELETE. The room file and every per-room sibling that is
@@ -378,7 +435,10 @@ def retire_room(room, idle_days=IDLE_DAYS, now=None):
     then cursor topology, the room's cursor lock, every seat estate that has
     a cursor here, and the room's transaction lock -- which also recovers a
     prepared cursor transaction before anything is removed. Idleness is
-    re-proven under them: a post since the scan keeps the room.
+    re-proven under them: a post since the scan keeps the room. `closed`
+    says the room was nominated under the finished-meld bound, and then the
+    meld's being finished is re-proven there too (a pure lifecycle read,
+    safe under the room lock).
 
     WHAT STAYS. The room's standalone locks (`<room>.lock`,
     `.cursor-room.<room>.lock`, `.cursor-txn-room.<room>.lock`) are held by
@@ -393,6 +453,15 @@ def retire_room(room, idle_days=IDLE_DAYS, now=None):
     now = time.time() if now is None else now
     if not room.startswith(RETIRE_PREFIX):
         return None, "not a meld room"
+    if room.startswith(KEEP_PREFIX) and _standing_pair_is_kept(room):
+        return None, "a pair's standing room stays open while both of its pair " \
+                     "are seats"
+    # The archive and its index live in the durable journal, and the index
+    # stops the LIVE bus from replaying the room. An isolated namespace must
+    # not retire a live room it only holds a copy of.
+    isolated = chat.journal_write_refusal()
+    if isolated:
+        return None, isolated
     key = pk.slug(room)
     root = chat.chat_dir()
     src = chat.room_path(room)
@@ -406,6 +475,8 @@ def retire_room(room, idle_days=IDLE_DAYS, now=None):
                 return None, "room is already gone"
             if now - st.st_mtime < idle_days * DAY:
                 return None, "posted to since the scan"
+            if closed and not _finished(room):
+                return None, "the meld is no longer finished"
             # the substring test only skips the parse for names that cannot
             # be this room's; the parser still decides every candidate
             names = [n for n in _listing(root) if key in n]
@@ -449,13 +520,15 @@ def retire_room(room, idle_days=IDLE_DAYS, now=None):
 
 def cmd_retire_rooms(args):
     """chat retire-rooms [--apply] [--idle-days N] — archive meld rooms idle
-    past the bound off the live bus (dry-run default)."""
+    past the bound, and finished melds quiet past CLOSED_IDLE_DAYS, off the
+    live bus (dry-run default)."""
     from .cli import guard_tail
     usage = ("usage: helm chat retire-rooms [--apply] [--idle-days N]  "
-             "(archive meld rooms with no post for N days, default %d, to "
-             "<journal>/%s; their cursors go with them and the restore no "
-             "longer resurrects them. Dry-run by default)"
-             % (IDLE_DAYS, ARCHIVE_DIR))
+             "(archive meld rooms with no post for N days, default %d, and "
+             "finished melds with none for %d, to <journal>/%s; their "
+             "cursors go with them and the restore no longer resurrects "
+             "them. Dry-run by default)"
+             % (IDLE_DAYS, CLOSED_IDLE_DAYS, ARCHIVE_DIR))
     rc = guard_tail("helm chat retire-rooms", args, flags=("--apply",),
                     valued=("--idle-days",), usage=usage)
     if rc is not None:
@@ -472,22 +545,26 @@ def cmd_retire_rooms(args):
                   "days, at least 1 — got %r" % raw, file=sys.stderr)
             return 2
     apply = "--apply" in args
-    rooms = retirable_rooms(days)
+    rooms = _retirable(days)
     if not rooms:
-        print("helm chat retire-rooms: no meld room has been idle %g days — "
-              "nothing to retire" % days)
+        print("helm chat retire-rooms: no meld room has been idle %g days, "
+              "and no finished meld quiet %d — nothing to retire"
+              % (days, CLOSED_IDLE_DAYS))
         return 0
     if not apply:
-        for room, idle in rooms:
-            print("  would retire  %s  (idle %dd)" % (room, idle // DAY))
-        print("helm chat retire-rooms: %d meld room%s idle %g+ days would be "
-              "archived to %s — nothing touched; --apply retires them"
-              % (len(rooms), "s"[:len(rooms) != 1], days, archive_root()))
+        for room, idle, _bound, done in rooms:
+            print("  would retire  %s  (idle %dd%s)"
+                  % (room, idle // DAY, ", meld finished" if done else ""))
+        print("helm chat retire-rooms: %d meld room%s (idle %g+ days, or "
+              "finished and quiet %d+) would be archived to %s — nothing "
+              "touched; --apply retires them"
+              % (len(rooms), "s"[:len(rooms) != 1], days, CLOSED_IDLE_DAYS,
+                 archive_root()))
         return 0
     done = cursors = refused = 0
-    for room, _idle in rooms:
+    for room, _idle, bound, finished in rooms:
         try:
-            out, why = retire_room(room, days)
+            out, why = retire_room(room, bound, closed=finished)
         except OSError as exc:
             out, why = None, "%s: %s" % (type(exc).__name__, exc)
         if out is None:

@@ -10,7 +10,9 @@ is why both survive as named ops. (2) Backend selection resolves to git for
 every input — unset, git, jj, garbage, a colocated `.jj/` — and never raises.
 """
 import ast
+import fcntl
 import os
+import pathlib
 import shutil
 import signal
 import subprocess
@@ -241,6 +243,88 @@ class PrimitiveTest(VcsBase):
             rc, out, err = self.git.run(self.root, "status")
         self.assertEqual((rc, out), (-1, b""))
         self.assertIn(b"no git here", err)
+
+    def test_the_holding_push_runs_no_ambient_program(self):  # noqa: VACUOUS_ASSERTION — the unlisted control variable positively reaches git's child in the same output
+        """task/3265 r4 (helm-codex R1 of round 3): `run_holding`, the
+        push's seam, removes every variable that names a program git runs
+        while it pushes, the caller's own overlay included. Everything else
+        in the environment still reaches git. git exports its own
+        GIT_EXEC_PATH to its children, so the read is that no planted value
+        arrives, never that the name is absent."""
+        names = ("GIT_EXEC_PATH", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS",
+                 "GIT_PROXY_COMMAND")
+        ambient = {name: "/planted/" + name.lower() for name in names}
+        ambient["HELM_R4_CONTROL"] = "kept"
+        with mock.patch.dict(os.environ, ambient):
+            rc, out, err = self.git.run_holding(
+                self.root, "-c", "alias.helm-env=!env", "helm-env",
+                env={"GIT_SSH_COMMAND": "/planted/overlay"})
+        self.assertEqual(rc, 0, err)
+        self.assertIn("HELM_R4_CONTROL=kept", out.splitlines())
+        self.assertEqual([ln for ln in out.splitlines() if "/planted" in ln],
+                         [])
+
+    def test_the_holding_push_hands_its_descriptors_to_a_holder_not_git(self):  # noqa: VACUOUS_ASSERTION — the lock is positively held while git runs
+        """task/3265 door read B3: `keep` lives in the holder `run_holding`
+        starts, never in git or anything git starts, and the holder lets it
+        go when git ends. git here runs a program that leaves a sleeper
+        behind, as git's credential-cache daemon outlives a push. While git
+        runs the lock is held with the caller's own descriptor closed (the
+        holder has it); once git has answered, it can be taken at once while
+        the sleeper still runs."""
+        lock = os.path.join(self.tmp, "held.lock")
+        mark = lambda name: os.path.join(self.tmp, name)  # noqa: E731
+        prog = mark("lingers")
+        with open(prog, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nsleep 120 </dev/null >/dev/null 2>&1 &\n"
+                     "echo $! > '%s'\n: > '%s'\n"
+                     "while [ ! -e '%s' ]; do sleep 0.05; done\n"
+                     % (mark("sleeper.pid"), mark("started"),
+                        mark("release")))
+        os.chmod(prog, 0o755)
+
+        def sleeper_down():
+            try:
+                with open(mark("sleeper.pid"), encoding="utf-8") as fh:
+                    os.kill(int(fh.read().strip()), 9)
+            except (OSError, ValueError):
+                pass
+
+        self.addCleanup(sleeper_down)
+
+        def free():
+            fd = os.open(lock, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+            finally:
+                os.close(fd)
+
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        got = {}
+        runner = threading.Thread(target=lambda: got.update(answer=(
+            self.git.run_holding(self.root, "-c", "alias.linger=!" + prog,
+                                 "linger", keep=(fd,), timeout=60))))
+        runner.start()
+        end = time.monotonic() + 60
+        while not os.path.exists(mark("started")) and time.monotonic() < end:
+            time.sleep(0.05)
+        os.close(fd)
+        try:
+            during = free()
+        finally:
+            open(mark("release"), "w").close()
+            runner.join(60)
+        self.assertEqual(got["answer"][0], 0, got)
+        # the control: while git ran, the holder held it
+        self.assertFalse(during)
+        with open(mark("sleeper.pid"), encoding="utf-8") as fh:
+            sleeper = int(fh.read().strip())
+        self.assertTrue(os.path.exists("/proc/%d" % sleeper))
+        self.assertTrue(free(), "a child git left behind holds the lock")
 
     def test_run_env_overlays_never_replaces_the_ambient_environment(self):
         # the ref-guard's sanctioned-creator bit rides this overlay; git still
@@ -1329,6 +1413,83 @@ class LandedStateTest(VcsBase):
             self.assertEqual(self.git.landed_state(self.root, branch, "main"),
                              seam_of[expected], branch)
 
+    def _cure_on_trunk(self, name, landed):
+        """(branch, reviewed sha, per-cure shas) — a lane commit, then a
+        two-commit cure on top of it; trunk takes the lane commit REWORKED
+        (other bytes, no patch twin) and cherry-picks the first `landed` cure
+        commits. The shape of task/3357's specimens."""
+        branch = self._lane(name, [name + "-lane", name + "-cure1",
+                                   name + "-cure2"])
+        shas = [_sh(self.root, "git", "rev-parse", "%s~%d" % (branch, n)
+                    ).stdout.strip() for n in (2, 1, 0)]
+        self._commit("trunk-moved-" + name)
+        with open(os.path.join(self.root, name + "-lane.txt"), "w") as f:
+            f.write("reworked when it landed")
+        self.assertEqual(_sh(self.root, "git", "add", "-A").returncode, 0)
+        self.assertEqual(_sh(self.root, "git", "commit", "-q", "-m",
+                             "landed reworked").returncode, 0)
+        for sha in shas[1:1 + landed]:
+            self.assertEqual(
+                _sh(self.root, "git", "cherry-pick", sha).returncode, 0)
+        return branch, shas[0], shas[1:]
+
+    def test_LIMIT_judges_only_the_commits_after_it(self):  # noqa: VACUOUS_ASSERTION — the unconditional whole-range NOT_ANCESTOR on the same branch is the positive control that the lane commit has no twin; the limited read must then answer PATCH_EQUIVALENT
+        """`git cherry <upstream> <head> <limit>` SEMANTICS (task/3357). The
+        lane commit landed reworked, so the WHOLE branch honestly reads
+        NOT_ANCESTOR; the two cure commits after `limit` are on trunk under
+        new shas, so the limited question reads PATCH_EQUIVALENT. The live
+        specimens: 3 of 6 and 3 of 14 lane commits read '+', every cure
+        commit '-'."""
+        branch, reviewed, _cure = self._cure_on_trunk("lim", landed=2)
+        self.assertEqual(self.git.landed_state(self.root, branch, "main"),
+                         vcs.NOT_ANCESTOR,
+                         "the whole lane reads landed, so this arm cannot "
+                         "tell the limited range from the whole one")
+        self.assertEqual(self.git.landed_state(self.root, branch, "main",
+                                               limit=reviewed),
+                         vcs.PATCH_EQUIVALENT)
+
+    def test_LIMIT_keeps_every_refusal_over_the_narrowed_range(self):  # noqa: VACUOUS_ASSERTION — the unconditional control is the fully landed cure answering PATCH_EQUIVALENT through the same call before each refusing shape is read
+        """Every belt runs over `limit..tip`: a partly landed range reads
+        NOT_ANCESTOR, an EMPTY range UNKNOWN (nothing measured is not a
+        yes), a range holding an empty commit UNKNOWN (its patch id matches
+        any empty commit), and a limit that is not a full sha UNKNOWN (it
+        would reach git's argv as a revision or an option)."""
+        branch, reviewed, _cure = self._cure_on_trunk("all", landed=2)
+        self.assertEqual(self.git.landed_state(self.root, branch, "main",
+                                               limit=reviewed),
+                         vcs.PATCH_EQUIVALENT, "the control cure is not read "
+                                               "as landed")
+        tip = _sh(self.root, "git", "rev-parse", branch).stdout.strip()
+        for label, limit, wanted in (
+                ("the range is empty", tip, vcs.UNKNOWN),
+                ("a short limit", reviewed[:12], vcs.UNKNOWN),
+                ("an option-shaped limit", "--output=x", vcs.UNKNOWN)):
+            with self.subTest(limit=label):
+                self.assertEqual(self.git.landed_state(
+                    self.root, branch, "main", limit=limit), wanted)
+        part, reviewed, _cure = self._cure_on_trunk("part", landed=1)
+        self.assertEqual(self.git.landed_state(self.root, part, "main",
+                                               limit=reviewed),
+                         vcs.NOT_ANCESTOR, "a cure only partly on trunk read "
+                                           "as landed")
+        wt = os.path.join(self.tmp, "wt-empty-cure")
+        self.git.add_worktree(self.root, wt, "lane/empty-cure", base="main")
+        self._commit("empty-cure-lane", where=wt)
+        base = _sh(wt, "git", "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(_sh(wt, "git", "commit", "-q", "--allow-empty", "-m",
+                             "an empty cure").returncode, 0)
+        self.assertEqual(self.git.remove_worktree(self.root, wt)[0], 0)
+        self.assertEqual(_sh(self.root, "git", "commit", "-q", "--allow-empty",
+                             "-m", "an unrelated empty commit").returncode, 0)
+        self.assertTrue(_sh(self.root, "git", "cherry", "main",
+                            "lane/empty-cure", base).stdout.startswith("-"),
+                        "the empty-commit trap did not fire, so UNKNOWN below "
+                        "proves nothing")
+        self.assertEqual(self.git.landed_state(self.root, "lane/empty-cure",
+                                               "main", limit=base),
+                         vcs.UNKNOWN)
+
     def test_wip_commit_stages_everything_under_the_janitor_identity(self):
         wt = os.path.join(self.tmp, "wt-wip")
         self.git.add_worktree(self.root, wt, "lane/wip", base="main")
@@ -1376,6 +1537,131 @@ class LandedStateTest(VcsBase):
 # ---------------------------------------------------------------------------
 # backend selection — git today, jj never a crash
 # ---------------------------------------------------------------------------
+
+class TrunkReadingTest(VcsBase):
+    """`patch_sequence_containment`'s second reading. When trunk's train
+    merges make the pair's range unreadable, each tip is read from its own
+    fork point off trunk — `trunk` when given, else the remote default branch
+    — and a match counts only when the candidate's fork point is forward."""
+
+    def _ok(self, *cmd):
+        r = _sh(self.root, *cmd)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def _lane(self, base, name):
+        """One commit adding lane.txt on `base`: the same patch on any base."""
+        self._ok("git", "checkout", "-q", "-b", name, base)
+        with open(os.path.join(self.root, "lane.txt"), "w") as f:
+            f.write("the lane's own work\n")
+        self._ok("git", "add", "lane.txt")
+        self._ok("git", "commit", "-q", "-m", "lane " + name)
+        tip = self._ok("git", "rev-parse", "HEAD")
+        self._ok("git", "checkout", "-q", "main")
+        return tip
+
+    def _trains(self):
+        """(car, trunk): lane commit `car` lands on main inside a train merge,
+        and a second train merge follows it."""
+        self._ok("git", "checkout", "-q", "-b", "car", "main")
+        car = self._commit("car")
+        self._ok("git", "checkout", "-q", "-b", "other", "main")
+        self._commit("other")
+        self._ok("git", "checkout", "-q", "main")
+        self._ok("git", "merge", "-q", "--no-ff", "-m", "train1", "car")
+        self._ok("git", "merge", "-q", "--no-ff", "-m", "train2", "other")
+        return car, self._ok("git", "rev-parse", "HEAD")
+
+    def _remote(self, name):
+        """A bare `name` holding main. Push, not fetch: a fetch records the
+        remote's default branch by itself on newer git."""
+        bare = os.path.join(self.tmp, name + ".git")
+        self._ok("git", "init", "-q", "--bare", "-b", "main", bare)
+        self._ok("git", "remote", "add", name, bare)
+        self._ok("git", "push", "-q", name, "main")
+
+    def test_trunk_None_reads_the_remote_default_branch(self):
+        car, trunk = self._trains()
+        reviewed, rebased = self._lane(car, "reviewed"), self._lane(trunk,
+                                                                    "rebased")
+        # PREMISE: the pair's base is the landed car and its range carries
+        # both train merges, so the pair reading cannot answer.
+        self.assertEqual(self.git.fork_point(self.root, reviewed, rebased),
+                         car)
+        self.assertIsNone(self.git.patch_sequence(self.root, car, rebased))
+        self._remote("origin")
+        self._ok("git", "remote", "set-head", "origin", "main")
+        self.assertEqual(self.git.default_trunk(self.root),
+                         (trunk, "origin/main"))
+        said = {}
+        self.assertEqual(self.git.patch_sequence_containment(
+            self.root, reviewed, rebased, report=said),
+            (vcs.PATCH_SEQUENCE_EXACT, 0, 1, 1))
+        self.assertEqual(said["reading"], "trunk")
+        self.assertIn("off trunk %s (origin/main)" % trunk[:12],
+                      said["basis"])
+
+    def test_a_declared_trunk_refusal_never_falls_back_to_remote_default(self):  # noqa: VACUOUS_ASSERTION — the usable origin/HEAD and its exact default_trunk answer are the same-fixture positive controls for the fallback this refusal must suppress
+        car, trunk = self._trains()
+        reviewed, rebased = self._lane(car, "reviewed"), self._lane(trunk,
+                                                                    "rebased")
+        self._remote("origin")
+        self._ok("git", "remote", "set-head", "origin", "main")
+        self.assertEqual(self.git.default_trunk(self.root),
+                         (trunk, "origin/main"),
+                         "control: discovery would make this pair verify")
+        said = {}
+        got = self.git.patch_sequence_containment(
+            self.root, reviewed, rebased,
+            trunk=lambda: (None, "the declared trunk does not resolve"),
+            report=said)
+        self.assertEqual(got[0], vcs.PATCH_SEQUENCE_UNKNOWN)
+        self.assertEqual(said["reading"], "pair")
+        self.assertIn("declared trunk does not resolve", said["why"])
+
+    def test_no_default_branch_leaves_an_unreadable_pair_UNKNOWN(self):
+        car, trunk = self._trains()
+        reviewed, rebased = self._lane(car, "reviewed"), self._lane(trunk,
+                                                                    "rebased")
+        said = {}
+        self.assertEqual(self.git.patch_sequence_containment(
+            self.root, reviewed, rebased, report=said)[0],
+            vcs.PATCH_SEQUENCE_UNKNOWN)
+        self.assertIn("the repository has no remote", said["why"])
+        # The ONE remote of a repository without origin is the one read, and
+        # a remote whose default branch git never recorded names no trunk.
+        self._remote("upstream")
+        said = {}
+        self.assertEqual(self.git.patch_sequence_containment(
+            self.root, reviewed, rebased, report=said)[0],
+            vcs.PATCH_SEQUENCE_UNKNOWN)
+        self.assertIn("refs/remotes/upstream/HEAD is not set", said["why"])
+        # CONTROL, same pair: once it is recorded, the same call answers.
+        self._ok("git", "remote", "set-head", "upstream", "main")
+        self.assertEqual(self.git.patch_sequence_containment(
+            self.root, reviewed, rebased),
+            (vcs.PATCH_SEQUENCE_EXACT, 0, 1, 1))
+
+    def test_a_match_on_an_OLDER_fork_point_is_BACKWARD(self):
+        car, trunk = self._trains()
+        older, newer = self._lane(car, "older"), self._lane(trunk, "newer")
+        # CONTROL: forward is a match, and a callable trunk is honoured.
+        self.assertEqual(self.git.patch_sequence_containment(
+            self.root, older, newer, trunk=lambda: trunk),
+            (vcs.PATCH_SEQUENCE_EXACT, 0, 1, 1))
+        said = {}
+        self.assertEqual(self.git.patch_sequence_containment(
+            self.root, newer, older, trunk=trunk, report=said),
+            (vcs.PATCH_SEQUENCE_BACKWARD, None, 1, 1))
+        self.assertIn("not provably forward", said["why"])
+        # A readable pair never pays for a trunk: the callable is not called.
+        sibling = self._lane(car, "sibling")
+        self.assertEqual(self.git.patch_sequence_containment(
+            self.root, older, sibling,
+            trunk=lambda: self.fail("the trunk was observed for a pair the "
+                                    "common base could answer")),
+            (vcs.PATCH_SEQUENCE_EXACT, 0, 1, 1))
+
 
 class SelectionTest(VcsBase):
     def _jj(self, *parts):
@@ -2315,10 +2601,20 @@ _DIRECT_SPAWN_DEBT = {
     "seat_launch_assets.py": "toplevel probe during spawn homing; ordinary migration debt",
     "web:_roster_git_one": "`log -1` row for the project panel; semantic owner survives the web.py physical split; ordinary migration debt",
     "wiring.py": "2 read-only observation calls (diff --name-only --diff-filter=A, ls-files --others) answering ONE question: which modules did THIS tree add. Runs inside the Stop hook, so it is fail-open by contract — a None answer means 'could not look' and leaves the gate open; ordinary migration debt",
-    "hostpath_guard.py": "6 read-only observations (config --get-regexp "
+    "hostpath_guard.py": "13 read-only observations (config --get-regexp "
                          "of remote.* and url.*, ls-remote --heads --tags of "
                          "the push URL, remote get-url, rev-list --objects, "
-                         "cat-file --batch-check, cat-file --batch) behind "
+                         "cat-file --batch-check, cat-file --batch, and after "
+                         "a hit for-each-ref of refs/remotes/, rev-parse "
+                         "--git-path info/grafts, config --show-scope of "
+                         "the remote URLs and the same ls-remote --heads "
+                         "--tags of a PUBLIC remote's own URL (what a PUBLIC "
+                         "remote other than the destination advertises now), "
+                         "and for the shared-history rung "
+                         "ls-remote --symref, merge-base, rev-list --stdin "
+                         "and rev-list --max-parents=0 --stdin (the new "
+                         "roots); no remote-tracking ref says what the "
+                         "destination holds) behind "
                          "ONE _git helper. Same standing "
                          "exception class as nevertrack.py: the pre-push guard "
                          "executes this file as a PLAIN SCRIPT "
@@ -2361,10 +2657,13 @@ _DIRECT_SPAWN_DEBT = {
         "A PRE-COMMIT RUNG, SAME LAW AS ITS SIBLINGS ABOVE: the "
         "installer snapshots its bytes beside the hook, where no "
         "helm package exists to import, so it cannot reach the vcs "
-        "seam. Two reads only — `diff --cached --name-only` for the "
-        "staged paths and `show <ref>:<path>` for the line counts — "
-        "and it fails OPEN, printing UNMEASURED and returning 0 "
-        "when either refuses.",
+        "seam. Two reads decide the budget — `diff --cached "
+        "--name-only` for the staged paths and `show <ref>:<path>` for "
+        "the line counts — and it fails OPEN, printing UNMEASURED and "
+        "returning 0 when either refuses. On a refusal only, three more "
+        "reads place its record: `rev-parse --git-common-dir` and "
+        "`--show-toplevel`, and `symbolic-ref HEAD` for the branch; a "
+        "failed record is named and never changes the refusal.",
     "conflict_marker.py": "7 read-only index+HEAD observations (diff --cached "
                           "--name-status -z -M for the rename-aware staged "
                           "set, ls-files --stage for stage-0 OIDs, check-attr "
@@ -2404,19 +2703,22 @@ _DIRECT_SPAWN_DEBT = {
 _DYNAMIC_ARGV_MODULES = {
     "autocompact.py", "cell.py", "chatnode.py", "doctor.py", "fleet.py",
     "handoff.py", "harness.py", "modelrouter.py", "providers.py", "seat.py",
-    "seat_health.py", "seat_lifecycle.py", "seat_lifecycle_runtime.py",
-    "owedpush.py",
+    "seat_health.py", "seat_lifecycle_runtime.py",
     "seat_proxy.py", "session.py",
     # keepalive.py — CONFIRMED not git, read off every subprocess in the
-    # module. `ensure_timer` runs the runtime-discovered systemctl twice
-    # (`--user daemon-reload`, `--user enable --now helm-keepalive.timer`) —
-    # the identical shape tasksmirror.py and owedpush.py are listed for — and
-    # `hand_crontab` runs the runtime-discovered `crontab -l` READ-ONLY, to
-    # report a hand-installed cadence it must never edit. Nothing else in the
-    # module spawns at all: its own work is filesystem reads, one OAuth
-    # refresh over urllib, and an atomic credential write, so there is no
-    # version control for a dynamic argv to reach.
+    # module. `hand_crontab` runs the runtime-discovered `crontab -l`
+    # READ-ONLY, to report a hand-installed cadence it must never edit; its
+    # timer installs through timerhealth.install_user_timer (task/3307).
+    # Nothing else in the module spawns at all: its own work is filesystem
+    # reads, one OAuth refresh over urllib, and an atomic credential write, so
+    # there is no version control for a dynamic argv to reach.
     "keepalive.py",
+    # remote_session.py — CONFIRMED not git, read off every subprocess in it.
+    # Its one `_run` seam spawns the runtime-resolved `claude` (a launch under
+    # `script`, a follow-up, a token refresh) and `gh api` (the drop read).
+    # Every repository operation (the bundle, the cure, the lane diff) goes
+    # through the helm/vcs.py seam, remote_relay's too.
+    "remote_session.py",
     # suspend.py — CONFIRMED not git, read off every subprocess in the
     # module. `_kick_pass` detaches `python -m helm proxywatch --force` (the
     # module's own proof pass, never a repository operation) and `_post`
@@ -2424,6 +2726,19 @@ _DYNAMIC_ARGV_MODULES = {
     # clocks and a state file and bounces proxies through seat_proxy's own
     # primitives, so there is no version control for a dynamic argv to reach.
     "suspend.py",
+    # postland.py — CONFIRMED not git, read off the module's one subprocess.
+    # `_start` runs this interpreter on the landed checkout's own `bin/helm
+    # lr postland --record <head>`: a timed dispatch-ledger read in a new
+    # process (task/3538), not version control. Every repository question
+    # the module asks (the checkout's top level and HEAD, the head's full
+    # id, the status of its code) goes through the helm/vcs.py seam.
+    "postland.py",
+    # buildskew.py — CONFIRMED not git, read off every subprocess in the
+    # module. Its one direct spawn is a built tool's own `--version` (the
+    # binary seat._proxy_bin resolves), read for the commit it reports; the
+    # source checkout's HEAD and whether it holds that commit are asked
+    # through the helm/vcs.py seam (task/2963).
+    "buildskew.py",
     # gatewindow.py — CONFIRMED not git, read off every subprocess in the
     # module. All three are the FAB_BINARY constant, which is fab's
     # dispatch CLI and not version control: `fab gate --repo <room>` to
@@ -2436,40 +2751,57 @@ _DYNAMIC_ARGV_MODULES = {
     # gatecanary.py — CONFIRMED not git, read off every subprocess in the
     # module. `_launch` runs the operator's launcher prefix (`fab gate` by
     # default, HELM_GATE_CANARY_LAUNCH otherwise) with `--repo ROOM
-    # [--sliced]`, which gates a tree and is not version control, and
-    # `ensure_timer` runs the runtime-discovered systemctl twice, the shape
-    # keepalive.py is listed for. Its repository questions (trunk, tree,
-    # the peek room) go through the helm/vcs.py seam and helm/work.
+    # [--sliced]`, which gates a tree and is not version control; its timer
+    # installs through timerhealth.install_user_timer. Its repository
+    # questions (trunk, tree, the peek room) go through the helm/vcs.py seam
+    # and helm/work.
     "gatecanary.py",
-    "tasksmirror.py",
+    # releasenightly.py — CONFIRMED not git, read off every subprocess in the
+    # module. `_launch` runs `fab <host> --key ... --repo ROOM -- python3
+    # scripts/release/release.py --nightly ...`, which dispatches the release
+    # tool's dry run to a build host and is not version control; its timer
+    # installs through timerhealth.install_user_timer. Its repository
+    # questions (the fresh trunk, the release remotes, the peek room) go
+    # through the helm/vcs.py seam and helm/work.
+    "releasenightly.py",
+    # gateshadow.py — CONFIRMED not git, read off every subprocess in the
+    # module. `_fab` runs the gatewindow.FAB_BINARY argvs a shadow pass builds
+    # (`fab gate measure|submit|--import|kill`), which dispatch and bind one
+    # sliced gate job and are not version control; its timer installs through
+    # timerhealth.install_user_timer. Its repository questions (the peek
+    # room, the tree's module walk) go through helm/work and the helm/vcs.py
+    # seam.
+    "gateshadow.py",
+    # seat_sidecar.py — CONFIRMED not git, read off the module's one
+    # subprocess. `_start` runs the family's declared sidecar runtime (bun,
+    # for cursor's bridge) with its declared serve argv and a port, detached;
+    # that launches a local HTTP bridge and is not version control. Its only
+    # other process work is os.kill on a pid it proved is that bridge. Its one
+    # repository question, the checkout's file list for `runtime_digest`,
+    # goes through the helm/vcs.py seam.
+    "seat_sidecar.py",
     "transcripts.py",
     # upstream_watch.py — CONFIRMED not git, read off every subprocess in the
     # module. `run_claude` runs the runtime-discovered `claude` program with
     # `-p` (the headless model runs of the watcher's propose and refute
-    # stages), and `install_timer` runs the runtime-discovered systemctl twice
-    # (`--user daemon-reload`, `--user enable --now helm-upstream-watch.timer`),
-    # the shape tasksmirror.py is listed for. Its one repository question, the
-    # stable checkout the model runs read, goes through work.find_root.
+    # stages); its timer installs through timerhealth.install_user_timer. Its
+    # one repository question, the stable checkout the model runs read, goes
+    # through work.find_root.
     "upstream_watch.py",
-    # owedpush.py — CONFIRMED not git, and confirmed by reading every
-    # subprocess in the module rather than by its name. `_ensure_timer` is its
-    # ONLY one: two runtime-discovered systemctl argvs, `--user daemon-reload`
-    # and `--user enable --now helm-owed-push.timer`, which is the identical
-    # shape tasksmirror.py is listed for directly below. The module's own work
-    # touches no repository at all — it reads the obligation ledger and posts
-    # chat DMs — so there is no version control for a dynamic argv to reach.
-    # tasksmirror.py — CONFIRMED not git. `ensure_timer` invokes the
-    # runtime-discovered systemctl to install and enable the mirror's user
-    # timer, the same seam autocompact and beacons already use. No version
-    # control is involved; the module reads harness JSON and appends to the
-    # ledger, and its only subprocess is the cadence installer.
+    # private_names.py — CONFIRMED not git, read off every subprocess in the
+    # module. Both run the runtime-discovered `helm` on PATH: `helm classify
+    # --each-line` for the advisory leg and `helm classify label` for the
+    # refused lines' labelled examples. Every repository read it makes goes
+    # through the conflict-marker rung's `_git` seam, the snapshot neighbour
+    # it is installed beside, so nothing here belongs in _DIRECT_SPAWN_DEBT.
+    "private_names.py",
     # seat_health.py — CONFIRMED not git. Doctor invokes the runtime-discovered
     # CLIProxyAPI binary only for its version banner.
-    # seat_lifecycle.py — CONFIRMED not git. Rebind timer installation invokes
-    # runtime-discovered systemctl; rebind commands target the selected harness
-    # adapter. seat_lifecycle_runtime.py owns headless launch spawning through a
-    # runtime-assembled argv. The pinned dynamic resume/spawn argv remain in
-    # seat.py.
+    # seat_lifecycle_runtime.py — CONFIRMED not git. It owns headless launch
+    # spawning through a runtime-assembled argv; seat_lifecycle.py's rebind
+    # commands target the selected harness adapter, and its rebind timer
+    # installs through timerhealth.install_user_timer. The pinned dynamic
+    # resume/spawn argv remain in seat.py.
     # seat_proxy.py — CONFIRMED not git. Smoke invokes claude with dynamically
     # selected model/tool arguments; proxy up invokes the runtime-discovered
     # CLIProxyAPI binary. Neither command is version control.
@@ -2479,9 +2811,10 @@ _DYNAMIC_ARGV_MODULES = {
     "gatechild.py",
     # stopfacts_resident.py — CONFIRMED not git, read off every subprocess in
     # the module. `_preflight` runs `<the running interpreter> -c "import
-    # helm.cli, helm.web_server, helm.stopfacts_resident"` to check that a
-    # changed tree imports before the resident re-execs onto it, and the
-    # re-exec itself is `os.execv` of this process's own command line. The
+    # helm.cli, helm.trunkroute, helm.selfrepo, helm.web, helm.web_server,
+    # helm.webserve, helm.stopfacts_resident"` to check that a changed tree
+    # imports before a `helm web` re-execs onto it, and the re-exec itself is
+    # `os.execv` of this process's own command line. The
     # head is sys.executable, which the static pass cannot decode; the git
     # the module's facts need is asked by the guard's own functions it calls.
     "stopfacts_resident.py",
@@ -2496,20 +2829,21 @@ _DYNAMIC_ARGV_MODULES = {
     # binary with model and port arguments. The binary path comes from argv,
     # so the static pass cannot decode it; nothing it runs is version control.
     "relevanced.py",
-    # proxywatch.py — CONFIRMED not git. Two systemctl spawns, both in
-    # ensure_timer: `daemon-reload` and `enable --now helm-proxywatch.timer`.
-    # The argv is assembled from a which()-resolved binary plus literals, which
-    # is why the static pass cannot decode it. Named here rather than routed
-    # through the vcs seam because the seam is for GIT, and a systemctl call is
-    # not a version-control operation wearing a different hat.
-    "proxywatch.py",
-    # stalebot.py — CONFIRMED not git. ONE spawn site: `ensure_timer` invokes
-    # the runtime-discovered systemctl (daemon-reload, enable --now) to
-    # install the stale-bot's daily user timer — the identical seam
-    # tasksmirror and proxywatch already declare. Every git question the
-    # module asks (landing proof, carrier patch-id scan) routes through
-    # helm/vcs.py's backend, including the patch-id pipe via stdin=.
-    "stalebot.py",
+    # timerhealth.py — CONFIRMED not git, read off both spawns. `_systemctl`
+    # runs `systemctl --user <verb>` for the census, and `install_user_timer`
+    # runs the one `daemon-reload` and the one `enable --now <timers>` that
+    # every helm timer installer asks for (task/3307): its argv is the
+    # caller's systemctl, a which()-resolved path or the bare name, plus
+    # literals and the caller's timer names, which is why the static pass
+    # cannot decode it. Named here rather than routed through the vcs seam
+    # because the seam is for GIT, and a systemctl call is not a
+    # version-control operation wearing a different hat.
+    # IT IS THE HELPER THE beacons.py ENTRY ASKED FOR, as the fourth copy of
+    # the same systemctl pair: "if a FIFTH timer-installer lands, the
+    # repetition has earned a helper". Sixteen had. gc, beacons, stalebot,
+    # tasksmirror, owedpush, proxywatch, remote_relay and seat_lifecycle left
+    # this list with it, because that pair was their only spawn.
+    "timerhealth.py",
     # codexhomes.py — CONFIRMED not git, by reading _orca_cli_codex_state.
     # ONE spawn: `<orca> account list`, sync-orca's CLI fallback for a daemon
     # whose accounts.list RPC fails (2026-08-04). The argv head is dynamic —
@@ -2540,31 +2874,6 @@ _DYNAMIC_ARGV_MODULES = {
     # and gate.tree_state; the ssh child runs a marker-structured sh script
     # on ANOTHER machine, which no local spawn audit could classify anyway.
     "gateroute.py",
-    # gc.py — CONFIRMED not git, and the SAME TWO SPAWNS as proxywatch.py above:
-    # `systemctl --user daemon-reload` and `systemctl --user enable --now
-    # helm-gc.timer`, both in the ship-its-own-cadence path, argv assembled from
-    # a which()-resolved binary plus literals. This audit did its job: the lane
-    # that taught gc to install its own timer added the spawn and did not
-    # discharge the allowlist, and the FULL SUITE caught it at the land gate
-    # after the review had already approved (2026-07-30). Confirming "not git"
-    # is the whole obligation this entry represents — it is not a formality,
-    # and the day it is added without someone reading the spawn, the audit
-    # stops meaning anything.
-    "gc.py",
-    # beacons.py — CONFIRMED not git, by reading beacons.py:1477 and not by
-    # pattern-matching the three entries above. It is the FOURTH module with
-    # the identical pair — `systemctl --user daemon-reload` and `enable --now
-    # helm-beacons.timer`, in ensure_timer, argv from a which()-resolved binary
-    # plus literals — and the static pass cannot decode it only because `cmd`
-    # is a LOOP VARIABLE over two literal lists, both of which begin with the
-    # resolved systemctl. Nothing reachable from that call is git.
-    # The gc.py note above predicted this lane exactly: the row that taught
-    # beacons to install its own timer added the spawn and did not discharge
-    # the allowlist, and the whole suite caught it at the gate — after the
-    # local subset had passed green. Two for two now. If a FIFTH timer-
-    # installer lands, the repetition has earned a helper (an `ensure_timer`
-    # the modules share) rather than a fifth paragraph saying the same thing.
-    "beacons.py",
     # gate.py — CONFIRMED not git, and confirmed by READING the spawns rather
     # than by the module's name sounding harmless. There are exactly two
     # subprocess calls: `gate.run`, whose argv is either
@@ -2610,6 +2919,23 @@ _DYNAMIC_ARGV_MODULES = {
     # script run in place from HELM_LOCAL_REVIEW_SCRIPT or its default path.
     # The script spawns git itself; helm spawns only the interpreter.
     "findingspass.py",
+    # webshot.py — CONFIRMED not git, read off every subprocess in the module.
+    # Two dynamic argvs, both the capture verb's whole point: the server child
+    # (`<interpreter> -c <code>` that imports the tree's own web_server) and the
+    # headless browser (runtime-resolved chrome via find_chrome). Neither spawns
+    # version control; the browser binary's name is why a static pass cannot
+    # decode it. Stopping either uses os.killpg / Popen.terminate, not a new
+    # spawn.
+    "webshot.py",
+    # autoland.py — CONFIRMED not git, read off every subprocess in the
+    # module. Two spawns, both `<the running interpreter> <helm root>/bin/helm
+    # lr ...` (task/3562): `fold_apply` runs `lr foldcheck <head> --apply` and
+    # `lr_close` runs `lr close <rid> --reason landed --json`, each in a fresh
+    # child so the post-ff fold reads a process that names the landed code.
+    # The head is sys.executable, which the static pass cannot decode; the
+    # audit round goes through gatewindow._fab and every repository question
+    # through the helm/vcs.py seam.
+    "autoland.py",
 }
 
 # PINNED so the seam's reach cannot quietly regress. OUTSIDE may only go DOWN
@@ -2626,8 +2952,14 @@ _DYNAMIC_ARGV_MODULES = {
 # close door can ever reach. It is the SAME `merge-base --is-ancestor` spelling
 # already standing in this module, and the module is already debt — this adds a
 # call of an accepted shape rather than a new anti-pattern.
-_SEAM_SPAWNS = 4                  # vcs.py: run, _capture, proc, git_version
-_GIT_SPAWNS_OUTSIDE = 51
+# vcs.py: run, _capture, proc, git_version, and the scope's one
+# `cat-file --batch-check` process (`_open_batch`, task/3056) — the seam's
+# own spawn sites, never debt. `run_holding`'s push is the seam's too, but it
+# spawns this interpreter running `_HOLDER`, which starts git (task/3265 door
+# read B3), so this static pass reads its argv as unresolved, the seam's own
+# kind, and does not count it here.
+_SEAM_SPAWNS = 5
+_GIT_SPAWNS_OUTSIDE = 54
 
 
 class SpawnDetectorTest(unittest.TestCase):
@@ -2910,7 +3242,8 @@ class SpawnDetectorTest(unittest.TestCase):
         self.assertTrue(unresolved)
 
     def test_the_seams_own_spawns_are_detected_by_this_sweep(self):
-        # if the sweep cannot see the seam's own three, it cannot see a copycat
+        # if the sweep cannot see the seam's own spawn sites, it cannot see a
+        # copycat
         git, _static, _unresolved = _sweep_helm()
         self.assertEqual(len([s for s in git if s[0] == "vcs.py"]), _SEAM_SPAWNS)
 
@@ -3528,6 +3861,1030 @@ class AmbientGitBudgetTest(unittest.TestCase):
             self.assertEqual(self.git.run(
                 "/repo", "ls-remote", "origin", "refs/heads/main",
                 timeout=0.01)[0], -1)
+
+
+# THE OVERLAY THE FOLD'S READS RUN UNDER, in `rowworld._scrubbed_env`'s shape:
+# repository selection removed, both history rewriters pinned off.
+_FOLD_VIEW = {"GIT_DIR": None, "GIT_WORK_TREE": None,
+              "GIT_OBJECT_DIRECTORY": None,
+              "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull}
+_BATCH_ARGV = "--batch-check=%(objectname) %(objecttype)"
+
+
+class TheFoldsGitQuestionsTest(VcsBase):
+    """task/3056 — what one cold dispatch fold asks git, asked for less.
+
+    Measured on an isolated copy of the ledger: 1,952 git processes per cold
+    fold, 262 `merge-tree`s and 265 `diff --raw`s re-asked in full by the
+    lensed fold a board read runs in the same scope, 1,407 processes that were
+    one existence or resolution question each, and a copy of `os.environ` per
+    spawn. Every arm here counts PROCESSES at `subprocess`, because the saving
+    is the process that did not start, and compares ANSWERS byte for byte,
+    because the acceptance is that no answer moved."""
+
+    def setUp(self):
+        super().setUp()
+        # A SIDE commit off the first one, so a three-way merge has two real
+        # sides and `merge-tree --write-tree` has a tree to write.
+        self.assertEqual(_sh(self.root, "git", "checkout", "-q", "-b", "side",
+                             self.shas[0]).returncode, 0)
+        self.side = self._commit("three")
+        self.assertEqual(_sh(self.root, "git", "checkout", "-q",
+                             "main").returncode, 0)
+        self.gitdir = os.path.join(self.root, ".git")
+
+    def processes(self):
+        """([argv, ...], patch): every process the seam starts while the patch
+        is active. `subprocess.run` starts through `Popen`, so one spy on
+        `Popen` sees both the single spawns and the scope's batch."""
+        seen, real = [], subprocess.Popen
+
+        def spy(argv, *a, **kw):
+            seen.append(tuple(str(x) for x in argv))
+            return real(argv, *a, **kw)
+        return seen, mock.patch.object(vcs.subprocess, "Popen",
+                                       side_effect=spy)
+
+    def ask(self, *argv, where=None, env=_FOLD_VIEW):
+        return self.git.run(where or self.gitdir, *argv, env=env)
+
+    def ambiguous_prefix(self):
+        """Four hex digits that name TWO objects in this repository. -> str
+
+        Two blobs are written whose ids share their first four digits; which
+        two is a function of their bytes alone, so the search finds the same
+        pair every run."""
+        import hashlib
+        firsts, n = {}, 0
+        while True:
+            body = "collide %d\n" % n
+            raw = body.encode()
+            oid = hashlib.sha1(b"blob %d\0" % len(raw) + raw).hexdigest()
+            if oid[:4] in firsts:
+                for text in (firsts[oid[:4]], body):
+                    self.assertEqual(_sh(self.root, "git", "hash-object", "-w",
+                                         "--stdin", input=text).returncode, 0)
+                return oid[:4]
+            firsts[oid[:4]] = body
+            n += 1
+
+    def test_the_replay_witness_forms_are_asked_once_per_scope(self):  # noqa: VACUOUS_ASSERTION — the spawn table is one exact equality holding the must-hit 1s beside the must-miss 2s, and the merge's rc 0 and written tree id and the diff's listed path are unconditional positives on the same answers the memo returned
+        """ARM 1: a merge-tree or diff --raw question asked twice in one scope
+        spawns once — and only the two exact forms the fold asks do.
+
+        ONE TABLE, the shape `VcsSeamTest` uses one module over: the two
+        admitted forms are the positives, and three look-alikes that a scope
+        CANNOT hold still are the must-misses. The work-tree diff is measured,
+        not assumed: its second answer differs because the file moved between
+        the asks, so a memo on it would have served a wrong answer."""
+        a, b = self.shas
+        forms = {
+            "merge-tree": ("merge-tree", "--write-tree",
+                           "--merge-base=" + a, b, self.side),
+            "diff --raw": ("diff", "--raw", "-z", "--abbrev=40",
+                           "--no-renames", a, b),
+            "merge-tree on a ref": ("merge-tree", "--write-tree",
+                                    "--merge-base=" + a, "main", self.side),
+            "diff with other options": ("diff", "--raw", "-z", a, b),
+        }
+        seen, patch = self.processes()
+        counted, answers = {}, {}
+        with patch:
+            for name, argv in forms.items():
+                del seen[:]
+                with projscope.scope():
+                    answers[name] = (self.ask(*argv), self.ask(*argv))
+                counted[name] = len([p for p in seen if argv[0] in p])
+            # THE WORK TREE MOVES BETWEEN THE TWO ASKS.
+            worktree = ("diff", "--raw", "-z", "--abbrev=40", "--no-renames",
+                        a)
+            del seen[:]
+            with projscope.scope():
+                before = self.ask(*worktree, where=self.root)
+                with open(os.path.join(self.root, "two.txt"), "w") as f:
+                    f.write("moved")
+                after = self.ask(*worktree, where=self.root)
+            counted["diff against the work tree"] = len(
+                [p for p in seen if "diff" in p])
+        self.assertEqual(counted, {"merge-tree": 1, "diff --raw": 1,
+                                   "merge-tree on a ref": 2,
+                                   "diff with other options": 2,
+                                   "diff against the work tree": 2})
+        # POSITIVE CONTROLS on the answers: a clean merge writes a tree, the
+        # diff lists a real change, and a memo hit is the same bytes.
+        tree, _nl, _rest = answers["merge-tree"][0][1].partition(b"\n")
+        self.assertEqual(answers["merge-tree"][0][0], 0)
+        self.assertRegex(tree.decode(), r"\A[0-9a-f]{40}\Z")
+        self.assertIn(b"two.txt", answers["diff --raw"][0][1])
+        self.assertEqual(answers["merge-tree"][1], answers["merge-tree"][0])
+        self.assertEqual(answers["diff --raw"][1], answers["diff --raw"][0])
+        self.assertNotEqual(before, after, "the work tree moved, so a memo on "
+                                           "this form would have lied")
+
+    def test_an_unpinned_bare_existence_question_is_never_batched(self):
+        """A replace ref makes the batch and the single command disagree on a
+        bare `cat-file -e`: the batch looks the object up through
+        replacement, the command does not. Without GIT_NO_REPLACE_OBJECTS in
+        the overlay the question is spawned and answers what its own process
+        answers; under the fold's pin it still rides the batch."""
+        commit = self.shas[1]
+        missing = "0" * 39 + "2"
+        _sh(self.root, "git", "update-ref", "refs/replace/" + missing, commit)
+        bare = ("cat-file", "-e", missing)
+        present = ("cat-file", "-e", commit)
+        unpinned = {"GIT_NO_REPLACE_OBJECTS": None}
+        single = self.ask(*bare, env=unpinned)
+        self.assertEqual(single[:2], (1, b""), "the fixture's own answer")
+        seen, patch = self.processes()
+        with patch, projscope.scope():
+            got = self.ask(*bare, env=unpinned)
+            control = self.ask(*present)
+        self.assertEqual(got[:2], single[:2])
+        self.assertTrue(any(p[-3:] == bare for p in seen),
+                        "an unpinned bare question spawns its own process")
+        # THE CONTROL: under the fold's pin a present bare id is batched.
+        self.assertEqual(control[:2], (0, b""))
+        self.assertFalse(any(p[-3:] == present for p in seen))
+
+    def test_a_batched_answer_is_the_single_spawn_answer(self):
+        """ARM 2: every existence and resolution question the batch carries
+        answers exactly what its own process answers — (rc, stdout, stderr),
+        byte for byte — including a missing object and an ambiguous name, and
+        only a RESOLVED answer is spared its process.
+
+        THE TABLE IS THE POPULATION the fold asks plus the edges the batch
+        must not flatten: a tree asked as a commit (`rev-parse --verify
+        --quiet` exits 1 AND writes an `error:` line there, which a batch
+        `missing` line cannot reproduce), a bare missing id (`cat-file -e`
+        exits 1, where a peeled one exits 128), and a four-digit name two
+        objects share."""
+        commit = self.shas[1]
+        tree = _sh(self.root, "git", "rev-parse", commit + "^{tree}").stdout.strip()
+        blob = _sh(self.root, "git", "rev-parse", commit + ":two.txt").stdout.strip()
+        missing = "0" * 39 + "1"
+        short = self.ambiguous_prefix()
+        questions = {
+            "a commit exists": ("cat-file", "-e", commit + "^{commit}"),
+            "a bare commit exists": ("cat-file", "-e", commit),
+            "a bare blob exists": ("cat-file", "-e", blob),
+            "a tree is not a commit": ("cat-file", "-e", tree + "^{commit}"),
+            "a missing object, peeled": ("cat-file", "-e",
+                                         missing + "^{commit}"),
+            "a missing object, bare": ("cat-file", "-e", missing),
+            "an ambiguous name exists?": ("cat-file", "-e", short),
+            "a commit resolves": ("rev-parse", "--verify", "--quiet",
+                                  commit + "^{commit}"),
+            "a commit's tree resolves": ("rev-parse", "--verify", "--quiet",
+                                         commit + "^{tree}"),
+            "a tree resolved as a commit": ("rev-parse", "--verify", "--quiet",
+                                            tree + "^{commit}"),
+            "a missing object resolved": ("rev-parse", "--verify", "--quiet",
+                                          missing + "^{commit}"),
+            "an ambiguous name resolved": ("rev-parse", "--verify", "--quiet",
+                                           short + "^{commit}"),
+            "the tree of a commit": ("rev-parse", commit + "^{tree}"),
+            "the tree of a missing object": ("rev-parse", missing + "^{tree}"),
+            "the tree of an ambiguous name": ("rev-parse", short + "^{tree}"),
+        }
+        single = {name: self.ask(*argv) for name, argv in questions.items()}
+        seen, patch = self.processes()
+        with patch, projscope.scope():
+            batched = {name: self.ask(*argv)
+                       for name, argv in questions.items()}
+        spawned = {name for name, argv in questions.items()
+                   if any(p[-len(argv):] == argv for p in seen)}
+        # MUST-HITS on the fixture, so the edges are the edges they claim.
+        self.assertEqual(single["a commit resolves"][:2],
+                         (0, commit.encode() + b"\n"))
+        self.assertEqual(single["a missing object, bare"][:2], (1, b""))
+        self.assertEqual(single["a missing object, peeled"][0], 128)
+        self.assertEqual(single["a tree resolved as a commit"][0], 1)
+        self.assertIn(b"expected commit type",
+                      single["a tree resolved as a commit"][2])
+        self.assertIn(b"ambiguous", single["an ambiguous name exists?"][2])
+        # THE PROPERTY: every resolved answer came off the batch, and every
+        # other answer was asked of its own process.
+        answered = {name for name, got in single.items() if got[0] == 0}
+        self.assertEqual(len(answered), 6, answered)
+        self.assertEqual(spawned, set(questions) - answered)
+        self.assertEqual(len([p for p in seen if _BATCH_ARGV in p]), 1,
+                         "one batch process for the repository, for the scope")
+        # AND NO ANSWER A CALLER READS MOVED: the exit code and stdout, byte
+        # for byte, for every question; and every answer the batch did not
+        # resolve is the command's own, stderr included.
+        self.assertEqual({name: got[:2] for name, got in batched.items()},
+                         {name: got[:2] for name, got in single.items()})
+        self.assertEqual({name: batched[name] for name in spawned},
+                         {name: single[name] for name in spawned})
+        # STDERR OF A RESOLVED ANSWER IS NOT REPRODUCED, and this is what that
+        # costs: the batch writes none, and the command writes only git's
+        # ADVICE there — measured on git 2.51 and 2.53, a `hint:` block about
+        # the grafts file the fold's own GIT_GRAFT_FILE pin names, on every
+        # command, wherever `advice.graftFileDeprecated` is not configured
+        # off. No caller of these forms reads stderr.
+        self.assertEqual({name: batched[name][2] for name in answered},
+                         dict.fromkeys(answered, b""))
+        self.assertEqual(
+            {name: b"".join(line for line in single[name][2].splitlines(True)
+                            if not line.startswith(b"hint:"))
+             for name in answered},
+            dict.fromkeys(answered, b""))
+
+    def test_the_batch_lives_for_one_scope_and_fails_toward_the_spawn(self):
+        """ARM 2b: the batch is opened at the first question that needs it,
+        closed when the scope ends, never shared with a forked child, and a
+        batch that dies hands its question to the ordinary spawn."""
+        opened, real_open = [], vcs._open_batch
+
+        def spy(cwd, env):
+            got = real_open(cwd, env)
+            opened.append(got)
+            return got
+
+        first = ("cat-file", "-e", self.shas[0] + "^{commit}")
+        second = ("cat-file", "-e", self.shas[1] + "^{commit}")
+        seen, patch = self.processes()
+        with mock.patch.object(vcs, "_open_batch", side_effect=spy), patch:
+            with projscope.scope():
+                self.assertEqual(self.ask(*first), (0, b"", b""))
+                batch = opened[0]
+                live = batch.proc
+                self.assertIsNone(live.poll(), "the batch is open inside "
+                                               "the scope")
+                # A FORKED CHILD inherits this object and must not use it.
+                del seen[:]
+                with mock.patch.object(vcs.os, "getpid",
+                                       return_value=batch.pid + 1):
+                    forked = self.ask(*second)
+                forked_spawns = [p for p in seen if second[-1] in p]
+            self.assertIsNotNone(live.poll(), "the scope's end closes its "
+                                              "batch")
+            self.assertIsNone(batch.proc)
+            with projscope.scope():
+                self.ask(*first)
+                dying = opened[1]
+                dying.proc.kill()
+                dying.proc.wait()
+                del seen[:]
+                after_death = self.ask(*second)
+                death_spawns = [p for p in seen if second[-1] in p]
+        self.assertEqual(len(opened), 2, "one batch per scope, not per ask")
+        self.assertEqual((forked[:2], after_death[:2]), ((0, b""), (0, b"")))
+        self.assertEqual((len(forked_spawns), len(death_spawns)), (1, 1),
+                         "each refusal is answered by the question's own "
+                         "process")
+
+    def test_the_batch_never_parks_in_a_worktree_room(self):  # noqa: VACUOUS_ASSERTION — the sleep probe found by the same scan is the positive control
+        """task/3099. The batch lives for the whole scope and `git -C` makes
+        its cwd the path it was opened with. The stop guard proves a live
+        delegated build by a process whose cwd IS a lane room, so a question
+        asked from a lane worktree must leave no process in that room, and
+        must still be answered by the batch."""
+        room = os.path.join(self.tmp, "room")
+        self.assertEqual(_sh(self.root, "git", "worktree", "add", "-q", "-b",
+                             "lane", room, self.side).returncode, 0)
+        want = os.path.realpath(room)
+
+        def parked():
+            found = []
+            for pid in os.listdir("/proc"):
+                try:
+                    if pid.isdigit() and os.path.realpath(
+                            "/proc/%s/cwd" % pid) == want:
+                        found.append(int(pid))
+                except OSError:
+                    continue
+            return found
+        # POSITIVE CONTROL on the same scan: a process that does sit in the
+        # room is found, so the empty answer below is a measurement.
+        probe = subprocess.Popen(["sleep", "30"], cwd=room)
+        try:
+            for _ in range(200):
+                if probe.pid in parked():
+                    break
+                time.sleep(0.025)
+            self.assertIn(probe.pid, parked())
+        finally:
+            probe.kill()
+            probe.wait(timeout=10)
+        opened, real_open = [], vcs._open_batch
+
+        def spy(cwd, env):
+            got = real_open(cwd, env)
+            opened.append(got)
+            return got
+        with mock.patch.object(vcs, "_open_batch", side_effect=spy), \
+                projscope.scope():
+            self.assertEqual(
+                self.ask("cat-file", "-e", self.side + "^{commit}",
+                         where=room), (0, b"", b""))
+            inside = parked()
+        self.assertEqual(len(opened), 1, "the batch answered the question")
+        self.assertEqual(inside, [], "a coprocess sits in the lane's room")
+
+    def test_a_REMOVED_target_is_refused_as_git_would(self):  # noqa: VACUOUS_ASSERTION — the first scoped ask answering 0 is the positive control
+        """task/3099, found in review (helm-codex). `git -C <path>` refuses a
+        path that is gone, so the batch may not answer for it either: a git
+        directory resolved while the worktree stood must not serve a later
+        scope asked from the removed path. (Inside ONE scope `run` memoises
+        its answers by design, so the removal is between scopes.)"""
+        room = os.path.join(self.tmp, "gone")
+        self.assertEqual(_sh(self.root, "git", "worktree", "add", "-q", "-b",
+                             "gone", room, self.side).returncode, 0)
+        question = ("cat-file", "-e", self.shas[0] + "^{commit}")
+        with projscope.scope():
+            self.assertEqual(self.ask(*question, where=room)[0], 0)
+        self.assertEqual(_sh(self.root, "git", "worktree", "remove",
+                             "--force", room).returncode, 0)
+        with projscope.scope():
+            scoped = self.ask(*question, where=room)
+        unscoped = self.ask(*question, where=room)
+        self.assertNotEqual(unscoped[0], 0, "control: git refuses a gone path")
+        self.assertEqual(scoped[0], unscoped[0],
+                         "the batch answered for a path git would refuse")
+
+    def test_the_batch_home_is_resolved_under_the_callers_overlay(self):  # noqa: VACUOUS_ASSERTION — the unscoped refusal is the control on the same question
+        """task/3099, found in review (helm-codex). The batch's git directory
+        is resolved under the SAME overlay the batch runs with. With ambient
+        GIT_DIR/GIT_WORK_TREE naming repository B and an overlay that clears
+        them, a question about repository A answered from B's store turns
+        B's object into a positive existence proof for A. The unscoped spawn
+        is the control: it asks A and refuses."""
+        other = os.path.join(self.tmp, "other")
+        os.makedirs(other)
+        for cmd in (("git", "init", "-q", "-b", "main"),
+                    ("git", "config", "user.email", "t@t"),
+                    ("git", "config", "user.name", "t")):
+            self.assertEqual(_sh(other, *cmd).returncode, 0)
+        with open(os.path.join(other, "b.txt"), "w") as f:
+            f.write("b")
+        _sh(other, "git", "add", "-A")
+        self.assertEqual(_sh(other, "git", "commit", "-q", "-m", "b").returncode, 0)
+        b_sha = _sh(other, "git", "rev-parse", "HEAD").stdout.strip()
+        ambient = {"GIT_DIR": os.path.join(other, ".git"), "GIT_WORK_TREE": other}
+        question = ("cat-file", "-e", b_sha + "^{commit}")
+        with mock.patch.dict(os.environ, ambient):
+            unscoped = self.ask(*question, where=self.root)
+            with projscope.scope():
+                scoped = self.ask(*question, where=self.root)
+        self.assertNotEqual(unscoped[0], 0, "control: A does not hold B's commit")
+        self.assertEqual(scoped[0], unscoped[0],
+                         "the scope answered from another repository's store")
+
+    def test_a_RELATIVE_repository_selection_is_read_where_the_caller_stands(self):  # noqa: VACUOUS_ASSERTION — the absolute spelling batching and B's own commit answering 0 are the controls
+        """task/3099, found in review (helm-codex). The batch runs from the
+        git directory, and a relative GIT_DIR is resolved against the
+        process's cwd, so the same relative value names a DIFFERENT repository
+        from there. From `proj`, `../B/.git` is B; from `B/.git` it is `B/B`.
+        A question about a commit only `B/B` holds must be refused exactly as
+        `git -C proj` refuses it, whether the relative value comes from the
+        overlay or the ambient environment. An absolute value names one
+        repository from everywhere, and still batches."""
+        outer = os.path.join(self.tmp, "B")
+        inner = os.path.join(outer, "B")
+        heads = {}
+        for where in (outer, inner):
+            os.makedirs(where)
+            for cmd in (("git", "init", "-q", "-b", "main"),
+                        ("git", "config", "user.email", "t@t"),
+                        ("git", "config", "user.name", "t")):
+                self.assertEqual(_sh(where, *cmd).returncode, 0)
+            heads[where] = self._commit(os.path.basename(where) + "-" +
+                                        str(len(heads)), where=where)
+        relative = os.path.relpath(os.path.join(outer, ".git"), self.root)
+        inner_only = ("cat-file", "-e", heads[inner] + "^{commit}")
+        outer_own = ("cat-file", "-e", heads[outer] + "^{commit}")
+
+        def both(question, env, ambient):
+            with mock.patch.dict(os.environ, ambient):
+                unscoped = self.ask(*question, where=self.root, env=env)
+                with projscope.scope():
+                    scoped = self.ask(*question, where=self.root, env=env)
+            return scoped[0], unscoped[0]
+        for label, env, ambient in (
+                ("overlay", {"GIT_DIR": relative}, {}),
+                ("ambient", None, {"GIT_DIR": relative})):
+            with self.subTest(label):
+                self.assertEqual(both(outer_own, env, ambient), (0, 0),
+                                 "control: the relative value selects B")
+                scoped, unscoped = both(inner_only, env, ambient)
+                self.assertNotEqual(unscoped, 0,
+                                    "control: B does not hold B/B's commit")
+                self.assertEqual(scoped, unscoped,
+                                 "the batch read the relative GIT_DIR from "
+                                 "its own directory")
+        opened, real_open = [], vcs._open_batch
+
+        def spy(cwd, env):
+            got = real_open(cwd, env)
+            opened.append(got)
+            return got
+        absolute = {"GIT_DIR": os.path.join(outer, ".git")}
+        with mock.patch.object(vcs, "_open_batch", side_effect=spy):
+            self.assertEqual(both(outer_own, absolute, {}), (0, 0))
+        self.assertEqual(len(opened), 1,
+                         "an absolute GIT_DIR is still answered by the batch")
+
+    def test_a_RELATIVE_config_home_spawns_where_the_caller_stands(self):  # noqa: VACUOUS_ASSERTION — each unscoped refusal proves its config was read, and the exact question process proves the scoped answer spawned
+        """task/3099, sealed-meld review. HOME and XDG_CONFIG_HOME are
+        cwd-resolved by git just like a relative GIT_DIR. A global config below
+        the caller disables replacement refs; from the batch's git directory
+        the same `.` selects another config, allowing the batch to return the
+        replacement commit's tree. Both spellings must spawn from the caller."""
+        original, replacement = self.shas
+        original_tree = _sh(self.root, "git", "rev-parse",
+                            original + "^{tree}").stdout.strip()
+        replacement_tree = _sh(self.root, "git", "rev-parse",
+                               replacement + "^{tree}").stdout.strip()
+        self.assertNotEqual(original_tree, replacement_tree)
+        self.assertEqual(_sh(self.root, "git", "update-ref",
+                             "refs/replace/" + original,
+                             replacement).returncode, 0)
+        question = ("rev-parse", original + "^{tree}")
+        for name, path in (("HOME", os.path.join(self.root, ".gitconfig")),
+                           ("XDG_CONFIG_HOME",
+                            os.path.join(self.root, "git", "config"))):
+            with self.subTest(name=name):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write("[core]\n\tuseReplaceRefs = false\n")
+                env = dict(_FOLD_VIEW, GIT_CONFIG_GLOBAL=None,
+                           GIT_NO_REPLACE_OBJECTS=None,
+                           XDG_CONFIG_HOME=None)
+                env[name] = "."
+                if name == "XDG_CONFIG_HOME":
+                    env["HOME"] = os.path.join(self.tmp, "empty-home")
+                unscoped = self.ask(*question, where=self.root, env=env)
+                self.assertEqual(unscoped[:2],
+                                 (0, original_tree.encode() + b"\n"),
+                                 "control: the caller's config disables "
+                                 "replace refs")
+                self.assertNotEqual(unscoped[1],
+                                    replacement_tree.encode() + b"\n")
+                seen, patch = self.processes()
+                with patch, projscope.scope():
+                    scoped = self.ask(*question, where=self.root, env=env)
+                self.assertEqual(scoped, unscoped)
+                self.assertTrue(any(p[-len(question):] == question for p in seen),
+                                "a relative %s question did not spawn" % name)
+                self.assertFalse(any(_BATCH_ARGV in p for p in seen),
+                                 "a relative %s opened a batch" % name)
+
+    def test_each_worktree_batches_under_its_own_object_config(self):  # noqa: VACUOUS_ASSERTION — the single-process answers prove the config divergence, and the two exact batch directories prove neither answer was inherited from the other worktree
+        """task/3099, sealed-meld review. A linked worktree can disable
+        replacement refs in config.worktree while the main worktree keeps them.
+        The caller's own git directory preserves that distinction without
+        parking in either worktree: ordinary safe calls still batch, once per
+        worktree rather than once per common repository."""
+        room = os.path.join(self.tmp, "configured-room")
+        self.assertEqual(_sh(self.root, "git", "worktree", "add", "-q", "-b",
+                             "configured", room, self.side).returncode, 0)
+        self.assertEqual(_sh(self.root, "git", "config",
+                             "extensions.worktreeConfig", "true").returncode, 0)
+        self.assertEqual(_sh(room, "git", "config", "--worktree",
+                             "core.useReplaceRefs", "false").returncode, 0)
+        original, replacement = self.shas
+        original_tree = _sh(self.root, "git", "rev-parse",
+                            original + "^{tree}").stdout.strip()
+        replacement_tree = _sh(self.root, "git", "rev-parse",
+                               replacement + "^{tree}").stdout.strip()
+        self.assertNotEqual(original_tree, replacement_tree)
+        self.assertEqual(_sh(self.root, "git", "update-ref",
+                             "refs/replace/" + original,
+                             replacement).returncode, 0)
+        question = ("rev-parse", original + "^{tree}")
+        env = dict(_FOLD_VIEW, GIT_NO_REPLACE_OBJECTS=None)
+        single = {where: self.ask(*question, where=where, env=env)
+                  for where in (self.root, room)}
+        self.assertEqual(single[self.root][:2],
+                         (0, replacement_tree.encode() + b"\n"),
+                         "control: the main worktree follows the replace ref")
+        self.assertEqual(single[room][:2],
+                         (0, original_tree.encode() + b"\n"),
+                         "control: config.worktree disables the replace ref")
+        opened, real_open = [], vcs._open_batch
+
+        def spy(cwd, overlay):
+            opened.append(cwd)
+            return real_open(cwd, overlay)
+        with mock.patch.object(vcs, "_open_batch", side_effect=spy), \
+                projscope.scope():
+            scoped = {where: self.ask(*question, where=where, env=env)
+                      for where in (self.root, room)}
+        self.assertEqual({where: got[:2] for where, got in scoped.items()},
+                         {where: got[:2] for where, got in single.items()})
+        own = {_sh(where, "git", "rev-parse", "--path-format=absolute",
+                   "--absolute-git-dir").stdout.strip()
+               for where in (self.root, room)}
+        self.assertEqual(set(opened), own)
+        self.assertEqual(len(opened), 2,
+                         "ordinary calls keep one batch per worktree")
+
+    def test_an_interrupted_exchange_closes_the_batch(self):
+        """ARM 2c: an exception that is not the batch's own — a hook's
+        `_Timeout` alarm, a KeyboardInterrupt — raised between a question's
+        write and its answer's read closes the batch on the way out; and a
+        forked child's `close` gives up its copies of the pipes without
+        killing its parent's process.
+
+        THE HARM THE FIRST HALF REFUSES, which the red arm served: the
+        interrupted question's answer stays in the pipe, the NEXT peeled
+        question reads it, the type matches, and the interrupted question's
+        id is returned as the next question's answer."""
+        class Interrupt(BaseException):
+            pass
+
+        def q(sha):
+            return ("rev-parse", "--verify", "--quiet", sha + "^{commit}")
+
+        opened, real_open = [], vcs._open_batch
+
+        def spy(cwd, env):
+            got = real_open(cwd, env)
+            opened.append(got)
+            return got
+
+        seen, patch = self.processes()
+        with mock.patch.object(vcs, "_open_batch", side_effect=spy), patch:
+            with projscope.scope():
+                self.assertEqual(self.ask(*q(self.shas[0]))[:2],
+                                 (0, self.shas[0].encode() + b"\n"))
+                batch = opened[0]
+                live = batch.proc
+                with mock.patch.object(batch.selector, "select",
+                                       side_effect=Interrupt()):
+                    with self.assertRaises(Interrupt):
+                        self.ask(*q(self.shas[1]))
+                self.assertIsNone(batch.proc, "an interrupted exchange must "
+                                              "close the batch")
+                self.assertIsNotNone(live.poll())
+                del seen[:]
+                third = self.ask(*q(self.side))
+                self.assertEqual(third[:2], (0, self.side.encode() + b"\n"),
+                                 "the next question must get ITS answer, "
+                                 "never the interrupted one's")
+                self.assertEqual(len([p for p in seen if self.side in p[-1]]),
+                                 1, "answered by the question's own process")
+            with projscope.scope():
+                self.ask(*q(self.shas[0]))
+                child = opened[1]
+                live = child.proc
+                with mock.patch.object(vcs.os, "getpid",
+                                       return_value=child.pid + 1), \
+                        mock.patch.object(live, "kill") as kill:
+                    child.close()
+                kill.assert_not_called()
+                self.assertIsNone(child.proc)
+                self.assertTrue(live.stdin.closed and live.stdout.closed,
+                                "the child's copies of the pipes are closed")
+                # git leaves on the EOF the closed copy gave it; the test
+                # reaps what a real child would rightly have left its parent.
+                live.wait(timeout=5)
+        self.assertEqual(len(opened), 2)
+
+    def test_the_child_env_is_built_once_per_scope(self):
+        """ARM 3: inside one scope every spawn under one overlay gets the ONE
+        environment built for it; outside a scope each spawn builds its own,
+        as before; and a second overlay is a second environment."""
+        envs, real = [], subprocess.run
+
+        def spy(argv, *a, **kw):
+            if "log" in argv:
+                envs.append(kw.get("env"))
+            return real(argv, *a, **kw)
+
+        asks = [("log", "-1", "--format=%H"), ("log", "-1", "--format=%T"),
+                ("log", "-1", "--format=%P")]
+        other = dict(_FOLD_VIEW, GIT_TERMINAL_PROMPT="0")
+        with mock.patch.object(vcs.subprocess, "run", side_effect=spy):
+            outside = [self.ask(*argv) for argv in asks]
+            out_envs = list(envs)
+            del envs[:]
+            with projscope.scope():
+                inside = [self.ask(*argv) for argv in asks]
+                self.ask("log", "-1", "--format=%an", env=other)
+            in_envs = list(envs)
+        self.assertEqual(inside, outside)
+        self.assertEqual(outside[0][:2], (0, self.shas[1].encode() + b"\n"))
+        # SAME CONTENT everywhere, so the saving changes nothing git sees.
+        self.assertEqual(len(out_envs), 3)
+        self.assertEqual(len(in_envs), 4)
+        self.assertTrue(all(e == out_envs[0] for e in out_envs + in_envs[:3]))
+        self.assertEqual(out_envs[0]["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertNotIn("GIT_DIR", out_envs[0])
+        # THE PROPERTY: one object per overlay per scope, one per spawn outside.
+        self.assertEqual(len({id(e) for e in out_envs}), 3)
+        self.assertEqual(len({id(e) for e in in_envs[:3]}), 1)
+        self.assertIsNot(in_envs[3], in_envs[0])
+        self.assertEqual(in_envs[3]["GIT_TERMINAL_PROMPT"], "0")
+
+
+class ExistenceIsOneQuestionTest(VcsBase):
+    """task/3090 — an unreachable tip's existence is asked about THAT sha.
+
+    `_batched_ancestry` answered "is this unreachable tip present at all" by
+    listing EVERY object in the repository (`cat-file --batch-all-objects`)
+    and testing membership. Measured on the live repository: 1,491,784
+    objects, 1.03 s of git and 119 MB RSS per listing, plus a Python set of
+    the same size, and helm web paid it about every 22 s (8 of 13 listings
+    sampled in 180 s). The scope's batch process answers the one sha instead."""
+
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(_sh(self.root, "git", "checkout", "-q", "-b", "side",
+                             self.shas[0]).returncode, 0)
+        self.side = self._commit("three")
+        self.assertEqual(_sh(self.root, "git", "checkout", "-q",
+                             "main").returncode, 0)
+
+    def asked(self, tip):
+        """(answer, [argv, ...]) for one scoped ancestry question."""
+        seen, real = [], subprocess.Popen
+
+        def spy(argv, *a, **kw):
+            seen.append(tuple(str(x) for x in argv))
+            return real(argv, *a, **kw)
+        with mock.patch.object(vcs.subprocess, "Popen", side_effect=spy), \
+                projscope.scope():
+            got = self.git.ancestry(self.root, tip, "main")
+        return got, seen
+
+    def test_an_unreachable_tip_is_asked_about_ALONE(self):
+        """All three answers survive, and no answer lists every object."""
+        cases = ((self.shas[0], vcs.ANCESTOR), (self.side, vcs.NOT_ANCESTOR),
+                 ("c" * 40, vcs.UNKNOWN))
+        for tip, want in cases:
+            got, seen = self.asked(tip)
+            self.assertEqual(got, want, tip)
+            self.assertTrue(seen, "the spy saw no process, so it measures "
+                            "nothing about %s" % tip)
+            self.assertFalse([a for a in seen if "--batch-all-objects" in a],
+                             "listed every object to ask about %s" % tip)
+
+    def test_the_batch_never_parks_in_a_worktree_room(self):  # noqa: VACUOUS_ASSERTION — the sleep probe found by the same scan is the positive control
+        """The stop guard proves a live delegated build by a process whose cwd
+        IS a lane room. The existence batch lives for the scope, so asking
+        about a lane worktree's unreachable tip must leave no process whose
+        cwd is that worktree, while the question is still answered."""
+        room = os.path.join(self.tmp, "room")
+        self.assertEqual(_sh(self.root, "git", "worktree", "add", "-q", "-b",
+                             "lane", room, self.side).returncode, 0)
+        want = os.path.realpath(room)
+
+        def parked():
+            found = []
+            for pid in os.listdir("/proc"):
+                try:
+                    if pid.isdigit() and os.path.realpath(
+                            "/proc/%s/cwd" % pid) == want:
+                        found.append(int(pid))
+                except OSError:
+                    continue
+            return found
+        # POSITIVE CONTROL on the same scan: a process that does sit in the
+        # room is found, so the empty answer below is a measurement.
+        probe = subprocess.Popen(["sleep", "30"], cwd=room)
+        try:
+            for _ in range(200):
+                if probe.pid in parked():
+                    break
+                time.sleep(0.025)
+            self.assertIn(probe.pid, parked())
+        finally:
+            probe.kill()
+            probe.wait(timeout=10)
+        with projscope.scope():
+            self.assertEqual(self.git.ancestry(room, self.side, "main"),
+                             vcs.NOT_ANCESTOR)
+            inside = parked()
+        self.assertEqual(inside, [], "a coprocess sits in the lane's room")
+
+    def test_a_REPLACED_absent_object_is_still_absent(self):  # noqa: VACUOUS_ASSERTION — UNKNOWN is a named answer, and the pre-replace ask is its control
+        """The listing enumerated the object store and never saw replacement,
+        so the per-sha question must not either: under refs/replace/<absent>
+        a replacement-aware lookup names the absent id as present, which would
+        turn an unknowable tip into a confident NOT_ANCESTOR. The same tip
+        without the replace ref is the positive control."""
+        absent = "d" * 40
+        self.assertEqual(self.asked(absent)[0], vcs.UNKNOWN)
+        self.assertEqual(_sh(self.root, "git", "update-ref",
+                             "refs/replace/" + absent,
+                             self.shas[0]).returncode, 0)
+        self.assertEqual(self.asked(absent)[0], vcs.UNKNOWN,
+                         "a replace ref made an absent object present")
+
+
+    def test_a_relative_cwd_is_qualified_before_it_keys_the_batch(self):  # noqa: VACUOUS_ASSERTION — both repositories answer their own commit True before the cross-repository absence is trusted
+        """One relative spelling can name two repositories after chdir. The
+        scope must keep two batches, never reuse the first repository's object
+        answer as evidence about the second."""
+        parents = [os.path.join(self.tmp, name) for name in ("left", "right")]
+        repos = [os.path.join(parent, "repo") for parent in parents]
+        for repo in repos:
+            os.makedirs(repo)
+            for cmd in (("git", "init", "-q", "-b", "main"),
+                        ("git", "config", "user.email", "t@t"),
+                        ("git", "config", "user.name", "t")):
+                self.assertEqual(_sh(repo, *cmd).returncode, 0)
+        left = self._commit("left-only", where=repos[0])
+        right = self._commit("right-only", where=repos[1])
+        self.assertNotEqual(left, right)
+        prior = os.getcwd()
+        self.addCleanup(os.chdir, prior)
+        with projscope.scope():
+            os.chdir(parents[0])
+            self.assertIs(vcs.exists("repo", left), True)
+            os.chdir(parents[1])
+            self.assertIs(vcs.exists("repo", left), False,
+                          "the second repository reused the first one's batch")
+            self.assertIs(vcs.exists("repo", right), True,
+                          "control: the qualified second batch answers its repo")
+
+    def test_a_symlinked_parent_in_a_relative_cwd_is_resolved_as_git_resolves_it(self):  # noqa: VACUOUS_ASSERTION — the second repository's own commit answering True is the control
+        """The kernel resolves `lnk/../repo` through the link: `..` is the
+        parent of the link's TARGET. A lexical fold (normpath, abspath) turns
+        the same spelling into the parent of the link itself, which is another
+        directory. The existence key and the batch must name the directory
+        `git -C lnk/../repo` enters, or the batch answers from the wrong
+        repository."""
+        here, there = (os.path.join(self.tmp, name) for name in ("here", "there"))
+        repos = {}
+        for side, parent in (("here", here), ("there", there)):
+            repo = os.path.join(parent, "repo")
+            os.makedirs(repo)
+            for cmd in (("git", "init", "-q", "-b", "main"),
+                        ("git", "config", "user.email", "t@t"),
+                        ("git", "config", "user.name", "t")):
+                self.assertEqual(_sh(repo, *cmd).returncode, 0)
+            repos[side] = self._commit(side + "-only", where=repo)
+        os.makedirs(os.path.join(there, "inner"))
+        os.symlink(os.path.join(there, "inner"), os.path.join(here, "lnk"))
+        prior = os.getcwd()
+        self.addCleanup(os.chdir, prior)
+        os.chdir(here)
+        spelled = os.path.join("lnk", "..", "repo")
+        direct = _sh(here, "git", "-C", spelled, "cat-file", "-e",
+                     repos["here"] + "^{commit}").returncode
+        self.assertNotEqual(direct, 0, "control: git -C enters the other repository")
+        with projscope.scope():
+            self.assertIs(vcs.exists(spelled, repos["there"]), True,
+                          "control: the spelling names the repository the link reaches")
+            self.assertIsNot(vcs.exists(spelled, repos["here"]), True,
+                             "a lexical fold answered from the link's own parent")
+
+    def test_a_RELATIVE_object_selection_is_read_where_the_caller_stands(self):  # noqa: VACUOUS_ASSERTION — the batch's own directory naming the commit, and the absolute spelling of the same store still batching, are the controls
+        """task/3099 x task/3090, found in review. The existence batch runs
+        from the common directory, and git resolves a relative
+        GIT_ALTERNATE_OBJECT_DIRECTORIES against the process's cwd: from the
+        worktree root `modules/sub/.git/objects` is nothing, from `.git` it is
+        a submodule's whole store. A commit only that store holds must get the
+        answer `git -C root` gives, never a confident NOT_ANCESTOR proved by
+        another repository's object. Spelled absolutely, the same store is one
+        store from everywhere, and still batches."""
+        sub = os.path.join(self.root, ".git", "modules", "sub")
+        os.makedirs(sub)
+        for cmd in (("git", "init", "-q", "-b", "main"),
+                    ("git", "config", "user.email", "t@t"),
+                    ("git", "config", "user.name", "t")):
+            self.assertEqual(_sh(sub, *cmd).returncode, 0)
+        foreign = self._commit("sub-0", where=sub)
+        common = self.git.common_dir(self.root)
+        relative = os.path.join("modules", "sub", ".git", "objects")
+        with mock.patch.dict(os.environ,
+                             {"GIT_ALTERNATE_OBJECT_DIRECTORIES": relative}):
+            self.assertNotEqual(
+                _sh(self.root, "git", "cat-file", "-e",
+                    foreign + "^{commit}").returncode, 0,
+                "control: from the root the relative store is nothing")
+            seen = _sh(common, "git", "cat-file", _BATCH_ARGV,
+                       input=foreign + "\n")
+            self.assertEqual(seen.stdout.split(), [foreign, "commit"],
+                             "control: from the git directory the same "
+                             "spelling is the submodule's store")
+            unscoped = self.git.ancestry(self.root, foreign, "main")
+            scoped, _argv = self.asked(foreign)
+            with projscope.scope():
+                direct = vcs.exists(common, foreign)
+        self.assertNotEqual(unscoped, vcs.NOT_ANCESTOR,
+                            "control: git -C root cannot see the commit")
+        self.assertEqual(scoped, unscoped,
+                         "a submodule's commit proved the tip present")
+        self.assertIsNone(direct,
+                          "exists answered from a store git -C root cannot see")
+        with mock.patch.dict(os.environ, {"GIT_ALTERNATE_OBJECT_DIRECTORIES":
+                                          os.path.join(common, relative)}):
+            with projscope.scope():
+                self.assertIs(vcs.exists(common, foreign), True,
+                              "control: the absolute spelling is one store "
+                              "from everywhere, and still batches")
+            self.assertEqual(self.asked(foreign)[0], vcs.NOT_ANCESTOR)
+
+
+
+class RelativeCwdTest(VcsBase):
+    """task/3105 — A RELATIVE CWD NAMES A REPOSITORY ONLY TOGETHER WITH THE
+    PROCESS'S WORKING DIRECTORY, so a key that carries the relative string
+    names every repository that string can reach.
+
+    Two parents each hold a repository at the relative path `repo`, and only
+    the first holds its own commit. An answer remembered under the first
+    parent must never be served after a chdir into the second: every memo in
+    the seam that carries a cwd is asked once under each parent inside ONE
+    scope, and the second answer must be the one the second repository gives
+    with no scope open."""
+
+    def setUp(self):
+        super().setUp()
+        self.parents, self.heads = {}, {}
+        for side in ("a", "b"):
+            # THE PHYSICAL PATH, because `os.getcwd()` answers the physical
+            # path after a chdir, and the absolute spelling the control arm
+            # compares must name the directory the same way.
+            parent = os.path.realpath(os.path.join(self.tmp, side))
+            repo = os.path.join(parent, "repo")
+            os.makedirs(repo)
+            for cmd in (("git", "init", "-q", "-b", "main"),
+                        ("git", "config", "user.email", "t@t"),
+                        ("git", "config", "user.name", "t")):
+                self.assertEqual(_sh(repo, *cmd).returncode, 0)
+            self.parents[side] = parent
+            self.heads[side] = self._commit(side, T1, where=repo)
+        self.addCleanup(os.chdir, os.getcwd())
+
+    def processes(self):
+        """([argv, ...], patch): every process the seam starts while the patch
+        is active, the single spawns and the scope's batch alike."""
+        seen, real = [], subprocess.Popen
+
+        def spy(argv, *a, **kw):
+            seen.append(tuple(str(x) for x in argv))
+            return real(argv, *a, **kw)
+        return seen, mock.patch.object(vcs.subprocess, "Popen",
+                                       side_effect=spy)
+
+    def test_a_scope_that_outlives_a_chdir_answers_for_the_new_directory(self):
+        """ARM (a): the memo, the batch process, the ancestry sets and the
+        whole-history patch-id map, each asked under parent A and then under
+        parent B in one scope. The batch pair is the measured one: A's
+        existence question opens the scope's `cat-file --batch-check` in A's
+        repository, and B's resolution question then rides that process."""
+        a = self.heads["a"]
+
+        def run(*argv):
+            return self.git.run("repo", *argv, env=_FOLD_VIEW)[:2]
+
+        asks = {
+            "the batch": (
+                lambda: run("cat-file", "-e", a),
+                lambda: run("rev-parse", "--verify", "--quiet",
+                            a + "^{commit}")),
+            "the run memo": (lambda: run("cat-file", "-t", a),) * 2,
+            "the ancestry sets": (
+                lambda: self.git.ancestry("repo", a, "HEAD"),) * 2,
+            "the verbatim map": (
+                lambda: sorted(self.git._verbatim_map("repo", "HEAD") or ()),
+            ) * 2,
+        }
+        truth, controls, scoped = {}, {}, {}
+        for name, (first, second) in asks.items():
+            os.chdir(self.parents["b"])
+            truth[name] = second()
+            with projscope.scope():
+                os.chdir(self.parents["a"])
+                controls[name] = first()
+                os.chdir(self.parents["b"])
+                scoped[name] = second()
+        # MUST-HITS ON THE FIXTURE: repository A holds its commit and B does
+        # not, so each question has a different answer in each directory.
+        self.assertEqual(controls, {"the batch": (0, b""),
+                                    "the run memo": (0, b"commit\n"),
+                                    "the ancestry sets": vcs.ANCESTOR,
+                                    "the verbatim map": [a]})
+        self.assertNotEqual(truth["the batch"][0], 0)
+        self.assertNotEqual(truth["the run memo"][0], 0)
+        self.assertEqual(truth["the ancestry sets"], vcs.UNKNOWN)
+        self.assertEqual(truth["the verbatim map"], [self.heads["b"]])
+        # THE PROPERTY: inside the scope, B's questions got B's answers.
+        self.assertEqual(scoped, truth)
+
+    def test_every_spelling_of_one_repository_is_one_question(self):  # noqa: VACUOUS_ASSERTION — each equality names a non-empty expected answer per spelling (rc 0 and git's own stdout), and the spawn counts are exact 1s on the same spy
+        """ARM (c), THE CONTROL: the key names the directory, it does not
+        switch the memo off. One repository asked by its relative, absolute,
+        bytes and `PathLike` spellings answers identically and spawns ONE
+        process for the memo's question and ONE batch for the scope; a cwd of
+        None answers the spawn's own -1, for the memo's question and for the
+        batch's, and raises nothing."""
+        a = self.heads["a"]
+        os.chdir(self.parents["a"])
+        spellings = {"relative": "repo",
+                     "relative again": "repo",
+                     "absolute": os.path.join(self.parents["a"], "repo"),
+                     "bytes": b"repo",
+                     "PathLike": pathlib.Path("repo")}
+        seen, patch = self.processes()
+        with patch, projscope.scope():
+            typed = {name: self.git.run(where, "cat-file", "-t", a,
+                                        env=_FOLD_VIEW)[:2]
+                     for name, where in spellings.items()}
+            batched = {name: self.git.run(where, "rev-parse", "--verify",
+                                          "--quiet", a + "^{commit}",
+                                          env=_FOLD_VIEW)[:2]
+                       for name, where in spellings.items()}
+            nowhere = (
+                self.git.run(None, "cat-file", "-t", a, env=_FOLD_VIEW)[0],
+                self.git.run(None, "rev-parse", "--verify", "--quiet",
+                             a + "^{commit}", env=_FOLD_VIEW)[0])
+        self.assertEqual(typed, dict.fromkeys(spellings, (0, b"commit\n")))
+        self.assertEqual(batched,
+                         dict.fromkeys(spellings, (0, a.encode() + b"\n")))
+        self.assertEqual(nowhere, (-1, -1))
+        named = [p for p in seen if p[2] != "None"]
+        self.assertEqual(len([p for p in named if "-t" in p]), 1,
+                         "every spelling of one repository is one question")
+        self.assertEqual(len([p for p in named if _BATCH_ARGV in p]), 1,
+                         "every spelling of one repository is one batch")
+
+    def test_a_vanished_working_directory_is_never_remembered(self):
+        """A relative cwd under a working directory that no longer exists names
+        no directory. Nothing asked there is remembered, so a chdir into a real
+        parent gets that repository's own answers; and nothing raises, the
+        existence door included, which answers None so its caller spawns."""
+        a = self.heads["a"]
+        gone = os.path.join(self.tmp, "gone")
+        os.makedirs(gone)
+        with projscope.scope():
+            os.chdir(gone)
+            os.rmdir(gone)
+            lost = (self.git.run("repo", "cat-file", "-t", a,
+                                 env=_FOLD_VIEW)[0],
+                    vcs.exists("repo", a),
+                    self.git.ancestry("repo", a, "HEAD"))
+            os.chdir(self.parents["a"])
+            found = (self.git.run("repo", "cat-file", "-t", a,
+                                  env=_FOLD_VIEW)[:2],
+                     vcs.exists("repo", a),
+                     self.git.ancestry("repo", a, "HEAD"))
+        self.assertEqual(found, ((0, b"commit\n"), True, vcs.ANCESTOR))
+        self.assertNotEqual(lost[0], 0)
+        self.assertEqual(lost[1:], (None, vcs.UNKNOWN))
+
+    def test_a_missing_directory_is_not_remembered_after_it_appears(self):
+        """A path that names no directory is an unreadable, never a cached
+        negative. If it becomes a repository during the same scope, the next
+        question reaches git and reads that repository's answer."""
+        a = self.heads["a"]
+        late = os.path.join(self.parents["a"], "late")
+        with projscope.scope():
+            missing = self.git.run(late, "cat-file", "-t", a,
+                                   env=_FOLD_VIEW)[:2]
+            os.symlink(os.path.join(self.parents["a"], "repo"), late)
+            appeared = self.git.run(late, "cat-file", "-t", a,
+                                    env=_FOLD_VIEW)[:2]
+        self.assertNotEqual(missing[0], 0,
+                            "control: the first question named no directory")
+        self.assertEqual(appeared, (0, b"commit\n"))
+
+    def test_a_retargeted_symlink_names_its_new_repository(self):
+        """The memo key is the directory git enters, not an absolute symlink
+        spelling. Retargeting that spelling during one scope must not serve the
+        first repository's answer to the second."""
+        a = self.heads["a"]
+        link = os.path.join(self.tmp, "repo-link")
+        os.symlink(os.path.join(self.parents["a"], "repo"), link)
+        with projscope.scope():
+            first = self.git.run(link, "cat-file", "-t", a,
+                                 env=_FOLD_VIEW)[:2]
+            os.unlink(link)
+            os.symlink(os.path.join(self.parents["b"], "repo"), link)
+            second = self.git.run(link, "cat-file", "-t", a,
+                                  env=_FOLD_VIEW)[:2]
+        self.assertEqual(first, (0, b"commit\n"))
+        self.assertNotEqual(second[0], 0,
+                            "the first repository's answer crossed the link")
+
+    def test_a_link_then_dotdot_is_the_directory_git_enters(self):  # noqa: VACUOUS_ASSERTION — A's own commit read through the absolute spelling and B's own commit read through the link are the positive controls, and git's unscoped refusal is the truth the scoped answer must equal
+        """The kernel resolves `lnk/../repo` through the link: `..` is the
+        parent of the link's TARGET. The memo key joins that spelling to the
+        working directory and never folds it, so it cannot collide with the
+        repository at the link's own parent, which a lexical fold names."""
+        a, b = self.heads["a"], self.heads["b"]
+        os.makedirs(os.path.join(self.parents["b"], "inner"))
+        os.symlink(os.path.join(self.parents["b"], "inner"),
+                   os.path.join(self.parents["a"], "lnk"))
+        os.chdir(self.parents["a"])
+        spelled = os.path.join("lnk", "..", "repo")
+        truth = self.git.run(spelled, "cat-file", "-t", a, env=_FOLD_VIEW)[:2]
+        with projscope.scope():
+            here = self.git.run(os.path.join(self.parents["a"], "repo"),
+                                "cat-file", "-t", a, env=_FOLD_VIEW)[:2]
+            there = self.git.run(spelled, "cat-file", "-t", a,
+                                 env=_FOLD_VIEW)[:2]
+            control = self.git.run(spelled, "cat-file", "-t", b,
+                                   env=_FOLD_VIEW)[:2]
+        self.assertEqual((here, control),
+                         ((0, b"commit\n"), (0, b"commit\n")))
+        self.assertNotEqual(truth[0], 0, "control: git -C enters B's repository")
+        self.assertEqual(there, truth)
 
 
 if __name__ == "__main__":

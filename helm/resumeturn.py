@@ -1497,6 +1497,32 @@ def show_directive(token, now=None):
     return next(iter(found)) if len(found) == 1 else None
 
 
+
+def stale_directive(token, now=None):
+    """(text, expires_at) for the unique long directive behind `token` whose
+    digest still matches its text, EXPIRED OR NOT; None when there is no such
+    record or more than one.
+
+    THIS IS THE READER'S ANSWER, NEVER THE ENTER GATE. A pane can hold
+    "Run `helm seat resume-turn --show <token>`" long after the record's
+    horizon (a seat stuck behind autocompaction read it 2h40m later), and
+    refusing then sends the seat hunting for a turn that is still on disk.
+    `--show` prints what this returns, marked STALE with its age;
+    show_directive, and so indirection_payload_available, still refuse an
+    expired record, because pressing Enter on a stale pointer must not
+    deliver it."""
+    from . import pk
+    entries = pk.read_json(state_path(), {}) or {}
+    found = set()
+    for entry in entries.values():
+        d = (entry or {}).get("directive") or {}
+        text = d.get("text") or ""
+        expires = d.get("expires_at")
+        if (d.get("token") == token and isinstance(expires, (int, float))
+                and d.get("digest") == _injection_digest(text)):
+            found.add((text, expires))
+    return next(iter(found)) if len(found) == 1 else None
+
 # The exact shape _wire_text emits for a long directive. Matching it is how a
 # caller asks "is this injection an INDIRECTION rather than the instruction
 # itself", which is a different question from whether the injection is Helm's.
@@ -3539,9 +3565,16 @@ def _pause_verdict(seat_name, session, row):
     family that could not be resolved, a snapshot with no record for it (the
     watcher has measured some other family, or nothing yet), and a record
     whose state or dark latch is not one the watcher writes are each UNKNOWN,
-    and UNKNOWN authorizes nothing."""
-    from . import proxywatch, seat as seatmod
+    and UNKNOWN authorizes nothing.
+
+    THE OWNER'S REST HOLDS BEFORE ANY OF THAT (helm/seat_rest.py), for a seat
+    with a family or without one: a seat with no family is exactly the seat
+    whose rest the early return below would otherwise skip."""
+    from . import proxywatch, seat as seatmod, seat_rest
     from .seats_runtime import runtime_for_session
+    rest = seat_rest.pause(seat_name)
+    if rest:
+        return "state %s" % rest["state"], ""
     runtime, verified = runtime_for_session(row or {}, session)
     try:
         family, ferr = seatmod.family_for(str(seat_name or ""), runtime,
@@ -3784,6 +3817,17 @@ def _roster_authority(seat_name, session):
 
 
 def _pause_authority(seat_name, session):
+    """The pause an act rests on, BY VALUE: the owner's rest record, when the
+    seat has one (`seat_rest.authority`), ahead of the family wall
+    (`_wall_authority`). A rest set or ended between the capture and the act
+    reads as a change; a seat that never rested reads as it always did."""
+    from . import seat_rest
+    rest = seat_rest.authority(seat_name)
+    wall = _wall_authority(seat_name, session)
+    return "rest %s; %s" % (rest, wall) if rest else wall
+
+
+def _wall_authority(seat_name, session):
     """This seat's family pause record BY VALUE: its state, dark latch,
     `since` and TRANSITION IDENTITY. The watcher rewrites the whole file on
     every pass with a new `ts`, whether or not any verdict changed, so the
@@ -4304,10 +4348,13 @@ def spawn_child(argv, pass_fds=()):
     hands the child an inherited descriptor — the wake-alert capability
     rides a pipe, never a caller-nameable path."""
     import subprocess
+    import threading
     with open(os.devnull, "r+b") as null:
-        subprocess.Popen(argv, stdin=null, stdout=null, stderr=null,
-                         start_new_session=True, close_fds=True,
-                         pass_fds=tuple(pass_fds))
+        p = subprocess.Popen(argv, stdin=null, stdout=null, stderr=null,
+                             start_new_session=True, close_fds=True,
+                             pass_fds=tuple(pass_fds))
+        threading.Thread(target=p.wait, name="resume-turn-reaper",
+                         daemon=True).start()
 
 
 def _child_argv(seat_name, session, text_path, delay, pids=None,
@@ -5356,9 +5403,16 @@ def cmd_resume_turn(args):
         token = _opt(args, "--show") or ""
         text = show_directive(token)
         if text is None:
-            print("helm seat resume-turn: directive %s is absent, ambiguous, or "
-                  "expired" % token, file=sys.stderr)
-            return 1
+            stale = stale_directive(token)
+            if stale is None:
+                print("helm seat resume-turn: directive %s is absent or "
+                      "ambiguous" % token, file=sys.stderr)
+                return 1
+            text, expires = stale
+            age = max(0, int(time.time() - expires) // 60)
+            print("STALE: this directive expired %s ago; it is history, so "
+                  "check the current state before acting on it"
+                  % ("%dh%02dm" % divmod(age, 60) if age > 90 else "%dm" % age))
         print(text)
         return 0
 

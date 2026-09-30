@@ -286,7 +286,7 @@ def restamp(adapter, rows, apply=False, force=False):
     try:
         p = state_path()
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with _flocked(p + ".lock") as lock:
+        with _flocked(p + ".lock", check=True) as lock:
             if lock.f is None:
                 raise OSError("pane title lock unavailable")
             stamps = plan(rows, asserted(), force=force)

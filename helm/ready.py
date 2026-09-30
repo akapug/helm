@@ -49,12 +49,21 @@ READY, NOT_READY = "READY", "NOT READY"
 _USAGE = "ready [--json] — the five-signal fleet-readiness gauge (advisory: renders, never gates)"
 
 
-def _row(signal, state, evidence, repair=None, note=None):
+def _row(signal, state, evidence, repair=None, note=None,
+         owner_repair=None, owner_note=None):
     """One signal's verdict. `repair` is the operator's next verb and is
     rendered only when the state is not green — honest-refusals style: the
-    line says what was measured, then what to run about it."""
+    line says what was measured, then what to run about it.
+
+    `owner_repair` and `owner_note` are the same two lines in the OWNER'S
+    words, for the console's READY card (the Seats page): facts and places,
+    never a command, because he does not use a terminal (console walk 3,
+    #5). Each defaults to its terminal line, so a caller passes one only
+    where that line names a command."""
     return {"signal": signal, "state": state, "evidence": evidence,
-            "repair": repair, "note": note}
+            "repair": repair, "note": note,
+            "owner_repair": repair if owner_repair is None else owner_repair,
+            "owner_note": note if owner_note is None else owner_note}
 
 
 def signal_daemon(detect=None):
@@ -75,7 +84,10 @@ def signal_daemon(detect=None):
         return _row("daemon", UNKNOWN,
                     "no metaharness detected — pane reachability unmeasurable",
                     repair="optional companion: orca (recommended), herdr also "
-                           "supported; HELM_METAHARNESS overrides detection")
+                           "supported; HELM_METAHARNESS overrides detection",
+                    owner_repair="a metaharness is optional, and none was "
+                                 "detected here: orca is the recommended one, "
+                                 "and herdr also works")
     probe = getattr(ad, "panes", None)
     if probe is None:
         try:
@@ -87,7 +99,9 @@ def signal_daemon(detect=None):
     if err:
         return _row("daemon", RED, "%s daemon not answering — %s"
                     % (ad.name, err),
-                    repair="start %s, then re-run `helm ready`" % ad.name)
+                    repair="start %s, then re-run `helm ready`" % ad.name,
+                    owner_repair="start %s; this card reads it again every "
+                                 "minute" % ad.name)
     n = len(rows)
     return _row("daemon", GREEN, "%s daemon answering — %d pane%s listed"
                 % (ad.name, n, "s"[:n != 1]))
@@ -206,13 +220,17 @@ def signal_seats(registered=None, liveness=None):
                        "; ".join(down)),
                     repair="`helm seat resume <seat>` re-seats each via the "
                            "detected metaharness",
+                    owner_repair="each seat named as down needs its pane "
+                                 "started again",
                     note=("unprovable besides: " + "; ".join(dark))
                     if dark else None)
     if dark:
         return _row("seats", UNKNOWN, "%d of %d pane%s unprovable — %s"
                     % (len(dark), len(names), "s"[:len(names) != 1],
                        "; ".join(dark)),
-                    repair="`helm seat where <seat>` has the per-seat detail")
+                    repair="`helm seat where <seat>` has the per-seat detail",
+                    owner_repair="why each pane could not be proven is "
+                                 "beside its name above")
     return _row("seats", GREEN, "%d registered seat%s, every pane resolves live"
                 % (len(names), "s"[:len(names) != 1]))
 
@@ -237,7 +255,10 @@ def signal_beacons(census=None):
             else "the process table"
         return _row("beacons", UNKNOWN, "%s could not be probed — no verdict "
                     "below it would be a death claim" % gap,
-                    repair="`helm beacons` has the census detail")
+                    repair="`helm beacons` has the census detail",
+                    owner_repair="no seat can be judged reachable or not until "
+                                 "this probe answers; this card takes the "
+                                 "census again every minute")
     unreachable = rep.get("unreachable") or []
     vacant = rep.get("vacant") or []
     ghosts = rep.get("ghosts") or []
@@ -307,19 +328,32 @@ def signal_beacons(census=None):
         repair = ("`helm beacons` names each fault; `helm seat resume <seat>` "
                   "re-seats one with no pane, and a seat whose pane is alive "
                   "can only be re-armed by that pane — no turn arms a beacon, "
-                  "the stop rung asks each seat to arm on its clean stops, "
+                  "the stop rung asks each seat to arm on its clean stops "
+                  "and refuses a local-model seat's unarmed stop once per "
+                  "fresh stop (the continuation stop passes), "
                   "and prompting a live pane that is not yours is the "
                   "owner's call")
+        # THE SAME ROUTES IN THE OWNER'S WORDS, for the READY card: the
+        # faults and where each repair has to reach, never a command to run
+        # (console walk 3, #5). Each clause below says what its terminal
+        # clause says, less the verb.
+        owner = ("a seat with no pane needs its pane started again, and a "
+                 "seat whose pane is alive can only be re-armed by that pane: "
+                 "no turn arms a beacon, each seat is asked to arm on its "
+                 "clean stops, and prompting a live pane is your call")
         if die:
+            named = ", ".join(beacons.label(r.get("seat")) for r in die)
             repair += ("; the DEAF-IN-EFFECT seat%s (%s) %s NOT re-arm — "
                        "the beacon is already live, so make the pane take a "
                        "turn: `%s`"
-                       % ("s"[:len(die) != 1],
-                          ", ".join(beacons.label(r.get("seat"))
-                                    for r in die),
+                       % ("s"[:len(die) != 1], named,
                           "do" if len(die) != 1 else "does",
                           beacons.repair_argv(
                               beacons.label(die[0].get("seat")))))
+            owner += ("; the DEAF-IN-EFFECT seat%s (%s) %s no re-arm: the "
+                      "beacon is already live, so the pane has to take a turn"
+                      % ("s"[:len(die) != 1], named,
+                         "need" if len(die) != 1 else "needs"))
         if occupied:
             # NAMES THE FACT, PRESCRIBES NO ACTUATOR. What decides this case is
             # that a pane is HOME, and until now a reader had to derive that
@@ -338,16 +372,27 @@ def signal_beacons(census=None):
                        "TAKE TURNS and stay deaf, so there is no turn to "
                        "wait for; that pane has to be asked, and the "
                        "`helm beacons --post` pass asks it once per deaf "
-                       "spell while it owes work, for this project's native "
-                       "claude seats only (bounded, refused while delivery "
-                       "is paused)"
+                       "spell while it owes work, for this project's seats "
+                       "whatever their family (bounded, refused while "
+                       "delivery is paused)"
                        % ("s"[:len(occupied) != 1],
                           ", ".join(beacons.label(r.get("seat"))
                                     for r in occupied),
                           "have" if len(occupied) != 1 else "has",
                           "they" if len(occupied) != 1 else "it",
                           "have" if len(occupied) != 1 else "has"))
-        return _row("beacons", RED, "; ".join(parts), repair=repair)
+            owner += ("; the DEAF seat%s (%s) %s an agent home and no wake "
+                      "path, so the pane has to be asked: seats in this state "
+                      "take turns and stay deaf, and the beacon watcher's "
+                      "pass asks each such pane once per deaf spell while it "
+                      "owes work, for its own project's seats whatever their "
+                      "family (bounded, refused while delivery is paused)"
+                      % ("s"[:len(occupied) != 1],
+                         ", ".join(beacons.label(r.get("seat"))
+                                   for r in occupied),
+                         "have" if len(occupied) != 1 else "has"))
+        return _row("beacons", RED, "; ".join(parts), repair=repair,
+                    owner_repair=owner)
     n = len(rep.get("seats") or [])
     unproven = len(rep.get("unproven") or [])
     return _row("beacons", GREEN, "%d seat%s on the roll — nothing "
@@ -382,7 +427,10 @@ def signal_families(snapshot=None, minted=None):
     if err:
         return _row("families", UNKNOWN, err,
                     repair="rerun `helm proxywatch` to measure current state; "
-                           "the recorder failure cannot derive a restart action")
+                           "the recorder failure cannot derive a restart action",
+                    owner_repair="a new proxy-watch pass has to measure the "
+                                 "current state; this failure cannot say "
+                                 "whether a restart would help")
     try:
         fams = sorted({f for f, _ in (minted or smod._minted_seats)()})
     except Exception as e:
@@ -426,30 +474,33 @@ def signal_families(snapshot=None, minted=None):
             walled.append("%s %s%s since %s" % (
                 fam, state, " [%s]" % split if split else "",
                 rec.get("since") or "?"))
-            if members:
-                repairs.extend("%s/%s: %s" % (
-                    fam, name, smod.remediation_text(
-                        smod.upstream_remediation(state_snapshot, fam, name)))
-                    for name, _seat_rec in members)
-            else:
-                repairs.append("%s: %s" % (
-                    fam, smod.remediation_text(None)))
+            rems = [("%s/%s" % (fam, name),
+                     smod.upstream_remediation(state_snapshot, fam, name))
+                    for name, _seat_rec in members] or [(fam, None)]
+            repairs.extend((who, smod.remediation_text(rem),
+                            smod.remediation_text(rem, owner=True))
+                           for who, rem in rems)
         else:
             dim.append("%s: %s%s" % (
                 fam, state or "?", " [%s]" % split if split else ""))
-    note = ("WALLED: " + "; ".join(walled) +
-            " — a wall is a fact, not unreadiness; remediation: " +
-            ", ".join(repairs)) if walled else None
+
+    def walled_note(remedies):
+        return ("WALLED: " + "; ".join(walled) +
+                " — a wall is a fact, not unreadiness; remediation: " +
+                ", ".join(remedies)) if walled else None
+    note = walled_note("%s: %s" % (who, text) for who, text, _o in repairs)
+    owner_note = walled_note("%s: %s" % (who, own)
+                             for who, _t, own in repairs)
     if dim:
         return _row("families", UNKNOWN, "; ".join(dim),
                     repair="remediation UNKNOWN: these records do not establish "
                            "whether a proxywatch pass or restart would help",
-                    note=note)
+                    note=note, owner_note=owner_note)
     return _row("families", GREEN, ("%d famil%s HEALTHY%s"
                 % (len(healthy), "y" if len(healthy) == 1 else "ies",
                    (": " + ", ".join(healthy)) if healthy else ""))
                 if healthy else "every measured family is walled, cause named",
-                note=note)
+                note=note, owner_note=owner_note)
 
 
 def signal_checkout(root=None, text=None):
@@ -496,12 +547,17 @@ def signal_checkout(root=None, text=None):
                     % (root, len(dirty), "s"[:len(dirty) != 1]),
                     repair="rescue the edits into a lane room (`helm work "
                            "claim <lane>`, or `helm work gc` for lease-less "
-                           "leftovers); never land them loose on trunk")
+                           "leftovers); never land them loose on trunk",
+                    owner_repair="the uncommitted edits belong in a lane room, "
+                                 "never landed loose on trunk")
     if head != main:
         return _row("checkout", RED, "shared checkout %s at %s but "
                     "origin/main is %s" % (root, head[:12], main[:12]),
                     repair="reconcile: push the landed work, or `git -C %s "
-                           "pull --ff-only`" % root)
+                           "pull --ff-only`" % root,
+                    owner_repair="the two need reconciling: the landed work "
+                                 "pushed, or the checkout fast-forwarded to "
+                                 "origin/main")
     return _row("checkout", GREEN, "shared checkout %s clean at origin/main "
                 "(%s, as last fetched)" % (root, head[:12]))
 

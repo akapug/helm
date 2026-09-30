@@ -37,13 +37,16 @@ const state = { host: null, meta: { textContent: "" }, active: null };
 function commentStub() {
   return { value: "", classList: { contains: c => c === "odqcomment" } };
 }
-function cardStub(id, hasComposer) {
+function cardStub(id, hasComposer, keys) {
   return {
     dataset: { id },
     style: {},
     _comment: hasComposer ? commentStub() : null,
+    // the option chips the card's html rendered, clickable (goal-ledger L1:
+    // a verdict must carry the rev its card was drawn at)
+    _choices: (keys || []).map(key => ({ dataset: { key }, onclick: null })),
     querySelector(sel) { return sel === ".odqcomment" ? this._comment : null; },
-    querySelectorAll() { return []; },
+    querySelectorAll(sel) { return sel === ".odqchoice" ? [...this._choices] : []; },
   };
 }
 // one stub per data-id in the freshly set html; a composer only where the
@@ -52,7 +55,8 @@ function deriveCards(html) {
   const starts = [...html.matchAll(/<div class="odqcard" data-id="([^"]+)"/g)];
   return starts.map((m, i) => {
     const seg = html.slice(m.index, i + 1 < starts.length ? starts[i + 1].index : html.length);
-    return cardStub(m[1], seg.includes("odqcomment"));
+    const keys = [...seg.matchAll(/class="chip odqchoice[^"]*" data-key="([^"]+)"/g)].map(k => k[1]);
+    return cardStub(m[1], seg.includes("odqcomment"), keys);
   });
 }
 function makeHost() {
@@ -82,7 +86,7 @@ global.toast = () => {};
 // ---- controllable network --------------------------------------------------
 const net = { queue: [] }; // each entry: {kind, url, res, rej}
 global.j = url => new Promise((res, rej) => net.queue.push({ kind: "j", url, res, rej }));
-global.post = url => new Promise((res, rej) => net.queue.push({ kind: "post", url, res, rej }));
+global.post = (url, body) => new Promise((res, rej) => net.queue.push({ kind: "post", url, body, res, rej }));
 const tick = () => new Promise(r => setImmediate(r)); // flush the await chain
 function take(kind) {
   const i = net.queue.findIndex(q => q.kind === kind);
@@ -291,6 +295,44 @@ const out = {};
   await poll(feed("card-aaa", "card-bbb"));       // the next 45s render
   out.clear_stays_cleared = boxVal("card-aaa");   // MUST stay ""
   out.clear_ledger_empty = !("card-aaa" in __odqDrafts);
+}
+
+// ---- scene rev: the verdict carries the rev its card was drawn at ---------
+// (goal-ledger L1) a card revised after the owner's comment says so, the Yes
+// he presses names the rev he read, and a stale-rev refusal redraws the card
+// at its current rev with the comment he typed still in the box.
+{
+  const revFeed = rev => ({ entries: [Object.assign(row("card-aaa"), { rev, revised_after_comment: rev > 1 })], counts: { open: 1 } });
+  await seed();
+  await poll(revFeed(2));
+  out.rev_line = /revised after your comment \(rev 2\)/.test(state.host.innerHTML);
+  const el = card("card-aaa");
+  el._comment.value = "yes, and index it";
+  el._choices[0].onclick();
+  const sent = take("post");
+  out.rev_url = sent.url;
+  out.rev_sent = sent.body && sent.body.rev;
+  out.rev_comment = sent.body && sent.body.comment;
+  const refusal = new Error("/api/decisions/verdict -> 409");
+  refusal.body = { code: "stale_rev", rev: 3, error: "rev 3 now" };
+  sent.rej(refusal);
+  await tick();
+  out.stale_refetched = net.queue.some(q => q.kind === "j");
+  // only a refetch that happened is answered: a build that never refetches
+  // must fail THIS scene's keys, never crash every other scene's
+  if (out.stale_refetched) { take("j").res(revFeed(3)); await tick(); }
+  out.stale_redrawn_at = /\(rev 3\)/.test(state.host.innerHTML);
+  out.stale_kept_comment = boxVal("card-aaa");
+  // CONTROL: any other failure keeps the old behaviour and fetches nothing
+  const el2 = card("card-aaa");
+  el2._choices[0].onclick();
+  net.queue.filter(q => q.kind === "post").forEach(q => q.rej(new Error("503")));
+  await tick();
+  out.plain_fail_refetched = net.queue.some(q => q.kind === "j");
+  net.queue.length = 0;
+  // an unrevised card draws no revision line
+  await poll(revFeed(1));
+  out.rev1_line = /revised/.test(state.host.innerHTML);
 }
 
 // ---- original three scenes, now driven through the real odqInit -----------

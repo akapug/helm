@@ -14,5 +14,7 @@
     "add` refuses and names this file and the key, and its route binds no",
     "proof. Only the keys a pool row names are read, so this comment is inert."
   ],
-  "qwen27": "http://192.0.2.10:8083/v1"
+  "qwen27": "http://192.0.2.10:8083/v1",
+  "qwenlocal": "http://192.0.2.10:8081/v1",
+  "bonsai": "http://192.0.2.11:8098/v1"
 }

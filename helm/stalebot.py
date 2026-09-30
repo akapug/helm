@@ -114,6 +114,8 @@ KEEP = "still-live-keep"             # no terminal proposed; evidence says why
 REDISPATCH = "redispatch-candidate"  # author CURED, nobody waiting; author's move
 PROXY_REDISPATCH = "redispatch-by-proxy"   # integrator must route/operate it
 SOURCE_UNAVAILABLE = "source-unavailable" # a whole source needs an obligated reader
+SOURCE_CLEAN_REHOLD = "source-clean-rehold"  # a source-clean hold records NO HOLDER
+SOURCE_CLEAN_CLOSE = "source-clean-close"  # a stamped source-clean hold: train, then foldcheck
 
 
 class _SourceProblem(str):
@@ -125,7 +127,7 @@ class _SourceProblem(str):
         return out
 
 
-_USAGE = """usage: helm stale sweep [--dry-run] [--quiet] [--json] [--ensure-timer]
+_USAGE = """usage: helm stale sweep [--dry-run] [--apply] [--quiet] [--json] [--ensure-timer]
        helm stale redispatch <dispatch-id> --reviewer <current-seat> [--repo <checkout>]
   Walk aged open work — lr loops past their per-stage STALLED threshold,
   open dispatch rows past their deadline with no visible progress, task rows
@@ -142,6 +144,13 @@ _USAGE = """usage: helm stale sweep [--dry-run] [--quiet] [--json] [--ensure-tim
   A digest capped at 12 lines latches ONLY what it
   rendered and declares the remainder, which rides the next sweep.
     --dry-run       classify and print the digests; post nothing, write no state
+    --apply         ACT on the task ledger's hygiene plan (task/3451): link
+                    train lands to their tasks and mark them landed, whole
+                    ask not yet re-read (no land closes a task, task/3643),
+                    DM a P0 or owner-asked holder once to re-read and
+                    confirm, ping and then unassign rows past their
+                    freshness contract.
+                    Without it the task section only prints what it would do
     --quiet         sweep and record state without posting
     --json          the full machine report
     --ensure-timer  install/refresh the daily systemd user timer and exit
@@ -191,11 +200,22 @@ def collect(now=None, task_path=None, repo=None, trunk=None):
     for lr in stalled:
         rid = str(lr.get("id") or "")
         lr_ids.add(rid)
+        # A SOURCE-CLEAN HOLD'S STALL IS ITS HOLD'S AGE, NOT ITS STAGE DWELL
+        # (task/2695, task/3053): `stalled` was tripped by `hold_age_s`
+        # against the gate turnaround, and the stage is one the review has
+        # already left. `helm lr stalls` says it this way; so does the sweep.
+        if lr.get("source_clean_tip"):
+            age = int(lr.get("hold_age_s") or 0)
+            why = "%s since the source-clean hold, past its %s gate " \
+                  "turnaround" % (_fmt_age(age),
+                                  _fmt_age(lr.get("stall_threshold_s") or 0))
+        else:
+            age = int(lr.get("dwell_s") or 0)
+            why = "%s past its %s stage threshold" % (_fmt_age(age),
+                                                      lr.get("state"))
         items.append({
             "kind": "lr", "id": rid, "row": store.get(rid) or {"id": rid},
-            "lr": lr, "age_s": int(lr.get("dwell_s") or 0),
-            "why_aged": "%s past its %s stage threshold" % (
-                _fmt_age(lr.get("dwell_s") or 0), lr.get("state"))})
+            "lr": lr, "age_s": age, "why_aged": why})
     try:
         current, un = dispatches.snapshot()
     except Exception as e:               # noqa: BLE001 — same law as above
@@ -527,6 +547,7 @@ def classify_dispatch(row, lr=None, repo=None, trunk=None):
     """(terminal, evidence, door) for one aged dispatch/lr row.
 
     PRECEDENCE IS THE CLASSIFIER, spelled once:
+      0. a HELD SOURCE-CLEAN row                      -> ITS door (below)
       1. content ON TRUNK (ancestry or patch-id)      -> SUPERSEDE, carrier named
       2. content PROVEN ABSENT and claims ROTTED      -> CANCEL, rot quoted
       3. READY base >= the measured STALE_BASE_BEHIND -> RETIP
@@ -535,8 +556,16 @@ def classify_dispatch(row, lr=None, repo=None, trunk=None):
     housekeeping the close already performs; absent+rotted outranks retip
     because a moot row re-tipped is the same moot row with a fresher clock.
     An UNKNOWN landing never cancels: cancel requires the ABSENT proof, so an
-    unreadable repo degrades to KEEP with the failure named."""
+    unreadable repo degrades to KEEP with the failure named.
+
+    A SOURCE-CLEAN HOLD OUTRANKS ALL FOUR (task/3053). Its review is finished
+    and never verdicted, so `lr close --reason superseded` cannot close it —
+    the landed rung proposed exactly that door for every source-clean row
+    whose tip reached trunk. `_source_clean_door` names the one that can."""
     rid = str(row.get("id") or "")
+    clean = _source_clean_door(row, lr, repo, trunk)
+    if clean:
+        return clean
     proof, tip, pinned, gitdir = _landing_state(row, repo, trunk)
     if proof in ("ancestor", "patch-equivalent"):
         carrier = tip if proof == "ancestor" else _carrier(gitdir, tip, pinned)
@@ -618,6 +647,68 @@ def classify_dispatch(row, lr=None, repo=None, trunk=None):
                     % (sha[:12], "lane" if exact else "lane STEM", matched),
                     "helm lr close %s --reason superseded" % rid[:12])
     return (KEEP, "landing %s; claims %s: %s" % (proof, verdict, detail), "")
+
+
+def _source_clean_door(row, lr=None, repo=None, trunk=None):
+    """(terminal, evidence, door) for a HELD SOURCE-CLEAN row, else None.
+
+    TWO DOORS, SPLIT BY CONDITION 1's HOLDER RUNG (task/3053):
+      * THE RUNG REFUSES — the hold records NO HOLDER (written before holds
+        were stamped), or its stamp is a hand that is not the recipient's or
+        is a LANE AUTHOR's (the author's ruling 3, round 4). No land can
+        close it and `helm train` takes no such car, so the move is its
+        reviewer's: release and re-hold. The digest reaches that reviewer,
+        because `lr` bills the reviewer on the same answer.
+      * THE RUNG PASSES — the integrator's. Its tip rides the next
+        `helm train` as a source-clean car, and after the gate and the land
+        `helm lr foldcheck <head> --gate gate:<id> --apply` closes it. When
+        the held tip is already on trunk, that close is the whole door.
+    ONE PREDICATE CALL AND NO SECOND READING: the projection carries the
+    rung's answer as `source_clean_rehold`, and this reads it; only a row
+    the projection did not carry asks `landreq.source_clean_rehold` of the
+    dispatch row itself. The close door judges holder, lineage and gate;
+    this names the door and proves nothing."""
+    src = lr if isinstance(lr, dict) and lr else row
+    clean = str(src.get("source_clean_tip") or "").strip()
+    if not clean or src.get("terminal"):
+        return None
+    rid12 = str(row.get("id") or src.get("id") or "")[:12]
+    actor = src.get("hold_actor")
+    if isinstance(lr, dict) and "source_clean_rehold" in lr:
+        rehold = lr.get("source_clean_rehold")
+    else:
+        # THE DISPATCH ROW, never the projection's renamed fields: the rung
+        # reads `recipient`, `sender` and the chain identity off it.
+        rehold = landreq.source_clean_rehold(row)
+    if rehold:
+        return (SOURCE_CLEAN_REHOLD,
+                "held source-clean at %s, but no land can close it and it is "
+                "its reviewer's to re-hold: %s" % (clean[:12], rehold["why"]),
+                rehold["door"])
+    # THE HELD TIP'S LANDEDNESS, through the row the projection carries: the
+    # lr row names the repository even when the dispatch store had no row.
+    proof, _tip, pinned, _gitdir = _landing_state(
+        dict(src, reviewed_tip=clean), repo, trunk)
+    if proof == "ancestor" and pinned:
+        return (SOURCE_CLEAN_CLOSE,
+                "held source-clean at %s by @%s, and the tip is ON trunk: the "
+                "land that carried it owes the close" % (clean[:12], actor),
+                "helm lr foldcheck %s --gate gate:<the land's whole-suite "
+                "receipt> --apply" % str(pinned)[:12])
+    if proof == "patch-equivalent":
+        # A COPY LANDED, NOT THE TIP (a cherry-picking land): the close proves
+        # ancestry only, so no land door can close this row and the sweep
+        # names none rather than one that refuses. THE CLAUSE IS THE BOARD'S
+        # (`landreq.SOURCE_CLEAN_COPY_ON_TRUNK`): `source_clean_on_main`
+        # prints it for the same row, so the two surfaces cannot disagree.
+        return (KEEP, "held source-clean at %s by @%s, but %s"
+                % (clean[:12], actor, landreq.SOURCE_CLEAN_COPY_ON_TRUNK), "")
+    return (SOURCE_CLEAN_CLOSE,
+            "held source-clean at %s by @%s, not on trunk (landing %s): it "
+            "rides the next train as a source-clean car"
+            % (clean[:12], actor, proof),
+            "helm train --apply; after its gate and land, helm lr foldcheck "
+            "<landed head> --gate gate:<its receipt> --apply")
 
 
 def classify_task(row, root, now=None):
@@ -927,7 +1018,7 @@ def redispatch_cured(rid, reviewer, repo=None):
     successor, why, sent = dispatches.send(
         reviewer_token, row.get("lane"), message, tip,
         note="stale-bot cured successor", kind="review", repo=root,
-        supersedes=row["id"], key=key, unique_key=True,
+        supersedes=row["id"], key=key, unique_key=True, pair_meld={},
         _cured_operation={"validate": validate})
     if successor is None or why or not sent:
         return successor, why, sent
@@ -1520,7 +1611,8 @@ WantedBy=timers.target
 """
 
 
-def _timer_units(interval=DEFAULT_INTERVAL_S):
+def _timer_units(interval=DEFAULT_INTERVAL_S, inputs=None):
+    # `inputs` replaces per-install values (timerhealth.unit_values).
     # Same law as tasksmirror._timer_units, same reason: a persistent unit
     # must never capture a DISPOSABLE WORKTREE's path — the binary is the
     # stable install, the cwd is the lane folded back to the shared checkout.
@@ -1528,18 +1620,21 @@ def _timer_units(interval=DEFAULT_INTERVAL_S):
     helm_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "helm")
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cwd = work.find_root(here) or here
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    from . import timerhealth
+    udir = timerhealth.user_unit_dir()
     return (os.path.join(udir, "helm-stale-bot.service"),
-            _UNIT_SERVICE % {"helm": helm_bin, "cwd": cwd},
+            _UNIT_SERVICE % timerhealth.unit_values(
+                {"helm": helm_bin, "cwd": cwd}, inputs),
             os.path.join(udir, "helm-stale-bot.timer"),
-            _UNIT_TIMER % {"interval": interval})
+            _UNIT_TIMER % timerhealth.unit_values({"interval": interval},
+                                                  inputs))
 
 
 def ensure_timer(interval=DEFAULT_INTERVAL_S):
     """Install/refresh and enable the daily cadence -> (ok, detail).
     Idempotent: re-running is the refresh path (tasksmirror's shape)."""
     import shutil
-    import subprocess
+    from . import timerhealth
     if interval < 1:
         return False, "interval must be at least 1 second"
     systemctl = shutil.which("systemctl")
@@ -1547,25 +1642,31 @@ def ensure_timer(interval=DEFAULT_INTERVAL_S):
         return False, ("systemctl unavailable; run `helm stale sweep` from "
                        "another scheduler")
     spath, service, tpath, timer = _timer_units(interval)
-    try:
-        os.makedirs(os.path.dirname(spath), exist_ok=True)
-        pk.atomic_write(spath, service)
-        pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    for cmd in ([systemctl, "--user", "daemon-reload"],
-                [systemctl, "--user", "enable", "--now",
-                 "helm-stale-bot.timer"]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, "%s failed: %s" % (
-                " ".join(cmd), (r.stderr or r.stdout or "").strip()[:200])
+    error, _unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer)), ("helm-stale-bot.timer",),
+        systemctl)
+    if error:
+        return False, error
     return True, "stale-bot cadence enabled every %ds (%s)" % (interval, tpath)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _task_hygiene(apply):
+    """The task ledger's self-cleaning pass (helm/taskhygiene.py) -> its
+    report. A pass that raises is one UNAVAILABLE line, never a traceback
+    over the digests the sweep already delivered."""
+    from . import taskhygiene
+    try:
+        return taskhygiene.sweep(apply=apply)
+    except Exception as e:               # noqa: BLE001 — graceful degrade
+        return {"actions": [], "candidates": [], "duplicates": [],
+                "counts": {}, "applied": [], "failed": [], "deferred": [],
+                "apply": apply,
+                "unavailable": ["task hygiene failed (%s)" % e]}
+
 
 def cmd_stale(args):
     args = list(args or [])
@@ -1613,17 +1714,23 @@ def cmd_stale(args):
         return 2
     rest = args[1:]
     rc = cli.guard_tail("helm stale sweep", rest,
-                        flags=("--dry-run", "--quiet", "--json",
+                        flags=("--dry-run", "--apply", "--quiet", "--json",
                                "--ensure-timer"), usage=_USAGE)
     if rc is not None:
         return rc
+    if "--apply" in rest and "--dry-run" in rest:
+        print("helm stale sweep: --apply and --dry-run contradict each other "
+              "— nothing was done", file=sys.stderr)
+        return 2
     if "--ensure-timer" in rest:
         ok, detail = ensure_timer()
         print("helm stale sweep: %s" % detail,
               file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
     rep = sweep(post="--dry-run" not in rest, quiet="--quiet" in rest)
+    hyg = _task_hygiene("--apply" in rest)
     if "--json" in rest:
+        rep = dict(rep, tasks=hyg)
         print(json.dumps(rep, ensure_ascii=False, indent=1))
     else:
         for it in rep["items"]:
@@ -1643,6 +1750,9 @@ def cmd_stale(args):
         if rep["no_deadline"]:
             print("  %d open row(s) predate the deadline field — never "
                   "age-measurable, counted not dropped" % rep["no_deadline"])
+        from . import taskhygiene
+        for line in taskhygiene.render(hyg):
+            print(line)
     for u in rep["unavailable"]:
         print("helm stale sweep: source UNAVAILABLE — %s (its rows are "
               "UNKNOWN, not fine)" % u, file=sys.stderr)

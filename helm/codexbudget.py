@@ -473,7 +473,7 @@ def _unknown(acct, status, note):
             "state": "unknown", "status": status, "allowed": None,
             "reached_type": None, "note": note, "windows": [],
             "binding": None, "longest_pct": None, "gauges": [],
-            "binding_gauge": None}
+            "binding_gauge": None, "reset_credits": None}
 
 
 def probe_record(acct, get_json=None, now=None, ceiling=None):
@@ -528,6 +528,12 @@ def probe_record(acct, get_json=None, now=None, ceiling=None):
         binding = binding_gauge(data, now=now)
         allowed = rl.get("allowed")
         reached = _reached_type(data)
+        # THE BALANCE RIDES THE SAME BODY: the vendor puts the reset-credit
+        # counts beside the windows, so the runway reads them from this probe
+        # and no second vendor call is made for them (`codexresets.
+        # usage_balance`). None is an unread balance, never 0.
+        from . import codexresets
+        balance = codexresets.usage_balance(data)
     except _Malformed as e:
         return _unknown(acct, "malformed", "usage body is unreadable: %s" % e)
     except Exception as e:                  # noqa: BLE001 — never a failure
@@ -561,7 +567,8 @@ def probe_record(acct, get_json=None, now=None, ceiling=None):
             "allowed": allowed, "reached_type": reached, "note": None,
             "windows": windows, "binding": binding,
             "longest_pct": longest["used_percent"] if longest else None,
-            "gauges": gauges, "binding_gauge": binding_of(gauges)}
+            "gauges": gauges, "binding_gauge": binding_of(gauges),
+            "reset_credits": balance}
 
 
 def pool_budget(get_json=None, now=None, ceiling=None, write_cache=True,
@@ -595,7 +602,7 @@ def _redacted(rows):
     dispatch gate reads."""
     keep = ("account_id", "email", "plan", "tier", "file", "state", "status",
             "allowed", "reached_type", "note", "windows", "binding",
-            "longest_pct")
+            "longest_pct", "reset_credits")
     return [{k: r.get(k) for k in keep} for r in rows]
 
 
@@ -739,7 +746,7 @@ def refusal_text(recipient, v):
             "at or past the %.0f%% ceiling on its longest window (%s). The "
             "longest window is the one that runs out — filing work here spends "
             "a budget that is gone. Wait for the reset, raise %s, or pass "
-            "force=True to file it anyway."
+            "--force to file it anyway."
             % (recipient, v["ceiling"],
                ", ".join("%s %.0f%%" % (_name(r), r["longest_pct"])
                          for r in v["over"]) or "no account readable",

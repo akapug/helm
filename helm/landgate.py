@@ -46,11 +46,10 @@ honest mistake. A land is IRREVERSIBLE on a shared trunk, so anything this
 module cannot prove is a REFUSAL, never a pass. UNKNOWN is not qualified.
 """
 
-import json
 import os
 import sys
 
-from . import home, pk, vcs
+from . import pk, vcs
 
 OK = "ok"
 REFUSE = "refuse"

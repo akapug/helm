@@ -74,9 +74,10 @@ def chat_pane(m, width, height):
     aggregates, bottom-anchored to `height` rows."""
     msgs, reacts = chat.thread(m["rows"])
     lines = []
-    for row in msgs:
-        lines.extend(emoji.wrap(chat._fmt(row), width))
-        counts = reacts.get(chat.rkey(row))
+    for run in chat.ack_runs(enumerate(msgs)):     # a run of acks: one line
+        row = run[0][1]
+        lines.extend(emoji.wrap(chat.run_line(run, lambda _i: ""), width))
+        counts = reacts.get(chat.rkey(row)) if len(run) == 1 else None
         if counts:
             lines.append(emoji.clip("   " + chat.react_line(counts), width))
     if not lines:
@@ -89,10 +90,14 @@ def status_line(m, width):
     st = chat._public_transport(m["status"])
     head = ("#%s" % st["head"]) if st.get("head") is not None else "-"
     transport = "%s %s" % (chat.transport_label(st).upper(), head)
-    if st.get("mode") == "degraded":
+    if st.get("mode") in ("degraded", "unknown"):
         transport += " · %s: %s · last %ss ago" % (
             st.get("profile") or "?", st.get("reason") or "unknown",
             st.get("last_age_s") or 0)
+        if st.get("mode") == "unknown" and st.get("cause"):
+            # UNKNOWN names why it is unknown; the reason alone reads as a
+            # measured failure.
+            transport += " · " + st["cause"]
     parts = ["helm", m["room"], transport, m["quota"],
              m["notice"] or "q quits"]
     return emoji.clip(" · ".join(p for p in parts if p), width)

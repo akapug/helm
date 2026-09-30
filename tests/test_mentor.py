@@ -383,10 +383,10 @@ class ReviewLogTest(MentorBase):
 
 class DispatchTest(MentorBase):
     def test_bare_prints_the_writer_gate(self):
-        rc, out, _ = self.run_cmd([])
-        self.assertEqual(rc, 0)
-        self.assertIn("WRITER GATE", out)
-        self.assertIn("v1 same-home", out)
+        rc, _, err = self.run_cmd([])
+        self.assertEqual(rc, 2)
+        self.assertIn("WRITER GATE", err)
+        self.assertIn("v1 same-home", err)
 
     def test_unknown_subcommand(self):
         rc, _, err = self.run_cmd(["coach"])

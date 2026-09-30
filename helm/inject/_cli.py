@@ -13,17 +13,23 @@ from .. import moments
 from ._ledger import (_lane_report, _ledger_append, parse_hook_json,
                       project_for_cwd)
 from ._compare import _compare_report
+from ._use import _use_report
 from ._whisper import _explain
 
 
 def cmd_inject(args):
     """inject [--project P] [--json] [--explain] [--hook-json] [--lane-report]
-    [--compare-report] [--moment-report [--days N]] [--replay TURNS ...] —
+    [--use-report [--hours N] [--min-fires N]] [--compare-report]
+    [--moment-report [--days N]] [--replay TURNS ...] —
     prompt text on stdin -> context lines. --hook-json reads the harness
     hook's FULL JSON on stdin instead (prompt/cwd/session_id) and derives
     --project from the cwd via the registry; malformed hook JSON injects
     nothing, rc 0 (fail-open). --explain prints what WOULD fire and why, sans
     ledger row. --lane-report renders the lane-split cohort table (read-only).
+    --use-report reads each fire's own turn from the session transcript and
+    reports, per id, how often the seat named it or carried its rare
+    keywords, with UNKNOWN apart from unused and the prune candidates
+    (read-only; --json for the dict).
     --compare-report renders the local-vs-comparison divergence verdict
     (read-only). --moment-report renders the per-route missed-moment verdicts
     and the hook's latency and timeout bars (read-only; rc 1 on any RED).
@@ -34,7 +40,8 @@ def cmd_inject(args):
     # hook-json path — `inject --bogus` used to inject the real context and
     # exit 0 with the bogus flag pretending it existed.
     _known = ("--project", "--json", "--explain", "--hook-json",
-              "--lane-report", "--compare-report", "--moment-report", "--days",
+              "--lane-report", "--use-report", "--hours", "--min-fires",
+              "--compare-report", "--moment-report", "--days",
               "--replay", "--gold", "--labels", "--limit", "--recorded",
               "--out")
     bad = [a for a in args if a.startswith("-")
@@ -44,9 +51,22 @@ def cmd_inject(args):
         print("helm inject: unknown arg '%s'%s" % (bad[0], suggest(bad[0], _known)),
               file=sys.stderr)
         return 2
+    # a report's own flags mean nothing without it: passed alone they would
+    # pass the guard above and turn their value into the prompt text of a
+    # live inject (a ledger row, cooldown state)
+    parent = {"--hours": "--use-report", "--min-fires": "--use-report",
+              "--days": "--moment-report", "--gold": "--replay",
+              "--labels": "--replay", "--limit": "--replay",
+              "--recorded": "--replay", "--out": "--replay"}
+    orphan = [a for a in args if a in parent and parent[a] not in args]
+    if orphan:
+        print("helm inject: %s needs %s" % (orphan[0], parent[orphan[0]]),
+              file=sys.stderr)
+        return 2
     if "-h" in args or "--help" in args:
         print("inject [--project P] [--json] [--explain] [--hook-json] "
-              "[--lane-report] [--compare-report] "
+              "[--lane-report] [--use-report [--hours N] [--min-fires N]] "
+              "[--compare-report] "
               "[--moment-report [--days N]] "
               "[--replay TURNS.jsonl [--recorded] [--gold GOLD --labels LABELS] "
               "[--limit N] [--out FILE]]")
@@ -56,6 +76,8 @@ def cmd_inject(args):
         project = args[args.index("--project") + 1]
     if "--lane-report" in args:
         return _lane_report(project=project)
+    if "--use-report" in args:
+        return _use_report(args)
     if "--compare-report" in args:
         return _compare_report(project=project)
     if "--moment-report" in args:
@@ -83,6 +105,8 @@ def cmd_inject(args):
                 project = project_for_cwd(cwd)
                 scope_via = cwd if project else None
         except moments.Deadline:
+            # The disarm hands an outer budget back (hookrun's, in-process).
+            moments.disarm_deadline()
             return 0
     else:
         # scan args for the inline-text positional FIRST; only read stdin when

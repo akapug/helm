@@ -50,15 +50,108 @@ def provider_name(seat):
     return "helm-%s" % seat
 
 
+# --- the provider's window and output cap (task/3380) ------------------------
+# MEASURED on a local seat's host: every generated provider declared
+# contextWindow 400000 and maxTokens 64000, whatever the seat. pi reads
+# contextWindow as the TOTAL window (pi 0.87.1: it compacts past
+# contextWindow - reserveTokens, 16384 by default, and clamps each request's
+# max_tokens to contextWindow - input - 4096), so on a local seat it held
+# context far past the server slot (qwen27's is 212,992, bonsai's 131,072)
+# and requests failed on context overflow.
+#
+# BOTH NUMBERS NOW COME FROM THE SEAT FAMILY'S CATALOG ROW, through the reading
+# the Claude Code launch line stamps: seat_catalog.launch_window, i.e.
+# model_context[model] first, else max_context, narrowed by a context_budget.
+# So a pi arm and a Claude Code arm of one seat are taught one window, which is
+# what an arm comparison needs, and a re-probe that moves a slot moves both.
+#
+# THE CATALOG'S NUMBER IS AN INPUT CEILING where the catalog derives one (the
+# slot less the output cap and, for Claude Code, its reserve: codex and the
+# local families); pi reads it as the total. That tells pi LESS than the model
+# holds, so it compacts early and clamps its output inside it: the recoverable
+# direction. A family that pins no window is the exception (provider_limits).
+
+# The output a family that declares no max_output_tokens is given: the 32k a
+# seat requests in the catalog's own input-ceiling arithmetic ("272k total -
+# 32k output - 20k reserve = 220k" on codex), so the window those families
+# pin already leaves room for it.
+UNDECLARED_OUTPUT_TOKENS = 32000
+
+
+def provider_limits(family, model):
+    """(limits, err): the contextWindow and maxTokens pi's provider declares
+    for `model` served by `family`, read off the family's catalog row.
+
+    limits = {"context_window", "max_tokens", "window_source",
+    "output_source", "warnings"}. The window is seat_catalog.launch_window's
+    answer. A family that pins NO window gets Claude Code's default for a
+    non-claude model, the window that family's Claude Code seats already run
+    under, with a warning: the catalog leaves those families unpinned on
+    purpose (see grok's entry), so there is no number of helm's own to use. A
+    maxTokens at or above the window is refused: it leaves a request no room
+    for input, and no number is invented to replace it."""
+    from . import seat as seatmod
+    from .seat_catalog import _CC_ASSUMED_WINDOW_MIRROR, launch_window
+    fam = seatmod.FAMILIES.get(family)
+    if fam is None:
+        return None, "unknown family %r" % family
+    warnings = []
+    per_model = (fam.get("model_context") or {}).get(model)
+    window = launch_window(fam, model)
+    if window and window != (per_model or fam.get("max_context")):
+        window_source = "%s's context_budget" % family
+    elif window and per_model:
+        window_source = "%s's model_context[%s]" % (family, model)
+    elif window:
+        window_source = "%s's max_context" % family
+    else:
+        window = _CC_ASSUMED_WINDOW_MIRROR
+        window_source = (
+            "%s pins no context window (no max_context, no model_context "
+            "entry for %s); %d is the window Claude Code assumes for a "
+            "non-claude model, which this family's Claude Code seats run "
+            "under" % (family, model, window))
+        warnings.append(window_source + ". Pin a backed max_context in "
+                        "seat_catalog to replace it.")
+    out = fam.get("max_output_tokens")
+    if out:
+        output_source = "%s's max_output_tokens" % family
+    else:
+        out = UNDECLARED_OUTPUT_TOKENS
+        output_source = ("%s declares no max_output_tokens; %d is the output "
+                         "the catalog's input-ceiling arithmetic assumes"
+                         % (family, out))
+    if out >= window:
+        return None, ("family %s would declare maxTokens %d (%s) at or above "
+                      "its contextWindow %d (%s), which leaves a request no "
+                      "room for input; lower max_output_tokens or pin a "
+                      "larger window in seat_catalog"
+                      % (family, out, output_source, window, window_source))
+    return {"context_window": window, "max_tokens": out,
+            "window_source": window_source, "output_source": output_source,
+            "warnings": warnings}, None
+
+
 def extension_source(seat, port, model, upstream=None, key_env=KEY_ENV,
-                     host="127.0.0.1"):
+                     host="127.0.0.1", limits=None):
     """The generated TypeScript. Deliberately tiny and dependency-free.
 
     It registers ONE provider pointing at a helm seat's local CLIProxyAPI, so a
     pi run and a Claude Code run reach the same upstream through the same proxy
     on the same credentials. `api: "openai-completions"` is what CLIProxyAPI
     speaks on its OpenAI-compatible route.
+
+    `limits` is provider_limits' answer for this seat's family and `model`;
+    without it the seat's family is resolved and read here, so no caller can
+    write a window of its own choosing. A refusal raises ValueError.
     """
+    if limits is None:
+        from . import seat as seatmod
+        family, err = seatmod._seat_family(seat)
+        if not err:
+            limits, err = provider_limits(family, model)
+        if err:
+            raise ValueError(err)
     return '''// GENERATED BY `helm pi extension` — edit helm/pi.py, not this file.
 //
 // Points pi at helm's own CLIProxyAPI for seat "%(seat)s", so a pi run and a
@@ -84,6 +177,9 @@ export default function (pi: ExtensionAPI) {
         reasoning: true,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        // From helm's catalog, as the Claude Code launch line reads it.
+        // window: %(ctx_src)s.
+        // output: %(maxtok_src)s.
         contextWindow: %(ctx)d,
         maxTokens: %(maxtok)d,
       },
@@ -92,7 +188,9 @@ export default function (pi: ExtensionAPI) {
 }
 ''' % {"seat": seat, "provider": provider_name(seat), "host": host,
        "port": port, "model": upstream or model, "key_env": key_env,
-       "ctx": 400000, "maxtok": 64000}
+       "ctx": limits["context_window"], "maxtok": limits["max_tokens"],
+       "ctx_src": limits["window_source"],
+       "maxtok_src": limits["output_source"]}
 
 
 def seat_port(seat, verified_family=None):
@@ -146,8 +244,15 @@ def seat_port(seat, verified_family=None):
     return port, None
 
 
-def write_extension(seat, out=None, model=None, apply=False):
-    """-> (path, source, err). Writes only when apply is True."""
+def _warn_stderr(message):
+    print("helm pi: warning: " + message, file=sys.stderr)
+
+
+def write_extension(seat, out=None, model=None, apply=False, warn=None):
+    """-> (path, source, err). Writes only when apply is True.
+
+    The window and output cap come from provider_limits; each of its warnings
+    goes to `warn` (stderr by default) as well as into the file."""
     from . import seat as seatmod
     port, err = seat_port(seat)
     if err:
@@ -157,7 +262,12 @@ def write_extension(seat, out=None, model=None, apply=False):
     model = model or fam.get("model")
     if not model:
         return None, None, "family %s declares no model" % family
-    src = extension_source(seat, port, model)
+    limits, err = provider_limits(family, model)
+    if err:
+        return None, None, err
+    for message in limits["warnings"]:
+        (warn or _warn_stderr)(message)
+    src = extension_source(seat, port, model, limits=limits)
     path = out or os.path.join(DEFAULT_DIR, "helm-%s.ts" % seat)
     if not apply:
         return path, src, None
@@ -185,6 +295,11 @@ _USAGE = """usage: helm pi extension [--seat S] [--out PATH] [--model M] [--appl
              Prints the shim by default; --apply writes it to pi's extension
              dir. The generated file reads %s from the child environment,
              never a literal; helm never prints the seat's proxy token.
+             contextWindow and maxTokens come from the seat family's catalog
+             row (the window the Claude Code launch line teaches, and
+             max_output_tokens); a family that pins no window gets Claude
+             Code's default with a warning, and a cap at or above the window
+             is refused.
   run        exec pi through SEAT's generated helm-SEAT provider. Defaults the
              model to that provider, refuses a conflicting provider, and puts
              the proxy key only in the child environment.

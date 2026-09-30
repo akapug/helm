@@ -112,7 +112,8 @@ class NewAgentGuideTest(unittest.TestCase):
         # the guide is real onboarding, not a doc dump: every first-10-minutes
         # claim is an executable verb — pin the load-bearing ones so a rewrite
         # cannot silently drop a leg
-        text = open(GUIDE, encoding="utf-8").read()
+        with open(GUIDE, encoding="utf-8") as fh:
+            text = fh.read()
         for needle in ("helm chat wait --seat", "helm chat post",
                        "helm work claim", "helm store resolve", "helm fleet",
                        "helm who", "helm session ls", "helm seat launch",
@@ -123,7 +124,8 @@ class NewAgentGuideTest(unittest.TestCase):
         # the finding-1 class, structurally: a backticked command that greps or
         # reads repo files only works from the checkout root and pins a source
         # substring, not a runtime capability — the guide may not carry one
-        text = open(GUIDE, encoding="utf-8").read()
+        with open(GUIDE, encoding="utf-8") as fh:
+            text = fh.read()
         for span in re.findall(r"`([^`\n]+)`", text):
             toks = span.split()
             first = toks[0] if toks else ""
@@ -140,7 +142,8 @@ class NewAgentGuideTest(unittest.TestCase):
         # Future-tense claims are allowed ONLY with the structural marker: the
         # span immediately followed by "(lane/<lane>)" — `helm fleet`
         # (lane/fleet-truth-verb) — which names where the verb lands.
-        text = open(GUIDE, encoding="utf-8").read()
+        with open(GUIDE, encoding="utf-8") as fh:
+            text = fh.read()
         verbs, _marked = parse_guide_helm_spans(text)
         self.assertTrue(verbs, "guide carries no helm commands to verify")
         neutral = tempfile.mkdtemp(prefix="helm-guide-neutral-")
@@ -169,7 +172,8 @@ class NewAgentGuideTest(unittest.TestCase):
         #     fails here: drop the marker and rewrite the claim in the
         #     present tense. Prose markers have no verb to probe; their
         #     expiry is pinned by the launch-line canary below.
-        text = open(GUIDE, encoding="utf-8").read()
+        with open(GUIDE, encoding="utf-8") as fh:
+            text = fh.read()
         _verbs, marked = parse_guide_helm_spans(text)
         all_lanes = {m.group(1) for m in LANE_MARKER.finditer(text)}
         self.assertTrue(
@@ -233,7 +237,8 @@ class NewAgentGuideTest(unittest.TestCase):
         # outputs collapse to equal. `helm work` refuses everything outside a
         # git repo, so the probes run from a scratch git repo — still neutral,
         # not the checkout.
-        text = open(GUIDE, encoding="utf-8").read()
+        with open(GUIDE, encoding="utf-8") as fh:
+            text = fh.read()
         scratch = tempfile.mkdtemp(prefix="helm-guide-subverb-")
         try:
             subprocess.run(["git", "init", "-q", scratch],

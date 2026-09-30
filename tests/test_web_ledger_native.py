@@ -67,6 +67,10 @@ class NativeBase(unittest.TestCase):
         # the one way this cache could make a test lie about the world.
         web._qstate.pop("ledger-native-pulse", None)
         self.addCleanup(web._qstate.pop, "ledger-native-pulse", None)
+        # THE ROOM INDEX IS PROCESS-WIDE TOO (task/3715): a class's arm must
+        # read its own rooms, never a fold another arm left of the same file.
+        web_ledger._ROOM_FOLDS.clear()
+        self.addCleanup(web_ledger._ROOM_FOLDS.clear)
 
     def req(self, path, payload=None):
         """(status, obj) — 4xx/5xx returned, not raised."""
@@ -169,7 +173,8 @@ class TestNativeLedgerEmptyHome(NativeBase):
         # that the cache behind it cannot support.
         self.assertIsInstance(d["chat"].pop("age_s"), (int, float))
         self.assertEqual(d["chat"], {"rooms": 0, "msgs": 0, "last_ts": "",
-                                     "last_from": "", "last_room": ""})
+                                     "last_from": "", "last_room": "",
+                                     "unreadable": []})
 
 
 class TestNativeLedgerTamper(NativeBase):
@@ -204,10 +209,13 @@ class TestNativeChatPulseIsCached(NativeBase):
     of the cure that can regress independently: that repeated requests inside
     one window share ONE walk, and that the window still ENDS.
 
-    THE COUNTER IS OF THE DOMINATING CALLEE, NOT OF THE ENDPOINT. A request
-    count would stay flat if the walk moved somewhere else; `chat.read` is
-    where the profile puts the time, and the fixture has exactly one room, so
-    one call to it is one walk."""
+    THE COUNTER IS OF THE WALK ITSELF, NOT OF THE ENDPOINT. A request count
+    would stay flat if the walk moved somewhere else. It counted `chat.read`
+    until task/3715, when the walk stopped calling it: the rooms are now read
+    through the room index, which reads a room only where it moved, and
+    tests/test_web_ledger_index.py binds that half. What this class binds is
+    how often the walk RUNS, so it counts `_native_chat_pulse`, the function
+    the window's single-flight calls."""
 
     @classmethod
     def seed(cls):
@@ -216,10 +224,10 @@ class TestNativeChatPulseIsCached(NativeBase):
     def setUp(self):
         super().setUp()
         self.calls = []
-        real = chat.read
+        real = web_ledger._native_chat_pulse
         patcher = mock.patch.object(
-            chat, "read",
-            lambda *a, **k: (self.calls.append(a[:1]), real(*a, **k))[1])
+            web_ledger, "_native_chat_pulse",
+            lambda: (self.calls.append(1), real())[1])
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -228,8 +236,8 @@ class TestNativeChatPulseIsCached(NativeBase):
         # a patch that failed to take would make every arm below pass by
         # counting nothing. This call is not the subject — it proves the
         # instrument moves before the subject is allowed to hold it still.
-        chat.read("main")
-        self.assertEqual(len(self.calls), 1, "the chat.read counter never moved")
+        web_ledger._native_chat_pulse()
+        self.assertEqual(len(self.calls), 1, "the walk counter never moved")
         self.calls.clear()
 
         for _ in range(6):
@@ -248,7 +256,10 @@ class TestNativeChatPulseIsCached(NativeBase):
         room = os.path.join(os.environ["HELM_CHAT_DIR"], "main.jsonl")
         with open(room, encoding="utf-8") as f:
             prior = f.read()
-        self.addCleanup(lambda: open(room, "w", encoding="utf-8").write(prior))
+        def restore_room():
+            with open(room, "w", encoding="utf-8") as fh:
+                fh.write(prior)
+        self.addCleanup(restore_room)
         with open(room, "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": "2026-07-21T10:00:20Z",
                                 "from": "kimi", "text": "later"}) + "\n")
@@ -681,6 +692,9 @@ class TestSseDoorbellWatcher(unittest.TestCase):
         import tempfile
         self.d = tempfile.mkdtemp()
         os.makedirs(os.path.join(self.d, "dm"), exist_ok=True)
+        # the room EXISTS before any watcher arms: the arms below append to
+        # it raw, and a raw CREATE bumps no room generation (task/3519)
+        open(os.path.join(self.d, "main.jsonl"), "a").close()
         self._p = mock.patch("helm.chat.chat_dir", return_value=self.d)
         self._p.start()
         self.addCleanup(self._p.stop)
@@ -763,8 +777,10 @@ class TestSseDoorbellWatcher(unittest.TestCase):
             fp1 = web._chat_fingerprint()
             self.assertNotEqual(fp0, fp1)
             self.assertEqual(len(calls), 2, "an APPEND must not re-list")
-            # and a CREATE moves the dir, so the very next tick re-lists
-            self._append("brand-new-room.jsonl")
+            # and a CREATE by the chat writer bumps the room generation, so
+            # the very next tick re-lists (task/3519: the directory's own
+            # mtime moves with every cursor write and is no longer the key)
+            chat._append_once({"from": "x", "text": "r"}, "brand-new-room")
             self.assertNotEqual(fp1, web._chat_fingerprint())
             self.assertGreater(len(calls), 2)
 
@@ -784,7 +800,8 @@ class TestSseDoorbellWatcher(unittest.TestCase):
         self._append("main.jsonl")
         fp_app = web._chat_fingerprint()
         self.assertNotEqual(fp0, fp_app)
-        self._append("a-room-that-did-not-exist.jsonl")
+        chat._append_once({"from": "x", "text": "r"},
+                          "a-room-that-did-not-exist")
         self.assertNotEqual(fp_app, web._chat_fingerprint())
         # deletion is the other direction of the same signal
         fp1 = web._chat_fingerprint()
@@ -1029,6 +1046,9 @@ class TestSseDoorbellWire(unittest.TestCase):
         import tempfile
         cls.d = tempfile.mkdtemp()
         os.makedirs(os.path.join(cls.d, "dm"), exist_ok=True)
+        # the room EXISTS before any watcher arms: the arms below append to
+        # it raw, and a raw CREATE bumps no room generation (task/3519)
+        open(os.path.join(cls.d, "main.jsonl"), "a").close()
         cls.env_prior = os.environ.get("HELM_CHAT_DIR")
         os.environ["HELM_CHAT_DIR"] = cls.d
         cls.srv = web.make_server(0)
@@ -1165,7 +1185,7 @@ class TestSseDoorbellWire(unittest.TestCase):
                 # The watcher baseline already exists when read_started fires.
                 # Change it before Handler._sse notifies, so the wake has an
                 # observable seq increment and wire doorbell to deliver.
-                with open(os.path.join(self.d, "race.jsonl"), "a") as f:
+                with open(os.path.join(self.d, "main.jsonl"), "a") as f:
                     f.write('{"from":"race","text":"wake"}\n')
                 s = socket.create_connection(("127.0.0.1", port), timeout=2)
                 s.settimeout(0.05)
@@ -1308,7 +1328,7 @@ class TestSseDoorbellWire(unittest.TestCase):
                 # Change the fingerprint before the real handler connects. Its
                 # connect notify wakes the watcher and produces the write that
                 # BrokenWire turns into a deterministic disconnect.
-                with open(os.path.join(self.d, "disconnect.jsonl"), "a") as f:
+                with open(os.path.join(self.d, "main.jsonl"), "a") as f:
                     f.write('{"from":"race","text":"disconnect"}\n')
                 handler_thread = threading.Thread(target=serve_stream,
                                                   daemon=True)
@@ -1347,10 +1367,25 @@ class TestSseDoorbellWire(unittest.TestCase):
                     for t in threading.enumerate()):
                 time.sleep(0.02)
             self.assertTrue(web._sse_ensure_watcher(self.srv))  # fresh arm
-            time.sleep(0.10)                     # settle: one idle cycle
-            # Prove watcher is on idle: beat static over < idle period
+            # The arm stamps beat (web._sse_ensure_watcher); only the watcher's
+            # tick moves it. A fixed sleep to settle guesses when the first tick
+            # has run, and under load it has not, so the first beat lands inside
+            # the quiet window that must be checked. Instead, wait for the beat
+            # to actually CHANGE (an event the first tick is; load can only delay
+            # it, never cancel it), then measure quiet from that proven point.
             with self.srv._sse["cond"]:
-                beat_before = self.srv._sse["beat"]
+                arm_beat = self.srv._sse["beat"]
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                with self.srv._sse["cond"]:
+                    if self.srv._sse["beat"] != arm_beat:
+                        beat_before = self.srv._sse["beat"]
+                        break
+                time.sleep(0.02)
+            else:
+                self.fail("the idle watcher never changed its beat within 3 s "
+                          "of arming; the quiet check below would be vacuous")
+            # Prove watcher is on idle: beat static over < idle period
             time.sleep(0.15)
             with self.srv._sse["cond"]:
                 self.assertEqual(self.srv._sse["beat"], beat_before)

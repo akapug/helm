@@ -131,6 +131,7 @@ class TheRefusedTableTest(GuardBase):
         "helm dispatch cancel 0123abcd moot",
         "helm dispatch rebind 0123abcd --to seat-b",
         "helm dispatch retip 0123abcd --ref %s --reason r" % TIP,
+        "helm review done 0123abcd fix 'x' --no-patch-because r",
         "helm lr close 0123abcd --reason withdrawn --evidence e",
         "helm lr land 0123abcd",
         "helm lr expired --apply",
@@ -243,6 +244,15 @@ class TheFoldedLedgerRungTest(GuardBase):
         "evidence=$(cat <<'EOF'\nthe finding\nEOF\n)\n"
         "helm dispatch verdict d-1 T --fix \"$evidence\"",
         "case $x in a) helm dispatch verdict d-1 T;; esac",
+        # `-h` AFTER A BARE `--` is the text the door records, never help
+        # (task/3382): the hold door wrote this reason while the rung
+        # waved it through as a usage call.
+        "helm dispatch hold d-1 -- -h",
+        "helm dispatch hold d-1 waiting --help",
+        "helm dispatch verdict d-1 T --concur --measured -- --help",
+        "helm review done d-1 concur -- -h",
+        "helm review done d-1 fix finding --worse-than-main helm/x.py "
+        "--no-patch-because -h",
     )
 
     # what task/1388 passed because it writes nothing: reads, dry runs, a
@@ -667,7 +677,7 @@ class TheRungReadsWhatRunsTest(GuardBase):
         'for v in "helm lr land" "helm lr show"; do echo "$v"; done',
         "tail -1 f | python3 -c 'import sys; print(\"helm lr close\")'",
         "grep x f | sed 's/helm lr close//'",
-        "cat > brief.txt <<EOF\nfile helm dispatch verdict $ROW\nEOF",
+        "python3 - <<EOF\nfile helm dispatch verdict $ROW\nEOF",
         "python3 - <<'EOF'\nimport subprocess\ns = 'helm lr close x'\nEOF",
     )
 

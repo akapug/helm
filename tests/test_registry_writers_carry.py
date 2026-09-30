@@ -33,7 +33,12 @@ from helm import automap, home, pk, registry  # noqa: E402
 OPEN = {"value": "may-leave-lan", "reason": "non-client", "by": "owner", "ts": 1}
 FUTURE = {"from": "a newer helm", "n": 3}
 STATE = {"colour": "yellow", "reason": "normal work", "by": "owner", "ts": 1}
-CARRIED = {"residency": OPEN, "zz_future_field": FUTURE}
+# THE TEAM (task/3156) is the newest authored field, so it is the next key an
+# older helm has never heard of.
+TEAM = {"v": 2, "by": "owner", "ts": 1, "reason": "one team",
+        "members": [{"seat": "seat-a", "family": "codex", "role": "builder"}],
+        "shares": {"codex": 30}}
+CARRIED = {"residency": OPEN, "zz_future_field": FUTURE, "team": TEAM}
 
 
 class Base(unittest.TestCase):
@@ -191,6 +196,9 @@ class EveryWriterCarriesKeysItDoesNotOwn(Base):
     def test_residency_and_an_unowned_key_survive_every_writer(self):  # noqa: VACUOUS_ASSERTION — every assertion is an equality on a planted value, and each writer asserts its own effect first
         self.sweep()
 
+    def test_the_team_survives_every_writer(self):  # noqa: VACUOUS_ASSERTION — every assertion is an equality on a planted value, and each writer asserts its own effect first
+        self.sweep(fields=("team",))
+
     def test_the_fixture_resolves_both_keys_before_any_writer_runs(self):  # noqa: VACUOUS_ASSERTION — assert_carried is an equality on each planted value, three projects, unconditionally
         """The premise, or every survival above is about nothing."""
         self.plant()
@@ -211,6 +219,21 @@ class TheOldCodeShapeCarriesTheFieldItDoesNotKnow(Base):
             self.assertNotIn("residency", registry.AUTHORED_FIELDS)     # the premise
             self.WRITERS = tuple(w for w in Base.WRITERS if w != "w_set_residency")
             self.sweep()
+
+
+class AnOlderWriterKeepsTheTeam(Base):
+    """task/3156: a helm whose field tables predate `team` rebuilds an entry
+    from the fields it knows. The team must ride through as a key it does not
+    own, exactly as `residency` did."""
+
+    def test_a_writer_that_does_not_know_team_keeps_it(self):  # noqa: VACUOUS_ASSERTION — every assertion is an equality on a planted value, and each writer asserts its own effect first
+        old = tuple(f for f in registry.AUTHORED_FIELDS if f != "team")
+        old_never = tuple(f for f in registry.NEVER_MIGRATED_FIELDS
+                          if f != "team")
+        with mock.patch.object(registry, "AUTHORED_FIELDS", old), \
+                mock.patch.object(registry, "NEVER_MIGRATED_FIELDS", old_never):
+            self.assertNotIn("team", registry.AUTHORED_FIELDS)          # the premise
+            self.sweep(fields=("team",))
 
 
 class AKeyClearedAtTheCurrentLocationStaysClearedAcrossAnUndo(Base):

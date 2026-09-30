@@ -70,8 +70,13 @@ def setUpModule():
 
 
 def tearDownModule():
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT, as tests.test_landreq's does
+    # (task/3039): a stopped patcher left here is module data the sliced
+    # gate's leak audit reads as a rebinding, and fails the run.
+    _LIVE_SEATS_PATCH = None
 
 
 class ComposeTest(_landreq.LandReqBase):
@@ -1196,6 +1201,107 @@ class ComposeTest(_landreq.LandReqBase):
         self.assertIn("capped", err)
         self.assertIn("state UNKNOWN", err)
         self.assertNotIn("conflict in", err)
+
+    def record_state_resolution(self, tip):
+        """Leave the repo's rerere cache holding a resolution for `tip`'s
+        conflict with trunk on `state`, the way an integrator's earlier
+        hand-resolve would (task/2687). The scratch branch is deleted; the
+        recorded resolution stays in the shared rr-cache."""
+        self.git("config", "rerere.enabled", "true")
+        self.git("config", "rerere.autoupdate", "true")
+        self.git("checkout", "-q", "-b", "rr-scratch", self.main)
+        rc = subprocess.run(["git", "-C", self.repo, "cherry-pick", tip],
+                            capture_output=True, text=True).returncode
+        self.assertNotEqual(rc, 0, "the fixture's pick must conflict")
+        self.git("checkout", "--theirs", "--", "state")
+        self.git("add", "state")
+        self.git("-c", "core.editor=true", "cherry-pick", "--continue")
+        self.git("checkout", "-q", self.main)
+        self.git("branch", "-D", "rr-scratch")
+        self.assertTrue(os.listdir(os.path.join(self.gitdir(), "rr-cache")))
+
+    def test_rerere_recorded_resolution_is_a_conflict_not_an_empty_pick(self):
+        # TASK/2687, reproduced: with rerere enabled and a resolution already
+        # recorded, the pick stopped with CHERRY_PICK_HEAD present, the path
+        # STAGED (no unmerged entry), HEAD unmoved — and compose excluded the
+        # car as "WITHOUT conflicts — an empty pick". The pick runs with
+        # rerere off, so the conflict is the conflict and names its file.
+        tip3 = self.second_lane(name="side3", path="state")
+        self.record_state_resolution(tip3)
+        one = self.dispatch(lane="lane/one")
+        three = self.dispatch(ref=tip3, lane="lane/three")
+        self.approve(one, self.side)
+        self.approve(three, tip3)
+        rc, out, err = self.compose(one["id"][:12], three["id"][:12],
+                                    "--json")
+        self.assertEqual(rc, 0, err)
+        got = json.loads(out)
+        self.assertEqual([m["id"] for m in got["members"]], [one["id"]])
+        self.assertEqual([x["id"] for x in got["excluded"]], [three["id"]])
+        reason = got["excluded"][0]["reason"]
+        self.assertIn("conflict in state", reason)
+        self.assertNotIn("WITHOUT conflicts", reason)
+        self.assertNotIn("empty pick", reason)
+
+    def test_staged_resolution_with_no_unmerged_paths_is_a_named_conflict(self):
+        # TASK/2687's in-tree shape with rerere OFF: the pick stops, something
+        # stages the resolution (no unmerged path), CHERRY_PICK_HEAD remains
+        # and the diff against HEAD is NOT empty. That is a conflict that was
+        # auto-resolved, never "an empty pick", and the car is evicted like
+        # any conflicting car.
+        tip3 = self.second_lane(name="side3", path="state")
+        one = self.dispatch(lane="lane/one")
+        three = self.dispatch(ref=tip3, lane="lane/three")
+        self.approve(one, self.side)
+        self.approve(three, tip3)
+        real = landreq.vcs.backend
+        def staging(root):
+            be = real(root)
+            class Wrap:
+                def __getattr__(self, name):
+                    return getattr(be, name)
+                def text(self, cwd, *args, **kw):
+                    rc, out, err = be.text(cwd, *args, **kw)
+                    if rc != 0 and "cherry-pick" in args \
+                            and ".." in args[-1]:
+                        be.text(cwd, "checkout", "--theirs", "--", "state")
+                        be.text(cwd, "add", "state")
+                    return rc, out, err
+                def run(self, cwd, *args, **kw):
+                    return be.run(cwd, *args, **kw)
+            return Wrap()
+        with mock.patch.object(landreq.vcs, "backend", staging):
+            rc, out, err = self.compose(one["id"][:12], three["id"][:12],
+                                        "--json")
+        self.assertEqual(rc, 0, err)
+        got = json.loads(out)
+        self.assertEqual([m["id"] for m in got["members"]], [one["id"]])
+        self.assertEqual([x["id"] for x in got["excluded"]], [three["id"]])
+        reason = got["excluded"][0]["reason"]
+        self.assertIn("conflict in state", reason)
+        self.assertIn("auto-resolved", reason)
+        self.assertNotIn("WITHOUT conflicts", reason)
+        self.assertNotIn("empty pick", reason)
+        self.assertEqual(self.git("status", "--porcelain", cwd=got["room"]),
+                         "")
+
+    def test_genuinely_empty_pick_keeps_its_empty_wording_under_rerere(self):
+        # The other half of task/2687: a car whose change is already on the
+        # base is REALLY empty (empty diff against HEAD, git's own "now
+        # empty"), and keeps its empty-pick wording — rerere on or off.
+        self.git("config", "rerere.enabled", "true")
+        self.git("config", "rerere.autoupdate", "true")
+        row = self.dispatch(lane="lane/one")
+        self.approve(row, self.side)
+        self.git("cherry-pick", self.side)
+        with self.ready_rows(row), \
+                mock.patch.object(landreq, "_stored_patch_index",
+                                  lambda gd, t: ({}, landreq.INDEX_CAPPED)):
+            rc, _out, err = self.compose(row["id"][:12])
+        self.assertEqual(rc, 1)
+        self.assertIn("an empty pick", err)
+        self.assertNotIn("conflict in", err)
+        self.assertNotIn("auto-resolved", err)
 
     def test_capped_screen_with_partial_hits_says_unprovable_not_split(self):
         # FIX r2: under a capped scan, the unmatched remainder may sit

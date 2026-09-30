@@ -283,6 +283,27 @@ class ResumeCwdOverrideTest(ResumeFixture):
         with open(os.path.join(d, "spawn.json")) as f:
             self.assertEqual(json.load(f)["worktree"], chosen)
 
+    def test_resume_seeds_the_assets_for_the_cwd_the_pane_runs_in(self):  # noqa: VACUOUS_ASSERTION — rc 0, the spawned cwd and a non-empty call list are asserted before the workdir equality, so a resume that never re-minted fails first
+        """seat.py's one-line wiring (workdir=resume_cwd, task/3253): a
+        resumed lite seat's excludes are derived from the cwd its pane is
+        started in. Without this arm the keyword can be dropped and every
+        suite stays green."""
+        d, _ = self._mint()
+        sniffed = os.path.join(self.tmp, "sniffed")
+        chosen = os.path.join(self.tmp, "chosen")
+        os.makedirs(sniffed)
+        os.makedirs(chosen)
+        self._plant_session(d, sniffed)
+        fake = FakeAdapter()
+        with mock.patch.object(seats, "TEMP_ROOTS", ("/dev/shm",)), \
+                mock.patch.object(seats, "safe_cwd", return_value=self.tmp):
+            rc, _out, err, wla = self._resume(["codex", "--cwd", chosen], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.spawned[0][2], chosen)   # the pane's own cwd
+        self.assertTrue(wla.call_args_list)
+        self.assertEqual([c.kwargs.get("workdir") for c in wla.call_args_list],
+                         [chosen] * len(wla.call_args_list))
+
     def test_a_recorded_cwd_that_no_longer_exists_refuses_loudly(self):  # noqa: VACUOUS_ASSERTION — positive controls: rc 1, REFUSING, the reason, the --cwd rescue; the absences (no spawn, no reap, no remint) ARE the blocker, and mutation 3 (gate disabled) reddens the rc arm
         d, _ = self._mint()
         self._plant_session(d, os.path.join(self.tmp, "was-here", "gone"))

@@ -585,6 +585,25 @@ class LocalNeverTrackTest(unittest.TestCase):
             self.assertEqual(merged[prefix], why,
                              "the shipped entries apply beside the local ones")
 
+    def test_a_LOOSE_private_list_still_loads_and_is_named(self):
+        """A private list a group or other permission can reach is an
+        exposure of its own; the guard keeps reading it (refusing would
+        switch the guard off) and says so on every scan."""
+        with open(self.listfile, "w", encoding="utf-8") as f:
+            f.write("local/private-skill/\n")
+        os.chmod(self.listfile, 0o600)
+        self.assertIsNone(nevertrack.loose_note(self.listfile))   # private: quiet
+        os.chmod(self.listfile, 0o644)
+        note = nevertrack.loose_note(self.listfile)
+        self.assertIsNotNone(note)
+        self.assertIn(self.listfile, note)
+        self.assertIn("chmod 600", note)
+        self.assertNotIn("local/private-skill/", note)          # never its content
+        with self.env(self.listfile):
+            local, _path = nevertrack.load_local_never_track()
+        self.assertIn("local/private-skill/", local)             # still guards
+        self.assertIsNone(nevertrack.loose_note(self.absent))    # absent: no note
+
     def test_an_absent_local_list_is_empty_and_keeps_the_shipped_law(self):
         with self.env(self.absent):
             local, path = nevertrack.load_local_never_track()

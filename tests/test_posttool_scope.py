@@ -128,9 +128,10 @@ class PosttoolScopeTest(unittest.TestCase):
                 incoming.close()
 
     @contextmanager
-    def _owners(self, outside=False, failure=None, quiet=False):
+    def _owners(self, outside=False, failure=None, quiet=False, orca=False):
         trace = {k: [] for k in ("stages", "scope", "outcomes", "text", "bytes",
-                                "record", "prepare", "delivery", "commit", "order", "projects", "telemetry")}
+                                "record", "prepare", "delivery", "commit", "order", "projects", "telemetry",
+                                "delegation")}
         self.telemetry_rows = trace["telemetry"]
         with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
             helm = Path(root) / "helm"
@@ -142,6 +143,11 @@ class PosttoolScopeTest(unittest.TestCase):
             stack.callback(os.chdir, before_cwd)
             stack.enter_context(mock.patch.dict(os.environ, {
                 "HOME": root, "HELM_HOME": root + "/state", "HELM_NO_TREE_WARNING": "1"}))
+            # The Orca door reads ORCA_PANE_KEY, so an arm run from a pane
+            # Orca opened would otherwise test the door and not the scope.
+            os.environ.pop("ORCA_PANE_KEY", None)
+            if orca:
+                os.environ["ORCA_PANE_KEY"] = "pane-key-fixture"
             event = {"session_id": "scope-session-範囲", "tool_name": "Edit", "cwd": str(cwd),
                      "tool_input": {"file_path": "écriture/範囲.py", "new_string": "naïve λ"},
                      "tool_response": {"stdout": "réussi 雪"}}
@@ -203,6 +209,11 @@ class PosttoolScopeTest(unittest.TestCase):
 
             for obj, name, replacement in (
                     (hooklatency, "append", lambda row: _capture_append(trace["telemetry"], row)),
+                    # The END window stream is telemetry I/O too, owned here
+                    # like `append`: its box reading opens /proc files and its
+                    # writer appends. Their real I/O is test_hookwindow's.
+                    (hooklatency, "_sample", lambda end: None),
+                    (hooklatency, "_window", lambda end, box: None),
                     (hooks, "helm_bin", lambda: str(helm / "bin/helm")),
                     (_ledger, "project_for_cwd", project),
                     (record, "_record", record_io),
@@ -212,7 +223,8 @@ class PosttoolScopeTest(unittest.TestCase):
                     (seats, "_assert_own_seat", lambda *a, **kw: ("fixture-seat", None)),
                     (seats_cli.actors, "grant_on_behalf", lambda *a, **kw: (None, None)),
                     (seats_rename, "recover_seat_rename", lambda: True),
-                    (seats_cli, "_record_posttool_delegation", lambda event: None),
+                    (seats_cli, "_record_posttool_delegation",
+                     lambda event: trace["delegation"].append(event.get("session_id"))),
                     (seats_cli, "deliver_any", delivery_io),
                     (posttoolrun._Event, "stage", stage),
                     (hooks, "hook_skips_here", scope),
@@ -250,6 +262,8 @@ class PosttoolScopeTest(unittest.TestCase):
             self.assertEqual(trace["delivery"][0]["cwd"], event["cwd"])
             self.assertEqual(trace["order"], ["record", "prepare", "delivery", "receipt", "commit"])
             self.assertEqual(trace["commit"][0]["session"], event["session_id"])
+            self.assertEqual(trace["delegation"], [event["session_id"]])
+            self.assertFalse(trace["delivery"][0].get("project_only"))
             context = json.loads(raw)["hookSpecificOutput"]["additionalContext"]
             self.assertEqual(context, "WHISPER 範囲 λ\n\nDELIVERY naïve 雪")
             self.assertEqual([o["status"] for _, o in trace["outcomes"]], [hookoutcome.ANSWERED] * 3)
@@ -269,6 +283,51 @@ class PosttoolScopeTest(unittest.TestCase):
             self.assertTrue(all("scoped outside" in o["why"] for _, o in trace["outcomes"][1:]))
             self.assertEqual((raw, text, errors), (b"", "", ""))
             self.assertEqual(rc, 0)
+
+    def test_an_orca_pane_outside_scope_gets_delivery_and_no_whisper(self):
+        """The Orca door admits the pair's DELIVERY phase outside helm's
+        project and keeps its whisper PREPARATION phase shut: the seat is
+        handed its own rows, narrowed to its own project, and nothing that
+        steers it toward helm work. The delegation evidence stays out too,
+        because the SubagentStop hook that clears it is still scoped."""
+        with self._owners(outside=True, orca=True) as (trace, event):
+            payload = json.dumps(event, ensure_ascii=False)
+            rc, raw, text, errors = self._installed(payload)
+            self.assertEqual([(p, verb, skipped) for p, verb, _, skipped in trace["scope"]], [
+                ("outer", "hooks", False), ("record", "record", False),
+                ("prepare", "chat", True), ("delivery", "chat", False)])
+            self.assertEqual([p for p, _, _ in trace["stages"]], ["record", "prepare", "delivery"])
+            self.assertEqual(self.input_reads, [payload])
+            self.assertEqual(trace["bytes"], [("delivery", payload.encode("utf-8"))])
+            self.assertEqual(trace["record"], [event])
+            self.assertEqual(trace["prepare"], [])
+            self.assertEqual(trace["order"], ["record", "delivery", "receipt"])
+            self.assertEqual(trace["commit"], [])
+            self.assertEqual(trace["delegation"], [])
+            self.assertEqual(len(trace["delivery"]), 1)
+            self.assertEqual(trace["delivery"][0]["session"], event["session_id"])
+            self.assertIs(trace["delivery"][0].get("project_only"), True)
+            self.assertEqual([o["status"] for _, o in trace["outcomes"]],
+                             [hookoutcome.ANSWERED, hookoutcome.SKIPPED, hookoutcome.ANSWERED])
+            context = json.loads(raw)["hookSpecificOutput"]["additionalContext"]
+            self.assertEqual(context, "DELIVERY naïve 雪")
+            self.assertEqual((rc, text, errors), (0, "", ""))
+
+    def test_an_orca_pane_inside_scope_keeps_the_whole_pair(self):
+        # MUST-HIT twin: inside helm the door changes nothing, the whisper
+        # pass runs and the delivery is not narrowed.
+        with self._owners(orca=True) as (trace, event):
+            payload = json.dumps(event, ensure_ascii=False)
+            rc, raw, text, errors = self._installed(payload)
+            self.assertEqual([(p, skipped) for p, _, _, skipped in trace["scope"]],
+                             [("outer", False), ("record", False),
+                              ("prepare", False), ("delivery", False)])
+            self.assertEqual(trace["order"], ["record", "prepare", "delivery", "receipt", "commit"])
+            self.assertEqual(trace["delegation"], [event["session_id"]])
+            self.assertFalse(trace["delivery"][0].get("project_only"))
+            context = json.loads(raw)["hookSpecificOutput"]["additionalContext"]
+            self.assertEqual(context, "WHISPER 範囲 λ\n\nDELIVERY naïve 雪")
+            self.assertEqual((rc, text, errors), (0, "", ""))
 
     def test_bad_or_missing_payload_is_not_a_scope_skip(self):
         # A payload that is empty or does not parse names no thread, so

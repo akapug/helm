@@ -181,6 +181,32 @@ class LandRoadArms(SlicedDefaultBase):
         self.assertEqual(self.ran, [], "a compose room ran outside the window")
         self.assertEqual(gate.suite_mode(self.compose)[0], gate.SERIAL)
 
+    def test_sliced_in_a_compose_room_follows_the_land_door(self):
+        """`--sliced` in a compose room asks the window for slices: refused,
+        naming why and the serial door, while the land door refuses a sliced
+        receipt; handed on while it admits one. `--serial` is handed on as
+        the window's escape."""
+        calls = []
+
+        def launch(room, label=None, trunk_ref=None, supersede=False,
+                   serial=False, **_kw):
+            calls.append((room, serial))
+            return 0, {"room": room}
+        with mock.patch.object(gatewindow, "launch", launch):
+            rc, _out, err = self.verb("--repo", self.compose, "--sliced")
+            self.assertEqual(rc, 2, err)
+            self.assertIn("runs as slices only while the land door admits "
+                          "a sliced receipt", err)
+            self.assertIn("helm gate window launch --repo", err)
+            with mock.patch.object(gatewindow, "land_mode",
+                                   return_value=(True, "planted: it admits")):
+                rc, _out, err = self.verb("--repo", self.compose, "--sliced")
+                self.assertEqual(rc, 0, err)
+            rc, _out, err = self.verb("--repo", self.compose, "--serial")
+            self.assertEqual(rc, 0, err)
+        self.assertEqual(calls, [(self.compose, False), (self.compose, True)])
+        self.assertEqual(self.ran, [], "a compose room ran outside the window")
+
     def test_the_window_submits_fabs_serial_scope(self):
         """`helm train` and `lr compose` launch through gatewindow, whose
         keyed job names the serial scope: the runner Fab executes for it
@@ -209,10 +235,17 @@ class LandRoadArms(SlicedDefaultBase):
 
     def test_landwindow_compose_gates_through_the_window(self):
         """The train's compose verb has one gate call, and it is the window
-        (whose scope the arm above pins)."""
-        source = inspect.getsource(landwindow.compose)
-        self.assertIn("gatewindow.launch(", source)
-        self.assertNotIn("gate.run(", source)
+        (whose scope the arm above pins). `compose` reaches it through
+        `_compose_applied`, then `compose_room`, the one compose path
+        `helm train blame` and `helm train auto` share; no link of that chain
+        calls the gate any other way."""
+        chain = (landwindow.compose, landwindow._compose_applied,
+                 landwindow.compose_room)
+        self.assertIn("_compose_applied(", inspect.getsource(chain[0]))
+        self.assertIn("compose_room(", inspect.getsource(chain[1]))
+        self.assertIn("gatewindow.launch(", inspect.getsource(chain[2]))
+        for fn in chain:
+            self.assertNotIn("gate.run(", inspect.getsource(fn), fn.__name__)
 
 
 class FallbackArms(SlicedDefaultBase):

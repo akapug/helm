@@ -9,9 +9,11 @@ and typed-timeout bars, the payload probe on the shapes captured live from
 Claude Code 2.1.281 (CRITIC BLOCK 4), and the machine-author set being the
 one registry the tool-boundary delivery reads."""
 import os
+import signal
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -119,7 +121,9 @@ class RoutesTableTest(unittest.TestCase):
         for r in M.ROUTES:
             with self.subTest(route=r.id):
                 self.assertTrue(r.status == M.LIVE or r.status.startswith("planned"))
-                if r.status == M.LIVE and r.id != "jit":
+                # The name says ARRIVAL rows: a live row of another family is
+                # detected by its own hook code, which its form names.
+                if r.status == M.LIVE and r.family == "arrival":
                     self.assertIsNotNone(r.detector)
                 if r.status != M.LIVE:
                     self.assertIsNone(r.detector)
@@ -272,6 +276,169 @@ class HookHealthTest(unittest.TestCase):
         self.assertGreater(w, 0)
 
 
+class DeadlineKeepsTheOuterBudgetTest(unittest.TestCase):
+    """ITIMER_REAL is ONE timer per process, and `hookrun` arms it with the
+    handler's budget (hooks.TIMEOUT_S, 10 s) before it runs inject in-process.
+    A disarm that stops the process timer stops that budget too, for the rest
+    of inject's run. The deadline's disarm must hand the outer budget back:
+    its own handler, and the time it has left. Scaled 10:8 to tenths."""
+
+    OUTER, INNER = 0.5, 0.4
+
+    def setUp(self):
+        self.fired = []
+        self.handler = lambda signum, _frame: self.fired.append(signum)
+        before = signal.signal(signal.SIGALRM, self.handler)
+        # LIFO: the record goes, then the timer, then the handler comes back.
+        self.addCleanup(signal.signal, signal.SIGALRM, before)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        replaced = getattr(M, "_REPLACED", None)
+        if replaced is not None:
+            self.addCleanup(replaced.clear)
+        young = mock.patch.object(M, "process_wall_ms", return_value=0.0)
+        young.start()
+        self.addCleanup(young.stop)
+
+    def cycle(self, seconds):
+        """One arm and disarm as inject runs them: a deadline that lands
+        first is caught, and disarmed again."""
+        try:
+            M.arm_deadline(seconds)
+            M.disarm_deadline()
+        except M.Deadline:
+            M.disarm_deadline()
+
+    def assert_outer_fires(self, bound=None):
+        """The outer handler is back, its timer runs with no more than it
+        had, and it fires. Checked BEFORE the wait, so a stopped timer reads
+        red instead of hanging."""
+        self.assertIs(signal.getsignal(signal.SIGALRM), self.handler)
+        left = signal.getitimer(signal.ITIMER_REAL)[0]
+        self.assertTrue(self.fired or 0 < left <= (bound or self.OUTER),
+                        "the outer budget was stopped (%r left)" % left)
+        while not self.fired:
+            time.sleep(0.01)
+        self.assertEqual(self.fired, [signal.SIGALRM])
+
+    def test_an_outer_budget_that_fires_first_is_left_running(self):  # noqa: VACUOUS_ASSERTION — assert_outer_fires ends on an unconditional assertEqual(fired, [SIGALRM])
+        """The arm refuses under an outer timer that fires first, and the
+        disarm, with nothing armed, must not stop it (the 10 s budget inject
+        lost for the rest of its run)."""
+        signal.setitimer(signal.ITIMER_REAL, self.OUTER)
+        self.cycle(M.DEADLINE_S)
+        self.assert_outer_fires()
+
+    def test_an_outer_budget_that_fires_first_keeps_sole_charge(self):  # noqa: VACUOUS_ASSERTION — the refused arm, the empty record and assert_outer_fires' assertEqual(fired, [SIGALRM]) are unconditional
+        """REFUSED, NOT NESTED, and held with no disarm: an outer due before
+        the deadline keeps its handler and its time, so it fires on its own
+        time instead of waiting under the later deadline."""
+        signal.setitimer(signal.ITIMER_REAL, self.INNER)
+        self.assertFalse(M.arm_deadline(self.OUTER))
+        self.assertEqual(M._REPLACED, [])
+        self.assert_outer_fires(bound=self.INNER)
+
+    def test_an_outer_budget_armed_first_fires_after_a_nested_deadline(self):  # noqa: VACUOUS_ASSERTION — assert_outer_fires ends on an unconditional assertEqual(fired, [SIGALRM])
+        signal.setitimer(signal.ITIMER_REAL, self.OUTER)
+        self.cycle(self.INNER)
+        self.assert_outer_fires()
+
+    def test_a_second_disarm_leaves_the_outer_budget_running(self):  # noqa: VACUOUS_ASSERTION — assert_outer_fires ends on an unconditional assertEqual(fired, [SIGALRM])
+        """inject disarms twice on one turn: construction's, then the CLI's."""
+        signal.setitimer(signal.ITIMER_REAL, self.OUTER)
+        self.cycle(self.INNER)
+        M.disarm_deadline()
+        self.assert_outer_fires()
+
+    def test_the_deadline_still_lands_first_under_a_longer_outer_budget(self):  # noqa: VACUOUS_ASSERTION — assert_outer_fires ends on an unconditional assertEqual(fired, [SIGALRM])
+        """NESTED, NOT REFUSED: under hookrun the soft deadline still lands
+        first, so the turn ledgers its `timed_out` row inside the outer
+        budget instead of being cut at it."""
+        outer = 2.0
+        signal.setitimer(signal.ITIMER_REAL, outer)
+        with self.assertRaises(M.Deadline):
+            M.arm_deadline(0.05)
+            while not self.fired:
+                time.sleep(0.01)
+        M.disarm_deadline()
+        self.assert_outer_fires(bound=outer)
+
+    def test_an_outer_budget_that_ran_out_meanwhile_fires_at_once(self):  # noqa: VACUOUS_ASSERTION — assert_outer_fires ends on an unconditional assertEqual(fired, [SIGALRM])
+        """Charged the time between: an outer budget whose time ran out under
+        the deadline fires as soon as it is back, never with its time restored
+        and never not at all."""
+        signal.setitimer(signal.ITIMER_REAL, self.OUTER)
+        clock = [100.0]
+        with mock.patch.object(M, "_now", lambda: clock[0], create=True):
+            try:
+                M.arm_deadline(self.INNER)
+                clock[0] += 2 * self.OUTER
+                M.disarm_deadline()
+            except M.Deadline:
+                M.disarm_deadline()
+        left = signal.getitimer(signal.ITIMER_REAL)[0]
+        self.assertTrue(self.fired or left <= 0.001, left)
+        self.assert_outer_fires()
+
+    def test_with_no_outer_timer_the_disarm_puts_back_the_handler_only(self):  # noqa: VACUOUS_ASSERTION — the handler's identity is asserted unconditionally beside the stopped timer and the empty record
+        """The installed hook's own case (the lane wrapper, no outer timer):
+        the deadline arms, and the disarm stops it and restores the handler."""
+        self.assertTrue(M.arm_deadline(60.0))
+        self.assertIs(signal.getsignal(signal.SIGALRM), M._on_alarm)
+        self.assertTrue(0 < signal.getitimer(signal.ITIMER_REAL)[0] <= 60.0)
+        M.disarm_deadline()
+        self.assertIs(signal.getsignal(signal.SIGALRM), self.handler)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertEqual(M._REPLACED, [])
+
+    def test_a_disarm_off_the_main_thread_owes_the_outer_budget(self):
+        """Off the main thread `signal.signal` raises, so that disarm cannot
+        put the handler back. It stops the deadline and keeps the record; the
+        outer timer stays owed (re-armed now, it would fire into the
+        deadline's handler) until the main thread's disarm."""
+        import threading
+        signal.setitimer(signal.ITIMER_REAL, 30.0)
+        self.assertTrue(M.arm_deadline(20.0))
+        off_main = threading.Thread(target=M.disarm_deadline)
+        off_main.start()
+        off_main.join()
+        self.assertIs(signal.getsignal(signal.SIGALRM), M._on_alarm)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        M.disarm_deadline()
+        self.assertIs(signal.getsignal(signal.SIGALRM), self.handler)
+        self.assertTrue(0 < signal.getitimer(signal.ITIMER_REAL)[0] <= 30.0)
+        self.assertEqual(M._REPLACED, [])
+
+    def inject(self, stdin, **patches):
+        """`helm inject --hook-json` in-process under a 30 s outer budget,
+        as `hooks run UserPromptSubmit` runs it; the outer budget after."""
+        import contextlib
+        import importlib
+        import io
+        cli = importlib.import_module("helm.inject._cli")
+        signal.setitimer(signal.ITIMER_REAL, 30.0)
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+                (mock.patch.multiple(cli, **patches) if patches
+                 else contextlib.nullcontext()):
+            self.assertEqual(cli.cmd_inject(["--hook-json"]), 0)
+        self.assertIs(signal.getsignal(signal.SIGALRM), self.handler)
+        left = signal.getitimer(signal.ITIMER_REAL)[0]
+        self.assertTrue(0 < left <= 30.0,
+                        "inject stopped its outer budget (%r left)" % left)
+
+    def test_inject_hands_back_the_outer_budget_after_a_whole_turn(self):  # noqa: VACUOUS_ASSERTION — self.inject asserts rc 0, the handler's identity and a running timer unconditionally
+        from helm import inject
+        with mock.patch.object(inject, "gather", return_value={}), \
+                mock.patch.object(inject, "render", return_value=""):
+            self.inject('{"prompt": "hi", "cwd": "/nowhere"}',
+                        project_for_cwd=mock.Mock(return_value=None))
+
+    def test_inject_hands_back_the_outer_budget_on_a_garbled_payload(self):  # noqa: VACUOUS_ASSERTION — self.inject asserts rc 0, the handler's identity and a running timer unconditionally
+        self.inject("not json")
+
+    def test_inject_hands_back_the_outer_budget_when_its_parse_times_out(self):  # noqa: VACUOUS_ASSERTION — self.inject asserts rc 0, the handler's identity and a running timer unconditionally
+        self.inject("{}", parse_hook_json=mock.Mock(side_effect=M.Deadline()))
+
+
 class PayloadShapeTest(unittest.TestCase):
     """The payload probe on the shapes CAPTURED LIVE (Claude Code 2.1.281,
     scripts/probe-hook-payloads.sh): paths and ids invented,
@@ -350,6 +517,56 @@ class MachineAuthorsSyncTest(unittest.TestCase):
         self.assertIs(M.MACHINE_AUTHORS, machine_senders.SUBSYSTEMS)
         self.assertIn("worktree-gc", M.MACHINE_AUTHORS)        # control
         self.assertNotIn("agent", M.MACHINE_AUTHORS)
+
+
+class DeadlineLeavesTheHandlerItFoundTest(unittest.TestCase):
+    """An armed deadline replaces the SIGALRM handler; disarming puts the
+    replaced one back, so a young process that runs the hook's code without
+    being a hook (a test runner's fresh worker) keeps its own handler."""
+
+    def test_disarm_puts_back_the_handler_the_arm_replaced(self):
+        import signal
+        from unittest import mock
+
+        def planted(_signum, _frame):
+            pass
+        before = signal.signal(signal.SIGALRM, planted)
+        self.addCleanup(signal.signal, signal.SIGALRM, before)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        with mock.patch.object(M, "process_wall_ms", return_value=0.0):
+            self.assertTrue(M.arm_deadline(60.0))
+        self.assertIs(signal.getsignal(signal.SIGALRM), M._on_alarm)
+        M.disarm_deadline()
+        self.assertIs(signal.getsignal(signal.SIGALRM), planted)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertEqual(M._REPLACED, [])
+
+    def test_a_disarm_that_cannot_put_the_handler_back_keeps_the_record(self):
+        """Off the main thread `signal.signal` raises, so that disarm cannot
+        put the handler back; it keeps the record, and the main thread's
+        disarm puts the replaced handler back."""
+        import signal
+        import threading
+        from unittest import mock
+
+        def planted(_signum, _frame):
+            pass
+        before = signal.signal(signal.SIGALRM, planted)
+        self.addCleanup(signal.signal, signal.SIGALRM, before)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        self.addCleanup(M._REPLACED.clear)
+        with mock.patch.object(M, "process_wall_ms", return_value=0.0):
+            self.assertTrue(M.arm_deadline(60.0))
+        off_main = threading.Thread(target=M.disarm_deadline)
+        off_main.start()
+        off_main.join()
+        # CONTROL: the timer stopped off the main thread, the handler did not
+        # move, so a restore was still owed.
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertIs(signal.getsignal(signal.SIGALRM), M._on_alarm)
+        M.disarm_deadline()
+        self.assertIs(signal.getsignal(signal.SIGALRM), planted)
+        self.assertEqual(M._REPLACED, [])
 
 
 if __name__ == "__main__":

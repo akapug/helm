@@ -795,10 +795,11 @@ def coverage_phrase(got):
 
 
 def usage():
-    """The synopsis, read from the ONE place that holds it. `cli._VERB_HELP`
-    is what `helm preread --help` and the root listing print, so a second copy
-    here is a second thing to keep true; this reads that one."""
-    from .cli import _VERB_HELP
+    """The synopsis, read from the ONE place that holds it.
+    `cli_help._VERB_HELP` is what `helm preread --help` prints and what the
+    root listing cuts its one line from, so a second copy here is a second
+    thing to keep true; this reads that one."""
+    from .cli_help import _VERB_HELP
     return "helm " + _VERB_HELP["preread"]
 
 

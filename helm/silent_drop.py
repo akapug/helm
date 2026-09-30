@@ -60,6 +60,24 @@ RECENT_ALERT_WINDOW_S = 20 * 60   # only alert on a drop recent enough to ACT on
                           # a stale drop on a frozen/idle seat must never re-cry —
                           # the newest-drop-in-tail otherwise re-alerts forever
 _STATE = "silent_drop.json"
+# A DROP STORM (task/3546) is this many distinct drops in a row that the seat
+# did NOT recover between, each within STORM_GAP_S of the one before. A drop
+# the seat answered on its own (a completed text turn before its next drop) is
+# the known self-recovering reasoning-only class the alert below names, and
+# never counts. The dispatch door refuses new work to a seat in a storm
+# (helm/seat_hold.py). It ends on a MEASURED healthy reading, HEALTHY_TURNS
+# completed text turns after its last drop; it AGES OUT once no drop has been
+# seen for STORM_AGE_ENV seconds (STORM_AGE_S by default), because a seat the
+# door refuses produces no turns to prove itself with; and `helm seat hold
+# <seat> --clear` acknowledges the drops at or before it. A storm whose drops
+# the seat's transcript cannot show answered or not (no transcript, or a tail
+# that begins after them, as after a relaunch) is UNKNOWN, which admits.
+STORM_DROPS = 2
+STORM_GAP_S = LATCH_TTL_S
+HEALTHY_TURNS = 3
+STORM_AGE_ENV = "HELM_DROP_STORM_AGE_S"
+STORM_AGE_S = 6 * 3600
+DROPS_KEPT = 10           # the latch remembers this many drop instants per seat
 
 _USAGE = """usage: helm seat silent-drop [--seat S] [--once] [--dry-run] [--quiet] [--json]
   One read-only pass over every proxy seat: scan the recent transcript tail
@@ -112,6 +130,16 @@ def _recent(ts):
         return (now - t).total_seconds() <= RECENT_ALERT_WINDOW_S
     except (ValueError, TypeError):
         return True
+
+
+def _epoch(ts):
+    """A transcript timestamp -> UTC epoch seconds, or None when unparseable."""
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(
+            str(ts).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 def _blocks(r):
@@ -173,6 +201,7 @@ def scan_seat(seat_name):
             usage = (r.get("message") or {}).get("usage") or {}
             newest = {
                 "seat": seat_name,
+                "family": family,
                 "transcript": tp,
                 "ts": r.get("timestamp"),
                 "output_tokens": usage.get("output_tokens"),
@@ -242,6 +271,139 @@ def scan(seats=None):
     return [f for f in (scan_seat(s) for s in seats) if f]
 
 
+def _drops(entry, finding):
+    """The latch's drop instants for one seat with `finding`'s added, bounded.
+
+    An entry written before the list existed still carries the drop it
+    alerted on, so that drop is kept rather than forgotten."""
+    entry = entry or {}
+    drops = entry.get("drops")
+    kept = list(drops) if isinstance(drops, list) else (
+        [entry["ts"]] if entry.get("ts") else [])
+    ts = finding.get("ts")
+    if ts and ts not in kept:
+        kept.append(ts)
+    return kept[-DROPS_KEPT:]
+
+
+def storm_age_s():
+    """HELM_DROP_STORM_AGE_S, a whole number of seconds, else STORM_AGE_S.
+    0 is the default too: a window of no seconds would age every storm out
+    at once, which silently turns the door off."""
+    raw = (os.environ.get(STORM_AGE_ENV) or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else STORM_AGE_S
+
+
+def _text_turns(seat_name, lines=None):
+    """(epochs, first, why) — the instants of the completed assistant turns
+    WITH TEXT in the seat's newest transcript tail, sorted, and the instant
+    of the tail's earliest timestamped line (None when it has none): a drop
+    before `first` is one this tail cannot show answered or not. `why` names
+    what could not be read at all (no transcript)."""
+    if lines is None:
+        from . import seat
+        family, err = seat._seat_family(seat_name)
+        if err:
+            return [], None, "not a known seat family"
+        tp = autocompact._newest_transcript(seat._instance_dir(family,
+                                                               seat_name))
+        if not tp:
+            return [], None, "no transcript to read"
+        lines = autocompact._tail_lines(tp)[-RECENT_LINES:]
+    out, first = [], None
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if not isinstance(r, dict):
+            continue
+        at = _epoch(r.get("timestamp"))
+        if at is None:
+            continue
+        first = at if first is None else min(first, at)
+        if r.get("type") == "assistant" and not r.get("isSidechain") \
+                and _has_text(r):
+            out.append(at)
+    return sorted(out), first, None
+
+
+def storm(seat_name, latch=None, lines=None, after=None, now=None):
+    """(reading, unknown) — is this seat in a DROP STORM right now?
+
+    (None, None) when the latch records no storm for it; (reading, None) when
+    it does, the reading naming when the run began, its last drop, how many
+    clean turns followed and whether that is a measured healthy reading;
+    (None, why) when the latch or the answers to its drops cannot be read,
+    which is UNKNOWN and never "no storm" nor a storm: the door admits it
+    with a note. READ-ONLY: the latch is `check`'s, and this never writes it.
+
+    Drops at or before epoch `after` (an operator's `--clear`) are
+    acknowledged and not read. A SELF-RECOVERED drop, one a completed text
+    turn followed before the seat's next drop, does not count: that is the
+    known reasoning-only class, and a seat dropping it at half its turns is
+    working. A storm is STORM_DROPS or more drops in a row that the seat
+    answered nothing between, and it ends on HEALTHY_TURNS clean turns after
+    the newest. ONLY A DROP THE TAIL CAN SHOW UNANSWERED COUNTS: with no
+    transcript to read, or a tail that begins after the drops (the seat was
+    relaunched, and its answers are in the old session), a run too short to
+    be a storm on what the tail shows is UNKNOWN, unless HEALTHY_TURNS clean
+    turns already follow its newest drop. A latch with no drop newer than
+    storm_age_s() is no storm at all.
+    `latch`, `lines` and `now` are seams (a caller reading many seats reads
+    the latch once)."""
+    from . import pk
+    if latch is None:
+        try:
+            latch = pk.read_json(_state_path(), {}, strict=True) or {}
+        except Exception as exc:            # noqa: BLE001 — a reason, never a verdict
+            return None, "the silent-drop latch could not be read (%s: %s)" % (
+                exc.__class__.__name__, exc)
+    if not isinstance(latch, dict):
+        return None, ("the silent-drop latch is not a JSON object (%s)"
+                      % type(latch).__name__)
+    entry = latch.get(seat_name)
+    if not isinstance(entry, dict):
+        return None, None
+    now = time.time() if now is None else now
+    drops = sorted(t for t in (_epoch(ts) for ts in _drops(entry, {}))
+                   if t is not None and (after is None or t > after))
+    # The cheap refusals first: the transcript is read only for a seat
+    # that could be in a storm.
+    if len(drops) < STORM_DROPS or now - drops[-1] > storm_age_s():
+        return None, None
+    turns, first, why = _text_turns(seat_name, lines)
+    # THE RUN, walked back from the newest drop: an earlier drop joins it
+    # only when the seat answered nothing between it and the next one, and
+    # the first drop the seat recovered from ends it. A drop before the
+    # tail's first line cannot join it: the tail cannot show whether it was
+    # answered. Whether the seat has recovered from the NEWEST is what
+    # HEALTHY_TURNS measures below.
+    run = drops[-1:]
+    edge = bool(why) or first is None or drops[-1] < first
+    for at, nxt in [] if edge else reversed(list(zip(drops, drops[1:]))):
+        if nxt - at > STORM_GAP_S or any(at < t < nxt for t in turns):
+            break
+        if at < first:
+            edge = True
+            break
+        run.insert(0, at)
+    clean = sum(1 for t in turns if t > run[-1])
+    if edge and len(run) < STORM_DROPS and clean < HEALTHY_TURNS:
+        if not why:
+            why = ("its transcript tail begins at %s" % pk.epoch_ts(first)
+                   if first is not None
+                   else "its transcript tail has no timestamped line")
+        return None, ("%d latched drops, the last at %s, and %s, so whether "
+                      "the seat answered them cannot be read"
+                      % (len(drops), pk.epoch_ts(drops[-1]), why))
+    if len(run) < STORM_DROPS:
+        return None, None
+    return {"seat": seat_name, "since": pk.epoch_ts(run[0]),
+            "last": pk.epoch_ts(run[-1]), "drops": len(run),
+            "clean_turns": clean, "healthy": clean >= HEALTHY_TURNS}, None
+
+
 # ---------------------------------------------------------------------------
 # the latch (one alert per seat per episode)
 # ---------------------------------------------------------------------------
@@ -259,7 +421,7 @@ def _alert_text(f):
     # seats_integrator.integrator_addressed)
     from .seats_integrator import integrator_addressed
     return integrator_addressed(
-        "@%(seat)s SILENT-DROP detected: codex "
+        "SILENT-DROP detected on %(seat)s: %(family)s "
         "produced %(output_tokens)s output_tokens but the completion "
         "arrived EMPTY (proxy drop-after-generate, not a refusal). The "
         "turn ended silently — nothing surfaced. transcript %(session)s "
@@ -267,6 +429,7 @@ def _alert_text(f):
         "generated then lost — consider re-asking. [silent-drop "
         "watchdog]%(storm)s" % {
             "seat": f["seat"],
+            "family": f.get("family") or "this seat's model",
             "output_tokens": f.get("output_tokens"),
             "session": f.get("session"),
             "ts": f.get("ts"),
@@ -299,6 +462,15 @@ def check(seats=None, post=True, quiet=False, dry=False):
         alerted = []
         for f in findings:
             entry = st.get(f["seat"])
+            # THE SAME DROP IS ANNOUNCED ONCE. A drop stays recent for
+            # RECENT_ALERT_WINDOW_S, longer than the latch, so without this a
+            # pass after the latch expires found the very drop it had already
+            # announced and announced it again. Neither an alert nor a
+            # suppressed count: it is not a new drop.
+            if entry and entry.get("session") == f.get("session") \
+                    and entry.get("ts") == f.get("ts"):
+                f["latched"] = True
+                continue
             # PER-SEAT rate-limit (attention-budget): once a seat has alerted,
             # suppress further drops for LATCH_TTL_S REGARDLESS of the drop ts.
             # A known drop-class (codex reasoning-only completions, ~50% on
@@ -311,12 +483,18 @@ def check(seats=None, post=True, quiet=False, dry=False):
                 f["latched"] = True
                 if not dry:
                     entry["suppressed"] = (entry.get("suppressed") or 0) + 1
+                    entry["drops"] = _drops(entry, f)
                     st[f["seat"]] = entry
                 continue
             f["latched"] = False
             f["suppressed_since_last"] = (entry.get("suppressed") or 0) if entry else 0
             if not dry:
-                st[f["seat"]] = {"alerted_at": now, "ts": f.get("ts"), "suppressed": 0}
+                # THE DROP INSTANTS OUTLIVE THE ALERT: `storm` reads the run
+                # across alerts, so a storm longer than one latch window is
+                # still one storm (task/3546).
+                st[f["seat"]] = {"alerted_at": now, "ts": f.get("ts"),
+                                 "session": f.get("session"), "suppressed": 0,
+                                 "drops": _drops(entry, f)}
             alerted.append(f)
         if not dry:
             pk.write_json(p, st)

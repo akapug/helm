@@ -39,7 +39,7 @@ _M4 = {
 }
 _M5 = {
     "name": "M5-missing-parent-falls-back-to-kid-repo",
-    "path": "helm/dispatches.py",
+    "path": "helm/dispatches_rebind.py",
     "find": (
         "    prepo = parent.get(\"repo_id\") if isinstance(parent, dict) else None\n"
     ),

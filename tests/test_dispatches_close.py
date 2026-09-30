@@ -47,8 +47,9 @@ class TheCloseLadderIsPublishedByTheLedgerTest(unittest.TestCase):
         defining would buy the exemption by typing.
         """
         declared = self._declared()
-        self.assertEqual(24, len(declared), _POPULATED)
-        tree = ast.parse(io.open(_SATELLITE, encoding="utf-8").read())
+        self.assertEqual(25, len(declared), _POPULATED)
+        with io.open(_SATELLITE, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
         defined = {n.name for n in tree.body
                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
                                      ast.ClassDef))}
@@ -68,7 +69,7 @@ class TheCloseLadderIsPublishedByTheLedgerTest(unittest.TestCase):
         confined to these files cannot see it.
         """
         declared = self._declared()
-        self.assertEqual(24, len(declared), _POPULATED)
+        self.assertEqual(25, len(declared), _POPULATED)
         unpublished = [n for n in declared if not hasattr(dispatches, n)]
         self.assertEqual([], unpublished,
                          "moved out of dispatches but never published back: %s"
@@ -111,7 +112,8 @@ class TheCloseLadderIsPublishedByTheLedgerTest(unittest.TestCase):
         here is collected from EVERY top-level binding form, and the arm below
         names one constant that only a tuple-aware collector finds.
         """
-        owned = owner_globals(io.open(_OWNER, encoding="utf-8").read())
+        with io.open(_OWNER, encoding="utf-8") as fh:
+            owned = owner_globals(fh.read())
         owned |= {n for _, names in dispatches._OWNER_NAMES for n in names}
         self.assertTrue(owned, _POPULATED)
         self.assertIn("_TRUNK_REF_KEY", owned,
@@ -131,7 +133,8 @@ class TheCloseLadderIsPublishedByTheLedgerTest(unittest.TestCase):
         """THE CONTROL, because an empty finding and a blind instrument look
         identical. A checker that never fires would pass the arm above on a
         file that was never rewritten at all."""
-        owned = owner_globals(io.open(_OWNER, encoding="utf-8").read())
+        with io.open(_OWNER, encoding="utf-8") as fh:
+            owned = owner_globals(fh.read())
         self.assertNotIn("json", owned,
                          "an IMPORTED name is not an owner name; if it were, "
                          "the split would rewrite `json` to `dispatches.json`")

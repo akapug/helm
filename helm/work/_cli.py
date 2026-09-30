@@ -9,7 +9,8 @@ import sys
 from .. import seats
 from ..seats_common import ttl_flag
 from ._common import DEFAULT_TTL, LANE_RE, RECENT_WRITE_SECONDS
-from ._lanes import _worktree_records, find_root, unguarded_inventory
+from ._lanes import (_worktree_records, find_root, lane_branch,
+                     unguarded_inventory)
 from ._gc import (LANE_LANDED, _rowed_lanes, format_gc_summary, gc_enact,
                   gc_scan, lane_overlaps, phantom_scan, prune_phantom_records,
                   was_reclassified, refresh_trunk, list_rows,
@@ -26,10 +27,16 @@ from ._guard import install_guard
 # ---------------------------------------------------------------------------
 
 USAGE = """usage: helm work <verb> [--repo PATH] [--seat S]
-  claim <lane> [--ttl N] [--lease ID]   check in: lease + private room —
+  claim <lane> [--ttl N] [--lease ID] [--task task/N]
+                                        check in: lease + private room —
                                         prints path<TAB>branch<TAB>lease<TAB>ttl.
                                         --ttl is seconds, bare or with one
-                                        unit suffix: 3600, 3600s, 90m, 4h, 1d
+                                        unit suffix: 3600, 3600s, 90m, 4h, 1d.
+                                        --task records the OPEN task the lane
+                                        serves on its branch (the one join's
+                                        stored key); an unknown or closed task,
+                                        or a lane that records another, is
+                                        refused before anything is claimed
   release [<lane>] --lease ID [--park] [--stale]  check out: dirty refuses (--park
                                         WIP-commits); landed room retires,
                                         unlanded room + branch stay for triage.
@@ -44,9 +51,15 @@ USAGE = """usage: helm work <verb> [--repo PATH] [--seat S]
   peek --drop <path-or-committish>      retire a peek room (occupied, pane-
                                         bound, or dirty REFUSES; never --force)
   gc [--apply]                          housekeeping: keep/triage/rescue/remove
-                                        (dry-run; only clean LANDED rooms retire)
+                                        (dry-run; clean LANDED rooms retire, and
+                                        empty claims idle past 24h)
   list                                  the room board: worktree registry x
                                         claims, plus YOUR OWN lease ids
+  checkout-watch [--apply]              a dirty or unreadable shared checkout,
+                                        once per distinct state, to the
+                                        integrator; a git operation in flight
+                                        skips the tick (dry-run; --apply posts).
+                                        --install-timer wires the 2-minute cadence.
   install-guard [--apply] [--profile P] composed deterministic git guards (dry/apply):
                                         rail = shared-tree rail + every pre-commit rung;
                                         leak = the legs EVERY repo owes: never-track
@@ -186,6 +199,15 @@ def _show(path):
     return path if path.isprintable() else repr(path)
 
 
+def _unchecked(what, exc):
+    """One stderr line for a disclosure that raised (claim time, or the
+    `list` board's overlap check): it names what could not be checked and the
+    exception class, so a failed check never reads as "nothing to disclose".
+    The claim or board it belongs to stands."""
+    print("helm work: could not check %s (%s)"
+          % (what, exc.__class__.__name__), file=sys.stderr)
+
+
 def _tree_word(row):
     """The tree's state in ONE word. CONFLICT and DANGLING are called out rather
     than folded into "dirty", because that folding is exactly what hid a dangling
@@ -217,7 +239,7 @@ def _tree_word(row):
 # A shared guard that refuses a documented form is not the same guard.
 _SHARED_FLAGS = ("--repo", "--seat")
 _VERB_FLAGS = {
-    "claim": ("--ttl", "--lease"),
+    "claim": ("--ttl", "--lease", "--task"),
     "release": ("--lease", "--superseded", "--stale", "--park"),
     "peek": ("--drop", "--json"),
     "stash": (),
@@ -265,8 +287,8 @@ _EQUALS_FLAGS = ("--superseded",)
 # `list` WAS EXCLUDED BY NAME AND THAT IS THE MISTAKE ITSELF. The property is
 # "calls guard_tail", not "is called list" — I checked the one verb I had in
 # mind and found one of the three. This list is derived from the call sites,
-# and an arm holds it to them so a fourth cannot appear unnoticed.
-_GUARD_TAIL_VERBS = ("gc", "list", "install-guard")
+# and an arm holds it to them so another cannot appear unnoticed.
+_GUARD_TAIL_VERBS = ("gc", "list", "install-guard", "checkout-watch")
 
 # -h AND --help ARE EVERY VERB'S, so they are never "unknown" and they are
 # ANSWERED here rather than passed through. Passing them through is not
@@ -389,10 +411,34 @@ def _unknown_flags(verb, rest):
     return out
 
 
+def _claim_task(root, lane, token):
+    """(task id, why) — the OPEN task `claim --task` names for `lane`, or
+    the refusal that names it: not a task id, not in the ledger, not open,
+    or a lane whose branch already records another task (`taskkey`)."""
+    from .. import taskkey
+    if token is None:
+        return None, "--task wants a task id (task/N)"
+    tid, why = taskkey.open_task(token)
+    if why:
+        return None, "--task: %s" % why
+    records, why = taskkey.lane_records(root)
+    if why:
+        return None, ("--task: the record of lane %s could not be read (%s)"
+                      % (lane, why))
+    have = records.get(taskkey.lane_name(lane)) or frozenset()
+    if have and have != {tid}:
+        return None, ("--task %s: lane %s records %s; a lane serves one "
+                      "task, so claim a new lane for %s"
+                      % (tid, lane, ", ".join(sorted(have)), tid))
+    return tid, None
+
+
 def cmd_work(args):
-    """work claim|release|gc|list|install-guard — worktree lifecycle on the
-    claims lane: private room per lane, the shared checkout stays the
-    integrator's, abandoned dirty work is rescued, never discarded."""
+    """work claim|release|gc|list|install-guard|checkout-watch — worktree
+    lifecycle on the claims lane: private room per lane, the shared checkout
+    stays the integrator's, abandoned dirty work is rescued, never discarded.
+    checkout-watch reports a stray write on that checkout; it does not refuse
+    one."""
     args = list(args or [])
     if not args:
         print(USAGE, file=sys.stderr)
@@ -505,6 +551,16 @@ def cmd_work(args):
         seat, arc = acting("claim a lane lease")
         if arc:
             return arc
+        # THE TASK THIS LANE SERVES, judged before the light, the lease or
+        # the room (task/3643): an unknown or closed task, or a lane whose
+        # branch already records another task, is refused by name and
+        # nothing is claimed. It is RECORDED only after the claim holds.
+        task = None
+        if "--task" in rest:
+            task, why = _claim_task(root, pos[0], seats._flag(rest, "--task"))
+            if why:
+                print("helm work claim: REFUSED — %s" % why, file=sys.stderr)
+                return 1
         # THE PROJECT'S LIGHT, BEFORE ANYTHING IS CHECKED OUT. A new lane IS
         # new work starting here, so this is the door the owner's colour has to
         # hold at. A RENEWAL is never refused: a lease is a lock on a room, not
@@ -518,10 +574,29 @@ def cmd_work(args):
             return 1
         if lit_note or lit_refusal:
             print("helm work: NOTE — " + (lit_note or lit_refusal), file=sys.stderr)
+        # THE PROJECT'S SHARE OF A SHORT FAMILY, beside the light (task/3156):
+        # advice only, and a read that fails says FAILED, never nothing. A
+        # claim files no dispatch row, so the note asks about ONE MORE.
+        from .. import teams
+        share_note = teams.door_note(root)
+        if share_note:
+            print("helm work: NOTE — " + share_note, file=sys.stderr)
         rc, line = claim(root, pos[0], seat,
                          ttl=ttl,
                          lease=seats._flag(rest, "--lease"), session=session)
         print(line, file=sys.stdout if rc == 0 else sys.stderr)
+        if rc == 0 and task:
+            from .. import taskkey
+            written, why = taskkey.record_lane(root, pos[0], task)
+            if why:
+                print("helm work claim: the lease and room hold, but the "
+                      "task was NOT recorded: %s" % why, file=sys.stderr)
+                rc = 1
+            else:
+                print("helm work: lane %s serves %s (%s on branch %s)"
+                      % (pos[0], task, "recorded" if written
+                         else "already recorded", lane_branch(pos[0])),
+                      file=sys.stderr)
         if rc == 0:
             # WHO ELSE IS LIVE, AND IN WHAT. A lease answers "is anyone in this
             # ROOM", never "is anyone already fixing this DEFECT" — and the
@@ -561,8 +636,8 @@ def cmd_work(args):
                     print("helm work: lane %s — trunk changed code this lane "
                           "edits: %s; rebase before trusting a gate on it"
                           % (lane, shown), file=sys.stderr)
-            except Exception:
-                pass
+            except Exception as exc:          # noqa: BLE001 — said, not raised
+                _unchecked("whether trunk moved code a live lane edits", exc)
             # A SECOND try, NOT a shared one. A reviewer measured the shared
             # version: with the moved-target call raising, the live-lane
             # disclosure below DISAPPEARED ENTIRELY and the claim still
@@ -611,8 +686,8 @@ def cmd_work(args):
                                 len(files) - FILES_SHOWN)
                         print("helm work: live lane %s is in %s"
                               % (lane, shown), file=sys.stderr)
-            except Exception:
-                pass
+            except Exception as exc:          # noqa: BLE001 — said, not raised
+                _unchecked("which live lanes are in which files", exc)
             # AND WHETHER THE RAIL AROUND THIS NEW ROOM IS ACTUALLY ARMED.
             # stale_guard_hooks has exactly ONE production caller — `gc`,
             # which prints it above a 45-room listing. So a landed-but-inert
@@ -653,8 +728,9 @@ def cmd_work(args):
                                        for s, n, _w in drift),
                              remedy, note),
                           file=sys.stderr)
-            except Exception:
-                pass
+            except Exception as exc:          # noqa: BLE001 — said, not raised
+                _unchecked("whether the guard rail around this room is armed",
+                           exc)
         return rc
     if verb == "release":
         pos = _positional(rest)
@@ -899,8 +975,8 @@ def cmd_work(args):
         print("helm work gc — %d room%s under %s-wt/ (%s)" % (
             len(rows), "s"[:len(rows) != 1], root,
             "APPLYING" if enforcing else "dry-run; --apply enforces — only "
-            "clean LANDED rooms retire; dirty/unlanded work stays for triage, "
-            "never discarded"))
+            "clean LANDED rooms and empty claims idle past 24h retire; "
+            "dirty/unlanded work stays for triage, never discarded"))
         w = max(len(r["lane"]) for r in rows)
         removed = 0
         # PLANNED-VS-DONE, because "removed=0" is literally true and reads as
@@ -1074,8 +1150,9 @@ def cmd_work(args):
             # two open lanes have actually touched the same file.
             try:
                 overlaps = lane_overlaps(root, registered=registered)
-            except Exception:      # noqa: BLE001 — the board never dies on it
+            except Exception as exc:  # noqa: BLE001 — the board never dies on it
                 overlaps = []
+                _unchecked("which open lanes touch the same files", exc)
             if overlaps:
                 print("OVERLAPPING LANES — a lease guards a ROOM, not a DEFECT; "
                       "these touch the same files:")
@@ -1152,6 +1229,25 @@ def cmd_work(args):
             return 2
         rc, lines = install_guard(root, apply="--apply" in rest,
                                   profile=profile)
+        for ln in lines:
+            print(ln, file=sys.stdout if rc == 0 else sys.stderr)
+        return rc
+    if verb == "checkout-watch":
+        from ..cli import guard_tail
+        from .. import checkoutwatch
+        grc = guard_tail("helm work checkout-watch", rest,
+                         flags=("--apply", "--install-timer"),
+                         valued=("--repo", "--seat"),
+                         usage="work checkout-watch [--apply] "
+                               "[--install-timer] [--repo PATH]")
+        if grc is not None:
+            return grc
+        if "--install-timer" in rest:
+            ok, detail = checkoutwatch.ensure_timer()
+            print("helm work checkout-watch: %s" % detail,
+                  file=sys.stdout if ok is not False else sys.stderr)
+            return 0 if ok is not False else 1
+        rc, lines = checkoutwatch.watch(root, apply="--apply" in rest)
         for ln in lines:
             print(ln, file=sys.stdout if rc == 0 else sys.stderr)
         return rc

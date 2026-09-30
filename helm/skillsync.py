@@ -46,6 +46,11 @@ prints no error, /learn and /premise are simply not there — so the link is
 minted where the dir is minted, and `helm doctor` names any config dir whose
 skills entry is missing or points elsewhere. `helm skills sync` remains the
 deliberate repair (a real dir moved, a foreign link normalized).
+
+The host operator's global instructions ride the same shape one file wide:
+link_instructions() gives a config dir `rules/global-instructions.md` -> the
+default home's CLAUDE.md, at seat birth and through `helm tidy` (see the
+block above instructions_canonical for why the link is not CLAUDE.md itself).
 """
 import collections
 import errno
@@ -176,6 +181,105 @@ def link_canonical(cdir, relink=True, host_fallback=False):
         return answer("linked", src, True)
     except OSError as e:
         return answer("error", str(e), False)
+
+
+# ---------------------------------------------------------------------------
+# the global instructions — the same distribution, one FILE instead of a dir
+# ---------------------------------------------------------------------------
+# A config dir's own CLAUDE.md is Claude Code's User memory for that dir, and a
+# seat's is NOT free: helm seeds the seat's feedback rule into it IN PLACE and
+# refuses to write through a link (seat_launch_assets._seed_seat_rules,
+# task/2328). So the host operator's global instructions reach a seat through
+# the OTHER User-memory door Claude Code reads from the same config dir, its
+# `rules/` directory (TRACED in the 2.1.282 bundle: the User CLAUDE.md and the
+# User rules dir are both joined onto the one config-dir root, and a linked
+# User memory file is followed for the terminal entrypoint). One link, helm's
+# own name, pointing at the default home's CLAUDE.md: an edit there reaches
+# every seat with no re-sync, exactly as a skill edit reaches the hub.
+INSTRUCTIONS_LINK = os.path.join("rules", "global-instructions.md")
+_OFF = ("off", "0", "no", "false")
+
+Instr = collections.namedtuple("Instr", "action detail link")
+
+
+def instructions_canonical():
+    """(path, configured) — the global instructions file every seat links to.
+
+    HELM_INSTRUCTIONS_CANONICAL (a file path; `off` turns distribution off),
+    else the host's authored `instructions_canonical`, else the default
+    home's CLAUDE.md. `configured` is True when the path was NAMED (env or
+    authored) rather than defaulted, because a named file that is missing is
+    a fault to say out loud, while a default home with no CLAUDE.md simply has
+    nothing to share. Propagates registry.AuthoredUnreadable, like
+    canonical()."""
+    from . import homes as credhomes
+    p = _home.env("INSTRUCTIONS_CANONICAL")
+    if p and p.strip().lower() in _OFF:
+        return None, True
+    if not p:
+        p = registry.authored_host().get("instructions_canonical")
+    if p:
+        return os.path.realpath(os.path.expanduser(p)), True
+    return os.path.realpath(os.path.join(credhomes.DEFAULTS["claude"],
+                                         "CLAUDE.md")), False
+
+
+def link_instructions(cdir, apply=True):
+    """Give ONE config dir its `rules/global-instructions.md -> <global
+    CLAUDE.md>` link. -> Instr(action, detail, link), never an exception.
+
+    Never touches the dir's own CLAUDE.md. actions: `ok` (already the direct
+    link), `linked`/`would-link` (absent), `relinked`/`would-relink` (a link
+    elsewhere under helm's own name is normalized, as seat mint normalizes a
+    skills link), `real` (a REAL file holds that name — kept, surfaced),
+    `blocked` (`rules` exists and is not a real directory — kept, surfaced),
+    `none` (distribution is off, or the default home has no CLAUDE.md: the
+    quiet answers), `unavailable` (a NAMED source is missing or the authored
+    layer is unreadable — loud), `error` (the OSError text). apply=False
+    plans without writing."""
+    try:
+        src, named = instructions_canonical()
+    except registry.AuthoredUnreadable as e:
+        return Instr("unavailable", "authored layer unreadable (%s)" % e, None)
+    if src is None:
+        return Instr("none", "global instructions distribution is off", None)
+    if not os.path.isfile(src):
+        if named:
+            return Instr("unavailable", "%s is configured but MISSING" % src, None)
+        return Instr("none", "no global instructions file at %s" % src, None)
+    rules = os.path.join(cdir, "rules")
+    link = os.path.join(cdir, INSTRUCTIONS_LINK)
+    try:
+        if os.path.lexists(rules) and (os.path.islink(rules)
+                                       or not os.path.isdir(rules)):
+            return Instr("blocked", "%s is not a real directory — left alone"
+                         % rules, link)
+        if os.path.islink(link):
+            old = os.readlink(link)
+            if old == src:
+                return Instr("ok", src, link)
+            if apply:
+                _swap_symlink(link, src)
+            return Instr("relinked" if apply else "would-relink",
+                         "was -> " + old, link)
+        if os.path.lexists(link):
+            return Instr("real", "%s is a real file — kept; rename it to let "
+                         "the global instructions link land" % link, link)
+        if apply:
+            os.makedirs(rules, exist_ok=True)
+            _swap_symlink(link, src)
+        return Instr("linked" if apply else "would-link", src, link)
+    except OSError as e:
+        return Instr("error", str(e), link)
+
+
+def claude_md_state(cdir):
+    """What the dir's OWN CLAUDE.md is — `real`, `link` or `none` (read-only,
+    reported beside the instructions link, never changed by it)."""
+    p = os.path.join(cdir, "CLAUDE.md")
+    if os.path.islink(p):
+        return "link"
+    return "real" if os.path.isfile(p) else "none"
 
 
 def failure_line(res):

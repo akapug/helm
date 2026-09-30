@@ -174,12 +174,15 @@ class FleetNotesRendererTest(unittest.TestCase):
         self.assertLess(html.index("Open the full receipt"),
                         html.index("</details>"))
 
-    def test_board_pointer_routes_to_the_kanban_on_the_work_page(self):
+    def test_board_pointer_routes_to_the_pipeline_on_the_work_page(self):
+        """A note bound for "board" (the retired land board) opens the Work
+        page's pipeline entry (task/3643), by its address and by its tap."""
         html = self.rendered["board"]
-        self.assertIn('href="#work"', html)
+        self.assertIn('href="#work/pipeline"', html)
         self.assertIn('data-note-tab="board"', html)
-        self.assertIn("go to board", html)
-        self.assertIn('$("#tierpipeline").scrollIntoView', self.source)
+        self.assertIn("go to Work › pipeline →", html)
+        self.assertIn('showView(dest === "board" ? "pipeline" : canonView(dest))',
+                      _extract_fn(self.source, "notesSec"))
 
     def test_active_scheme_is_not_rendered_as_a_pointer(self):  # noqa: VACUOUS_ASSERTION — rendered headline positively proves only the unsafe pointer disappeared
         html = self.rendered["unsafe"]
@@ -192,6 +195,44 @@ class FleetNotesRendererTest(unittest.TestCase):
         self.assertIn("https://example.test/runbook?a=1&amp;b=2", html)
         self.assertIn('target="_blank"', html)
         self.assertIn('rel="noopener noreferrer"', html)
+
+
+class SessionsVocabularyTest(unittest.TestCase):
+    """Dead nav-label references in the sessions console.
+
+    The sessions script references ``#quota`` with text "quota tab" in two
+    places (the resume-as strip and the pickAccount guard).  The nav section
+    that owns the quota/provider data is now labelled **Fleet › credit**
+    (``10-nav.html.part`` line 52: ``data-v="quota"`` maps to button text
+    "credit" under the "Fleet" area).
+
+    The noteGoto "board" label was "go to board →" — the kanban lives on the
+    Work page's pipeline sub-section, so the label and its target tab are
+    updated in a parallel commit.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = web_ui_loader.read_text()
+
+    def test_resume_as_strip_uses_fleet_credit_not_quota_tab(self):
+        """The resume-as footer should point agents to 'Fleet › credit',
+        not a stale 'quota tab' that no longer exists in the nav."""
+        # "quota table" in 20-quota.js is a different thing; only the nav
+        # label "quota tab" (standalone) is stale.
+        self.assertNotIn(">quota tab", self.source,
+                           "'quota tab' nav label is stale — nav uses 'Fleet › credit'")
+        self.assertIn("Fleet › credit →", self.source,
+                      "sessions.js should mention 'Fleet › credit' "
+                      "for the provider picker")
+
+    def test_pickAccount_guard_uses_fleet_credit_not_quota_tab(self):
+        """The 'no account selected' toast must also point to 'Fleet › credit'."""
+        # The two occurrences should both use the correct label.
+        count = self.source.count("Fleet › credit")
+        self.assertGreaterEqual(count, 4,
+                                "expected at least 4 'Fleet › credit' refs "
+                                "(2 comments + link + toast)")
 
 
 if __name__ == "__main__":

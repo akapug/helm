@@ -370,7 +370,8 @@ def post_once(force=False):
 
 
 def timer_units():
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    from . import timerhealth
+    udir = timerhealth.user_unit_dir()
     return (os.path.join(udir, _SERVICE_NAME), _SERVICE,
             os.path.join(udir, _TIMER_NAME), _TIMER)
 
@@ -389,37 +390,16 @@ def install_timer():
     if not shutil.which("systemctl"):
         return False, "systemctl unavailable"
     spath, service, tpath, timer = timer_units()
-    try:
-        pk.atomic_write(spath, service)
-        pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    reload_cmd = ["systemctl", "--user", "daemon-reload"]
-    enable_cmd = ["systemctl", "--user", "enable", "--now",
-                  "helm-proxy-fork-watch.timer"]
-    try:
-        reload_result = subprocess.run(
-            ["systemctl", "--user", "daemon-reload"], capture_output=True,
-            text=True, timeout=SYSTEMCTL_TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return False, "%s failed: %s" % (" ".join(reload_cmd), e)
-    if reload_result.returncode != 0:
-        return False, "%s failed: %s" % (
-            " ".join(reload_cmd), _safe_detail(
-                reload_result.stderr or reload_result.stdout or
-                "exit %d" % reload_result.returncode))
-    try:
-        enable_result = subprocess.run(
-            ["systemctl", "--user", "enable", "--now",
-             "helm-proxy-fork-watch.timer"], capture_output=True, text=True,
-            timeout=SYSTEMCTL_TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return False, "%s failed: %s" % (" ".join(enable_cmd), e)
-    if enable_result.returncode != 0:
-        return False, "%s failed: %s" % (
-            " ".join(enable_cmd), _safe_detail(
-                enable_result.stderr or enable_result.stdout or
-                "exit %d" % enable_result.returncode))
+    from . import timerhealth
+    # The bare `systemctl` on PATH, and a failure's output folded to one line
+    # by _safe_detail: this installer's own report.
+    error, _unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer)), (_TIMER_NAME,),
+        subprocess=subprocess, timeout=SYSTEMCTL_TIMEOUT_S,
+        clean=lambda r: _safe_detail(r.stderr or r.stdout
+                                     or "exit %d" % r.returncode))
+    if error:
+        return False, error
     return True, "enabled daily timer %s" % tpath
 
 

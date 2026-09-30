@@ -33,7 +33,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # arm about the ARMS reads the file and an arm about the INSTALLED COMMAND
 # reads the command. Conflating the two is what a text search over the command
 # would now do silently, passing on a ladder that had lost the arm.
-LADDER = open(os.path.join(ROOT, "bin", "helm-hook"), encoding="utf-8").read()
+with open(os.path.join(ROOT, "bin", "helm-hook"), encoding="utf-8") as _fh:
+    _LADDER_SRC = _fh.read()
+LADDER = _LADDER_SRC
 # THE ARMS WITHOUT THE PROSE. The script explains WHY a code is excluded, so a
 # `assertNotIn("137")` over the whole file is satisfied by nothing and refuses
 # the explanation instead of the arm.
@@ -1123,8 +1125,19 @@ class GateFailureVisibilityTest(HooksBase):
         complaint; the harness-visibility arms need the third channel,
         because stdout is the ONLY one the harness reads on exit 0."""
         if binpath is None:
-            binpath = os.path.join(self.tmp, "stub", "helm")
-            os.makedirs(os.path.dirname(binpath), exist_ok=True)
+            # A NEW STUB PER RUN, NEVER A REWRITE IN PLACE (task/3417). A
+            # gate's rc 2 starts `helm friction record` DETACHED from the helm
+            # beside the wrapper, which is this stub, and the wrapper exits 2
+            # without waiting. One shared stub path let the next run's
+            # open(..., "w") land inside that counter's execve, which the
+            # kernel refuses with ETXTBSY. Measured on a 16-core build node
+            # over the refusal arm: 56 errors in 4,000 runs under 16 CPU
+            # burners, 53 in 4,000 under 32, and 0 in 1,300 idle.
+            # A fresh directory keeps the counter's file untouched, as
+            # `AdvisoryAnnouncesItsFailure._drive` and test_hook_wrapper's
+            # `run_kind` already do.
+            binpath = os.path.join(
+                tempfile.mkdtemp(prefix="stub-", dir=self.tmp), "helm")
             with open(binpath, "w") as f:
                 f.write("#!/bin/sh\n%s\n" % body)
             os.chmod(binpath, 0o755)
@@ -1188,6 +1201,28 @@ class GateFailureVisibilityTest(HooksBase):
         rc, err = self.run_gate("exit 0")
         self.assertEqual(rc, 0)
         self.assertEqual(err, "")
+
+    def test_a_refusals_detached_counter_never_has_its_stub_rewritten(self):
+        """THE MECHANISM OF task/3417, PINNED WITHOUT A RACE. A gate's rc 2
+        starts `helm friction record` DETACHED from the helm beside the
+        wrapper, which is the stub this class wrote, and the wrapper exits 2
+        without waiting for it. When every run rewrote ONE stub path, the
+        `exit 0` run after an `exit 2` run could open that file for writing
+        while the counter was still inside its execve, and the kernel refuses
+        a writer then: `open` raised ETXTBSY (errno 26) in the arm above.
+        Each run owns its stub now, so the file a counter executes is never
+        opened again: the next run names a different path, and the refused
+        run's stub still holds the body it refused with."""
+        refused = self.run_proc("exit 2")
+        passed = self.run_proc("exit 0")
+        self.assertEqual((refused.returncode, passed.returncode), (2, 0))
+        # words[6] is the child: the wrapper takes five operands after its
+        # own path (`_wrapper_prefix`), and `render` put the stub there.
+        a, b = (shlex.split(p.args[2])[6] for p in (refused, passed))
+        self.assertNotEqual(a, b, "the next run rewrote the stub that a "
+                            "refusal's detached counter executes")
+        with open(a) as f:
+            self.assertEqual(f.read(), "#!/bin/sh\nexit 2\n")
 
     def test_the_alarm_reaches_the_HARNESS_and_not_only_the_debug_log(self):
         """A finding, and it invalidated every arm above as a proof of
@@ -1360,7 +1395,7 @@ class GateFailureVisibilityTest(HooksBase):
 
 class CommandTest(HooksBase):
     def test_generated_command_shape_and_resolvable_helm(self):
-        cmd = hooks.hook_command()
+        cmd = hooks.spec_command(hooks.SPECS[0])
         words = shlex.split(cmd)
         self.assertIn("inject --hook-json", cmd)
         # NEVER HOLD A TURN: the budget is the wrapper's fourth operand and
@@ -1389,7 +1424,7 @@ class InstallTest(HooksBase):
         self.assertIn("2 of 2 claude homes covered", out)
         for d in (a, homes.DEFAULTS["claude"]):
             cmds = hooks._hook_cmds(self.read_settings(d))
-            self.assertEqual(cmds, [hooks.hook_command()])
+            self.assertEqual(cmds, [hooks.spec_command(hooks.SPECS[0])])
         before = self.read_settings(a)
         rc, out, _ = self.run_hooks(["install"])   # re-install detects up-to-date
         self.assertEqual(rc, 0)
@@ -1412,7 +1447,7 @@ class InstallTest(HooksBase):
         self.assertEqual(got["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "echo pre")
         cmds = hooks._hook_cmds(got)
         self.assertIn("echo other", cmds)
-        self.assertIn(hooks.hook_command(), cmds)
+        self.assertIn(hooks.spec_command(hooks.SPECS[0]), cmds)
         self.assertEqual(len(cmds), 2)
 
     def test_stale_helm_entry_updated_in_place_never_doubled(self):
@@ -1423,7 +1458,7 @@ class InstallTest(HooksBase):
         action, _ = hooks.install_home(d)
         self.assertEqual(action, "update")
         self.assertEqual(hooks._hook_cmds(self.read_settings(d)),
-                         [hooks.hook_command()])
+                         [hooks.spec_command(hooks.SPECS[0])])
 
     def test_dry_prints_diff_writes_nothing(self):
         d = self.mk_home("a-user-example")
@@ -2155,6 +2190,56 @@ class WorkflowDefaultsTest(HooksBase):
         self.assertNotEqual(action, "ok")
         self.assertEqual(
             self.read_settings(d).get("workflowSizeGuideline"), "small")
+
+    # task/2962: THE OWNER'S RULE IS NO AI AUTHORING LINE ANYWHERE. Claude
+    # Code writes a co-author trailer on commits and a generated-with line on
+    # PRs unless `attribution` says otherwise, and a proxy seat's config dir
+    # never carried the setting.
+    NO_ATTRIBUTION = {"commit": "", "pr": "", "sessionUrl": False}
+
+    def test_every_family_seat_gets_no_ai_attribution(self):
+        for family in sorted(seat.FAMILIES):
+            with self.subTest(family=family):
+                d = self.mk_seat(family)
+                action, detail = hooks.install_home(
+                    d, specs=hooks.SEAT_SPECS)
+                self.assertNotEqual(action, "fail", detail)
+                self.assertEqual(self.read_settings(d).get("attribution"),
+                                 self.NO_ATTRIBUTION,
+                                 "family %s seat keeps an AI authoring "
+                                 "line" % family)
+
+    def test_a_different_attribution_is_updated_and_its_siblings_survive(self):
+        d = self.mk_seat("codex", settings={
+            "attribution": {"commit": "Co-Authored-By: a model", "pr": "",
+                            "later": 1},
+            "model": "gpt-5.6-sol"})
+        action, detail = hooks.install_home(d, specs=hooks.SEAT_SPECS)
+        self.assertEqual(action, "update", detail)
+        s = self.read_settings(d)
+        self.assertEqual(s["attribution"],
+                         dict(self.NO_ATTRIBUTION, later=1))
+        self.assertEqual(s.get("model"), "gpt-5.6-sol")
+        # the second pass has nothing to write
+        self.assertEqual(hooks.install_home(d, specs=hooks.SEAT_SPECS),
+                         ("ok", "hook up to date"))
+
+    def test_an_attribution_that_is_not_an_object_is_replaced(self):
+        d = self.mk_seat("kimi", settings={"attribution": "off"})
+        action, detail = hooks.install_home(d, specs=hooks.SEAT_SPECS)
+        self.assertEqual(action, "update", detail)
+        self.assertEqual(self.read_settings(d)["attribution"],
+                         self.NO_ATTRIBUTION)
+
+    def test_the_merge_reports_add_update_and_ok_for_an_object_default(self):
+        out = {}
+        self.assertEqual(hooks._merge_defaults(out), "add")
+        self.assertTrue(hooks._defaults_live(out))
+        self.assertEqual(hooks._merge_defaults(out), "ok")
+        out["attribution"]["sessionUrl"] = True
+        self.assertFalse(hooks._defaults_live(out))
+        self.assertEqual(hooks._merge_defaults(out), "update")
+        self.assertEqual(out["attribution"], self.NO_ATTRIBUTION)
 
     def test_every_family_inherits_workflows_enabled_feature(self):
         # the ENABLE half: ONE complete source cache, and every family's seed
@@ -4704,6 +4789,28 @@ class UncoveredPanesTest(HooksBase):
         self.assertNotIn("never joined", text)
         self.assertNotIn("no roster row", text)
 
+    def test_a_coverage_census_that_raises_is_UNKNOWN_never_empty(self):
+        """A raise inside the coverage census comes back as one UNKNOWN row
+        naming the exception class, printed under the look-do-NOT-relaunch
+        header. An empty list renders as every running pane covered."""
+        proc = self.mk_proc(4242, [b"claude"], [b"HELM_CHAT_NAME=kimi"])
+        self.assertEqual([r["seat"] for r in hooks.uncovered_panes(proc)],
+                         ["kimi"], "control: the fixture pane is judged")
+        with mock.patch("helm.seats.roster",
+                        side_effect=RuntimeError("roster exploded")):
+            rows = hooks.uncovered_panes(proc)
+            out = io.StringIO()
+            hooks.surface_uncovered(out=out)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertTrue(rows[0]["coverage_unknown"])
+        self.assertEqual(rows[0]["census_failed"], "RuntimeError")
+        self.assertIn("RuntimeError", rows[0]["reason"])
+        text = out.getvalue()
+        self.assertIn("COVERAGE COULD NOT BE READ", text)
+        self.assertIn("do NOT relaunch", text)
+        self.assertIn("RuntimeError", text)
+        self.assertNotIn("NOT receiving fleet chat", text)
+
 
 class UnsignedPanesTest(HooksBase):
     """No-silent-break for signing: a pane launched before launch_line
@@ -4742,6 +4849,29 @@ class UnsignedPanesTest(HooksBase):
         self.assertEqual([(p["pid"], p["seat"]) for p in rows],
                          [(11, "oldkimi")])
         self.assertIn("no HELM_CELL_BIN", rows[0]["sign_reason"])
+
+    def test_a_signing_census_that_raises_is_UNKNOWN_never_empty(self):
+        """A raise inside the signing census comes back as one UNKNOWN row
+        naming the exception class, printed under the look-do-NOT-relaunch
+        header. An empty list renders as every running pane able to sign."""
+        proc = self.mk_proc(11, [b"claude"], [b"HELM_CHAT_NAME=oldkimi"])
+        self.assertEqual([p["seat"] for p in hooks.unsigned_panes(proc)],
+                         ["oldkimi"], "control: the fixture pane is judged")
+        with mock.patch("helm.cell._usable",
+                        side_effect=RuntimeError("probe exploded")):
+            rows = hooks.unsigned_panes(proc)
+            out = io.StringIO()
+            with mock.patch.object(hooks, "uncovered_panes", return_value=[]):
+                hooks.surface_uncovered(out=out)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertTrue(rows[0]["sign_unknown"])
+        self.assertEqual(rows[0]["census_failed"], "RuntimeError")
+        self.assertIn("RuntimeError", rows[0]["sign_reason"])
+        text = out.getvalue()
+        self.assertIn("SIGNING COULD NOT BE READ", text)
+        self.assertIn("do NOT relaunch", text)
+        self.assertIn("RuntimeError", text)
+        self.assertNotIn("posting UNSIGNED", text)
 
     def test_unexecutable_bin_and_missing_profile_flagged(self):
         signer = os.path.join(self.tmp, "signer")
@@ -4914,6 +5044,79 @@ class UnsignedPanesTest(HooksBase):
         self.assertIn("SIGN AS THEIR OWN SEAT", out.getvalue())
         self.assertNotIn("posting UNSIGNED", out.getvalue())
 
+    def _owner_export_scan(self, proc, **live_sids):
+        """(rows, surface text) for one scan of the fake /proc, with seat-a an
+        owner-export actor and the pid-keyed session read doubled."""
+        with mock.patch.dict(os.environ,
+                             {"HELM_CHAT_OWNER_NAMES": "owner-profile"}), \
+                mock.patch("helm.seats.roster_checked",
+                           return_value=(self._owner_export(), False)), \
+                mock.patch("helm.sessions.live_sids", **live_sids):
+            scan = hooks.running_panes(proc)
+            rows = hooks.unsigned_panes(panes=hooks.running_panes(proc))
+            out = io.StringIO()
+            with mock.patch.object(hooks, "running_panes", return_value=scan), \
+                    mock.patch.object(hooks, "uncovered_panes",
+                                      return_value=[]):
+                hooks.surface_uncovered(out=out)
+        return rows, out.getvalue()
+
+    def test_a_FAILED_session_record_read_is_UNKNOWN_never_a_relaunch(self):
+        """A claude pane's session is read from the pid-keyed records. When
+        that read RAISES, the pane's session was not read at all; it is not
+        "unknown" in the sense the refusal line means. Filing it under
+        "posting UNSIGNED — relaunch" spends the pane's context on a failed
+        read. It comes back signing UNKNOWN, naming the exception class,
+        under the look-do-NOT-relaunch header. RED before: the read's {}
+        read as "this pane's session is unknown" (identity_conflict)."""
+        bin_env = self._signer_env()
+        proc = self.mk_proc(34, [b"claude"],
+                            [b"HELM_CHAT_NAME=seat-a", bin_env,
+                             b"HELM_CELL_PROFILE=owner-profile"])
+        # control on the same scan: a pane whose OWN environ carries its bound
+        # session needs no record read, so the failed read changes nothing
+        self.mk_proc(35, [b"claude"],
+                     [b"HELM_CHAT_NAME=seat-a", bin_env,
+                      b"HELM_CELL_PROFILE=owner-profile",
+                      ("CLAUDE_CODE_SESSION_ID=%s" % self.OWNER_SID).encode()])
+        rows, text = self._owner_export_scan(
+            proc, side_effect=OSError("records unreadable"))
+        rows = {p["pid"]: p for p in rows}
+        self.assertTrue(rows[35].get("sign_info"), rows[35])
+        self.assertTrue(rows[34].get("sign_unknown"), rows[34])
+        self.assertEqual(rows[34].get("census_failed"), "OSError")
+        self.assertIn("FAILED (OSError)", rows[34]["sign_reason"])
+        self.assertNotIn("identity_conflict", rows[34]["sign_reason"])
+        self.assertIn("SIGNING COULD NOT BE READ", text)
+        self.assertIn("do NOT relaunch", text)
+        self.assertIn("OSError", text)
+        self.assertNotIn("posting UNSIGNED", text)
+        self.assertNotIn("identity_conflict", text)
+
+    def test_a_SUCCEEDING_session_record_read_keeps_the_refusal_byte_for_byte(self):
+        """THE CONTROL for the arm above: the same pane, and the record read
+        answers with no session for it. That is a real unknown session, and
+        the refusal line and its relaunch header are unchanged, byte for
+        byte."""
+        bin_env = self._signer_env()
+        proc = self.mk_proc(34, [b"claude"],
+                            [b"HELM_CHAT_NAME=seat-a", bin_env,
+                             b"HELM_CELL_PROFILE=owner-profile"])
+        rows, text = self._owner_export_scan(proc, return_value={})
+        reason = ("profile 'owner-profile' is not this pane's seat 'seat-a' — "
+                  "the signing gate refuses it (identity_conflict): the "
+                  "owner's profile is set aside only for a seat whose session "
+                  "is bound to its row, and this pane's session is unknown")
+        self.assertEqual([(p["pid"], p["sign_reason"]) for p in rows],
+                         [(34, reason)])
+        self.assertFalse(rows[0].get("sign_unknown"))
+        self.assertEqual(
+            text,
+            "helm hooks: 1 running pane(s) posting UNSIGNED (no signing env, "
+            "or a profile that is not their own) — relaunch from their minted "
+            "launch.sh to sign:\n"
+            "  pid 34      seat-a         " + reason + "\n")
+
     def test_unnamed_pane_not_judged_and_surface_prints(self):
         proc = self.mk_proc(15, [b"claude"], [b"TERM=xterm"])
         self.assertEqual(hooks.unsigned_panes(proc), [])
@@ -4940,6 +5143,12 @@ class FleetHookScopeTest(unittest.TestCase):
     `envtidy._helm_args`, so helm stopped recognising its own hooks.
     """
     FLEET = ("chat", ["deliver", "--hook-json"])
+
+    def setUp(self):
+        # A pane Orca opened carries ORCA_PANE_KEY, and the door reads it, so
+        # an arm run from such a pane would test the door instead of the
+        # scope. Every arm starts outside Orca; an Orca arm says so.
+        self._orca(False)
 
     def _at(self, project, verb=None, rest=None, expect_consulted=True):
         """hook_skips_here as if cwd resolved to `project`.
@@ -5001,9 +5210,10 @@ class FleetHookScopeTest(unittest.TestCase):
                              "shell-substitution rungs serve every project"
                              % verb)
 
-    # THE ORCA DOOR (task/2673 PART C): JOIN, and only join, runs for a pane
-    # Orca opened, whatever its project. All four quadrants of
-    # (Orca pane or not) x (helm cwd or not), plus a scoped non-join hook.
+    # THE ORCA DOOR (task/2673 PART C, task/3165): JOIN and the DELIVERY leg,
+    # and nothing else, run for a pane Orca opened, whatever its project. All
+    # four quadrants of (Orca pane or not) x (helm cwd or not), plus the
+    # scoped hooks that must stay shut.
     JOIN = ("chat", ["join", "--hook-json"])
 
     def _orca(self, pane):
@@ -5031,13 +5241,65 @@ class FleetHookScopeTest(unittest.TestCase):
         self._orca(False)
         self.assertFalse(self._at("helm", *self.JOIN))
 
-    def test_the_orca_door_opens_join_only(self):
+    def test_the_orca_door_opens_join_and_deliver_only(self):
+        """The door opens for join and for the delivery leg, and for no other
+        fleet hook.
+
+        Why delivery joined it, in the reconciliation's words: "Delivery of a
+        seat's own addressed rows blocks and nags nothing." The fleet scope
+        exists for the hooks that direct work at a seat; stop-guard and
+        delegation-stop are that kind, so they stay scoped."""
         self._orca(True)
-        for verb, rest in (self.FLEET,
-                           ("chat", ["stop-guard", "--hook-json"]),
-                           ("chat", ["delegation-stop", "--hook-json"])):
-            self.assertTrue(self._at("sitka-inc", verb, list(rest)),
-                            "%s %s must stay scoped under Orca" % (verb, rest))
+        self.assertFalse(self._at("sitka-inc", *self.JOIN,
+                                  expect_consulted=False))
+        self.assertFalse(self._at("sitka-inc", "chat",
+                                  ["deliver", "--hook-json"],
+                                  expect_consulted=False),
+                         "an Orca pane's delivery leg must run outside helm")
+        self.assertTrue(self._at("sitka-inc", "chat",
+                                 ["stop-guard", "--hook-json"]),
+                        "stop-guard must stay scoped under Orca")
+        self.assertTrue(self._at("sitka-inc", "chat",
+                                 ["delegation-stop", "--hook-json"]),
+                        "delegation-stop must stay scoped under Orca")
+
+    def test_a_pane_orca_did_not_open_gets_no_delivery_outside_helm(self):
+        self._orca(False)
+        self.assertTrue(self._at("sitka-inc", "chat",
+                                 ["deliver", "--hook-json"]))
+        self.assertFalse(self._at("helm", "chat", ["deliver", "--hook-json"]))
+
+    # The installed PostToolUse pair runs `chat deliver --hook-json --room
+    # main` first, as its whisper PREPARATION pass (helm/posttoolrun.py), and
+    # only then the delivery leg. The whisper is a steer about helm work, so
+    # it stays scoped even though its argv starts like the delivery leg's.
+    PREPARE = ("chat", ["deliver", "--hook-json", "--room", "main"])
+
+    def _pair_phase(self, phase):
+        from helm import posttoolrun
+        event = posttoolrun._Event()
+        event.phase = phase
+        token = posttoolrun._CURRENT.set(event)
+        self.addCleanup(posttoolrun._CURRENT.reset, token)
+
+    def test_the_orca_door_keeps_the_whisper_pass_scoped(self):
+        self._orca(True)
+        self._pair_phase("prepare")
+        self.assertTrue(self._at("sitka-inc", *self.PREPARE),
+                        "the whisper pass ran outside helm through the door")
+        # MUST-HIT: inside helm the same pass still runs.
+        self.assertFalse(self._at("helm", *self.PREPARE))
+
+    def test_the_orca_door_admits_the_pairs_delivery_phase(self):
+        self._pair_phase("delivery")
+        # MUST-HIT first: the same phase from a pane Orca did not open is
+        # still scoped out, so the admission below is the door's.
+        self.assertTrue(self._at("sitka-inc", "chat",
+                                 ["deliver", "--hook-json"]))
+        self._orca(True)
+        self.assertFalse(self._at("sitka-inc", "chat",
+                                  ["deliver", "--hook-json"],
+                                  expect_consulted=False))
 
     def test_a_human_invocation_is_never_skipped(self):
         # --hook-json is the discriminator; `helm chat deliver` typed by hand
@@ -5095,7 +5357,7 @@ class OwnershipIsTokenwiseTest(HooksBase):
         # these are the exact strings the installer writes. The unconditional
         # control first: an empty SPECS would turn the loop below into a
         # vacuous pass, and the inject form must hold with no loop at all.
-        self.assertTrue(hooks._ours(hooks.hook_command()))
+        self.assertTrue(hooks._ours(hooks.spec_command(hooks.SPECS[0])))
         self.assertGreater(len(hooks.SPECS), 0)
         for sp in hooks.SPECS:
             cmd = hooks.spec_command(sp)
@@ -5563,11 +5825,6 @@ class UnreadableIsUnknownNotOkTest(unittest.TestCase):
                          "an unreadable guard read as launchable")
         self.assertEqual(key, hooks.LAUNCH_UNJUDGED)
         self.assertIn("UNKNOWN", detail)
-        # AND IT IS NOT A GAP EITHER. `_interpreter_gap` collapses UNJUDGED to
-        # None by design, which is exactly why nothing that decides whether a
-        # guard is provisioned may call it — pinned here so that coercion can
-        # never quietly come back as the contract.
-        self.assertIsNone(hooks._interpreter_gap(unreadable))
 
     def test_a_readable_healthy_shebang_is_still_no_gap(self):  # noqa: VACUOUS_ASSERTION — this IS the positive control for test_an_unreadable_shebang_is_UNKNOWN beside it: it proves the function does not answer UNKNOWN for everything
         """UNCONDITIONAL POSITIVE CONTROL on the same observable: the
@@ -5578,7 +5835,6 @@ class UnreadableIsUnknownNotOkTest(unittest.TestCase):
         with open(fine, "wb") as f:
             f.write(b"#!/bin/sh\nexit 0\n")
         os.chmod(fine, 0o755)
-        self.assertIsNone(hooks._interpreter_gap(fine))
         self.assertEqual(hooks._interpreter_launch(fine)[0], hooks.LAUNCH_OK)
 
 
@@ -5635,11 +5891,11 @@ class OwnershipReadsCommandsNotProseTest(unittest.TestCase):
         self.assertTrue(hooks._own_hit("/opt/g/helm %s --follow" % m, m))
 
     def test_every_declared_prelude_word_is_actually_stepped_over(self):
-        """THE DECLARATION IS THE ORACLE, not a list I retype here. The set
-        named six words and the code hand-checked three, so `exec`, `command`
-        and `builtin` were never stepped over and every entry behind one read
-        as UNOWNED. Deriving the cases from the regex means a word added to
-        the set with no handler goes red instead of silently unowning."""
+        """THE DECLARATION IS THE ORACLE, not a list I retype here. Every
+        word in `_PRELUDE` must be stepped over so the program behind it is the
+        executed word; deriving the cases from the table means a row whose
+        grammar does not reach the program goes red instead of silently
+        unowning."""
         m = self._phrase_marker()
         # DERIVED FROM THE TABLE, NEVER RETYPED. The literal list this arm
         # used to carry was itself a second declaration that could drift from
@@ -5647,9 +5903,6 @@ class OwnershipReadsCommandsNotProseTest(unittest.TestCase):
         # and it reddened the moment the table legitimately changed.
         declared = sorted(hooks._PRELUDE)
         self.assertTrue(declared, "the prelude table is empty")
-        for word in declared:
-            self.assertTrue(hooks._PRELUDE_WORD.match(word),
-                            "%s is in the table and not in the regex" % word)
         for word in declared:
             # DERIVED FROM THE ROW, not retyped: a prelude that takes N
             # operands needs N filler words before the program, or the walk
@@ -5746,13 +5999,17 @@ class WrapperGrammarIsDataNotAGuessTest(unittest.TestCase):
         # POSITIVE CONTROL on the same observable: without -v it DOES run.
         self.assertTrue(self.owned("command /opt/g/helm " + self.MARKER))
 
-    def test_the_grammar_table_and_the_regex_cannot_drift(self):
-        """The regex used to name six words while the code handled three. Both
-        are derived from ONE table now, so a word added with no grammar cannot
-        silently become a transparent wrapper."""
-        for word in hooks._PRELUDE:
-            with self.subTest(prelude=word):
-                self.assertTrue(hooks._PRELUDE_WORD.match(word))
+    def test_every_prelude_row_carries_the_grammar_the_walk_reads(self):
+        """`_executed` reads each `_PRELUDE` row's `operand_opts` and
+        `operands` by subscript, so a word added with no grammar raises inside
+        ownership instead of silently becoming a transparent wrapper."""
+        self.assertIn("timeout", hooks._PRELUDE)
+        self.assertEqual(hooks._PRELUDE["timeout"]["operands"], 1)
+        self.assertEqual(
+            [word for word, row in hooks._PRELUDE.items()
+             if not isinstance(row.get("operand_opts"), (set, frozenset))
+             or not isinstance(row.get("operands"), int)], [],
+            "a prelude row lacks the grammar _executed subscripts")
         # `command` IS in the table — it genuinely runs what follows — and its
         # printing forms are refused by not_transparent_opts instead. Removing
         # the word outright was my first cut and my OWN positive control
@@ -5778,7 +6035,8 @@ class ExecutableIsNotLaunchableEvenWithoutAShebangTest(unittest.TestCase):
         broken = os.path.join(d, "broken")
         shutil.copy(real, broken)
         os.chmod(broken, 0o755)
-        raw = bytearray(io.open(broken, "rb").read())
+        with io.open(broken, "rb") as fh:
+            raw = bytearray(fh.read())
         for needle in (b"/lib64/ld-linux-x86-64.so.2", b"/lib/ld-linux"):
             at = raw.find(needle)
             if at >= 0:
@@ -5787,7 +6045,8 @@ class ExecutableIsNotLaunchableEvenWithoutAShebangTest(unittest.TestCase):
                 break
         else:
             self.skipTest("no PT_INTERP string found to corrupt on this host")
-        io.open(broken, "wb").write(bytes(raw))
+        with io.open(broken, "wb") as fh:
+            fh.write(bytes(raw))
         verdict, key, detail = hooks._interpreter_launch(broken)
         self.assertEqual(verdict, hooks.LAUNCH_GAP)
         self.assertEqual(key, hooks.LAUNCH_INTERPRETER_MISSING)
@@ -5845,13 +6104,15 @@ class ExecutableIsNotLaunchableEvenWithoutAShebangTest(unittest.TestCase):
                           ("magic-only", b"\x7fELF"),
                           ("bad-ei-class", b"\x7fELF\x09\x01" + b"\x00" * 58)):
             m = os.path.join(d, tag)
-            io.open(m, "wb").write(blob)
+            with io.open(m, "wb") as fh:
+                fh.write(blob)
             os.chmod(m, 0o755)
             malformed.append(m)
         broken = os.path.join(d, "broken")
         shutil.copy(real, broken)
         os.chmod(broken, 0o755)
-        raw = bytearray(io.open(broken, "rb").read())
+        with io.open(broken, "rb") as fh:
+            raw = bytearray(fh.read())
         for needle in (b"/lib64/ld-linux-x86-64.so.2", b"/lib/ld-linux"):
             at = raw.find(needle)
             if at >= 0:
@@ -5860,9 +6121,11 @@ class ExecutableIsNotLaunchableEvenWithoutAShebangTest(unittest.TestCase):
                 break
         else:
             self.skipTest("no PT_INTERP string found to corrupt on this host")
-        io.open(broken, "wb").write(bytes(raw))
+        with io.open(broken, "wb") as fh:
+            fh.write(bytes(raw))
         plain = os.path.join(d, "plain")
-        io.open(plain, "wb").write(b"not an elf and no shebang\n")
+        with io.open(plain, "wb") as fh:
+            fh.write(b"not an elf and no shebang\n")
         os.chmod(plain, 0o755)
 
         # ONE PASS, ONE TABLE, so the probe's must-hit and the correspondence
@@ -5909,7 +6172,8 @@ class ExecutableIsNotLaunchableEvenWithoutAShebangTest(unittest.TestCase):
         import tempfile
         d = tempfile.mkdtemp()
         plain = os.path.join(d, "plain")
-        io.open(plain, "wb").write(b"not an elf and no shebang\n")
+        with io.open(plain, "wb") as fh:
+            fh.write(b"not an elf and no shebang\n")
         os.chmod(plain, 0o755)
         self.assertEqual(hooks._interpreter_launch(plain)[0],
                          hooks.LAUNCH_UNJUDGED)
@@ -6109,7 +6373,7 @@ class TheGrammarIsCheckedAgainstTheSHELLNotAgainstOurTableTest(unittest.TestCase
          "the operator as the executed word reads a running guard as unowned, "
          "which is the false negative that earns a duplicate hook"),
         ("2>&1 %s", True,
-         "THE `&` IN A REDIRECTION IS NOT A SEPARATOR. `_segments` split this "
+         "THE `&` IN A REDIRECTION IS NOT A SEPARATOR. `_segments_ex` split this "
          "into `2>` and `1 <guard>`, so the executed word came out as `1`. The "
          "defect was in the SPLITTER, not the word scanner — one function "
          "further out than every previous round of this review"),
@@ -6169,7 +6433,7 @@ class TheGrammarIsCheckedAgainstTheSHELLNotAgainstOurTableTest(unittest.TestCase
 
     def _sees_executed_guard(self, command):
         return any(os.path.basename(hooks._executed(segment)[0]) == self.NAME_MARKER
-                   for segment in hooks._segments(command))
+                   for segment in hooks._segments_ex(command)[0])
 
     def test_all_COMMAND_BEGIN_expectations_match_an_actual_shell(self):
         """Bash executes an inert scratch binary; no parser result is its oracle.
@@ -6218,7 +6482,7 @@ class TheGrammarIsCheckedAgainstTheSHELLNotAgainstOurTableTest(unittest.TestCase
         """MEASURED POPULATION, not an imagined one. A census of every hook
         command on this host — 387 strings across 166 settings.json files,
         third-party repos included — puts `if` SECOND by frequency (17) behind
-        `timeout` (136). `_segments` splits on `;`, so a real `if ...; then
+        `timeout` (136). `_segments_ex` splits on `;`, so a real `if ...; then
         <our hook>; fi` entry arrives with `then` in the leading position and
         used to read as the executed word. The cost of that false negative is
         stated in `_executed` itself: an unowned entry earns a canonical
@@ -6283,7 +6547,7 @@ class TheGrammarIsCheckedAgainstTheSHELLNotAgainstOurTableTest(unittest.TestCase
                       "its verdict about the table proves nothing")
         self.assertEqual(
             read & {"_PRELUDE", "_OWN_EXECUTABLES", "_ASSIGNMENT",
-                    "_PRELUDE_WORD", "_KEYWORD", "SPECS"}, set(),
+                    "_KEYWORD", "SPECS"}, set(),
             "this class reads the very table it exists to check "
             "independently: %s" % sorted(read))
 

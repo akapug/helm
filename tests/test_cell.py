@@ -19,7 +19,7 @@ from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import cell  # noqa: E402
-from tests.test_no_private_names import hits_in  # noqa: E402
+from helm.private_names import hits_in  # noqa: E402
 
 CELL_HEX = "ab" * 32
 TURN = "cd" * 32

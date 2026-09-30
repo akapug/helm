@@ -70,8 +70,13 @@ def setUpModule():
 
 
 def tearDownModule():
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT, as tests.test_landreq's does
+    # (task/3039): a stopped patcher left here is module data the sliced
+    # gate's leak audit reads as a rebinding, and fails the run.
+    _LIVE_SEATS_PATCH = None
 
 
 class OutsiderApprovalIsWhatMakesALaneREADYTest(_landreq.LandReqBase):
@@ -248,7 +253,12 @@ class OutsiderApprovalIsWhatMakesALaneREADYTest(_landreq.LandReqBase):
         outsider who approved an earlier round read an artifact the composed
         tip has since replaced."""
         first = self.patched_round()
-        older = self.successor("seat-c", first, ref=self.b,
+        # ANOTHER TIP THAT STILL CARRIES THE REVIEWER'S CURE (task/3288): a
+        # ref without it is refused at the door before any approve is read.
+        self.git("checkout", "-q", "-b", "older", self.cure)
+        older_tip = self.commit("an arm on top of the cure", path="h")
+        self.git("checkout", "-q", self.main)
+        older = self.successor("seat-c", first, ref=older_tip,
                                lane="lane/older-tip")
         final = self.successor("seat-b", older)
         lr = self.lr(final)
@@ -627,7 +637,13 @@ class OutsiderApprovalIsWhatMakesALaneREADYTest(_landreq.LandReqBase):
                                   return_value=(self.repo, None)) as home:
             chains, why = landreq.chain_contributor_index()
         self.assertIsNone(why, why)
-        self.assertEqual(home.call_count, 3, "once per absent repository field")
+        # ONCE PER JOIN, not once per row (task/3053): every repo-less row
+        # resolves to the same home repository, and the join now also runs
+        # inside a source-clean close's replay, where each ask spawned git.
+        # Three repo-less rows (a, b and the damaged d) still read it: the
+        # count is exact, so a join that stopped asking at all reddens too.
+        self.assertEqual(home.call_count, 1, "once per join, for every "
+                                             "absent repository field")
         repo = dispatches._real(self.repo)
         self.assertEqual(set(chains), {(repo, a), (repo, b)})
         self.assertEqual(chains[(repo, a)], ({"seat-a", "seat-c"}, [], None))

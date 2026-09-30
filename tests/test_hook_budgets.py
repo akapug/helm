@@ -68,6 +68,9 @@ BUDGETS = {
     # The agent-model refusal: the fact, three doors and the premise pointer,
     # with the flag's value echoed at most AGENT_MODEL_ECHO characters wide.
     "PreToolUse/refusal-agent-model": 460,
+    # The nested-spawn refusal (task/1775): the fact, the bounded-delegate
+    # contract, the cure (report to the parent) and the Workflow's own door.
+    "PreToolUse/refusal-nested-spawn": 400,
     # The env-dump refusal (task/3037): what the command prints, its spelling
     # capped at chat._ENV_SPELL, and the cure for that kind.
     "PreToolUse/refusal-env-dump": 420,
@@ -75,7 +78,24 @@ BUDGETS = {
     # chat._TREE_SPELL, the checkout it would run in, the same verb spelled
     # with the lane under that checkout, and the integrator's declaration.
     # The path is said twice, so the ceiling holds an 80-character top.
-    "PreToolUse/refusal-shared-checkout": 580,
+    # The declaration names the seat's environment and says command text
+    # does not count (task/3301). That clause makes the widest render 616;
+    # 650 leaves a few dozen characters, the headroom the other ceilings keep.
+    "PreToolUse/refusal-shared-checkout": 650,
+    # The recursive-grep refusal (task/3384): the grep, the operand as typed
+    # and the broad root it resolves to, each capped at chat._GREP_SPELL, how
+    # it recurses capped at chat._GREP_HOW, the -NUM depth note, and both
+    # routes the search law names.
+    "PreToolUse/refusal-recursive-grep": 560,
+    # The beacon-timeout refusal (task/3404): the timeout as given (or the
+    # harness default it falls to), why a short lease costs a wake, and the
+    # corrected Monitor call. Measured LESS the seat's command, which the
+    # call carries whole at any width: that text is the seat's own call,
+    # already in its context, and a cut or a placeholder is no call at all.
+    # The seat's own description is measured out the same way (task/3435);
+    # the fixed description a call without one falls to is fixed text, and
+    # is charged.
+    "PreToolUse/refusal-beacon-timeout": 400,
     # PreToolUse pass-path steers, once per (session, steer).
     "PreToolUse/steer": 450,
     # PreToolUse pass path, EVERYTHING one call is handed at once. The lines
@@ -198,10 +218,14 @@ class StaticMessageBudgetTest(BudgetAssertion):
         drawn = 0
         for spelling, pieces, _says in chat._ACTIONS_ROWS:
             anchored = any(a for _t, _m, a in pieces)
+            # a `*` is an owner slot, and a gh api row is drawn as a WRITE:
+            # its own spelling is a GET, which the invocation text cuts
+            sample = spelling.replace("*", "x").replace(
+                "gh api ", "gh api -X PUT ")
             for form, shape in self.FORMS:
                 with self.subTest(row=spelling, form=form):
                     act = chat.github_actions_refusal(
-                        command=shape % (pad, spelling))
+                        command=shape % (pad, sample))
                     self.assertIsNotNone(act, spelling)
                     self.assertRegex(act, r"^%s at character \d{5} of the "
                                      r"folded command%s " % (
@@ -214,10 +238,11 @@ class StaticMessageBudgetTest(BudgetAssertion):
         anchors = sorted({t for _s, pieces, _y in chat._ACTIONS_ROWS
                           for t, _m, a in pieces if a})
         for text in anchors:
+            sample = text.replace("*", "x")
             for form, shape in self.FORMS:
                 with self.subTest(anchor=text, form=form):
                     act = chat.github_actions_refusal(
-                        command=shape % (pad, text + " $V"))
+                        command=shape % (pad, sample + " $V"))
                     self.assertRegex(act, r"^%s at character \d{5} "
                                      % re.escape(text))
                     drawn += 1
@@ -264,6 +289,17 @@ class StaticMessageBudgetTest(BudgetAssertion):
         self.assertEqual(len(chat.agent_model_message("\x00" * 500)),
                          len(text))
 
+    def test_pretooluse_nested_spawn_refusal(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
+        self.assert_within("PreToolUse/refusal-nested-spawn",
+                           "[helm argv-guard] BLOCKED: "
+                           + actors.sidechain_spawn_refusal())
+
+    def test_the_fable_build_steer_line(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
+        """The Agent rung's one pass-path steer (task/2574) is computed, not
+        a table row, so the table arm cannot see it."""
+        self.assert_within("PreToolUse/steer",
+                           "[helm steer] " + chat.FABLE_BUILD_STEER)
+
     def test_pretooluse_env_dump_refusal_for_every_kind(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
         """Every kind the rung names, at the widest spelling it can carry.
         The kinds are read from the shipped table, so a kind added tomorrow
@@ -284,6 +320,60 @@ class StaticMessageBudgetTest(BudgetAssertion):
         text = chat.shared_checkout_message((top, "x" * chat._TREE_SPELL))
         self.assertEqual(text.count(top), 2)
         self.assert_within("PreToolUse/refusal-shared-checkout", text)
+
+    def test_pretooluse_recursive_grep_refusal_at_its_widest(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
+        """Every field at its cap, and a depth spelling so the -NUM note is
+        in the render. The caps are read from the shipped constants, so the
+        widest render is drawn through the renderer rather than typed."""
+        how = "-" + "9" * (chat._GREP_HOW - 1)
+        text = chat.recursive_grep_message(
+            ("x" * chat._GREP_SPELL, "y" * chat._GREP_SPELL, how, "/" * 500))
+        self.assertIn("-C NUM", text)
+        self.assertIn("/usr/bin/rg", text)
+        self.assertIn("/" * (chat._GREP_SPELL - 1) + "…", text)
+        self.assertNotIn("/" * chat._GREP_SPELL, text)
+        self.assert_within("PreToolUse/refusal-recursive-grep", text)
+        self.assert_within("PreToolUse/refusal-recursive-grep",
+                           chat.recursive_grep_message(
+                               ("x" * chat._GREP_SPELL, None, "-rn", None)))
+
+    def test_pretooluse_beacon_timeout_refusal_at_its_widest(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), and each witness is first asserted to carry its command's and its description's literal exactly once
+        """The budget governs the FIXED text around what the seat typed: the
+        refusal carries the seat's command whole at any width (task/3404,
+        codex's F2), and the seat's own description whole when it gave one
+        (task/3435). Both are the seat's own call, already in its context.
+        So the arm measures the message less the command's json literal and
+        less a seat description's, over the widest census spelling and a
+        command wider than any seat types, a seat description short and
+        wide, and none (the fixed description it falls to is fixed text, and
+        is charged), at each timeout clause. Less every description, the
+        text must not grow with anything the seat typed."""
+        from helm import seats_advice
+        census = ('HELM_CHAT_NAME=zed HELM_CELL_PROFILE=zed helm chat wait '
+                  '--seat zed --follow --replace 2>&1 | /usr/bin/grep '
+                  '--line-buffered -v -E " TRIAGE |proxywatch —"')
+        wide = 'cd "/tmp/%s" && %s' % ("x" * 300, census)
+        for given in (None, 1799999.9999999998, 300000):
+            fixed = set()
+            for command in (census, wide):
+                for description in (None, "zed inbox", "d — " * 100):
+                    with self.subTest(given=given, command=command[:24],
+                                      description=(description or "")[:9]):
+                        text = chat.beacon_timeout_message(
+                            (given, command, description))
+                        literal = json.dumps(command, ensure_ascii=False)
+                        said = json.dumps(
+                            description or seats_advice.BEACON_DESCRIPTION,
+                            ensure_ascii=False)
+                        self.assertEqual(text.count(literal), 1, text)
+                        self.assertEqual(text.count(said), 1, text)
+                        rest = text.replace(literal, "", 1)
+                        self.assert_within(
+                            "PreToolUse/refusal-beacon-timeout",
+                            rest.replace(said, "", 1) if description
+                            else rest)
+                        fixed.add(rest.replace(said, "", 1))
+            self.assertEqual(len(fixed), 1, fixed)
 
     def test_every_shipped_argv_steer(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
         """The SHIPPED table, not a sample of it: a new steer added tomorrow
@@ -395,8 +485,12 @@ class StaticMessageBudgetTest(BudgetAssertion):
         """The highest-frequency Stop message. The full arming instruction is
         worth its bytes ONCE per session; after that the seat has it."""
         from helm.seats_stop_guard import _inbox_clean_line
-        first = _inbox_clean_line("main", "a-seat", "sess-inbox-clean")
-        repeat = _inbox_clean_line("main", "a-seat", "sess-inbox-clean")
+        # A session of its own per run: the latch outlives the call, so a
+        # fixed id reads as already-told when the module runs twice in one
+        # process (a consumer list that names it twice did exactly that).
+        session = "sess-inbox-clean-%d-%d" % (os.getpid(), id(self))
+        first = _inbox_clean_line("main", "a-seat", session)
+        repeat = _inbox_clean_line("main", "a-seat", session)
         self.assert_within("Stop/inbox-clean-first", first)
         self.assert_within("Stop/inbox-clean-repeat", repeat, floor=30)
         # THE FIRST ONE CARRIES THE PAYLOAD, the repeat carries the reminder.

@@ -35,6 +35,7 @@ from .seats_identity import (DERIVED, _dispute_sentence, acting_seat,
 from .seats_address import seat_scope
 from .seats_roster import nonpane_session, write_roster
 from .seats_runtime import launch_runtime
+from .sessionstart import note_session_start
 from .seats_delivery import (_cursor, _init_cursor, _scan_rooms, cursor_path,
                              deliver_any)
 
@@ -157,8 +158,15 @@ def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
     inputs = {"cwd": cwd, "seat": seat, "room": room,
               "room_explicit": room_explicit, "room_source": room_source,
               "session_source": session_source, "require_pane": require_pane}
+    # Claude's record of the process is read only where the hook asks for
+    # it (`require_pane`); a join that did not ask records its kind unknown.
+    kind = session_kind(session) if require_pane is not None else None
+    # HOW THE SESSION BEGAN is recorded first, whatever this join then
+    # decides: it is a fact about the session, not about the seat it joins
+    # (`note_session_start`, task/3483).
+    if session and session_source:
+        note_session_start(session, session_source, kind)
     if require_pane is not None:
-        kind = session_kind(session)
         if kind not in PANE_KINDS and (require_pane or kind is not None):
             return None, ""
     dis = identity_disagreement(session)
@@ -559,6 +567,10 @@ def join_banner(seat, display_room, scope, covered_pid=None):
     so does the deferred-tool fallback, because a seat that cannot find the
     tool cannot perform the act. What is not here is the rationale — why a
     background shell cannot wake a PTY agent — which the guide carries whole.
+    The call grew by the description the Monitor tool requires (task/3435),
+    and the prose around it gave that width back: the fallback keeps its act
+    and drops its label, and the pointer says what the guide explains in
+    fewer words.
 
     AND THE CITATION IT CARRIED WAS DEAD: it named premise
     `native-wake-only-agent-armed`, the store holds
@@ -574,10 +586,8 @@ def join_banner(seat, display_room, scope, covered_pid=None):
                 % (seat, display_room, covered_pid, GUIDE_PATH))
     return ("[helm chat] seat '%s' in room %s — mentions, DMs and @all wake "
             "you between tool calls%s. First action: arm your "
-            "beacon — %s; %s. No Monitor tool? "
-            "DEFERRED: ToolSearch(query: "
-            "\"select:Monitor\"). Bearings, and why a background shell will "
-            "not do: %s"
+            "beacon — %s; %s. No Monitor tool? ToolSearch(query: "
+            "\"select:Monitor\"). Why not a background shell: %s"
             % (seat, display_room, scope, seats_advice.beacon_monitor(seat),
                seats_advice.BEACON_EXPIRY_TERSE, GUIDE_PATH))
 
@@ -612,6 +622,53 @@ def _emit_line(line):
     where bare print() block-buffers — an unflushed wake-line never reaches the
     agent. flush per line = one emitted row, one immediate agent wake."""
     print(line, flush=True)
+
+
+def _owed_wake(seat):
+    """The `render` a per-row wake line passes through: it names the dispatch
+    rows `seat` owes and is not working (`seats_stop_owed.owed_clause`, the
+    wording the doorbell's ring carries too). A seat that owes nothing gets
+    the line unchanged.
+
+    IT RUNS BEFORE THE WAKE CURSOR COMMITS, NEVER BETWEEN THE COMMIT AND THE
+    WRITE. It was the emit, so it ran after the commit. Its first call
+    imports helm.dispatches and about 80 more modules, and without bytecode
+    that import compiles them: measured 0.58-0.63 s on one fab node and
+    0.21 s on another. A Monitor ends the pipeline at its deadline with
+    SIGTERM. A kill inside that gap took the row off the cursor and showed
+    nothing, and the lead's hook skipped the row as already woken. So
+    `deliver` asks for the line before the commit, and after the commit
+    only the write is left.
+
+    THE CLAUSE GOES BEFORE THE TAIL, AS ON THE RING. A line with rows behind
+    it ends with delivery's `(+N waiting — helm chat read ...)` tail, and
+    readers strip that tail as fixed text at the end of the line (promptshape,
+    the doorbell's `_TAIL`, which this reuses). So the line is the lead, then
+    the clause, then the tail, and the tail stays last. A line with no tail
+    ends with the clause.
+
+    THE INCIDENT. A seat owing a review was woken three times by
+    beacon events and ended each turn "Standing by". Every wake line named
+    only the chat row that woke it, and nothing the seat read said a review
+    was waiting on it. The obligation now rides the wake that is already
+    happening.
+
+    ON THE SAME LINE, NEVER A LINE OF ITS OWN. One Monitor line is one wake,
+    so a separate line would be a second wake that nothing addressed. And
+    this only decorates a line the beacon was already emitting, so a seat
+    that owes nothing, or that nothing addressed, is never woken by it. The
+    clause never raises, so it cannot cost the row it rides."""
+    from .beacon_doorbell import _TAIL
+    from .seats_stop_owed import owed_clause
+
+    def render(line):
+        c = owed_clause(seat, line)
+        t = _TAIL.search(line) if c else None
+        at = t.start() if t else len(line)
+        return line[:at] + c + line[at:] if c else line
+    return render
+
+
 def _beacon_orphaned():
     """True when THIS beacon's launcher is gone — our direct parent was reaped
     and init adopted us (getppid() == 1).
@@ -687,20 +744,21 @@ def _beacon_identity_refusal(session, cwd=None, ambient_seat=True,
 
 
 def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
-         emit=None, follow=False, session=None, ambient=None):
+         emit=None, follow=False, session=None, ambient=None, doorbell=False):
     """Block until the next word arrives; returns the line or None on
     timeout. Seat mode IS a delivery (advances the cursor via deliver's
     at-most-once path); --any watches the room without touching cursors.
     Busy-turn parity comes from the PostToolUse hook; an IDLE seat gets
     woken only if it armed a Monitor on this — opt-in by design (M11).
 
-    --follow (the idle-wake beacon) NEVER returns on a match: it streams each
-    matching event as one emitted line — one Monitor line = one agent wake —
-    and returns only on timeout (a Monitor passes none: the HARNESS ends the
-    watch at its own deadline, and the seat re-arms). A contiguous burst of
-    reactions to one row is ONE wake event: the shared delivery drain
-    aggregates it before the cursor commits, while deliverable() stays a
-    stateless routing rule. The beacon's
+    --follow (the idle-wake beacon) NEVER returns on a match: with the
+    doorbell off it streams each matching event as one emitted line (one
+    Monitor line = one agent wake, which is why the CLI turns the doorbell
+    on, below) and returns only on timeout (a Monitor passes none: the
+    HARNESS ends the watch at its own deadline, and the seat re-arms). A
+    contiguous burst of reactions to one row is ONE wake event: the shared
+    delivery drain aggregates it before the cursor commits, while
+    deliverable() stays a stateless routing rule. The beacon's
     DEFAULT scope is MENTION-ONLY: @mentions of the seat (any room), replies
     and reactions to its rows, DMs, and @all — a plain
     home-room row no longer wakes it. A wake-muted room gates this beacon only;
@@ -723,7 +781,12 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
     MULTI-ROOM: seat mode rides deliver_any — `room` is the PRIMARY room, and
     a matching row in ANY live room (a channel the seat never joined included)
     wakes the seat, per-room cursor per (seat, room, session) so the boundary
-    hook and the beacon never double-deliver. --any stays one room's tap."""
+    hook and the beacon never double-deliver. --any stays one room's tap.
+
+    doorbell=True (the CLI beacon's default; `--per-row` turns it off) keeps
+    the drain above and replaces the per-row stream with ONE announce-only
+    ring line per burst, so a resumed seat pulls its backlog instead of paying
+    a turn per row (helm.beacon_doorbell.waiter_bell)."""
     poll = chat.POLL_S if poll is None else poll
     if ambient is None:
         # THE BEACON SHAPE (--follow) defaults MENTION-ONLY; every other wait
@@ -799,6 +862,10 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
     # wake-line would sit unflushed and the agent would never wake (the beacon
     # worked in a tty, dead through Monitor). flush=True = one line, one wake.
     stream = emit or (_emit_line if follow else emit)
+    # A SEAT'S WAKE NAMES WHAT IT OWES. Only the beacon's own delivery lines
+    # carry it (`_owed_wake`), composed before the wake cursor commits; the
+    # bytes still go to `stream`, the object the destination check asks about.
+    wake = _owed_wake(seat) if follow and not any_row else None
     # WHAT THIS CONSUMER CAN ACTUALLY REACH, and the question is about the
     # OBJECT, never about a function name.
     #
@@ -830,6 +897,13 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
     # refuse, so `destination_usable` is asked at the moment a row would
     # be spent, beside the call that spends it.
     since = chat.read(room)[1] if any_row else None
+    bell = None
+    if follow and not any_row:   # lambdas: both names resolve HERE per call
+        from .beacon_doorbell import waiter_bell
+        bell = waiter_bell(
+            seat, session, stream, doorbell, room=room, ambient=ambient,
+            deliver=lambda **kw: deliver_any(**kw),
+            usable=lambda: destination_usable(stream, follower=True))
     while True:
         if follow and _beacon_orphaned():
             # loud, then STOP: a beat from here would be a lie (see
@@ -864,12 +938,14 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
                     since = total
             else:
                 since = total
+        elif bell is not None:
+            bell.ring()     # the per-row leg's drain, announce-only
         else:
             drained = 0
             while True:                     # drain currently-matching rows,
                 try:                        # bounded so a backlog can't firehose
                     line = deliver_any(session=session, seat=seat,
-                                       emit=stream, room=room,
+                                       emit=stream, render=wake, room=room,
                                        ambient=ambient,
                                        channel="beacon" if follow else None,
                                        sink_usable=destination_usable(
@@ -887,23 +963,19 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
                     # the seat goes deaf). One catch-up nudge naming the verb
                     # that actually DRAINS.
                     #
-                    # THE COMMENT THAT USED TO SIT HERE SAID "the agent's read
-                    # advances the cursor". IT DOES NOT. chat.consume() clears
-                    # only the owner-unread marker; the seat's delivery cursor is
-                    # untouched, so a seat obeying this nudge exactly drained
-                    # NOTHING. Live-tested: post 5 addressed rows, run `helm chat
-                    # read`, pending is still 5. Two instruction sites carried
-                    # that false promise while ~2,250 rows piled up across nine
-                    # seats and the work-actuator gate (which read that pile)
-                    # never opened for anyone — the fleet waited to be told twice
-                    # for days. An instruction that cannot be obeyed is worse
-                    # than no instruction: it is obeyed, and nothing happens.
-                    #
-                    # `read` NOT advancing is CORRECT and stays: an addressed row
-                    # is an OBLIGATION, and reading past an obligation does not
-                    # discharge it. The drain for an obligation is ACTING on it,
-                    # or `catchup --including-mentions`, which parks it
-                    # deliberately and accountably. So the string names those.
+                    # A READ IS A DELIVERY, NOT AN ACT. `helm chat read`, run
+                    # as this seat, moves its delivery cursor past the rows it
+                    # printed whole (helm.pull_delivery), so the pile this
+                    # nudge names drains as the seat reads it. An instruction
+                    # that cannot be obeyed is worse than none: before that,
+                    # a read moved nothing, and ~2,250 rows piled up across
+                    # nine seats while the work-actuator gate that read the
+                    # pile never opened. What a read does not do is answer:
+                    # an addressed row is an OBLIGATION, discharged by ACTING
+                    # on it (reply, ack, verdict) or parked, deliberately and
+                    # accountably, by `catchup --including-mentions`. So the
+                    # string names those; its bytes are the --per-row
+                    # stream's, which keeps the pre-doorbell stream exactly.
                     stream("[helm chat] more pending — `helm chat read` SHOWS "
                            "them; addressed rows stay owed until you ACT or "
                            "`helm chat catchup --including-mentions --apply` "

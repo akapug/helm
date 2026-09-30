@@ -54,7 +54,7 @@ Ordinary positive controls
     admission and supplies the current seam observation.
 
 Historical controls preserved in hooks.py history
-  ThinkPad, four worktree leases, 3,186 dispatch rows, approximately 120 binding
+  the hub host, four worktree leases, 3,186 dispatch rows, approximately 120 binding
   rows: full profile 7.70s before binding memo, 6.27s after; exact hook rc2 samples
   8.7s / 8.1s / 5.9s; seam 4.36s before memo, 2.14s after. The recorded policy
   treats 8.7s as an observed sample maximum, not a runtime bound, and requires at

@@ -212,12 +212,6 @@ def candidate_rows(entries):
     return rows
 
 
-def row_hash(text):
-    """The content address of a row's text: its embedding is computed once
-    per hash and reused until the text changes."""
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
-
-
 def turn_id(session, text, t0):
     return hashlib.sha256(("%s\0%.6f\0%s" % (session or "-", t0, text or ""))
                           .encode("utf-8")).hexdigest()[:20]

@@ -58,7 +58,8 @@ def bare_owner_globals(path, owned):
     it would either refuse a correct file or, worse, teach someone to spell a
     real global as a local to quiet it.
     """
-    src = io.open(path, encoding="utf-8").read()
+    with io.open(path, encoding="utf-8") as fh:
+        src = fh.read()
     stack = [symtable.symtable(src, os.path.basename(path), "exec")]
     found = []
 
@@ -165,5 +166,6 @@ def ledger_sources(module):
     out = []
     for path in paths:
         if path and os.path.exists(path):
-            out.append((path, io.open(path, encoding="utf-8").read()))
+            with io.open(path, encoding="utf-8") as fh:
+                out.append((path, fh.read()))
     return out

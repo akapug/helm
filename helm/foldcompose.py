@@ -305,11 +305,6 @@ def activation_state(project):
     return ACTIVATION_UNKNOWN, None
 
 
-def activation_trunk(project):
-    """The verified activation trunk, or None when inactive or unreadable."""
-    state, trunk = activation_state(project)
-    return trunk if state == ACTIVATION_ACTIVE else None
-
 
 def _write_once(path, record):
     """Atomically create one JSON record without replacing an existing one."""
@@ -1100,10 +1095,6 @@ def _ref_observation(where, ref, sha):
         return None, False
     return None, False
 
-
-def _ref_path(ref):
-    """`origin/main` -> `remotes/origin/main`; `main` -> `heads/main`."""
-    return ("remotes/" + ref) if "/" in ref else ("heads/" + ref)
 
 
 def gap_is_a_lower_bound(gap):

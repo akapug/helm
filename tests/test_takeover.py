@@ -461,15 +461,41 @@ class CapabilityBoundaryTest(TempBase):
                          "helm.takeover")
         self.assertEqual(auth.scope, "task-build-continuation")
 
-    def test_review_fold_release_and_land_layers_do_not_accept_the_capability(self):  # noqa: VACUOUS_ASSERTION — each named authority module is opened and checked for both forbidden symbols
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for rel in ("helm/dispatches.py", "helm/foldcheck.py", "helm/landreq.py",
-                    "helm/work/_claims.py"):
-            with self.subTest(rel=rel), open(os.path.join(root, rel),
-                                             encoding="utf-8") as f:
-                source = f.read()
-            self.assertNotIn("BuildContinuationAuthorization", source)
-            self.assertNotIn("takeover_auth", source)
+    def test_review_fold_release_and_land_layers_do_not_accept_the_capability(self):  # noqa: VACUOUS_ASSERTION — the absence is checked over every file each authority module's surface spans, and two positive controls prove that read reaches a satellite and that the same predicate fires on one
+        """A LAYER IS A MODULE'S WHOLE SURFACE, NOT ONE FILE. `dispatches`
+        and `landreq` hand whole questions to satellites (task/3407 moved
+        about 3,900 ledger lines into six), so opening `dispatches.py` alone
+        stopped reading most of the review layer. `ledger_sources` follows
+        each module's `_OWNER_NAMES`, so the next split stays in scope."""
+        import importlib
+        from tests._satellite_resolution import ledger_sources
+        forbidden = ("BuildContinuationAuthorization", "takeover_auth")
+
+        def hits(sources):
+            return [(os.path.basename(path), token) for path, source in sources
+                    for token in forbidden if token in source]
+
+        read = []
+        for name in ("helm.dispatches", "helm.foldcheck", "helm.landreq",
+                     "helm.work._claims"):
+            read.extend(ledger_sources(importlib.import_module(name)))
+        self.assertEqual(hits(read), [])
+        # POSITIVE CONTROL, REACH: the read spans every satellite either
+        # module declares, and the two named here by hand.
+        files = {os.path.basename(path) for path, _source in read}
+        from helm import dispatches, landreq
+        declared = {"%s.py" % satellite for module in (dispatches, landreq)
+                    for satellite, _names in module._OWNER_NAMES}
+        self.assertLessEqual({"dispatches_spiral.py", "landreq_close.py"},
+                             declared)
+        self.assertLessEqual(declared, files)
+        # POSITIVE CONTROL, PREDICATE: the same check fires when the token is
+        # in a satellite's text and nowhere else.
+        planted = [(path, source + "\ntakeover_auth\n"
+                    if path.endswith("dispatches_spiral.py") else source)
+                   for path, source in read]
+        self.assertEqual(hits(planted),
+                         [("dispatches_spiral.py", "takeover_auth")])
 
 
 class CliContractTest(TempBase):
@@ -1438,6 +1464,26 @@ class ARefusalNamesEveryDoorThatOpensItTest(unittest.TestCase):
                 self.assertNotIn(forbid, detail,
                                  "shape of %d door(s) states %r, which its "
                                  "rows do not supply" % (n, forbid))
+
+
+class FullCommitIdTest(unittest.TestCase):
+    """A lineage tip is a full commit id: 40 hex (sha1) or 64 hex (sha256),
+    and nothing between (task/3437). git never prints 41 to 63 hex for
+    rev-parse --verify; the grammar is still the one full-id grammar."""
+
+    @staticmethod
+    def resolved(printed):
+        with mock.patch.object(takeover.work, "_git",
+                               return_value=(0, printed, "")) as asked:
+            got = takeover._git_commit("/nowhere", "lane/source")
+        return got, asked.call_count
+
+    def test_rev_parse_output_is_a_full_commit_id(self):
+        self.assertEqual(self.resolved("c" * 40), ("c" * 40, 1))
+        self.assertEqual(self.resolved("c" * 64), ("c" * 64, 1))
+        with self.assertRaises(takeover.TakeoverRefused) as caught:
+            self.resolved("c" * 50)
+        self.assertIn("lineage UNKNOWN", str(caught.exception))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""helm cred — WHO a credential home actually holds, and the safe /login.
+"""helm cred — which account a credential home's metadata names, and the safe /login.
 
 THE INCIDENT this exists for: a session hits its limit, the human runs
 `/login` inside it, and Claude Code writes the NEW account into the config dir
@@ -15,7 +15,7 @@ We do not fight the write. We make it NON-DESTRUCTIVE, TRUTHFUL, REVERSIBLE:
     `account_of()` reads <dir>/.claude.json's oauthAccount block (email, uuid,
     org — identity METADATA; the tokens live in .credentials.json and are
     never read here) and caches it by mtime. `helm cred list` shows
-    DIR NAME | ACTUAL ACCOUNT | verdict, so drift is visible, not inferred.
+    DIR NAME | METADATA ACCOUNT | verdict, so drift is visible, not inferred.
   * NON-DESTRUCTIVE — `helm cred backup` snapshots a home's .credentials.json
     bytes plus its oauthAccount block into ~/.cred-backups/<folded-email>/<ts>/
     at 0600 (dirs 0700), skipping when an identical snapshot already exists.
@@ -76,12 +76,14 @@ from .account import _read_account, account_of, oauth_block, verdict_for
 from .snapshots import (
     _COMMIT_SIGNALS, _block_commit_signals, _capture_home, _census_pair,
     _claim_snapshot_dir, _drop, _family_of_blob, _foreign_family, _identical,
-    _lineage_accounts, _lineage_homes, _lineage_load, _lineage_path,
+    LINEAGE_AMBIGUOUS, LINEAGE_BASIS, LINEAGE_MATCH, LINEAGE_MISMATCH, LINEAGE_TAG_HEX,
+    LINEAGE_UNKNOWN, _lineage_accounts, _lineage_doc, _lineage_homes,
+    _lineage_load, _lineage_path,
     _lineage_record, _pre_image, _prune, _rollback_files,
     _snapshot_families_on_disk, _snapshot_expiry, _snapshot_family,
     _snapshot_files, _snapshots_in, _unblock_commit_signals, account_dir,
-    backup, backup_all, folded_dir, restore, rows, snapshots,
-    snapshots_for_home_name)
+    backup, backup_all, folded_dir, metadata_says, restore, rows, snapshots,
+    snapshots_for_home_name, token_lineage)
 from .heal import (
     _CLAUDE_FAMILY_COMMS, _comm_claude_family, _family_elsewhere, _held_note,
     _login_cmd, _pair_misbound, _proc_start, _proc_uid,

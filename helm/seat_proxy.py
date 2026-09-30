@@ -212,10 +212,25 @@ def _up(family, quiet=False, seat=None):
     if fam is None:
         return 1
     seat = seat or family
+    if fam.get("activation_refusal"):
+        print("helm seat: refusing %s proxy start — %s"
+              % (seat, fam["activation_refusal"]), file=sys.stderr)
+        return 1
     ownership = _seat_surface_error(family, seat)
     if ownership:
         print("helm seat: " + ownership, file=sys.stderr)
         return 1
+    if seat == family and fam.get("sidecar"):
+        # THE SECOND PROCESS COMES UP FIRST, OR THE PROXY DOES NOT (task/1056).
+        # A proxy in front of a bridge that cannot serve binds its port and
+        # answers nothing, and every liveness instrument then reads the seat
+        # as up. seat_sidecar starts a dead or wedged bridge and refuses what a
+        # restart cannot fix (no vendored checkout, a refused login).
+        from . import seat_sidecar
+        if seat_sidecar.up(family, quiet=quiet) != 0:
+            print("helm seat: refusing to start the %s proxy in front of a "
+                  "bridge that does not serve" % seat, file=sys.stderr)
+            return 1
     # an instance proxy must have its own minted config before it can come up
     cfgd = _proxy_home(family, seat)
     if seat != family and not os.path.exists(os.path.join(cfgd, "config.yaml")):
@@ -281,35 +296,71 @@ def _up(family, quiet=False, seat=None):
                   "failed (%s); existing bytes and listener were left intact"
                   % (seat, exc), file=sys.stderr)
             return 1
+        from . import offpeak
+        closing = offpeak.closing_transition(
+            plan["old"], plan["text"], family, fam)
+        closed_published = False
+        if closing:
+            try:
+                _write_private(config_path, plan["text"])
+                closed_published = True
+            except OSError as exc:
+                print("helm seat: refusing %s proxy replacement — the paid "
+                      "route's closed config could not be published (%s); the "
+                      "listener was left intact and the close is unproved"
+                      % (seat, exc), file=sys.stderr)
+                return 1
         drift, detail = proxy_drift(family, seat, record=owned) \
             if owned else (PROXY_CURRENT, None)
         if owned and not plan["changed"] and drift != PROXY_STALE:
             print("helm seat: %s proxy already running (pid %d, port %d)"
                   % (seat, owned["pid"], port), file=sys.stderr)
             return 1
-        # An unowned bound port is resolved before staging or publishing config.
-        # Adoption needs no replacement binary: the exact listener already runs.
+        # An ordinary adopted listener keeps running. A MONEY-CLOSE is different:
+        # adopt its exact birth identity, then continue through stop+restart so
+        # success means the process actually loaded the closed bytes.
         if not owned and _port_open(port):
-            return _adopt_or_refuse_port(seat, port, cfgd)
-        # Establish replacement capability BEFORE mutating config or stopping a
-        # working listener. A missing/non-executable binary leaves both live.
+            adopted = _adopt_or_refuse_port(seat, port, cfgd)
+            if adopted or not closing:
+                return adopted
+            owned = _running_pid_rec(family, seat)
+            if not owned:
+                print("helm seat: refusing %s proxy replacement — its adopted "
+                      "listener could not be re-authenticated; closed config is "
+                      "published but the live route is unproved" % seat,
+                      file=sys.stderr)
+                return 1
         b = _proxy_bin()
         ready, why = _proxy_binary_ready(b) if b else (False, "not found")
         if not ready:
-            print("helm seat: cli-proxy-api binary unavailable (%s; checked "
-                  "HELM_PROXY_BIN, %s, PATH) — run `helm seat doctor`"
-                  % (why, PROXY_BIN_DEFAULT), file=sys.stderr)
+            if closing and owned:
+                stopped, stop_why = _stop_owned_proxy(family, seat, owned)
+                if not stopped:
+                    print("helm seat: paid route config is closed, but refusing "
+                          "%s proxy stop — %s; live closure is unproved"
+                          % (seat, stop_why), file=sys.stderr)
+                    return 1
+                print("helm seat: %s paid route closed and listener stopped; "
+                      "replacement binary unavailable (%s)" % (seat, why),
+                      file=sys.stderr)
+            else:
+                print("helm seat: cli-proxy-api binary unavailable (%s; checked "
+                      "HELM_PROXY_BIN, %s, PATH) — run `helm seat doctor`"
+                      % (why, PROXY_BIN_DEFAULT), file=sys.stderr)
             return 1
         staged = None
         try:
-            if plan["changed"]:
+            if plan["changed"] and not closed_published:
                 staged = _stage_private(config_path, plan["text"])
             if owned:
                 stopped, why = _stop_owned_proxy(family, seat, owned)
                 if not stopped:
-                    print("helm seat: refusing %s proxy replacement — %s; "
-                          "config and listener were left intact"
-                          % (seat, why), file=sys.stderr)
+                    print("helm seat: refusing %s proxy replacement — %s; %s"
+                          % (seat, why,
+                             "closed config is published but live closure is "
+                             "unproved" if closing else
+                             "config and listener were left intact"),
+                          file=sys.stderr)
                     return 1
             if _port_open(port):
                 return _adopt_or_refuse_port(seat, port, cfgd)
@@ -320,7 +371,8 @@ def _up(family, quiet=False, seat=None):
             restore = ""
             if owned:
                 try:
-                    _write_private(config_path, plan["old"])
+                    if not closing:
+                        _write_private(config_path, plan["old"])
                     old_binary = ((owned.get("launch") or {}).get("binary") or {}).get(
                         "source") or b
                     prior, prior_error = _launch_proxy_process(
@@ -344,7 +396,7 @@ def _up(family, quiet=False, seat=None):
             restored = None
             if owned:
                 try:
-                    if plan["changed"]:
+                    if plan["changed"] and not closing:
                         _write_private(config_path, plan["old"])
                     old_binary = ((owned.get("launch") or {}).get("binary") or {}).get(
                         "source") or b
@@ -356,7 +408,9 @@ def _up(family, quiet=False, seat=None):
                     launch_error += "; previous listener restore failed (%s)" % \
                         restore_error
                 else:
-                    launch_error += "; previous config and listener restored"
+                    launch_error += ("; previous listener restored against the "
+                                     "closed config" if closing else
+                                     "; previous config and listener restored")
             print("helm seat: %s" % launch_error, file=sys.stderr)
             return 1
     if not quiet:
@@ -535,6 +589,16 @@ def _smoke(family, multi=False):
         return 1
     if not shutil.which("claude"):
         print("helm seat: `claude` not on PATH — cannot smoke", file=sys.stderr)
+        return 1
+    # smoke is not an operator's "run it": it would auto-start a proxy the
+    # operator stood down, and the supervisors would then report the running
+    # proxy against the record. It refuses and names the verb that clears it.
+    from . import seat_down
+    down, _unreadable = seat_down.read(family, family)
+    if down and not _running_pid(family):
+        print("helm seat: refusing to smoke %s — %s; %s first"
+              % (family, seat_down.describe(down),
+                 seat_down.resume_hint(family)), file=sys.stderr)
         return 1
     if not _running_pid(family):
         if _up(family, quiet=True) != 0:

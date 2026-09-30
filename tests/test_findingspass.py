@@ -8,7 +8,9 @@ THE OWNER'S CONTRACT, one arm or more per clause:
   * it is NEVER an approval, NEVER a gate, and NEVER the different-model read;
   * an empty result is not a clean review, and the note says so;
   * a reader that is down, slow or broken leaves ONE line naming why;
-  * the endpoint comes from seat_catalog's qwen27 entry, never a literal host.
+  * the endpoint and the model come from ONE pool row of the reader
+    family's seat_catalog entry (qwen27 unless the knob names another),
+    never a literal host, and the read names its budget and thinking.
 
 NO ARM CALLS THE REAL MODEL OR THE REAL SCRIPT. Each arm writes a FIXTURE
 `local-review.py` into its own temp dir — a script that prints a status line
@@ -178,8 +180,13 @@ class FindingsBase(_landreq.LandReqBase):
     detached start: an arm that runs the pass in-process must not race a
     detached twin of itself for the same row."""
 
-    KEYS = ("HELM_QWEN27_FINDINGS", "HELM_LOCAL_REVIEW_SCRIPT",
-            "HELM_QWEN27_FINDINGS_TIMEOUT_S")
+    #: Every knob the pass reads. The ones after the switch and the script
+    #: are cleared before each arm, so a value in the runner's environment
+    #: steers no arm.
+    KNOBS = ("HELM_QWEN27_FINDINGS_TIMEOUT_S", "HELM_QWEN27_FINDINGS_READER",
+             "HELM_QWEN27_FINDINGS_THINK", "HELM_QWEN27_FINDINGS_MAX_TOKENS",
+             "HELM_QWEN27_FINDINGS_THINK_MAX_TOKENS")
+    KEYS = ("HELM_QWEN27_FINDINGS", "HELM_LOCAL_REVIEW_SCRIPT") + KNOBS
 
     def setUp(self):
         super().setUp()
@@ -193,7 +200,8 @@ class FindingsBase(_landreq.LandReqBase):
                     os.environ[key] = value
         self.addCleanup(restore)
         os.environ["HELM_QWEN27_FINDINGS"] = "off"
-        os.environ.pop("HELM_QWEN27_FINDINGS_TIMEOUT_S", None)
+        for key in self.KNOBS:
+            os.environ.pop(key, None)
         _configure_endpoints({READER: _READER_ENDPOINT})
         self.fixtures = 0
 
@@ -408,6 +416,54 @@ class TheScriptsOutFileHasSomewhereToGoTest(FindingsBase):
                           if n.startswith("run-")], [])
 
 
+class ExamineReadsOnlyAFullObjectIdTest(FindingsBase):
+    """task/3431: the tip gate in front of the script is the FULL object id
+    grammar — 40 lowercase hex (sha1) or 64 (sha256), and nothing between.
+    `[0-9a-f]{40,64}` admitted 41 to 63 characters: no commit has such a
+    name, so the script was started on a tip that names nothing (the
+    overshoot ecc8d7c6093 cured in dispatches._FULL_TIP).
+
+    Every arm passes a checkout that does not exist, so no arm starts the
+    script: a tip the gate ADMITS stops at the next gate, which names the
+    checkout, and a tip it REFUSES stops at the tip gate itself. The reason
+    string therefore says which gate the tip reached."""
+
+    def setUp(self):
+        super().setUp()
+        self.fixture(rc=0, body=CLEAN)
+        self.gone = os.path.join(self.tmp, "no-such-checkout")
+        self.refused = "the row names no full tip to read"
+        self.admitted = ("the row's checkout %s is not readable here"
+                         % self.gone)
+
+    def reached(self, cases):
+        """[(label, outcome, reason, text)] for each (label, tip)."""
+        out = []
+        for label, tip in cases:
+            fields, text = findingspass.examine(tip, self.gone)
+            out.append((label, fields["outcome"], fields["reason"], text))
+        return out
+
+    def test_a_length_between_the_two_hashes_is_refused(self):  # noqa: VACUOUS_ASSERTION — every case's whole (outcome, reason, output) is asserted EQUAL to a non-empty literal list naming the exact gate it reached; the empty output is the script-not-started half of that exact value
+        cases = (("41 hex", "1" * 41), ("50 hex", "5" * 50),
+                 ("63 hex", "6" * 63))
+        self.assertEqual(self.reached(cases),
+                         [(label, "not-run", self.refused, "")
+                          for label, _tip in cases])
+
+    def test_sha1_and_sha256_lengths_pass_and_other_shapes_do_not(self):  # noqa: VACUOUS_ASSERTION — every case's whole (outcome, reason, output) is asserted EQUAL to a non-empty literal list naming the exact gate it reached; the empty output is the script-not-started half of that exact value
+        cases = (("40 hex", "a" * 40, self.admitted),
+                 ("64 hex", "b" * 64, self.admitted),
+                 ("39 hex", "c" * 39, self.refused),
+                 ("65 hex", "d" * 65, self.refused),
+                 ("40 uppercase", "A" * 40, self.refused),
+                 ("40 non-hex", "g" * 40, self.refused),
+                 ("40 hex + newline", "e" * 40 + "\n", self.refused),
+                 ("empty", "", self.refused))
+        self.assertEqual(self.reached([(n, t) for n, t, _w in cases]),
+                         [(n, "not-run", w, "") for n, _t, w in cases])
+
+
 class NoFindingsIsEarnedAtTheLedgerTest(FindingsBase):
     """THE REPLAY SIDE of "an empty result is not a clean review": a note
     that would render as no findings is refused unless the script's own
@@ -549,8 +605,8 @@ class ItIsNeverTheDifferentModelReadTest(FindingsBase):
 
 
 class TheEndpointIsTheCatalogsTest(unittest.TestCase):
-    """seat_catalog's qwen27 entry names the endpoint; no host is written in
-    the pass. The provider key is read generically, because the serving stack
+    """The reader family's seat_catalog entry names the endpoint and the
+    model, both off one pool row; no host is written in the pass. The provider key is read generically, because the serving stack
     under that entry moves."""
 
     def setUp(self):
@@ -559,54 +615,101 @@ class TheEndpointIsTheCatalogsTest(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"HELM_HOME": self.home})
         env.start()
         self.addCleanup(env.stop)
+        # the patch restores the whole environment, this knob included
+        os.environ.pop("HELM_QWEN27_FINDINGS_READER", None)
 
     def table(self, **entry):
-        return {READER: entry}
+        """{READER: entry}, shaped as a catalog entry: it names its model,
+        and a pool row that declares no rung is the owner's own (`free`)."""
+        pool = entry.get("pool_providers")
+        if isinstance(pool, dict):
+            entry["pool_providers"] = {
+                key: dict({"rung": "free"}, **row) if isinstance(row, dict)
+                else row for key, row in pool.items()}
+        return {READER: dict({"model": READER}, **entry)}
+
+    def test_only_the_owners_own_model_is_ever_sent_a_diff(self):
+        """ONLY A ROW DECLARED `rung: free` IS A PROVIDER. The pass sends the
+        row's diff to the endpoint with no key, so a vendor's metered row, or
+        a row that declares no rung, is never one it reads from."""
+        vendor = {"base_url": "https://api.vendor.invalid/v1",
+                  "upstream_model": "vendor-model", "rung": "paid"}
+        local = {"base_url": "http://local.invalid:8/v1",
+                 "upstream_model": "local-model", "rung": "free"}
+        url, model, why = findingspass.endpoint(self.table(
+            pool_providers={"vendor": vendor, "local": local},
+            pool_default="vendor"))
+        self.assertIsNone(why, why)
+        self.assertEqual((url, model), ("http://local.invalid:8/v1/chat/"
+                                        "completions", "local-model"))
+        url, model, why = findingspass.endpoint(self.table(
+            pool_providers={"vendor": vendor}))
+        self.assertEqual((url, model), (None, None))
+        self.assertIn("vendor: its rung is paid", why)
+        url, model, why = findingspass.endpoint({READER: {
+            "model": READER,
+            "pool_providers": {"bare": {"base_url": "http://bare.invalid/v1"}}}})
+        self.assertEqual((url, model), (None, None))
+        self.assertIn("bare: its rung is undeclared", why)
 
     def test_pool_default_wins_else_the_first_listed(self):
-        pool = {"first": {"base_url": "http://one.invalid:1/v1/"},
-                "second": {"base_url": "http://two.invalid:2/v1"}}
-        url, why = findingspass.endpoint(self.table(pool_providers=pool,
-                                                    pool_default="second"))
+        pool = {"first": {"base_url": "http://one.invalid:1/v1/",
+                          "upstream_model": "model-one"},
+                "second": {"base_url": "http://two.invalid:2/v1",
+                           "upstream_model": "model-two"}}
+        url, model, why = findingspass.endpoint(
+            self.table(pool_providers=pool, pool_default="second"))
         self.assertIsNone(why, why)
         self.assertEqual(url, "http://two.invalid:2/v1/chat/completions")
-        url, why = findingspass.endpoint(self.table(pool_providers=pool))
+        # the model comes off the SAME row as the endpoint
+        self.assertEqual(model, "model-two")
+        url, model, why = findingspass.endpoint(self.table(pool_providers=pool))
         self.assertIsNone(why, why)
         self.assertEqual(url, "http://one.invalid:1/v1/chat/completions")
+        self.assertEqual(model, "model-one")
 
     def test_no_entry_or_no_usable_provider_says_why(self):
-        url, why = findingspass.endpoint({})
-        self.assertIsNone(url)
+        url, model, why = findingspass.endpoint({})
+        self.assertEqual((url, model), (None, None))
         self.assertIn("no %s entry" % READER, why)
-        url, why = findingspass.endpoint(self.table(pool_providers={
+        url, model, why = findingspass.endpoint(self.table(pool_providers={
             "x": {"base_url": "ftp://nope"}}))
-        self.assertIsNone(url)
+        self.assertEqual((url, model), (None, None))
         self.assertIn("no pool provider", why)
-        url, why = findingspass.endpoint(self.table(pool_providers={
+        url, model, why = findingspass.endpoint(self.table(pool_providers={
             "x": {"base_url": "http://ok.invalid/v1"}}))
         self.assertIsNone(why, why)
         self.assertEqual(url, "http://ok.invalid/v1/chat/completions")
+        # a row naming no upstream model asks for the entry's own model
+        self.assertEqual(model, READER)
 
-    def test_a_row_on_the_operators_box_resolves_through_the_endpoints_file(self):
+    def test_a_row_and_an_entry_naming_no_model_is_no_provider(self):
+        url, model, why = findingspass.endpoint({READER: {"pool_providers": {
+            "x": {"base_url": "http://ok.invalid/v1"}}}})
+        self.assertEqual((url, model), (None, None))
+        self.assertIn("no pool provider", why)
+        self.assertIn("x: the row names no model", why)
+
+    def test_a_row_on_the_operators_box_resolves_through_the_endpoints_file(self):  # noqa: VACUOUS_ASSERTION — the None is the error channel of the call whose url is asserted to its exact value
         """A row with base_url_from and no base_url is the shape the shipped
         catalog gives the reader. Reading base_url directly found NO provider
         for it, so every note read NOT RUN while the endpoint was set."""
         pool = {"local": {"base_url_from": READER}}
         _configure_endpoints({READER: _READER_ENDPOINT + "/"})
-        url, why = findingspass.endpoint(self.table(pool_providers=pool))
+        url, _model, why = findingspass.endpoint(self.table(pool_providers=pool))
         self.assertIsNone(why, why)
         self.assertEqual(url, _READER_ENDPOINT + "/chat/completions")
 
     def test_an_unconfigured_endpoint_is_not_run_and_names_the_file(self):
         pool = {"local": {"base_url_from": READER}}
         path = _configure_endpoints(None)
-        url, why = findingspass.endpoint(self.table(pool_providers=pool))
+        url, _model, why = findingspass.endpoint(self.table(pool_providers=pool))
         self.assertIsNone(url)
         self.assertIn("no pool provider", why)
         self.assertIn(path, why)
         self.assertIn("not configured", why)
         _configure_endpoints({READER: "ftp://nope"})
-        url, why = findingspass.endpoint(self.table(pool_providers=pool))
+        url, _model, why = findingspass.endpoint(self.table(pool_providers=pool))
         self.assertIsNone(url)
         self.assertIn("not an http(s) URL", why)
 
@@ -614,26 +717,28 @@ class TheEndpointIsTheCatalogsTest(unittest.TestCase):
         pool = {"local": {"base_url_from": READER},
                 "public": {"base_url": "http://two.invalid:2/v1"}}
         _configure_endpoints(None)
-        url, why = findingspass.endpoint(self.table(pool_providers=pool,
-                                                    pool_default="local"))
+        url, _model, why = findingspass.endpoint(
+            self.table(pool_providers=pool, pool_default="local"))
         self.assertIsNone(why, why)
         self.assertEqual(url, "http://two.invalid:2/v1/chat/completions")
         _configure_endpoints({READER: _READER_ENDPOINT})
-        url, why = findingspass.endpoint(self.table(pool_providers=pool,
-                                                    pool_default="local"))
+        url, _model, why = findingspass.endpoint(
+            self.table(pool_providers=pool, pool_default="local"))
         self.assertIsNone(why, why)
         self.assertEqual(url, _READER_ENDPOINT + "/chat/completions")
 
     def test_the_shipped_catalog_resolves_and_the_pass_writes_no_host(self):  # noqa: VACUOUS_ASSERTION — the resolved url is asserted to be one of the catalog's own bases, and the no-host scan reads the source this module is loaded from
         from helm import seat, seat_catalog  # noqa: F401 — the facade first (seat_compat)
         _configure_endpoints({READER: _READER_ENDPOINT + "/"})
-        url, why = findingspass.endpoint()
+        url, model, why = findingspass.endpoint()
         self.assertIsNone(why, why)
         entry = seat_catalog.FAMILIES[READER]
         bases = [seat_catalog.pool_base_url(p)[0] for p in
                  entry["pool_providers"].values()]
         self.assertIn(url[:-len("/chat/completions")], bases)
         self.assertEqual(url, _READER_ENDPOINT + "/chat/completions")
+        self.assertIn(model, [p.get("upstream_model") for p in
+                              entry["pool_providers"].values()])
         with open(findingspass.__file__, encoding="utf-8") as f:
             source = f.read()
         import re
@@ -654,7 +759,7 @@ class TheInvocationContractTest(FindingsBase):
         self.assertIsNotNone(out, err)
         with open(record, encoding="utf-8") as f:
             argv = f.readline().split()[3:]
-        url, _why = findingspass.endpoint()
+        url, _model, _why = findingspass.endpoint()
         self.assertEqual(argv[0], self.side)
         self.assertIn("--judge", argv)
         self.assertEqual(argv[argv.index("--repo") + 1],
@@ -664,6 +769,208 @@ class TheInvocationContractTest(FindingsBase):
         self.assertTrue(os.path.isfile(findingspass.checklist_path()))
         self.assertEqual(argv[argv.index("--endpoint") + 1], url)
         self.assertIn("--out", argv)
+
+
+#: A reader family that exists only in the arms that patch it into the
+#: catalog, with its own pool row, endpoint key and upstream model id: an argv
+#: that carries them was resolved by name, never by the qwen27 default.
+_FIXTURE_READER = "fixture-reader"
+_FIXTURE_MODEL = "Fixture/Reader-9B"
+_FIXTURE_ENDPOINT = "http://192.0.2.20:8081/v1"
+_FIXTURE_ENTRY = {"model": _FIXTURE_READER, "probe_models": (_FIXTURE_MODEL,),
+                  "pool_default": "local",
+                  "pool_providers": {"local": {
+                      "base_url_from": _FIXTURE_READER,
+                      "upstream_model": _FIXTURE_MODEL, "rung": "free"}}}
+
+
+def _flag(argv, name):
+    """The value after `name` in a recorded argv, or None when it is absent."""
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+class TheReadIsAskedToConcludeTest(FindingsBase):
+    """THE PASS NAMES THE READ'S BUDGET, MODEL AND THINKING ON EVERY RUN, and
+    the reader family is a knob resolved from the catalog by name.
+
+    Left to the script's defaults the budget is 4096 tokens, and on the
+    stored outputs of 423 qwen27 reads at that budget, 98 ran to exactly 4096
+    and were cut while still reasoning. The defaults here are the model
+    makers' recommended output lengths: 16384 with thinking off and 32768
+    with it on."""
+
+    def one_run(self, lane):
+        """(the argv the script was started with, the row's newest note)."""
+        row = self.row(lane=lane)
+        record = os.path.join(self.tmp, "argv-" + lane.replace("/", "-"))
+        self.fixture(rc=0, body=CLEAN, record=record)
+        out, err = self.run_pass(row["id"])
+        self.assertIsNotNone(out, err)
+        with open(record, encoding="utf-8") as f:
+            argv = f.readline().split()[3:]
+        return argv, self.notes(row["id"])[-1]
+
+    def catalog_model(self):
+        """The upstream model id on the pool row seat_catalog's qwen27 entry
+        defaults to, read off the catalog rather than asked of the pass."""
+        from helm import seat, seat_catalog  # noqa: F401 — the facade first (seat_compat)
+        entry = seat_catalog.FAMILIES[READER]
+        return entry["pool_providers"][entry["pool_default"]]["upstream_model"]
+
+    def with_fixture_reader(self):
+        from helm import seat, seat_catalog  # noqa: F401 — the facade first (seat_compat)
+        patch = mock.patch.dict(seat_catalog.FAMILIES,
+                                {_FIXTURE_READER: _FIXTURE_ENTRY})
+        patch.start()
+        self.addCleanup(patch.stop)
+        _configure_endpoints({READER: _READER_ENDPOINT,
+                              _FIXTURE_READER: _FIXTURE_ENDPOINT})
+
+    def test_thinking_off_names_its_budget_and_the_catalogs_model(self):
+        argv, note = self.one_run("lane/concludes-off")
+        self.assertEqual(_flag(argv, "--max-tokens"), "16384", argv)
+        self.assertEqual(_flag(argv, "--model"), self.catalog_model(), argv)
+        # the judge asks the reader's endpoint, so it names the same model
+        self.assertEqual(_flag(argv, "--judge-model"), self.catalog_model(),
+                         argv)
+        self.assertNotIn("--think", argv)
+        self.assertEqual(note["reader"], READER)
+
+    def test_thinking_on_passes_think_and_its_own_budget(self):
+        os.environ["HELM_QWEN27_FINDINGS_THINK"] = "on"
+        # the thinking-off budget does not steer a thinking read
+        os.environ["HELM_QWEN27_FINDINGS_MAX_TOKENS"] = "8192"
+        argv, _note = self.one_run("lane/concludes-on")
+        self.assertIn("--think", argv)
+        self.assertEqual(_flag(argv, "--max-tokens"), "32768", argv)
+
+    def test_each_budget_has_one_knob(self):
+        os.environ["HELM_QWEN27_FINDINGS_MAX_TOKENS"] = "8192"
+        argv, _note = self.one_run("lane/concludes-knob-off")
+        self.assertEqual(_flag(argv, "--max-tokens"), "8192", argv)
+        os.environ["HELM_QWEN27_FINDINGS_THINK"] = "on"
+        os.environ["HELM_QWEN27_FINDINGS_THINK_MAX_TOKENS"] = "40960"
+        argv, _note = self.one_run("lane/concludes-knob-on")
+        self.assertIn("--think", argv)
+        self.assertEqual(_flag(argv, "--max-tokens"), "40960", argv)
+
+    def test_a_value_that_is_not_a_positive_integer_is_ignored(self):  # noqa: VACUOUS_ASSERTION — both loops run over non-empty literal tuples, and every subtest asserts an exact budget or an exact boolean
+        for bad in ("", " ", "abc", "0", "-5", "12.5"):
+            with self.subTest(value=bad):
+                os.environ["HELM_QWEN27_FINDINGS_THINK"] = "off"
+                os.environ["HELM_QWEN27_FINDINGS_MAX_TOKENS"] = bad
+                self.assertEqual(findingspass.max_tokens(), 16384)
+                os.environ["HELM_QWEN27_FINDINGS_THINK"] = "on"
+                os.environ["HELM_QWEN27_FINDINGS_THINK_MAX_TOKENS"] = bad
+                self.assertEqual(findingspass.max_tokens(), 32768)
+        for word, on in (("on", True), ("1", True), ("yes", True),
+                         ("true", True), (" ON ", True), ("off", False),
+                         ("0", False), ("", False), ("maybe", False)):
+            with self.subTest(think=word):
+                os.environ["HELM_QWEN27_FINDINGS_THINK"] = word
+                self.assertIs(findingspass.thinking(), on)
+
+    def test_the_bound_scales_with_the_budget_and_its_knob_wins(self):
+        """A read that runs to its cap takes time in proportion to the cap,
+        so the default bound is 3600 s per 16384 tokens of budget and never
+        less than 3600 s."""
+        self.assertEqual(findingspass.timeout_s(), 3600)
+        os.environ["HELM_QWEN27_FINDINGS_THINK"] = "on"
+        self.assertEqual(findingspass.timeout_s(), 7200)
+        os.environ["HELM_QWEN27_FINDINGS_THINK_MAX_TOKENS"] = "65536"
+        self.assertEqual(findingspass.timeout_s(), 14400)
+        os.environ["HELM_QWEN27_FINDINGS_THINK"] = "off"
+        os.environ["HELM_QWEN27_FINDINGS_MAX_TOKENS"] = "4096"
+        self.assertEqual(findingspass.timeout_s(), 3600)
+        os.environ["HELM_QWEN27_FINDINGS_TIMEOUT_S"] = "900"
+        self.assertEqual(findingspass.timeout_s(), 900)
+
+    def test_the_reader_is_a_knob_resolved_from_the_catalog_by_name(self):  # noqa: VACUOUS_ASSERTION — every observable is asserted to an exact value: the endpoint, both model flags, the note's reader and its whole line
+        self.with_fixture_reader()
+        os.environ["HELM_QWEN27_FINDINGS_READER"] = _FIXTURE_READER
+        argv, note = self.one_run("lane/concludes-reader")
+        self.assertEqual(_flag(argv, "--endpoint"),
+                         _FIXTURE_ENDPOINT + "/chat/completions", argv)
+        self.assertEqual(_flag(argv, "--model"), _FIXTURE_MODEL, argv)
+        self.assertEqual(_flag(argv, "--judge-model"), _FIXTURE_MODEL, argv)
+        self.assertEqual(note["reader"], _FIXTURE_READER)
+        self.assertEqual(findingspass.summary(note),
+                         "%s: no findings (complete, 5 reads). Not a review, "
+                         "not an approval." % _FIXTURE_READER)
+
+    def test_an_unknown_reader_family_is_not_run_and_says_why(self):  # noqa: VACUOUS_ASSERTION — the unstarted script is read off the same run whose note is asserted to its exact outcome, reader and whole line
+        os.environ["HELM_QWEN27_FINDINGS_READER"] = "no-such-reader"
+        row = self.row(lane="lane/concludes-unknown")
+        record = os.path.join(self.tmp, "argv-unknown")
+        self.fixture(rc=0, body=CLEAN, record=record)
+        out, err = self.run_pass(row["id"])
+        self.assertIsNone(err, err)
+        note = self.notes(row["id"])[-1]
+        self.assertEqual(note["outcome"], "not-run")
+        self.assertEqual(note["reader"], "no-such-reader")
+        self.assertEqual(findingspass.summary(note),
+                         "no-such-reader: NOT RUN — no no-such-reader "
+                         "endpoint: seat_catalog has no no-such-reader entry. "
+                         "Not a review.")
+        self.assertFalse(os.path.exists(record),
+                         "the script was started with no reader to ask")
+
+    def test_a_name_that_is_not_a_family_name_is_ignored(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a non-empty literal tuple and each subtest asserts reader() EQUAL to an exact family name
+        for raw, want in (("", READER), ("  ", READER), ("Qwen Local", READER),
+                          ("../x", READER), ("x" * 65, READER),
+                          (" QwenLocal ", "qwenlocal"),
+                          ("qwenlocal", "qwenlocal")):
+            with self.subTest(raw=raw):
+                os.environ["HELM_QWEN27_FINDINGS_READER"] = raw
+                self.assertEqual(findingspass.reader(), want)
+
+    def test_a_read_by_one_reader_leaves_the_row_owed_the_others(self):  # noqa: VACUOUS_ASSERTION — the None is the skipped run's row channel, whose reason is asserted positively after the same row is asserted to carry both readers' notes exactly
+        self.with_fixture_reader()
+        row = self.row(lane="lane/concludes-two")
+        self.fixture(rc=0, body=CLEAN)
+        out, err = self.run_pass(row["id"])
+        self.assertIsNone(err, err)
+        os.environ["HELM_QWEN27_FINDINGS_READER"] = _FIXTURE_READER
+        out, err = self.run_pass(row["id"])
+        self.assertIsNone(err, err)
+        self.assertEqual([n["reader"] for n in self.notes(row["id"])],
+                         [READER, _FIXTURE_READER])
+        out, err = self.run_pass(row["id"])
+        self.assertIsNone(out)
+        self.assertIn("already carries a read", err)
+
+    def test_the_ledger_keeps_the_reader_that_read_and_refuses_a_malformed_one(self):  # noqa: VACUOUS_ASSERTION — each refusal is asserted POSITIVELY by its reducer message, and the admitted control on the same row is asserted to land with its reader
+        row = self.row(lane="lane/concludes-ledger")
+        for bad in ("", "not a family", "x" * 65, "a\x1bb"):
+            with self.subTest(reader=bad):
+                out, err = dispatches.record_findings_note(
+                    row["id"], self.side, {"outcome": "not-run",
+                                           "reason": "r", "reader": bad})
+                self.assertIsNone(out)
+                self.assertIn("refused by the reducer", err)
+        out, err = dispatches.record_findings_note(
+            row["id"], self.side, {"outcome": "not-run", "reason": "r",
+                                   "reader": "qwenlocal"})
+        self.assertIsNone(err, err)
+        self.assertEqual([n["reader"] for n in self.notes(row["id"])],
+                         ["qwenlocal"])
+
+    def test_the_configured_readers_model_is_never_the_different_model_read(self):  # noqa: VACUOUS_ASSERTION — the admitted control runs unconditionally before the loop, and each refusal in the loop over a literal tuple is asserted positively by its message
+        self.with_fixture_reader()
+        author = "claude-opus-5-5"
+        # CONTROL: with the knob unset the same model is admitted, so the
+        # refusal below is the knob's and not the door's
+        given, err = dispatches._on_behalf_shape(_FIXTURE_READER, "wf-1",
+                                                 author, "concur")
+        self.assertIsNone(err, err)
+        self.assertEqual(given["reviewer_model"], _FIXTURE_READER)
+        os.environ["HELM_QWEN27_FINDINGS_READER"] = _FIXTURE_READER
+        for model in (_FIXTURE_READER, READER):
+            with self.subTest(model=model):
+                given, err = dispatches._on_behalf_shape(model, "wf-1",
+                                                         author, "concur")
+                self.assertIsNone(given)
+                self.assertIn("findings pass's model", err)
 
 
 class TheOffSwitchAndTheStartTest(FindingsBase):

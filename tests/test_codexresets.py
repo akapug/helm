@@ -86,19 +86,18 @@ def _weekly_key(body):
     return "secondary_window" if rl.get("secondary_window") else "primary_window"
 
 
-#: THE DEFAULT SHAPE IS A RATE-LIMIT WALL, AND THAT IS NOT COSMETIC. The
-#: recorded `team` body carries rate_limit_reached_type
-#: `workspace_owner_credits_depleted` — a wall a rate-limit reset credit does
-#: not lift — so every pass arm defaulting to it was measuring the policy
-#: against a world it must now REFUSE. The `pro` body is a real
-#: `rate_limit_reached` wall at 100%, which is the world the happy path is
-#: about; the credits-depleted body still drives its own arms, by name.
+#: THE DEFAULT SHAPE IS A RATE-LIMIT WALL. The recorded `team` body carries
+#: rate_limit_reached_type `workspace_owner_credits_depleted`, a workspace
+#: wall a reset is measured to lift too, and it drives its own arms by name.
+#: The `pro` body is a real `rate_limit_reached` wall at 100%, the credit's
+#: own case, so the happy path defaults to it.
 DEFAULT_SHAPE = "pro"
 
 
 def reading(shape=DEFAULT_SHAPE, weekly_pct=None, five_hour_pct=None,
             weekly_resets_in=None, email=None, reached=_UNSET,
-            account_id=None, user_id=None, file=None, token=None):
+            account_id=None, user_id=None, file=None, token=None,
+            credits=_UNSET):
     """One `codexbudget` budget row, built by the shipped probe from a
     recorded vendor body. Named keyword arguments move ONE field each, on a
     copy, so an arm that needs a healthier week does not also invent a plan,
@@ -123,6 +122,12 @@ def reading(shape=DEFAULT_SHAPE, weekly_pct=None, five_hour_pct=None,
     if reached is not _UNSET:
         body["rate_limit_reached_type"] = \
             None if reached is None else {"type": reached, "details": None}
+    if credits is not _UNSET and credits is not None:
+        # THE BALANCE BLOCK THE USAGE BODY CARRIES, in its measured shape;
+        # the recorded bodies predate it.
+        body["rate_limit_reset_credits"] = {
+            "available_count": credits,
+            "applicable_available_count": credits}
     name = file or ("codex-%s.json" % shape)
     acct = {"account_id": body["account_id"], "user_id": user_id,
             "email": body["email"],
@@ -268,10 +273,28 @@ class ResetHandler(BaseHTTPRequestHandler):
         return self._json(200, {"code": mode})
 
 
+def _rows_in_order(rows, *_args, **_kwargs):
+    """The spend order with nothing held and the rows' own order."""
+    return list(range(len(list(rows or ())))), {}
+
+
 class FakeVendorCase(unittest.TestCase):
-    """One local vendor per test, plus the token sweep every subclass runs."""
+    """One local vendor per test, plus the token sweep every subclass runs.
+
+    THE OWNER'S SPEND ORDER HAS ITS OWN ARMS (`SpendOrderTest`,
+    `SpendOrderPassTest`). The arms here pin the wire, the ledger and the
+    identity binding, and they decide a lone Pro wall on its own merits, so
+    they run under an order that keeps the rows' order and holds nothing.
+    A class that sets `REAL_ORDER` runs the shipped order."""
+
+    REAL_ORDER = False
 
     def setUp(self):
+        if not self.REAL_ORDER:
+            order = mock.patch.object(codexresets, "spend_order",
+                                      side_effect=_rows_in_order)
+            order.start()
+            self.addCleanup(order.stop)
         # REALPATH, because the event-ledger primitive refuses a parent
         # reached through a symlink — and a temp root can be one.
         self.tmp = os.path.realpath(
@@ -669,14 +692,14 @@ class DecisionTableTest(unittest.TestCase):
              codexresets.NO_ACT, codexresets.R_UNKNOWN_READING),
             ("a week with room left", dict(row=healthy, credits=self.LISTED),
              codexresets.NO_ACT, codexresets.R_NOT_EXHAUSTED),
-            ("a wall the vendor calls a depleted member balance",
+            ("a workspace member-credits wall, which a reset lifts",
              dict(row=reading(reached="workspace_member_credits_depleted"),
                   credits=self.LISTED),
-             codexresets.NO_ACT, codexresets.R_CREDITS_DEPLETED),
-            ("a wall the vendor calls a depleted owner balance",
+             codexresets.CONSUME, codexresets.R_READY),
+            ("a workspace owner-credits wall, which a reset lifts",
              dict(row=reading(reached="workspace_owner_credits_depleted"),
                   credits=self.LISTED),
-             codexresets.NO_ACT, codexresets.R_CREDITS_DEPLETED),
+             codexresets.CONSUME, codexresets.R_READY),
             ("a wall the vendor calls something this helm does not know",
              dict(row=reading(reached="quota_moon_phase"),
                   credits=self.LISTED),
@@ -747,6 +770,13 @@ class DecisionTableTest(unittest.TestCase):
                                     codexresets.NATURAL_RESET_FLOOR_S + 60),
                         credits=self.LISTED)
         self.assertEqual(d.action, codexresets.CONSUME)
+
+    def test_a_cached_reset_interval_is_aged_before_spending(self):
+        d = self.decide(row=reading(weekly_resets_in=61 * 60),
+                        age=59 * 60, credits=self.LISTED)
+        self.assertEqual((d.action, d.reason),
+                         (codexresets.NO_ACT,
+                          codexresets.R_NATURAL_RESET_NEAR))
 
     def test_the_natural_reset_floor_is_an_hour_and_the_arm_says_so(self):
         # LITERAL SECONDS, NOT THE CONSTANT. A floor arm deriving its
@@ -1620,36 +1650,40 @@ class WorkspaceIdentityTest(WorkspaceIdentityBase):
 
 
 class CreditsDepletedTest(FakeVendorCase):
-    """WHY IT IS WALLED. A rate-limit reset credit lifts a RATE-LIMIT wall.
-    `workspace_member_credits_depleted` and `workspace_owner_credits_depleted`
-    are states of the workspace's CREDIT balance, and whether the vendor would
-    even accept a reset against one is UNVERIFIED — it cannot be verified
-    without spending the owner's asset to ask, which is why this refuses."""
+    """WHY IT IS WALLED. `workspace_member_credits_depleted` and
+    `workspace_owner_credits_depleted` name the workspace's credit balance,
+    and a reset is MEASURED to lift them: three Team members walled at 100%
+    weekly on `workspace_owner_credits_depleted` were each redeemed one
+    credit, and the next usage read put all three at 0% with no reached
+    type. They are taken like a rate-limit wall."""
 
     def test_the_recorded_team_body_is_a_credits_depleted_wall(self):
-        """The fixture really is that world, so the refusal below is about the
+        """The fixture really is that world, so the arm below is about the
         reached type rather than about an invented body."""
         row = reading("team")
         self.assertEqual(row["reached_type"],
                          "workspace_owner_credits_depleted")
         self.assertEqual(codexresets.weekly_window(row)["used_percent"], 100)
+        self.assertEqual(codexresets.wall_kind(row["reached_type"]),
+                         codexresets.WALL_CREDIT_BALANCE)
 
-    def test_a_credits_depleted_wall_is_never_offered_a_reset(self):
+    def test_a_credits_depleted_wall_is_taken_like_a_rate_limit_wall(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a two-element constant, so both reset outcomes and both request sequences are asserted
         for kind in codexresets.CREDITS_DEPLETED_TYPES:
             with self.subTest(reached=kind):
+                ResetHandler.seen = []
                 out = codexresets.reset_pass(
                     [reading(reached=kind)], reading_age_s=0.0,
                     url_base=self.base,
                     accounts=[account_of(reading(reached=kind))],
-                    ledger=self.ledger)
-                self.assertEqual(out[0]["reason"],
-                                 codexresets.R_CREDITS_DEPLETED)
-        self.assertEqual(ResetHandler.seen, [],
-                         "not even the balance is read for a wall a credit "
-                         "cannot lift")
-        codexresets.list_credits(self.account, url_base=self.base)
-        self.assertTrue(ResetHandler.seen,
-                        "must-hit: the recorder fills when it is called")
+                    ledger=os.path.join(self.tmp, "%s.jsonl" % kind),
+                    probe=lambda _a: reading(weekly_pct=0))
+                self.assertEqual((out[0]["reason"], out[0]["outcome"]),
+                                 (codexresets.R_READY,
+                                  codexresets.OUTCOME_RESET))
+                self.assertEqual([r["path"] for r in ResetHandler.seen],
+                                 [codexresets.LIST_PATH,
+                                  codexresets.CONSUME_PATH,
+                                  codexresets.LIST_PATH])
 
     def test_control_a_plain_rate_limit_wall_is_still_taken(self):
         """MUST-HIT through the identical call: the recorded pro body is
@@ -2656,6 +2690,524 @@ class SurfaceTest(unittest.TestCase):
                       "docs/VERBS.md quotes a dry-run line the verb does not "
                       "print")
 
+RATE = 73e6
+
+
+def pace_for(rows_weeks, rate=RATE):
+    """A runway pace: the fleet's token rate and each row's week, given in
+    HOURS of that rate, keyed as the runway keys a member."""
+    return {"tokens_per_hour": rate,
+            "week_tokens": {codexresets.pace_key(row): hours * rate
+                            for row, hours in rows_weeks}}
+
+
+#: The row a pass reports for a walled account whose OWN listing it read
+#: and measured at no spendable credit: the one answer that resolves it.
+LISTED_ZERO = {"action": codexresets.NO_ACT, "reason": codexresets.R_NO_CREDIT}
+
+
+class SpendOrderTest(unittest.TestCase):
+    """THE OWNER'S ORDER, PURE. A codex credit restarts its account's week,
+    so a Pro credit waits until it is the ONLY unblock option; a non-Pro one
+    is spent at empty; the least forfeited clock goes first. `settled` is
+    what the pass has already decided: a walled Team row holds every Pro
+    until its own listing resolves it."""
+
+    NOW = 2_000_000.0
+
+    def pro(self, **kw):
+        kw.setdefault("credits", 1)
+        return reading(**kw)                    # a Pro rate-limit wall, 119h
+
+    def team(self, **kw):
+        kw.setdefault("reached", "workspace_owner_credits_depleted")
+        kw.setdefault("credits", 0)
+        kw.setdefault("file", "codex-team-%s.json" % kw.get("weekly_resets_in"))
+        return reading("team", **kw)            # a Team wall at 100%, 134h
+
+    def order(self, rows, pace, settled=None):
+        return codexresets.spend_order(rows, pace, self.NOW, settled=settled)
+
+    def test_an_unknown_or_stale_rate_holds_a_pro_credit(self):  # noqa: VACUOUS_ASSERTION — each pace's hold sentence is an exact positive; the empty hold map is the measured-rate control
+        pro = self.pro()
+        for pace in (None, {"tokens_per_hour": None, "week_tokens": {}},
+                     {"tokens_per_hour": 0, "week_tokens": {}}):
+            with self.subTest(pace=pace):
+                _order, holds = self.order([pro], pace)
+                self.assertIn("token rate is unknown or stale", holds[0])
+        # THE CONTROL: a measured rate, and a lone walled Pro whose 30h week
+        # of burn ends before its own 119h reset, is the only option
+        _order, holds = self.order([pro], pace_for([(pro, 30)]))
+        self.assertEqual(holds, {})
+
+    def test_an_account_that_still_serves_comes_first(self):  # noqa: VACUOUS_ASSERTION — the hold names the serving account exactly; the empty map is the walled control
+        pro, serving = self.pro(), self.team(weekly_pct=60, reached=None)
+        _order, holds = self.order([pro, serving], pace_for([(pro, 30)]))
+        self.assertIn("first: a Team account at 60% still serves", holds[0])
+        self.assertIn("Pro credit held until it is the only unblock option",
+                      holds[0])
+        # THE CONTROL: the same account walled, and measured at no credit by
+        # its own listing, leaves the Pro the only option
+        walled = self.team()
+        _order, holds = self.order([pro, walled], pace_for([(pro, 30)]),
+                                   settled={1: LISTED_ZERO})
+        self.assertEqual(holds, {})
+
+    def test_a_non_pro_credit_comes_first_and_is_decided_first(self):
+        pro, team = self.pro(), self.team(credits=1)
+        pace = pace_for([(pro, 30), (team, 1.6)])
+        order, holds = self.order([pro, team], pace)
+        self.assertEqual(order, [1, 0],
+                         "the Team credit forfeits less clock and goes first")
+        self.assertNotIn(1, holds, "a non-Pro credit is never held")
+        # the pass spent it: an unblock option that came first
+        spent = {"action": codexresets.CONSUME, "reason": codexresets.R_READY}
+        _order, holds = self.order([pro, team], pace, settled={1: spent})
+        self.assertIn("first: a Team account's reset credit, spent at empty "
+                      "in this pass (team@fixture.invalid)", holds[0])
+        # ready, and deferred by the one-per-pass budget: it still comes first
+        deferred = {"action": codexresets.NO_ACT,
+                    "reason": codexresets.R_PASS_BUDGET}
+        _order, holds = self.order([pro, team], pace, settled={1: deferred})
+        self.assertIn("first: a Team account's reset credit, ready at empty "
+                      "and deferred to the next pass", holds[0])
+
+    def test_a_walled_team_holds_every_pro_until_its_listing_resolves_it(self):  # noqa: VACUOUS_ASSERTION — the first hold sentence is an unconditional exact positive on the same map the closing empty-map control reads, and the subTest loop runs over a literal four-tuple
+        """The Team's cached count reads 0 and is never asked. Only its own
+        listing, read when the pass decides it, resolves it."""
+        pro, team = self.pro(), self.team()
+        pace = pace_for([(pro, 30)])
+        _order, holds = self.order([pro, team], pace)
+        self.assertIn("first: an empty Team account (team@fixture.invalid) "
+                      "that this pass has not resolved (not yet decided)",
+                      holds[0])
+        for reason in (codexresets.R_CREDITS_UNREAD, codexresets.R_COOLDOWN,
+                       codexresets.R_LEDGER_UNKNOWN,
+                       codexresets.R_RUNG_ERROR):
+            with self.subTest(reason=reason):
+                _order, holds = self.order(
+                    [pro, team], pace,
+                    settled={1: {"action": codexresets.NO_ACT,
+                                 "reason": reason}})
+                self.assertIn("has not resolved (%s)" % reason, holds[0])
+        # an unknown rate does not hide the row the owner can act on
+        _order, holds = self.order([pro, team], None)
+        self.assertIn("(team@fixture.invalid)", holds[0])
+        # THE CONTROL: its own listing measured no credit, and nothing else
+        # comes first
+        _order, holds = self.order([pro, team], pace,
+                                   settled={1: LISTED_ZERO})
+        self.assertEqual(holds, {})
+        # a credential that does not bind is RESOLVED as unusable: a credit
+        # helm cannot list it cannot spend, so it is never the unblock
+        for reason in (codexresets.R_NO_CREDENTIAL,
+                       codexresets.R_AMBIGUOUS_CREDENTIAL):
+            with self.subTest(unusable=reason):
+                _order, holds = self.order(
+                    [pro, team], pace,
+                    settled={1: {"action": codexresets.NO_ACT,
+                                 "reason": reason}})
+                self.assertEqual(holds, {})
+
+    def test_a_natural_reset_inside_the_week_of_burn_comes_first(self):  # noqa: VACUOUS_ASSERTION — both holds name the reset and the week exactly; the empty map is the later-reset control
+        pro = self.pro()
+        soon = self.team(weekly_resets_in=10 * 3600)
+        _order, holds = self.order([pro, soon], pace_for([(pro, 30)]),
+                                   settled={1: LISTED_ZERO})
+        self.assertIn("first: a Team account's natural reset in 10h, inside "
+                      "this credit's 30h week of burn at 73M tokens/h",
+                      holds[0])
+        # its OWN natural reset inside its week of burn comes first too
+        own = self.pro(weekly_resets_in=20 * 3600)
+        _order, holds = self.order([own], pace_for([(own, 30)]))
+        self.assertIn("first: its own natural reset in 20h", holds[0])
+        # THE CONTROL: the reset lands after the week of burn
+        later = self.team(weekly_resets_in=40 * 3600)
+        _order, holds = self.order([pro, later], pace_for([(pro, 30)]),
+                                   settled={1: LISTED_ZERO})
+        self.assertEqual(holds, {})
+
+    def test_a_hold_states_what_a_spend_now_would_net(self):
+        pro = self.pro()
+        serving = self.team(weekly_pct=60, reached=None)
+        _order, holds = self.order([pro, serving], pace_for([(pro, 30)]))
+        # a 30h week spent 119h before its reset nets 30 x 119/168 = ~21h
+        self.assertIn("spent now it would net ~21h of fleet burn (its 30h "
+                      "week x 119h/168)", holds[0])
+
+    def test_the_least_forfeited_clock_goes_first(self):
+        near = self.team(credits=1, weekly_resets_in=20 * 3600,
+                         reached="rate_limit_reached")
+        far = self.team(credits=1, weekly_resets_in=130 * 3600,
+                        reached="rate_limit_reached")
+        order, holds = self.order([near, far],
+                                  pace_for([(near, 2), (far, 2)]))
+        self.assertEqual(order, [1, 0],
+                         "a week spent 130h out forfeits less than one "
+                         "spent 20h out")
+        self.assertEqual(holds, {})
+        # an unknown forfeit keeps its place AFTER the known ones
+        order, _holds = self.order([near, far], pace_for([(far, 2)]))
+        self.assertEqual(order, [1, 0])
+
+    def test_a_non_pro_credit_is_never_held_without_a_pace(self):  # noqa: VACUOUS_ASSERTION — the order [0] is exact and an empty hold map is the law under test; the Pro arms above prove the same call does hold
+        team = self.team(credits=1)
+        order, holds = self.order([team], None)
+        self.assertEqual((order, holds), ([0], {}))
+
+    def test_an_unknown_plan_is_held_as_pro_until_classified(self):
+        row = self.pro()
+        row["plan"] = "new-vendor-tier"
+        _order, holds = self.order([row], None)
+        self.assertIn(0, holds,
+                      "an unknown tier must not inherit Team's cheap-credit rule")
+
+    def test_a_reset_exactly_at_the_week_boundary_holds_pro(self):
+        pro = self.pro()
+        boundary = self.team(weekly_resets_in=30 * 3600)
+        _order, holds = self.order([pro, boundary], pace_for([(pro, 30)]),
+                                   settled={1: LISTED_ZERO})
+        self.assertIn("natural reset in 30h", holds[0])
+
+    def test_cached_reset_times_are_aged_in_the_spend_order(self):
+        pro = self.pro()
+        boundary = self.team(weekly_resets_in=30 * 3600 + 59 * 60)
+        _order, holds = codexresets.spend_order(
+            [pro, boundary], pace_for([(pro, 30)]), self.NOW,
+            reading_age_s=59 * 60, settled={1: LISTED_ZERO})
+        self.assertIn("natural reset in 30h", holds[0])
+
+    def test_every_non_pro_row_is_decided_before_a_pro_one(self):  # noqa: VACUOUS_ASSERTION — each assertEqual compares the whole (order, holds) pair, and the order [0, 1] is an exact positive
+        """Only a walled Team row's listing, read when the row is DECIDED,
+        resolves it, and the Pro is asked about only after that. So the
+        Team row is decided first, whatever its forfeit."""
+        pro = self.pro()
+        team = self.team()                      # usage count 0, no weight
+        order, holds = self.order([team, pro], pace_for([(pro, 30)]),
+                                  settled={0: LISTED_ZERO})
+        self.assertEqual((order, holds), ([0, 1], {}),
+                         "an unknown Team forfeit still comes before a Pro")
+        # a KNOWN Team forfeit (12h week, 35h out: ~9.5h) larger than the
+        # Pro's (30h week, 119h out: ~8.8h) does not put the Pro first either
+        late = self.team(weekly_resets_in=35 * 3600)
+        order, holds = self.order([late, pro],
+                                  pace_for([(pro, 30), (late, 12)]),
+                                  settled={0: LISTED_ZERO})
+        self.assertEqual((order, holds), ([0, 1], {}))
+
+
+class SpendOrderPassTest(FakeVendorCase):
+    """THE SHIPPED ORDER THROUGH THE REAL PASS: its default pace is the codex
+    runway snapshot, a HOLD is local and sends nothing, and the manual door
+    is not bound by it."""
+
+    REAL_ORDER = True
+
+    def pass_(self, rows, accounts=None, **kw):
+        kw.setdefault("probe", lambda _a: reading(weekly_pct=0))
+        kw.setdefault("ledger", self.ledger)
+        return codexresets.reset_pass(
+            rows, reading_age_s=0.0, url_base=self.base,
+            accounts=accounts or [account_of(r) for r in rows], **kw)
+
+    def test_a_lone_pro_wall_with_no_pace_is_held_and_sends_nothing(self):  # noqa: VACUOUS_ASSERTION — the HOLD row is an exact positive and the control through the same call sends and resets
+        pro = reading(credits=1)
+        row, = self.pass_([pro])
+        self.assertEqual((row["action"], row["reason"]),
+                         (codexresets.HOLD, codexresets.R_HOLD_PRO))
+        self.assertIn("token rate is unknown or stale", row["detail"])
+        self.assertEqual(ResetHandler.seen, [], "a HOLD is local")
+        self.assertEqual(self.ledger_rows(), [])
+        # THE CONTROL through the same call: a pace under which it is the
+        # only unblock option spends it
+        row, = self.pass_([pro], pace=pace_for([(pro, 30)]))
+        self.assertEqual(row["outcome"], codexresets.OUTCOME_RESET)
+
+    def test_a_zero_cached_pro_balance_cannot_bypass_the_hold(self):
+        pro = reading(credits=0)
+        serving = reading("team", weekly_pct=60, reached=None)
+        rows = self.pass_([pro, serving],
+                          pace=pace_for([(pro, 30)]))
+        by = {r["account"]: r for r in rows}
+        self.assertEqual(by[pro["email"]]["action"], codexresets.HOLD)
+        self.assertIn("still serves", by[pro["email"]]["detail"])
+        self.assertEqual(ResetHandler.seen, [],
+                         "the authoritative listing must not reopen a held Pro")
+
+    def test_the_default_pace_is_the_runway_snapshot(self):
+        from helm import codexpace
+        pro = reading(credits=1)
+        codexpace.write_snapshot({
+            "v": codexpace.V, "ts": time.time(),
+            "fleet": {"tokens_per_hour": RATE},
+            "accounts": [{"member": codexresets.pace_key(pro),
+                          "tokens_per_pct": 30 * RATE / 100.0}]})
+        row, = self.pass_([pro])
+        self.assertEqual(row["outcome"], codexresets.OUTCOME_RESET)
+        # a STALE snapshot is no pace, and the same pass holds
+        codexpace.write_snapshot({
+            "v": codexpace.V, "ts": time.time() - 3 * 3600,
+            "fleet": {"tokens_per_hour": RATE},
+            "accounts": [{"member": codexresets.pace_key(pro),
+                          "tokens_per_pct": 30 * RATE / 100.0}]})
+        row, = self.pass_([reading(credits=1)],
+                          ledger=os.path.join(self.tmp, "second.jsonl"))
+        self.assertEqual(row["action"], codexresets.HOLD)
+
+    def test_the_manual_door_is_not_bound_by_the_order(self):
+        pro = reading(credits=1)
+        row, = self.pass_([pro], source=codexresets.MANUAL, pace=None)
+        self.assertEqual(row["outcome"], codexresets.OUTCOME_RESET)
+
+    # THE FOUR FALSIFIERS OF THE BAR: no Pro spend until every cheaper
+    # eligible row is authoritatively resolved. Each arm walls a Pro that
+    # holds a credit beside a walled Team, under a pace that on its own
+    # releases the Pro (its 30h week of burn ends long before either natural
+    # reset). Only the Team's own listing, read when the pass decides it,
+    # resolves the Team; its cached usage count never does.
+
+    def pro_beside_team(self, name, listing=None, cached=0, plan=None,
+                        team_accounts=None, **kw):
+        """(team row, pro row) from one pass on its own ledger. The Team's
+        listing answers `listing` credits, or, when that is None,
+        `ResetHandler.list_mode`. `team_accounts(team)` gives the pooled
+        records that serve the Team; by default its own, on TOKEN_B."""
+        ResetHandler.seen = []
+        pro = reading(credits=1)
+        if plan is not None:
+            pro["plan"] = plan
+        team = reading("team", credits=cached)
+        ResetHandler.balances = {TOKEN_A: 1}
+        if listing is not None:
+            ResetHandler.balances[TOKEN_B] = listing
+        serving = (team_accounts or (lambda t: [account_of(t, TOKEN_B)]))
+        rows = self.pass_([team, pro],
+                          accounts=serving(team) + [account_of(pro, TOKEN_A)],
+                          pace=pace_for([(pro, 30)]),
+                          ledger=os.path.join(self.tmp, name + ".jsonl"),
+                          **kw)
+        by = {r["account"]: r for r in rows}
+        return by[team["email"]], by[pro["email"]]
+
+    def consumed_with(self):
+        return [r["auth"] for r in self.consume_requests()]
+
+    def test_a_positive_team_listing_spends_the_team_and_holds_the_pro(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a literal two-tuple, and each arm asserts the Team's reset and the one Team consume as exact positives
+        """The usage count says the walled Team holds 0; its listing says 1.
+        The Team credit is spent, and the Pro is HELD: a credit spent this
+        pass is an unblock option that comes first. A deferral by the
+        one-per-pass budget is not a hold, and a budget of two proves it."""
+        for budget in (1, 2):
+            with self.subTest(budget=budget), mock.patch.object(
+                    codexresets, "MAX_CONSUMES_PER_PASS", budget):
+                team, pro = self.pro_beside_team("positive-%d" % budget,
+                                                 listing=1)
+                self.assertEqual(team["outcome"], codexresets.OUTCOME_RESET)
+                self.assertEqual((pro["action"], pro["reason"]),
+                                 (codexresets.HOLD, codexresets.R_HOLD_PRO))
+                self.assertIn("a Team account's reset credit", pro["detail"])
+                self.assertEqual(self.consumed_with(), ["Bearer " + TOKEN_B],
+                                 "the Team credit is spent, the Pro is not")
+
+    def test_a_measured_zero_team_listing_releases_the_pro(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a literal two-tuple, and each arm asserts the Pro's reset and its one consume as exact positives
+        """The Team's listing measured no spendable credit, so the Team is
+        resolved, and the Pro is the only unblock option. The Team's cached
+        count does not decide it either way: a cached 1 that the listing
+        measures at 0 releases the Pro too."""
+        for cached in (0, 1):
+            with self.subTest(cached=cached):
+                team, pro = self.pro_beside_team("zero-%d" % cached,
+                                                 listing=0, cached=cached)
+                self.assertEqual(team["reason"], codexresets.R_NO_CREDIT)
+                self.assertEqual(pro["outcome"], codexresets.OUTCOME_RESET)
+                self.assertEqual(self.consumed_with(), ["Bearer " + TOKEN_A])
+
+    def test_an_unread_team_listing_holds_the_pro(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a literal four-tuple; the empty consume list is paired with the exact HOLD row and the one Team listing on the same fake
+        """The Team's cached count is 0 and its listing cannot be read: an
+        error, a refusal, a body helm cannot parse, a timeout. The Team is
+        unresolved, and the Pro HOLDS, naming the Team and why."""
+        ResetHandler.delay = 1.0
+        for mode in ("500", "429", "malformed", "slow"):
+            with self.subTest(listing=mode):
+                ResetHandler.list_mode = mode
+                team, pro = self.pro_beside_team("unread-" + mode,
+                                                 timeout=0.3)
+                self.assertEqual(team["reason"], codexresets.R_CREDITS_UNREAD)
+                self.assertEqual((pro["action"], pro["reason"]),
+                                 (codexresets.HOLD, codexresets.R_HOLD_PRO))
+                self.assertIn(team["account"], pro["detail"])
+                self.assertIn(codexresets.R_CREDITS_UNREAD, pro["detail"])
+                self.assertEqual(self.consume_requests(), [])
+                self.assertEqual(self.auths(codexresets.LIST_PATH),
+                                 ["Bearer " + TOKEN_B],
+                                 "a held Pro is not even listed")
+
+    def test_an_unbound_team_credential_is_unusable_and_releases_the_pro(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a literal two-tuple, and each arm asserts the Pro's reset, its one consume and the Team's named blocked line as exact positives
+        """A Team whose reading binds to no single pooled credential can be
+        neither listed nor spent, so it is never the unblock. It is RESOLVED
+        as unusable: the Pro is not held behind it, and the pass reports the
+        Team blocked, by name."""
+        def twins(team):
+            # two pooled records that both prove this member and neither
+            # of which carries the file the reading was probed from
+            return [dict(account_of(team, token), file=f, files=[f])
+                    for token, f in ((TOKEN_B, "codex-team-twin-b.json"),
+                                     (TOKEN_C, "codex-team-twin-c.json"))]
+        for why, serving in ((codexresets.R_NO_CREDENTIAL, lambda _t: []),
+                             (codexresets.R_AMBIGUOUS_CREDENTIAL, twins)):
+            with self.subTest(credential=why):
+                team, pro = self.pro_beside_team("unbound-" + why,
+                                                 team_accounts=serving)
+                self.assertEqual(team["reason"], why)
+                self.assertEqual(pro["outcome"], codexresets.OUTCOME_RESET)
+                self.assertEqual(self.consumed_with(), ["Bearer " + TOKEN_A])
+                notice = codexresets.pass_notice([team, pro])
+                self.assertIn(team["account"], notice)
+                self.assertIn(why, notice)
+
+    def test_a_cooling_team_holds_the_pro(self):
+        """A cool-down clears inside the pass window on its own, so a Team
+        in one stays UNRESOLVED and holds the Pro. The first pass spends the
+        Team's credit; the second finds the same wall inside its cool-down."""
+        team, pro = self.pro_beside_team("cooling", listing=1)
+        self.assertEqual(team["outcome"], codexresets.OUTCOME_RESET)
+        team, pro = self.pro_beside_team("cooling", listing=1)
+        self.assertEqual(team["reason"], codexresets.R_COOLDOWN)
+        self.assertEqual((pro["action"], pro["reason"]),
+                         (codexresets.HOLD, codexresets.R_HOLD_PRO))
+        self.assertIn("(%s)" % codexresets.R_COOLDOWN, pro["detail"])
+        self.assertIn(team["account"], pro["detail"])
+        self.assertEqual(self.auths(codexresets.CONSUME_PATH), [],
+                         "the second pass sends nothing")
+
+    def test_an_unknown_plan_is_held_as_pro_behind_an_unread_team(self):  # noqa: VACUOUS_ASSERTION — the empty consume list is followed by the control through the same helper, which must consume exactly once
+        """A plan helm cannot classify is Pro until classified, so it waits
+        for the Team like a Pro does."""
+        ResetHandler.list_mode = "500"
+        team, row = self.pro_beside_team("unknown-unread",
+                                         plan="new-vendor-tier")
+        self.assertEqual((row["action"], row["reason"]),
+                         (codexresets.HOLD, codexresets.R_HOLD_PRO))
+        self.assertIn(team["account"], row["detail"])
+        self.assertEqual(self.consume_requests(), [])
+        # THE CONTROL: beside a Team measured at zero it is the only unblock
+        # option, and it spends
+        ResetHandler.list_mode = "ok"
+        _team, row = self.pro_beside_team("unknown-zero", listing=0,
+                                          plan="new-vendor-tier")
+        self.assertEqual(row["outcome"], codexresets.OUTCOME_RESET)
+        self.assertEqual(self.consumed_with(), ["Bearer " + TOKEN_A])
+
+    def test_a_team_credit_is_spent_before_a_pro_one(self):
+        pro = reading(credits=1)
+        team = reading("team", credits=1)
+        accounts = [account_of(pro, TOKEN_A), account_of(team, TOKEN_B)]
+        rows = self.pass_([pro, team], accounts=accounts,
+                          pace=pace_for([(pro, 30), (team, 1.6)]))
+        by = {r["account"]: r for r in rows}
+        self.assertEqual(by[team["email"]]["outcome"],
+                         codexresets.OUTCOME_RESET)
+        self.assertEqual(by[pro["email"]]["action"], codexresets.HOLD)
+        self.assertIn("a Team account's reset credit", by[pro["email"]]["detail"])
+        self.assertEqual([r["auth"] for r in self.consume_requests()],
+                         ["Bearer " + TOKEN_B],
+                         "the one consume went out with the Team credential")
+        self.assertNoSecret(rows)
+
+    def test_the_dry_run_prints_hold_and_the_option_that_comes_first(self):  # noqa: VACUOUS_ASSERTION — the HOLD line, its reason and its first option are exact positives on the printed output
+        pro, serving = reading(credits=1), reading("team", weekly_pct=60,
+                                                   reached=None)
+        out = io.StringIO()
+        with mock.patch.object(codexbudget, "cached_budget",
+                               return_value=([pro, serving], 60.0)), \
+                mock.patch.object(codexresets, "_pool_accounts",
+                                  return_value=([account_of(pro),
+                                                 account_of(serving)], True)), \
+                mock.patch.object(codexresets, "pace_now",
+                                  return_value=pace_for([(pro, 30)])), \
+                mock.patch.dict(os.environ,
+                                {"HELM_CODEX_RESETS_BASE_URL": self.base}), \
+                mock.patch.object(codexresets, "_cooling_now",
+                                  return_value=None), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(codexresets._run_dry_run(), 0)
+        line, = [l for l in out.getvalue().splitlines()
+                 if l.lstrip().startswith(pro["email"])]
+        self.assertIn(codexresets.HOLD, line)
+        self.assertIn(codexresets.R_HOLD_PRO, line)
+        self.assertIn("first: a Team account at 60% still serves", line)
+        self.assertEqual(self.consume_requests(), [])
+
+
+class AfterReadLagTest(unittest.TestCase):
+    """A usage read taken right after a redemption can lag the vendor
+    (measured: two of three read 100% right after, 0% on the next read), so
+    the result line says an unmoved after-read is early."""
+
+    ROW = {"account": "team@fixture.invalid", "outcome": None,
+           "weekly_pct": 100.0, "after_weekly_pct": 100.0,
+           "spendable_after": 0}
+
+    def test_an_unmoved_after_read_is_said_to_be_early(self):
+        row = dict(self.ROW, outcome=codexresets.OUTCOME_RESET)
+        line = codexresets.result_line(row)
+        self.assertIn("RESET (100% used -> 100% used, a read taken this soon "
+                      "can lag the vendor; the next pass re-reads it)", line)
+        self.assertIn("1 credit spent, 0 left", line)
+        # THE CONTROL: an after-read that moved says nothing about lag
+        moved = codexresets.result_line(dict(row, after_weekly_pct=0.0))
+        self.assertIn("RESET (100% used -> 0% used); 1 credit spent", moved)
+        self.assertNotIn("lag", moved)
+
+
+class RunwayLineTest(unittest.TestCase):
+    """`helm codex resets` prints the runway line `helm burn` prints, so the
+    held credits are valued against the horizon on the verb that lists them."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-codexresets-runway-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        env = mock.patch.dict(os.environ,
+                              {"HELM_HOME": os.path.join(self.tmp, "home")})
+        env.start()
+        self.addCleanup(env.stop)
+
+    ROW = {"account": "you@example.com", "member": "m", "state": "ok",
+           "spendable": 1, "weekly_pct": 37.0, "reset_in_s": 306000,
+           "status": codexresets.LIST_OK, "note": None, "available": 1,
+           "total_earned": 1, "expires": []}
+    CAUSE = ("codex runway 54h is under the 85h horizon; +1 Pro reset credit "
+             "held: it cannot help before Monday's reset without forfeiting "
+             "it; worth ~32h after")
+
+    def run_verb(self, dry):
+        out = io.StringIO()
+        with mock.patch.object(codexresets, "_listing_rows",
+                               return_value=([dict(self.ROW)], None, None,
+                                             None)), \
+                mock.patch.object(codexbudget, "cached_budget",
+                                  return_value=([], 60.0)), \
+                mock.patch.object(codexresets, "_cooling_now",
+                                  return_value=None), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = codexresets._run_dry_run() if dry else codexresets._run_list()
+        self.assertEqual(rc, 0)
+        return out.getvalue()
+
+    def test_the_listing_and_the_dry_run_print_the_runway_line(self):  # noqa: VACUOUS_ASSERTION — both loops run over a literal two-tuple, so every assertion inside them runs
+        from helm import codexpace
+        for dry in (False, True):
+            self.assertIn("codex runway: not measured", self.run_verb(dry))
+        codexpace.write_snapshot({"v": codexpace.V, "ts": time.time(),
+                                  "verdict": "short", "cause": self.CAUSE})
+        for dry in (False, True):
+            with self.subTest(dry=dry):
+                out = self.run_verb(dry)
+                self.assertIn("codex runway [short, read", out)
+                self.assertIn(self.CAUSE, out)
+
+
 class CliDoorTest(unittest.TestCase):
     def test_the_manual_door_refuses_to_pick_an_account(self):
         err = io.StringIO()
@@ -2663,6 +3215,16 @@ class CliDoorTest(unittest.TestCase):
             rc = codexresets.cmd_resets(["--consume"])
         self.assertEqual(rc, 2)
         self.assertIn("wants a value", err.getvalue())
+
+    def test_dry_run_cannot_be_combined_with_the_spending_door(self):
+        err = io.StringIO()
+        with mock.patch.object(codexresets, "_run_consume",
+                               side_effect=AssertionError("spent")), \
+                contextlib.redirect_stderr(err):
+            rc = codexresets.cmd_resets(
+                ["--dry-run", "--consume", "account@example.com"])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot be combined", err.getvalue())
 
     def test_junk_refuses_through_the_real_verb(self):
         # Through `cli.main`, so the arm covers the codex dispatcher's wiring

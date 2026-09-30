@@ -22,8 +22,8 @@ import time
 import unittest
 from unittest import mock
 
-from helm import (fabgate, foldcheck, gate, gateimport, gateslice, gatewindow,
-                  landgate, vcs)
+from helm import (autoland, fabgate, foldcheck, gate, gateimport, gateslice,
+                  gatewindow, landgate, vcs)
 from helm.work import _gc
 from tests._gate_supervisor import require_supervisor
 from tests.test_gate import GateBase
@@ -121,6 +121,23 @@ class MintTest(SliceFixture):
         self.assertIsNone(gate.row_refusal(row, consuming_repo=self.repo))
         state, rid, why = gate.bind("gate:%s" % row["id"], self.head)
         self.assertEqual((state, rid), ("VERIFIED", row["id"]), why)
+
+    def test_a_receipt_minted_before_the_load_recorder_still_reads(self):
+        """The runner file set grew by helm/gateloads.py (task/3039 lane 2).
+        A stored receipt names the files IT ran, so the set it carries is
+        read if it is this helm's or the one before; any other refuses."""
+        row = self.minted()
+
+        def before(r):
+            files = r["slice_authority"]["runner"]["files"]
+            files[:] = [f for f in files if f["path"] != "helm/gateloads.py"]
+        older = self.edited(row, before)
+        self.assertEqual(len(older["slice_authority"]["runner"]["files"]),
+                         len(gate.SLICE_RUNNER_FILES) - 1)
+        self.assertIsNone(gate.slice_refusal(older))
+        stray = self.edited(
+            row, lambda r: r["slice_authority"]["runner"]["files"].pop())
+        self.assertIn("runner record", gate.slice_refusal(stray))
 
     def test_evidence_that_disagrees_with_the_protocol_mints_nothing(self):
         row, err = self.mint(self.evidence(outcome=dict(
@@ -647,7 +664,9 @@ class ReaderTest(SliceFixture):
         row = self.minted()
 
         def swap(r):
-            r["slice_authority"]["runner"]["files"][2]["blob"] = "0" * 40
+            files = r["slice_authority"]["runner"]["files"]
+            next(f for f in files
+                 if f["path"] == "helm/gateslice.py")["blob"] = "0" * 40
         self.assertRefused(self.edited(row, swap),
                            "runner file helm/gateslice.py is not the blob")
 
@@ -698,6 +717,20 @@ class ReaderTest(SliceFixture):
         self.assertNotEqual(gate._receipt_id(tampered), tampered["id"])
         ids = [r["id"] for r in gate.receipts()[0]]
         self.assertEqual(ids.count(row["id"]), 1)
+
+    def test_the_planned_count_auto_land_reads_is_the_one_the_id_binds(self):
+        """Auto-land compares two receipts' planned counts (task/3613). The
+        count it reads off a minted row is the runner's own, and the row's
+        content id binds it: a moved count is a different receipt."""
+        row = self.minted()
+        planned = row["slice_authority"]["planned"]
+        self.assertEqual(autoland.planned_count(row), (planned, None))
+        moved = copy.deepcopy(row)
+        moved["slice_authority"]["planned"] = planned + 1
+        self.assertNotEqual(gate._receipt_id(moved), row["id"])
+        plain = dict(row, v=4)
+        plain.pop("slice_authority")
+        self.assertIsNone(autoland.planned_count(plain)[0])
 
     def test_the_kind_carries_the_serial_ladder_and_not_the_sharded_rung(self):
         keys = gate.receipt_version_keys(gate.SLICE_VERSION)

@@ -756,6 +756,9 @@ class ResolvedRouteReachesEverySurfaceTest(unittest.TestCase):
             "base_url": "https://api.deepseek.com/v1"}
 
     def setUp(self):
+        # ds4pro as ONE alias on TWO vendors: the two routes these arms render
+        from tests._two_route_catalog import patch_two_routes
+        patch_two_routes(self)
         self.tmp = tempfile.mkdtemp(prefix="helm-test-resolved-")
         self.prior = {k: os.environ.get(k) for k in ENV_KEYS}
         for k in ENV_KEYS:
@@ -988,9 +991,9 @@ class WeakRungDoesNotWearAStrongFamilysNameTest(unittest.TestCase):
 
     PRO_FAMILY = "ds4pro"        # noqa: SEAT_NAME — the catalog family under test
     WEAK_FAMILY = "ds4flash"     # noqa: SEAT_NAME — the catalog family under test
-    FLASH = {"alias": "deepseek-v4-flash", "provider": "openrouter",  # noqa: SEAT_NAME — the catalog's own provider block name
-             "upstream_model": "deepseek/deepseek-v4-flash",
-             "base_url": "https://openrouter.ai/api/v1"}
+    FLASH = {"alias": "deepseek-v4-flash", "provider": "opencode-go",
+             "upstream_model": "deepseek-v4.1-flash",
+             "base_url": "https://opencode.ai/zen/go/v1"}
 
     def test_the_flash_route_no_longer_resolves_to_the_pro_family(self):
         from helm import seat
@@ -998,10 +1001,10 @@ class WeakRungDoesNotWearAStrongFamilysNameTest(unittest.TestCase):
         self.assertIsNone(err, err)
         self.assertEqual(family, self.WEAK_FAMILY)
         self.assertNotEqual(family, self.PRO_FAMILY)
-        # CONTROL: both PRO routes still resolve to the pro family, so the
-        # split moved one route and did not break the family it left.
+        # CONTROL: the pro route still resolves to the pro family, so the
+        # split moved the flash route and did not break the family it left.
         pro = [r for r in seat.proxy_routes(self.PRO_FAMILY)]
-        self.assertEqual(len(pro), 2, pro)
+        self.assertEqual(len(pro), 1, pro)
         for route in pro:
             self.assertEqual(seat.proxy_route_family(route),
                              (self.PRO_FAMILY, None))

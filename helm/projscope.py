@@ -49,6 +49,12 @@ composition.
 
 A RAISE IS NEVER MEMOISED. `memo` stores only a value that was returned, so a
 transient failure is re-asked rather than frozen into the pass.
+
+A HELD RESOURCE DIES WITH THE CACHE THAT HOLDS IT (task/3056). `vcs` keeps one
+`git cat-file --batch-check` process per repository open for a scope and
+memoises it like any answer; `on_exit` is how that process is closed when the
+outermost scope ends, at the same instant the cache is dropped. Nothing held
+this way outlives the projection, which is the whole law above.
 """
 import threading
 import time
@@ -67,6 +73,8 @@ def _state():
         tls.deadlines = []
     if not hasattr(tls, "deadlines"):        # a thread that predates budgets
         tls.deadlines = []
+    if not hasattr(tls, "closers"):          # ...or that predates held resources
+        tls.closers = []
     return tls
 
 
@@ -146,6 +154,12 @@ class scope:
             t.depth = 0
             t.cache.clear()
             t.deadlines = []
+            closers, t.closers = t.closers, []
+            for close in reversed(closers):
+                try:
+                    close()
+                except Exception:           # noqa: BLE001 — see `on_exit`
+                    pass
         return False
 
 
@@ -204,6 +218,23 @@ def memo(key, compute):
         hit = compute()
         t.cache[key] = hit
     return hit
+
+
+def on_exit(close):
+    """Call `close()` when the OUTERMOST scope on this thread ends. -> bool
+
+    For a resource a scope HOLDS rather than an answer it caches: the thing is
+    opened by whatever first needs it inside the scope, and closed when the
+    cache that remembers it is dropped. Closers run newest first, and one that
+    raises is ignored: a scope's answer is already computed when it ends, and a
+    failed cleanup must neither replace the exception the scope is leaving on
+    nor turn a good answer into a raise. False, and nothing registered, outside
+    a scope, where nothing is held."""
+    t = _state()
+    if t.depth <= 0:
+        return False
+    t.closers.append(close)
+    return True
 
 
 def forget(key):

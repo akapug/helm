@@ -262,6 +262,27 @@ class FabGateBase(unittest.TestCase):
 
 
 class RequestIdentityTest(FabGateBase):
+    def test_attempt_is_an_int_from_two_up(self):
+        base = self.request()["identity"]
+        two, two_err = fabgate._identity_contract(dict(base, attempt=2))
+        self.assertIsNone(two_err, two_err)
+        self.assertEqual(json.loads(two)["attempt"], 2)
+        seven, seven_err = fabgate._identity_contract(dict(base, attempt=7))
+        self.assertIsNone(seven_err, seven_err)
+        self.assertEqual(json.loads(seven)["attempt"], 7)
+        one, one_err = fabgate._identity_contract(dict(base, attempt=1))
+        zero, zero_err = fabgate._identity_contract(dict(base, attempt=0))
+        flag, flag_err = fabgate._identity_contract(dict(base, attempt=True))
+        text, text_err = fabgate._identity_contract(dict(base, attempt="2"))
+        self.assertEqual(one_err, "attempt is not an integer of 2 or more")
+        self.assertIsNone(one)
+        self.assertEqual(zero_err, "attempt is not an integer of 2 or more")
+        self.assertIsNone(zero)
+        self.assertEqual(flag_err, "attempt is not an integer of 2 or more")
+        self.assertIsNone(flag)
+        self.assertEqual(text_err, "attempt is not an integer of 2 or more")
+        self.assertIsNone(text)
+
     def test_same_tree_scope_interpreter_and_runner_is_a_must_hit(self):
         first = self.request(queue_timeout=60, execution_timeout=600)
         second = self.request(queue_timeout=900, execution_timeout=1200)
@@ -1874,6 +1895,133 @@ class NodeMachineIdTest(FabGateBase):
             artifact, self.repo, authority, want_id=row["id"])
         self.assertIsNone(err)  # noqa: VACUOUS_ASSERTION — the imported verdict and id below are the positive control for the three refusals
         self.assertEqual((verdict, imported["id"]), ("imported", row["id"]))
+
+
+FAB_LAUNCHED_NOTHING = ("Fab launched nothing on node-a (exit 75, retry the "
+                        "submit): RETRY: the build stopped before the node "
+                        "registered the job")
+
+
+class TransportBuilder(FakeBuilder):
+    """A builder over fab's CLI transport, which answers a submit with the
+    process exit AND the event: `(exit, event)`. With `absent` it answers the
+    way `fab gate submit` does when the build stopped before the node
+    registered anything — fab-gate-job's emit_submit shape, field for field."""
+
+    def __init__(self, exit_code, absent=True, code="AUTHORITY_ABSENT",
+                 generation=None, pair=True):
+        super().__init__()
+        self.exit_code, self.absent, self.code = exit_code, absent, code
+        self.generation, self.pair = generation, pair
+        self.follows = 0
+
+    def submit(self, request):
+        if not self.absent:
+            return self.exit_code, super().submit(request)
+        self.submissions += 1
+        key = request["key"]
+        event = {"v": fabgate.EVENT_VERSION, "event": "gate-job",
+                 "disposition": "UNKNOWN",
+                 "handle": {"v": fabgate.HANDLE_VERSION, "key": key,
+                            "job_id": "gate-" + key, "host": "node-a",
+                            "generation": self.generation},
+                 "snapshot": {"state": "UNKNOWN", "exit": None,
+                              "exit_class": None, "artifact": None,
+                              "artifact_sha256": None, "receipt": None,
+                              "queue_elapsed_s": None,
+                              "execution_elapsed_s": None, "live": False,
+                              "reason": self.code},
+                 "reason": FAB_LAUNCHED_NOTHING,
+                 "request": copy.deepcopy(request)}
+        return (self.exit_code, event) if self.pair else event
+
+    def observe(self, handle):
+        self.follows += 1
+        return super().observe(handle)
+
+    def wait(self, handle, timeout):
+        self.follows += 1
+        return super().wait(handle, timeout)
+
+
+class LaunchedNothingTest(FabGateBase):
+    """FAB LAUNCHED NOTHING IS NOT DISPATCHED, AND IT IS DECIDED ONCE (task/3114).
+
+    `fabgate.not_dispatched` is the one reading of fab's absent-authority
+    answer; `submit` and the window's `dispatch` both ask it, so
+    `submit_and_follow` inherits it through `submit`. The near-miss arms are
+    the fail-closed half: anything short of the whole shape is today's
+    rejection, unchanged.
+    """
+
+    def test_submit_and_follow_on_fab_launching_nothing_follows_nothing(self):
+        builder, job = TransportBuilder(75), self.request()
+        out = io.StringIO()
+        result, err = fabgate.submit_and_follow(builder, job, self.repo,
+                                                out=out)
+        self.assertIsNone(result)
+        self.assertEqual(err, FAB_LAUNCHED_NOTHING)
+        self.assertIsInstance(err, fabgate.NotDispatched)
+        # NO FOLLOW: nothing was observed or waited on, and no detach report
+        # (no LOST handle, no join/kill/import commands) was printed.
+        self.assertEqual(builder.follows, 0)
+        self.assertEqual(out.getvalue(), "")
+        # ONE submit: the retry is the caller's, on its next pass.
+        self.assertEqual(builder.submissions, 1)
+        # CONTROL on the same observables: the same transport answering a
+        # real launch IS followed, and its loss prints the detach report.
+        control, out2 = TransportBuilder(75, absent=False), io.StringIO()
+        result2, err2 = fabgate.submit_and_follow(control, self.request(),
+                                                  self.repo, out=out2)
+        self.assertIsNone(err2)
+        self.assertTrue(result2["detached"])
+        self.assertGreater(control.follows, 0)
+        self.assertIn("CLIENT DETACHED", out2.getvalue())
+
+    def test_submit_reads_the_absent_shape_as_NOT_DISPATCHED(self):
+        builder, job = TransportBuilder(75), self.request()
+        admitted, err = fabgate.submit(builder, job)
+        self.assertIsNone(admitted)
+        self.assertEqual(err, FAB_LAUNCHED_NOTHING)
+        self.assertIsInstance(err, fabgate.NotDispatched)
+        # CONTROL: exit 75 over a real launch is admitted, as it always was.
+        admitted2, err2 = fabgate.submit(TransportBuilder(75, absent=False),
+                                         self.request())
+        self.assertIsNone(err2)
+        self.assertEqual(admitted2["disposition"], "LAUNCHED")
+
+    def test_every_near_miss_keeps_todays_rejection(self):  # noqa: VACUOUS_ASSERTION — the real-generation arm first admits on the same `admitted` observable, unconditionally, before the fixed three-row rejection table
+        # A REAL GENERATION is a named job, whatever the snapshot says: today
+        # that is an admitted UNKNOWN the caller follows, and it stays one.
+        gen = "run-%s-1-%s" % ("a" * 32, "b" * 16)
+        builder = TransportBuilder(75, generation=gen)
+        admitted, err = fabgate.submit(builder, self.request())
+        self.assertIsNone(err)
+        self.assertEqual((admitted["disposition"],
+                          admitted["handle"]["generation"]), ("UNKNOWN", gen))
+        near = (("null generation, TRANSIENT_AUTHORITY, exit 75",
+                 dict(exit_code=75, code="TRANSIENT_AUTHORITY")),
+                ("the absent shape on exit 94", dict(exit_code=94)),
+                ("the absent shape with no exit at all",
+                 dict(exit_code=75, pair=False)))
+        for name, kw in near:
+            with self.subTest(name):
+                builder, job = TransportBuilder(**kw), self.request()
+                admitted, err = fabgate.submit(builder, job)
+                self.assertIsNone(admitted)
+                self.assertNotEqual(err, FAB_LAUNCHED_NOTHING)
+                self.assertFalse(type(err).__name__ == "NotDispatched", err)
+                # today's sentence, then fab's own reason when it gave one
+                self.assertTrue(err.startswith((
+                    "Fab returned a handle without exact v2 safe identities",
+                    "Fab submit returned a malformed gate-job event")), err)
+
+    def test_exit_75_over_a_real_launch_is_admitted_as_today(self):
+        builder, job = TransportBuilder(75, absent=False), self.request()
+        admitted, err = fabgate.submit(builder, job)
+        self.assertIsNone(err)
+        self.assertEqual(admitted["disposition"], "LAUNCHED")
+        self.assertEqual(admitted["handle"]["job_id"], "gate-" + job["key"])
 
 
 if __name__ == "__main__":

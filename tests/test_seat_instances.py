@@ -36,10 +36,10 @@ class Slice6Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-slice6-")
         self._env = {k: os.environ.get(k) for k in
-                     ("HELM_HOME", "HELM_CODEX_ULTRA_SEATS", "MELD_HOME")}
+                     ("HELM_HOME", "HELM_CODEX_PRO_SEATS", "MELD_HOME")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ.pop("MELD_HOME", None)
-        os.environ.pop("HELM_CODEX_ULTRA_SEATS", None)
+        os.environ.pop("HELM_CODEX_PRO_SEATS", None)
         pin_suite_guard(self, self.tmp)
         os.makedirs(seat.seat_dir("codex"), exist_ok=True)
         os.makedirs(codexhomes.pool_dir(), exist_ok=True)
@@ -106,17 +106,17 @@ class LaunchLineInstanceTest(Slice6Base):
 
 class CapacityTest(Slice6Base):
     def test_pool_of_pro_and_team_folds_tiers(self):
-        self._pool_cred("cto", plan="pro")          # ultra -> 3
+        self._pool_cred("cto", plan="pro")          # pro   -> 3
         self._pool_cred("sitka", plan="team")       # team  -> 1
         self._pool_cred("ops", plan="team")         # team  -> 1
         cap = codexhomes.capacity()
         self.assertEqual(cap["total"], 5)
         by_tier = {c["tier"] for c in cap["creds"]}
-        self.assertEqual(by_tier, {"ultra", "team"})
+        self.assertEqual(by_tier, {"pro", "team"})
 
-    def test_env_override_moves_ultra_count(self):
+    def test_env_override_moves_pro_count(self):
         self._pool_cred("cto", plan="pro")
-        os.environ["HELM_CODEX_ULTRA_SEATS"] = "5"
+        os.environ["HELM_CODEX_PRO_SEATS"] = "5"
         self.assertEqual(codexhomes.capacity()["total"], 5)
 
     def test_disabled_and_unparseable_contribute_zero(self):

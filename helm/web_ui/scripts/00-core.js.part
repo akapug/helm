@@ -106,43 +106,60 @@ function toast(m, ms) {
 }
 
 /* ---------- nav (the predecessor's navtab pattern; helm is the default view) ---------- */
-const VIEWS = ["work", "chat", "quota", "roster", "sessions", "configs", "boxes", "history"];
+const VIEWS = ["home", "work", "flow", "pipeline", "backlog", "chat", "quota", "models", "roster", "sessions", "configs", "boxes", "history"];
 function canonView(v) {
   /* A RETIRED VIEW ID LANDS ON THE PAGE THAT TOOK IT OVER, so an old bookmark
-     hash or a saved helm.view keeps working. Each rename ships its migration:
+     hash keeps working. Each rename ships its migration:
      storage -> boxes; the overview helm -> board -> work, when the board, the
      work tab and the scheduler became one Work page; and ledger -> history,
      the signing ledger it now is. The map lives inside the function so the
      function is whole wherever it is lifted. */
   const moved = {storage: "boxes", helm: "work", board: "work",
-                 scheduler: "work", ledger: "history"};
+                 scheduler: "pipeline", ledger: "history"};
   return Object.prototype.hasOwnProperty.call(moved, v) ? moved[v] : v;
 }
-/* THE OLD TABS THAT BECAME SECTIONS OF A PAGE. canonView answers which PAGE
-   an old hash opens; this brings that tab's section into view, opened when it
-   is a fold. Called after showView, so the page is already shown. */
-function goOldSection(raw) {
-  const id = {scheduler: "schedfold"}[raw];
-  const el = id ? $("#" + id) : null;
-  if (!el) return null;
-  el.open = true;
-  el.scrollIntoView({block: "start"});
-  return id;
+/* WORK'S SECTIONS SPEAK ONE HASH (task/3445): #work/projects, then the one
+   Work page (task/3643) at #work/work, and its two pre-filtered entries,
+   #work/pipeline and #work/backlog; each carries its own state after a "?"
+   (#work/projects?q=&light=&open=helm&tab=team, #work/work?stage=review),
+   so a link opens a project at a tab or the page at a card. Every other
+   view is its own id, as it always was. `viewHash` is the path a view
+   writes; `hashView` reads one back into {v, path, query}, a bare or retired
+   id going through canonView. An old #scheduler bookmark opens the pipeline
+   grouped by who has it, which is what "who waits on whom" became. PURE. */
+function viewHash(v) {
+  const work = {work: "projects", flow: "work", pipeline: "pipeline", backlog: "backlog"};
+  return Object.prototype.hasOwnProperty.call(work, v) ? "work/" + work[v] : v;
+}
+function hashView(raw) {
+  const s = String(raw || ""), at = s.indexOf("?");
+  const path = at < 0 ? s : s.slice(0, at), query = at < 0 ? "" : s.slice(at + 1);
+  const sec = ["work", "flow", "pipeline", "backlog"].find(v => viewHash(v) === path);
+  if (path === "scheduler") return {v: "pipeline", path, query: "lens=list&group=move" + (query ? "&" + query : "")};
+  return {v: sec || canonView(path === "work/" ? "work" : path), path, query};
+}
+/* THE PAGE A VIEW IS DRAWN ON: Work's pipeline and backlog are entries into
+   the one Work page (task/3643), so they show its element. PURE. */
+function pageOf(v) {
+  return v === "pipeline" || v === "backlog" ? "flow" : v;
 }
 /* FOUR AREAS, the owner's words: "what if it was just work and history and
    history focuses on signing stuff" and "since chat already needs no sub menu,
    maybe board needs no submenu either and history just moves to the 4th item
    in the top level menu". This is a GROUPING, NOT A ROUTE: the keys are the
    view ids VIEWS carries, so canonView and every #hash still decide what
-   renders; an area only decides which section row is on screen. Work, Chat
-   and History are one page each and have no section row; Fleet keeps five.
+   renders; an area only decides which section row is on screen. Chat and
+   History are one page each and have no section row; Work has four
+   (projects, then the one Work page and its pipeline and backlog entries —
+   task/3445, task/3643) and Fleet six.
    Declaration ORDER is load-bearing: the first key of an area is the section
    that area opens on, which is why firstSection() can read it off this one map
    instead of a second list that would drift from it. */
 const AREA_OF = {
-  work: "work",
+  home: "home",
+  work: "work", flow: "work", pipeline: "work", backlog: "work",
   chat: "chat",
-  quota: "fleet", roster: "fleet", sessions: "fleet", configs: "fleet",
+  quota: "fleet", models: "fleet", roster: "fleet", sessions: "fleet", configs: "fleet",
   boxes: "fleet",
   history: "history"
 };
@@ -203,6 +220,45 @@ function publishNavHeight() {
 }
 window.addEventListener("resize", publishNavHeight);
 
+/* WHERE A LANDING PUTS THE WINDOW (task/3475): the target's top just below
+   the sticky navigation. `top` is the target's viewport top, `scrollY` the
+   window's scroll and `navH` the nav's measured height, so the target's page
+   top less the nav is the scroll that shows it right under it. PURE. */
+function landY(top, scrollY, navH) {
+  return Math.max(0, Math.round((top || 0) + (scrollY || 0) - (navH || 0)));
+}
+/* THE ELEMENT A VIEW LANDS ON: the open project on Work › projects, else
+   nothing, which is the page's own top (scrollY 0 is the page right under
+   the navigation). */
+function viewTarget(v) {
+  return v === "work" ? document.querySelector("#brows .brow.open") : null;
+}
+/* THE CLEARANCE A LANDING LEAVES under the navigation: the same 8 px every
+   in-page target's scroll-margin-top carries, so a landing and a
+   scrollIntoView put a heading in the same place. */
+const LAND_GAP = 8;
+/* LAND ON A TARGET, measured against the navigation's real height (a hard-
+   coded clearance is wrong the moment the nav wraps). `goTarget.at` keeps
+   where the window REALLY is after the landing, not the y asked for: a page
+   still too short clamps the scroll, and only the scroll it reached lets a
+   target drawn after the landing — a deep link's project arrives with the
+   board read — land again while the reader has not moved the page. */
+function goTarget(v, el) {
+  const navH = publishNavHeight();
+  const y = el && el.getBoundingClientRect
+    ? landY(el.getBoundingClientRect().top, window.scrollY,
+            navH == null ? null : navH + LAND_GAP) : 0;
+  window.scrollTo(0, y);
+  goTarget.at = {v: v, y: Math.round(window.scrollY)};
+  return goTarget.at.y;
+}
+
+/* THE ONE PLACE A NAV TAB BECOMES SELECTED: showView, and the Work page
+   when a filter turns it into another of its entries (`wkNavSync`); each
+   caller reveals the tab after it (`revealActiveTab`). */
+function navSelect(v) {
+  $$(".navtab").forEach(t => t.classList.toggle("on", t.dataset.v === v));
+}
 function showView(v) {
   /* the area comes FIRST: a section in a closed area is display:none, so the
      strip has to be open before the reveal below measures anything in it. */
@@ -211,16 +267,31 @@ function showView(v) {
   showView.cur = v;
   AREA_LAST[area] = v;
   $$(".navarea").forEach(b => b.classList.toggle("on", b.dataset.a === area));
+  // HOME HAS NO AREA BUTTON (task/3445): the brand is its way back
+  const brand = $("#brand");
+  if (brand) brand.classList.toggle("on", v === "home");
   $$(".navsec").forEach(s => s.classList.toggle("on", s.dataset.a === area));
-  $$(".navtab").forEach(t => t.classList.toggle("on", t.dataset.v === v));
+  navSelect(v);
+  // WORK'S ENTRIES SET THEIR FILTER before the address is written (task/3643)
+  if (pageOf(v) === "flow") wkShow(v);
   // AN AREA OF ONE PAGE HAS NO SECTION ROW, so the empty row is hidden rather
   // than left as a blank band under the areas
   const strip = $(".navtabs");
   if (strip) strip.classList.toggle("solo", !$$('.navsec[data-a="' + area + '"]').length);
-  $$(".view").forEach(p => p.classList.toggle("on", p.id === "view-" + v));
-  localStorage.setItem("helm.view", v);
-  if (location.hash !== "#" + v) history.replaceState(null, "", "#" + v);
+  $$(".view").forEach(p => p.classList.toggle("on", p.id === "view-" + pageOf(v)));
+  // A NEW PAGE LANDS ON ITS TARGET (task/3445 L1b, task/3475): the walk
+  // opened Work › backlog at scrollY 702-811, past its own header, because a
+  // page change kept the last page's scroll, and a link to an open project
+  // landed at 0 with the project 1,720 px down. Every page lands with its
+  // target (`viewTarget`, else its own top) right under the sticky
+  // navigation; showing the page already on screen moves nothing.
+  if (was !== v) goTarget(v, viewTarget(v));
+  // THE HASH NAMES THE VIEW; a view's own state rides after its "?"
+  // (`viewQuery`), so a return to it reopens what was open
+  const h = "#" + viewHash(v) + viewQuery(v);
+  if (location.hash !== h) history.replaceState(null, "", h);
   if (v === "quota") initQuota();
+  if (v === "models") initModels();
   if (v === "boxes") initStorage();
   if (v === "sessions") initSessions();
   if (v === "configs") { cfgInit(); srevInit(); }
@@ -229,7 +300,9 @@ function showView(v) {
      fetch queued behind the page's long reads outlived its own deadline and
      drew the queue UNKNOWN (measured: the first answered in 1.3s, the
      duplicate that owned the surface timed out at 8s). */
-  if (v === "work" && was && was !== "work") { odqInit(); tqInit(); }
+  if (v === "work" && was && was !== "work") odqInit();
+  if (pageOf(v) === "flow") wkPaint(WK.main);
+  if (v === "home") initHome(was);
   if (v === "chat") initChat();
   if (v === "roster") initRoster();
   if (v === "history") initLedger();
@@ -249,8 +322,8 @@ $$(".navarea").forEach(b => b.onclick = () => {
   if (v) showView(v);
 });
 window.addEventListener("hashchange", () => {
-  const raw = location.hash.slice(1), v = canonView(raw);
-  if (VIEWS.includes(v)) { showView(v); goOldSection(raw); }
+  const r = hashView(location.hash.slice(1)), v = r.v;
+  if (VIEWS.includes(v)) { viewRoute(v, r.query); showView(v); }
 });
 $("#themetog").onclick = () => {
   const r = document.documentElement;
@@ -307,12 +380,13 @@ const noteAgo = iso => {
 function noteGoto(raw) {
   // THE VOCABULARY IS THE FLEET'S (`helm note set --goto`), so the keys stay
   // as agents write them; each points at the page that holds it now. "board"
-  // is the LAND board, the kanban on Work.
+  // was the land board; the work under way is the Work page's pipeline
+  // entry now (task/3643).
   const tabs = {
     ledger: {href: "#history", tab: "ledger", label: "go to history →"},
     chat: {href: "#chat", tab: "chat", label: "go to chat →"},
     roster: {href: "#roster", tab: "roster", label: "go to roster →"},
-    board: {href: "#work", tab: "board", label: "go to board →"},
+    board: {href: "#work/pipeline", tab: "board", label: "go to Work › pipeline →"},
   };
   if (tabs[raw]) return tabs[raw];
   if (typeof raw === "string" && /^https?:\/\/[^\s]+$/i.test(raw))
@@ -331,7 +405,12 @@ function noteRowHTML(n) {
     (detail ? '<details><summary>details</summary><div class="ndetail">' + esc(detail) + '</div></details>' : "") +
     pointer + '</div>';
 }
+let NOTES_LAST = null;           // the last /api/notes body, for the Home notes tile
 function notesSec(d) {
+  NOTES_LAST = d;
+  // HOME'S TILES REDRAW AS A READING LANDS, not on their five-second clock
+  // alone, so a tile never says "not read" over an answer the page holds
+  if (typeof homeRender === "function") homeRender();
   const el = $("#notesec");
   const notes = (d && !d.unavailable && Array.isArray(d.notes)) ? d.notes : [];
   if (!notes.length) { el.classList.remove("show"); el.innerHTML = ""; return; }
@@ -354,7 +433,7 @@ function notesSec(d) {
     '<span class="ncount">' + count +
     (older.length ? " · " + older.length + " older" : "") +
     (d.cap ? " · " + notes.length + "/" + d.cap + " keys" : "") + '</span>' +
-    '<span class="nhow"><code>helm note set &lt;key&gt; &lt;headline&gt; --detail … --goto …</code></span></div>' +
+    '<span class="nhow">what the fleet left you, one note per key</span></div>' +
     '<div class="nrows">' + fresh.map(noteRowHTML).join("") + '</div>' +
     (older.length ? '<details class="nolder"' + (openOlder ? " open" : "") + '>' +
       '<summary>' + older.length + (older.length === 1 ? " older note" : " older notes") +
@@ -363,9 +442,8 @@ function notesSec(d) {
   el.querySelectorAll("[data-note-tab]").forEach(a => a.onclick = ev => {
     ev.preventDefault();
     const dest = a.dataset.noteTab;
-    // a note bound for "board" means the LAND board, the kanban on Work
-    showView(dest === "board" ? "work" : canonView(dest));
-    if (dest === "board") setTimeout(() => $("#tierpipeline").scrollIntoView({block: "start"}), 0);
+    // a note bound for "board" means the work under way: Work's pipeline
+    showView(dest === "board" ? "pipeline" : canonView(dest));
   });
   el.classList.add("show");
 }
@@ -385,25 +463,9 @@ function storeStrip(s) {
   $("#store").classList.add("show");
 }
 
-/* ---------- sessions strip ---------- */
-function sessStrip(s) {
-  if (!s || s.unavailable || !Array.isArray(s.sessions) || !s.sessions.length) return;
-  const rows = s.sessions.slice(0, 12).map(r =>
-    '<div class="srow" data-cmd="' + esc(r.cmd || "") + '" title="click to copy the resume command">' +
-    '<span class="sage">' + esc(age(r.mt)) + '</span>' +
-    '<span class="hchip h-' + esc(r.h) + '">' + esc(r.h) + '</span>' +
-    '<span class="sproj">' + esc(r.project || "–") + '</span>' +
-    '<span class="stitle">' + esc((r.t || "(untitled)").slice(0, 80)) + '</span></div>').join("");
-  $("#sessions").innerHTML = '<span class="slabel">sessions</span><div class="srows">' + rows + "</div>";
-  $("#sessions").classList.add("show");
-  $("#sessions").querySelectorAll(".srow").forEach(el => el.addEventListener("click", async () => {
-    const cmd = el.dataset.cmd;
-    if (!cmd) return;
-    try { await navigator.clipboard.writeText(cmd); } catch (e) {}
-    el.classList.add("copied");
-    setTimeout(() => el.classList.remove("copied"), 900);
-  }));
-}
+/* (The sessions strip that sat under the Work page's system band is gone
+   (task/3445): Fleet › sessions is the list, and the strip repeated its
+   newest dozen under a second count.) */
 
 /* ---------- skills strip ---------- */
 async function post(url, body) {
@@ -721,7 +783,11 @@ document.addEventListener("keydown", ev => {
     ev.preventDefault();
     $("#q").focus();
   }
-  if (ev.key === "Escape" && BOARD_OPEN.size) {
+  // Esc closes the open project on Work › projects, but a drawer open in
+  // its Work tab takes the Esc first (52-work closes it): closing the row
+  // under it would throw away the drawer and a note being typed in it
+  if (ev.key === "Escape" && BOARD_OPEN.size && $("#view-work").classList.contains("on")
+      && !(typeof WK !== "undefined" && WK.proj.view.card && wkRoot(WK.proj))) {
     BOARD_OPEN.clear();
     renderBoard();
   }
@@ -737,14 +803,10 @@ function foot(reg) {
   const ts = reg.generated_ts ? new Date(reg.generated_ts) : null;
   const when = ts && !isNaN(ts) ? age(ts.getTime() / 1000) : null;
   $("#foot").innerHTML = '<span class="fmark">⎈</span> ~/.helm' +
-    (when ? " · synced " + (when === "0d" ? "today" : when + " ago") : " · never synced — run <code>helm sync</code>") +
+    (when ? " · synced " + (when === "0d" ? "today" : when + " ago") : " · never synced") +
     " · localhost surface — the CLI is the helm";
 }
 
-function homeStats() {
-  const sess = projects.reduce((n, p) => n + Object.values(p.sessions || {}).reduce((a, b) => a + b, 0), 0);
-  $("#stats").innerHTML = statCell(projects.length, "projects") + statCell(sess, "sessions");
-}
 
 /* THE REGISTRY: the rows the board draws, the footer, and where a row's pane
    lives. Read at boot, after every light he sets, and on the board's own poll,
@@ -763,7 +825,6 @@ async function loadRegistry() {
   DETAIL_ROUTE = typeof reg.detail_route === "string" ? reg.detail_route : null;
   projects = Object.values(reg.projects || {});
   projects.sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0));
-  homeStats();
   renderBoard();
   foot(reg);
 }
@@ -779,15 +840,14 @@ async function load() {
   j("/api/whoami").then(greet).catch(() => {});
   j("/api/notes").then(notesSec).catch(() => {});
   j("/api/store").then(storeStrip).catch(() => {});
-  j("/api/sessions").then(sessStrip).catch(() => {});
   j("/api/skills").then(skillsSec).catch(() => {});
 }
 load();
-// fleet notes are the one home-tab strip agents write WHILE you are looking at
-// it, so it refreshes on its own timer (cheap read, board tab only, only when
-// the page is visible). The other strips are boot-time state.
+// fleet notes are the one Home card agents write WHILE you are looking at it,
+// so it refreshes on its own timer (cheap read, Home only, only when the page
+// is visible). The other strips are boot-time state.
 setInterval(() => {
-  if ($("#view-work").classList.contains("on") && !document.hidden)
+  if ($("#view-home").classList.contains("on") && !document.hidden)
     j("/api/notes").then(notesSec).catch(() => {});
 }, 60000);
 
@@ -797,12 +857,15 @@ setInterval(() => {
    COLOUR IS A CLASS: green is spent only on a signal MEASURED green; UNKNOWN
    is loud warn, because a gauge that could not measure must never look like
    one that measured healthy. The server caches the gauge behind a 30s
-   single-flight, so this poll can stay dumb. */
+   single-flight, so this poll can stay dumb.
+   THE OWNER'S WORDS, NEVER A COMMAND (console walk 3, #5): each row's
+   `owner_repair` and `owner_note` are its repair and note as facts and
+   places, and the terminal lines that name a verb are not drawn here. */
 const READY_POLL_MS = 60000;
 const READY_FETCH_MS = 15000;
 function readyCardHTML(d) {
   const head = h => '<div class="rhead"><span class="slabel">ready</span>' + h +
-    '<span class="rhow"><code>helm ready</code> — advisory: renders, never gates</span></div>';
+    '<span class="rhow">advisory: it shows, it never stops work</span></div>';
   if (!d || d.pending) return head('<span class="rverdict rmut">not read yet</span>');
   if (d.unavailable) return head('<span class="rverdict runk">UNKNOWN</span>') +
     '<div class="rrows"><div class="rrow rsunk"><span class="rev">' + esc(d.unavailable) + '</span></div></div>';
@@ -813,14 +876,19 @@ function readyCardHTML(d) {
       '<span class="rstate r' + k + '">' + esc(s.state) + '</span>' +
       '<span class="rsig">' + esc(s.signal) + '</span>' +
       '<span class="rev">' + esc(s.evidence) + '</span>' +
-      (s.note ? '<div class="rnote">' + esc(s.note) + '</div>' : "") +
-      (s.repair && s.state !== "GREEN" ? '<div class="rfix">→ ' + esc(s.repair) + '</div>' : "") +
+      (s.owner_note ? '<div class="rnote">' + esc(s.owner_note) + '</div>' : "") +
+      (s.owner_repair && s.state !== "GREEN" ? '<div class="rfix">→ ' + esc(s.owner_repair) + '</div>' : "") +
       '</div>';
   }).join("");
   return head('<span class="rverdict r' + vk + '">' + esc(d.ready) + '</span>') +
     '<div class="rrows">' + rows + '</div>';
 }
-function readyShow(d) { $("#readysec").innerHTML = readyCardHTML(d); }
+let READY_LAST = null;           // the last /api/ready body, for the Home seats tile
+function readyShow(d) {
+  READY_LAST = d;
+  $("#readysec").innerHTML = readyCardHTML(d);
+  if (typeof homeRender === "function") homeRender();
+}
 
 /* ================= GUARD REFUSALS card (GET /api/friction) =================
    How often a guard stopped an agent this week, and THE OWNER'S DIAL: the one
@@ -982,6 +1050,7 @@ const POSTURE_MSG_MS = 20000;
 let POSTURE = {pending: true};
 let POSTURE_MSG = null;          // {text, kind, at}: the last thing a press said
 let POSTURE_DRAFT = "";
+const POSTURE_FOLD = {};         // fold -> open, as he last left it (why?, the note)
 let POSTURE_BUSY = false;
 function postureAgo(t, now) {
   if (typeof t !== "number") return "at a time the record does not say";
@@ -993,55 +1062,67 @@ function postureAgo(t, now) {
   const days = Math.floor(h / 24);
   return days + (days === 1 ? " day ago" : " days ago");
 }
+/* ONE LINE AND ITS BUTTON (task/3445): whether he is marked away, for how
+   long, and the one press that changes it. Who set it and what agents do
+   about it are behind "why?", and the notice to every agent behind "Leave a
+   note for agents" — open while he is typing one, and kept open across the
+   poll's redraws once he opened it (`postureShow`). */
 function postureCardHTML(d, msg, now, draft) {
-  const head = '<div class="phead"><span class="slabel">away mode</span>' +
-    '<span class="phow">Agents learn what you set here at their next turn. Nobody is woken.</span></div>';
+  const head = '<div class="phead"><span class="slabel">away mode</span></div>';
   if (!d || d.pending) return head + '<p class="pline pmut">Not read yet.</p>';
   if (d.unavailable) return head +
     '<p class="pline pwarn">The console could not read this card just now. It tries again shortly.</p>';
   const a = d.away || {}, n = d.notice || {};
   const btn = (act, label, cls) => '<button type="button" class="pbtn' + (cls ? " " + cls : "") +
     '" data-act="' + act + '">' + label + '</button>';
-  let away, buttons;
+  const fold = (id, open, summary, body) => '<details class="pfold" data-fold="' + id + '"' +
+    (open ? " open" : "") + '><summary>' + summary + '</summary>' + body + '</details>';
+  const how = "Agents learn what you set here at their next turn. Nobody is woken.";
+  let line, why;
   if (a.state === "away") {
-    const who = a.owner_door ? "You set this here."
+    line = '<p class="pline"><b>You’re marked away</b> (' +
+      esc(postureAgo(a.t, now).replace(/ ago$/, "")) + ') · ' + btn("back", "I’m back") + '</p>';
+    why = (a.owner_door ? "You set this here."
       : "This was not set from your console: " + esc(a.by || "an unnamed process") +
-        " set it (" + esc(a.via || "no provenance") + ").";
-    away = '<p class="pline"><b>You are marked away</b>, since ' + esc(postureAgo(a.t, now)) +
-      '. ' + who + ' Agents are asked to coordinate through helm chat and dispatch and to keep local chat short.</p>';
-    buttons = btn("back", "I’m back");
+        " set it (" + esc(a.via || "no provenance") + ").") +
+      " Agents are asked to coordinate through the fleet's chat and dispatch and to keep local chat short. " + how;
   } else if (a.state === "present") {
-    away = '<p class="pline">You are not marked away.</p>';
-    buttons = btn("away", "I’m away");
+    line = '<p class="pline">You’re not marked away · ' + btn("away", "I’m away") + '</p>';
+    why = how;
   } else {
-    away = '<p class="pline pwarn">Whether you are marked away could not be read: ' +
-      esc(a.why || "no reason was given") + '. This is not the same as being here.</p>';
-    buttons = btn("away", "I’m away") + btn("back", "I’m back", "psec");
+    line = '<p class="pline pwarn">Whether you are marked away could not be read: ' +
+      esc(a.why || "no reason was given") + '. This is not the same as being here.</p>' +
+      '<div class="prow">' + btn("away", "I’m away") + btn("back", "I’m back", "psec") + '</div>';
+    why = how;
   }
-  let notice;
+  let notice, mark = "";
   if (n.state === "set") {
     notice = '<p class="pline">Every agent is shown your notice: <q class="ptext">' + esc(n.text) +
       '</q> <span class="pmut">Set ' + esc(postureAgo(n.t, now)) + '.</span></p>';
+    mark = ' <span class="pmut">· one is showing</span>';
   } else if (n.state === "none") {
     notice = '<p class="pline pmut">No notice is set.</p>';
   } else if (n.state === "ignored") {
     notice = '<p class="pline pwarn">A notice you did not write is on disk, and agents are not shown it' +
       (n.why ? ": " + esc(n.why) : "") + '. Clear notice removes it.</p>';
+    mark = ' <span class="pwarn">· needs a look</span>';
   } else {
     notice = '<p class="pline pwarn">Your notice could not be read: ' + esc(n.why || "no reason was given") +
       '. This is not the same as no notice.</p>';
+    mark = ' <span class="pwarn">· needs a look</span>';
   }
   const max = typeof d.notice_max === "number" ? d.notice_max : 240;
   const presets = (Array.isArray(d.presets) ? d.presets : []).map(p =>
     '<button type="button" class="ppre" data-preset="' + esc(p.id) + '" title="' + esc(p.text) + '">' +
     esc(p.label) + '</button>').join("");
   const clear = n.state === "set" || n.state === "ignored" ? btn("clear", "Clear notice", "psec") : "";
-  return head + away + '<div class="prow">' + buttons + '</div>' +
-    '<div class="psub"><span class="slabel">notice to every agent</span></div>' + notice +
-    '<textarea class="pnote" maxlength="' + max + '" rows="2" aria-label="Notice to every agent"' +
-    ' placeholder="A short notice. Every agent is shown it once, at its next turn.">' + esc(draft || "") +
-    '</textarea><div class="prow">' + btn("notice", "Show this notice") + clear +
-    (presets ? '<span class="ppres"><span class="pmut">Fill in:</span> ' + presets + '</span>' : "") + '</div>' +
+  return head + line +
+    fold("why", false, "why?", '<p class="pline pmut">' + why + '</p>') +
+    fold("note", !!draft, "Leave a note for agents" + mark, notice +
+      '<textarea class="pnote" maxlength="' + max + '" rows="2" aria-label="Notice to every agent"' +
+      ' placeholder="A short notice. Every agent is shown it once, at its next turn.">' + esc(draft || "") +
+      '</textarea><div class="prow">' + btn("notice", "Show this notice") + clear +
+      (presets ? '<span class="ppres"><span class="pmut">Fill in:</span> ' + presets + '</span>' : "") + '</div>') +
     '<p class="pmsg' + (msg && msg.kind ? " p" + esc(msg.kind) : "") + '" role="status">' +
     (msg && msg.text ? esc(msg.text) : "") + '</p>';
 }
@@ -1051,7 +1132,13 @@ function postureShow(d) {
   if (!sec) return;
   const act = sec.contains(document.activeElement) && document.activeElement.dataset
     ? document.activeElement.dataset.act : null;
+  // EACH FOLD AS HE LEFT IT, opened or closed: the note fold a draft opens
+  // stays shut once he shuts it, and one he opened stays open
+  sec.querySelectorAll("details[data-fold]").forEach(f => { POSTURE_FOLD[f.dataset.fold] = f.open; });
   sec.innerHTML = postureCardHTML(POSTURE, POSTURE_MSG, Date.now() / 1000, POSTURE_DRAFT);
+  sec.querySelectorAll("details[data-fold]").forEach(x => {
+    if (x.dataset.fold in POSTURE_FOLD) x.open = POSTURE_FOLD[x.dataset.fold];
+  });
   if (act) {
     const again = sec.querySelector('.pbtn[data-act="' + act + '"]');
     if (again) again.focus();
@@ -1184,38 +1271,21 @@ async function pollReady() {
       everything unproven is neutral. Only CONTRARY and STALLED alarm, and
       only they reach the nav badge.
 
-   lrCardHTML/lrRowHTML/lrNav are PURE (data in, string/object out) so
-   tests/test_web_lr.py (CardRuntimeBase and its subclasses) runs this exact
-   source under node. */
+   The land requests themselves are drawn on the Work page, one card per
+   piece of work, off /api/work (task/3643); this answer still carries the
+   owner asks and holds (on you) and the local chain (the signing record).
+   The nav badge is not this answer's: it is the Work page's stuck count. */
 const LR_POLL_MS = 45000;
 // The read's DEADLINE. A poll with no deadline cannot report "no answer": the
 // promise stays pending, the UNKNOWN branch never runs, and the card holds
 // whatever it drew last. 12s is well inside the 45s poll, so a slow read is
 // reported as unread rather than queued behind itself.
 const LR_FETCH_MS = 30000;
-// "?" until the FIRST read completes — never 0, which is a count.
-let NAV_LR = "?", NAV_LR_TITLE = "";
-// The last answer lrShow drew, whatever it was — board, UNKNOWN, pending. The
-// view toggle re-renders from it instantly instead of waiting out the 45s
-// poll, and re-rendering the LAST ANSWER (not the last BOARD) means a toggle
-// during an outage keeps the honest UNKNOWN strip on screen.
+// The last answer lrShow drew, whatever it was — board, UNKNOWN, pending.
+// Holding the LAST ANSWER (not the last BOARD) keeps an outage's honest
+// UNKNOWN on screen rather than an older good read.
 let LR_LAST = null;
 
-/* The owner's stored view choice for the pipeline wall. KANBAN IS THE DEFAULT
-   (owner 2026-08-03): only the stored word "list" picks the list, so an
-   absent, ancient or mangled value can never flip the wall silently. */
-function lrViewPref() {
-  return localStorage.getItem("helm.lrview") === "list" ? "list" : "kanban";
-}
-
-/* mirrors landreq._fmt_dwell — one unit per magnitude, tabular */
-function lrDwell(s) {
-  s = Math.max(0, Math.round(Number(s) || 0));
-  if (s < 3600) return Math.floor(s / 60) + "m";
-  const p = n => String(n).padStart(2, "0");
-  if (s < 86400) return Math.floor(s / 3600) + "h" + p(Math.floor((s % 3600) / 60)) + "m";
-  return Math.floor(s / 86400) + "d" + p(Math.floor((s % 86400) / 3600)) + "h";
-}
 /* ONE owner for the magnitude, two callers for the direction. `lrAgo` says how
    long AGO; the building band says how much lease is LEFT, and this card's own
    history is what makes that split worth writing down: `helm work list` printed
@@ -1238,1396 +1308,12 @@ function lrAgo(s) {
   return d === null ? "unknown" : d + " ago";
 }
 
-/* THE one display predicate for a contrary whose verdict was HONORED through
-   succession (contrary_discharge "a"/"b") or which IS the succession
-   instrument itself ("c" — the resolved door's confirmation round, rendered
-   as a quiet "confirmation") — the JS twin of landreq.honored_display, and
-   the ONLY place this page answers the question (marks, header counts, nav
-   badge and the home band all ask it). It exists because the first cut
-   answered inline per surface and the surfaces disagreed at once
-   (dispatch 97d8899a): an honored row with `stalled` true was quiet on the
-   home band and STALLED-loud everywhere else. Honored wins over the stalled
-   ALARM: the successor already landed, so a "stall" nobody can unstall is
-   noise — and a confirmation round's landed tip is its healthy shape by
-   design, so nothing is unstallable there either. Display only — `stalled`,
-   `owed_by` and every server field are untouched; "unverified" and an
-   absent stamp (old server) both answer false, fail-closed. */
-function lrHonored(c) {
-  /* A PURE READER. This used to re-derive the classification from `contrary`
-     and `contrary_discharge` — a second implementation of honored_display,
-     kept equal by parity tests. The server ships the answer now, so there is
-     one implementation and the browser renders it. An old server without the
-     field answers undefined, which is falsy, so the fail-closed reading that
-     the derivation guaranteed is preserved. */
-  return !!(c && c.honored);
-}
-
-/* The alarm classes + every honest annotation for one row. Mirrors the marks
-   landreq._line prints in the terminal, so the card and `helm lr list` cannot
-   describe the same row differently. */
-/* WHY A ROW IS NOT OBSERVABLE, in the same words the terminal uses. This
-   surface printed "git could not be read for this repo" for every
-   non-observable READY row, which is TRUE of exactly one of the four causes
-   `landreq` distinguishes and is a false accusation against the repository
-   for the other three. UNDERIVED is the one the owner kept hitting and the
-   one the old sentence libelled hardest: git was never asked, because the
-   reader ran out of the budget it declared, so the row is undetermined and
-   nothing was found wrong with it.
-
-   THESE STRINGS ARE PINNED TO `landreq.OBSERVE_REASON` BY A TEST, not by
-   anyone remembering. Two renderers of one datum is exactly how a board and a
-   terminal come to describe one row differently, and this file is not
-   imported by the Python that owns the vocabulary. */
-const LR_OBSERVE_REASON = {
-  "underived": "BUDGET EXPIRED — the reader ran out of its derive budget before this row; git was not asked and this is not a claim about the work",
-  "no-repo-or-tip": "git could not be read for this repo",
-  "no-trunk-or-tip": "no trunk or tip to compare against",
-  "not-asked": "not asked — no verdict yet, so nothing could have landed",
-};
-
-function lrObserveReason(why) {
-  /* An UNRECOGNISED value renders as unrecorded rather than as any of the
-     four: a word this build does not know is exactly the case where naming a
-     cause would be inventing one. */
-  return LR_OBSERVE_REASON[String(why)] || "reason unrecorded";
-}
-
-function lrMarks(c, reason) {
-  const marks = [];
-  const standing = c.owed_seat_standing;
-  if (standing && standing.state === "ORPHANED")
-    marks.push({k: "warn", t: "ORPHANED — "
-      + String(standing.why || "no roster row answers to its holder")
-      + ". The work is NOT reassigned and this row is NOT expired; "
-      + "helm seat reassign moves it."});
-  else if (standing && standing.state === "RENAMED")
-    marks.push({k: "mut", t: "RENAMED — "
-      + String(standing.why || "its lineage names a successor")});
-  const delivered = c.close_reason === "delivered-report";
-  if (c.abandoned)
-    marks.push({k: "mut", t: "ABANDONED — LAND STATE UNKNOWN; reviewed work written off: "
-      + String(c.abandon_reason || "reason unavailable")});
-  if (c.contrary) {
-    // WHICH physical fact contradicts the verdict. An unread contrary_state
-    // says so rather than guessing the friendlier of the two.
-    // MIRRORS landreq.contrary_fact EXACTLY — same three states, same
-    // provenance words, same "(...)" shape. The python side is the one door
-    // its two terminal renderers share; this is the third renderer and it
-    // cannot import that door, so the words are duplicated here deliberately
-    // and a seam arm asserts the two agree rather than trusting this comment.
-    // TWO VALUES ONLY, matching landreq._CONTRARY_PROVENANCE_WORDS — a seat arm
-    // reads both tables and fails if they drift. `discharged` was dropped as a
-    // lifecycle label in an evidence field; the `discharged` row field names it.
-    const PROV = {observed: "observed on trunk",
-                  recorded: "recorded when closed"};
-    const base = c.contrary_state === "landed" ? "LANDED"
-      : c.contrary_state === "merged-local" ? "MERGED_LOCAL" : "STATE UNREAD";
-    // Provenance renders ONLY inside this `if (c.contrary)` gate: contrary_state
-    // is populated on rows whose contrary is FALSE (a routine approve-then-land
-    // reads contrary=false, contrary_state="landed"), so the state and its
-    // provenance are meaningful only where the alarm is.
-    // A TRAILING CLAUSE, NEVER SPLICED INTO THE FACT. Mirrors
-    // landreq.contrary_provenance_clause. The first version put it inside the
-    // fact and turned "MERGED_LOCAL on local trunk" into "MERGED_LOCAL
-    // (observed on trunk) on local trunk", reddening ten arms that assert a
-    // contiguous phrase. The fact is the fact; provenance annotates the claim.
-    const prov = PROV[c.contrary_provenance];
-    const provClause = prov ? " [" + prov + "]" : "";
-    const fact = base;
-    const pol = String(c.polarity || "unknown").toUpperCase();
-    // `contrary_discharge` is the server's DISPLAY-TRUTH stamp: "a"/"b" mean
-    // an on-trunk APPROVE in this row's chain HONORED the verdict through
-    // succession, and "c" means this row IS the resolved door's confirmation
-    // round — the discharge instrument, whose landed tip is its healthy
-    // shape by design — so the alarm would claim a defiance that never
-    // happened. The same words `helm lr list` prints, or one row reads two
-    // ways. "unverified" and an absent stamp (old server) both stay LOUD: an
-    // uncomputed ancestry pair is never guessed quiet. Display only —
-    // `contrary` itself and `owed_by` are untouched.
-    const disch = c.contrary_discharge;
-    if (disch === "c" && lrHonored(c))
-      marks.push({k: "mut", t: "CONFIRMATION: " + fact + " by design — the "
-        + "resolution verified on trunk; the discharge instrument, never a debt"
-        + provClause});
-    else if (lrHonored(c))
-      marks.push({k: "mut", t: "SUPERSEDED-CLOSED: " + fact + ", and the " + pol
-        + " verdict was HONORED through succession ("
-        + (disch === "a" ? "continuation" : "ladder discharge") + ")"
-        + provClause});
-    else if (disch === "unverified")
-      marks.push({k: "bad", t: "CONTRARY? " + fact + " despite " + pol
-        + " verdict — succession UNVERIFIED ("
-        + String(c.succession_unknown_reason
-          || "carrier relation or landing proof is unreadable")
-        + "; no discharge was inferred)" + provClause});
-    else
-      marks.push({k: "bad", t: "CONTRARY: " + fact + " despite " + pol + " verdict"
-        + (c.discharged ? " — DISCHARGED by " + String(c.superseding_tip || "-").slice(0, 12)
-                        : " — owed by the integrator") + provClause});
-  }
-  if (c.withdraw_contradicted)
-    marks.push({k: "bad", t: "WITHDRAWN, yet the change is on trunk — the withdrawal's premise no longer holds"});
-  // THE SAME WORDS `helm lr list` PRINTS (landreq_cli._line) for a row whose
-  // work main already holds with no verdict recorded — without them this
-  // card draws it as a plain AWAITING_REVIEW row. The server's own answer
-  // (`on_main_unverdicted`, `landreq.on_main_unverdicted`), never re-derived
-  // here: containment alone is also true of a row under a recorded FIX, and
-  // these words would call that contradiction "no verdict".
-  if (c.on_main_unverdicted === true)
-    marks.push({k: "warn", t: "ALREADY ON TRUNK — this work is in history and the row "
-      + "has NO VERDICT recorded; it is a LEDGER gap (a review that never "
-      + "happened), not a slow reviewer and not a rebase its author owes"});
-  // marks carry PLAIN text; lrRowHTML escapes them once on the way out
-  // honored-first (same predicate as landreq._line): the stalled ALARM
-  // yields to the honored banner — the successor already landed. `stalled`
-  // and `owed_by` themselves are untouched.
-  if (c.stalled && !lrHonored(c)) {
-    if (c.succession_state === "moved") {
-      // A proved successor already carries the work; keep the measurement on
-      // the wire without publishing an alarm nobody can act on.
-    } else if (c.succession_state === "unknown") {
-      marks.push({k: "warn", t: "STALLED — succession UNKNOWN ("
-        + String(c.succession_unknown_reason
-          || "carrier relation or landing proof is unreadable")
-        + "; whether a successor carried it cannot be read)"});
-    } else {
-      marks.push({k: "warn", t: "STALLED past its stage threshold — owed by "
-        + (c.owed_by || "unknown")});
-    }
-  }
-  // "could not look" is not "nothing there", and only one of them is news.
-  if (c.receipt_state === "unreadable")
-    marks.push({k: "warn", t: "LAND RECEIPT LEDGER UNREADABLE — helm could not read the receipt index, so this row's receipt is UNKNOWN, not absent (diagnostic only; git still governs)"});
-  // A retirement helm cannot date. The row IS closed; the stamp beside it on
-  // the ledger is not a timestamp, which is a repair to make and not an
-  // absence to shrug at, so it is said on the collapsed row rather than only
-  // behind a tap.
-  if (c.closed_ts_unreadable)
-    marks.push({k: "warn", t: "CLOSURE STAMP UNREADABLE — this row was retired and the ledger's stamp for it is not a timestamp, so WHEN it closed is UNKNOWN"});
-  // A stamp that PARSES and cannot be true. Distinct from the one above: there
-  // is nothing to re-read here, the record is simply dated after now.
-  if (c.closed_ts_impossible)
-    marks.push({k: "warn", t: "CLOSURE STAMP IMPOSSIBLE — the ledger dates this row's closure in the FUTURE, so WHEN it closed is UNKNOWN; the row is shown here only because it ENTERED its state inside the window"});
-  // Attestation is a separate durable axis from verdict polarity. A mismatch is
-  // not repaired by re-signing: the sidecar says what it actually bound, and the
-  // row stays loud until the two durable ledgers agree again.
-  if (c.attest_state === "unverifiable")
-    marks.push({k: "warn", t: "ATTEST UNVERIFIABLE — the verdict stands; its signed delivery record does not verify against the current evidence — "
-      + String(c.attest_detail || "the attest sidecar binds different verdict evidence")});
-  else if (c.attest_state === "unknown" || c.attest_state === "doubt")
-    marks.push({k: "warn", t: "ATTEST " + String(c.attest_state).toUpperCase()
-      + " — " + String(c.attest_detail || "attestation state unavailable")});
-  // A transition the record holds and the dispatch fold did not accept. It is
-  // historical repair evidence, never the owner of current polarity.
-  if (Array.isArray(c.ledger_refused) && c.ledger_refused.length)
-    marks.push({k: "warn", t: "LEDGER ROW REFUSED — the dispatch store holds a historical "
-      + c.ledger_refused.join("/") + " event its fold refused; current fields come only from accepted dispatch state"});
-  // dwell_s is 0 when the age could not be measured, and 0 reads as "just
-  // now" — the most flattering possible value for the oldest possible row.
-  // The CAUSE is deliberately not named: it is the entry stamp on a live row
-  // and the retirement instant on a retired one, and naming one of the two
-  // sends him to re-read a stamp that is perfectly fine.
-  if (!c.dwell_known)
-    marks.push({k: "warn", t: "DWELL UNKNOWN — this row's age was never measured (the record carries no usable instant to measure from, or none to measure to), so it can never register as stalled"});
-  if (reason)
-    marks.push({k: "mut", t: "NOT MEASURABLE: " + reason + " — no stall is billable in either direction"});
-  // WHY THE RECORD REFUSED TO CALL THIS ROW READY, in its own words — the
-  // same sentence `helm lr show` prints under NOT READY, so the card and the
-  // terminal cannot describe one row differently. It gets a line rather than
-  // sharing the verification chip with the gate binding, because when a row
-  // carries both, whichever is tested first silences the other.
-  if (c.ungated)
-    marks.push({k: "mut", t: "NOT READY — " + c.ungated});
-  if (c.closed_by_landing)
-    marks.push({k: "mut", t: "UNDECLARED — closed by landing, not by approval"});
-  if (delivered)
-    marks.push({k: "mut", t: "DELIVERED REPORT — artifact handoff recorded under explicit refs"
-      + (c.delivered_report_correction ? " — explicit correction of preserved cancellation: "
-        + String(c.cancel_reason || "reason unavailable") : "")});
-  if ((c.state === "READY" || c.state === "MERGED_LOCAL") && !c.observable)
-    marks.push({k: "mut", t: "landing unobservable — " + lrObserveReason(c.observe_why)});
-  return marks;
-}
-
-/* The VERIFICATION chip: whether a gate receipt is BOUND to this row. That is
-   a different axis from the lifecycle state ("landed" is where the code is),
-   and a different axis again from whether the record REFUSED to call the row
-   READY — which is `ungated`, and which lives in lrMarks.
-
-   Those last two used to share this one chip, `gate` tested first. So a row
-   that carried BOTH — a bound receipt whose gate_caps stamp is unreadable is
-   refused READY, and a probe reproduced exactly that — printed "receipt NOT
-   READ here" and nothing else: the binding was shown and the refusal was
-   hidden behind it. Two facts in one slot means one of them is always the one
-   that loses, so the refusal moved out to a line of its own. */
-function lrGate(c) {
-  const delivered = c.close_reason === "delivered-report";
-  if (delivered)
-    return '<span class="lrg" title="delivered-report carries handoff evidence, not a review gate">GATE N/A</span>';
-  // A CHIP THAT CAN ONLY EVER BE BAD NEWS STOPS PRINTING. Owner ruling,
-  // decision d2f490d0, 2026-08-06: "the chip goes quiet when there is nothing
-  // to report ... gate state moves behind the card's expand with the rest of
-  // the detail." Measured before he was asked: this function had exactly two
-  // reachable outcomes on a live board — "receipt NOT READ here" when an id is
-  // bound and "UNVERIFIED" when none is — so it was negative on 100% of cards,
-  // and a badge every card wears is a badge the eye stops reading. That was
-  // the remaining half of the alarm saturation in task/333.
-  //
-  // NOTHING IS LOST, which is what makes this a demotion rather than a
-  // deletion: the expand's `lrcant` line already says WHICH of the two in
-  // words, and it now carries the receipt id as well so the token is still one
-  // click away. Same headlines-click-to-detail split UNDECLARED took.
-  //
-  // GATE N/A ABOVE SURVIVES DELIBERATELY: it is not bad news, it is the
-  // narrow, true statement that no gate applies to a delivered-report row. The
-  // rule this implements is that the chip prints only when it has something to
-  // SAY — so when a VERIFIED branch exists, it belongs here and will read as
-  // signal precisely because the negative cases are quiet.
-  return "";
-}
-
-/* `closed` marks a row drawn under the CLOSED footer: only there is "when did
-   this close" a question, and only there may the panel answer it.
-
-   `under` marks a row drawn INSIDE a lane box that already prints the lane
-   name. Measured in the browser 2026-08-11, on the very group built to cure
-   this: `project-raw-batch-is-unproven-end-to-end` rendered its name FOUR
-   times in one box — once as the caption and once as the bold headline of each
-   of the three cards — and three identical bold headlines still read as three
-   identical strangers, which is the owner's complaint surviving inside its own
-   fix. So a nested row leads with the thing that actually tells it apart from
-   its neighbours: its CHAIN. The lane is on the hover and, unchanged, on the
-   expand's first line, so nothing left the card. UNNESTED ROWS ARE UNTOUCHED —
-   the name is still the headline everywhere it is the distinguishing fact,
-   which is task/333's property and every caller that omits this argument. */
-function lrRowHTML(c, reason, closed, under) {
-  const marks = lrMarks(c, reason);
-  const alarm = marks.some(m => m.k === "bad" || m.k === "warn");
-  // green is ONLY a landing git observed; alarm outranks it if both are true
-  const cls = alarm ? "alarm" : c.landed ? "landed" : "";
-  const who = esc(c.author || "?") + "→" + esc(c.reviewer || "?");
-  const delivered = c.close_reason === "delivered-report";
-  const pol = delivered ? "N/A"
-    : c.polarity ? String(c.polarity).toUpperCase() : "UNDECLARED";
-  const shownSha = delivered ? c.base_sha : c.review_sha;
-  const shownShaFull = delivered ? c.base_sha : c.review_sha_full;
-  // "?" and not "0m": an unreadable entry stamp is not an age of zero.
-  const dwell = c.dwell_known ? lrDwell(c.dwell_s) : "?";
-  // helm only reads trunk once a verdict is recorded, so an OPEN row's
-  // landed/merged_local are both false because NOBODY LOOKED. Printing "not on
-  // trunk" there states a git fact this card never obtained.
-  const trunk = delivered
-    ? "NO LAND CLAIM — this terminal records artifact handoff evidence, not Git"
-    : c.abandoned ? "LAND STATE UNKNOWN — commit evidence was destroyed"
-    : c.landed ? ("on " + (c.has_upstream ? "upstream" : "local") + " trunk")
-    : c.merged_local ? "on local trunk, not pushed"
-    : c.observable ? "not on trunk"
-    : "NOT OBSERVED — git was not read for this row, so its trunk position is UNKNOWN";
-  // A STEP WITH NO STAMP SAYS WHICH KIND OF NO-STAMP IT IS. "(git-observed)"
-  // is true of exactly one step — the landing git noticed, which carries no
-  // moment anywhere — and it used to be printed over every absent ts,
-  // explaining an OPEN step (git is not read at all before a verdict) as
-  // something git had seen. An unreadable stamp is a third thing again.
-  const tl = (Array.isArray(c.timeline) ? c.timeline : [])
-    .map(t => esc(t.state) + (t.ts ? " " + esc(t.ts)
-      : t.ts_unreadable ? " (the ledger's stamp here is NOT A TIMESTAMP)"
-      : t.ts_impossible ? " (the ledger's stamp here is dated in the FUTURE)"
-      : t.observed ? " (git-observed, no ledger stamp)"
-      : " (no stamp on the ledger event)"))
-    .join(" → ");
-  // THE IDENTIFYING TEXT GETS ITS OWN LINE, AND IT WRAPS RATHER THAN CLIPS.
-  // task/333, owner-observed: "this board is ugly, nigh-unreadable". MEASURED
-  // on the live console before this change — 36 cards, 236px wide, and the
-  // line-1 flex budget was title 35px / state 105px / dwell 42px / warn 12px.
-  // The STATE BADGE HELD THREE TIMES THE PIXELS OF THE NAME, because .lrlane
-  // was the only child with flex:1 1 auto and min-width:0 and therefore
-  // absorbed 100% of the squeeze: 34 of 36 titles clipped, the worst given
-  // 3px to render 120px of text. And the average title width was 69px at
-  // 1440, 1280, 1100 AND 960 body width — IDENTICAL — because this grid is
-  // fixed-width, so widening the window or the card cannot fix it. Only
-  // taking the title OUT of the competition can.
-  return '<div class="lrrow ' + cls + '" data-id="' + esc(c.id) + '">'
-    + '<div class="lrtitle"'
-    + (under ? ' title="lane ' + esc(c.lane || "(no lane)")
-      + " — one of several pieces of work filed under that NAME, which is a"
-      + ' renamable label and not identity"' : "") + ">"
-    + (under ? "↳ chain " + esc(String(lrChainRoot(c)).slice(0, 12))
-             : esc(c.lane || "(no lane)")) + "</div>"
-    + '<div class="lrl1"><span class="lrstate">' + esc(c.state) + "</span>"
-    + '<span class="lrdwell">' + esc(dwell) + "</span>"
-    + (alarm ? '<span class="lrwarn">⚠</span>' : "") + "</div>"
-    + '<div class="lrl2"><span class="lrsha" data-sha="' + esc(shownShaFull || "")
-    + '" title="' + (delivered
-      ? "the preserved BUILD base — tap to copy the full sha"
-      : "the reviewed commit — tap to copy the full sha") + '">' + esc(shownSha || "—") + "</span>"
-    // POLARITY IS A HEADLINE ONLY WHEN IT SAYS SOMETHING. UNDECLARED was
-    // printed on every undecided row — 11% of in-flight carry it and it reads
-    // as an accusation — while the SAME fact is already spelled out in the
-    // expand below ("verdict polarity ... (from <source>)"). An absent verdict
-    // is the normal state of a row awaiting review, so it belongs behind the
-    // disclosure with the rest of the agent-density, per the owner-surface
-    // headlines-click-to-detail rule. A DECLARED polarity still leads.
-    + '<span class="lrwho">' + who + "</span>"
-    + (pol && String(pol).toUpperCase() !== "UNDECLARED"
-        ? '<span class="lrpol">' + esc(pol) + "</span>" : "")
-    + lrGate(c) + "</div>"
-    + marks.map(m => '<div class="lrmark ' + m.k + '">' + esc(m.t) + "</div>").join("")
-    + '<div class="lrx" hidden>'
-    // the lane leads the expand as well: the headline now wraps rather than
-    // ellipsizing (task/333), so this is a confirmation of the name rather
-    // than the only place it is readable — and it stays first because every
-    // field below it is qualified BY it
-    + "<div><b>lane</b> " + esc(c.lane || "(no lane)") + "</div>"
-    + "<div><b>id</b> <code>" + esc(c.id) + "</code></div>"
-    + "<div><b>" + (delivered ? "base sha" : "reviewed sha")
-    + "</b> <code>" + esc(shownShaFull || "—") + "</code></div>"
-    + "<div><b>branch</b> " + esc(c.branch || "—") + "</div>"
-    + (delivered
-      ? "<div><b>artifact</b> " + esc(c.artifact_ref || "—") + "</div>"
-        + "<div><b>report</b> " + esc(c.report_ref || "—") + "</div>"
-        + "<div><b>evidence</b> " + esc(c.close_evidence || "—") + "</div>" : "")
-    + "<div><b>author → reviewer</b> " + who + "</div>"
-    + "<div><b>verdict polarity</b> " + esc(pol)
-    + (delivered
-      ? " <span>(not claimed by this terminal)</span></div>"
-      : " <span title=\"the named store owns current verdict polarity; LR is only its projection\">(from "
-        + esc(String(c.polarity_source || "source unknown").replace(/-/g, " ")) + ")</span></div>")
-    + (!delivered && c.attest_state ? "<div><b>verdict attest</b> "
-      + esc(String(c.attest_state).toUpperCase())
-      + " <span title=\"read from the named durable sidecar; this view never re-signs\">(from "
-      + esc(String(c.attest_source || "source unknown").replace(/-/g, " ")) + ")</span>"
-      + (c.attest_detail ? " — " + esc(c.attest_detail) : "") + "</div>" : "")
-    + "<div><b>trunk</b> " + esc(trunk) + "</div>"
-    + (c.landing_trunk_sha ? "<div><b>trunk anchor</b> <code>" + esc(c.landing_trunk_sha) + "</code></div>" : "")
-    + "<div><b>owed by</b> " + esc(c.owed_by || "—") + " · dwelling " + esc(dwell) + "</div>"
-    + (tl ? "<div><b>timeline</b> " + tl + "</div>" : "")
-    // THREE ANSWERS, NEVER TWO. A stamp; a stamp that is not one (printed as
-    // the closure instant until a review read it back off a withdrawn row); and
-    // no stamp anywhere, which is the ordinary case for a landing git
-    // observed. The middle one is the record telling you to go repair it.
-    + (closed ? "<div><b>closed</b> " + (c.closed_ts ? esc(c.closed_ts)
-      : c.closed_ts_unreadable
-        ? "the ledger's own retirement stamp for this row is NOT A TIMESTAMP, so WHEN this closed is UNKNOWN — repair that ledger row"
-      : c.closed_ts_impossible
-        ? "the ledger dates this row's closure in the FUTURE, which is not an instant it can have closed at, so WHEN this closed is UNKNOWN — repair that ledger row"
-        : "no closure stamp — git records no moment for the merge helm observed, so WHEN this closed is UNKNOWN")
-      + "</div>" : "")
-    // THREE ANSWERS HERE TOO. A state the server SENT; the "I could not look"
-    // state; and no state at all — which used to render as the word "none",
-    // the card inventing a finding out of a field it was never sent. That was
-    // the third rendering of "unreadable receipt storage" as "there is no
-    // receipt" on this one card, and the only one living in the browser.
-    + "<div><b>land receipt</b> " + (c.receipt_state === "unreadable"
-      ? "LEDGER UNREADABLE — helm could not read the land-receipt index; this is NOT &quot;no receipt&quot;"
-      : c.receipt_state ? esc(c.receipt_state)
-      : "NOT SENT — this row reached the card with no receipt state at all, which is NOT &quot;no receipt&quot;")
-    + " — diagnostic only; git governs</div>"
-    + '<div class="lrcant">' + (delivered
-      ? "this terminal validates reference syntax only (artifact/chat existence is not checked) and intentionally makes no reviewed-tip, verdict, gate, or Git landing claim"
-      : "this card cannot prove the exact trunk commit, and "
-        // THE TOKEN COMES WITH IT. The headline chip that used to print
-        // `gate:<id>` is quiet now (owner ruling d2f490d0), so if the id did
-        // not land here it would be gone from the surface entirely — which
-        // would make this a deletion rather than the demotion it is meant to
-        // be. It is the one thing a reader needs to go check the receipt.
-        + (c.gate ? "has not read the gate receipt bound to this row (gate:"
-                    + esc(String(c.gate).slice(0, 10)) + ")"
-                  : "nothing has gate-checked this row at all"))
-    + ". Cross-check outside the browser with <code>helm lr show " + esc(String(c.id).slice(0, 12))
-    + "</code>.</div></div></div>";
-}
-
-/* ============ RELATED ROWS: ONE LANE NAME, ONE OR MORE WORK CHAINS ============
-
-   THE DEFECT THIS EXISTS TO REMOVE, in the owner's words (2026-08-11): "if
-   these are actually stacked somehow then they should display as related, the
-   list you print on the webUI makes them look all separate". Every land-request
-   row was drawn as its own top-level card, so one lane carrying several rounds
-   read as several independent pieces of stalled work. MEASURED on his live
-   board the same night: 41 in-flight rows under 30 DISTINCT LANE NAMES —
-   `project-raw-batch-is-unproven-end-to-end` and `compose-reads-stale-projection`
-   drew three cards each, six more names drew two. He had been reading that
-   header as 41 separate problems.
-
-   THE KEY IS THE CHAIN, AND THE LANE IS ONLY THE NAME ABOVE IT. This file's
-   producer says it at length (landreq's span comment, task/734): a lane label
-   is renamable free text and is not identity — keying on it makes one renamed
-   piece of work count as many AND collapses two unrelated efforts that happen
-   to share a name. So the nesting is TWO levels and they are not the same
-   claim:
-
-     lane name  — the OUTER box. It asserts only "these rows were filed under
-                  one label", which is exactly what the owner is looking at and
-                  exactly as much as a label can support. When one holds several
-                  chains the header SAYS SO, so the box is never read as one
-                  piece of work.
-     chain_root — the INNER group, and the only work-identity claim made here.
-                  Rounds of ONE effort (`--supersedes`, which carries the
-                  immutable root) nest into one line: current state and age
-                  visible, earlier rounds folded behind a tap.
-
-   MEASURED CONSEQUENCE, so nobody reads more into this than it does: on that
-   same live board all 41 live rows carried 41 DISTINCT chain roots, so chain
-   nesting alone would have changed nothing on screen — the collapse the owner
-   actually sees comes from the lane box, and the honest reading of that is "30
-   names, 41 chains", which is what the header now prints. Chain nesting is not
-   decoration for that: it fires the moment anyone files a round with
-   `--supersedes` (the closed strip already holds such a pair), and it is what
-   keeps the lane box from having to pretend a label is identity. */
-
-/* WORK IDENTITY FOR ONE ROW — never the lane label.
-
-   The fallback is "a root names itself" — the same seal `_append_dispatch`
-   writes — and it is deliberately the row's own id with NO synthetic prefix:
-   a row that founded a chain IS the row its descendants name, so an absent
-   root joining its own descendants' group is correct, not a collision. The
-   direction of the failure is what matters: an unreadable root can only ever
-   SPLIT a group into singletons, never merge two efforts that are not one. */
-function lrChainRoot(c) {
-  const root = c && c.chain_root;
-  return typeof root === "string" && root ? root : String((c && c.id) || "");
-}
-
-/* The lane LABEL, in one place, so the group box and every count of it cannot
-   drift into naming the box two different things. */
-function lrLaneName(c) {
-  return String((c && c.lane) || "(no lane)");
-}
-
-/* WHICH ROUND OF A CHAIN IS HAPPENING NOW — the one no sibling supersedes.
-
-   `supersedes` is a DECLARED relation in the record, so this is a read rather
-   than a guess. The alternatives were both inferences the browser has no
-   standing to make: "newest dwell" is wrong the moment a stamp is unreadable
-   (dwell_s is a fabricated 0 there, which would elect the oldest round), and
-   "last in server order" is an ordering, not a claim.
-
-   ANYTHING BUT EXACTLY ONE UNSUPERSEDED ROW AND THIS FUNCTION DECLINES, taking
-   the server's own first row instead. Zero (a cycle, or a chain whose head is
-   already closed and out of this list) and two-or-more (a fork) are both
-   records this browser may not adjudicate, and electing a head from a record
-   that does not name one is inventing the very fact the group is built on. */
-function lrChainHead(rows) {
-  if (!rows || rows.length < 2) return 0;
-  const superseded = new Set();
-  rows.forEach(c => {
-    if (c && typeof c.supersedes === "string" && c.supersedes)
-      superseded.add(c.supersedes);
-  });
-  const open = rows.filter(c => !superseded.has(String((c && c.id) || "")));
-  return open.length === 1 ? rows.indexOf(open[0]) : 0;
-}
-
-/* THE STRONGEST EVIDENCE AVAILABLE that same-named chains are one piece of
-   work: they cite the SAME REVIEWED COMMIT. Three land requests at one tip are
-   three requests over one piece of content, which is precisely the "actually
-   stacked somehow" the owner suspected — and it is the thing a label cannot
-   tell him.
-
-   IT IS A DISCLOSURE AND NEVER A MERGE. landreq's own index records why: "A
-   TIP CITED BY MANY PIECES OF WORK IS A BASE, NOT ONE PIECE OF WORK" — 15
-   unrelated fan-out lanes once shared one tip. Printing the fact lets the
-   owner decide; merging on it would rebuild that defect in the renderer.
-
-   REVIEW ROWS ONLY, AND `review_sha_full` ONLY. On a `--kind build` row the
-   cited commit is the BASE the work started FROM, not content under review;
-   comparing the two is the exact conflation that once let one landing be
-   claimed by five roots. A build row therefore never contributes to, and is
-   never counted in, this reading. */
-function lrSharedTip(chains) {
-  const by = new Map();
-  (chains || []).forEach(ch => {
-    const c = ch && ch.head;
-    if (!c || c.kind !== "review") return;
-    const tip = typeof c.review_sha_full === "string" ? c.review_sha_full : "";
-    if (!tip) return;
-    by.set(tip, (by.get(tip) || 0) + 1);
-  });
-  let best = null;
-  by.forEach((n, tip) => {
-    if (n > 1 && (!best || n > best.chains)) best = {tip: tip, chains: n};
-  });
-  return best;
-}
-
-/* PURE (data in, plain objects out — the lrCardHTML pattern, so tests run this
-   exact source under node). Rows in, one entry per LANE NAME out:
-
-     [{lane, rows, chains: [{root, rows: [card…], head: card, earlier: [card…]}],
-       shared_tip: {tip, chains} | null}]
-
-   STABLE FIRST-APPEARANCE ORDER at both levels. The server already sorts these
-   rows canonically (stage, then dwell) and every consumer here re-uses that
-   order rather than inventing a second one; a lane takes the position of its
-   FIRST row, so nothing jumps around a board the owner has learned to scan. */
-function lrLaneGroups(rows) {
-  const lanes = new Map();
-  (rows || []).forEach(c => {
-    const name = lrLaneName(c);
-    if (!lanes.has(name))
-      lanes.set(name, {lane: name, rows: 0, chains: [], byRoot: new Map()});
-    const g = lanes.get(name);
-    const root = lrChainRoot(c);
-    if (!g.byRoot.has(root)) {
-      const chain = {root: root, rows: [], head: null, earlier: []};
-      g.byRoot.set(root, chain);
-      g.chains.push(chain);
-    }
-    g.byRoot.get(root).rows.push(c);
-    g.rows += 1;
-  });
-  const out = [];
-  lanes.forEach(g => {
-    delete g.byRoot;                  // a build scaffold, not part of the shape
-    g.chains.forEach(chain => {
-      const i = lrChainHead(chain.rows);
-      chain.head = chain.rows[i];
-      chain.earlier = chain.rows.filter((_c, j) => j !== i);
-    });
-    g.shared_tip = lrSharedTip(g.chains);
-    out.push(g);
-  });
-  return out;
-}
-
-/* PURE: one lane group as markup, for the list view AND for a board column —
-   ONE renderer, because two would be how the two views came to draw one lane's
-   rows as related in one place and separate in the other.
-
-   A LANE WITH ONE CHAIN AND ONE ROW RENDERS EXACTLY AS IT ALWAYS DID: the bare
-   `lrRowHTML` card, byte for byte, no box, no header, no chrome. That is 21 of
-   the owner's 30 lanes, and a grouping that redecorated them would be charging
-   every quiet lane for a problem it does not have. */
-function lrGroupHTML(g, unmeas) {
-  const look = c => (unmeas instanceof Map ? unmeas.get(c && c.id) : undefined);
-  const chains = (g && g.chains) || [];
-  // ONE ROUND, ONE CHAIN — the unchanged card.
-  if (chains.length === 1 && !chains[0].earlier.length)
-    return lrRowHTML(chains[0].head, look(chains[0].head));
-  // ONLY a lane box that prints the NAME above its children may take the name
-  // off them. A single chain gets no caption (its own headline is the name),
-  // so its rows keep theirs.
-  const under = chains.length > 1;
-  const body = chains.map(chain => {
-    const n = chain.earlier.length;
-    return lrRowHTML(chain.head, look(chain.head), false, under)
-      + (n
-        // NEXT-SIBLING TOGGLE, NOT AN ID. The card, the board and the home
-        // glance can all draw the same chain in one document, so any id
-        // minted from the root would be duplicated across surfaces and every
-        // tap would open whichever copy the DOM found first.
-        ? '<button type="button" class="lrgmore" data-lrmore="1"'
-          + ' aria-expanded="false" title="earlier rounds of THIS SAME work'
-          + " — same chain root " + esc(String(chain.root).slice(0, 12))
-          + ', superseded by the round above">' + n + " earlier round"
-          + (n === 1 ? "" : "s") + " in this chain — tap to show</button>"
-          + '<div class="lrgearlier" hidden>'
-          + chain.earlier.map(c => lrRowHTML(c, look(c), false, under)).join("")
-          + "</div>"
-        : "");
-  }).join("");
-  // ONE CHAIN, SEVERAL ROUNDS: the row's own headline already prints the lane
-  // name, so a header repeating it would be noise. The box is only the fold.
-  if (chains.length === 1)
-    return '<div class="lrgrp">' + body + "</div>";
-  const st = g.shared_tip;
-  return '<div class="lrgrp multi">'
-    + '<div class="lrghead" title="these rows were filed under ONE LANE NAME'
-    + " and helm does not read a name as identity: a lane label is renamable"
-    + " free text, so the " + chains.length + " chains below are grouped here"
-    + " because they SHARE A NAME, not because the record says they are one"
-    + ' piece of work">'
-    + '<span class="lrglane">' + esc(g.lane) + "</span>"
-    + '<span class="lrgn">' + chains.length + " chains · " + g.rows
-    + " row" + (g.rows === 1 ? "" : "s") + "</span></div>"
-    + (st
-      // THE ONE PIECE OF EVIDENCE A NAME CANNOT GIVE HIM. Stated, never acted
-      // on: the rows stay separate because the record keeps them separate.
-      ? '<div class="lrgnote" title="a shared reviewed commit is evidence, not'
-        + " identity — a tip cited by many chains can also be a shared BASE,"
-        + ' so this is said and never merged">' + st.chains
-        + " of these chains cite the SAME reviewed commit "
-        + esc(String(st.tip).slice(0, 12))
-        + " — one piece of content under " + st.chains
-        + " separate land requests</div>"
-      : "")
-    + body + "</div>";
-}
-
-/* A column's place on the board. The rank mirrors landreq.STAGE_ORDER's
-   pipeline direction (left = dispatched, right = terminal); a state this list
-   has never met sorts LAST and is still drawn, because dropping a column is
-   dropping rows. READY-<RUNG> variants (READY-SELF-REVIEW, …) sit beside
-   READY: the rung is the point, so each keeps its own column. */
-function lrKbRank(state) {
-  const order = ["OPEN", "AWAITING_BUILD", "AWAITING_REVIEW",
-    "CHANGES_REQUESTED", "REVIEWED", "READY", "MERGED_LOCAL", "LANDED",
-    "SUPERSEDED", "DELIVERED_REPORT", "ABANDONED"];
-  const i = order.indexOf(String(state));
-  if (i >= 0) return i;
-  if (String(state).indexOf("READY") === 0) return order.indexOf("READY") + 0.5;
-  return order.length;
-}
-
-/* WHICH COLUMN a row belongs to, in one place: the board groups by it and the
-   closed partition counts what LEFT each column by it, and a second copy of
-   `c.state || "(no state)"` is how the two would drift into naming different
-   columns for one row. */
-function lrKbKey(c) {
-  return String((c && c.state) || "(no state)");
-}
-
-/* PURE (data in, string out — the lrCardHTML pattern, so tests run this exact
-   source under node). One column per STATE STRING THE ROWS ACTUALLY CARRY —
-   the exact word the list view prints in .lrstate, never a client-side
-   vocabulary — and a column exists only for states present in the data: the
-   list draws no row for an absent state, and this view invents no empty
-   column for one. The cards ARE lrRowHTML's rows, so kanban and list can
-   never disagree about one row.
-
-   `discharged` is a state→count Map of rows that left this board for the
-   CLOSED strip (verified-superseded / confirmation — owner 2026-08-04:
-   "superseded, if verified, should just be like another type of closed").
-   Those rows are NOT drawn here: the column holds only undischarged work.
-   What stays is a DOOR — the same `data-lrclosed` toggle the closed footer
-   carries, so the rows that left are one tap away from the column they left,
-   and a state whose every row was discharged keeps its (card-less) column
-   rather than vanishing with no trace of where 9 rows went. */
-function lrKanbanHTML(loops, unmeas, discharged) {
-  const off = discharged instanceof Map ? discharged : new Map();
-  const cols = new Map();
-  loops.forEach(c => {
-    const k = lrKbKey(c);
-    if (!cols.has(k)) cols.set(k, []);
-    cols.get(k).push(c);
-  });
-  off.forEach((n, k) => { if (n && !cols.has(k)) cols.set(k, []); });
-  const keys = Array.from(cols.keys())
-    .sort((a, b) => lrKbRank(a) - lrKbRank(b) || (a < b ? -1 : a > b ? 1 : 0));
-  return '<div class="lrkb">' + keys.map(k => {
-    const rows = cols.get(k);
-    // the SAME alarm predicate the row renders with — a column is loud
-    // exactly when a card inside it is, never on a parallel count
-    const alarms = rows.filter(c => lrMarks(c, unmeas.get(c && c.id))
-      .some(m => m.k === "bad" || m.k === "warn")).length;
-    const gone = off.get(k) || 0;
-    return '<div class="lrkcol' + (alarms ? " alarmed" : "") + '">'
-      + '<div class="lrkhead"><span class="lrkstate" title="' + esc(k) + '">'
-      + esc(k) + "</span>"
-      + (alarms ? '<span class="lrkwarn" title="' + alarms + " row"
-        + (alarms === 1 ? "" : "s") + ' in this column carry an alarm mark">⚠'
-        + alarms + "</span>" : "")
-      + '<span class="lrkn" title="' + rows.length + " row"
-      + (rows.length === 1 ? "" : "s") + ' in this state">' + rows.length
-      + "</span></div>"
-      // SAME LANE→CHAIN NESTING AS THE LIST (one owner, `lrGroupHTML`). A
-      // column already groups by STATE, which is a different axis and not a
-      // substitute: `project-raw-batch-is-unproven-end-to-end` put two of its
-      // three rows side by side in READY, and side-by-side in one column is
-      // exactly the "all separate" reading on the view the owner opens by
-      // default.
-      + '<div class="lrkrows">'
-      + lrLaneGroups(rows).map(g => lrGroupHTML(g, unmeas)).join("")
-      + "</div>"
-      + (gone ? '<button type="button" class="lrkfoot" data-lrclosed="1"'
-        + ' title="' + gone + " row" + (gone === 1 ? "" : "s")
-        + " in this state discharged their verdict — superseded through"
-        + " succession, or a confirmation round — so they are counted CLOSED"
-        + " and are not work in this column. Each keeps its own"
-        + " SUPERSEDED-CLOSED / CONFIRMATION line in the closed list"
-        + ' below">' + gone + " discharged — closed · tap to show</button>" : "")
-      + "</div>";
-  }).join("") + "</div>";
-}
-
-/* Is this answer a BOARD? A 200 whose body the card cannot read is not an empty
-   pipeline — it is an unread one, and it used to render as the happiest state
-   this card has: `lrCardHTML({})` printed "0 in flight", "the dispatch ledger
-   READ cleanly", "nothing closed in the last 24h" and badged 0. The
-   card already fails closed on malformed JSON and on a read that never
-   answered; a response whose SCHEMA regressed is the same fact arriving through
-   a different door.
-
-   The four ROW-CARRYING arrays are the test, and deliberately not every field:
-   `closed_total` absent is a degradation the card renders honestly on purpose
-   ("TOTAL UNKNOWN"), and demanding it here would convert a designed honest
-   branch into an outage. ONE owner for both readers below — a recogniser the
-   badge and the body disagree about is a badge that says 0 over a strip that
-   says UNKNOWN. */
-function lrIsBoard(d) {
-  return !!d && Array.isArray(d.loops) && Array.isArray(d.stalled_ids)
-    && Array.isArray(d.unmeasurable) && Array.isArray(d.closed_recent);
-}
-
-/* WHAT IS BUILDING — the owner's 13:26 question, as a reader.
-
-   He opened this card over a fleet with three live builds on it and read
-   "0 in flight", then asked whether that could be true while work was
-   plainly ongoing. The card was not wrong: it counts LAND REQUESTS, and a land
-   request is filed at the END of a build. What it had no words for was the
-   part before that, which is most of the work most of the time. `building` is
-   that reading, from `helm work list` rather than from the dispatch ledger.
-
-   THREE STATES AND THEY ARE NOT INTERCHANGEABLE. "absent" is a server that
-   predates this band: it sent no key, so this card says NOTHING about
-   building rather than inventing a zero for it (the law every other term on
-   this card obeys — an absent reading is never a measured one). "unknown" is a
-   reading that was ATTEMPTED and failed, and it is loud, because "the lane
-   rooms could not be read" and "nothing is being built" are the two sentences
-   this whole card exists to keep apart. "ok" carries rows, and a zero there is
-   a MEASURED zero and worth printing — "nothing is being built" is exactly the
-   claim he needs to be able to trust.
-
-   PURE, and shared by the pipeline card and the home band for the reason
-   lrHonored records one screen down: two surfaces that classify the same
-   payload separately disagree about it within the day. */
-function lrBuilding(d) {
-  const b = d && d.building;
-  if (!b || typeof b !== "object")
-    return {state: "absent", rows: [], total: null, unmeasured: 0, why: ""};
-  if (b.unavailable)
-    return {state: "unknown", rows: [], total: null, unmeasured: 0,
-            why: String(b.unavailable)};
-  if (!Array.isArray(b.rows))
-    return {state: "unknown", rows: [], total: null, unmeasured: 0,
-            why: "the lane reading arrived with no rows in it — what is "
-              + "BUILDING is UNKNOWN, not zero"};
-  // THE TOTAL IS THE SERVER'S, NEVER THE LENGTH OF THE CAPPED LIST — the
-  // closed-footer lesson, one band over: a cap may hide rows, it may not edit
-  // the number. A body carrying rows and no total is half-shaped, and the
-  // count then says so rather than quietly reporting the cap.
-  const total = typeof b.total === "number" ? b.total : null;
-  return {state: "ok", rows: b.rows, total,
-          unmeasured: typeof b.unmeasured === "number" ? b.unmeasured : 0,
-          why: ""};
-}
-
-/* The count term, for the pipeline card's header and the home band's headline
-   — ONE sentence, so the two numbers the owner reads in two places cannot be
-   spelled differently. "" on an absent reading: silence, never a zero. */
-function lrBuildingTerm(bd) {
-  if (bd.state === "absent") return "";
-  if (bd.state === "unknown") return "building UNKNOWN";
-  return (bd.total === null ? "?" : bd.total) + " building";
-}
-
-/* The band itself: one line per lane, the four facts `helm work list` prints. */
-function lrBuildingHTML(bd) {
-  if (bd.state === "absent") return "";
-  if (bd.state === "unknown")
-    return '<div class="lrbuild"><div class="lrbhead unk">⚠ WHAT IS BUILDING — UNKNOWN</div>'
-      + '<div class="lrbwhy">' + esc(bd.why) + "</div></div>";
-  const dropped = bd.total === null ? 0 : Math.max(0, bd.total - bd.rows.length);
-  const head = (bd.total === null ? "?" : bd.total)
-    + " lane" + (bd.total === 1 ? "" : "s") + " BUILDING"
-    + (dropped ? " — showing " + bd.rows.length + ", " + dropped
-        + " not shown (<code>helm work list</code>)" : "");
-  // WHY THE ROWS ARE HERE AT ALL and not only a number: the owner steers from
-  // this page, and "4 building" with no names tells him work exists without
-  // telling him whose. The holder is the column he actually uses.
-  const rows = bd.rows.map(r => {
-    r = r || {};
-    const left = lrDur(r.lease_remaining_s);
-    return '<div class="lrbrow"><span class="lrblane">'
-      + esc(String(r.lane || "(lane not recorded)")) + "</span>"
-      + '<span class="lrbwho">' + esc(r.holder ? "@" + r.holder : "holder UNKNOWN")
-      + "</span>"
-      + '<span class="lrbn" title="commits on this lane that the trunk ref does '
-      + 'not have yet">+' + (typeof r.ahead === "number" ? r.ahead : "?")
-      + "</span>"
-      + '<span class="lrblease" title="how much of this lane’s claim is LEFT, '
-      + "not how long it has been held: a claim row carries an expiry and a "
-      + 'last-renewed stamp, and no instant for when the lease was first taken">'
-      + (left === null ? "lease UNKNOWN" : "lease " + left + " left") + "</span>"
-      + (r.dirty ? '<span class="lrbdirty" title="uncommitted edits in this room '
-        + '— the +N beside it counts COMMITS only">+edits</span>' : "")
-      + "</div>";
-  }).join("");
-  const unm = bd.unmeasured
-    ? '<div class="lrbwhy">' + bd.unmeasured + " further leased lane"
-      + (bd.unmeasured === 1 ? " whose distance from" : "s whose distance from")
-      + " the trunk git could not answer — counted NEITHER as building nor as"
-      + " idle, because “?” is not “0”</div>"
-    : "";
-  return '<div class="lrbuild"><div class="lrbhead">' + head + "</div>"
-    + (bd.rows.length ? '<div class="lrbrows">' + rows + "</div>"
-      : '<div class="lrbwhy">no lane room holds a live claim with commits the '
-        + "trunk does not have — this is a MEASURED zero, read from "
-        + "<code>helm work list</code>, not an absence of information</div>")
-    + unm + "</div>";
-}
-
-/* WHO HOLDS THE BALL NOW. The server resolves this pair after succession
-   annotation; the browser only formats it. In particular it must not translate
-   lrHonored/contrary/state/owed_by independently — that made confirmation rows
-   say "nobody" here while the CLI still said "integrator". An older or
-   half-shaped response fails closed as holder UNKNOWN. */
-function lrBall(c) {
-  c = c || {};
-  const role = String(c.holder_role || "unknown");
-  const seat = c.holder_seat ? String(c.holder_seat) : null;
-  if (seat) return {role, seat, text: role + " @" + seat};
-  if (role === "nobody") return {role, seat: null, text: "nobody"};
-  if (role === "unknown") return {role, seat: null, text: "holder UNKNOWN"};
-  return {role, seat: null, text: role + " (seat not recorded)"};
-}
-
-/* THE IN-FLIGHT RENDERERS ARE GONE, NOT ORPHANED (owner ruling, task/2355).
-   `lrInflightMoving`, `lrInflightRowHTML`, `lrInflightHTML` and
-   `lrInflightWire` drew one line per live loop — lane, state, holder,
-   dwell, marks — into the home band, and they had exactly one caller.
-   The owner ruled that the cards repeating the ones he uses come off, and
-   by his own account the row text is agent jargon he never reads; the
-   holder column was the part that answered a question of his, and
-   `dashOwedBy` answers it as names and counts instead. Deleting the row
-   and keeping its renderers would have left ~130 lines no caller can
-   reach, which reads as coverage. The helpers they shared — `lrMarks`,
-   `lrDwell`, `lrChainRoot`, `lrLaneName`, `lrBall` — all keep other
-   callers on the pipeline wall and in `dashOwedBy`, so nothing else moved. */
-
-
-/* PURE: the whole card body as a string. Every branch here is a test case.
-   `view` chooses how the IN-FLIGHT rows are drawn — "list" is the flat wall,
-   anything else (including absent: every caller that does not care) is the
-   kanban board, so the default cannot drift to the list by omission. */
-function lrNonbillableLabels(d, ids) {
-  // The server owns authorization classification. An older/unrecognised
-  // response is explicitly unclassified, never guessed from hold prose.
-  const labels = new Map([
-    ["pre-tier", "pre-tier (not authorized)"],
-    ["advisory", "advisory (not authorized)"],
-    ["authorization-held", "authorization held"],
-    ["unbillable", "other nonbillable"],
-    ["unclassified", "unclassified nonbillable"]
-  ]);
-  const counts = new Map(), seen = new Set();
-  (d.unmeasurable || []).forEach(u => {
-    if (!u || !ids.has(u.id) || seen.has(u.id)) return;
-    seen.add(u.id);
-    const kind = labels.has(u.kind) ? u.kind : "unclassified";
-    counts.set(kind, (counts.get(kind) || 0) + 1);
-  });
-  return [...labels].filter(([kind]) => counts.has(kind))
-    .map(([kind, label]) => counts.get(kind) + " " + label);
-}
-
-function lrCardHTML(d, view) {
-  d = d || {};
-  view = view === "list" ? "list" : "kanban";
-  const label = '<span class="slabel">land pipeline</span>';
-  const how = '<span class="lrhow"><code>helm lr list</code></span>';
-  if (d.pending) {
-    // NOTHING HAS ANSWERED YET. This is the card's FIRST PAINT and the state a
-    // hung /api/lr leaves it in until the fetch deadline fires. Before it
-    // existed the section was an empty <section> with the nav badge at 0 —
-    // pixel-identical to a healthy quiet board, which is "nothing outstanding"
-    // said by a card that has read nothing at all.
-    return '<div class="lrhead">' + label
-      + '<span class="lrcounts">NOT READ YET</span>' + how + "</div>"
-      + '<div class="lrpending">⌛ READING THE LAND PIPELINE — nothing has answered yet</div>'
-      + '<div class="lrfresh">this card is blank because no read has COMPLETED, not because '
-      + "nothing is in flight. If it stays this way, check <code>helm lr list</code>.</div>";
-  }
-  // WARMING IS NOT UNREADABLE. The server says "I have not computed this yet"
-  // — a fact about a CACHE, not about the record. Asserting the ledger cannot
-  // be READ on a cold start was a false claim the owner met first, on every
-  // view after a restart. Checked BEFORE unavailable so a warming body can
-  // never fall through into the alarm branch.
-  if (d.warming) {
-    return '<div class="lrhead">' + label
-      + '<span class="lrcounts">reading…</span>' + how + "</div>"
-      + '<div class="lrwhy">the pipeline is being read now — this is the FIRST '
-      + "read since the server started, and it costs a full projection. "
-      + "Nothing is wrong with the record; it has not been computed yet, and "
-      + "this card refreshes itself when it is.</div>";
-  }
-  // A MISSED DEADLINE DURING A REBUILD IS THE `warming` FACT ARRIVING BY A
-  // DIFFERENT DOOR: the server is computing, the record is fine, and this
-  // card repairs itself on the next poll. It is checked before `unavailable`
-  // for the same reason `warming` is — so it can never fall through into the
-  // alarm branch — and it deliberately carries NO terminal instruction,
-  // because nothing is wrong for a terminal to fix.
-  if (d.rebuilding) {
-    return '<div class="lrhead">' + label
-      + '<span class="lrcounts">reading…</span>' + how + "</div>"
-      + '<div class="lrwhy">' + esc(String(d.rebuilding)) + ". A full "
-      + "projection takes about half a minute and helm is doing one now. "
-      + "Nothing is wrong with the record; this card refreshes itself when "
-      + "the read lands.</div>";
-  }
-  if (d.unavailable) {
-    // The record could not be READ. No rows, no counts, no reassurance.
-    return '<div class="lrhead">' + label
-      + '<span class="lrcounts">UNKNOWN</span>' + how + "</div>"
-      + '<div class="lrunknown">⚠ DISPATCH LEDGER UNREADABLE — pipeline UNKNOWN</div>'
-      + '<div class="lrwhy">' + esc(String(d.unavailable)) + "</div>"
-      + '<div class="lrfresh">no rows are shown because none could be READ — this is '
-      + "not an empty pipeline. Check it from a terminal with <code>helm lr list</code>.</div>";
-  }
-  if (!lrIsBoard(d)) {
-    // The read SUCCEEDED and the answer is not a board. Same strip as an
-    // unreadable ledger, because the owner is in the same position: nothing on
-    // screen was read, and a count would be invented.
-    return '<div class="lrhead">' + label
-      + '<span class="lrcounts">UNKNOWN</span>' + how + "</div>"
-      + '<div class="lrunknown">⚠ ANSWER NOT RECOGNISED — pipeline UNKNOWN</div>'
-      + '<div class="lrwhy">the land-pipeline read returned successfully with a body this '
-      + "card cannot read (no land-loop rows in it), so nothing here was measured</div>"
-      + '<div class="lrfresh">this is NOT an empty pipeline — it is an unread one. Check it '
-      + "from a terminal with <code>helm lr list</code>.</div>";
-  }
-  const loops = Array.isArray(d.loops) ? d.loops : [];
-  const stalled = new Set(Array.isArray(d.stalled_ids) ? d.stalled_ids : []);
-  const unmeas = new Map((Array.isArray(d.unmeasurable) ? d.unmeasurable : [])
-    .map(u => [u && u.id, u && u.reason]));
-  const closed = Array.isArray(d.closed_recent) ? d.closed_recent : [];
-  // A VERIFIED-quiet row is CLOSED, not work (owner 2026-08-04: "superseded,
-  // if verified, should just be like another type of closed"). lrHonored —
-  // THE display predicate — partitions the rows ONCE, and the honored side
-  // (a/b honored through succession, "c" the confirmation instrument) leaves
-  // the in-flight surfaces for the closed strip below: the board's
-  // SUPERSEDED column holds only undischarged rows. The RECORD keeps the
-  // distinction — each such row still prints SUPERSEDED-CLOSED /
-  // CONFIRMATION, never a plain retirement — only the PLACEMENT and the
-  // accounting move. "contrary" and "stalled" count LIVE alarms only, and
-  // the honored count is never silently dropped (it moves to the closed
-  // accounting): the header said "11 contrary" over 6 live + 5 honored
-  // (2026-08-04), and the first fix left the same row counted "1 stalled ·
-  // 1 honored" while its own mark rendered quiet. "unverified" and
-  // an absent stamp both stay LIVE and in the alarm: fail-closed.
-  const live = loops.filter(c => !lrHonored(c));
-  const liveIds = new Set(live.map(c => c && c.id));
-  const honoredRows = loops.filter(lrHonored);
-  const honored = honoredRows.length;
-  // WHICH column each discharged row left, so the board can leave a door
-  // there instead of a hole. Keyed by lrKbKey — the board's own grouping
-  // key, never a second reading of `state`.
-  const honoredByCol = new Map();
-  honoredRows.forEach(c => {
-    const k = lrKbKey(c);
-    honoredByCol.set(k, (honoredByCol.get(k) || 0) + 1);
-  });
-  const contrary = live.filter(c => c && c.contrary).length;
-  const stalledN = [...stalled].filter(id => liveIds.has(id)).length;
-  // THE SHAPE THE ROWS ARE ACTUALLY DRAWN IN, computed ONCE and used by both
-  // the header and the body below — a header counting a grouping the body did
-  // not draw is this card's own recorded failure ("the count filtered and the
-  // list did not"), one axis over.
-  const groups = lrLaneGroups(live);
-  const chainsN = groups.reduce((n, g) => n + g.chains.length, 0);
-  // "IN FLIGHT" IS NOT REDEFINED, AND THAT IS DELIBERATE. It counts ROWS, it is
-  // `landreq.inflight_rows` on the other transport, and this file's history is
-  // one long record of what happens when a noun on this card quietly starts
-  // naming a second number (`filed.in_flight` → `open`, task/324; the honored
-  // partition, 2026-08-04). The owner's actual question — "how many separate
-  // things am I looking at" — gets NEW terms with their OWN words instead, so a
-  // reader returning to a number he memorised is never silently compared
-  // against a different metric:
-  //
-  //   in flight    rows moving, unchanged, same predicate as `helm lr list`
-  //   chains       DISTINCT PIECES OF WORK (chain_root) — the honest answer to
-  //                "how many separate problems". Equal to in-flight whenever
-  //                every chain has one live round, which is the common case;
-  //                lower the moment a chain carries several.
-  //   lane names   how many BOXES are drawn below. Never a work count — a name
-  //                is a label — but it is the number of things his eye lands
-  //                on, and it was the missing one: 41 rows read as 41 problems
-  //                because nothing on screen said they sat under 30 names.
-  //
-  // AND THE SUBTRACTION IS STATED WHERE THE NUMBER IS. The honored partition
-  // has been excluded from both counts since 2026-08-04, but it was disclosed
-  // only in the CLOSED FOOTER at the far end of the card, and a reader at the
-  // header had nothing telling him a subtraction had happened at all. Measured
-  // 2026-08-12: a teammate with the ledger open and `git merge-base` in hand
-  // read this same board, concluded the header was counting five settled
-  // confirmation rows as live debt, and went as far as trying to `lr close`
-  // them — helm refused, correctly, because they are the discharge instrument.
-  // Nothing was wrong with the numbers; the DISCLOSURE was three screens from
-  // the claim it qualified. If a reader with instruments got it wrong, the
-  // owner reading a phone was never going to get it right.
-  // BUILDING SITS BESIDE IN FLIGHT because that is where the owner read the
-  // zero: "0 in flight ... work is ongoing", over a busy fleet. It is a
-  // SECOND SOURCE, not a redefinition — `in flight` still counts exactly the
-  // rows `helm lr list` prints, which is the law the span above spends thirty
-  // lines on — and the two terms partition the work: a lane leaves this one
-  // and enters that one the moment its land request is filed.
-  const bd = lrBuilding(d);
-  const bterm = lrBuildingTerm(bd);
-  const counts = [live.length + " in flight"]
-    .concat(bterm ? [bterm] : [])
-    .concat([stalledN + " stalled"])
-    .concat(contrary ? [contrary + " contrary"] : [])
-    .concat(lrNonbillableLabels(d, liveIds))
-    .concat([chainsN + " chain" + (chainsN === 1 ? "" : "s"),
-             groups.length + " lane name" + (groups.length === 1 ? "" : "s")])
-    .concat(honored ? [honored + " settled, not counted above"] : [])
-    .join(" · ");
-  // THE CLAUSE RIDES ITS TERM. An explanation of a number this card did not
-  // print is noise at best, and on an older server — which sends no lane
-  // reading at all — it would be this card asserting a band it does not have.
-  const buildingWhy = bterm
-    ? " · building = LANE ROOMS holding a live claim with commits the trunk"
-      + " does not have and NO land request filed yet, read from `helm work"
-      + " list` — a different record from every other number here, which is"
-      + " the point: a build files its request at the END, so this is the work"
-      + " that exists before anything on the ledger knows about it. The two"
-      + " terms partition: a lane leaves this one and joins in flight in the"
-      + " same read that files its row." : "";
-  const countsWhy = "in flight = ROWS moving (the same predicate `helm lr list`"
-    + " prints — unchanged)" + buildingWhy + " · chains = DISTINCT PIECES OF WORK, keyed on the"
-    + " immutable chain root a superseding round carries, which is the count of"
-    + " separate problems · lane names = how many boxes are drawn below. A lane"
-    + " is a renamable LABEL and never identity, so a box holding several"
-    + " chains says so on its header rather than claiming they are one piece of"
-    + " work. · settled = rows whose verdict was discharged through succession,"
-    + " or which ARE a confirmation round — helm's own words for them are"
-    + " “the discharge instrument, never a debt”. They were ALREADY"
-    + " subtracted from every number to the left of this one and already moved"
-    + " out of the list below; this term exists so that subtraction is visible"
-    + " here rather than only in the closed strip at the foot of the card. They"
-    + " are not hidden — they are one tap away under “closed in the"
-    + " last 24h”.";
-  const skipped = typeof d.receipts_skipped === "number"
-    ? " · " + d.receipts_skipped + " receipt row" + (d.receipts_skipped === 1 ? "" : "s")
-      + " skipped (failed self-hash)" : "";
-  const fresh = "ledger read " + lrAgo(d.read_age_s) + " · newest ledger write "
-    + lrAgo(d.ledger_age_s) + skipped;
-  // FILED — the all-time population behind this board, from the same read.
-  // Absent is SAID (an older server sent no split), never rendered as a zero
-  // and never re-derived from the capped lists above — a length is not a
-  // count (the closed_total lesson, one field over). Per-term "?" keeps a
-  // half-shaped split honest without discarding the terms that did arrive.
-  const f = (d.filed && typeof d.filed === "object") ? d.filed : null;
-  // LEGACY WIRE KEY, read under the new name. `in_flight` was renamed `open`
-  // (task/324) because one word named two numbers; but the console is served
-  // from disk while the SERVER process can be older, so a hot-reloaded UI
-  // against a pre-rename server got a perfectly well-formed split and
-  // rendered "? open" — which reads as "the server sent a broken split"
-  // when the truth is a version skew, and sends the reader to debug the
-  // wrong thing. "?" stays the answer for a genuinely absent term;
-  // it is not the answer for a term that arrived under its old name.
-  // REMOVABLE once no deployed server predates the rename.
-  const FILED_WAS = {open: "in_flight"};
-  const fnum = k => {
-    if (!f) return null;
-    if (typeof f[k] === "number") return f[k];
-    const was = FILED_WAS[k];
-    return was && typeof f[was] === "number" ? f[was] : null;
-  };
-  const fterm = k => { const n = fnum(k); return n === null ? "?" : String(n); };
-  // THE OFF-FRONTIER RESIDUE (task/2381), term for term with
-  // landreq.off_frontier_line. `open` no longer leads this strip: it named
-  // one number for two populations — work the owner is owed, and rows whose
-  // lane branch no longer exists in any repository — and he read the second
-  // as the first. Silent on zero AND on absent: a board with no residue says
-  // nothing about debris it does not have, and a server older than this split
-  // sends no key at all, where naming a "?" residue plus a command to clear
-  // it would send a reader after rows nobody counted.
-  // TWO NUMBERS, BECAUSE THE RESIDUE IS TWO POPULATIONS. "Placed" is the
-  // classification's answer — the lane is gone and git can say where the work
-  // went — and it is NOT "the close ladder will take it". Measured over 316
-  // placed rows on a copy of the live ledger, the authorizing witness
-  // affirmed 122 and refused 182, so a single number covering both facts is
-  // wrong about 58% of what it calls clearable. A body
-  // carrying the residue and NO split makes no clearance claim at all: a zero
-  // invented here would say "nothing can be cleared" about a board nobody
-  // measured.
-  const offN = fnum("off_frontier");
-  const okN = fnum("closable"), noN = fnum("not_closable");
-  let offTerm = "";
-  if (offN !== null && offN > 0) {
-    offTerm = " · " + offN + " OFF-FRONTIER (lane gone AND the work placed —"
-      + " not work owed)";
-    if (okN === null || noN === null) {
-      offTerm += " · helm lr retire --off-frontier censuses them";
-    } else {
-      if (okN > 0) {
-        offTerm += " · " + okN + " closable now: helm lr retire"
-          + " --off-frontier --apply closes these " + okN;
-      }
-      if (noN > 0) {
-        // NO APOSTROPHE: this string is rendered through esc() and the CLI
-        // prints the identical bytes, so a `'` here would become `&#39;` and
-        // break the byte-identical parity the strip is held to.
-        offTerm += " · " + noN + " placed but NOT closable yet — the close"
-          + " ladder cannot take the witness these rows need (helm lr retire"
-          + " --off-frontier names the refusal per row)";
-      }
-    }
-  }
-  // A BODY WITH NO FRONTIER TERMS PRINTS THE OLD WORDING, NOT A "?" — the
-  // same version-skew rule FILED_WAS encodes one rename over. An older
-  // server's `open` is a real number; only the SPLIT of it is missing, and
-  // "? open on the live frontier" reads as a broken payload.
-  // THE UNPLACEABLE ROWS RIDE INSIDE THE FRONTIER NUMBER AND ARE NAMED
-  // THERE, term for term with landreq.filed_line. They are counted as work
-  // owed (the safe direction) and they are NOT ordinary queued work — their
-  // lane is gone and helm could not place the tip — so a count folded in
-  // silently would be a backlog the owner can neither act on nor see.
-  const unc = fnum("unclassified");
-  const lead = fnum("open_frontier") !== null
-    ? fterm("open_frontier") + " open on the live frontier"
-      + (unc !== null && unc > 0
-         ? " (incl. " + unc + " unclassified — lane gone, tip not placeable,"
-           + " counted as work owed)" : "")
-    : fterm("open") + " open";
-  const filedLine = f && typeof f.total === "number"
-    ? "filed " + f.total + " all-time · " + lead + " · "
-      + fterm("held") + " held · " + fterm("underived") + " underived · "
-      + fterm("landed") + " landed · "
-      + fterm("closed") + " closed · " + fterm("non_loop") + " non-loop"
-      + offTerm
-    : "filed total UNKNOWN — the server sent no filed split";
-  // PROJECT SCOPE — the withheld disclosure (task/974). Rows owned by OTHER
-  // projects leave this board's lists and counts, and THIS line is where the
-  // owner learns they exist, how many, whose, and the escape that shows
-  // them. Mirrors landreq.withheld_line term for term (filed_line's law: one
-  // record, two surfaces, no disagreement). Absent is SAID — an older server
-  // sent no reading — never rendered as "0 withheld"; a scope the server
-  // could not resolve renders as UNRESOLVED + wide, never a confident
-  // narrower board.
-  const w = (d.withheld && typeof d.withheld === "object") ? d.withheld : null;
-  const wAll = !!d.all_projects;
-  let scopeLine;
-  if (!w) {
-    scopeLine = "project scope UNKNOWN — this body carries no withheld "
-      + "reading (an older helm web built it)";
-  } else if (!w.scope_repo) {
-    scopeLine = "project scope UNRESOLVED ("
-      + (w.scope_why || "no repository identity")
-      + ") — showing EVERY project's rows";
-  } else {
-    const who = w.scope
-      || "repository " + w.scope_repo + " (registered to no project)";
-    const n = typeof w.foreign === "number" ? w.foreign : 0;
-    const m = typeof w.unresolved === "number" ? w.unresolved : 0;
-    const verb = wAll ? "shown labeled" : "withheld";
-    const by = n && w.by_project && typeof w.by_project === "object"
-      ? " (" + Object.keys(w.by_project).sort()
-          .map(k => k + " " + w.by_project[k]).join(", ") + ")" : "";
-    // UNRESOLVED rows are SHOWN, marked — absence of provenance is not
-    // foreignness — so that term is a census of marks, not of removals.
-    scopeLine = "project scope: " + who + (wAll ? " — ALL PROJECTS" : "")
-      + " · " + (n ? n + " row" + (n === 1 ? "" : "s")
-        + " from other projects " + verb + by
-        : "0 rows from other projects")
-      + (m ? " · " + m + " row" + (m === 1 ? "" : "s")
-        + " of UNRESOLVED project shown, marked" : "")
-      + (n && !wAll
-        ? " · helm lr list --all-projects (or /api/lr?all_projects=1) shows them"
-        : "");
-  }
-  // THE COUNT IS THE SERVER'S TOTAL, NEVER THE LENGTH OF THE CAPPED LIST: the
-  // phone shows a footer, not a history, so 13 closed lanes used to render as
-  // the number 12. A cap may hide rows; it may not edit the number, and what it
-  // dropped is said out loud.
-  const total = typeof d.closed_total === "number" ? d.closed_total : null;
-  const dropped = total === null ? 0 : Math.max(0, total - closed.length);
-  const unknownWhen = typeof d.closed_unknown_when === "number" ? d.closed_unknown_when : 0;
-  const closedHead = total === null
-    ? "closed in the last 24h: showing " + closed.length + ", TOTAL UNKNOWN (the server sent no count)"
-    : "closed in the last 24h: " + total
-      + (dropped ? " — showing the newest " + closed.length + ", " + dropped
-        + " not shown (<code>helm lr list --all</code>)" : "");
-  // The honored partition joins the CLOSED accounting — a closed-type count
-  // beside the 24h number, never an in-flight term — and its rows sit behind
-  // the same tap as the retired ones, so the ONE closed surface is where a
-  // discharged row is found from either view.
-  const closedHonored = honored ? " · " + honored
-    + " honored (verified superseded/confirmation — closed, not in flight)" : "";
-  // Rows the record cannot place in or out of the window at all. Counted, never
-  // dropped: dropping them is what let this footer say "nothing closed in the
-  // last 24h" over a lane that had merged minutes earlier.
-  const unknownFoot = unknownWhen
-    ? '<div class="lrfoot">' + unknownWhen + " further row" + (unknownWhen === 1 ? " is" : "s are")
-      + " CLOSED at an UNKNOWN time — the record carries no usable closure instant for "
-      + (unknownWhen === 1 ? "it" : "them")
-      // WHY, without naming one cause as THE cause: a git-observed landing has
-      // no stamp anywhere, and a stamp that is not a timestamp or one dated in
-      // the future is not a closure instant either. The old sentence asserted
-      // the first over all three.
-      + " (a landing git observed carries none anywhere; a stamp helm cannot read, "
-      + "or one dated in the future, is not one either), so this card cannot say whether "
-      + (unknownWhen === 1 ? "it" : "they") + " closed in the last 24h</div>"
-    : "";
-  // the 1-click view control: both choices visible, the active one lit. It
-  // renders only on a BOARD — the pending/UNKNOWN strips have no rows to
-  // re-arrange, and a control that does nothing is a lie about a control.
-  const vtog = '<span class="lrvtog" title="how the in-flight rows are drawn '
-    + '— the choice is remembered on this device">'
-    + '<span class="lrvopt' + (view === "kanban" ? " on" : "")
-    + '" data-lrview="kanban" role="button">⊞ board</span>'
-    + '<span class="lrvopt' + (view === "list" ? " on" : "")
-    + '" data-lrview="list" role="button">☰ list</span></span>';
-  return '<div class="lrhead">' + label + '<span class="lrcounts" title="'
-    + esc(countsWhy) + '">' + esc(counts)
-    + "</span>" + vtog + how + "</div>"
-    + '<div class="lrfiled" title="every dispatch row the ledger holds, all-time.'
-    + " open on the live frontier = every non-terminal loop except held whose"
-    + " work is still somewhere a person can take it: a lane-family ref, a"
-    + " checked-out room, a live lease, or the tip held off trunk by a live"
-    + " branch or room — ledger accounting, how much is on the books and still"
-    + " reachable. OFF-FRONTIER is the rest of that same bucket, and only the"
-    + " rows helm could PLACE: the lane is gone AND the work landed under a"
-    + " later tip or was abandoned and reaped. PLACED IS NOT CLOSABLE: the"
-    + " close ladder demands a proof of its own, and it refuses a placed row"
-    + " whose witness it cannot take — so the term beside it counts what"
-    + " `helm lr retire --off-frontier --apply` would close now, and the term"
-    + " after that counts the placed rows it would refuse, one reason per row"
-    + " in the census. A row helm could"
-    + " not place counts as ON the frontier, never off it — unknown is work"
-    + " owed — and the frontier term says how many of those there are. A"
-    + " server older than the split sends no frontier terms and the strip then"
-    + " reads `open = every non-terminal loop except held`, the whole bucket"
-    + " under its old word, because a real number must never render as `?`."
-    + " The header above counts IN FLIGHT, which is a"
-    + " different question: only the carrying chain frontier, and it counts a"
-    + " verified-superseded row (its verdict discharged through succession, or"
-    + " a confirmation round) as CLOSED rather than as work, so it reads"
-    + " lower. Both are true, and `helm lr list` prints these same two numbers"
-    + " under these same two words · held ="
-    + " a verdict the record cannot act on (undeclared polarity, or a declared"
-    + " approval held by tier/gate policy) · underived = helm ASKED whether"
-    + " this landed and could not finish before its derive budget ran out, so"
-    + " the answer is unknown rather than no. Drawn OUT of open and held, not"
-    + " added beside them: counting an unanswered row as either makes the"
-    + " board report a backlog that is partly its own unfinished reading. The"
-    + " proof ledger is positive-only, so these can only turn out to have"
-    + " LANDED — the board over-reports and never under-reports, and reading"
-    + " again shrinks it, though that shrinkage does not yet carry across a"
-    + " land (task/2259) · landed = retired with the change on"
-    + " trunk · closed = retired any other way · non-loop = cancelled transit /"
-    + ' migration / ref-less legacy rows">' + esc(filedLine) + "</div>"
-    + '<div class="lrfiled" title="which project this board answers for.'
-    + " Rows owned by OTHER projects leave the lists and counts above by"
-    + " default — this line is the disclosure: how many left, whose they"
-    + ' are, and the escape that shows them">' + esc(scopeLine) + "</div>"
-    + '<div class="lrfresh">' + esc(fresh) + "</div>"
-    // ABOVE the in-flight rows, deliberately. Building is the EARLIER half of
-    // the same pipeline, and the owner's complaint was that the card began at
-    // the filing — so the card now begins where the work does.
-    + lrBuildingHTML(bd)
-    + (live.length
-      ? (view === "list"
-        // THE WALL BECAME A NEST (owner 2026-08-11). Same rows, same order,
-        // same `lrRowHTML` cards — only rows whose LANE NAME or WORK CHAIN
-        // relates them now sit inside one box instead of standing as separate
-        // top-level entries. `groups` is the header's own reading, so the count
-        // above and the boxes below cannot disagree.
-        ? '<div class="lrrows">'
-          + groups.map(g => lrGroupHTML(g, unmeas)).join("") + "</div>"
-        : lrKanbanHTML(live, unmeas, honoredByCol))
-      : honored
-        ? (view === "list"
-          ? '<div class="lrnone">nothing OPEN in flight — every remaining row '
-            + "discharged its verdict (superseded through succession, or a "
-            + "confirmation round) and is counted closed below.</div>"
-          // the board still draws its card-less columns, so the doors to the
-          // discharged rows stay where those rows used to be
-          : lrKanbanHTML(live, unmeas, honoredByCol))
-        : '<div class="lrnone">no land loops in flight — the dispatch ledger READ cleanly, '
-          + "and it holds nothing open.</div>")
-    // honored rows render WITHOUT the closed flag: the ledger has not retired
-    // them, so "when did this close" is not their question — their own
-    // SUPERSEDED-CLOSED / CONFIRMATION mark says what discharged them — and
-    // each keeps its unmeasurable reason threading, byte-equal to the row the
-    // board would have drawn.
-    + (closed.length || honored
-      ? '<button type="button" class="lrfoot" data-lrclosed="1">'
-        + closedHead + closedHonored + " — tap to show</button>"
-        + '<div class="lrrows" id="lrclosed" hidden>'
-        + honoredRows.map(c => lrRowHTML(c, unmeas.get(c.id))).join("")
-        + closed.map(c => lrRowHTML(c, null, true)).join("") + "</div>"
-      : unknownWhen ? ""
-        : '<div class="lrfoot">nothing closed in the last 24h</div>')
-    + unknownFoot;
-}
-
-/* PURE: what the home tab's nav badge should say. UNKNOWN gets a "?" rather
-   than a zero, so an unreadable pipeline reaches him from any other tab. */
-function lrNav(d) {
-  if (!d || d.pending)
-    return {n: "?", title: "the land pipeline has not been read yet — this badge is "
-      + "not a count of anything"};
-  if (d.unavailable)
-    return {n: "?", title: "the land pipeline could not be read — pipeline UNKNOWN"};
-  if (!lrIsBoard(d))
-    return {n: "?", title: "the land pipeline answered with a body this card cannot "
-      + "read — pipeline UNKNOWN, and this badge is not a count of anything"};
-  // the badge is the ALARM count, so an honored contrary (lrHonored — THE
-  // display predicate) rings NEITHER alarm: not the contrary one, and not
-  // the stalled one either, or the badge disagrees with the quiet row it
-  // points at. Unverified/unstamped rows still ring, fail-closed.
-  const rows = (Array.isArray(d.loops) ? d.loops : [])
-    .filter(c => c && !lrHonored(c) && (c.contrary || c.stalled));
-  return {n: rows.length, title: rows.length
-    ? rows.length + " land loop" + (rows.length === 1 ? "" : "s")
-      + " contradicting a verdict or stalled — see the land pipeline's kanban on the Work page" : ""};
-}
-
-function lrWire() {
-  // the view toggle: store ONLY an explicit choice (kanban is the default
-  // when the key is unset), then redraw from the answer already in hand —
-  // a toggle must not cost a 45s poll, and must not fetch anything.
-  $$("#lrsec .lrvopt").forEach(el => el.onclick = () => {
-    const v = el.dataset.lrview === "list" ? "list" : "kanban";
-    if (v === lrViewPref()) return;
-    localStorage.setItem("helm.lrview", v);
-    if (LR_LAST) lrShow(LR_LAST);
-  });
-  // ONE closed list, SEVERAL DOORS: the footer strip and every board-column
-  // chip toggle the SAME #lrclosed box, so a discharged row is reachable from
-  // wherever the owner is looking — the column it left, or the foot of the
-  // card. A second closed list would be a second truth about what is closed;
-  // this is the same one, opened from another place. Revealing it also brings
-  // it into view: on a phone the board is a tall horizontal scroller and the
-  // box opens below the fold, which reads as a tap that did nothing.
-  $$("#lrsec [data-lrclosed]").forEach(el => el.onclick = () => {
-    const box = $("#lrclosed");
-    if (!box) return;
-    box.hidden = !box.hidden;
-    if (!box.hidden && box.scrollIntoView) box.scrollIntoView({block: "nearest"});
-  });
-  // EARLIER ROUNDS OF ONE CHAIN, folded under the round happening now. The
-  // box is the button's NEXT SIBLING rather than an id target, because the
-  // list, the board and the home glance can each draw the same chain in one
-  // document and any id minted from the chain root would be duplicated —
-  // every tap would then open whichever copy the DOM reached first.
-  $$("#lrsec [data-lrmore]").forEach(el => el.onclick = () => {
-    const box = el.nextElementSibling;
-    if (!box) return;
-    box.hidden = !box.hidden;
-    el.setAttribute("aria-expanded", box.hidden ? "false" : "true");
-  });
-  $$("#lrsec .lrrow").forEach(el => el.addEventListener("click", async ev => {
-    const sha = ev.target.closest && ev.target.closest(".lrsha");
-    if (sha && sha.dataset.sha) {
-      try { await navigator.clipboard.writeText(sha.dataset.sha); } catch (e) {}
-      toast("copied " + sha.dataset.sha.slice(0, 12));
-      return;
-    }
-    const x = el.querySelector(".lrx");
-    if (x) x.hidden = !x.hidden;
-  }));
-}
-
 /* ================= SYSTEM DASHBOARD (home, above the fold) =================
-   One band, five rows, each owned by the poll that already carries its data —
-   NO poll of its own. The lr-fed rows (pipeline / landed / owner / chain)
-   render here off pollLr's answer; the fleet row renders off pollChat's
-   presence array; the signing pulse stays pollDregg's. The pipeline WALL
-   is the kanban higher up this same Work page — this band's pipeline row is
-   the glance, and it carries the jump.
-
-   THE PARTITION vs THE CARD'S COUNTS: the bar partitions LIVE work ONCE
-   (contrary > stalled > unmeasurable > moving). A row whose verdict was
-   honored through succession, or which is the confirmation instrument, is
-   CLOSED rather than a fifth kind of in-flight work: it leaves both the
-   headline and proportional bar and joins the closed accounting beside them.
-   The card header below counts each LIVE fact (a contrary row that is also
-   stalled is in both numbers there). Both are true; the titles say which
-   question each answers, so the two "stalled" numbers cannot silently
-   masquerade as the same measurement. */
+   The cells that are left, each owned by the poll that already carries its
+   data — NO poll of its own. The chain cell renders off pollLr's answer; the
+   fleet row renders off pollChat's presence array; the signing pulse stays
+   pollDregg's. The land requests themselves are cards on the Work page
+   (task/3643), whose stage row is their glance. */
 let DASH_FLEET_TS = 0;
 // The answers card rides the chat poll, so its own read can die silently
 // while the card keeps showing the last thing it saw — the exact hazard
@@ -2651,17 +1337,6 @@ let DASH_CHAT_FAILED = 0;
 // it is the cadence the poll is actually running at rather than a guess.
 let DASH_CHAT_CADENCE_S = 2;
 
-/* one land receipt as a comparable row: lane · commit · git's answer · age.
-   THE TRI-STATE IS THE POINT: ✓ and ✗ are git's answers; UNKNOWN is git
-   unable to answer, and today EVERY receipt reads UNKNOWN (the recorded
-   commits were local merges git has since collected) — that word is the
-   honest state of the record, never a blank. */
-/* THE SIGNATURE IS A BADGE, NOT A GATE. A land reaches this card because it is
-   ON TRUNK; whether anyone additionally minted a signed receipt for it is a
-   separate, weaker fact about the RECORD. Wiring it the other way round is the
-   defect this card was rebuilt to remove — the receipt log was the row source,
-   so an unwitnessed land was an INVISIBLE land. Never again: this function may
-   change what a row SAYS and may never decide whether a row EXISTS. */
 /* HOME-CARD LAW, ONE IMPLEMENTATION. The owner's rule, verbatim: "if it is
    there it does not go stale, and anything on the homepage should be actually
    useful, otherwise why pipe it there". Two rules, and they are one helper each
@@ -2670,10 +1345,16 @@ let DASH_CHAT_CADENCE_S = 2;
      cardSource  every card says which command-line read it came from and how
                  old that read is. A number with no provenance is a number the
                  owner cannot check against `helm lr list`.
-     cardStale   a read older than its own poll cadence renders NOTHING. Not a
-                 dimmed value, not a last-known figure — a stale value on this
-                 page is worse than an empty row, because the empty row sends
-                 him to the command line and the stale one does not.
+     cardStale   a read older than its own poll cadence is never presented as
+                 current. A card that cannot say its reading's age beside the
+                 value renders NOTHING for it — a stale value passed off as
+                 current is worse than an empty row. A card that can says it:
+                 the last reading, DATED, with its age and the word stale
+                 beside the numbers, once (task/3632, the land pipeline's
+                 reading and every surface of it: "a dated last reading beats
+                 blanking" — the review's ruling). Blanking a reading the
+                 server still stood behind put "stale" and "0" on Home most
+                 of every hour.
 
    The multiple is 4x the cadence rather than 1x on purpose: one missed beat is
    a slow read, four consecutive misses is a dead poll, and a card that blanks
@@ -2694,6 +1375,19 @@ function cardStale(ageS, cadenceS) {
     || ageS > cardBoundS(cadenceS);
 }
 
+/* IS THE LAND PIPELINE'S READING PAST ITS OWN BOUND (task/3632)? The server
+   serves that reading while it rebuilds, up to the bound it names
+   (`limit_s`, its hard bound), so a reading younger than that is one it
+   still stands behind. Judged by four of this page's polls instead (180 s),
+   it read "stale" most of every hour — read ages ran 62-407 s — and the
+   cards that refuse a stale reading blanked on a healthy one. A body that
+   names no bound (an older server) keeps the card law's four polls. PURE. */
+function lrStale(d) {
+  const age = d && typeof d.read_age_s === "number" ? d.read_age_s : null;
+  const limit = d && typeof d.limit_s === "number" ? d.limit_s : cardBoundS(45);
+  return age === null || !isFinite(age) || age > limit;
+}
+
 /* TWO AGES WHEN THEY DIFFER. `ageS` is the READING's age — how long since the
    server last read or confirmed the inputs — and it is the one the freshness
    bound judges. `projS`, when the body carries it, is the PROJECTION's own age:
@@ -2706,311 +1400,6 @@ function cardSource(read, ageS, projS) {
   return '<span class="dsub dcsrc">' + esc(read) + " · read "
     + esc(typeof ageS === "number" ? lrAgo(ageS) : "age unknown") + proj + "</span>";
 }
-
-function dashLandRow(r) {
-  r = r || {};
-  const ref = r.trunk_ref || "trunk (ref unknown)";
-  /* THE ROW'S EXISTENCE IS A RECORDED LAND. It is here because the
-     land-request ledger carries a `close --reason landed` for it, which is the
-     event the integrator writes as the land happens and the same event
-     `helm lr list` projects. So neither of the two verdicts below can mean "it
-     might not have landed" — they say what PROOF the closing ladder recorded,
-     which is a different and still useful fact. There were four while the rows
-     came off a trunk walk; two of those answered about git's own view of the
-     reviewed content and are unreachable from a close event. */
-  const v = r.on_trunk === true
-    ? {cls: "dok",
-       txt: "✓ " + (r.how === "patch-equivalent" ? "landed (patch)" : "landed"),
-       t: "the closing ladder proved the reviewed content onto " + ref
-         + " by " + (r.how || "?") + " at close time, and that proof is why "
-         + "this row is closed. HISTORICAL: it says the work got there, never "
-         + "that the bytes are there now"}
-    : {cls: "dunk", txt: "? proof not recorded",
-       t: "the ledger closed this row as LANDED and recorded no proof mode "
-         + "with it, so HOW it was proven onto " + ref + " cannot be read "
-         + "back. The land itself is the record's own claim; only the proof "
-         + "is missing"};
-  /* THE AGE, AND WHY IT IS MISSING WHEN IT IS MISSING. Three states, not two:
-     a readable closure instant gives an age; a closure the ledger recorded
-     with a stamp that is NOT a timestamp says UNREADABLE, because that is a
-     corrupt record to repair rather than a record that never had a stamp; and
-     a closure with no instant anywhere says unknown. The stage-entry instant is
-     never borrowed for any of them — a confident date over an unmeasured
-     closure is the failure this row exists to avoid. */
-  const age = typeof r.age_s === "number" ? lrAgo(r.age_s)
-    : r.ts_unreadable ? "age UNREADABLE" : "age unknown";
-  const ageWhy = typeof r.age_s === "number"
-    ? "measured from the closure instant the ledger recorded"
-    : r.ts_unreadable
-      ? "the ledger's closure stamp for this row is not a timestamp, so this "
-        + "land has no readable instant. The stage-entry instant is a "
-        + "different event and is deliberately not substituted for it"
-      : "the record carries no closure instant for this land";
-  /* THE TASK NUMBER IS THE IDENTITY THE OWNER READS. Lane labels are agent
-     jargon by his own account, so the task comes first when the record names
-     one. It is never invented: a land whose close evidence named no task says
-     so, because a blank there would read as a render that failed. */
-  const task = r.task
-    ? '<span class="dltask" title="the task this land served, read out of the '
-      + 'close evidence the ledger already carries">task/' + esc(r.task) + "</span>"
-    : '<span class="dltask dmut" title="the close evidence for this land names '
-      + 'no task number — nothing is inferred from the lane label">no task</span>';
-  const gate = r.gate
-    ? '<span class="dlgate" title="the whole-suite gate receipt this land was '
-      + 'verified by">gate:' + esc(String(r.gate).slice(0, 12)) + "</span>"
-    : '<span class="dlgate dunk" title="no gate token is recorded on this '
-      + 'row, so this land is UNVERIFIED as far as this card can read">gate ?</span>';
-  return '<div class="dland"><span class="dllane" title="' + esc((r.lane || "(no lane)")
-    + " — closed as landed "
-    + (r.ts || (r.ts_unreadable ? "at a time the ledger recorded unreadably"
-                                : "at an unknown time")) + " onto "
-    + (r.trunk_sha || "—") + " on " + ref) + '">'
-    + esc(r.lane || "(no lane)") + "</span>" + task + "<code>"
-    + esc((r.reviewed_tip || "").slice(0, 8) || "—") + "</code>" + gate
-    + '<span class="dlver ' + v.cls + '" title="' + esc(v.t) + '">' + v.txt
-    + '</span><span class="dlage" title="' + esc(ageWhy) + '">'
-    + esc(age) + "</span></div>";
-}
-
-
-function dashLandGroups(rows) {
-  const by = new Map(), out = [];
-  rows.forEach((r, i) => {
-    const root = (r && typeof r.chain_root === "string" && r.chain_root) ? r.chain_root : null;
-    const k = root ? "chain:" + root : "row:" + i;
-    if (!by.has(k)) { const g = []; by.set(k, g); out.push(g); }
-    by.get(k).push(r);
-  });
-  return out;
-}
-
-/* Which receipt speaks FOR the group. Preference order is evidentiary, not
-   chronological: the round whose reviewed tip IS the trunk sha is literally
-   the commit that landed; failing that, any round git can still prove; and
-   only then the newest, which is a guess about recency dressed as an answer
-   and is therefore last. */
-function dashLandPrimary(g) {
-  return g.find(r => r && r.reviewed_tip && r.reviewed_tip === r.trunk_sha)
-      || g.find(r => r && r.on_trunk === true)
-      || g.slice().sort((a, b) => (((b && b.ts) || "")).localeCompare(((a && a.ts) || "")))[0];
-}
-
-/* The answers a landed close can carry about its own proof, as a comparable
-   token. Used ONLY to detect disagreement inside a group — never to render.
-
-   TWO TOKENS NOW, NOT FOUR, and the two that went are not a simplification:
-   they belonged to the trunk-walking reader. `absent` meant git had proven the
-   reviewed content was never on trunk, and `corr` meant a receipt's stored
-   patch-id was the only evidence. Neither is reachable from a ledger close —
-   a `landed` close IS the record asserting the land, and this card may not
-   contradict the record it renders — so a key for them would be a branch no
-   input can enter, which is worse than absent: it reads as coverage.
-
-   THE KEY IS THE OUTCOME AND NEVER THE METHOD. Folding `how` into it made two
-   rounds that BOTH proved the reviewed content onto trunk — one by ancestry,
-   one by patch-equivalence — compare unequal, so the group auto-opened under a
-   summary claiming in words that its receipts do not agree about whether the
-   content ever reached trunk. They agree exactly about that; they differ about
-   which instrument answered it, which is not a disagreement and is already
-   printed on each row. A key that can turn two affirmatives into THEY DISAGREE
-   is a false alarm on the one part of this card whose alarm must be believed. */
-function dashLandVerdictKey(r) {
-  r = r || {};
-  return r.on_trunk === true ? "ok" : "unk";
-}
-
-/* One LAND. Collapsing is a summary, and A SUMMARY THAT HIDES THE DECIDING
-   FACT IS WORSE THAN THE FLAT LIST IT REPLACED — the failure this whole card
-   exists to avoid. So when the rounds DISAGREE (one proven on trunk, another
-   proven absent), the disagreement is promoted INTO the collapsed summary in
-   words and the group opens by default. Agreement collapses quietly; conflict
-   never does. */
-function dashLandGroup(g) {
-  const primary = dashLandPrimary(g);
-  const rest = g.filter(r => r !== primary);
-  if (!rest.length) return dashLandRow(primary);
-  const split = new Set(g.map(dashLandVerdictKey)).size > 1;
-  const n = rest.length;
-  const label = n + " earlier round" + (n === 1 ? "" : "s")
-    + (split ? " — THEY DISAGREE" : "");
-  return '<div class="dlgroup' + (split ? " dlsplit" : "") + '">'
-    + dashLandRow(primary)
-    + "<details" + (split ? " open" : "") + '><summary title="'
-    + esc(split
-        ? "The receipts in this land do NOT agree about whether the reviewed "
-          + "content ever REACHED trunk. That is a fact about the record, not a "
-          + "rendering detail, "
-          + "so this group opens itself and will not collapse the conflict away."
-        : "Each round of this lane minted its own signed receipt. They agree, "
-          + "so only the landing round is shown above; the rounds are the "
-          + "reviewed history and are kept, not thinned.")
-    + '">' + esc(label) + "</summary>"
-    + rest.map(dashLandRow).join("") + "</details></div>";
-}
-
-function dashLands(rl, pending, ageS) {
-  const el = $("#dlands");
-  if (!el) return;
-  if (pending) { el.innerHTML = '<span class="dmut">not read yet</span>'; return; }
-  if (!rl || typeof rl !== "object" || !Array.isArray(rl.rows)) {
-    // a pipeline body with no lands reading at all — the half-live deploy
-    // (new page, old server). NOT SENT, never "no lands".
-    el.innerHTML = '<span class="dunk">NOT SENT</span> <span class="dmut">— the server '
-      + "answered without a landed reading (older <code>helm web</code>; restart it)</span>";
-    return;
-  }
-  // THE HOME-CARD STALENESS RULE, AND IT IS THE FIRST THING THIS CARD DOES.
-  // Its own read age decides whether it renders at all, so a dead 45s poll
-  // leaves an EMPTY row rather than yesterday's lands looking like today's.
-  // That is the owner's rule taken literally: a card that can go stale is a
-  // card that comes off, and the only card allowed to stay is one that
-  // removes itself when it cannot be current.
-  if (cardStale(ageS, 45)) {
-    el.innerHTML = '<span class="dunk">STALE — not rendered</span> <span class="dsub">'
-      + "the pipeline read behind this card is "
-      + esc(typeof ageS === "number" ? lrAgo(ageS) : "of unknown age")
-      + ", past this card's own freshness bound. Its last values are "
-      + "deliberately NOT shown; run <code>helm lr list</code></span>";
-    return;
-  }
-  if (rl.unavailable) {
-    el.innerHTML = '<span class="dunk">UNKNOWN</span> <span class="dmut">— '
-      + esc(String(rl.unavailable)) + "</span>";
-    return;
-  }
-  // THE PHRASE "no lands" MAY NOT APPEAR HERE. An empty answer off this
-  // reader is a real measurement — the ledger holds no landed close — and it
-  // is still not a licence to certify a quiet pipeline in words a skimming
-  // reader takes as "nothing is happening".
-  if (!rl.rows.length) {
-    el.innerHTML = '<span class="dmut">the land-request ledger records no '
-      + "closed-as-landed row for this project — check with <code>helm lr "
-      + "list --all</code> before reading that as a quiet week</span>";
-    return;
-  }
-  // WHEN NO ROW CARRIES A RECORDED PROOF, SAY SO ONCE IN WORDS. Six question
-  // marks could be skimmed as decoration, and this is the card's most
-  // important sentence on the day it is true: the ledger is closing rows as
-  // landed without recording how any of them was proven, which is a repair to
-  // make rather than a state to shrug at.
-  //
-  // IT IS COMPUTED OVER rl.rows — THE WHOLE ANSWER — NEVER OVER THE GROUP
-  // PRIMARIES, which is the property its predecessor earned: grouping changes
-  // what is SHOWN and must never change what is COUNTED.
-  const allUnproven = rl.rows.every(r => !r || r.on_trunk !== true);
-  el.innerHTML = '<div class="dlands">'
-    + dashLandGroups(rl.rows).map(dashLandGroup).join("")
-    // THE CAP DISCLOSES ITSELF OVER A MEASURED POPULATION. Under the old
-    // trunk grammar no honest total existed, so the card could only say "more
-    // exist". The ledger holds every landed close, so the number is real and
-    // the cap is visibly a display budget rather than a silent edit.
-    + (rl.rows_truncated
-      ? '<div class="dsub" style="margin-top:2px">newest ' + rl.rows.length
-        + " of "
-        + (typeof rl.total === "number" ? rl.total + " recorded lands"
-                                        : "a total this body did not send")
-        + " — this card is a glance, the history is on <code>helm lr list "
-        + "--all</code></div>"
-      : "")
-    // THE ORDER IS NEWEST FIRST AND IT IS A MEASUREMENT, so there is nothing
-    // to disclaim here. Two lands closed inside one second have no answer from
-    // their whole-second stamps, and the producer orders them by the ledger's
-    // own append index for the close — the record answering, rather than the
-    // list disclaiming a place it could not justify.
-    + (allUnproven ? '<div class="dsub" style="margin-top:2px">every row above '
-      + 'closed as LANDED with <span class="dunk">no proof mode recorded</span>'
-      + " — the lands are the ledger's own claim, and how each was proven onto "
-      + "trunk cannot be read back from the record. A real gap in the record, "
-      + "said out loud.</div>" : "")
-    + cardSource("helm lr list", ageS)
-    + "</div>";
-}
-
-
-/* WHO OWES THE NEXT MOVE — the top row of Board (owner ruling, task/2355).
-   From `d.loops`, the SAME projection `helm lr list` renders, and from the
-   server-resolved holder pair rather than a browser re-derivation: `lrBall`'s
-   own comment records what re-deriving it cost last time.
-
-   IT IS A ROLL-UP, NOT A LIST OF ROWS. The owner's account of this page is
-   that he reads the totals and never the row text, because row text is agent
-   jargon — so this row answers his question ("who owes the next move") with
-   names and counts, and the per-row detail stays one click away on the
-   ledger. It REPLACED the in-flight row, which printed lane, state, holder and
-   dwell per loop: the holder column was the only part of it he read, and the
-   rest was the jargon. */
-function dashOwedBy(d, pending, board) {
-  const el = $("#downedby");
-  if (!el) return;
-  if (pending) { el.innerHTML = '<span class="dmut">not read yet</span>'; return; }
-  const ageS = d && typeof d.read_age_s === "number" ? d.read_age_s : null;
-  if (cardStale(ageS, 45)) {
-    el.innerHTML = '<span class="dunk">STALE — not rendered</span> <span class="dsub">'
-      + "the pipeline read behind this row is "
-      + esc(typeof ageS === "number" ? lrAgo(ageS) : "of unknown age")
-      + "; run <code>helm lr list</code></span>";
-    return;
-  }
-  if (!board) {
-    el.innerHTML = '<span class="dunk">UNKNOWN</span> <span class="dmut">— '
-      + esc(String((d && d.unavailable) || "the answer was not a pipeline board"))
-      + "</span>";
-    return;
-  }
-  // ONE BUCKET PER HOLDER, counted over LIVE loops only: a verdict honored
-  // through succession is closed, and nobody owes a move on it.
-  const live = d.loops.filter(c => c && !lrHonored(c));
-  const by = new Map();
-  let nobody = 0, unknown = 0;
-  live.forEach(c => {
-    const ball = lrBall(c);
-    // THE ROLE IS NOT A CLOSED VOCABULARY, AND IT IS NOT PLAIN LANGUAGE.
-    // MEASURED on the live board: 11 of 29 live loops carry the holder role
-    // "unknown (declared verdict held)" — a REVIEWED row whose polarity nobody
-    // declared — and matching the bare word "unknown" put all eleven at the TOP
-    // of this row under that sentence, as if it were a person's name. The owner's
-    // account of this page is that row text is agent jargon he never reads, so
-    // the first word decides the bucket and the jargon never reaches the chip.
-    const role = String(ball.role || "unknown").split(" ")[0];
-    if (role === "nobody") { nobody++; return; }
-    if (role === "unknown") { unknown++; return; }
-    // A KNOWN ROLE WITH NO SEAT IS STILL A REAL ANSWER — "the integrator owes
-    // two" is actionable — so it buckets under the role WORD rather than under
-    // lrBall's "(seat not recorded)" sentence, which is a note to an agent.
-    const key = ball.seat || role;
-    const seen = by.get(key) || {n: 0, oldest: -1, seat: ball.seat || role,
-                                 text: ball.text};
-    seen.n += 1;
-    if (c.dwell_known && typeof c.dwell_s === "number" && c.dwell_s > seen.oldest) {
-      seen.oldest = c.dwell_s;
-    }
-    by.set(key, seen);
-  });
-  const rows = Array.from(by.values()).sort((a, b) => b.n - a.n || b.oldest - a.oldest);
-  if (!rows.length && !unknown) {
-    el.innerHTML = '<span class="dmut">nobody owes a move — '
-      + live.length + " live loop" + (live.length === 1 ? "" : "s")
-      + ", every one of them closed or held</span>" + cardSource("helm lr list", ageS);
-    return;
-  }
-  const CAP = 6;
-  const shown = rows.slice(0, CAP);
-  const extra = rows.length - shown.length;
-  el.innerHTML = shown.map(r => '<span class="dowed" title="'
-      + esc(r.text + " — " + r.n + " live land loop" + (r.n === 1 ? "" : "s")
-            + " waiting on this holder"
-            + (r.oldest >= 0 ? ", the longest waiting " + lrDwell(r.oldest) : ""))
-      + '"><span class="dnum">' + r.n + "</span> " + esc(r.seat)
-      + "</span>").join("")
-    + (extra ? '<span class="dsub">+' + extra + " more holder"
-        + (extra === 1 ? "" : "s") + "</span>" : "")
-    + (unknown ? '<span class="dsub"><span class="dunk">' + unknown
-        + " holder UNKNOWN</span> — the roster could not answer for "
-        + (unknown === 1 ? "one row" : "those rows") + "</span>" : "")
-    + (nobody ? '<span class="dsub">' + nobody + " owed by nobody</span>" : "")
-    + cardSource("helm lr list", ageS);
-}
-
 
 /* ANSWERS FOR YOU — one small card (owner ruling, task/2364). Replies that
    ADDRESS HIM, in the words their author wrote, with their age.
@@ -3043,8 +1432,9 @@ function dashAnswers(d) {
     el.hidden = false;
     el.innerHTML = '<div class="dahead">answers for you</div>'
       + '<div class="dasub"><span class="dunk">NOT SENT</span> — this '
-      + "<code>helm web</code> answered without the owner-addressed reading; "
-      + "restart it, and read <code>helm chat read</code> meanwhile</div>";
+      + "server answered without the owner-addressed reading, so it needs a "
+      + 'restart; the <a class="dslink" href="#chat">chat</a> has the replies '
+      + "meanwhile</div>";
     return;
   }
   if (!rows.length) {
@@ -3094,7 +1484,7 @@ function dashAnswers(d) {
     // `dashAnswersClock` is what takes the card off once the read stops
     // arriving. A count with no provenance is a count he cannot check against
     // the command line, and this card's whole claim is "right now".
-    + cardSource("helm chat read", 0);
+    + cardSource("chat", 0);
   el.querySelectorAll("[data-gochat]").forEach(node => node.onclick = event => {
     event.stopPropagation(); showView("chat");
   });
@@ -3145,8 +1535,8 @@ function dashAnswersClock() {
            : ", and its last attempt failed " + esc(lrAgo(tried)))
        : "the chat read behind this card last answered "
          + esc(lrAgo(gone)))
-    + ", so what is waiting for you is UNKNOWN; run <code>helm chat "
-    + "read</code></div>";
+    + ", so what is waiting for you is UNKNOWN; the "
+    + '<a class="dslink" href="#chat">chat</a> has the room</div>';
 }
 
 function dashFleetClock() {
@@ -3166,10 +1556,10 @@ function dashFleetClock() {
             + esc(lrAgo(tried)))
                         : "last read " + esc(lrAgo(gone)))
     + " — who is on is UNKNOWN, and the seats this row last saw are "
-    + "deliberately not shown; run <code>helm fleet</code></span>";
+    + "deliberately not shown until presence reads again</span>";
 }
 
-function dashChain(nc, pending, ageS) {
+function dashChain(nc, pending, ageS, stale) {
   const el = $("#dchain");
   if (!el) return;
   if (pending) { el.innerHTML = '<span class="dmut">chain not read yet</span>'; return; }
@@ -3177,11 +1567,12 @@ function dashChain(nc, pending, ageS) {
   // verification verdict are values, and a value past its read's freshness
   // bound comes off rather than standing as current — the same law the lands
   // card and the owed-by row already apply, and the reason it is a helper.
-  if (cardStale(ageS, 45)) {
+  // The bound is the pipeline reading's own (`lrStale`, task/3632).
+  if (stale) {
     el.innerHTML = '<span class="dunk">STALE — not rendered</span> <span class="dsub">'
       + "the pipeline read behind this card is "
       + esc(typeof ageS === "number" ? lrAgo(ageS) : "of unknown age")
-      + "; run <code>helm premise-check --chain</code></span>";
+      + "; the card comes back with the next fresh read</span>";
     return;
   }
   if (!nc || typeof nc !== "object")
@@ -3190,225 +1581,34 @@ function dashChain(nc, pending, ageS) {
     { el.innerHTML = '<span class="dunk">chain UNKNOWN</span> <span class="dsub">' + esc(String(nc.unavailable)) + "</span>"; return; }
   if (!nc.count)
     { el.innerHTML = '<span class="dmut">local chain empty — no records yet on this machine</span>'; return; }
+  // SAID PLAINLY, AND NO COMMAND (console walk 3, #6): the owner does not use
+  // a terminal, so the card names what was checked and when, and the read's
+  // age is its own clause after the head index rather than glued to it.
   el.innerHTML = (nc.verified
-    ? '<span class="dok" title="premise.verify_chain() re-hashed every record this read — a cryptographic check, not a stored flag">chain ✓</span> '
-      + '<span class="dnum">' + (nc.count | 0) + '</span> <span class="dsub">records verified · head #'
+    ? '<span class="dok" title="premise.verify_chain() re-hashed every record this read — a cryptographic check, not a stored flag">chain verified</span>: '
+      + '<span class="dnum">' + (nc.count | 0) + '</span> <span class="dsub">records · head #'
       + esc(String(nc.head_index ?? "?")) + "</span>"
     : '<span class="dbad" title="' + esc(String(nc.detail || "no detail sent"))
       + '">chain ✗ FAILS verification</span> <span class="dsub">head #'
       + esc(String(nc.head_index ?? "?")) + " · inspect the failure detail above</span>")
-    + cardSource("helm premise-check --chain", ageS);
-}
-
-function dashOwner(d, pending, board) {
-  const el = $("#downer");
-  if (!el) return;
-  if (pending) { el.innerHTML = '<span class="dmut">not read yet</span>'; return; }
-  // THE HOME-CARD STALENESS RULE, ON THE OWNER STRIP TOO. An owner ask and an
-  // LR hold on him are the most actionable values on this page, which is
-  // exactly why an expired one may not stand as current: the reader acts on it.
-  const ageS = d && typeof d.read_age_s === "number" ? d.read_age_s : null;
-  if (cardStale(ageS, 45)) {
-    el.innerHTML = '<span class="dunk">STALE — not rendered</span> <span class="dsub">'
-      + "the pipeline read behind this strip is "
-      + esc(typeof ageS === "number" ? lrAgo(ageS) : "of unknown age")
-      + "; run <code>helm lr list</code></span>";
-    return;
-  }
-  // EVERY BRANCH NAMES THE READ AND ITS AGE. The strip has eight
-  // sentences and each is an answer about the owner queue, so the provenance
-  // belongs on all eight rather than on the one that happens to carry a number.
-  const src = cardSource("helm lr list", ageS);
-  // Fleet-filed asks now ride the SAME /api/lr answer as the graph. The home
-  // strip consumes that canonical model instead of claiming there is no Web
-  // door, and never fetches the owner queue independently.
-  const model = d.scheduler;
-  if (!model || typeof model !== "object") {
-    el.innerHTML = '<span class="dunk">owner asks UNKNOWN</span> <span class="dsub">— '
-      + "the scheduler model was not sent</span>"
-      + src;
-    return;
-  }
-  const asks = Array.isArray(model.owner_asks) ? model.owner_asks : [];
-  const dropped = typeof model.owner_asks_dropped === "number"
-    ? model.owner_asks_dropped : 0;
-  const askCount = typeof model.owner_ask_count === "number"
-    ? model.owner_ask_count : null;
-  if (asks.length) {
-    const first = asks[0];
-    const known = asks.length + dropped;
-    const countLabel = askCount === null
-      ? known + "+ KNOWN OWNER ASKS · QUEUE UNKNOWN"
-      : askCount + " OWNER ASK" + (askCount === 1 ? "" : "S");
-    el.innerHTML = '<span class="dwarn">' + countLabel
-      + '</span> <span class="dsub">oldest: '
-      + esc(first.age_known ? lrAgo(first.age_s) : "age unknown") + " · "
-      + esc(first.plain_title || first.title || "owner input")
-      + (dropped ? " · +" + dropped + " more not shown" : "")
-      + ' · <span class="dslink" data-goscheduler>who waits on whom →</span></span>'
-      + src;
-    el.querySelectorAll("[data-goscheduler]").forEach(node => node.onclick = event => {
-      event.stopPropagation(); showView("work"); goOldSection("scheduler");
-    });
-    return;
-  }
-  if (askCount > 0) {
-    el.innerHTML = '<span class="dwarn">' + askCount + " OWNER ASK"
-      + (askCount === 1 ? "" : "S") + '</span> <span class="dsub">all '
-      + dropped + ' details capped · <span class="dslink" data-goscheduler>who waits on whom →</span></span>'
-      + src;
-    el.querySelectorAll("[data-goscheduler]").forEach(node => node.onclick = event => {
-      event.stopPropagation(); showView("work"); goOldSection("scheduler");
-    });
-    return;
-  }
-  if (model.owner_asks_unavailable) {
-    el.innerHTML = '<span class="dunk">owner asks UNKNOWN</span> <span class="dsub">— '
-      + esc(String(model.owner_asks_unavailable)) + "</span>"
-      + src;
-    return;
-  }
-  if (!Array.isArray(model.owner_holds)) {
-    el.innerHTML = '<span class="dunk">owner LR holds UNKNOWN</span> <span class="dsub">— '
-      + "the canonical holder projection was not sent</span>"
-      + src;
-    return;
-  }
-  const holds = model.owner_holds;
-  if (holds.length) {
-    const first = holds[0];
-    const detail = first.detail ? " · " + first.detail : "";
-    el.innerHTML = '<span class="dwarn">' + holds.length + " LR HOLD"
-      + (holds.length === 1 ? "" : "S") + ' ON OWNER</span> <span class="dsub">oldest: '
-      + esc(first.age_known ? lrAgo(first.age_s) : "age unknown") + " · "
-      + esc(first.plain_title || first.title || "land request") + esc(detail)
-      + ' · <span class="dslink" data-goscheduler>who waits on whom →</span></span>'
-      + src;
-    el.querySelectorAll("[data-goscheduler]").forEach(node => node.onclick = event => {
-      event.stopPropagation(); showView("work"); goOldSection("scheduler");
-    });
-    return;
-  }
-  if (!board || model.unavailable) {
-    el.innerHTML = '<span class="dunk">pipeline UNKNOWN</span> <span class="dmut">— '
-      + "fleet-filed owner asks read cleanly, but LR holder truth cannot be read</span>"
-      + src;
-    return;
-  }
-  el.innerHTML = '<span class="dmut">no fleet-filed owner asks or owner-held land requests</span>'
-      + src;
+    + " · " + cardSource("re-hashed on the pipeline read", ageS);
 }
 
 function dashLr(d) {
-  const pipe = $("#dpipe");
-  if (!pipe) return;                        // page without the band (tests)
   const pending = !d || !!d.pending;
-  const board = !pending && !d.unavailable && lrIsBoard(d);
-  // THE IN-FLIGHT ROW IS GONE FROM THIS BAND (owner ruling, task/2355: cards
-  // that repeat the ones he uses come off). It printed one line per loop —
-  // lane, state, holder, dwell — and by his own account the row text is agent
-  // jargon he never reads; the holder column was the part that answered a
-  // question of his, and `dashOwedBy` answers it as names and counts. Its four
-  // renderers went with it in the same commit rather than being left callerless
-  // — see the note where they stood.
-  dashOwedBy(d || {}, pending, board);
-  // A body with NO recent_lands/native_chain and a named unavailable is a
-  // read that FAILED (pollLr's synthetic body, or the handler's own) — those
-  // cells inherit that reason. Only a body that otherwise answered and still
-  // lacks the field earns "NOT SENT — older server": the harness caught the
-  // first version blaming a network error on a server version.
+  // THE PIPELINE ROWS ARE GONE FROM THIS BAND (task/3585, task/3643): in
+  // flight, owed by and landed are the Work page's stage row now. Their
+  // renderers went with them rather than being left callerless.
+  // A body with NO native_chain and a named unavailable is a read that FAILED
+  // (pollLr's synthetic body, or the handler's own) — the chain cell inherits
+  // that reason. Only a body that otherwise answered and still lacks the
+  // field earns "NOT SENT — older server": the harness caught the first
+  // version blaming a network error on a server version.
   const inherit = f => !pending && d && d[f] === undefined && d.unavailable
     ? {rows: [], unavailable: String(d.unavailable)} : (!pending && d ? d[f] : null);
   dashChain(inherit("native_chain"), pending,
-            d && typeof d.read_age_s === "number" ? d.read_age_s : null);
-  // THE CARD'S OWN READ AGE IS AN ARGUMENT, not something it digs out of the
-  // body: `read_age_s` is resolved at RESPONSE time for exactly this reason
-  // (the body can be up to _LR_FLOOR_S old), and passing it makes the
-  // staleness rule visible at the call site rather than hidden in the card.
-  dashLands(inherit("recent_lands"), pending,
-            d && typeof d.read_age_s === "number" ? d.read_age_s : null);
-  dashOwner(d || {}, pending, board);
-  // EVERY branch below ends with the jump to the wall — the detail surface
-  // moved to the ledger tab, and a glance row that cannot reach its detail
-  // is a dead end on a phone. The link is navigation, not data, so it is
-  // present even when the row itself says UNKNOWN.
-  const go = ' <span class="dslink" data-goledger>full pipeline: the kanban →</span>';
-  if (pending) {
-    pipe.innerHTML = '<span class="dmut">not read yet</span>' + go;
-  } else if (cardStale(d && typeof d.read_age_s === "number" ? d.read_age_s : null, 45)) {
-    // THE SIX TOTALS OBEY THE SAME LAW AS EVERY OTHER CARD (owner ruling,
-    // task/2355). These are the numbers he pastes, which is the strongest
-    // reason they may not be allowed to stand past their read: a number he
-    // pastes is a number he acts on, and a headline of 29 in flight taken from
-    // a dead poll is worse than an empty row, because the empty row sends him
-    // to the command line. The bar goes with them — a proportional bar over
-    // expired counts is the same claim drawn instead of written.
-    pipe.innerHTML = '<span class="dunk">STALE — not rendered</span> <span class="dsub">'
-      + "the pipeline read behind these totals is "
-      + esc(d && typeof d.read_age_s === "number" ? lrAgo(d.read_age_s)
-                                                  : "of unknown age")
-      + ", past this band's own freshness bound. The counts are deliberately "
-      + "NOT shown; run <code>helm lr list</code></span>" + go;
-  } else if (!board) {
-    pipe.innerHTML = '<span class="dunk">UNKNOWN</span> <span class="dmut">— '
-      + esc(String((d && d.unavailable) || "the answer was not a pipeline board"))
-      + "</span>" + go;
-  } else {
-    const bd = lrBuilding(d), bterm = lrBuildingTerm(bd);
-    const loops = d.loops, stalledSet = new Set(d.stalled_ids);
-    const unmeasSet = new Set(d.unmeasurable.map(u => u && u.id));
-    const nonbillableIds = new Set();
-    const live = loops.filter(c => c && !lrHonored(c));
-    const hon = loops.filter(lrHonored).length;
-    let mov = 0, stl = 0, ctr = 0, unm = 0;
-    live.forEach(c => {
-      if (c.contrary) ctr++;
-      else if (c.stalled || stalledSet.has(c.id)) stl++;
-      else if (unmeasSet.has(c.id)) { unm++; nonbillableIds.add(c.id); }
-      else mov++;
-    });
-    const seg = (n, cls, t) => n ? '<i class="' + cls + '" style="flex-grow:' + n
-      + '" title="' + esc(t) + '"></i>' : "";
-    const n = (v, cls) => '<span class="' + (v ? cls : "dmut") + '"><span class="dnum">'
-      + v + "</span>";
-    pipe.innerHTML =
-      '<span title="every LIVE land loop counted ONCE: contrary > stalled > unmeasurable > moving. A verdict honored through succession is CLOSED, not in flight, so it is excluded from this headline and bar and joins the closed accounting below. The pipeline card counts each live fact separately, so its stalled number can be higher.">'
-      + '<span class="dnum">' + live.length + "</span> in flight</span>"
-      // THE TERM THE OWNER'S OWN READING ASKED FOR, and this is the exact
-      // headline he read as "0 in flight" while three builds were live. It is
-      // the same sentence the pipeline card prints (lrBuildingTerm owns it),
-      // beside the number it qualifies rather than three screens away — the
-      // disclosure-distance lesson the pipeline card's header records. Silent
-      // on an absent reading: an older server sends no key and this band then
-      // says nothing about building, never zero.
-      + (bterm ? '<span title="lane rooms holding a live claim with commits the '
-        + 'trunk does not have and no land request filed yet, from `helm work '
-        + 'list` — the work that exists BEFORE anything is filed, which is why '
-        + 'this band could read 0 in flight over a busy fleet">'
-        + (bd.state === "ok"
-          ? '<span class="dnum">' + (bd.total === null ? "?" : bd.total)
-            + "</span> building"
-          : '<span class="dunk">building UNKNOWN</span>') + "</span>" : "")
-      + '<span class="dbar" role="img" aria-label="live pipeline composition">'
-      + seg(mov, "dmov", mov + " moving — inside their stage thresholds")
-      + seg(stl, "dstl", stl + " stalled past a stage threshold")
-      + seg(ctr, "dctr", ctr + " CONTRARY — trunk contradicts a verdict")
-      + seg(unm, "dunm", unm + " nonbillable — authorization/advisory holds are not failed projection reads")
-      + "</span>"
-      + n(mov, "dmut") + " moving</span> " + n(stl, "dwarn") + " stalled</span> "
-      + n(ctr, "dbad") + " contrary</span> "
-      + n(unm, "dmut") + " nonbillable</span>"
-      + '<span class="dsub">' + esc(lrNonbillableLabels(d, nonbillableIds).join(" · ")) + '</span>'
-      + '<span class="dsub">' + (typeof d.closed_total === "number"
-        ? d.closed_total + " closed 24h" : "closed-24h total UNKNOWN")
-      + (hon ? " · " + hon + " honored closed" : "")
-      + "</span>" + cardSource("helm lr list", d.read_age_s, d.projected_age_s) + go;
-  }
-  pipe.querySelectorAll("[data-goledger]").forEach(e => e.onclick = ev => {
-    ev.stopPropagation();
-    showView("work");
-    $("#tierpipeline").scrollIntoView({block: "start"});
-  });
+            d && typeof d.read_age_s === "number" ? d.read_age_s : null,
+            !pending && lrStale(d));
   // THE TWO CHAT-FED CARDS ARE CHECKED HERE TOO, BUT THIS IS NO LONGER THEIR
   // CLOCK. They expire on the chat poll's own cadence and are checked on its
   // interval; the pipeline heartbeat is kept as a SECOND caller because a
@@ -3425,6 +1625,8 @@ function dashLr(d) {
    so the reader learns exactly one presence language. Ephemeral review-SAs
    and the owner's own cockpit row are not fleet. */
 function dashFleet(list) {
+  // Home's seats tile counts these same rows (`homeSeats`)
+  if (Array.isArray(list) && typeof FLEET_LAST !== "undefined") FLEET_LAST = list;
   const el = $("#dfleet");
   if (!el || !Array.isArray(list)) return;  // older server: the honest boot text stays
   const seats = list.filter(s => s && s.seat && !s.ephemeral && !s.owner);
@@ -3460,10 +1662,10 @@ function dashFleet(list) {
     .concat(act.sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0)).map(s => dot(s, "fresh", "active <2m")))
     .concat(qui.map(s => dot(s, "quiet", "quiet <15m")));
   const CAP = 9;
-  // RENDERED STRAIGHT TO THE ROW, and kept nowhere. The staleness path
-  // withholds the seat list rather than reprinting it, so a module variable
-  // holding the last render would be a stored value with no reader — the same
-  // dead surface as a callerless renderer.
+  // RENDERED STRAIGHT TO THE ROW, and the render is kept nowhere. The
+  // staleness path withholds the seat list rather than reprinting it; the
+  // rows themselves are kept (FLEET_LAST) only because Home's seats tile
+  // counts them, on the same staleness clock.
   el.innerHTML = (named.length
     ? named.slice(0, CAP).join(" ")
       + (named.length > CAP ? ' <span class="dmut">+' + (named.length - CAP) + "</span>" : "")
@@ -3486,25 +1688,23 @@ function dashFleet(list) {
     // THE ROW NAMES ITS READ LIKE EVERY OTHER CARD. Presence rides the chat
     // poll, so the age shown is that read's age at the instant it rendered, and
     // `dashFleetClock` is what takes the row off once that read stops arriving.
-    + cardSource("helm fleet", 0);
+    + cardSource("seat presence", 0);
   DASH_FLEET_TS = Date.now();
+  if (typeof homeRender === "function") homeRender();
 }
 
 function lrShow(d) {
   LR_LAST = d;
-  $("#lrsec").innerHTML = lrCardHTML(d, lrViewPref());
-  lrWire();
-  // the dashboard band + the fold summary ride this SAME answer — one read,
-  // two altitudes. typeof-guarded because the client-runtime tests extract
-  // lrShow ALONE and run it under node, where the band does not exist; on
-  // the real page the function is always defined.
+  // the History chain cell, on-you and Home's signing tile ride this SAME
+  // answer — one read, several altitudes. typeof-guarded because the
+  // client-runtime tests extract lrShow ALONE and run it under node, where
+  // the band does not exist; on the real page the function is always defined.
   if (typeof dashLr === "function") dashLr(d);
-  if (typeof schedulerShow === "function") schedulerShow(d);
   if (typeof onYouShow === "function") onYouShow({lr: d});
-  const nav = lrNav(d);
-  NAV_LR = nav.n;
-  NAV_LR_TITLE = nav.title;
-  renderNav();
+  // Home's signing tile reads this answer too, as it lands
+  if (typeof homeRender === "function") homeRender();
+  // THE NAV BADGE IS NOT THIS ANSWER'S: it is the Work page's stuck count,
+  // off /api/work (task/3643, `wkBadge`)
 }
 
 async function pollLr() {

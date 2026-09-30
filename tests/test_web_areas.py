@@ -8,13 +8,19 @@ what if it was just work and history and history focuses on signing stuff",
 and "since chat already needs no sub menu, maybe board needs no submenu either
 and history just moves to the 4th item in the top level menu?".
 
-So the nav is four areas. WORK is one page: the burn board, the work tab and
-the scheduler merged, with the land pipeline moved onto it from History. CHAT
-is unchanged. FLEET keeps its sections (credit, seats, sessions, configs,
-boxes) and is the only area with a section row. HISTORY is the signing ledger
+So the nav is four areas. WORK merged the burn board, the work tab and the
+scheduler, with the land pipeline moved onto it from History; since task/3445
+(the IA review's Option 1 — the owner: "why would the work page have all
+projects listed twice or more listing different things?") it has a section row
+of its own, and its sections speak one hash, #work/<section>. Since task/3643
+the row is projects · work · pipeline · backlog: projects is its own screen,
+and work is the ONE Work page, with pipeline and backlog as its two
+pre-filtered entries, drawn on the same element. CHAT is unchanged. FLEET keeps its
+sections (credit, seats, sessions, configs, boxes). Work and Fleet have
+section rows. HISTORY is the signing ledger
 alone. Three older rounds live on in `canonView`: `storage` -> `boxes`, the
 overview's `helm` -> `board`, and now `board`, `scheduler` -> `work` and
-`ledger` -> `history`, so no bookmark or saved view is stranded.
+`ledger` -> `history`, so no bookmark is stranded.
 
 That claim is mostly NEGATIVE, which is why these arms exist in two registers:
 
@@ -26,7 +32,6 @@ That claim is mostly NEGATIVE, which is why these arms exist in two registers:
   `if (false && VIEWS.includes(v)) showView(v)` keeps every literal a grep
   looks for and routes nothing.
 """
-import hashlib
 import json
 import os
 import re
@@ -40,47 +45,31 @@ from tests.test_web_nav_reveal_runtime import _boot_block
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.join(HERE, "navareas_runtime_harness.js")
-# the part the six totals and the owner row live in, read as BYTES
-HOME_PART = os.path.join(os.path.dirname(HERE), "helm", "web_ui", "views",
-                         "00-home.html.part")
-# sha256 of the <section id="dash"> ... </section> band inside that part. It is
-# a TRIPWIRE, not a schema: the owner ruled the totals stay exactly where they
-# are, so a change to this band is a decision about HIS surface and updates this
-# line in the same commit it is made.
-#
-# RE-PINNED ONCE, DELIBERATELY, BY THE RULING THAT FOLLOWED (task/2355): the
-# in-flight row came OFF and an owed-by row went ON at the top, so the band is
-# still six rows and two of them are different rows. The previous digest was
-# c4eb445c60fbf4c0a0ea28423203686cf23061f2b7997e89cb0fec4f94810415 and it is
-# recorded here rather than silently replaced, because the value of a tripwire
-# is that its history says how many times the surface was touched.
-#
-# RE-PINNED A SECOND TIME, AND THIS ONE IS AN ADDITION (task/2622). Nothing
-# came off: a seventh row went on, carrying the task BACKLOG's totals. The
-# owner asked how he is supposed to cross-check the priority ordering of a
-# 477-row list, and the band's pipeline row counts LAND LOOPS — a different
-# population answering a different question — so the queue he was asking about
-# had no number anywhere on this page. The digest before this row existed was
-# 1266fc53ea0c4648c4600080412726335ce4b450b17b80c71dd6b2fc6fcd3c2f.
-#
-# RE-PINNED A THIRD TIME (task/2975, the burn board). The seven rows and their
-# order are unchanged; two cells moved or were corrected. The dregg signing
-# pulse left the `record` row for the board's headline, where the design put
-# it beside the capacity line, and the `owner` row's title stopped claiming
-# owner asks have no web endpoint — they have ridden /api/lr for weeks. The
-# digest before this change was
-# cb5636e669955a7b26cb675628e4aea2370d6461340589ff4a97197aaaa59dd2.
-DASH_BAND_SHA256 = \
-    "64251f66149969b4376706c86ea6f82bc537d35907e99b80480bc234872eb198"
-DASH_BAND_ROWS = 7
+# THE TOTALS BAND WAS SUPERSEDED by the owner's delegation of the IA redesign
+# (premise owner-ia-guidelines-no-duplicate-ux-mirrors-ax-overview-home:
+# "a real homepage"), task/3445. Its byte digest pinned the earlier ruling that
+# the totals stay where they are. They are still on the FIRST PAGE, which is
+# Home: each total is a Home tile, with the command and read-time lines left
+# to the detail pages. The pipeline and backlog tiles are ONE work tile since
+# task/3643, the Work page's own stage row. The band's cells went to those
+# pages: the pipeline row atop the Work page, the seats row atop Fleet ›
+# seats, the chain check atop the history page's local record.
+# The band's last digest, for the record, was
+# 64251f66149969b4376706c86ea6f82bc537d35907e99b80480bc234872eb198
+# (seven rows).
+HOME_TOTALS = ('id="hwork"', 'id="hseats"', 'id="hrecord"')
 
 # THE RULING, AS A TABLE: view id -> (area, section label). A view that is its
 # area's only page has no section row, so its label is None. The KEY is the
 # view id, because that is what a hash, a bookmark and localStorage carry.
 RULED = {
-    "work": ("work", None),
+    "work": ("work", "projects"),
+    "flow": ("work", "work"),
+    "pipeline": ("work", "pipeline"),
+    "backlog": ("work", "backlog"),
     "chat": ("chat", None),
     "quota": ("fleet", "credit"),
+    "models": ("fleet", "models"),
     "roster": ("fleet", "seats"),
     "sessions": ("fleet", "sessions"),
     "configs": ("fleet", "configs"),
@@ -90,12 +79,24 @@ RULED = {
 AREA_LABELS = {"work": "Work", "chat": "Chat", "fleet": "Fleet",
                "history": "History"}
 AREA_ORDER = ["work", "chat", "fleet", "history"]
+# HOME (task/3445 L3) is the page the console opens on. It has no area button:
+# the brand is its way back, so it is in the router's lists and not the nav's.
+HOME = "home"
+# THE PAGE EACH VIEW IS DRAWN ON (`pageOf`, task/3643): pipeline and backlog
+# are entries into the one Work page, so they show its element
+PAGE_OF = {"pipeline": "flow", "backlog": "flow"}
 # EVERY RETIRED VIEW ID and the page it lands on now. `storage` and `helm` are
 # the two older renames; the other three are this merge.
 MOVED = {"storage": "boxes", "helm": "work", "board": "work",
-         "scheduler": "work", "ledger": "history"}
-# the section an old hash is brought to on the page it now opens
-MOVED_SECTION = {"scheduler": "schedfold"}
+         "scheduler": "pipeline", "ledger": "history"}
+# THE HASH EACH VIEW WRITES: Work's sections speak #work/<section>, every
+# other view its own id
+HASH = {"work": "#work/projects", "flow": "#work/work",
+        "pipeline": "#work/pipeline", "backlog": "#work/backlog"}
+# WORK'S OWN HASHES, and the page each one opens
+WORK_HASHES = {"work/projects": "work", "work/work": "flow",
+               "work/pipeline": "pipeline", "work/backlog": "backlog",
+               "work/projects?open=alpha&tab=lanes": "work"}
 
 
 def _nav(src):
@@ -163,15 +164,20 @@ class TestAreaTable(unittest.TestCase):
         self.assertEqual([a["key"] for a in areas], AREA_ORDER)
         self.assertEqual({a["key"]: a["label"] for a in areas}, AREA_LABELS)
 
-    def test_only_fleet_has_a_section_row(self):
-        """Work, Chat and History are single pages with no submenu; Fleet keeps
-        its five sections, quota relabelled credit, in this order."""
+    def test_work_and_fleet_have_section_rows(self):
+        """Chat and History are single pages with no submenu; Work has four
+        sections (task/3445, task/3643) and Fleet keeps its six, quota
+        relabelled credit, in this order."""
         groups = re.findall(r'<div class="navsec(?: on)?" data-a="([a-z]+)"',
                             _nav(self.src))
-        self.assertEqual(groups, ["fleet"])
+        self.assertEqual(groups, ["work", "fleet"])
+        work = [a for a in _areas(self.src) if a["key"] == "work"][0]
+        self.assertEqual([(s["view"], s["label"]) for s in work["sections"]],
+                         [("work", "projects"), ("flow", "work"),
+                          ("pipeline", "pipeline"), ("backlog", "backlog")])
         fleet = [a for a in _areas(self.src) if a["key"] == "fleet"][0]
         self.assertEqual([(s["view"], s["label"]) for s in fleet["sections"]],
-                         [("quota", "credit"), ("roster", "seats"),
+                         [("quota", "credit"), ("models", "models"), ("roster", "seats"),
                           ("sessions", "sessions"), ("configs", "configs"),
                           ("boxes", "boxes")])
 
@@ -190,91 +196,82 @@ class TestAreaTable(unittest.TestCase):
         opens an area whose page is hidden, which reads as a blank screen."""
         markup = {view: area for view, (area, _l) in _table(self.src).items()}
         self.assertEqual(len(markup), len(RULED))
-        self.assertEqual(len(_area_of_map(self.src)), len(RULED))
-        self.assertEqual(_area_of_map(self.src), markup)
+        self.assertEqual(len(_area_of_map(self.src)), len(RULED) + 1)
+        self.assertEqual(_area_of_map(self.src), dict(markup, home=HOME))
+        self.assertIn('id="brand" href="#home"', _nav(self.src))
 
-    def test_VIEWS_carries_the_eight_live_ids_and_no_retired_one(self):
+    def test_VIEWS_carries_the_live_ids_and_no_retired_one(self):  # noqa: VACUOUS_ASSERTION — the sorted-list equality against RULED is the unconditional positive control on the same VIEWS line the absence loop reads
         """The router's own list is the ruling's ids. A retired id in it would
         route to a panel that no longer exists; canonView owns their
         migration instead."""
         line = self.src[self.src.index("const VIEWS"):].split("\n")[0]
         self.assertEqual(sorted(re.findall(r'"([a-z]+)"', line)),
-                         sorted(RULED))
+                         sorted(list(RULED) + [HOME]))
         for gone in MOVED:
             self.assertNotIn('"%s"' % gone, line, gone)
 
     def test_every_view_has_its_panel_and_the_merged_panels_are_gone(self):
         for view in RULED:
-            self.assertIn('id="view-%s"' % view, self.src,
+            self.assertIn('id="view-%s"' % PAGE_OF.get(view, view), self.src,
                           "the %s panel is gone" % view)
-        for gone in ("board", "scheduler", "ledger"):
+        # the pipeline and backlog have no panel of their own: they are the
+        # Work page's entries (task/3643)
+        for gone in ("board", "scheduler", "ledger", "pipeline", "backlog"):
             self.assertNotIn('id="view-%s"' % gone, self.src, gone)
         self.assertEqual(self.src.count('id="view-work"'), 1)
 
-    def test_the_work_page_reads_top_to_bottom_as_ruled(self):
-        """On you first, then the lanes line and the project rows, then the
-        fleet-wide kanban (the land pipeline) and the task backlog under them;
-        the system band keeps its place on the same page."""
-        page = self.src[self.src.index('id="view-work"'):
-                        self.src.index('id="view-quota"')]
-        order = [page.index(m) for m in (
-            'id="onyou"', 'id="odq"', 'id="bhead"', 'id="dreggstrip"',
-            'id="flagcard"', 'id="brows"', 'id="tierpipeline"', 'id="lrsec"',
-            'id="schedfold"', 'id="schedulersec"', 'id="otq"', 'id="dash"')]
+    def test_work_is_two_screens_each_as_ruled(self):  # noqa: VACUOUS_ASSERTION — str.index() RAISES on any missing marker, so every marker is asserted present before an order or absence is compared
+        """PROJECTS: on you first, then the lanes line, the filter bar and one
+        line per project — and nothing under them (task/3445 L3: the system
+        band became Home's tiles). WORK (task/3643): the one Work page, then
+        its three folds; the pipeline's and the backlog's screens, the land
+        board, who waits on whom and the owed lists are gone."""
+        def view(v):
+            i = re.search(r'<div class="view(?: on)?" id="view-%s">' % v,
+                          self.src).start()
+            return self.src[i:self.src.index('<div class="view"', i + 10)]
+        work, flow = view("work"), view("flow")
+        order = [work.index(m) for m in (
+            'id="onyou"', 'id="odq"', 'id="bhead"',
+            'id="controls"', 'id="lightf"', 'id="brows"')]
         self.assertEqual(order, sorted(order))
+        order = [flow.index(m) for m in (
+            'id="wkmain"', 'id="wkseams"', 'id="wkleft"', 'id="wkelse"')]
+        self.assertEqual(order, sorted(order))
+        for gone in ('id="fleetkb"', 'id="walldetail"', 'id="lrsec"',
+                     'id="pipesum"', 'id="dpipe"', 'id="downedby"',
+                     'id="dlands"', 'id="tierpipeline"', 'id="pipeproj"',
+                     'id="pipekb"', 'id="schedfold"', 'id="schedulersec"',
+                     'id="obd"', 'id="oub"', 'id="ocb"', 'id="otq"'):
+            self.assertNotIn(gone, self.src)
+        self.assertNotIn('id="wkmain"', work)
 
-    def test_history_is_the_signing_ledger_alone(self):
+    def test_history_is_the_signing_ledger_alone(self):  # noqa: VACUOUS_ASSERTION — each ledger marker is asserted PRESENT on the same page slice the absence loop reads, and str.index() raises when the history view is missing
         page = self.src[self.src.index('id="view-history"'):]
         ends = [i for i in (page.find('<div class="view"', 10),
                             page.find("<script", 10)) if i > 0]
         page = page[:min(ends)]
         for marker in ('id="tiersigned"', 'id="tierlocal"', 'id="ledgerstrip"'):
             self.assertIn(marker, page, marker)
-        for marker in ('id="lrsec"', 'id="tierpipeline"', 'id="schedulersec"'):
+        for marker in ('id="lrsec"', 'id="wkmain"', 'id="schedulersec"'):
             self.assertNotIn(marker, page, marker)
 
-    def test_the_six_totals_and_the_owner_strip_stay_on_the_first_page(self):
-        """Owner ruling: he reads only the totals, and they stay where they
-        are. So the dashboard band — the pipeline partition that renders
-        in-flight / moving / stalled / contrary / nonbillable and the owner
-        row — stays inside the first page, which is now Work, ahead of every
-        other view in the document.
-
-        `id="dinflight"` is NOT in this sweep any more and `id="downedby"` is:
-        the second ruling (task/2355) took the per-loop in-flight row off and
-        put the owed-by roll-up at the top of the band."""
+    def test_the_totals_stay_on_the_first_page_which_is_home(self):  # noqa: VACUOUS_ASSERTION — str.index() RAISES on any missing total, so each is asserted present before its placement is compared
+        """Owner ruling: he reads only the totals, and they stay on the first
+        page. The first page is Home (task/3445 L3), each total its own tile;
+        the band that held them is gone, and nothing carries the in-flight row
+        task/2355 took off."""
         src = self.src
-        for marker in ('id="dash"', 'id="dpipe"', 'id="downedby"',
-                       'id="downer"', 'id="dlands"'):
-            self.assertIn(marker, src, "the totals band lost %s" % marker)
-        self.assertNotIn('id="dinflight"', src,
-                         "the in-flight row came off in task/2355; a page "
-                         "still carrying it has an element no renderer writes")
-        order = [src.index(m) for m in ('id="view-work"', 'id="dash"',
-                                        'id="downedby"', 'id="dpipe"',
-                                        'id="downer"', 'id="view-quota"')]
-        self.assertEqual(order, sorted(order),
-                         "the totals band left the Work page, or owed-by is "
-                         "not at the top of it")
-        self.assertIn("contrary > honored", src)
-        for word in ("stalled", "unmeasurable", "moving"):
-            self.assertIn(word, src)
-
-    def test_the_totals_band_is_byte_for_byte_what_it_was(self):  # noqa: VACUOUS_ASSERTION — the drow count assertion is the unconditional positive control on the extracted band, and an empty extraction hashes to a different digest anyway
-        """THE BYTE COMPARE, because the arm above is a marker sweep and a
-        marker sweep survives a reworded label, a dropped title or a reordered
-        row — every one of which changes what the owner reads while keeping
-        every id it looks for. So hash the band itself, out of its own PART
-        file: the merge moved sections around it and not a byte inside it."""
-        with open(HOME_PART, "rb") as handle:
-            part = handle.read().decode("utf-8")
-        i = part.index('<section id="dash">')
-        band = part[i:part.index("</section>", i) + len("</section>")]
-        self.assertEqual(band.count('<div class="drow'), DASH_BAND_ROWS)
-        self.assertEqual(hashlib.sha256(band.encode("utf-8")).hexdigest(),
-                         DASH_BAND_SHA256,
-                         "the totals band changed; the owner ruled it stays as "
-                         "it is, so re-pin DASH_BAND_SHA256 only deliberately")
+        home = src[src.index('id="view-home"'):]
+        home = home[:home.index('<div class="view')]
+        for marker in HOME_TOTALS:
+            self.assertIn(marker, home, "the %s total left Home" % marker)
+        for gone in ('id="dash"', 'id="dinflight"'):
+            self.assertNotIn(gone, src, gone)
+        # ONE work tile in place of the pipeline and backlog tiles, which
+        # counted the same work two ways (task/3643)
+        for gone in ('id="hpipe"', 'id="hbacklog"'):
+            self.assertNotIn(gone, src, gone)
 
 
 class TestAreaRouterRuntime(unittest.TestCase):
@@ -289,9 +286,10 @@ class TestAreaRouterRuntime(unittest.TestCase):
         with open(HARNESS, encoding="utf-8") as handle:
             template = handle.read()
         fn = "\n\n".join(_extract_fn(src, n) for n in
-                         ("revealActiveTab", "navBadge", "areaBadge",
-                          "firstSection", "canonView", "goOldSection",
-                          "showView"))
+                         ("revealActiveTab", "navBadge", "navBadgeText", "areaBadge",
+                          "firstSection", "canonView", "viewHash", "hashView",
+                          "pageOf", "landY", "viewTarget", "goTarget",
+                          "navSelect", "showView"))
         script = template.replace("/*__INJECT__*/", fn)
         script = script.replace("/*__BOOT__*/",
                                 "function __runBoot() " + _boot_block(src))
@@ -303,10 +301,11 @@ class TestAreaRouterRuntime(unittest.TestCase):
             "areas": areas,
             "views": views,
             "area_of": _area_of_map(src),
-            "panels": ["view-" + v for v in RULED],
-            "anchors": sorted(set(MOVED_SECTION.values())),
+            # the page's own panels, read off it
+            "panels": re.findall(r'<div class="view(?: on)?" id="(view-[a-z]+)"',
+                                 src),
             # every live view, then every retired id canonView migrates
-            "hashes": views + sorted(MOVED),
+            "hashes": views + sorted(MOVED) + sorted(WORK_HASHES),
             "click_sequence": [{"area": "fleet"}, {"view": "sessions"},
                                {"area": "work"}, {"area": "fleet"},
                                {"area": "history"}],
@@ -323,19 +322,25 @@ class TestAreaRouterRuntime(unittest.TestCase):
         """THE INPUT CONTROL. Every arm below reads a snapshot of a DOM that was
         built from the parsed page; if the parse returned nothing the snapshots
         are all empty and every absence arm passes vacuously."""
-        self.assertEqual(self.out["built"], {"tabs": 5, "panels": 8,
-                                            "areas": 4, "sections": 1})
-        self.assertEqual(len(self.out["routes"]), len(RULED) + len(MOVED))
+        self.assertEqual(self.out["built"], {"tabs": 10, "panels": 11,
+                                            "areas": 4, "sections": 2})
+        self.assertEqual(len(self.out["routes"]),
+                         len(RULED) + 1 + len(MOVED) + len(WORK_HASHES))
 
     def test_every_live_hash_renders_its_own_page(self):  # noqa: VACUOUS_ASSERTION — the sorted(routes) equality ahead of the loop is the unconditional positive control on the same observable, so a harness run that measured no routes fails before the loop it would otherwise skip
         """Exactly one panel and one area are lit for each; a fleet page also
         lights its one tab and the section row, and a single page lights no tab
         and hides the empty section row."""
         self.assertEqual(sorted(self.out["routes"]),
-                         sorted(list(RULED) + list(MOVED)))
+                         sorted(list(RULED) + [HOME] + list(MOVED) + list(WORK_HASHES)))
+        # HOME: its panel, no area button lit and no section row
+        got = self.out["routes"][HOME]
+        self.assertEqual((got["panel"], got["panels_on"], got["areas_on"],
+                          got["solo"], got["hash"]),
+                         ("view-home", 1, 0, True, "#home"))
         for view, (area, label) in RULED.items():
             got = self.out["routes"][view]
-            self.assertEqual(got["panel"], "view-" + view,
+            self.assertEqual(got["panel"], "view-" + PAGE_OF.get(view, view),
                              "#%s rendered %s" % (view, got["panel"]))
             self.assertEqual(got["area"], area, "#%s opened %s" % (view, got["area"]))
             self.assertEqual([got["panels_on"], got["areas_on"]], [1, 1])
@@ -347,36 +352,54 @@ class TestAreaRouterRuntime(unittest.TestCase):
                 self.assertEqual(got["section_open"], area)
                 self.assertEqual([got["tabs_on"], got["sections_on"]], [1, 1])
                 self.assertIs(got["solo"], False, view)
-            self.assertEqual(got["hash"], "#" + view)
-            self.assertEqual(got["saved"], view)
+            self.assertEqual(got["hash"], HASH.get(view, "#" + view))
+            # "/" always opens Home, so no page is saved for a boot to read
+            self.assertIsNone(got["saved"], view)
 
-    def test_every_retired_hash_lands_on_the_page_that_took_it_over(self):
+    def test_works_section_hashes_open_their_section(self):
+        """#work/projects and #work/work each open their screen, and
+        #work/pipeline and #work/backlog open the Work page with their own
+        tab lit; a section's state rides after a "?"."""
+        self.assertEqual(self.out["routes"]["work/pipeline"]["panel"],
+                         "view-flow")              # the unconditional control
+        for h, view in WORK_HASHES.items():
+            got = self.out["routes"][h]
+            self.assertEqual((got["panel"], got["tab"]),
+                             ("view-" + PAGE_OF.get(view, view), view), h)
+            self.assertEqual(got["panels_on"], 1, h)
+
+    def test_every_retired_hash_lands_on_the_page_that_took_it_over(self):  # noqa: VACUOUS_ASSERTION — the scheduler route's panel is asserted equal to view-flow unconditionally before the loop, and every loop arm is an equality
         """#board, #helm and #scheduler open Work, #ledger opens History, and
-        #storage still opens boxes. The page rewrites the hash and the saved
-        view to the live id, so the retired one is not written back."""
+        #storage still opens boxes. The page rewrites the hash to the live
+        id, so the retired one is not written back."""
+        self.assertEqual(self.out["routes"]["scheduler"]["panel"],
+                         "view-flow")              # the unconditional control
         for old, new in MOVED.items():
             got = self.out["routes"][old]
-            self.assertEqual(got["panel"], "view-" + new, old)
+            self.assertEqual(got["panel"], "view-" + PAGE_OF.get(new, new), old)
             self.assertEqual(got["area"], RULED[new][0], old)
-            self.assertEqual((got["hash"], got["saved"]), ("#" + new, new), old)
+            self.assertEqual((got["hash"], got["saved"]),
+                             (HASH.get(new, "#" + new), None), old)
             self.assertEqual(got["panels_on"], 1, old)
 
-    def test_an_old_section_hash_is_brought_into_view(self):
-        """A #scheduler bookmark lands on Work AT the scheduler, opened; the
-        other retired hashes scroll nothing."""
-        self.assertEqual(self.out["routes"]["scheduler"]["scrolled"],
-                         ["schedfold"])
-        self.assertIs(self.out["routes"]["scheduler"]["opened"], True)
+    def test_an_old_scheduler_hash_opens_who_has_what(self):
+        """"Who waits on whom" became the pipeline's List grouped by who has
+        it (task/3643): a #scheduler bookmark routes the pipeline entry with
+        that lens and grouping; the other retired hashes route no state."""
+        self.assertEqual(self.out["routes"]["scheduler"]["routed"],
+                         [["pipeline", "lens=list&group=move"]])
         for old in ("board", "helm", "ledger", "work"):
+            self.assertEqual(self.out["routes"][old]["routed"],
+                             [[MOVED.get(old, old), ""]], old)
             self.assertEqual(self.out["routes"][old]["scrolled"], [], old)
 
-    def test_a_hash_no_view_answers_to_selects_nothing(self):
-        """MUST-MISS on the same driver: nothing is pre-selected and no default
-        is applied, so a snapshot wired to a constant, or a boot that ignored
-        the hash, fails here while passing every arm above."""
-        self.assertEqual(self.out["routes"]["work"]["panels_on"], 1)
-        self.assertEqual(self.out["bogus"]["panels_on"], 0)
-        self.assertIsNone(self.out["bogus"]["panel"])
+    def test_a_hash_no_view_answers_to_opens_home(self):
+        """MUST-MISS on the same driver: nothing is pre-selected, so the page a
+        hash opens is the boot's doing. "/" and a hash no view answers to open
+        HOME (task/3445 L3); a hash a view answers to opens that view."""
+        self.assertEqual(self.out["routes"]["work"]["panel"], "view-work")
+        self.assertEqual(self.out["bogus"]["panels_on"], 1)
+        self.assertEqual(self.out["bogus"]["panel"], "view-home")
         self.assertEqual(self.out["bogus"]["areas_on"], 0)
 
     def test_an_area_opens_its_first_section_then_the_one_you_left(self):
@@ -390,7 +413,7 @@ class TestAreaRouterRuntime(unittest.TestCase):
                          ["view-quota", "view-sessions", "view-work",
                           "view-sessions", "view-history"])
         self.assertEqual([s["solo"] for s in steps],
-                         [False, False, True, False, True])
+                         [False, False, False, False, True])
         self.assertNotEqual(steps[0]["panel"], steps[3]["panel"])
 
     def test_coming_back_to_work_refreshes_its_queues_and_the_boot_does_not(self):
@@ -401,6 +424,18 @@ class TestAreaRouterRuntime(unittest.TestCase):
         self.assertEqual(self.out["routes"]["work"]["queue_reads"], 0)
         steps = self.out["click_seq"]
         self.assertEqual([s["queue_reads"] for s in steps], [0, 0, 1, 1, 1])
+
+    def test_a_page_change_lands_at_the_new_pages_top(self):
+        """The walk opened Work › backlog at scrollY 702-811, past its own
+        header: a page change kept the old page's scroll. Every page change
+        lands at the top (the page starts right under the sticky nav), a
+        boot included; showing the page already on screen scrolls nothing."""
+        steps = self.out["click_seq"]
+        self.assertEqual([len(s["tops"]) for s in steps], [2, 3, 4, 5, 6])
+        self.assertEqual(set(map(tuple, steps[-1]["tops"])), {(0, 0)})
+        for h in ("work/backlog", "quota", "history"):
+            self.assertEqual(self.out["routes"][h]["tops"], [[0, 0]], h)
+        self.assertEqual(self.out["same_view_tops"], 0)
 
     def test_a_single_page_areas_badge_is_on_its_area_button(self):
         """Chat has no section row, so its unread count lives on the Chat
@@ -420,6 +455,9 @@ class TestAreaRouterRuntime(unittest.TestCase):
 
     def test_counts_in_one_area_add_and_an_unreadable_count_wins(self):
         self.assertEqual(self.out["badge_sums"]["area"]["text"], "7")
+        # a floor keeps its bound on the tab and on the sum (task/3723)
+        self.assertEqual(self.out["badge_floor"]["section"]["text"], "≥2")
+        self.assertEqual(self.out["badge_floor"]["area"]["text"], "≥7")
         self.assertEqual(self.out["badge_unknown_wins"]["area"]["text"], "?")
         self.assertTrue(self.out["badge_unknown_wins"]["area"]["mention"])
 

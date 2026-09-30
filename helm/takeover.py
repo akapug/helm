@@ -406,7 +406,10 @@ def _bundle_anchor(bundle):
 
 def _git_commit(root, ref):
     rc, out, err = work._git(root, "rev-parse", "--verify", ref + "^{commit}")
-    if rc != 0 or not re.match(r"\A[0-9a-f]{40,64}\Z", out or ""):
+    # A full commit id is 40 hex (sha1) or 64 (sha256), nothing between
+    # (task/3437).
+    if rc != 0 or not re.match(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z",
+                               out or ""):
         raise TakeoverRefused("cannot resolve %s (%s) — lineage UNKNOWN"
                               % (ref, err or "no commit"))
     return out

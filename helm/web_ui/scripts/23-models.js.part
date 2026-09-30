@@ -1,0 +1,214 @@
+/* ================= FLEET › MODELS (task/3448) =================
+   The model scorecard: the page of `helm eval board`, over the same board
+   (/api/models). One ranked table the owner reads as totals — our score and
+   its band, the lanes it rests on, the maker's benchmark beside it — and a
+   model opens its detail in place: the benchmark with its source and date,
+   our record, and what each land cost in reviews and patches. Under it the
+   apprenticeship rungs, as evidence; nothing here promotes a seat. A value the
+   board could not measure is null there and UNKNOWN here, never a zero. */
+let MODELS = null;          // the /api/models body; null = not read yet
+let MODELS_OPEN = null;     // the model whose detail is open (#models?model=)
+let MODELS_SEAT = null;     // a seat the address named before the board arrived
+let MODELS_WINDOW = "30d";
+
+/* THE BOARD ROUNDS EVERY NUMBER ONCE (scorecard._whole), so the page
+   prints it as it came, exactly as `helm eval board` does: a half never
+   reads one way here and another there. */
+function modelsPct(v) {
+  return v === null || v === undefined ? "UNKNOWN" : String(v);
+}
+function modelsDur(m) {
+  if (m === null || m === undefined) return "UNKNOWN";
+  return m < 120 ? m + "m" : Math.trunc(m / 60) + "h" + String(m % 60).padStart(2, "0") + "m";
+}
+function modelsCell(v, suffix) {
+  return v === null || v === undefined ? '<span class="munk">UNKNOWN</span>'
+    : esc(String(v)) + (suffix || "");
+}
+
+/* THE TABLE: totals first, then one row per model, measured ones first. A
+   model with neither a public benchmark nor enough lanes of ours reads "not
+   scored", with no band and no rank, at the foot: no number without the
+   evidence behind it. PURE. */
+function modelsTableHTML(b) {
+  if (!b) return '<div class="mempty">not read yet</div>';
+  if (b.unavailable) return '<div class="mempty munk">' + esc(b.unavailable) + "</div>";
+  const models = b.models || [];
+  const priors = models.filter(m => m.prior).length;
+  const unscored = models.filter(m => m.score.state === "not scored").length;
+  const head = '<div class="mtotals"><b>' + (models.length - unscored) + "</b> models ranked"
+    + (unscored ? " · <b>" + unscored + "</b> not scored" : "") + " · <b>"
+    + (b.lanes | 0) + "</b> lanes in " + esc(b.window) + ", <b>" + (b.decided | 0) + "</b> decided · <b>" + priors
+    + '</b> with a public benchmark <span class="gmeta">our score blends how often a model\'s lanes '
+    + "land without a patch here with its maker's benchmark, which counts for "
+    + (b.prior_lanes | 0) + " lanes and fades as ours accrue; a model with neither a benchmark nor "
+    + (b.floor | 0) + " decided lanes of ours is not scored</span></div>";
+  const rows = models.map(m => {
+    const s = m.score, p = m.prior, x = m.measured, c = m.cost;
+    const open = MODELS_OPEN === m.model;
+    return '<tr class="mrow' + (open ? " open" : "") + (s.state === "measured" ? "" : " mthin")
+      + '" data-model="' + esc(m.model) + '" tabindex="0">'
+      + '<td class="mnum">' + (m.rank === null || m.rank === undefined ? "" : m.rank) + "</td>"
+      + '<td class="mname">' + esc(m.model) + (p ? '<span class="gmeta">' + esc(p.exact) + "</span>" : "") + "</td>"
+      + (s.state === "not scored" ? '<td class="mscore"><span class="gmeta">not scored</span></td>'
+        : '<td class="mscore"><b>' + modelsPct(s.posterior) + '</b> <span class="mband">'
+        + modelsPct(s.band[0]) + "–" + modelsPct(s.band[1]) + "</span></td>")
+      + '<td class="mnum">' + s.n + (s.state === "prior only" ? ' <span class="gmeta">prior only</span>' : "") + "</td>"
+      + "<td>" + (p ? "<b>" + esc(String(p.value)) + '</b> <span class="gmeta">' + esc(p.bench) + "</span>"
+        : '<span class="gmeta">no prior</span>') + "</td>"
+      + '<td class="mnum">' + (s.ours === null ? '<span class="munk">UNKNOWN</span>' : modelsPct(s.ours) + "%") + "</td>"
+      + '<td class="mnum">' + modelsCell(c.reads_per_land) + "</td>"
+      + '<td class="mnum">' + (x.handback_median_min === null ? '<span class="munk">UNKNOWN</span>'
+        : modelsDur(x.handback_median_min)) + "</td></tr>"
+      + (open ? '<tr class="mdetail"><td colspan="8">' + modelDetailHTML(m, b) + "</td></tr>" : "");
+  }).join("");
+  return head + '<div class="mscroll"><table class="mtable"><thead><tr>'
+    + '<th class="mnum">#</th><th>model</th><th>our score</th><th class="mnum">decided</th>'
+    + "<th>benchmark</th><th class=\"mnum\">lands clean</th><th class=\"mnum\">reviews per land</th>"
+    + '<th class="mnum">time to hand back</th></tr></thead><tbody>' + rows + "</tbody></table></div>"
+    + modelsUnnamed(b.unnamed);
+}
+/* LANES WHOSE MODEL THE LEDGER CANNOT NAME are not a model: one line under the
+   table, the words `helm eval board` prints (scorecard.unnamed_line). PURE. */
+function modelsUnnamed(u) {
+  const parts = u ? [[u.lanes, "lane"], [u.reviews, "review"]].filter(p => p[0])
+    .map(p => p[0] + " " + p[1] + (p[0] === 1 ? "" : "s")) : [];
+  if (!parts.length) return "";
+  const one = parts.length === 1 && u.lanes + u.reviews === 1, seats = u.seats || [];
+  return '<div class="mfoot gmeta">' + parts.join(" and ") + (one ? " carries" : " carry")
+    + " no model on the ledger (" + (seats.length === 1 ? "seat " : "seats ") + esc(seats.join(", ")) + ")</div>";
+}
+
+/* ONE MODEL, opened: its benchmark with source and date, our record, what a
+   land cost, how it reads, and its seats. PURE. */
+function modelDetailHTML(m, b) {
+  const s = m.score, p = m.prior, x = m.measured, c = m.cost, r = x.reader;
+  const fam = o => o ? Object.keys(o).map(k => esc(k) + " " + esc(o[k])).join(", ") : "";
+  const bench = sc => "<b>" + esc(sc.bench) + " " + esc(sc.value) + "</b>, measured by "
+    + esc(sc.harness) + ", " + esc(sc.date) + ' — <a href="' + esc(sc.source)
+    + '" target="_blank" rel="noopener">source</a>';
+  const lines = [];
+  lines.push(p ? "<div>" + bench(p) + (p.others || []).map(o => "<div class=\"gmeta\">also " + bench(o) + "</div>").join("")
+      + (p.departs ? '<div class="gmeta">our setup departs from the maker\'s: ' + esc(p.departs) + "</div>" : "")
+      + '<div class="gmeta">a benchmark is the maker\'s harness, not ours: it only places a model until our lanes speak</div></div>'
+    : s.state === "not scored"
+      ? "<div>no public benchmark for this exact model and fewer than " + ((b && b.floor) | 0)
+        + " decided lanes of ours: <b>not scored</b> — its record below is all there is</div>"
+      : "<div>no public benchmark for this exact model: its score started at the fleet's pooled rate, "
+        + modelsPct(s.prior) + "</div>");
+  lines.push("<div>lands without a patch: <b>" + x.clean + "</b> of " + x.decided + " decided lanes"
+    + (s.ours === null ? "" : " (" + modelsPct(s.ours) + "%)") + " · " + x.landed + " landed of " + x.lanes + " lanes"
+    + (s.gap === null ? "" : ' · <b class="' + (Math.abs(s.gap) >= 15 ? "mgap" : "") + '">'
+      + (s.gap > 0 ? "+" : "") + s.gap + "</b> against its benchmark") + "</div>");
+  lines.push("<div>rounds to land (median): " + modelsCell(x.rounds_median)
+    + " · fixes asked per lane (median): " + modelsCell(x.fix_per_lane_median)
+    + " · time to hand back (median): " + modelsDur(x.handback_median_min) + "</div>");
+  // COUNTS beside each ratio, by the family that did them: a real read is
+  // never shown as a rounded 0
+  const over = (k, one, fams) => " — " + k + " " + one + (k === 1 ? "" : one === "patch" ? "es" : "s")
+    + " over " + c.lands + " land" + (c.lands === 1 ? "" : "s") + (fams && Object.keys(fams).length ? " (" + fam(fams) + ")" : "");
+  lines.push("<div>reviews per land: " + modelsCell(c.reads_per_land) + (c.lands ? over(c.reads, "review", c.by_family) : "")
+    + " · patches per land: " + modelsCell(c.patches_per_land) + (c.lands ? over(c.patches, "patch", c.patches_by_family) : "")
+    + '<div class="gmeta">' + esc(c.basis) + "</div></div>");
+  lines.push("<div>as a reader: " + (r ? "agreed with the approval tier's later read on <b>" + r.agree + "</b> of "
+    + r.pairs + " tips, missed " + r.misses + ", flagged " + r.false_alarms + " it then approved"
+    : '<span class="munk">UNKNOWN</span> — nothing it read was read again by the approval tier') + "</div>");
+  Object.keys((b && b.unknown) || {}).forEach(k => lines.push('<div class="gmeta">' + esc(k.replace(/_/g, " "))
+    + ': <span class="munk">UNKNOWN</span> — ' + esc(b.unknown[k]) + "</div>"));
+  lines.push('<div class="gmeta">seats: ' + (m.seats || []).map(esc).join(", ") + "</div>");
+  return '<div class="mdet">' + lines.join("") + "</div>";
+}
+
+/* THE RUNGS: each seat's rung, the next one and what it needs, and what the
+   record says so far. Evidence only: nothing here admits anyone. PURE. */
+function modelsRungsHTML(rungs, b) {
+  if (!rungs) return "";
+  const rows = (rungs.seats || []).map(r => {
+    const rd = r.reader;
+    return '<div class="mrung"><div><b>' + esc(r.seat) + '</b> <span class="mrungword">' + esc(r.rung)
+      + '</span> <span class="gmeta">next: ' + esc(r.next_rung) + " · " + esc(r.by) + " " + esc(r.date) + "</span></div>"
+      + '<div class="gmeta">needs: ' + esc(r.next) + "</div>"
+      + '<div class="gmeta">so far: ' + esc(r.evidence) + (rd ? "; on our record, " + rd.agree + " of " + rd.pairs
+        + " tips agreed with the approval tier, " + rd.misses + " missed" : "") + "</div></div>";
+  }).join("");
+  return '<div class="qonetop"><b>apprenticeships</b><span class="gmeta">'
+    + esc((rungs.ladder || []).join(" → ")) + " · only you admit a seat to its next rung; this shows the evidence</span></div>"
+    + rows;
+}
+
+/* THE ADDRESS: #models?model=<id> opens a model; #models?seat=<seat> opens
+   the model that seat runs, once the board says which, and waits in the
+   address until then. Both go through the one view router (viewQuery and
+   viewRoute), like every view's own state, and follow its rule: a model or a
+   seat the read board does not answer falls back to the table and the address
+   drops it. An unread board proves nothing unknown, so it keeps the key. */
+function modelsQuery() {
+  const s = MODELS_OPEN ? {model: MODELS_OPEN} : MODELS_SEAT ? {seat: MODELS_SEAT} : null;
+  return s ? "?" + new URLSearchParams(s).toString() : "";
+}
+function modelsRoute(query) {
+  const s = new URLSearchParams(query || "");
+  MODELS_OPEN = s.get("model") || null;
+  MODELS_SEAT = MODELS_OPEN ? null : s.get("seat") || null;
+  modelsResolve();
+  modelsRender();
+}
+function modelsResolve() {
+  if (!MODELS || MODELS.unavailable) return;
+  if (MODELS_SEAT) {
+    const hit = (MODELS.seats || []).find(x => x.seat === MODELS_SEAT);
+    MODELS_OPEN = hit ? hit.model : null;
+    MODELS_SEAT = null;
+  }
+  if (MODELS_OPEN && !(MODELS.models || []).some(m => m.model === MODELS_OPEN)) MODELS_OPEN = null;
+  viewHashSync("models");
+}
+
+function modelsRender() {
+  const body = $("#modelsbody"), rungs = $("#modelsrungs");
+  if (!body) return;
+  body.innerHTML = modelsTableHTML(MODELS);
+  if (rungs) rungs.innerHTML = MODELS && !MODELS.unavailable ? modelsRungsHTML(MODELS.rungs, MODELS) : "";
+  $$("#modelswin [data-mwin]").forEach(b => b.classList.toggle("on", b.dataset.mwin === MODELS_WINDOW));
+}
+async function loadModels() {
+  const win = MODELS_WINDOW;
+  let got;
+  try {
+    got = await j("/api/models?window=" + encodeURIComponent(win), 30000);
+  } catch (e) {
+    got = {unavailable: "the scorecard could not be read (" + ((e && e.message) || "no answer") + ")"};
+  }
+  // A LATE ANSWER FOR ANOTHER WINDOW is dropped: the chip on screen names the
+  // window the table shows, whichever read answers last
+  if (win !== MODELS_WINDOW) return;
+  MODELS = got;
+  modelsResolve();
+  modelsRender();
+}
+/* A ROW OPENS OR CLOSES its detail, from a click or, focused, from Enter or
+   Space; the keyboard keeps its place on the redrawn row. */
+function modelsToggle(model, keep) {
+  MODELS_OPEN = MODELS_OPEN === model ? null : model;
+  modelsRender();
+  viewHashSync("models");
+  const row = keep && document.querySelector('#modelsbody tr.mrow[data-model="' + CSS.escape(model) + '"]');
+  if (row) row.focus();
+}
+function initModels() {
+  modelsRender();
+  loadModels();
+}
+$("#view-models").addEventListener("click", ev => {
+  const win = ev.target.closest("[data-mwin]");
+  if (win) { MODELS_WINDOW = win.dataset.mwin; MODELS = null; modelsRender(); loadModels(); return; }
+  if (ev.target.closest("a, .mdetail")) return;
+  const row = ev.target.closest(".mrow");
+  if (row) modelsToggle(row.dataset.model, false);
+});
+$("#view-models").addEventListener("keydown", ev => {
+  const row = ev.target.closest && ev.target.closest(".mrow");
+  if (!row || ev.target !== row || (ev.key !== "Enter" && ev.key !== " ")) return;
+  ev.preventDefault();
+  modelsToggle(row.dataset.model, true);
+});

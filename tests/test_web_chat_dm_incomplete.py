@@ -28,6 +28,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from helm import web_ui_loader  # noqa: E402
+from tests._ownerverbs import owner_verbs, view_markup  # noqa: E402
 from tests.test_web_chat_client_runtime import _extract_fn  # noqa: E402
 
 EXTRACT = ["roomType", "chatQuietCut", "chatRoomQuiet", "chatSplitQuiet",
@@ -135,6 +136,16 @@ t("an_OLD_SERVER_envelope_is_UNREPORTED_not_complete", () => {
                               .includes("dms")};
 });
 
+// RULE 2 ON THE CHAT VIEW'S RAIL: the rail the owner reads in each DM state,
+// hovers included, for the arm that checks it names no helm verb.
+t("the_rail_in_every_dm_state", () => {
+  const rooms = [{room: "main", last: iso(60)},
+                 {room: "dm-alice-0123abcd", seat: "alice", last: iso(60)}];
+  return {incomplete: render(rooms, true),
+          unreported: renderEnvelope(rooms, {rooms: [], lines: []}),
+          ok: render(rooms, false)};
+});
+
 console.log(JSON.stringify(out));
 """
 
@@ -235,6 +246,23 @@ class TestDmIncompleteRail(unittest.TestCase):
         self.assertTrue(d["modern_ok_silent"],
                         "a server that DID measure and found it complete still "
                         "warned — the pole is gone and the badge means nothing")
+
+    def test_the_chat_view_tells_the_owner_no_helm_verb(self):  # noqa: VACUOUS_ASSERTION — each render's absence of a verb follows an unconditional positive control on the same markup, asserting the branch named was drawn
+        """RULE 2 ON THE CHAT VIEW (console walk 3, open points). Its empty
+        log told the owner agents "post with `helm chat post <text>` · watch
+        with `helm chat read --follow`", its presence hovers named `helm chat
+        roster` and `helm chat status`, and the rail's incomplete-DM hover
+        said to check "the helm chat dir". The rail is read in each DM state
+        off the real renderer, and the view's own markup is the static half."""
+        rail = self._detail("the_rail_in_every_dm_state")
+        page = view_markup(web_ui_loader.read_text(), "chat")
+        # POSITIVE CONTROLS on the same renders: each is the state named
+        self.assertIn("dms incomplete", rail["incomplete"])
+        self.assertIn("dms not reported", rail["unreported"])
+        self.assertIn("alice", rail["ok"])
+        self.assertIn('id="chatlog"', page)
+        for name, markup in dict(rail, page=page).items():
+            self.assertEqual(owner_verbs(markup), [], "%s: %s" % (name, markup))
 
 
 if __name__ == "__main__":

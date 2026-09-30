@@ -192,9 +192,10 @@ def authority_path():
 # seats_identity._FAMILIES by tests/test_seatname_guard.py; this module is a
 # hook snapshot and cannot import them.
 FAMILY_KEYS = frozenset((
-    "claude", "codex", "deepseek", "dots3", "ds4flash", "ds4pro", "fable",
-    "gemini", "glm", "gpt", "gptoss", "grok", "haiku", "kimi", "llama",
-    "mistral", "openrouter", "opus", "opus46", "qwen", "qwen27", "sonnet"))
+    "bonsai", "claude", "codex", "cursor", "deepseek", "dots3", "ds4flash",
+    "ds4pro", "fable", "gemini", "glm", "gpt", "gptoss", "grok", "haiku",
+    "kimi", "llama", "mistral", "openrouter", "opus", "opus46", "qwen",
+    "qwen27", "qwenlocal", "sonnet"))
 
 ARMED = "ARMED"
 HELD = "HELD"

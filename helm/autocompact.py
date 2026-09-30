@@ -17,23 +17,35 @@ READ (ground-truthed 2026-07-21, decision-spirited):
      child-stamp fix): the newest main-chain assistant record's
      usage.input_tokens + cache_read + cache_creation = the context CC itself
      is holding. This is CC's OWN gauge (statusline-equivalent), so pct tracks
-     exactly the number that wedges. PRIMARY.
+     exactly the number that wedges. PRIMARY. A main-chain compact_boundary
+     NEWER than that record is the reading instead (task/3534): its
+     compactMetadata.postTokens when that is a positive int, else UNKNOWN —
+     never the usage from before the compaction.
   2. proxy.log — a usage-bearing JSON line in the seat's proxy log tail.
      CLIProxyAPI's default gin access log carries NO token fields (verified
      live against both seats), so today this yields nothing — kept as the
      zero-cost fallback that lights up if request/usage logging is ever
      enabled (config `request-log: true`) or the proxy version changes.
 
-WINDOW: FAMILIES[family]["max_context"], narrowed by the family's
-`context_budget` where one is declared (seat_catalog.taught_window; kimi's 1M
-is taught as 380k, task/2944), which the launch line teaches CC
-through BOTH of its context knobs — CLAUDE_CODE_MAX_CONTEXT_TOKENS (capacity)
-and CLAUDE_CODE_AUTO_COMPACT_WINDOW (the auto-compact window, clamped by that
-capacity). They are not synonyms and #182 nearly swapped one for the other; the
-seat.py comment at the mint site carries the verified mechanism. When a family
-doesn't set one, CC assumes 200k for any non-claude model — we mirror that
-assumption (HELM_AUTOCOMPACT_ASSUME_WINDOW, default 200000; 0/off = strict
-no-op when unset) so pct still tracks CC's gauge.
+WINDOW: the window of the MODEL the reading came from — seat_catalog.
+launch_window: FAMILIES[family]["model_context"][model], else "max_context",
+narrowed by the family's `context_budget` where one is declared
+(seat_catalog.taught_window; kimi's 1M is taught as 380k, task/2944). The model
+is the one the usage record names (the upstream's served model), else the
+seat's registered or declared launch model. That is the number the launch line
+teaches CC for that model, through BOTH of its context knobs —
+CLAUDE_CODE_MAX_CONTEXT_TOKENS (capacity) and CLAUDE_CODE_AUTO_COMPACT_WINDOW
+(the auto-compact window, clamped by that capacity). They are not synonyms and
+#182 nearly swapped one for the other; the seat.py comment at the mint site
+carries the verified mechanism. When a family doesn't set one, CC assumes 200k
+for any non-claude model. The gauge mirrors that assumption so pct still
+tracks CC's gauge, and the row is REPORT-ONLY (`window-unproven`: "window
+unproven, no fire"). The owner's ruling on task/3534: "really bad practice to
+make auto-firing things that we dont fully understand the input data about".
+An assumed window is not a window helm has proven, so nothing fires on it.
+HELM_AUTOCOMPACT_ASSUME_WINDOW=<tokens> is the explicit opt-in (the operator
+declares the window for this host and the seat fires); unset is the
+report-only default; 0/off = no window at all (`window-unset`).
 
 TRIGGER (decision-spirited): /compact INJECTION via the metaharness seam
 (harness.py send — orca `terminal send`/herdr `pane run`). cv-side transcript
@@ -60,13 +72,28 @@ copy; once a copy exists it is preserved even if automatic resume fails.
 POLL — LEAN, NO DEMONS (machine law: single-shot verbs, external cadence):
 `helm seat autocompact` is one idempotent bounded pass; schedule it with a
 systemd --user timer (`--install-timer` prints/writes the units) or any
-Monitor/cron loop. A latch (state file) makes overlapping/frequent calls safe:
-one fire per seat per episode, keyed by the strongest available session, pane
-handle, or seat identity and re-armed only when context drops or that identity
-changes. A missing session therefore never disables an identity-proven pane.
-Verified injected/submitted compactions never time-rearm; manual alerts may
-repeat after LATCH_TTL_S. An attempted send is not success: the composer must
-visibly drain or transition before the actuation latches.
+Monitor/cron loop. A latch (state file) makes overlapping/frequent calls safe,
+and what it holds depends on what the pane did:
+  * a VERIFIED fire (the composer drained or a turn opened) latches one fire
+    per seat per episode, keyed by the strongest available session, pane
+    handle, or seat identity and re-armed only when context drops or that
+    identity changes. A missing session therefore never disables an
+    identity-proven pane. It never time-rearms; manual alerts may repeat
+    after LATCH_TTL_S.
+  * a REFUSAL (the pane answered /compact with "Not enough messages to
+    compact" or another of CC's own compaction refusals, read after the send
+    or still on screen before the next one) latches the SEAT until a reading
+    newer than the refusal exists (task/3534). Identity changes and a
+    lower percentage do not end it: the measured runaway typed /compact
+    every minute into a seat whose status kept flipping between
+    session-mismatch and ok. It is said once, by the hot rung.
+  * an UNPROVEN send (the bytes went in, no drain, no turn, no refusal was
+    seen) is not success, and it is not a license to send again either: it
+    latches the seat the same way, until a reading newer than the send
+    exists (task/3534). A send the pane never took (the adapter refused it,
+    or the exact /compact still sits in the composer) is FAILED_TO_SUBMIT and
+    is retried next pass. Before any send, the pass reads a refusal still on
+    screen and latches on it instead of typing.
 
 CLAUDE SEATS ARE SCANNED TOO (HELM_AUTOCOMPACT_CLAUDE=0 restores the old skip).
 This module used to skip any transcript whose model said claude-*, on the
@@ -95,25 +122,30 @@ from . import home
 
 # Fire at >= this pct (override: HELM_AUTOCOMPACT_THRESHOLD). 80, not 90, per the
 # owner (2026-07-29: "autocompact ACTUALLY fires at 80" for every proxied seat).
-# This watchdog is THE enforcer, not a backup: CC's native autocompaction is
-# STRUCTURALLY DEAD for a proxied seat. CC computes context% from the usage block
-# on message_start, but the cli-proxy translator hardcodes that block to
-# {input_tokens:0,output_tokens:0} with NO cache fields (verified in the fork,
-# references/CLIProxyAPI/.../codex/claude/codex_claude_response.go:98) and fills
-# the real numbers only on the terminal message_delta (ibid. 144-148). A codex
-# seat's whole prompt lives in cache_read_input_tokens (measured live: 161,280 of
-# 162,131), so CC's live gauge reads ~0% all session and
-# CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (any percent) multiplies a numerator pinned near
-# zero — it never crosses any threshold. This watchdog instead reads the persisted
-# TRANSCRIPT (the merged final usage, real numbers) and injects /compact, so 80%
-# here is the one firing point that actually fires. The minted systemd unit runs
-# `helm seat autocompact --once` with no --threshold, so this default IS the
-# fleet's live trigger. seat.py's AUTOCOMPACT_PCT_OVERRIDE is aligned to the same
-# 80 so the two knobs can never imply different firing points.
+# This watchdog is the BACKUP to Claude Code's native autocompaction, which
+# DOES fire on a proxied seat. A claim stood here that it could not (the
+# translator sends zero usage on message_start, so CC's gauge would read ~0%);
+# the seats' own transcripts refute it. They hold `compact_boundary` records
+# with trigger "auto" at CC's own trigger, 80% of (taught window less the
+# output reserve, min(output cap, 20k)): a codex seat taught 320,000 compacted
+# 59 times at preTokens 237k-252k, seats taught 220,000 at ~160k, bonsai
+# (98,304, cap 16,384) at ~66k, and qwen27, openrouter, cursor and grok each at
+# their own taught window, so CC's gauge does read real numbers. So 80% HERE,
+# of the whole window, sits ABOVE CC's trigger: this pass fires on a seat whose
+# native compaction did not (a wedged pane, a window CC was never taught), and
+# a reading over it on a seat CC is compacting means the WINDOW is wrong, not
+# the seat. The minted systemd unit runs `helm seat autocompact --once` with no
+# --threshold, so this default IS the fleet's live trigger; seat.py's
+# AUTOCOMPACT_PCT_OVERRIDE carries the same 80 for CC's own trigger.
 DEFAULT_THRESHOLD = 80
 LATCH_TTL_S = 15 * 60       # manual alerts may repeat while still actionable
 FRESH_S = 6 * 3600          # older transcript = not this pane's live context
 CC_ASSUMED_WINDOW = 200000  # CC's hardcoded window for non-claude models
+# The two sources a window FAMILIES does not pin can carry (task/3534). The
+# first is CC's default, assumed and so report-only; the second is the
+# operator's explicit HELM_AUTOCOMPACT_ASSUME_WINDOW declaration.
+ASSUMED_WINDOW_SRC = "cc-assumed-default"
+OPT_IN_WINDOW_SRC = "HELM_AUTOCOMPACT_ASSUME_WINDOW"
 TAIL_BYTES = 512 * 1024     # bounded tail reads (transcripts + proxy.log)
 DEFAULT_INTERVAL_S = 60     # bounded scan cadence; one large turn can cross 80%
 SUBMIT_VERIFY_READS = 5     # ~1s repaint window, never 20 CLI subprocesses
@@ -128,7 +160,10 @@ _USAGE = """usage: helm seat autocompact [--seat S] [--threshold N] [--once]
        helm seat autocompact --install-timer [--interval SEC] [--apply]
   One idempotent pass over every proxy seat: read context%% (seat transcript,
   proxy.log fallback), inject /compact into the pane at >= threshold (default
-  %d%%, HELM_AUTOCOMPACT_THRESHOLD). Latched: one fire per episode. --dry-run
+  %d%%, HELM_AUTOCOMPACT_THRESHOLD) of a DECLARED window. Latched: one verified
+  fire per episode; a pane that refuses /compact, or a send helm cannot
+  prove, gets none until a newer reading; an assumed window is report-only.
+  --dry-run
   reads + decides but never injects; --quiet skips the chat post; --once is
   the (only) mode, accepted for interface stability. --install-timer prints
   the systemd --user units for the external cadence (--apply writes+enables).
@@ -151,15 +186,33 @@ def threshold_pct():
 
 
 def _assume_window():
-    """The window mirrored from CC's own non-claude default when FAMILIES
-    doesn't pin one. 0/off = strict: no window -> no-op for that seat."""
-    v = str(home.env("AUTOCOMPACT_ASSUME_WINDOW", CC_ASSUMED_WINDOW)).lower()
-    if v in ("0", "off", "none", ""):
-        return None
+    """(window, source) for a family FAMILIES does not pin a window for, or
+    (None, why) when there is none.
+
+    AN ASSUMED WINDOW IS REPORTED, NEVER FIRED ON (task/3534). Unset, this is
+    CC's own 200k default for a non-claude model, mirrored so the gauge still
+    reads against what the pane was taught; its source ASSUMED_WINDOW_SRC
+    makes read() give the row the report-only status `window-unproven`. The
+    owner's ruling on that task: "really bad practice to make auto-firing
+    things that we dont fully understand the input data about. if we can't
+    get context windows right on all model families, then anything that
+    relies on them being correct is still broken until they aren't".
+    HELM_AUTOCOMPACT_ASSUME_WINDOW=<tokens> is the explicit opt-in: the
+    operator declares the window for this host, the source names the
+    variable, and the seat fires as a catalog window does. 0/off = no window
+    at all (`window-unset`); a value that is not a positive count declares
+    nothing and reads as the assumed default."""
+    raw = home.env("AUTOCOMPACT_ASSUME_WINDOW")
+    v = "" if raw is None else str(raw).strip().lower()
+    if raw is not None and v in ("0", "off", "none", ""):
+        return None, "window unset (no FAMILIES max_context, assume-window off)"
     try:
-        return int(v)
+        declared = int(v)
     except ValueError:
-        return CC_ASSUMED_WINDOW
+        declared = 0
+    if declared > 0:
+        return declared, OPT_IN_WINDOW_SRC
+    return CC_ASSUMED_WINDOW, ASSUMED_WINDOW_SRC
 
 
 def scan_claude():
@@ -173,22 +226,46 @@ def scan_claude():
         ("0", "off", "no", "false")
 
 
-def _window(family):
-    """(window_tokens, source) for a family; (None, reason) when unknowable."""
+def _window(family, model=None):
+    """(window_tokens, source) for a seat of `family` running `model`;
+    (None, reason) when unknowable. `model` None = the family default.
+
+    THE WINDOW OF THE MODEL, NOT OF THE FAMILY: seat_catalog.launch_window,
+    the one reading the launch line stamps for that model (model_context[model]
+    first, else max_context, narrowed by a context_budget). A family is a cred
+    pool that serves several models; codex serves gpt-6-astra (220k input) and
+    gpt-5.6-sol (320k). Dividing a sol seat's reading by astra's window read
+    231,746 tokens as 105% and posted a CLIMBING refusal for a seat Claude
+    Code was compacting natively at 240k. The source names the key that
+    decided, spelled as pi.py spells it."""
     from . import seat
-    from .seat_catalog import taught_window
+    from .seat_catalog import launch_window
     fam = seat.FAMILIES.get(family) or {}
-    if fam.get("max_context"):
-        # THE SAME NUMBER THE LAUNCH LINE TEACHES CC. A budget-narrowed family
-        # reads against its budget, and the source names which key decided.
-        win = taught_window(fam, fam["max_context"])
-        if win != fam["max_context"]:
+    per_model = (fam.get("model_context") or {}).get(model) \
+        if isinstance(model, str) else None
+    win = launch_window(fam, model if per_model else None)
+    if win:
+        if win != (per_model or fam.get("max_context")):
             return win, "FAMILIES.context_budget"
+        if per_model:
+            return win, "FAMILIES.model_context[%s]" % model
         return win, "FAMILIES.max_context"
-    aw = _assume_window()
-    if aw:
-        return aw, "cc-assumed-default"
-    return None, "window unset (no FAMILIES max_context, assume-window off)"
+    return _assume_window()
+
+
+def _window_phrase(row):
+    """'its 500,000-token window (source: FAMILIES.context_budget)'.
+
+    EVERY ALARM CARRIES THE SOURCE, NOT ONLY THE NUMBER (task/3085). A window
+    is only as good as where it came from: a probed one, a budget sized from a
+    measurement, CC's own assumed default and an owner statement nobody has
+    measured all print as the same "N-token window". The gemini seat stalled
+    at 634k while taught a 1,000,000 window that only an owner statement
+    backed, and nothing on any surface said so."""
+    win = row.get("window")
+    return "its %s window (source: %s)" % (
+        "{:,}-token".format(win) if win else "UNKNOWN",
+        row.get("window_src") or "unrecorded")
 
 
 # ---------------------------------------------------------------------------
@@ -240,16 +317,126 @@ def _newest_transcript(instance_dir):
     return max(cands)[1] if cands else None
 
 
+def _gauge_transcript(instance_dir, record):
+    """(transcript path or None, session or None, why or None) — the
+    transcript whose usage IS this seat's context.
+
+    THE LIVE PROCESS'S SESSION, WHEN ONE IS LIVE (task/3208). Right after a
+    /clear on a claude that writes the new session's transcript lazily
+    (measured twice on a fleet host), the NEWEST transcript is the pre-clear
+    session's, and its usage reads as a cleared seat's context: a
+    `session-mismatch` against the register SessionStart already moved,
+    which is actionable, so over the trigger the watchdog would type
+    /compact into the pane that had just been cleared (traced, not seen).
+    The seat's claude names its current session in its own presence
+    record, so the gauge reads that session's transcript, and a live session
+    with none yet is a seat with no reading — the UNKNOWN rung's grace
+    already expects exactly that of a fresh session. With no live process,
+    live records the register does not let speak for the seat (a helper's),
+    or records the census cannot read, the newest transcript decides, as
+    before: a watchdog must not go blind on a census hiccup."""
+    from . import seat  # noqa: F401 — the facade loads before its impl module
+    from .seat_lifecycle_runtime import LIVE_SESSION, live_seat_session
+    state, sid, _cwd, _why = live_seat_session(instance_dir, record)
+    if state != LIVE_SESSION:
+        return _newest_transcript(instance_dir), None, None
+    # THE NEWEST OF THAT SESSION'S OWN FILES. `cv port` re-emits a session
+    # under another project slug with the SAME id and leaves the original, so
+    # one live id can own two transcripts, and the seat writes on in the one
+    # it resumed from. Refusing that as ambiguous — right for a caller
+    # CHOOSING among sessions — called a measured seat unmeasurable here.
+    copies = []
+    for p in glob.glob(os.path.join(glob.escape(instance_dir), "claude",
+                                    "projects", "*", sid + ".jsonl")):
+        try:
+            copies.append((os.path.getmtime(p), p))
+        except OSError:
+            pass
+    if copies:
+        return max(copies)[1], sid, None
+    return None, sid, ("the seat's live claude process holds session %s, "
+                       "which has no transcript under %s yet (claude writes "
+                       "it at the session's first message)"
+                       % (sid, os.path.join(instance_dir, "claude",
+                                            "projects")))
+
+
+def _no_context_why(instance_dir, tp):
+    """Why a seat has no context reading, naming the place the gauge read.
+
+    The two cases are different faults and a reader acts on them differently:
+    no transcript at all means the pane writes its session somewhere other
+    than the seat's CLAUDE_CONFIG_DIR, or has not yet written one; a
+    transcript with no usage means the rows the gauge sums are missing."""
+    if not tp:
+        return ("no session transcript under %s (the seat's CLAUDE_CONFIG_DIR) "
+                "and no usage-bearing proxy.log row"
+                % os.path.join(instance_dir, "claude", "projects"))
+    return ("its current transcript %s has no non-zero usage record in its "
+            "last %d KiB, and proxy.log has no usage-bearing row"
+            % (os.path.basename(tp), TAIL_BYTES // 1024))
+
+
+def _iso_epoch(text):
+    """The epoch of an ISO-8601 stamp (a trailing Z is UTC), else None."""
+    if not isinstance(text, str) or not text:
+        return None
+    from datetime import datetime, timezone
+    try:
+        at = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    try:
+        return at.timestamp()
+    except (OverflowError, OSError):
+        return None
+
+
+def _boundary_reading(boundary, model):
+    """The reading a compact_boundary is: its postTokens when that is a
+    positive int, else None (UNKNOWN), with the boundary's own time."""
+    meta = boundary.get("compactMetadata")
+    post = meta.get("postTokens") if isinstance(meta, dict) else None
+    ctx = post if isinstance(post, int) and not isinstance(post, bool) \
+        and post > 0 else None
+    return ctx, model, _iso_epoch(boundary.get("timestamp")), \
+        "compact_boundary"
+
+
 def _transcript_ctx(path):
-    """(ctx_tokens, model) from the newest main-chain assistant usage record —
-    input + cache_read + cache_creation = what CC is holding right now.
-    Sidechain (subagent) records never count. None when no usage in the tail."""
+    """(ctx_tokens or None, model, reading_at, kind) from the newest
+    main-chain reading in the tail, else None when the tail holds none.
+
+    A usage record's reading is input + cache_read + cache_creation = what CC
+    is holding (kind "usage"). Sidechain (subagent) records never count.
+    `reading_at` is the record's OWN timestamp, never the file's mtime: the
+    local command records a refused /compact leaves keep the mtime fresh
+    while the reading stays where it was.
+
+    A NEWER compact_boundary IS THE READING (task/3534). Walking back, a
+    main-chain boundary met before any usage record means CC compacted after
+    that usage, so the usage is what the seat held BEFORE the compaction.
+    MEASURED: a gemini seat read 707k (141.5% of its 500k window) from a usage
+    record that sat before a manual compact_boundary with postTokens 5325,
+    and the watchdog typed /compact into it every minute, each answered "Not
+    enough messages to compact". The boundary's compactMetadata.postTokens is
+    the reading when it is a positive int (kind "compact_boundary"); anything
+    else is UNKNOWN (ctx None), never the pre-boundary usage. The model still
+    comes from the newest usage record in the tail, so the window resolves
+    for the model that served the seat."""
+    boundary = None
     for ln in reversed(_tail_lines(path)):
         try:
             d = json.loads(ln)
         except ValueError:
             continue
         if not isinstance(d, dict) or d.get("isSidechain"):
+            continue
+        if d.get("type") == "system" and \
+                d.get("subtype") == "compact_boundary":
+            boundary = boundary or d
             continue
         msg = d.get("message")
         u = msg.get("usage") if isinstance(msg, dict) else None
@@ -273,12 +460,15 @@ def _transcript_ctx(path):
         # something unusual, and 0% is the one value that guarantees it never
         # fires. A seat that climbs back to 100% after a compact would be
         # invisible to the surface built to catch it.
+        if ctx and boundary is not None:
+            return _boundary_reading(boundary, msg.get("model") or "")
         if ctx:
-            return ctx, (msg.get("model") or "")
+            return (ctx, msg.get("model") or "",
+                    _iso_epoch(d.get("timestamp")), "usage")
     # Every usage record in the tail was zero: the context is UNKNOWN, not zero.
     # Returning None lets the caller say so; returning 0 would be a confident
     # lie that silences the alarm.
-    return None
+    return _boundary_reading(boundary, "") if boundary is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -297,15 +487,8 @@ _PROXY_TIME = re.compile(
 def _proxy_line_age(line, path, is_last):
     stamp = _PROXY_TIME.search(line)
     if stamp:
-        try:
-            from datetime import datetime, timezone
-            text = stamp.group(1).replace("Z", "+00:00")
-            at = datetime.fromisoformat(text)
-            if at.tzinfo is None:
-                at = at.replace(tzinfo=timezone.utc)
-            return max(0, time.time() - at.timestamp())
-        except (ValueError, OverflowError):
-            return None
+        at = _iso_epoch(stamp.group(1))
+        return None if at is None else max(0, time.time() - at)
     if not is_last:
         return None                       # file mtime belongs to a later row
     try:
@@ -347,9 +530,10 @@ def _proxy_log_ctx(family, seat_name):
 
 def read(seat_name):
     """One seat's context row: seat/family/window/ctx_tokens/pct/source/model/
-    session/age_s/status. Fresh context is actionable when its pane identity is
-    provable even if the session latch is absent or stale; every other status
-    names exactly why the seat is a no-op (doctor prints it)."""
+    session/age_s/reading/reading_at/status. Fresh context against a DECLARED
+    window is actionable when its pane identity is provable even if the
+    session latch is absent or stale; every other status names exactly why
+    the seat is a no-op (doctor prints it)."""
     from . import seat
     family, err = seat._seat_family(seat_name)
     if err:
@@ -362,16 +546,19 @@ def read(seat_name):
            "pct": None, "source": None, "model": None, "session": None,
            "registered_session": registered,
            "pane_handle": owned.get("handle"),
-           "pane_harness": owned.get("harness"), "age_s": None}
+           "pane_harness": owned.get("harness"), "age_s": None,
+           "reading": None, "reading_at": None}
     win, win_src = _window(family)
     row["window"], row["window_src"] = win, win_src
     if win is None:
         row["status"] = "window-unset"
+        row["unmeasured_why"] = win_src
         return row
-    tp = _newest_transcript(d)
+    tp, live_sid, live_why = _gauge_transcript(d, owned)
     got = _transcript_ctx(tp) if tp else None
-    if got:
-        row["ctx_tokens"], row["model"] = got
+    if got and got[0] is not None:
+        (row["ctx_tokens"], row["model"], row["reading_at"],
+         row["reading"]) = got
         row["source"] = "transcript"
         row["session"] = os.path.basename(tp)[:-len(".jsonl")]
         try:
@@ -379,12 +566,46 @@ def read(seat_name):
         except OSError:
             pass
     else:
+        # AN UNKNOWN AFTER A COMPACTION STAYS UNKNOWN (task/3534): a proxy
+        # row counts only when it is dated after that boundary, because one
+        # from before it is the pre-compaction usage by another route.
+        after = got[2] if got else None
+        row["model"] = (got[1] or None) if got else None
         proxy = _proxy_log_ctx(family, seat_name)
-        if proxy is not None:
+        at = None if proxy is None or proxy[2] is None \
+            else time.time() - proxy[2]
+        # A proxy row naming another session than the live one is that
+        # session's usage, never this seat's context now.
+        if proxy is not None and (not live_sid or proxy[1] == live_sid) \
+                and (got is None or (at is not None and after is not None
+                                     and at > after)):
             row["ctx_tokens"], row["session"], row["age_s"] = proxy
-            row["source"] = "proxy.log"
+            row["source"], row["reading"], row["reading_at"] = \
+                "proxy.log", "usage", at
+    # THE READING'S OWN MODEL DECIDES ITS WINDOW. A transcript record names
+    # the model that served it (the proxy copies the upstream's response
+    # model); a proxy.log row names none, so the seat's model decides, exactly
+    # as its launch line resolved it: the registered --model, else the
+    # instance's declared model, else the family's. An uncatalogued served id
+    # is not replaced by the registered one: what served the request outranks
+    # what was asked for, and it reads the family default, as the launch line
+    # does for a model the family does not catalogue.
+    if row["model"]:
+        model = row["model"]
+    else:
+        from .seat_catalog import instance_launch_model
+        model = owned.get("model") or instance_launch_model(
+            seat.FAMILIES.get(family) or {}, seat_name)
+    win, win_src = _window(family, model)
+    row["window"], row["window_src"] = win, win_src
     if row["ctx_tokens"] is None:
         row["status"] = "no-context-data"
+        row["unmeasured_why"] = live_why or (
+            ("its current transcript %s ends in a compact_boundary that "
+             "carries no postTokens, so its context since that compaction is "
+             "UNKNOWN until its next usage record (the usage before the "
+             "boundary is what it held before compacting)"
+             % os.path.basename(tp)) if got else _no_context_why(d, tp))
         return row
     row["pct"] = round(100.0 * row["ctx_tokens"] / win, 1)
     row["headroom_tokens"] = max(0, win - row["ctx_tokens"])
@@ -394,9 +615,28 @@ def read(seat_name):
         row["status"] = "claude-model"       # gate closed by configuration
     elif row["age_s"] is None:
         row["status"] = "context-undated"
+        row["unmeasured_why"] = (
+            "its only reading (%s) carries no age, so it cannot be tied to "
+            "the live pane" % row["source"])
     elif row["age_s"] > _int_env(
             "AUTOCOMPACT_FRESH_S", FRESH_S):
         row["status"] = "stale"              # not this pane's live context
+        if registered and registered != row["session"] and not glob.glob(
+                os.path.join(glob.escape(d), "claude", "projects", "*",
+                             glob.escape(registered) + ".jsonl")):
+            # AN OLD TRANSCRIPT OF THE REGISTERED SESSION IS AN IDLE SEAT, and
+            # its context is that reading. An old transcript of ANOTHER session
+            # while the registered one has none at all means the live pane
+            # writes where the gauge does not read.
+            row["unmeasured_why"] = (
+                "its registered session %s has no transcript under %s; the "
+                "newest there (%s) was last written %s ago"
+                % (registered, os.path.join(d, "claude", "projects"),
+                   row["session"], _age(row["age_s"])))
+    elif row["window_src"] == ASSUMED_WINDOW_SRC:
+        # MEASURED, BUT AGAINST A WINDOW NOBODY DECLARED (task/3534): the
+        # percentage is shown and no rung fires on it.
+        row["status"] = "window-unproven"
     elif not registered:
         # Fresh measurable context plus an identity-proven pane is actionable;
         # only the session-derived latch rung is absent.
@@ -438,10 +678,27 @@ def _latch_identity(row):
             row.get("session") or row.get("seat"))
 
 
+def _newer_reading(entry, row):
+    """Whether the row's reading was taken after the latch entry was written."""
+    at, fired = row.get("reading_at"), entry.get("fired_at")
+    return _finite_number(at) and _finite_number(fired) and at > fired
+
+
 def _episode_complete(entry, row):
-    """Whether the prior high-context episode has observably ended."""
+    """Whether the prior high-context episode has observably ended.
+
+    A REFUSAL ENDS ONLY ON A NEWER READING (task/3534). Once the pane has
+    answered a /compact with a refusal, another /compact on the same input
+    earns the same answer. So neither a new identity nor a lower percentage
+    ends that episode: only a reading the seat took after the refusal does.
+    An UNPROVEN send ends the same way: nothing visible followed it, so only
+    a newer reading says what it did.
+    MEASURED: the seat's status flipped between session-mismatch and ok, so
+    anything keyed on identity would have re-armed the watchdog."""
     if not entry:
         return False
+    if entry.get("mode") in _READING_LATCHES:
+        return _newer_reading(entry, row)
     prior = entry.get("identity") or entry.get("session")
     current = _latch_identity(row)
     if prior and current and prior != current:
@@ -509,10 +766,59 @@ def _command_pending(tail, command):
     return _exact_command_line(seat._current_prompt_line(tail), command)
 
 
-def _compact_pending(ad, handle):
-    """True only when the visible composer itself holds an unsent /compact.
-    Mentions in transcript/history are not pending input."""
-    return _command_pending(ad.read(handle, limit=2000), "compact")
+# THE PANE'S OWN "NO" TO A /compact (task/3534). Claude Code's answers to a
+# /compact that did not compact, read out of the 2.1.284 binary: the /compact
+# command returns "Not enough messages to compact." as its text output when
+# too little conversation is left, and throws or returns the rest (no
+# messages, a PreCompact hook that blocks, a failed or cancelled compaction, a
+# skipped one). Each is the TARGET refusing, so a second /compact on the same
+# input earns the same answer. Anchored at the row's start, after the result
+# glyph and an optional "Error:", so prose that quotes a phrase cannot match.
+COMPACT_REFUSED = "compact-refused"
+# A send whose effect is UNPROVEN: the bytes went in and no drain, no turn and
+# no refusal followed. Latched like a refusal (task/3534): helm cannot tell a
+# consumed /compact from a refused one it did not see, so it fails closed.
+COMPACT_UNPROVEN = "compact-unproven"
+# The latches only a reading newer than the latch releases.
+_READING_LATCHES = (COMPACT_REFUSED, COMPACT_UNPROVEN)
+_COMPACT_REFUSAL = re.compile(
+    r"^\s*(?:⎿\s*)?(?:Error:\s*)?(Not enough messages to compact"
+    r"|No messages to compact|Compaction blocked by PreCompact hook"
+    r"|Compaction failed|Error during compaction|Compaction canceled"
+    r"|Not compacted)\b")
+_COMPACT_ENTRY = re.compile(r"^\s*[❯>]\s*/compact(?:\s|$)")
+
+
+def _compact_refusal(tail):
+    """The refusal the pane answered its newest /compact with, else None.
+
+    POSITION DECIDES, as in `seat_lifecycle._turn_died_on`. Walking up from
+    the current composer, the refusal row must come before any newer
+    transcript entry, and the entry it sits under must be the submitted
+    /compact. An entry between it and the composer proves the seat took a
+    turn after the refusal, so the refusal is history. Returns the fixed
+    phrase, never the pane's bytes."""
+    from . import seat  # noqa: F401 — the facade loads before its impl module
+    from .seat_lifecycle import _PANE_ANSI, _TURN_ENTRY, _current_prompt_at
+    lines = [_PANE_ANSI.sub("", line) for line in (tail or "").splitlines()]
+    visible = [line for line in lines if line.strip()]
+    at, _line = _current_prompt_at(visible)
+    if at is None:
+        return None
+    refusal = None
+    for line in reversed(visible[:at]):
+        if refusal is None:
+            m = _COMPACT_REFUSAL.match(line)
+            if m:
+                refusal = m.group(1)
+                continue
+        elif _COMPACT_ENTRY.match(line):
+            return refusal
+        # _COMPACT_ENTRY also takes the no-break space the composer glyph
+        # is drawn with, which _TURN_ENTRY's `[ \t]` does not.
+        if _TURN_ENTRY.match(line) or _COMPACT_ENTRY.match(line):
+            return None
+    return None
 
 
 def _verify_compact_submission(ad, handle, before_tail):
@@ -555,6 +861,12 @@ def _verify_compact_submission(ad, handle, before_tail):
                 "pane consumed input but produced a new context-overflow 400; "
                 "recording the first causal strike, never success")
             return "context-400", strike
+        # The pane's own refusal outranks every success sign: a refused
+        # /compact can open a turn (its PreCompact hooks run) before the
+        # answer lands, and it drains the composer like a consumed one.
+        refusal = _compact_refusal(clean)
+        if refusal:
+            return COMPACT_REFUSED, refusal
         state, _ = seat._classify_pane_tail(clean)
         current = seat._current_prompt_line(clean)
         command_visible = _exact_command_line(current, "compact")
@@ -1101,13 +1413,16 @@ def _actuate_compact(row, ad, handle, detail, tail, payload, success_mode,
     accepted, proof = _verify_compact_submission(ad, handle, tail)
     if accepted is True:
         return success_mode, "%s; %s" % (detail, proof)
+    if accepted == COMPACT_REFUSED:
+        return COMPACT_REFUSED, ("%s; pane %s answered %s with \"%s\"" %
+                                 (detail, handle, label, proof))
     if accepted == "context-400":
         row["context_400_strike"] = proof
         return "context-400", "%s; %s" % (detail, proof["detail"])
     if accepted is False:
         return ("refused-failed-to-submit",
                 "pane %s did not consume %s — %s" % (handle, label, proof))
-    return ("refused-unknown",
+    return (COMPACT_UNPROVEN,
             "pane %s %s is unproven — %s" % (handle, label, proof))
 
 
@@ -1143,6 +1458,14 @@ def _fire(row, adapter):
                     "pane %s is BLOCKED_ON_HUMAN%s; /compact would discard the "
                     "pending prompt" %
                     (handle, " on %s" % blocked_on if blocked_on else ""))
+        # A REFUSAL STILL ON SCREEN IS THE PANE'S ANSWER (task/3534). The
+        # answer to an earlier /compact can land after that pass's bounded
+        # verify reads, so this pass reads it before typing anything.
+        refusal = _compact_refusal(clean_tail)
+        if refusal:
+            return (COMPACT_REFUSED,
+                    "pane %s answered its newest /compact with \"%s\"; "
+                    "another /compact was NOT sent" % (handle, refusal))
 
         # Outside a live turn, an exact command in the proven CURRENT composer is
         # explicit user intent. Submit Enter only — retyping would turn `/compact`
@@ -1223,9 +1546,9 @@ def _fire_text(row, mode, detail):
     else:
         head = ("⚠️ AUTOCOMPACT: seat %s needs /compact NOW (injection "
                 "unavailable — paste it into the pane)" % row["seat"])
-    return ("%s at %.0f%% (%s/%s, %s) — pre-empting the 100%% proxy hang. %s"
-            % (head, row["pct"], k(row["ctx_tokens"]), k(row["window"]),
-               row["source"], detail))
+    return ("%s at %.1f%% of %s (%s via %s) — pre-empting the 100%% proxy "
+            "hang. %s" % (head, row["pct"], _window_phrase(row),
+                          k(row["ctx_tokens"]), row["source"], detail))
 
 
 def _recovery_session_changed(entry, row):
@@ -1407,22 +1730,51 @@ def _hot_text(row, thr):
     gone quiet. Note this alarm still cannot SEE a 400 loop — `_overflow_400`
     measures precisely that from the pane tail and is not on this path; wiring
     it is the honest end state and is filed, not faked here."""
+    if row.get("actuation_state") == "COMPACT_REFUSED":
+        return ("autocompact STOPPED on %s: the pane REFUSED /compact at "
+                "%.1f%% of %s (>= %d%%) — %s. No further /compact goes to "
+                "this seat until it has a newer reading than this refusal; "
+                "the reading it refused on may predate a compaction the "
+                "gauge cannot see. [task/3534]"
+                % (row["seat"], row.get("pct") or 0.0, _window_phrase(row),
+                   thr, row.get("actuation_reason") or "refused"))
+    if row.get("compact_unproven"):
+        return ("autocompact STOPPED on %s: /compact was typed into the pane "
+                "at %.1f%% of %s (>= %d%%) and its effect is UNPROVEN — %s. "
+                "No further /compact goes to this seat until it has a newer "
+                "reading than this send: helm does not fire again on an "
+                "outcome it could not see. [task/3534]"
+                % (row["seat"], row.get("pct") or 0.0, _window_phrase(row),
+                   thr, row.get("actuation_reason") or "unproven"))
+    if row.get("status") == "window-unproven":
+        return ("autocompact REPORT-ONLY on %s: %.1f%% of %s (>= the %d%% "
+                "trigger), and that window is ASSUMED, not declared — window "
+                "unproven, no fire. Nothing auto-fires on a window helm has "
+                "not proven. Declare the family's window in seat_catalog "
+                "FAMILIES with its evidence (max_context and a backing grade, "
+                "or a context_budget), or declare one for this host with "
+                "HELM_AUTOCOMPACT_ASSUME_WINDOW=<tokens>; until then /compact "
+                "it by hand if it needs it. [task/3534]"
+                % (row["seat"], row.get("pct") or 0.0, _window_phrase(row),
+                   thr))
     if row.get("actuation_state"):
-        return ("autocompact REFUSED on %s at %.1f%% (>= %d%%): actuation "
-                "state=%s — %s. /compact was NOT injected; the next pass will "
-                "re-measure the pane rather than latch this refusal as success."
-                % (row["seat"], row.get("pct") or 0.0, thr,
-                   row["actuation_state"], row.get("actuation_reason") or
+        return ("autocompact REFUSED on %s at %.1f%% of %s (>= %d%%): "
+                "actuation state=%s — %s. /compact was NOT injected; the next "
+                "pass will re-measure the pane rather than latch this refusal "
+                "as success."
+                % (row["seat"], row.get("pct") or 0.0, _window_phrase(row),
+                   thr, row["actuation_state"],
+                   row.get("actuation_reason") or
                    "no actionable pane evidence"))
     age = row.get("age_s")
     taking_turns = age is not None and age <= WORKING_S
     head = (
-        "autocompact CANNOT ACT on %s — %.1f%% of its %s-token window (>= the "
-        "%d%% trigger) and status is '%s'. The context is real and measured; "
-        "the refusal is about PANE IDENTITY, not about the seat being fine. "
-        "Nothing will compact this seat until its session is re-bound" % (
-            row["seat"], row.get("pct") or 0.0,
-            "{:,}".format(row.get("window") or 0), thr, row.get("status")))
+        "autocompact CANNOT ACT on %s — %.1f%% of %s (>= the %d%% trigger) "
+        "and status is '%s'. The context is real and measured; the refusal "
+        "is about PANE IDENTITY, not about the seat being fine. Nothing will "
+        "compact this seat until its session is re-bound" % (
+            row["seat"], row.get("pct") or 0.0, _window_phrase(row), thr,
+            row.get("status")))
     if taking_turns:
         return head + (
             ", and it is STILL TAKING TURNS — its transcript grew %s ago, so "
@@ -1442,26 +1794,80 @@ def _hot_text(row, thr):
 
 def _dead_text(row, thr):
     return (
-        "%s is at %.1f%% of its %s-token window with NO LIVE PROCESS — its "
-        "transcript was last touched %s ago. Nothing will wedge, because "
-        "nothing is running; the percentage is an abandoned file being counted "
-        "as a seat. Respawn it (helm seat spawn %s) or clean the stale "
-        "transcript so it stops reading as a live seat."
-        % (row["seat"], row.get("pct") or 0.0,
-           "{:,}".format(row.get("window") or 0), _age(row.get("age_s")),
-           row["seat"]))
+        "%s is at %.1f%% of %s with NO LIVE PROCESS — its transcript was last "
+        "touched %s ago. Nothing will wedge, because nothing is running; the "
+        "percentage is an abandoned file being counted as a seat. Respawn it "
+        "(helm seat spawn %s) or clean the stale transcript so it stops "
+        "reading as a live seat."
+        % (row["seat"], row.get("pct") or 0.0, _window_phrase(row),
+           _age(row.get("age_s")), row["seat"]))
 
 
 def _silent_text(row, thr):
     return (
-        "SILENT NON-FIRING CAUGHT on %s — %.1f%% of its %s-token window (>= the "
-        "%d%% trigger), status '%s', yet nothing fired, latched, or flagged it. "
-        "This is the backstop: a seat at the wall that every specific rung let "
-        "through, which is the exact silence that reads as all-clear. Some check "
+        "SILENT NON-FIRING CAUGHT on %s — %.1f%% of %s (>= the %d%% trigger), "
+        "status '%s', yet nothing fired, latched, or flagged it. This is the "
+        "backstop: a seat at the wall that every specific rung let through, "
+        "which is the exact silence that reads as all-clear. Some check "
         "upstream stopped classifying this seat — read it now (helm seat "
         "autocompact --seat %s --json) and re-bind or /compact it by hand."
-        % (row["seat"], row.get("pct") or 0.0,
-           "{:,}".format(row.get("window") or 0), thr, row.get("status"),
+        % (row["seat"], row.get("pct") or 0.0, _window_phrase(row), thr,
+           row.get("status"), row["seat"]))
+
+
+# ---------------------------------------------------------------------------
+# the UNKNOWN rung — a live seat this pass cannot measure (task/3085)
+# ---------------------------------------------------------------------------
+
+# A live seat is announced only after it has stayed unmeasurable this long. A
+# session that has just started has no usage record until its first answer,
+# and a /clear or a between-rows fresh session starts one routinely; a line
+# for each of those would teach the room to filter this sender.
+UNKNOWN_GRACE_S = 10 * 60
+_UNKNOWN_KEY = "_unknown"   # state: {seat: {"fp", "since", "said"}}
+
+
+def _unmeasured(row, thr):
+    """A seat that may be running while this watchdog cannot measure it.
+
+    THE HOLE THIS CLOSES. Every rung above starts from a percentage: fire,
+    refuse, hot, dead and the backstop all ask "is this seat over the
+    trigger". A seat with no window, or with no reading of what it holds, has
+    no percentage, so none of them can ever see it, and a context overage on
+    it is silent by construction. `read()` sets `unmeasured_why` exactly when
+    the reading is missing and names what is missing; this predicate adds
+    that the seat may be live, because a seat nobody launched holds no
+    context at all.
+
+    LIVE MEANS THE CENSUS SAID SO, or the census could not look and the seat
+    holds a registered pane. A measured "not live" is a seat that is off, and
+    stays quiet. A measured row over the trigger belongs to the rungs above."""
+    if not row.get("unmeasured_why"):
+        return False
+    if row.get("pct") is not None and row["pct"] >= thr:
+        return False
+    live = row.get("pane_live")
+    return live is True or (live is None and bool(row.get("pane_handle")))
+
+
+def _unknown_text(row, thr):
+    if row.get("status") == "window-unset":
+        return (
+            "⚠️ WATCHDOG: UNKNOWN window for seat %s — %s. A live seat with no "
+            "window has no percentage, so the %d%% trigger cannot fire and a "
+            "context overage on it would be SILENT. Pin the family's window "
+            "in seat_catalog FAMILIES (max_context with its evidence, or a "
+            "context_budget), or declare one for this host with "
+            "HELM_AUTOCOMPACT_ASSUME_WINDOW=<tokens> (unset, the gauge reads "
+            "against CC's assumed 200k, report-only)."
+            % (row["seat"], row.get("unmeasured_why"), thr))
+    return (
+        "⚠️ WATCHDOG: UNKNOWN context for seat %s — %s. Against %s the %d%% "
+        "trigger cannot fire without a reading, so a context overage on this "
+        "seat would be SILENT. `helm seat autocompact --seat %s --json` shows "
+        "where the gauge reads; a pane that is taking turns but writes no "
+        "transcript there was launched outside its seat's CLAUDE_CONFIG_DIR."
+        % (row["seat"], row.get("unmeasured_why"), _window_phrase(row), thr,
            row["seat"]))
 
 
@@ -1642,7 +2048,10 @@ def _normalize_refusal_notice(raw):
                      "observed_pct": None if observed is None
                      else float(observed),
                      "window": payload.get("window"),
+                     "window_src": payload.get("window_src"),
                      "actuation_reason": payload.get("actuation_reason")}
+    if kind == "discharge" and isinstance(payload.get("trace"), str):
+        clean_payload["trace"] = payload["trace"]
     return {"v": 1, "id": notice_id, "kind": kind, "seat": seat,
             "episode": episode, "payload": clean_payload,
             "claim_token": claim, "claim_until": float(until)}
@@ -1666,7 +2075,10 @@ def _enqueue_refusal_notice(notices, kind, row, alarm):
     payload = {"threshold": alarm["threshold"], "evidence": evidence,
                "observed_pct": row.get("pct") if kind == "discharge"
                else None, "window": row.get("window"),
+               "window_src": row.get("window_src"),
                "actuation_reason": row.get("actuation_reason")}
+    if kind == "discharge" and row.get("discharge_trace"):
+        payload["trace"] = row["discharge_trace"]
     notice_id = _notice_id(kind, row["seat"], alarm.get("episode"), payload)
     if notice_id not in notices:
         notices[notice_id] = {
@@ -1679,6 +2091,7 @@ def _enqueue_refusal_notice(notices, kind, row, alarm):
 def _notice_row(notice, state=None):
     payload, evidence = notice["payload"], notice["payload"]["evidence"]
     row = {"seat": notice["seat"], "window": payload.get("window"),
+           "window_src": payload.get("window_src"),
            "actuation_reason": payload.get("actuation_reason")}
     if notice["kind"] == "wedge":
         row["refusal_wedge"] = dict(evidence)
@@ -1689,6 +2102,8 @@ def _notice_row(notice, state=None):
             "threshold": payload["threshold"],
             "episode": notice.get("episode"),
             "evidence": dict(evidence), "event_id": notice["id"]}
+        if payload.get("trace"):
+            row["refusal_alarm"]["trace"] = payload["trace"]
     return row
 
 
@@ -1729,6 +2144,36 @@ def _project_refusal_state(rows, alarms, notices):
         view["refusal_alarm"] = _notice_row(notice)["refusal_alarm"]
         views[notice["seat"]] = view
     return list(views.values())
+
+
+def _stale_alarm_trace(alarm, row, episode):
+    """Why an alarm this row can never match is discharged, else None.
+
+    A REFUSAL ALARM IS KEYED TO ONE EPISODE, and the same-episode discharge
+    is its only exit. When the seat can no longer be read as that episode (a
+    new session, a new pane), no row ever matches again and the alarm stays
+    ACTIVE for good. MEASURED (task/3534): the gemini seat's alarm held
+    evidence n=240 while its status flipped between session-mismatch and ok.
+    Such an alarm is discharged when the seat's NEWEST reading is measured,
+    tied to the seat's own session (ok or session-unbound), below the
+    alarm's threshold, and taken AFTER the alarm's non-falling run began: a
+    reading the alarm's own claim ("never once falling since then") cannot
+    survive. The caller checks the threshold. The trace names both keys and
+    both times, because the discharge otherwise reads like a recovery of the
+    episode the alarm was about."""
+    if not alarm.get("episode") or episode == alarm["episode"] \
+            or row.get("status") not in ("ok", "session-unbound"):
+        return None
+    at = row.get("reading_at")
+    since = (alarm.get("evidence") or {}).get("since")
+    if not (_finite_number(at) and _finite_number(since) and at > since):
+        return None
+    stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    return ("STALE EPISODE: the alarm was keyed to %s and the seat now reads "
+            "as %s, so no pass could ever match it; the seat's newest reading "
+            "(%s) is newer than the alarm's run (since %s)"
+            % (alarm["episode"], episode or "no episode", stamp(at),
+               stamp(since)))
 
 
 def _track_refusals(st, rows, now, thr, mutate=True, post=True):
@@ -1808,17 +2253,24 @@ def _track_refusals(st, rows, now, thr, mutate=True, post=True):
             state, pct = row.get("actuation_state"), row.get("pct")
             episode = _refusal_episode(row)
             alarm = alarms.get(name)
-            if alarm and alarm.get("episode") and episode == alarm["episode"] \
-                    and row.get("status") != "session-mismatch" \
-                    and _finite_number(pct) and pct < alarm["threshold"]:
+            same = bool(alarm and alarm.get("episode")
+                        and episode == alarm["episode"]
+                        and row.get("status") != "session-mismatch")
+            stale = None if same or not alarm \
+                else _stale_alarm_trace(alarm, row, episode)
+            if (same or stale) and _finite_number(pct) \
+                    and pct < alarm["threshold"]:
                 delivery_lock = _refusal_delivery_lock(blocking=False)
                 if delivery_lock is not None:
                     try:
                         for notice_id, notice in list(notices.items()):
                             if notice["kind"] == "wedge" \
                                     and notice["seat"] == name \
-                                    and notice.get("episode") == episode:
+                                    and notice.get("episode") \
+                                    == alarm["episode"]:
                                 notices.pop(notice_id)
+                        if stale:
+                            row["discharge_trace"] = stale
                         notice_id = _enqueue_refusal_notice(
                             notices, "discharge", row, alarm)
                         alarms.pop(name, None)
@@ -1828,7 +2280,13 @@ def _track_refusals(st, rows, now, thr, mutate=True, post=True):
                     finally:
                         delivery_lock.close()
 
-            if not state or not _finite_number(pct):
+            # A target's refusal or an unproven send is not autocompact's own
+            # safety refusal: it is latched until a newer reading and said
+            # once by the hot rung (task/3534), so it neither starts nor
+            # extends a wedge series.
+            if not state or state == "COMPACT_REFUSED" \
+                    or row.get("compact_unproven") \
+                    or not _finite_number(pct):
                 series.pop(name, None)
                 continue
             prior = series.get(name)
@@ -1958,25 +2416,25 @@ def _wedge_text(row, thr):
     if w.get("state") == "FAILED_TO_SUBMIT":
         return (
             "⚠️ WATCHDOG: seat %s has FAILED TO SUBMIT /compact for %d consecutive "
-            "watchdog passes — context %s from %.1f%% to %.1f%% of its %s-token "
-            "window, all above the %d%% trigger. Helm did NOT call or latch any "
-            "attempt as success. Latest reason: %s. The next cadence retries once; "
-            "inspect the named transport/composer failure or respawn its input path. "
+            "watchdog passes — context %s from %.1f%% to %.1f%% of %s, all "
+            "above the %d%% trigger. Helm did NOT call or latch any attempt as "
+            "success. Latest reason: %s. The next cadence retries once; inspect "
+            "the named transport/composer failure or respawn its input path. "
             "[attempted-is-not-acted]"
             % (row["seat"], w.get("n") or 0,
                "CLIMBING" if last > first else "FLAT", first, last,
-               "{:,}".format(row.get("window") or 0), thr,
+               _window_phrase(row), thr,
                row.get("actuation_reason") or "submission remained unverified"))
     common = (row["seat"], w.get("n") or 0, w.get("state") or "?",
               "CLIMBING" if last > first else "FLAT", first, last,
-              "{:,}".format(row.get("window") or 0),
+              _window_phrase(row),
               _age(max(0.0, time.time() - (w.get("since") or time.time()))),
               thr)
     if _wedge_stuck(w):
         return (
             "🚨 WATCHDOG: seat %s is STUCK BEHIND AUTOCOMPACT'S OWN SAFETY "
             "REFUSAL — %d consecutive refusals (state=%s), context %s from "
-            "%.1f%% to %.1f%% of its %s-token window over %s, never once "
+            "%.1f%% to %.1f%% of %s over %s, never once "
             "falling, all above the %d%% trigger. The refusal is CORRECT — "
             "/compact must never be queued into an open turn — but this "
             "episode has now outlived the self-clearing envelope: 66 of the 73 "
@@ -1989,7 +2447,7 @@ def _wedge_text(row, thr):
     return (
         "⚠️ WATCHDOG: seat %s is REFUSING /compact BEHIND ITS OWN SAFETY CHECK "
         "— %d consecutive refusals (state=%s), context %s from %.1f%% to %.1f%% "
-        "of its %s-token window over %s, never once falling, all above the %d%% "
+        "of %s over %s, never once falling, all above the %d%% "
         "trigger. The refusal is CORRECT — /compact must never be queued into an "
         "open turn — and a non-falling series is the discriminator between a "
         "busy seat and a wedged one, so this is worth WATCHING. It is not yet "
@@ -2008,10 +2466,41 @@ def _wedge_discharge_text(row, thr):
         "WATCHDOG DISCHARGED on %s — context was OBSERVED at %.1f%%, below "
         "the %d%% trigger, after an active refusal alarm that reached %d "
         "consecutive refusals from %.1f%% to %.1f%%. This is measured recovery, "
-        "not silence; the next over-threshold episode starts re-armed."
+        "not silence; the next over-threshold episode starts re-armed.%s"
         % (row["seat"], alarm.get("observed_pct") or 0.0, thr,
            evidence.get("n") or 0, evidence.get("first_pct") or 0.0,
-           evidence.get("last_pct") or 0.0))
+           evidence.get("last_pct") or 0.0,
+           " %s." % alarm["trace"] if alarm.get("trace") else ""))
+
+
+def _latch_unknown(st, rows, now, unknown):
+    """Announce each unmeasured live seat ONCE per episode, after its grace.
+
+    An episode is one seat unmeasurable for one reason (its status). It
+    starts when first seen, speaks once UNKNOWN_GRACE_S later, and ends when
+    the seat is measured, stops being live, or changes reason, so the next
+    episode starts re-armed. Entries for seats this pass did not scan are
+    left alone: a `--seat S` pass must not re-arm every other seat."""
+    seen = st.get(_UNKNOWN_KEY)
+    if not isinstance(seen, dict):
+        seen = st[_UNKNOWN_KEY] = {}
+    for row in rows:
+        name = row["seat"]
+        if not row.get("unmeasured"):
+            seen.pop(name, None)
+            continue
+        fp = "%s|%s" % (name, row.get("status"))
+        entry = seen.get(name)
+        if not isinstance(entry, dict) or entry.get("fp") != fp \
+                or not _finite_number(entry.get("since")):
+            entry = seen[name] = {"fp": fp, "since": now, "said": False}
+        if entry.get("said"):
+            row["unknown_latched"] = True
+        elif now - entry["since"] >= UNKNOWN_GRACE_S:
+            entry["said"] = True
+            unknown.append(row)
+    if not seen:
+        st.pop(_UNKNOWN_KEY, None)
 
 
 def _record_recovery(st, row, now, mode, detail, fired):
@@ -2152,10 +2641,34 @@ def check(seats=None, thr=None, fire=True, post=True, adapter=None):
             row["would_fire"] = True
             if _latch_blocks(entry, row, now):
                 row["latched"] = True
+                if entry.get("mode") in _READING_LATCHES:
+                    row["latched_why"] = (
+                        "%s %s ago; no fire until a newer reading"
+                        % ("pane refused /compact"
+                           if entry["mode"] == COMPACT_REFUSED else
+                           "a /compact send was unproven",
+                           _age(now - (entry.get("fired_at") or now))))
                 continue
             if not fire:
                 continue
             mode, detail = _fire(row, pane_adapter)
+            if mode in _READING_LATCHES:
+                # THE TARGET SAID NO, or helm cannot tell what the send did.
+                # Latched on the seat until a reading newer than it exists
+                # (`_episode_complete`); the hot rung below says so once. An
+                # unproven send keeps the UNKNOWN actuation state it always
+                # had, and says what it did.
+                row["actuation_state"] = "COMPACT_REFUSED" \
+                    if mode == COMPACT_REFUSED else "UNKNOWN"
+                row["compact_unproven"] = mode == COMPACT_UNPROVEN
+                row["actuation_reason"] = detail
+                st[row["seat"]] = {
+                    "fired_at": now, "identity": _latch_identity(row),
+                    "session": row.get("session"),
+                    "registered_session": row.get("registered_session"),
+                    "pct": row["pct"], "mode": mode,
+                    "reading_at": row.get("reading_at")}
+                continue
             if mode == "context-400":
                 row["actuation_state"] = "CONTEXT_400"
                 row["actuation_reason"] = detail
@@ -2212,7 +2725,11 @@ def check(seats=None, thr=None, fire=True, post=True, adapter=None):
             # so this stays empty and only lights when a rung above regresses.
             if _silently_dropped(row, thr):
                 row["silent_non_fire"] = True
+            elif _unmeasured(row, thr):
+                row["unmeasured"] = True       # no percentage for any rung above
+        unknown = []
         if fire:
+            _latch_unknown(st, rows, now, unknown)
             seen = st.setdefault("_hot", {})
             for name in alarmed:
                 seen.pop(name, None)  # the active alarm owns this incident
@@ -2256,7 +2773,8 @@ def check(seats=None, thr=None, fire=True, post=True, adapter=None):
                       % (row["seat"], e), file=sys.stderr)
         for row, text in ([(r, _hot_text(r, thr)) for r in hot] +
                           [(r, _dead_text(r, thr)) for r in dead] +
-                          [(r, _silent_text(r, thr)) for r in silent]):
+                          [(r, _silent_text(r, thr)) for r in silent] +
+                          [(r, _unknown_text(r, thr)) for r in unknown]):
             try:
                 from . import chat
                 chat.post(text, who="autocompact")
@@ -2310,8 +2828,8 @@ def check(seats=None, thr=None, fire=True, post=True, adapter=None):
                       if (row.get("refusal_alarm") or {}).get("event_id")
                       not in delivered]
     return {"rows": rows, "fired": fired, "hot": hot, "dead": dead,
-            "silent": silent, "wedged": wedged, "alarms": alarms,
-            "discharged": discharged}
+            "silent": silent, "unknown": unknown, "wedged": wedged,
+            "alarms": alarms, "discharged": discharged}
 
 
 # ---------------------------------------------------------------------------
@@ -2332,28 +2850,39 @@ def _age(s):
 
 def _row_line(row):
     if row.get("status") == "window-unset":
-        return "%-8s %s" % (row["seat"], row["window_src"])
+        return "%-8s %s%s" % (row["seat"], row["window_src"],
+                              " — UNKNOWN window on a live seat"
+                              if row.get("unmeasured") else "")
     if row.get("ctx_tokens") is None:
-        return ("%-8s no context data yet (transcript appears after the seat's "
-                "first persisted turn)" % row["seat"])
+        return ("%-8s no context data: %s%s" % (
+            row["seat"], row.get("unmeasured_why") or "no reading",
+            " — UNKNOWN on a live seat" if row.get("unmeasured") else ""))
     note = {"ok": "", "stale": " — STALE, no fire",
+            "window-unproven": " — window unproven, no fire",
             "claude-model": " — claude gate off (HELM_AUTOCOMPACT_CLAUDE=0)"}.get(
                 row["status"], " — " + row["status"])
+    if row.get("unmeasured"):
+        note += " — UNKNOWN on a live seat: %s" % row["unmeasured_why"]
     flag = ""
     if row.get("mode"):
         flag = " -> FIRED (%s%s)" % (
             row["mode"], ", fresh session between rows"
             if row.get("fresh_row") else "")
     elif row.get("latched"):
-        flag = " [latched]"
+        flag = " [latched: %s]" % row["latched_why"] \
+            if row.get("latched_why") else " [latched]"
     elif row.get("would_fresh"):
         flag = " -> would start a fresh session (between rows)"
     elif row.get("would_fire"):
         flag = " -> would fire"
     hr_k = row["headroom_tokens"] // 1000 if row.get("headroom_tokens") is not None else 0
-    return ("%-8s %5.1f%% of %dk (%dk via %s, %dk headroom, %s old)%s%s"
+    source = row["source"]
+    if row.get("reading") == "compact_boundary":
+        source += " compact_boundary"
+    return ("%-8s %5.1f%% of %dk [%s] (%dk via %s, %dk headroom, %s old)%s%s"
             % (row["seat"], row["pct"], row["window"] // 1000,
-               row["ctx_tokens"] // 1000, row["source"], hr_k,
+               row.get("window_src") or "source unrecorded",
+               row["ctx_tokens"] // 1000, source, hr_k,
                _age(row.get("age_s")), note, flag))
 
 
@@ -2396,9 +2925,10 @@ def _refusal_alarm_line(row):
                    alarm.get("event_id") or "?"))
     if alarm.get("state") == "discharged":
         return ("  DISCHARGED refusal alarm: observed %.1f%% below %d%% "
-                "trigger (prior wedge %d refusals)"
+                "trigger (prior wedge %d refusals)%s"
                 % (alarm.get("observed_pct") or 0.0,
-                   alarm.get("threshold") or 0, evidence.get("n") or 0))
+                   alarm.get("threshold") or 0, evidence.get("n") or 0,
+                   " — %s" % alarm["trace"] if alarm.get("trace") else ""))
     return None
 
 
@@ -2444,7 +2974,10 @@ WantedBy=timers.target
 """
 
 
-def _timer_units(interval=DEFAULT_INTERVAL_S):
+def _timer_units(interval=DEFAULT_INTERVAL_S, inputs=None):
+    # `inputs` replaces per-install values (timerhealth.unit_values): the
+    # drift census renders this template with wildcards (task/3405).
+    from . import timerhealth
     # A persistent unit must never capture a disposable worktree's PATH entry.
     helm_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "helm")
     # WorkingDirectory DERIVED, never a literal (seat.py's rebind-unit law):
@@ -2454,9 +2987,11 @@ def _timer_units(interval=DEFAULT_INTERVAL_S):
     from . import work
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cwd = work.find_root(here) or here
-    service = _UNIT_SERVICE % {"helm": helm_bin, "cwd": cwd}
-    timer = _UNIT_TIMER % {"interval": interval}
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    service = _UNIT_SERVICE % timerhealth.unit_values(
+        {"helm": helm_bin, "cwd": cwd}, inputs)
+    timer = _UNIT_TIMER % timerhealth.unit_values({"interval": interval},
+                                                  inputs)
+    udir = timerhealth.user_unit_dir()
     return (os.path.join(udir, "helm-autocompact.service"), service,
             os.path.join(udir, "helm-autocompact.timer"), timer)
 
@@ -2496,24 +3031,16 @@ def ensure_timer(interval=DEFAULT_INTERVAL_S):
     if off is not None:
         return None, ("install skipped by %s=%s: no unit file written, no "
                       "systemctl run" % (TIMER_ENV, off))
-    from . import pk
-    import subprocess
+    from . import timerhealth
     systemctl = shutil.which("systemctl")
     if not systemctl:
         return False, "systemctl unavailable; run autocompact from another scheduler"
     spath, service, tpath, timer = _timer_units(interval)
-    try:
-        pk.atomic_write(spath, service)
-        pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    for cmd in ([systemctl, "--user", "daemon-reload"],
-                [systemctl, "--user", "enable", "--now",
-                 "helm-autocompact.timer"]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, "%s failed: %s" % (
-                " ".join(cmd), (r.stderr or r.stdout or "").strip()[:200])
+    error, _unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer)), ("helm-autocompact.timer",),
+        systemctl)
+    if error:
+        return False, error
     return True, "timer enabled every %ds (%s)" % (interval, tpath)
 
 

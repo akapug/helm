@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""LAYOUT, MEASURED BY A REAL ENGINE — the two defects on this page that no
+"""LAYOUT, MEASURED BY A REAL ENGINE — what on this page no
 string can see.
 
-Both findings here are GEOMETRIC: a sticky element covering an input, and a
-flex row summing past the viewport. Neither is a property of any source text —
-the CSS that produces both is individually correct — so the only instrument
+The findings here are GEOMETRIC: a sticky element covering an input. That is
+not a property of any source text — the CSS that produces it is individually
+correct — so the only instrument
 that can hold them is a layout engine over the REAL assembled page. A python or
 node mirror of flexbox would be a second implementation free to disagree with
 the browser, which is the class of defect this suite spends most of its arms
@@ -12,8 +12,8 @@ refusing.
 
 So these arms run headless Chrome over the page `helm web` serves, with ONE
 substitution: the application script is replaced by a probe that lifts the real
-`publishNavHeight` and the real landed-row renderers out of the same assembled
-source and calls them. Nothing fetches, so nothing here depends on a server;
+`publishNavHeight` and its neighbours out of the same assembled source and
+calls them. (The landed-row arm went with the band's landed row, task/3585.) Nothing fetches, so nothing here depends on a server;
 everything measured is the shipped markup under the shipped stylesheet.
 
 WHERE CHROME IS ABSENT THESE SKIP, exactly as the node harnesses skip. A skipped
@@ -37,10 +37,8 @@ CHROME = ("google-chrome", "google-chrome-stable", "chromium",
 # Headless Chrome clamps its window to 500px wide, so a 390px VIEWPORT is not
 # available to this instrument. The phone rules key on `max-width:680px`, which a
 # 500px viewport satisfies exactly as a 390px one does, so the media query under
-# test is live; the 390px design floor is then applied as the CONTENT width,
-# which is what a flex row's own layout depends on.
+# test is live.
 PHONE_VIEWPORT = (500, 844)
-PHONE_CONTENT = 390
 DESKTOP_VIEWPORT = (1400, 900)
 
 
@@ -208,7 +206,6 @@ const $ = s => document.querySelector(s);
 // THE MODULE STATE renderNav READS. `NAV_SESS` is what the catalog callback
 // writes; the rest are the other cells' own, empty here.
 let NAV_ACC = "", NAV_SESS = "", NAV_CHAT = 0, NAV_CHAT_MENTION = false;
-let NAV_LR = 0, NAV_LR_TITLE = "";
 // THE BADGE PATH IS SHIMMED AND THE HEIGHT PATH IS REAL, deliberately: badges
 // have their own arms (they mutate a tab, not the nav's row count), and what is
 // under measurement here is the republish that follows the stats mutation. The
@@ -292,84 +289,6 @@ document.body.appendChild(pre);
         self.assertGreaterEqual(cured["inputTop"], cured["navBottom"] - 1, cured)
         self.assertTrue(cured["insideControls"], cured)
         self.assertFalse(cured["insideNav"], cured)
-
-
-class ALandedRowFitsThePhoneTest(HomeGeometryBase):
-    """AN EXPANDED LANDED ROW DOES NOT DRAG THE PAGE SIDEWAYS.
-
-    The row has six cells and five of them refuse to shrink, so an ordinary
-    short land — a two-character lane, a task number, an eight-character tip, a
-    twelve-character gate token and the unrecorded-proof verdict — summed past
-    the 390px design floor and widened the document. The rows are rendered by
-    the REAL renderers lifted out of the assembled page, over the envelope the
-    REAL producer emits, so the measured row is the row the owner gets.
-    """
-
-    def probe(self):
-        fns = "\n\n".join(_extract_fn(self.src, n) for n in
-                          ("lrDur", "lrAgo", "cardSource", "cardBoundS",
-                           "cardStale",
-                           "dashLandRow",
-                           "dashLandGroups", "dashLandPrimary",
-                           "dashLandVerdictKey", "dashLandGroup", "dashLands"))
-        esc = [ln for ln in self.src.splitlines() if ln.startswith("const esc = ")]
-        assert len(esc) == 1, "the assembled page's esc definition moved"
-        row = json.dumps({
-            "lane": "ui", "task": "2355", "reviewed_tip": "a" * 40,
-            "gate": "b" * 16, "trunk_sha": "c" * 40,
-            "trunk_ref": "refs/remotes/origin/main", "on_trunk": None,
-            "how": None, "chain_root": None, "ts": "2026-09-12T00:00:00Z",
-            "age_s": 3600, "ts_unreadable": False})
-        return """<script>
-const $ = s => document.querySelector(s);
-""" + esc[0] + "\n" + fns + """
-// THE CONTENT WIDTH IS THE PHONE FLOOR. The viewport is what the media query
-// reads; this is what the flex row lays out inside.
-const wrap = document.createElement("div");
-wrap.style.width = "%dpx";
-wrap.style.margin = "0";
-document.body.style.margin = "0";
-const band = $("#dash");
-wrap.appendChild(band);
-document.body.insertBefore(wrap, document.body.firstChild);
-const row = %s;
-dashLands({rows: [row], total: 1, rows_truncated: false,
-           source: "helm lr list", unavailable: null}, false, 3);
-function widest() {
-  const left = wrap.getBoundingClientRect().left;
-  let right = left, worst = null;
-  $("#dlands").querySelectorAll("*").forEach(node => {
-    const r = node.getBoundingClientRect();
-    if (r.width && r.right > right) { right = r.right; worst = node.className; }
-  });
-  return {overflow: Math.round((right - left) * 100) / 100, worst: worst,
-          wrapped: getComputedStyle($("#dlands .dland")).flexWrap};
-}
-const out = {cured: widest()};
-// THE MUST-HIT: the phone rule is what makes the row wrap. Overriding it back to
-// a single line reproduces the overflow in this same browser, which is what
-// proves this measurement can see it.
-$("#dlands").querySelectorAll(".dland").forEach(node => {
-  node.style.flexWrap = "nowrap";
-});
-out.uncured = widest();
-const pre = document.createElement("pre");
-pre.id = "helmgeom";
-pre.textContent = JSON.stringify(out);
-document.body.appendChild(pre);
-</script>""" % (PHONE_CONTENT, row)
-
-    def test_the_row_wraps_instead_of_widening_the_page(self):
-        out = self.measure(self.probe(), PHONE_VIEWPORT, "phone")
-        cured, uncured = out["cured"], out["uncured"]
-        # THE MUST-HIT FIRST: held on one line, this exact row overflows the
-        # phone floor, so the instrument demonstrably sees the defect.
-        self.assertGreater(uncured["overflow"], PHONE_CONTENT,
-                           "the uncured control did not reproduce the overflow")
-        # AND THE CURE: the shipped rule wraps the row and every cell lands
-        # inside the floor.
-        self.assertEqual(cured["wrapped"], "wrap", cured)
-        self.assertLessEqual(cured["overflow"], PHONE_CONTENT, cured)
 
 
 if __name__ == "__main__":

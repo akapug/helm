@@ -21,6 +21,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests import _lockwait  # noqa: E402
+from tests._offpeak_clock import pin as _pin_offpeak_clock  # noqa: E402
 from tests._tmphome import declaring as _tmp_declaring  # noqa: E402
 from tests._tmphome import session_for as _tmp_session_for  # noqa: E402
 from tests._tmphome import declare as _tmp_declare  # noqa: E402
@@ -28,6 +30,7 @@ from tests._tmphome import corroborate as _tmp_corroborate  # noqa: E402
 
 from helm import (beacons, chat, dispatches, eventledger, home, pk, proxywatch,
                   record, seats, seats_cursor, seats_delivery, seats_receipts,
+                  seats_rotation,
                   seats_identity, seats_rename, seats_stop_claims,
                   seats_stop_guard, seats_stop_seam, seats_stop_signals,
                   web)  # noqa: E402
@@ -45,6 +48,7 @@ from helm import seat as seatmod  # noqa: E402,F401
 from helm import seat_lifecycle  # noqa: E402
 from helm import seats_incarnation as seatmod_incarnation  # noqa: E402
 from helm import seats_stop_timing  # noqa: E402
+from helm import web_roster  # noqa: E402
 
 # Classes this module HANDED AWAY, read by `helm/retired_name_rung.py`.
 #
@@ -79,7 +83,10 @@ _OWNER_NAMES = (
                                   "TheFinalCaptureIsTheLastWordTest")),
 )
 
-THREAD_TIMEOUT = 2.0
+# A HANG bound, never a speed claim: every thread wait in these arms ends
+# on an event the code under test sets, and a loaded build host (a sliced
+# suite is one) can hold a correct writer past any short bound.
+THREAD_TIMEOUT = _lockwait.HANG_S
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -1585,7 +1592,7 @@ class DeliverTest(SeatsBase):
 
         def gated_write(*args, **kwargs):
             write_entered.set()
-            if not baseline_entered.wait(2):
+            if not baseline_entered.wait(THREAD_TIMEOUT):
                 errors.append("rehome never reached cursor baselining")
             return real_write(*args, **kwargs)
 
@@ -1608,13 +1615,13 @@ class DeliverTest(SeatsBase):
                     session="s-new", seat="alice", room="new-room"),),
                 daemon=True)
             delivery.start()
-            self.assertTrue(write_entered.wait(1))
+            self.assertTrue(write_entered.wait(THREAD_TIMEOUT))
             rehome = threading.Thread(
                 target=run, args=(lambda: seats.rehome_seat(
                     "alice", "new-room"),), daemon=True)
             rehome.start()
-            delivery.join(3)
-            rehome.join(3)
+            delivery.join(THREAD_TIMEOUT)
+            rehome.join(THREAD_TIMEOUT)
         self.assertFalse(delivery.is_alive(), "delivery deadlocked")
         self.assertFalse(rehome.is_alive(), "rehome deadlocked")
         self.assertEqual(errors, [])
@@ -1626,7 +1633,7 @@ class DeliverTest(SeatsBase):
         chat.post("seed", who="bob")
         path = chat.room_path("main")
         results = []
-        with chat._room_lock("main"):
+        with _lockwait.observed() as waits, chat._room_lock("main"):
             workers = [
                 threading.Thread(target=lambda: results.append(
                     chat._rotate(path, cap=0, room="main"))),
@@ -1637,7 +1644,10 @@ class DeliverTest(SeatsBase):
             ]
             for worker in workers:
                 worker.start()
-            time.sleep(0.1)
+            # Each worker reaches a lock this thread holds (or finishes)
+            # before it is released, so the cycle is exercised on any host.
+            for worker in workers:
+                waits.wait_blocked(worker)
         for worker in workers:
             worker.join(THREAD_TIMEOUT)
             self.assertFalse(worker.is_alive(), "three-way lock cycle")
@@ -2401,7 +2411,7 @@ class WaitTest(SeatsBase):
 class BeaconFileSinkRefusalTest(SeatsBase):
     """A --follow beacon whose stdout is a regular FILE wakes nobody: armed
     as a background shell task it would consume rows into an unread sink
-    (three #playapal seats in one night, 2026-08-21). wait() must refuse at
+    (three seats of one project's room in one night). wait() must refuse at
     arm time, INTO that file, and consume nothing; a pipe stdout (the
     Monitor shape) streams the wake, and HELM_BEACON_FILE_SINK_OK=1 keeps a
     deliberate capture working."""
@@ -3181,7 +3191,7 @@ class PairedCursorCoordinationTest(SeatsBase):
 
         chat._ensure_dir()
         with mock.patch("helm.seats_delivery._baseline_state",
-                        side_effect=delayed):
+                        side_effect=delayed), _lockwait.observed() as waits:
             baseline = threading.Thread(
                 target=seats._baseline_room_cursors,
                 args=("main", "alice", ["late-session"]))
@@ -3191,8 +3201,8 @@ class PairedCursorCoordinationTest(SeatsBase):
                 target=seats._init_cursor,
                 args=("main", "alice", "other-session"))
             initializing.start()
-            initializing.join(0.05)
-            self.assertTrue(initializing.is_alive())
+            self.assertIsNotNone(waits.wait_blocked(initializing),
+                                 "late init was not held back by the baseline")
             resume.set()
             baseline.join(THREAD_TIMEOUT)
             initializing.join(THREAD_TIMEOUT)
@@ -3640,7 +3650,7 @@ class PairedCursorCoordinationTest(SeatsBase):
             session="s-a", seat="alice", channel="hook",
             emit=lambda _line: None))
         entered, release = threading.Event(), threading.Event()
-        real = seats_delivery._commit_cursor_updates
+        real = seats_rotation._commit_cursor_updates
         results = []
 
         def delayed(updates, finish=None):
@@ -3648,8 +3658,8 @@ class PairedCursorCoordinationTest(SeatsBase):
             self.assertTrue(release.wait(THREAD_TIMEOUT))
             return real(updates, finish=finish)
 
-        with mock.patch("helm.seats_delivery._commit_cursor_updates",
-                        side_effect=delayed):
+        with mock.patch("helm.seats_rotation._commit_cursor_updates",
+                        side_effect=delayed), _lockwait.observed() as waits:
             rotating = threading.Thread(target=lambda: results.append(
                 chat._rotate(chat.room_path("main"), cap=0, room="main")))
             rotating.start()
@@ -3657,9 +3667,8 @@ class PairedCursorCoordinationTest(SeatsBase):
             renaming = threading.Thread(target=lambda: results.append(
                 seats.rename_seat("alice", "renamed")))
             renaming.start()
-            renaming.join(0.05)
-            self.assertTrue(renaming.is_alive(),
-                            "rename moved a path snapshotted by rotation")
+            self.assertIsNotNone(waits.wait_blocked(renaming),
+                                 "rename moved a path snapshotted by rotation")
             release.set()
             rotating.join(THREAD_TIMEOUT)
             renaming.join(THREAD_TIMEOUT)
@@ -3730,7 +3739,7 @@ class PairedCursorCoordinationTest(SeatsBase):
         seats.join(session="s-a", seat="alice", cwd="/tmp/p")
         chat.post("@alice retained", who="owner")
         result = seats_cursor.CursorCommitResult(False, False)
-        with mock.patch("helm.seats_delivery._commit_cursor_updates",
+        with mock.patch("helm.seats_rotation._commit_cursor_updates",
                         return_value=result):
             self.assertFalse(chat._rotate(
                 chat.room_path("main"), cap=0, room="main"))
@@ -3766,7 +3775,7 @@ class PairedCursorCoordinationTest(SeatsBase):
         chat.post("@alice retained", who="owner")
         path = seats.beacon_cursor_path("main", "alice", "s-a")
         entered, release, results = threading.Event(), threading.Event(), []
-        real_read = seats_delivery._strict_json
+        real_read = seats_rotation._strict_json
 
         def blocked(target):
             if target == path:
@@ -3775,7 +3784,8 @@ class PairedCursorCoordinationTest(SeatsBase):
             return real_read(target)
 
         st = os.stat(chat.room_path("main"))
-        with mock.patch("helm.seats_delivery._strict_json", side_effect=blocked):
+        with mock.patch("helm.seats_rotation._strict_json",
+                        side_effect=blocked), _lockwait.observed() as waits:
             holding = threading.Thread(target=lambda: results.append(
                 seats.rotation_hold_offset("main", st.st_dev, st.st_ino, [])))
             holding.start()
@@ -3783,8 +3793,8 @@ class PairedCursorCoordinationTest(SeatsBase):
             renaming = threading.Thread(target=lambda: results.append(
                 seats.rename_seat("alice", "renamed")))
             renaming.start()
-            renaming.join(0.05)
-            self.assertTrue(renaming.is_alive())
+            self.assertIsNotNone(waits.wait_blocked(renaming),
+                                 "rename was not held back by the census")
             release.set()
             holding.join(THREAD_TIMEOUT)
             renaming.join(THREAD_TIMEOUT)
@@ -3795,7 +3805,7 @@ class PairedCursorCoordinationTest(SeatsBase):
         seats.join(session="s-a", seat="alice", cwd="/tmp/p")
         chat.post("@alice retained", who="owner")
         st = os.stat(chat.room_path("main"))
-        with mock.patch("helm.seats_delivery.os.listdir",
+        with mock.patch("helm.seats_rotation.os.listdir",
                         side_effect=OSError("census denied")):
             self.assertEqual(seats.rotation_hold_offset(
                 "main", st.st_dev, st.st_ino, []), 0)
@@ -3805,14 +3815,14 @@ class PairedCursorCoordinationTest(SeatsBase):
         chat.post("@alice retained", who="owner")
         path = seats.beacon_cursor_path("main", "alice", "s-a")
         st = os.stat(chat.room_path("main"))
-        real = seats_delivery._strict_json
+        real = seats_rotation._strict_json
 
         def unreadable(target):
             if target == path:
                 raise OSError("beacon denied")
             return real(target)
 
-        with mock.patch("helm.seats_delivery._strict_json",
+        with mock.patch("helm.seats_rotation._strict_json",
                         side_effect=unreadable):
             self.assertEqual(seats.rotation_hold_offset(
                 "main", st.st_dev, st.st_ino, []), 0)
@@ -3856,7 +3866,8 @@ class BroadcastReceiptTest(SeatsBase):
             return value
 
         with mock.patch.object(seats_receipts, "broadcast_census",
-                               side_effect=census):
+                               side_effect=census), \
+                _lockwait.observed() as waits:
             writer = threading.Thread(
                 target=lambda: posted.append(chat.post(
                     "@all serialized", who="owner")))
@@ -3865,9 +3876,8 @@ class BroadcastReceiptTest(SeatsBase):
             joiner = threading.Thread(target=lambda: joined.append(
                 seats.join(session="s-b", seat="bob", cwd="/tmp/p")))
             joiner.start()
-            joiner.join(0.05)
-            self.assertTrue(joiner.is_alive(),
-                            "roster changed between census and append")
+            self.assertIsNotNone(waits.wait_blocked(joiner),
+                                 "roster changed between census and append")
             release.set()
             writer.join(THREAD_TIMEOUT)
             joiner.join(THREAD_TIMEOUT)
@@ -4409,7 +4419,8 @@ class BroadcastReceiptTest(SeatsBase):
             self.assertTrue(release.wait(THREAD_TIMEOUT))
             return lanes
 
-        with mock.patch("helm.seats_ack._all_lanes", side_effect=blocked):
+        with mock.patch("helm.seats_ack._all_lanes", side_effect=blocked), \
+                _lockwait.observed() as waits:
             selector = threading.Thread(target=lambda: selected.append(
                 seats_receipts._locate_receipt_row(row["id"])))
             selector.start()
@@ -4417,8 +4428,8 @@ class BroadcastReceiptTest(SeatsBase):
             renamer = threading.Thread(target=lambda: renamed.append(
                 seats.rename_seat("alice", "renamed")))
             renamer.start()
-            renamer.join(0.05)
-            self.assertTrue(renamer.is_alive())
+            self.assertIsNotNone(waits.wait_blocked(renamer),
+                                 "rename was not held back by the selector")
             release.set()
             selector.join(THREAD_TIMEOUT)
             renamer.join(THREAD_TIMEOUT)
@@ -4440,7 +4451,8 @@ class BroadcastReceiptTest(SeatsBase):
             self.assertTrue(release.wait(THREAD_TIMEOUT))
             return real(*args, **kwargs)
 
-        with mock.patch("helm.seats_receipts._read_receipts", side_effect=blocked):
+        with mock.patch("helm.seats_receipts._read_receipts",
+                        side_effect=blocked), _lockwait.observed() as waits:
             rendering = threading.Thread(target=lambda:
                 seats_receipts.render_delivery_receipts(row["id"]))
             rendering.start()
@@ -4448,8 +4460,8 @@ class BroadcastReceiptTest(SeatsBase):
             rotating = threading.Thread(target=lambda: rotated.append(
                 chat._rotate(chat.room_path("main"), cap=0, room="main")))
             rotating.start()
-            rotating.join(0.05)
-            self.assertTrue(rotating.is_alive())
+            self.assertIsNotNone(waits.wait_blocked(rotating),
+                                 "rotation was not held back by the snapshot")
             release.set()
             rendering.join(THREAD_TIMEOUT)
             rotating.join(THREAD_TIMEOUT)
@@ -5426,7 +5438,11 @@ class BeaconRearmRungTest(BeaconProcsBase):
         with mock.patch.object(seats_stop_signals, "beacon_procs", probe), \
                 mock.patch.object(beacons, "live_sessions",
                                   return_value=live or {}):
-            return seats_stop_guard._rearm_rung(self.SID, seat)
+            line, refuses = seats_stop_guard._rearm_rung(self.SID, seat)
+        # A seat with no verified LOCAL runtime is never refused by this rung
+        # (task/3382): every arm here reads the advice, as before.
+        self.assertFalse(refuses)
+        return line
 
     def waiter(self):
         return self.proc(108, ["python3", "/x/bin/helm", "chat", "wait",
@@ -5445,7 +5461,8 @@ class BeaconRearmRungTest(BeaconProcsBase):
         self.assertIn("seat 'seat-a'", deaf)
         self.assertIn("NO live `helm chat wait` process", deaf)
         self.assertIn('Monitor(command: "helm chat wait --seat seat-a '
-                      '--follow", timeout_ms: 1800000)', deaf)
+                      '--follow", description: "inbox beacon", '
+                      'timeout_ms: 1800000)', deaf)
         self.assertIn("A TURN DOES NOT ARM IT", deaf)
         self.assertIn("select:Monitor", deaf)
         self.assertIn("NOT latched", deaf)
@@ -5464,7 +5481,8 @@ class BeaconRearmRungTest(BeaconProcsBase):
         def boom(name, proc_dir=None, strict=False):
             raise OSError("probe exploded")
         with mock.patch.object(seats_stop_signals, "beacon_procs", boom):
-            line = seats_stop_guard._rearm_rung(self.SID, "seat-a")
+            line, refuses = seats_stop_guard._rearm_rung(self.SID, "seat-a")
+        self.assertFalse(refuses)
         self.assertIn("NO PROVEN WAKE PATH", line)
         self.assertIn("the beacon probe raised OSError", line)
 
@@ -5543,7 +5561,8 @@ class BeaconGateTest(SeatsBase):
         self.assertIn("seat 'oi'", err)
         # the EXACT Monitor call, copy-pasteable
         self.assertIn('Monitor(command: "helm chat wait --seat oi --follow", '
-                      'timeout_ms: 1800000)', err)
+                      'description: "inbox beacon", timeout_ms: 1800000)',
+                      err)
         self.assertIn("re-arm it in the same turn", err)
         self.assertIn("select:Monitor", err)      # …and the DEFERRED escape
         self.assertIn("98 undelivered", err)      # why, from the real incident
@@ -6598,9 +6617,30 @@ class WorkOfferTest(SeatsBase):
     a GENUINELY idle seat is offered ONE terse take-it-or-pass for the top
     UNOWNED backlog row. Hermetic: the dispatch ledger is planted as raw
     event-sourced rows (no git), claims/roster in tmp. Offerable = an OBSERVED,
-    not-overdue open dispatch whose recipient is this seat or an absent/gone
-    seat (never a different LIVE seat), and whose `dispatch:<id8>` claim key is
-    free."""
+    not-overdue open dispatch whose recipient is this seat or nobody, and
+    whose `dispatch:<id8>` claim key is free. The arms that drive the offer
+    plant UNOWNED rows (`pool`): since task/3696 the offer skips a row
+    assigned to any other seat, live or absent, which is what "ghost" was."""
+
+    #: The recipient a planted row carries to stand for the unowned POOL. The
+    #: ledger refuses a row with no recipient (`dispatches._valid_identity`),
+    #: so the pool exists only at the `open_rows` seam, the way
+    #: test_no_recipient_pool_row_stays_an_offer synthesizes it.
+    POOL = "pool-stand-in"
+
+    def pool(self):
+        """While active, every open dispatch row planted to POOL reads as
+        unowned at the offer's one read of the backlog (`open_rows`); every
+        other rung still sees the row addressed to a seat that is not this
+        one."""
+        from helm import dispatches
+        real = dispatches.open_rows
+
+        def rows(*a, **kw):
+            return [dict(r, recipient=None)
+                    if r.get("recipient") == self.POOL else r
+                    for r in real(*a, **kw)]
+        return mock.patch.object(dispatches, "open_rows", side_effect=rows)
 
     def guard(self, payload=None, args=()):
         stdin = json.dumps(payload).encode() if isinstance(payload, dict) else payload
@@ -6624,7 +6664,7 @@ class WorkOfferTest(SeatsBase):
 
     def plant_dispatch(self, rid, recipient, lane="review the canary",
                        ts=None, observed=True, repo_id=None, kind=None,
-                       tip=None, ref=None, reviewed_tip=None):
+                       tip=None, ref=None, reviewed_tip=None, sender=None):
         """One OPEN dispatch (+ a delivered event unless observed=False) written
         straight to the ledger — an observed, not-overdue row that dispatches.
         stop_candidate() ignores (so the dispatch RUNG stays quiet and the seat
@@ -6642,6 +6682,8 @@ class WorkOfferTest(SeatsBase):
             rows[0]["repo_id"] = repo_id
         if kind is not None:
             rows[0]["kind"] = kind
+        if sender is not None:
+            rows[0]["sender"] = sender
         if observed:
             rows.append({"v": 3, "event": "delivered", "seq": 1, "id": rid,
                          "ts": ts, "delivery_ref": "dm-x"})
@@ -6653,8 +6695,9 @@ class WorkOfferTest(SeatsBase):
 
     def test_idle_seat_offered_top_backlog_with_claim_cmd(self):
         seats.join(session="s-o1", seat="ds4pro", cwd="/tmp/p")
-        self.plant_dispatch("a1b2c3d4e5f60011", "ghost")   # recipient absent
-        rc, _o, err = self.guard({"session_id": "s-o1"}, args=["--seat", "ds4pro"])
+        self.plant_dispatch("a1b2c3d4e5f60011", self.POOL)   # unowned pool row
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-o1"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 2, err)
         self.assertIn("[helm stop-whisper]", err)
         self.assertIn("you're free", err)
@@ -6663,7 +6706,8 @@ class WorkOfferTest(SeatsBase):
         self.assertIn("helm chat claim dispatch:a1b2c3d4", err)   # exact claim cmd
         self.assertIn("or pass", err)
         # latch: same backlog HEAD, a re-stop passes — never spam every stop
-        rc, _o, err = self.guard({"session_id": "s-o1"}, args=["--seat", "ds4pro"])
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-o1"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 0, err)
         self.assertNotIn("stop-whisper", err)
 
@@ -6945,7 +6989,10 @@ class WorkOfferTest(SeatsBase):
         presenting it as plain "top of backlog" costs a turn where naming the
         recipient costs a glance. Measured root cause worth keeping visible:
         grok's process was ALIVE while its presence beat was 25h stale, so
-        the liveness test called its work strandable."""
+        the liveness test called its work strandable. The free-seat OFFER
+        no longer shows such a row at all (task/3696,
+        test_a_row_assigned_to_another_seat_is_never_offered); this arm pins
+        the backlog producer, which still reports and labels it."""
         seats.join(session="s-as1", seat="ds4pro", cwd="/tmp/p")
         self.plant_dispatch("ee11ff2233445566", "grok")   # named, not live
         rows = seats._offer_rows("ds4pro")
@@ -7005,12 +7052,14 @@ class WorkOfferTest(SeatsBase):
         self.assertEqual(row.get("holder"), "ds4pro")
         self.assertEqual(row.get("session"), "s-ac1")
         self.assertTrue(row.get("lease"))            # a real minted nonce
-        # the lease is self-reinforcing: the NEXT stop hits the session-lease
-        # BLOCK naming the held dispatch — an idle seat is idling on its own
-        # task and gets told so, louder
+        # REVERSED (task/3696): the lease is the in-progress mark on a row
+        # still owed to this seat, so the NEXT stop names it IN PROGRESS and
+        # refuses nothing; the START above was this row's one refusal, and a
+        # lease nearing expiry or a discharged row still refuses.
         rc, _o, err = self.guard({"session_id": "s-ac1"}, args=["--seat", "ds4pro"])
-        self.assertEqual(rc, 2, err)
+        self.assertEqual(rc, 0, err)
         self.assertIn("dispatch:ac11ac11", err)
+        self.assertIn("IN PROGRESS", err)
         self.assertNotIn("auto-claimed", err)        # once — never re-whispered
 
     def test_autoclaim_survives_a_later_latch_write_failure(self):
@@ -7130,19 +7179,50 @@ class WorkOfferTest(SeatsBase):
         self.assertNotIn("auto-claimed", line)
         self.assertNotIn("dispatch:ac13ac13", seats._live_claims() or {})
 
-    def test_stranded_dispatch_stays_an_offer_never_autoclaimed(self):
-        """[ii] AMBIGUOUS stays surfaced: a row assigned to an absent OTHER
-        seat is the stranded-work case — routing it is a judgment call, so
-        the offer (with its [assigned:] tag) fires and NO lease is taken."""
+    def test_a_row_assigned_to_another_seat_is_never_offered(self):  # noqa: VACUOUS_ASSERTION — the unowned row planted after is offered on the same stderr observable, the positive control for the absence before it
+        """[ii] REVERSED (task/3696): a row assigned to ANOTHER seat is not
+        offered, live or not. It was offered as "stranded work" with an
+        [assigned:] tag, and on the integrator seat the free-seat line
+        offered a row assigned to another seat, a turn spent declining work
+        that was never this seat's to take. Routing another seat's row is its
+        sender's check-in, not an idle seat's pick. No lease is taken."""
         seats.join(session="s-ac2", seat="ds4pro", cwd="/tmp/p")
-        self.plant_dispatch("ac22ac22ac22ac22", "grok", kind="review")
-        rc, _o, err = self.guard({"session_id": "s-ac2"}, args=["--seat", "ds4pro"])
-        self.assertEqual(rc, 2, err)
-        self.assertIn("you're free", err)
-        self.assertIn("[assigned: grok]", err)
-        self.assertIn("or pass", err)
+        self.plant_dispatch("ac22ac22ac22ac22", "absent-seat", kind="review")
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-ac2"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("you're free", err)
+        self.assertNotIn("[assigned:", err)
         self.assertNotIn("auto-claimed", err)
         self.assertNotIn("dispatch:ac22ac22", seats._live_claims() or {})
+        # KEPT: an UNOWNED row behind it in the same backlog is offered.
+        self.plant_dispatch("ac23ac23ac23ac23", self.POOL, kind="review")
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-ac2"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("top of backlog is ac23ac23", err)
+        self.assertNotIn("ac22ac22", err)
+
+    def test_a_task_owned_by_another_seat_is_never_offered(self):  # noqa: VACUOUS_ASSERTION — the same offer line must carry the unowned task's title, the positive control for the absent owned one
+        """[ii] the task ledger's half of the same law: a task owned by an
+        absent seat is not offered, and the unowned pool row is."""
+        seats.join(session="s-ac2t", seat="ds4pro", cwd="/tmp/p")
+        theirs = self._file_task("an absent seat still holds this",
+                                 "absent-seat")
+        free = self._file_task("nobody holds this one")
+        with mock.patch.object(seats, "_git_project",
+                               side_effect=self._proj("helm")):
+            got = seats._work_offer_candidate("s-ac2t", "ds4pro",
+                                              None, None, [], False)
+        self.assertIsNotNone(got, "the unowned task never reached the offer")
+        fp, line = got
+        self.assertEqual(fp, "offer:" + free["id"].split("/", 1)[-1])
+        self.assertIn("nobody holds this one", line)
+        self.assertNotIn("an absent seat still holds this", line)
+        self.assertNotIn("[assigned:", line)
+        from helm import tasks
+        self.assertLess(tasks.sort_key(theirs), tasks.sort_key(free),
+                        "control: the other seat's task heads the backlog")
 
     def test_no_recipient_pool_row_stays_an_offer(self):
         """[iii] A no-recipient POOL row is ambiguous by definition (any idle
@@ -7258,17 +7338,21 @@ class WorkOfferTest(SeatsBase):
 
     def test_busy_seat_mid_claim_gets_no_offer(self):
         seats.join(session="s-o2", seat="ds4pro", cwd="/tmp/p")
-        self.plant_dispatch("b1b2c3d4e5f60022", "ghost")
+        self.plant_dispatch("b1b2c3d4e5f60022", self.POOL)
         seats.claim("worktree-x", "ds4pro", ttl=300, session="s-o2")
-        rc, _o, err = self.guard({"session_id": "s-o2"}, args=["--seat", "ds4pro"])
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-o2"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 2)                     # the claim-lease BLOCK fires
         self.assertIn("worktree-x", err)
         self.assertNotIn("you're free", err)        # mid-claim ⇒ not idle ⇒ no offer
 
     def test_own_dispatch_obligation_outranks_and_suppresses_offer(self):
         seats.join(session="s-o3", seat="ds4pro", cwd="/tmp/p")
-        # a NEEDS-CONFIRMATION dispatch is the seat's own obligation (dispatch rung)
-        self.plant_dispatch("c1c2c3d4e5f60033", "ghost", observed=False)
+        # a NEEDS-CONFIRMATION dispatch is the seat's own obligation (dispatch
+        # rung): it SENT the row. A senderless row to another seat is between
+        # two other seats and is no longer this seat's (task/3531).
+        self.plant_dispatch("c1c2c3d4e5f60033", "ghost", observed=False,
+                            sender="ds4pro")
         rc, _o, err = self.guard({"session_id": "s-o3"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 2)
         self.assertIn("NEEDS CONFIRMATION", err)    # own work first
@@ -7276,19 +7360,21 @@ class WorkOfferTest(SeatsBase):
 
     def test_pending_inbox_suppresses_offer(self):
         seats.join(session="s-o3b", seat="ds4pro", cwd="/tmp/p")
-        self.plant_dispatch("cc11dd22ee33ff44", "ghost")
+        self.plant_dispatch("cc11dd22ee33ff44", self.POOL)
         chat.post("@ds4pro look at this", who="daria")   # an undelivered mention
-        rc, _o, err = self.guard({"session_id": "s-o3b"}, args=["--seat", "ds4pro"])
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-o3b"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 2)
         self.assertIn("undelivered", err)           # the inbox block owns the stop
         self.assertNotIn("you're free", err)
 
     def test_all_claimed_backlog_gets_no_offer(self):
         seats.join(session="s-o4", seat="ds4pro", cwd="/tmp/p")
-        self.plant_dispatch("d1d2c3d4e5f60044", "ghost")
+        self.plant_dispatch("d1d2c3d4e5f60044", self.POOL)
         # another idle seat already claimed this exact row's key
         seats.claim("dispatch:d1d2c3d4", "other", ttl=300, session="s-other")
-        rc, _o, err = self.guard({"session_id": "s-o4"}, args=["--seat", "ds4pro"])
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-o4"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 0, err)                 # nothing unowned → clean stop
         self.assertNotIn("you're free", err)
 
@@ -7305,11 +7391,12 @@ class WorkOfferTest(SeatsBase):
         now = time.time()
         iso = lambda dt: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dt))
         # both recent (not overdue), different ts — open_rows sorts oldest first
-        self.plant_dispatch("f1110000aaaa1111", "ghost", lane="newer review",
+        self.plant_dispatch("f1110000aaaa1111", self.POOL, lane="newer review",
                             ts=iso(now - 60))
-        self.plant_dispatch("f2220000bbbb2222", "ghost", lane="older review",
+        self.plant_dispatch("f2220000bbbb2222", self.POOL, lane="older review",
                             ts=iso(now - 600))
-        rc, _o, err = self.guard({"session_id": "s-r"}, args=["--seat", "ds4pro"])
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-r"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 2, err)
         self.assertIn("older review", err)           # oldest ts wins
         self.assertIn("f2220000", err)
@@ -7324,26 +7411,29 @@ class WorkOfferTest(SeatsBase):
 
     def test_unreadable_claims_fail_closed_no_offer(self):
         seats.join(session="s-f", seat="ds4pro", cwd="/tmp/p")
-        self.plant_dispatch("a9a9c3d4e5f60099", "ghost")
+        self.plant_dispatch("a9a9c3d4e5f60099", self.POOL)
         chat._ensure_dir()
         with open(seats.claims_path(), "w") as f:
             f.write("not json{{")                    # claims UNKNOWN → unsure
-        rc, _o, err = self.guard({"session_id": "s-f"}, args=["--seat", "ds4pro"])
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-f"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 0, err)                 # never poach on uncertainty
         self.assertNotIn("you're free", err)
 
     def test_kill_switch_silences_the_offer(self):
         seats.join(session="s-k", seat="ds4pro", cwd="/tmp/p")
-        self.plant_dispatch("b9b9c3d4e5f60088", "ghost")
+        self.plant_dispatch("b9b9c3d4e5f60088", self.POOL)
         os.environ["HELM_STOP_GUARD_WHISPER"] = "0"
-        rc, _o, err = self.guard({"session_id": "s-k"}, args=["--seat", "ds4pro"])
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-k"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 0, err)
         self.assertNotIn("you're free", err)
 
     def test_offer_line_stays_within_the_byte_cap(self):
         seats.join(session="s-cap", seat="d" * 40, cwd="/tmp/p")
-        self.plant_dispatch("c9c9c3d4e5f60077", "ghost", lane="x" * 80)
-        rc, _o, err = self.guard({"session_id": "s-cap"}, args=["--seat", "d" * 40])
+        self.plant_dispatch("c9c9c3d4e5f60077", self.POOL, lane="x" * 80)
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-cap"}, args=["--seat", "d" * 40])
         self.assertEqual(rc, 2, err)
         line = next(l for l in err.splitlines() if "stop-whisper" in l)
         self.assertLessEqual(len(line.encode()), seats.STOP_WHISPER_CAP)
@@ -7353,17 +7443,20 @@ class WorkOfferTest(SeatsBase):
         seats.join(session="s-n", seat="ds4pro", cwd="/tmp/p")
         now = time.time()
         iso = lambda dt: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dt))
-        self.plant_dispatch("11aa11aa11aa11aa", "ghost", lane="first", ts=iso(now - 600))
-        self.plant_dispatch("22bb22bb22bb22bb", "ghost", lane="second", ts=iso(now - 60))
-        rc, _o, err = self.guard({"session_id": "s-n"}, args=["--seat", "ds4pro"])
+        self.plant_dispatch("11aa11aa11aa11aa", self.POOL, lane="first", ts=iso(now - 600))
+        self.plant_dispatch("22bb22bb22bb22bb", self.POOL, lane="second", ts=iso(now - 60))
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-n"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 2, err)
         self.assertIn("first", err)                  # head #1
         # the seat took it: claim its key → head advances to #2, offered once
         seats.claim("dispatch:11aa11aa", "ds4pro", ttl=300, session="s-other2")
-        rc, _o, err = self.guard({"session_id": "s-n"}, args=["--seat", "ds4pro"])
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-n"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 2, err)
         self.assertIn("second", err)                 # new head, new fp → one offer
-        rc, _o, err = self.guard({"session_id": "s-n"}, args=["--seat", "ds4pro"])
+        with self.pool():
+            rc, _o, err = self.guard({"session_id": "s-n"}, args=["--seat", "ds4pro"])
         self.assertEqual(rc, 0, err)                 # latched again
 
 
@@ -8504,9 +8597,14 @@ class WebRosterTest(SeatsBase):
             # membership, not position — same reason as above; the cached rep
             # carries whatever [0] held when it was minted
             self.assertIn("alice", [s["seat"] for s in obj["seats"]])
-            # PAST the TTL the failure is honest: fail open to unavailable
+            # PAST the TTL the failure is honest: fail open to unavailable.
+            # PAST THE WINDOW THE CACHE REALLY KEEPS, which `_rep_ttl` floors
+            # by the last rebuild's cost: aged only past the declared constant,
+            # a body built slowly was still fresh and served (seen: this arm
+            # red in every recorded whole suite on the slower build node).
             at, rep = web._ROSTER_REP_CACHE["main"]
-            web._ROSTER_REP_CACHE["main"] = (at - (web._ROSTER_REP_TTL + 1), rep)
+            web._ROSTER_REP_CACHE["main"] = (
+                at - (web_roster._rep_ttl("main") + 1), rep)
             obj, code = web._api_chat_roster({})
             self.assertEqual(code, 200)
             self.assertEqual(obj, {"seats": [], "claims": [], "unavailable": True})
@@ -9349,6 +9447,56 @@ class RosterGcTest(SeatsBase):
         self.assertEqual(pruned, [])
         self.assertIn("envseat", seats.roster())
 
+    def test_gc_roster_malformed_string_row_fails_open_not_crash(self):
+        """A roster row that is a plain string (not a dict) must not raise —
+        gc_roster must fail open for that row only, return it as verdict keep
+        with a why that says the row is malformed, and not kill the whole GC.
+
+        BEFORE THE CURE: a string row makes row.get() raise AttributeError,
+        killing the entire gc_roster loop (a single bad row breaks the scan)."""
+        from helm import seats_common as _common
+        self._row("good", session="sid-good-1")
+        d = _common.roster_path()
+        rows = _common.roster()
+        rows["badrow"] = "this is a string, not a row"
+        with open(d, "w") as f:
+            json.dump(rows, f)
+        roots, proc = self._empty_dirs()
+        # BEFORE the cure: this raises AttributeError on row.get("session")
+        # because row is a string, not a dict.
+        rows_out, pruned = seats.gc_roster(roots=roots, proc_dir=proc)
+        self.assertIsInstance(rows_out, list)
+        self.assertEqual(len(rows_out), 2)
+        # The good seat: prune (no evidence)
+        good_row = [r for r in rows_out if r["seat"] == "good"][0]
+        self.assertEqual(good_row["verdict"], "prune")
+        # The malformed row: keep with a why saying it's malformed
+        bad_row = [r for r in rows_out if r["seat"] == "badrow"][0]
+        self.assertEqual(bad_row["verdict"], "keep")
+        self.assertIn("keep-evidence probe failed", bad_row["why"])
+
+    def test_gc_roster_sessions_is_int_fails_open_not_crash(self):
+        """A roster row whose "sessions" value is an int (not a list) —
+        list(5) raises TypeError — must not kill the whole GC. It must
+        fail open for that row, return it as keep with a why that says
+        the row is malformed."""
+        from helm import seats_common as _common
+        self._row("good", session="sid-good-1")
+        d = _common.roster_path()
+        rows = _common.roster()
+        rows["intsess"] = {"session": "sid-intsess-1", "sessions": 5}
+        with open(d, "w") as f:
+            json.dump(rows, f)
+        roots, proc = self._empty_dirs()
+        # BEFORE the cure: list(5) raises TypeError, killing the
+        # whole gc_roster loop.
+        rows_out, pruned = seats.gc_roster(roots=roots, proc_dir=proc)
+        self.assertIsInstance(rows_out, list)
+        self.assertEqual(len(rows_out), 2)
+        bad_row = [r for r in rows_out if r["seat"] == "intsess"][0]
+        self.assertEqual(bad_row["verdict"], "keep")
+        self.assertIn("keep-evidence probe failed", bad_row["why"])
+
     def test_gc_cli_dry_run_default(self):
         from helm import session
         self._row("cli-junk", session="sid-cli-junk-3")
@@ -9395,6 +9543,14 @@ class AMovedFunctionOwesTheFacadeFanOutTest(SeatsBase):
         omits a module is exactly as green as one that includes it."""
         names = [m.__name__.rsplit(".", 1)[-1] for m in seats._impl_modules()]
         self.assertIn("seats_roomscan", names)
+        self.assertIn("seats_stop_spiral", names)
+
+    def test_the_spiral_owner_sees_a_facade_patch(self):  # noqa: VACUOUS_ASSERTION — object identity with the positive replacement proves the owner binding received the facade patch
+        from helm import seats_stop_spiral
+        from unittest import mock as _mock
+        replacement = _mock.Mock()
+        with _mock.patch.object(seats, "_melded_with", replacement):
+            self.assertIs(seats_stop_spiral._melded_with, replacement)
 
 
 class TheSampleSaysWhatItLookedAtNotOnlyWhatItFoundTest(SeatsBase):
@@ -9671,6 +9827,9 @@ class DrainInstructionsNameTheRealVerbTest(SeatsBase):
     across nine seats and the actuator gate that read that pile never opened for
     anyone (2026-07-30). These pin the strings to verbs that actually work."""
 
+    # The pin on the package's own wording reads only source, so it lives in
+    # tests/test_seats_catchup_promise.py, where the audit list runs it.
+
     def test_read_does_not_clear_an_addressed_row_and_we_say_so(self):
         # THE BEHAVIOUR IS CORRECT AND STAYS: an addressed row is an obligation;
         # reading past one does not discharge it. This test exists so nobody
@@ -9684,27 +9843,6 @@ class DrainInstructionsNameTheRealVerbTest(SeatsBase):
         after = len(seats._pending_all("main", "ds4pro", "s-drain",
                                        scan_lane="stop") or [])
         self.assertEqual(after, before, "read must not discharge an obligation")
-
-    def test_no_surface_promises_that_read_catches_you_up(self):
-        # THE WHOLE SEATS PACKAGE, not seats.py — and the split is what
-        # taught this test what it was actually asserting. The invariant is
-        # "no SURFACE promises that read catches you up"; pinning it to one
-        # FILENAME measured where the sentence lived, not whether it was
-        # right. When the beacon drain moved to seats_join.py the assertion
-        # went green-then-red for a reason that had nothing to do with the
-        # promise it guards.
-        d = os.path.dirname(seats.__file__)
-        names = sorted(f for f in os.listdir(d)
-                       if f == "seats.py" or f.startswith("seats_"))
-        # CONTROL: the scan sees the package at all. Without it, a renamed
-        # directory makes both assertions below vacuously true.
-        self.assertGreaterEqual(len(names), 3, "the seats package scan found "
-                                               "almost nothing: %s" % names)
-        src = "".join(open(os.path.join(d, f), encoding="utf-8").read()
-                      for f in names)
-        self.assertNotIn("helm chat read to catch up", src)
-        # and the drain that DOES work is the one we name
-        self.assertIn("catchup --including-mentions", src)
 
 
 class NdpStopbookTest(SeatsBase):
@@ -10151,6 +10289,20 @@ class NdpStopbookTest(SeatsBase):
         self.assertIn("3 leases held", got[1])
         b, _w = self.gate()
         self.assertIsNotNone(b, "the receiver shape must reach the block")
+
+
+_STOP_OFFPEAK_PIN = []
+
+
+def setUpModule():
+    # seat paths cross the off-peak door; pin its vendor clock so no test
+    # here makes the live proof or leaves offpeak._CLOCK_CACHE filled for a
+    # later unit (the sliced gate's leak audit; task/3238)
+    _STOP_OFFPEAK_PIN.append(_pin_offpeak_clock())
+
+
+def tearDownModule():
+    _STOP_OFFPEAK_PIN.pop()()
 
 
 if __name__ == "__main__":
@@ -10902,11 +11054,19 @@ class AChangedDispatchRowUnlatchesItsAdvice(SeatsBase):
     def _stop(self, snapshot):
         """One stop whose resident folded `snapshot`: the stand-in resident
         computes the stop facts from it, and the rung reads those (its own
-        one reading, the default)."""
+        one reading, the default). The stop is then PUBLISHED as the CLI
+        publishes it, because the lease memory records only a print that
+        reached the stream (task/3123)."""
+        from helm import seats_stop_seam
         warns, blocks = [], []
         with mock.patch.object(dispatches, "snapshot", return_value=snapshot):
             seats_stop_claims.claims_rung(
                 self.SESSION, "a-room", self.SEAT, blocks=blocks, warns=warns)
+        out = io.StringIO()
+        if blocks:
+            seats_stop_seam.emit_blocks(blocks, stream=out)
+        else:
+            seats_stop_seam.emit_warns(warns, stream=out)
         return "\n".join(blocks + warns)
 
     def _row(self, **over):
@@ -10981,18 +11141,22 @@ class AChangedDispatchRowUnlatchesItsAdvice(SeatsBase):
     def test_an_UNCHANGED_row_still_compresses_on_the_next_stop(self):
         """THE OPPOSITE POLE, and without it this arm would be satisfied by
         deleting the latch. A re-stop on a genuinely unchanged claim must
-        still compress, because that is what the latch is for."""
+        still compress, because that is what the latch is for.
+
+        ON A REBOUND ROW since task/3696: a claim on a row still owed is IN
+        PROGRESS and says nothing at an unchanged re-stop, so the compression
+        this arm pins belongs to a claim that owes an act."""
         self._claim()
-        first = self._stop(self._row())
-        self.assertIn("is OPEN and yours", first)
+        first = self._stop(self._row(recipient="another-seat"))
+        self.assertIn("REBOUND", first)
         self._claim()
-        second = self._stop(self._row())
+        second = self._stop(self._row(recipient="another-seat"))
         # UNCONDITIONAL POSITIVE ON THE SAME OBSERVABLE: the compressed stop
         # still SPEAKS — it carries the count and refers to the detail — so
         # this arm cannot be satisfied by a rung that fell silent or raised.
         self.assertIn("lease", second.lower(),
                       "MUST-HIT: the compressed stop still names the lease")
-        self.assertNotIn("is OPEN and yours", second,
+        self.assertNotIn("REBOUND", second,
                          "an unchanged row must still compress to one line")
 
 

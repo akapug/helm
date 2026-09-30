@@ -45,7 +45,10 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import (beacons, chat, cred, harness, homes,  # noqa: E402
-                  orcaadopt, seat_rehome, seat_resume_all, seats)
+                  orcaadopt, panetail, seat_rehome, seat_resume_all, seats)
+# ONE description of the measured exit-confirm screen in this tree: the
+# recogniser's own suite owns the fixture and its pointer mover.
+from tests.test_panetail import exit_dialog_focused_on  # noqa: E402
 
 EMAIL = "seat@example.test"
 UUID = "0a1b2c3d-0000-4000-8000-00000000cafe"
@@ -89,6 +92,36 @@ ADVANCED_PANE = "\n".join(("─" * 40, "❯", "─" * 40,
                            "  ⏵⏵ bypass permissions on"))
 
 
+def _framed(*rows):
+    """A pane tail with an input box, its statusline and `rows` below it: the
+    chrome a real footer sits in."""
+    return "\n".join(("─" * 40, "❯", "─" * 40,
+                      "  opus-5 | ~/dev/example/repo") + rows)
+
+
+#: The permission-mode footers, measured on throwaway panes of Claude Code
+#: 2.1.284 (task/3515); `default` draws the manual row.
+PLAN_FOOTER = "  ⏸ plan mode on (shift+tab to cycle) · ← for agents"
+ACCEPT_FOOTER = "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents"
+MANUAL_FOOTER = "  ⏸ manual mode on · ? for shortcuts · ← for agents"
+
+
+def _perm_in(line):
+    """The permission words a composed launch line hands claude: what follows
+    the `--` of its `helm launch` invocation, read the way a shell reads it.
+    The launched double inherits exactly these, so a line that dropped the
+    mode starts a process that runs without it."""
+    words = shlex.split(line)
+    rest = words[words.index("--") + 1:] if "--" in words else []
+    out = []
+    for i, word in enumerate(rest):
+        if word == "--dangerously-skip-permissions":
+            out.append(word)
+        elif word == "--permission-mode" and i + 1 < len(rest):
+            out += [word, rest[i + 1]]
+    return out
+
+
 def _now_ms(hours=0):
     return int((time.time() + hours * 3600) * 1000)
 
@@ -126,6 +159,9 @@ class _PaneAd(harness._CLIAdapter):
         # WHAT THE LAUNCH LINE ACTUALLY STARTS. The surfaces a rehome verifies
         # are produced HERE, by the keystroke under test, and by nothing else.
         self.on_launch = None
+        # THE PERMISSION-MODE FOOTER the pane draws (task/3515): None keeps
+        # the frame's own bypass row, "" draws none, text replaces it.
+        self.footer = None
 
     def resolve_pane(self, key):
         return {"handle": self.remap.get(key, "handle-of-" + key)}
@@ -134,10 +170,13 @@ class _PaneAd(harness._CLIAdapter):
         return [{"handle": HANDLE, "status": "connected"}]
 
     def read(self, handle, limit=3000, timeout=60):
+        pane = ADVANCED_PANE
+        if self.footer is not None:
+            pane = pane.replace("  ⏵⏵ bypass permissions on", self.footer)
         text = self.typed.get(handle)
         if text is not None:
-            return ADVANCED_PANE.replace("\n❯\n", "\n❯\xa0%s\n" % text)
-        return ADVANCED_PANE
+            return pane.replace("\n❯\n", "\n❯\xa0%s\n" % text)
+        return pane
 
     def send(self, handle, text, enter=True, timeout=60):
         if enter:
@@ -148,6 +187,82 @@ class _PaneAd(harness._CLIAdapter):
             self.sent.append((handle, text, enter))
         if enter and text and self.on_launch and "helm launch" in text:
             self.on_launch(handle, text)
+
+
+#: What the pane shows once the session has exited: the resume hint and the
+#: shell's prompt, with no composer and no dialog.
+SHELL_PANE = "\n".join(("Resume this session with:", "claude --resume " + SID,
+                        "~/dev/example/repo $"))
+#: A session that took /exit and never finished leaving: no composer, no
+#: dialog, and a process that is still alive.
+HUNG_PANE = "\n".join(("\u25cf Goodbye!", "\u273b Flushing the transcript\u2026"))
+
+
+class _ExitDialogAd(_PaneAd):
+    """A pane whose claude holds BACKGROUND TASKS — every seat with an armed
+    inbox beacon does — so `/exit` opens Claude Code's exit-confirm dialog
+    (task/3201, the measured screen in tests/fixtures) instead of exiting.
+
+    THE DIALOG IS CAUSED, NEVER PLANTED: it opens only when a bare Enter
+    submits a composer holding `/exit`, with the pointer where the arm put it
+    (`focus`; Claude Code opens it on option 1). It answers keys the way the
+    measured dialog does (task/3209, a throwaway pane): an option's DIGIT
+    selects that option with no Enter, and a bare Enter selects the option
+    under the pointer. Options 1 and 2 end the process; 3 ("Stay") closes the
+    dialog and keeps the session. `dialog=False` is the plain composer exit,
+    the positive control: the Enter that submits /exit is the whole exit.
+
+    `plain` is a session with NO background tasks whose pane cannot show the
+    exit: "shell" exits on the /exit's own Enter and leaves the shell prompt
+    (no composer to read back), "hang" keeps the process alive behind a frame
+    with no composer. Either way the wake reads UNVERIFIED, and only the pid
+    can say what happened.
+
+    `keys` records EVERY send, bare Enters included, with the screen it landed
+    on, so an arm can say which keystroke reached the dialog and which did not.
+    `exited` is the process: None defers to the arm's own spy (the plain exit),
+    False/True is this pane's truth once a dialog or a `plain` exit is in play.
+    """
+
+    def __init__(self, focus=1, dialog=True, showing=False, plain=None):
+        super().__init__()
+        self.focus, self.dialog, self.plain = focus, dialog and not plain, plain
+        self.showing = HANDLE if showing else None
+        self.exited = False if (dialog or plain) else None
+        self.hung = False
+        self.keys = []
+
+    def read(self, handle, limit=3000, timeout=60):
+        if self.exited:
+            return SHELL_PANE
+        if self.hung:
+            return HUNG_PANE
+        if self.showing == handle:
+            return exit_dialog_focused_on(self.focus)
+        return super().read(handle, limit=limit, timeout=timeout)
+
+    def send(self, handle, text, enter=True, timeout=60):
+        on = ("dialog" if self.showing == handle else
+              "shell" if self.exited else "composer")
+        self.keys.append((handle, text, enter, on))
+        if on == "dialog":
+            chosen = (int(text) if (text.isdigit() and not enter) else
+                      self.focus if (enter and not text) else None)
+            if chosen in (1, 2):
+                self.showing, self.exited = None, True
+            elif chosen == 3:
+                self.showing = None
+            return
+        held = self.typed.get(handle)
+        super().send(handle, text, enter=enter, timeout=timeout)
+        if not (enter and not text and held == "/exit"):
+            return
+        if self.plain == "shell":
+            self.exited = True
+        elif self.plain == "hang":
+            self.hung = True
+        elif self.dialog:
+            self.showing = handle
 
 
 class RehomeBase(unittest.TestCase):
@@ -231,12 +346,17 @@ class RehomeBase(unittest.TestCase):
         with open(seats.roster_path(), "w") as f:
             json.dump({seat: row}, f)
 
-    def plant_default_home(self):
+    def plant_default_home(self, creds=None):
         with open(os.path.join(self.defaults["claude"], ".claude.json"),
                   "w") as f:
             json.dump({"numStartups": 1,
                        "oauthAccount": {"emailAddress": "default@example.test",
                                         "accountUuid": "acct-default"}}, f)
+        if creds is not None:
+            path = os.path.join(self.defaults["claude"], ".credentials.json")
+            with open(path, "w") as f:
+                json.dump(creds, f)
+            os.chmod(path, 0o600)
         cred.cache_clear()
         return self.defaults["claude"]
 
@@ -259,7 +379,7 @@ class RehomeBase(unittest.TestCase):
         return name
 
     def plant_proc(self, pid, home_dir, model="opus", session=SID,
-                   attempt=None):
+                   attempt=None, flag="--resume", perm=()):
         """A REAL /proc entry for a claude process under the fixture HELM_PROC.
 
         The environ and argv are what a `helm launch --home H -- --model M
@@ -271,16 +391,50 @@ class RehomeBase(unittest.TestCase):
         model."""
         d = os.path.join(self.proc, str(pid))
         os.makedirs(d, exist_ok=True)
-        env = {"CLAUDE_CONFIG_DIR": home_dir, "HELM_CHAT_NAME": SEAT}
+        # `home_dir` None is a process on the DEFAULT home: the default is the
+        # ABSENCE of the variable, never ~/.claude spelled into it (task/3515).
+        env = {"HELM_CHAT_NAME": SEAT}
+        if home_dir is not None:
+            env["CLAUDE_CONFIG_DIR"] = home_dir
         if attempt:
             env[seat_rehome.ATTEMPT_ENV] = attempt
         with open(os.path.join(d, "environ"), "wb") as f:
             f.write(b"".join(("%s=%s\0" % kv).encode() for kv in env.items()))
         argv = ["claude"] + (["--model", model] if model else [])
-        argv += ["--resume", session] if session else []
+        argv += list(perm)
+        argv += [flag, session] if session else []
         with open(os.path.join(d, "cmdline"), "wb") as f:
             f.write(b"".join((a + "\0").encode() for a in argv))
         return d
+
+    def _seat_presence(self, transcript=True, **fields):
+        """The vendor's presence record for the SEAT's own process, where
+        `harness.presence_witness` reads it: <config>/sessions/<pid>.json
+        under the CLAUDE_CONFIG_DIR its /proc environ names, bound to its
+        birth stamp. `seat_rehome.plan` reads the same record for the
+        session the seat's live process holds NOW (task/3208), and asks
+        whether that session has a transcript in the same config root: a
+        seat that has worked has one, so `transcript` plants it, and False
+        models a session that has taken no message yet."""
+        root = os.path.join(self.tmp, "seat-config")
+        os.makedirs(os.path.join(root, "sessions"), mode=0o700, exist_ok=True)
+        rec = {"pid": SEAT_PID, "procStart": SEAT_START, "sessionId": SID,
+               "kind": "interactive", "entrypoint": "cli",
+               "statusUpdatedAt": 1790383066237}
+        rec.update(fields)
+        path = os.path.join(root, "sessions", "%d.json" % SEAT_PID)
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        os.chmod(path, 0o600)
+        if transcript:
+            proj = os.path.join(root, "projects", "-p")
+            os.makedirs(proj, exist_ok=True)
+            with open(os.path.join(proj, rec["sessionId"] + ".jsonl"),
+                      "w") as f:
+                f.write('{"type":"user","message":{"role":"user",'
+                        '"content":"x"}}\n')
+        self.plant_proc(SEAT_PID, root)
+        return root
 
     def plant_cwd(self, pid, name="seat-worktree"):
         """A REAL /proc/<pid>/cwd symlink, so the SHIPPED reader
@@ -456,8 +610,10 @@ class PlanTest(RehomeBase):
         self.assertIn("DRY RUN", self.out)
         self.assertIn(SID, self.out)
         self.assertIn(HANDLE, self.out)
+        # the pane's footer proves the live mode (task/3515): bypass here
         self.assertIn("helm launch --seat %s --home %s -- --model opus "
-                      "--resume %s" % (SEAT, name, SID), self.out)
+                      "--permission-mode bypassPermissions --resume %s"
+                      % (SEAT, name, SID), self.out)
         self.assertEqual(self.ad.sent, [], "a dry run typed into a pane")
         self.assertFalse(os.path.exists(seat_rehome.ledger_path()),
                          "a dry run wrote a ledger row")
@@ -522,6 +678,85 @@ class PlanTest(RehomeBase):
                           % (refusal and refusal.line()))
         self.assertEqual(p["session"], SID)
 
+    # -- task/3208: the session the pane's LIVE process holds ---------------
+    # The roster's CURRENT session is whatever the last SessionStart joined.
+    # The pane's process names the session it holds NOW in its own presence
+    # record (<config>/sessions/<pid>.json), and MEASURED on claude 2.1.283
+    # that record names a /clear's new session the instant it lands.
+    NEW = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+
+    def test_the_plan_resumes_the_session_the_panes_process_holds(self):
+        """A /clear the roster never saw leaves the roster naming the
+        pre-clear session while the pane runs a new one; resuming the
+        roster's would bring the old conversation back on the new home.
+        THE CONTROL is the same plan before the presence record exists: with
+        nothing to read, the roster decides, exactly as before."""
+        name = self.live_home()
+        self.plant_roster()                       # the roster names SID
+        with self.census([_proc()]):
+            p, refusal = seat_rehome.plan(SEAT, name, adapter=self.ad)
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertEqual(p["session"], SID)
+        self._seat_presence(sessionId=self.NEW)
+        with self.census([_proc()]):
+            p, refusal = seat_rehome.plan(SEAT, name, adapter=self.ad)
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertEqual(p["session"], self.NEW)
+        self.assertIn("--resume %s" % self.NEW, p["command"])
+
+    def test_a_helper_claude_in_the_pane_never_names_the_session(self):
+        """The same plan, but the pane process's record is a `claude -p`
+        helper's (entrypoint sdk-cli, MEASURED on 2.1.283) — a child of the
+        seat inherits its pane key and name, so it is in the candidate set —
+        and names a session that is not the roster's. It does not speak for
+        the seat, so the roster decides, as before task/3208. The control is
+        the record above, identical but for entrypoint "cli", which does."""
+        name = self.live_home()
+        self.plant_roster()                       # the roster names SID
+        self._seat_presence(sessionId=self.NEW, entrypoint="sdk-cli")
+        with self.census([_proc()]):
+            p, refusal = seat_rehome.plan(SEAT, name, adapter=self.ad)
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertEqual(p["session"], SID)
+        self.assertIn("--resume %s" % SID, p["command"])
+        self.assertIn("not the pane's interactive claude", p["session_note"])
+
+    def test_a_session_with_no_transcript_starts_fresh_under_its_own_id(self):
+        """claude writes a session's transcript at its first message, and
+        refuses `--resume` for one with none (MEASURED: "No conversation
+        found", exit 1) — AFTER this verb has already exited the seat. It
+        accepts `--session-id` for exactly that id (MEASURED), so the plan
+        launches with it and says so."""
+        name = self.live_home()
+        self.plant_roster(session=self.NEW)
+        self._seat_presence(transcript=False, sessionId=self.NEW)
+        with self.census([_proc()]):
+            p, refusal = seat_rehome.plan(SEAT, name, adapter=self.ad)
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertIn("--session-id %s" % self.NEW, p["command"])
+        self.assertNotIn("--resume", p["command"])
+
+    def test_the_verification_reads_the_flag_the_plan_launched_with(self):
+        """A fresh launch's process carries `--session-id`, never
+        `--resume`; a verification that only read `--resume` would call the
+        process this apply started a stranger and fail a rehome that
+        worked."""
+        name = self.live_home()
+        self.plant_roster(session=self.NEW)
+        self._seat_presence(transcript=False, sessionId=self.NEW)
+        with self.census([_proc()]):
+            p, refusal = seat_rehome.plan(SEAT, name, adapter=self.ad)
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertEqual(p["flag"], "--session-id")
+        p = dict(p, attempt=FOREIGN_MARK)
+        self.plant_proc(NEW_PID, self.home_dir, model=None, session=self.NEW,
+                        attempt=FOREIGN_MARK, flag="--session-id",
+                        perm=p["permission"])
+        ident, why = seat_rehome._planned_process(
+            p, {"pane_pids": [orcaadopt.ProcIdent(NEW_PID, NEW_START)]})
+        self.assertEqual(ident, NEW_PID)
+        self.assertIsNone(why, why)
+
     def _run(self, argv):
         out, err = io.StringIO(), io.StringIO()
         from helm import seat
@@ -548,20 +783,21 @@ class ApplyTest(RehomeBase):
     def _plant_neighbour(self, mark, model="opus"):
         """A DIFFERENT CLAUDE IN THE SEAT'S PANE — the counterexample time
         ordering cannot rule out. It runs on the planned home, resumes the
-        planned session, carries the planned model, is born AFTER the process
-        the exit removed, and arms an inbox beacon for the seat since the act.
-        The only thing it does not carry is THIS apply's marker: `mark` None is
-        a process started by any other route, and a foreign value is another
-        attempt's process.
+        planned session, carries the planned model and permission mode, is
+        born AFTER the process the exit removed, and arms an inbox beacon for
+        the seat since the act. The only thing it does not carry is THIS
+        apply's marker: `mark` None is a process started by any other route,
+        and a foreign value is another attempt's process.
         """
         self.plant_proc(NEIGHBOUR_PID, self.home_dir, model=model,
-                        session=SID, attempt=mark)
+                        session=SID, attempt=mark,
+                        perm=["--permission-mode", "bypassPermissions"])
         self.procs.append(_proc(pid=NEIGHBOUR_PID, start=NEIGHBOUR_START))
         beacons.register(SEAT, session=SID, pid=BEACON_PID, proc_dir=None)
 
     def _apply(self, name=None, model="opus", launch=None, stale_beacon=False,
                remap=False, break_the_ledger=False, verify_s=None, env=None,
-               marker=None, neighbour=None):
+               marker=None, neighbour=None, mode=None):
         """Plan, then apply, over the shipped doors. -> (rc, refusal).
 
         `launch` is WHAT THE LAUNCH LINE STARTS: None for exactly what the plan
@@ -602,9 +838,11 @@ class ApplyTest(RehomeBase):
             # fixture that mints the marker itself would pass over a producer
             # that never put one on the line at all.
             mark = _marker_in(text) if marker is None else marker
+            perm = (_perm_in(text) if started.get("perm") is None
+                    else started["perm"])
             self.plant_proc(started["pid"], started["home"],
                             model=started["model"], session=started["session"],
-                            attempt=mark or None)
+                            attempt=mark or None, perm=perm)
             self.procs.append(_proc(pid=started["pid"], start=started["start"]))
             self.plant_roster(session=started["session"])
             beacons.register(SEAT, session=started["session"], pid=BEACON_PID,
@@ -630,7 +868,9 @@ class ApplyTest(RehomeBase):
                                 for x in (expect_pids or ())]))
             out = real_send(seat, text, expect_pids=expect_pids,
                             adapter=adapter, **kw)
-            if out[0] == "resumed":
+            if out[0] == "resumed" or getattr(self.ad, "exited", None):
+                # A pane that owns its process says so itself: an exit whose
+                # wake read UNVERIFIED still removed the /proc row.
                 exited["yes"] = True
                 # THE CENSUS FOLLOWS THE WORLD: an exited process stops being a
                 # /proc row, so a verification that still finds it is finding
@@ -642,9 +882,13 @@ class ApplyTest(RehomeBase):
 
         def alive(pid, starttime=None, proc_dir=None):
             """The seat's process is gone once /exit lands; the beacon's is
-            not. A blanket answer would make the beacon arm vacuous."""
+            not. A blanket answer would make the beacon arm vacuous. A pane
+            that models its own process (`exited` not None — the exit-confirm
+            dialog double) is the truth instead: there the process ends at the
+            keystroke that answers the dialog, never at the wake's verdict."""
             if int(pid) == SEAT_PID:
-                return not exited["yes"]
+                own = getattr(self.ad, "exited", None)
+                return not (exited["yes"] if own is None else own)
             return True
 
         real_auth = orcaadopt.authorized_handle
@@ -665,7 +909,7 @@ class ApplyTest(RehomeBase):
                 mock.patch.object(orcaadopt, "send_to_pane", spy), \
                 mock.patch.object(beacons, "pid_alive", alive):
             p, refusal = seat_rehome.plan(SEAT, name, model=model,
-                                          adapter=self.ad)
+                                          adapter=self.ad, mode=mode)
             self.assertIsNone(refusal, refusal and refusal.line())
             buf = io.StringIO()
             with contextlib.ExitStack() as es:
@@ -924,6 +1168,34 @@ class ApplyTest(RehomeBase):
         self.assertEqual(len(self.calls), 1, "the rehome was retried")
         self.assertEqual(len(self._launched()), 1, "the rehome was retried")
         self.assertIn("PROVEN", self.text)
+    def test_a_first_message_before_the_exit_turns_fresh_into_resume(self):
+        """task/3208. The plan found the session with no transcript and
+        planned `--session-id`; the session then took its first message
+        before the exit, so a transcript exists by the time the launch line
+        is typed, and `--session-id` on it would be refused ("already in
+        use", MEASURED). The apply asks again once the exit is PROVEN — no
+        process is left to write it — and types `--resume`, which the
+        verification then reads."""
+        root = self._seat_presence(transcript=False)
+        real_wait = seat_rehome._wait_gone
+
+        def wait_after_a_first_message(*a, **k):
+            proj = os.path.join(root, "projects", "-p")
+            os.makedirs(proj, exist_ok=True)
+            with open(os.path.join(proj, SID + ".jsonl"), "w") as f:
+                f.write('{"type":"user"}\n')
+            return real_wait(*a, **k)
+
+        with mock.patch.object(seat_rehome, "_wait_gone",
+                               wait_after_a_first_message):
+            rc, refusal = self._apply()
+        self.assertEqual(self.p["flag"], "--session-id")   # the plan's
+        self.assertEqual(rc, 0, refusal and refusal.line())
+        _handle, line, _enter = self._launched()[0]
+        self.assertIn("--resume %s" % SID, line)
+        self.assertNotIn("--session-id", line)
+        self.assertIn("resuming it instead", self.text)
+
     def test_the_launch_carries_a_fresh_marker_the_pane_proves_it_by(self):
         """THE POSITIVE, and the CONTROL for every neighbour arm below.
 
@@ -1057,6 +1329,271 @@ class ApplyTest(RehomeBase):
         self.assertNotEqual(row["command"], row["pane_line"],
                             "the row reports the launch fragment alone")
 
+    # -- task/3201: the exit-confirm dialog ---------------------------------
+
+    def _apply_through(self, ad, exit_wait=None, **kw):
+        """`_apply` over a pane double that owns its process, with the turn
+        verb's settle and read-back interval at zero so the arm measures the
+        decision and not the clock. `exit_wait` shortens the wait for the old
+        pid, for an arm whose pid is meant to outlive it."""
+        self.ad = ad
+        with contextlib.ExitStack() as es:
+            es.enter_context(mock.patch.object(
+                harness, "SUBMIT_VERIFY_INTERVAL_S", 0))
+            if exit_wait is not None:
+                es.enter_context(mock.patch.object(
+                    seat_rehome, "EXIT_WAIT_S", exit_wait))
+            return self._apply(env={"HELM_SUBMIT_SETTLE_S": "0"}, **kw)
+
+    def _on(self, where):
+        """[(text, enter)] for every keystroke that landed on `where`."""
+        return [(t, e) for _h, t, e, on in self.ad.keys if on == where]
+
+    def test_an_exit_dialog_on_option_1_is_confirmed_and_the_rehome_proceeds(self):
+        """THE MEASURED DEFECT, as an arm (task/3201): the
+        seat holds background tasks, so its /exit opens Claude Code's
+        exit-confirm dialog with the pointer on "1. Exit and stop tasks". The verb read "no
+        readable composer" three times and refused a pane its own /exit had
+        already moved. Now it recognises the dialog, confirms option 1 through
+        the dialog door with ONE key (the option's digit, task/3209), and runs
+        the rest of its plan unchanged: the process is
+        PROVEN gone, the launch line is typed into the same pane, and all
+        three surfaces come back.
+
+        CAUSAL: the double ends the process only at the keystroke that answers
+        the dialog, so "PROVEN gone" below is evidence the key was pressed."""
+        rc, refusal = self._apply_through(_ExitDialogAd(focus=1))
+        self.assertEqual(rc, 0, refusal and refusal.line())
+        self.assertEqual(self._on("dialog"), [("1", False)],
+                         "the dialog was not answered by exactly ONE key, "
+                         "option 1's digit with no Enter: %r" % (self.ad.keys,))
+        self.assertEqual([k[1:3] for k in self.ad.keys
+                          if k[3] == "composer"], [("/exit", False),
+                                                   ("", True)],
+                         "the /exit was not typed and submitted once")
+        launch = self._on("shell")
+        self.assertEqual(len(launch), 1, "the launch line was not typed once "
+                         "into the pane the dialog left: %r" % (self.ad.keys,))
+        self.assertIn("helm launch", launch[0][0])
+        self.assertTrue(self.ad.exited)
+        self.assertIn("exit-confirm dialog", self.text)
+        self.assertIn("PROVEN gone", self.text)
+        self.assertNotIn("UNPROVEN", self.text)
+        # The pane showed this exit (the dialog closed), so the pane proves it.
+        self.assertEqual(seat_rehome.events()[0][0]["exit_proven_by"], "pane")
+
+    def test_the_dialog_is_confirmed_when_the_presence_record_agrees(self):
+        """THE DOOR'S SECOND WITNESS, end to end: the seat's own process has a
+        presence record, and it reads waiting for 'dialog open' — the state a
+        throwaway pane measured while this dialog stood. The confirm goes
+        through and the report says both witnesses agreed."""
+        self._seat_presence(status="waiting", waitingFor="dialog open")
+        rc, refusal = self._apply_through(_ExitDialogAd(focus=1))
+        self.assertEqual(rc, 0, refusal and refusal.line())
+        self.assertEqual(self._on("dialog"), [("1", False)])
+        self.assertIn("presence record for pid %d says it waits for "
+                      "'dialog open'" % SEAT_PID, self.text)
+
+    def test_a_presence_record_that_contradicts_the_dialog_presses_nothing(self):  # noqa: VACUOUS_ASSERTION — no key on the dialog IS the contract; the same keystroke record carries the /exit that opened it, and the refusal carries the record's own words
+        """The dialog stands on screen, and the vendor's own record for the
+        seat's process says the session is NOT waiting at a dialog. Two
+        witnesses disagree about whether this dialog awaits input now, and
+        the door refuses: a contradiction is never a licence to press."""
+        self._seat_presence(status="shell")
+        rc, refusal = self._apply_through(_ExitDialogAd(focus=1),
+                                          exit_wait=0.05)
+        self.assertEqual(rc, 1)
+        self.assertEqual(refusal.check, "clean exit")
+        self.assertIn("/exit -> manual", self.text)
+        self.assertEqual(self._on("dialog"), [],
+                         "a key was pressed over a contradicting record: %r"
+                         % (self.ad.keys,))
+        self.assertEqual(self._on("composer"), [("/exit", False), ("", True)])
+        line = refusal.line()
+        self.assertIn("status 'shell'", line)
+        self.assertIn("its witness refuses", line)
+        self.assertFalse(self.ad.exited)
+
+    def test_a_plain_composer_exit_spends_no_confirm_keystroke(self):
+        """THE POSITIVE CONTROL, through the same double: a seat with no
+        background tasks exits on the /exit's own Enter, and the dialog door
+        adds NOTHING — no second Enter, no digit."""
+        rc, refusal = self._apply_through(_ExitDialogAd(dialog=False))
+        self.assertEqual(rc, 0, refusal and refusal.line())
+        self.assertEqual([k[1:] for k in self.ad.keys
+                          if "helm launch" not in k[1]],
+                         [("/exit", False, "composer"),
+                          ("", True, "composer")],
+                         "the plain exit spent a keystroke beyond its own")
+        self.assertEqual(len(self._launched()), 1)
+        self.assertIn("PROVEN gone", self.text)
+        self.assertEqual(seat_rehome.events()[0][0]["exit_proven_by"], "pane")
+
+    def test_an_unverified_exit_is_proven_by_the_pid_and_the_rehome_proceeds(self):
+        """THE PID OUTRANKS THE PANE. A session with no background tasks exits
+        on the /exit's own Enter and takes its composer with it, so the
+        read-back finds none and the wake answers UNVERIFIED about an exit
+        that worked. The old pid is then PROVEN gone inside the existing wait,
+        and that is the fact the rest of the plan needs: the launch line is
+        typed once with its marker, all three surfaces come back, and the
+        ledger row says the exit was proven by the pid, not by the pane.
+
+        CAUSAL: the double ends the process at the /exit's Enter and nowhere
+        else, and the pane it leaves has no composer to read."""
+        rc, refusal = self._apply_through(_ExitDialogAd(plain="shell"))
+        self.assertEqual(rc, 0, refusal and refusal.line())
+        self.assertIn("/exit -> unverified", self.text,
+                      "the pane proved this exit, so the arm no longer "
+                      "measures the pid standing in for it")
+        self.assertEqual(self._on("composer"), [("/exit", False), ("", True)])
+        self.assertEqual(self._on("dialog"), [])
+        launch = self._launched()
+        self.assertEqual(len(launch), 1, "the launch line was not typed once: "
+                         "%r" % (self.ad.keys,))
+        self.assertEqual(_marker_in(launch[0][1]),
+                         seat_rehome.events()[0][0]["attempt"])
+        self.assertIn("proven by the pid, not by the pane", self.text)
+        for surface in ("pane", "register", "beacon"):
+            self.assertIn("  %-9s PROVEN" % surface, self.text)
+        self.assertNotIn("UNPROVEN", self.text)
+        row = seat_rehome.events()[0][0]
+        self.assertEqual((row["exit_wake"], row["exit_proven_by"]),
+                         ("unverified", "pid"))
+        self.assertEqual(row["verified"],
+                         {"pane": True, "register": True, "beacon": True})
+
+    def test_an_unverified_exit_whose_pid_outlives_the_wait_refuses(self):  # noqa: VACUOUS_ASSERTION — no launch over a live process IS the contract; the same keystroke record's composer rows are asserted non-empty and the refusal asserted to carry the wait's own reason, so the verb reached the wait
+        """THE OVERRIDE'S NEGATIVE: the same UNVERIFIED wake, and the old
+        process is still alive when the wait ends. Nothing proved the exit, so
+        the verb refuses as before, says the pid did not prove it either, and
+        names what the pane shows and that the session still runs."""
+        rc, refusal = self._apply_through(_ExitDialogAd(plain="hang"),
+                                          exit_wait=0.05)
+        self.assertEqual(rc, 1)
+        self.assertEqual(refusal.check, "clean exit")
+        self.assertEqual(self._on("composer"), [("/exit", False), ("", True)])
+        self.assertEqual(self._launched(), [],
+                         "a launch line was typed over a process still alive")
+        self.assertIn("/exit -> unverified", self.text)
+        line = refusal.line()
+        self.assertIn("the pid did not prove it either", line)
+        self.assertIn("still alive after", line)
+        self.assertIn("no composer helm can read and no dialog it recognises",
+                      line)
+        self.assertIn("still running", line)
+        self.assertNotIn("untouched", line)
+
+    def test_a_pointer_on_stay_is_never_pressed_and_the_refusal_names_the_dialog(self):  # noqa: VACUOUS_ASSERTION — no keystroke on the dialog and no launch IS the contract; the same keystroke record's composer rows are asserted non-empty, so the double demonstrably recorded the /exit that opened it
+        """THE NEGATIVE. Claude Code opens the dialog on option 1, so a pointer
+        on "3. Stay" means something answered it after it opened — a person,
+        most likely, choosing to keep the session. Helm does not move the
+        pointer back and does not press anything: it REFUSES, and the refusal
+        says the pane is sitting in an open exit-confirm dialog with the
+        pointer on Stay. It never says "untouched" — the /exit landed.
+
+        A PROVEN NON-EXIT NEVER REACHES THE PID WAIT: the wake is `manual`,
+        an answer, so there is nothing for the pid to prove. The wait is
+        shortened only so a regression that sent this arm to it fails fast."""
+        rc, refusal = self._apply_through(_ExitDialogAd(focus=3),
+                                          exit_wait=0.05)
+        self.assertEqual(rc, 1)
+        self.assertIn("/exit -> manual", self.text)
+        self.assertEqual(refusal.check, "clean exit")
+        self.assertEqual(self._on("dialog"), [],
+                         "a keystroke reached a dialog whose pointer is on "
+                         "Stay: %r" % (self.ad.keys,))
+        # CONTROL on the same keystroke record: the /exit DID land, which is
+        # what opened the dialog this arm refuses to answer.
+        self.assertEqual(self._on("composer"), [("/exit", False), ("", True)])
+        self.assertEqual(self._launched(), [])
+        self.assertFalse(self.ad.exited)
+        line = refusal.line()
+        self.assertIn("exit-confirm dialog", line)
+        self.assertIn("3. Stay", line)
+        self.assertIn("still running", line)
+        self.assertNotIn("untouched", line)
+        self.assertNotIn("the pid did not prove it either", line,
+                         "a proven non-exit went on to the pid wait")
+
+    def test_a_dialog_helm_did_not_open_is_never_answered(self):  # noqa: VACUOUS_ASSERTION — an EMPTY keystroke record is the contract; the double's own dialog is asserted still standing and the refusal text asserted to name it, so the pane was read and was a dialog
+        """NEVER BLIND. The pane is ALREADY in the exit-confirm dialog when the
+        verb arrives, pointer on option 1 — somebody else's /exit. The turn
+        verb's pre-read finds no composer and types nothing, so the dialog door
+        has no /exit of its own to follow up and presses nothing either. The
+        refusal names what the pane shows.
+
+        AND THE PID IS NEVER ASKED. The pre-read's refusal is UNVERIFIED, the
+        same wake the pid override keys on; what keeps it out of the wait is
+        that this apply typed no /exit. Were it to wait, the person confirming
+        their own dialog inside the window would read as this verb's exit and
+        get a launch line. The wait is shortened only so that regression
+        fails fast."""
+        # the dialog hides the mode footer, so the operator names the mode
+        # (task/3515) and the arm reaches the exit door it measures
+        rc, refusal = self._apply_through(_ExitDialogAd(focus=1, showing=True),
+                                          exit_wait=0.05,
+                                          mode="bypassPermissions")
+        self.assertEqual(rc, 1)
+        self.assertEqual(refusal.check, "clean exit")
+        self.assertIn("/exit -> unverified", self.text)
+        self.assertEqual(self.ad.keys, [],
+                         "a keystroke reached a pane helm had not typed /exit "
+                         "into: %r" % (self.ad.keys,))
+        self.assertEqual(self.ad.showing, HANDLE,
+                         "the dialog closed, so this arm no longer measures "
+                         "a dialog left standing")
+        line = refusal.line()
+        self.assertIn("exit-confirm dialog", line)
+        self.assertIn("1. Exit and stop tasks", line)
+        self.assertNotIn("the pid did not prove it either", line,
+                         "a wake over a /exit this apply never typed went on "
+                         "to the pid wait")
+
+    def test_a_dialog_that_never_closes_gets_ONE_enter_and_a_loud_refusal(self):  # noqa: VACUOUS_ASSERTION — no launch over a live process IS the contract; the same keystroke record carries exactly one Enter on the dialog and the /exit on the composer, so the verb acted and was recorded
+        """THE BOUNDED READ-BACK. The confirm key is pressed ONCE and the
+        pane is read back a bounded number of times; a dialog still standing
+        after them is UNKNOWN, which the rehome refuses, and no second key is
+        ever spent on it. That one key's send carries the act bound every
+        other act-door keystroke gets, not the transport's 60s default.
+
+        CAUSAL: this double swallows the confirm key, so the dialog stands
+        on every read-back and the process never ends.
+
+        THE PID IS ASKED TOO, and does not rescue it. The wake reads
+        UNVERIFIED and this apply typed the /exit, so the verb goes on to the
+        pid wait (shortened here); the process outlives it, and the refusal
+        says the pid did not prove the exit either."""
+        rc, refusal = self._apply_through(_StuckExitDialogAd(), exit_wait=0.05)
+        self.assertEqual(rc, 1)
+        self.assertEqual(refusal.check, "clean exit")
+        self.assertEqual(self._on("dialog"), [("1", False)],
+                         "the dialog was not pressed exactly ONCE, with option "
+                         "1's digit: %r" % (self.ad.keys,))
+        self.assertEqual(self.ad.timeouts, [harness.act_send_s()])
+        self.assertEqual(self._on("composer"), [("/exit", False), ("", True)])
+        self.assertEqual(self._launched(), [])
+        self.assertFalse(self.ad.exited)
+        line = refusal.line()
+        self.assertIn("has not been seen to close", line)
+        self.assertIn("the pid did not prove it either", line)
+        self.assertIn("still running", line)
+
+
+class _StuckExitDialogAd(_ExitDialogAd):
+    """The exit-confirm double whose confirm key never closes the dialog:
+    the keystroke is recorded and swallowed. `timeouts` is the bound each
+    keystroke on the dialog was sent with."""
+
+    def __init__(self):
+        super().__init__(focus=1)
+        self.timeouts = []
+
+    def send(self, handle, text, enter=True, timeout=60):
+        if self.showing != handle:
+            return super().send(handle, text, enter=enter, timeout=timeout)
+        self.keys.append((handle, text, enter, "dialog"))
+        self.timeouts.append(timeout)
+
 
 class LaunchLineScopeTest(RehomeBase):
     """THE ASSIGNMENT'S SCOPE, MEASURED IN A REAL SHELL.
@@ -1166,6 +1703,382 @@ class LaunchLineScopeTest(RehomeBase):
         self.assertTrue(line.startswith("cd "), line)
         self.assertIn(" && %s=%s " % (seat_rehome.ATTEMPT_ENV, attempt), line)
         self.assertNotIn("export", line)
+
+
+SKIP = "--dangerously-skip-permissions"
+
+
+class DefaultHomeTest(RehomeBase):
+    """task/3515 — `--home default` moves a seat PINNED to a named credhome
+    onto the Orca-synced default home, and every rehome keeps the permission
+    mode the old process ran with and names what its exit stopped.
+
+    The seat's OLD process is planted as a real /proc row on a named credhome,
+    so the plan reads its mode through the shipped readers
+    (`beacons.proc_argv`, `beacons.proc_env`) and the old home's own
+    settings.json. The apply arms reuse ApplyTest's causal fixture: the new
+    process exists only because the launch line was typed, and it inherits the
+    permission words the line carried and nothing else."""
+
+    _apply = ApplyTest._apply
+    _apply_through = ApplyTest._apply_through
+    _launched = ApplyTest._launched
+    _plant_neighbour = ApplyTest._plant_neighbour
+
+    def _old_seat(self, perm=(), settings=None):
+        """The seat as it runs today: pinned to a named credhome by
+        CLAUDE_CONFIG_DIR, started with `perm` on its argv. `settings` is the
+        old home's settings.json body."""
+        name, d = self.plant_home(email="pinned@example.test",
+                                  creds=_creds("FAKE-PINNED", 8))
+        if settings is not None:
+            with open(os.path.join(d, "settings.json"), "w") as f:
+                json.dump(settings, f)
+        self.plant_proc(SEAT_PID, d, perm=perm)
+        self.old_dir = d
+        return name, d
+
+    def _default_live(self, **kw):
+        self.plant_default_home(creds=_creds("FAKE-DEFAULT", 8, **kw))
+        self.home_dir = None
+        return self.defaults["claude"]
+
+    def _plan(self, target="default"):
+        self.plant_roster()
+        with self.census([_proc()]):
+            return seat_rehome.plan(SEAT, target, model="opus",
+                                    adapter=self.ad)
+
+    def test_the_default_plan_unsets_the_config_dir_and_carries_the_flag(self):
+        """THE POSITIVE. The launch line runs with CLAUDE_CONFIG_DIR REMOVED
+        (the default home is the absence of the variable, never ~/.claude
+        spelled into it), names no --home, and carries the old process's own
+        --dangerously-skip-permissions, because each home's settings.json
+        carries its own defaultMode and a relaunch with no flag takes the new
+        home's (measured: a bypass seat came back in auto mode)."""
+        self._old_seat(perm=[SKIP])
+        self._default_live()
+        p, refusal = self._plan()
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertEqual(
+            p["command"],
+            "env -u CLAUDE_CONFIG_DIR helm launch --seat %s -- --model opus "
+            "%s --resume %s" % (SEAT, SKIP, SID))
+        self.assertNotIn("--home", p["pane_line"])
+        self.assertEqual(p["permission"], [SKIP])
+
+    def test_a_named_rehome_carries_the_old_permission_mode_too(self):
+        """The mode rule is not the default target's alone: a named credhome
+        has its own settings.json default as well."""
+        self._old_seat(perm=["--permission-mode", "acceptEdits"])
+        self.ad.footer = ACCEPT_FOOTER
+        name = self.live_home()
+        p, refusal = self._plan(target=name)
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertIn("--home %s -- --model opus --permission-mode acceptEdits "
+                      "--resume %s" % (name, SID), p["command"])
+        self.assertFalse(p["command"].startswith("env -u"))
+
+    def test_argv_without_a_flag_falls_back_to_the_old_homes_settings(self):
+        """No flag on the old argv: the mode the session ran with was the OLD
+        home's settings.json permissions.defaultMode, and the relaunch passes
+        it explicitly."""
+        self._old_seat(settings={"permissions":
+                                 {"defaultMode": "bypassPermissions"}})
+        self._default_live()
+        p, refusal = self._plan()
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertIn("-- --model opus --permission-mode bypassPermissions "
+                      "--resume %s" % SID, p["command"])
+
+    def test_a_settings_mode_outside_the_clis_choices_is_never_passed(self):
+        """CURE P2-1: a settings default the CLI does not take would exit the
+        relaunch and leave the seat on no home, so it names no mode: it is
+        never passed, and with no footer the mode is UNKNOWN (CURE3)."""
+        self._old_seat(settings={"permissions": {"defaultMode": "yolo"}})
+        self._default_live()
+        self.ad.footer = ""
+        p, refusal = self._plan()
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertIsNone(p["permission"])
+        self.assertNotIn("yolo", p["command"])
+        self.assertIn("UNKNOWN", p["permission_note"])
+        for mode in sorted(seat_rehome.PERMISSION_MODES):
+            self.assertEqual(seat_rehome._valid_mode(mode), mode)
+
+    def test_a_project_layer_is_a_cross_check_on_the_footer(self):
+        """The cwd's project layers name a startup mode; the footer that
+        agrees with them is passed explicitly, and one that disagrees is
+        UNKNOWN (CURE3: startup layers are never proof, only a check)."""
+        for layer in ("settings.local.json", "settings.json"):
+            with self.subTest(layer=layer):
+                self._old_seat(settings={"permissions":
+                                         {"defaultMode": "bypassPermissions"}})
+                cwd = self.plant_cwd(SEAT_PID, name="wt-" + layer)
+                os.makedirs(os.path.join(cwd, ".claude"), exist_ok=True)
+                with open(os.path.join(cwd, ".claude", layer), "w") as f:
+                    json.dump({"permissions": {"defaultMode": "plan"}}, f)
+                self._default_live()
+                self.ad.footer = PLAN_FOOTER
+                p, refusal = self._plan()
+                self.assertIsNone(refusal, refusal and refusal.line())
+                self.assertEqual(p["permission"], ["--permission-mode", "plan"])
+                self.assertIn(layer, p["permission_note"])
+                self.ad.footer = None            # the bypass row
+                p, _refusal = self._plan()
+                self.assertIsNone(p["permission"])
+                self.assertIn("UNKNOWN", p["permission_note"])
+                os.unlink(os.path.join(self.proc, str(SEAT_PID), "cwd"))
+
+    def test_a_footer_showing_plan_relaunches_in_plan(self):
+        """CURE3: the old argv carries no flag and no settings layer names a
+        mode, and the pane's footer says plan mode: the relaunch passes
+        --permission-mode plan, even onto a home whose settings say bypass,
+        and verification asks the new argv for it."""
+        self._old_seat()
+        name = self.live_home()
+        with open(os.path.join(self.home_dir, "settings.json"), "w") as f:
+            json.dump({"permissions": {"defaultMode": "bypassPermissions"}}, f)
+        self.ad.footer = PLAN_FOOTER
+        p, refusal = self._plan(target=name)
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertEqual(p["permission"], ["--permission-mode", "plan"])
+        self.assertIn("-- --model opus --permission-mode plan --resume %s"
+                      % SID, p["command"])
+        self.assertIn("footer", p["permission_note"])
+        p = dict(p, attempt=FOREIGN_MARK)
+        for perm, ok in ((["--permission-mode", "plan"], True), ([], False)):
+            self.plant_proc(NEW_PID, self.home_dir, session=SID,
+                            attempt=FOREIGN_MARK, perm=perm)
+            ident, why = seat_rehome._planned_process(
+                p, {"pane_pids": [orcaadopt.ProcIdent(NEW_PID, NEW_START)]})
+            if ok:
+                self.assertEqual(ident, NEW_PID, why)
+            else:
+                self.assertIsNone(ident)
+                self.assertIn("--permission-mode plan", why)
+
+    def test_a_footer_that_disagrees_with_argv_is_unknown(self):
+        self._old_seat(perm=["--permission-mode", "acceptEdits"])
+        self._default_live()
+        self.ad.footer = PLAN_FOOTER
+        p, refusal = self._plan()
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertIsNone(p["permission"])
+        self.assertIn("says plan and acceptEdits", p["permission_note"])
+
+    def test_the_footer_names_every_measured_mode(self):
+        for row, mode in ((PLAN_FOOTER, "plan"), (ACCEPT_FOOTER, "acceptEdits"),
+                          (MANUAL_FOOTER, "manual"),
+                          ("  ⏵⏵ auto mode on (shift+tab to cycle) · ← for "
+                           "agents", "auto"),
+                          ("  ⏵⏵ don't ask on (shift+tab to cycle) · ← for "
+                           "agents", "dontAsk"),
+                          ("  ⏵⏵ bypass permissions on", "bypassPermissions")):
+            self.assertEqual(panetail.permission_footer(_framed(row))[0], mode)
+        self.assertIsNone(panetail.permission_footer(_framed())[0])
+        self.assertIsNone(panetail.permission_footer(
+            _framed(PLAN_FOOTER, ACCEPT_FOOTER))[0])
+        # a quoted footer high in the transcript is not the footer
+        self.assertIsNone(panetail.permission_footer(
+            "\n".join([PLAN_FOOTER] + ["line %d" % n for n in range(8)]))[0])
+
+    def test_a_footer_quoted_above_the_input_box_is_never_the_footer(self):
+        """helm-codex's QC of CURE3: the last six rows were read whatever they
+        were, so a transcript line quoting a footer just above the input box
+        proved a mode the pane never drew once the real footer was hidden
+        (a dialog, a statusline that wraps). The footer is chrome BELOW the
+        input box's bottom rule, so only rows under the last rule count."""
+        quoted = "\n".join(("assistant: the pane said", PLAN_FOOTER,
+                            "─" * 40, "❯", "─" * 40,
+                            "  opus-5 | ~/dev/example/repo"))
+        self.assertIsNone(panetail.permission_footer(quoted)[0])
+        # must-hit: the same frame with the real footer under the rule
+        self.assertEqual(panetail.permission_footer(
+            quoted + "\n" + ACCEPT_FOOTER)[0], "acceptEdits")
+        # no input box at all proves nothing
+        self.assertIsNone(panetail.permission_footer(ACCEPT_FOOTER)[0])
+        # helm-codex's QC of CURE4: a transcript that prints a rule of its
+        # own and a mode line, while a dialog hides the real box, is no input
+        # box: the rule must close a box whose composer row (❯) sits under
+        # an opening rule
+        forged = "\n".join(("assistant: done", "─" * 40, PLAN_FOOTER))
+        self.assertIsNone(panetail.permission_footer(forged)[0])
+        self.assertIsNone(panetail.permission_footer("\n".join((
+            "─" * 40, "some output", "─" * 40, PLAN_FOOTER)))[0])
+
+    def test_default_is_ambiguous_while_a_credhome_is_named_default(self):
+        """CURE P3-1: a credhome literally named `default` makes the reserved
+        word ambiguous, so it is refused; the credhome is still reachable by
+        its path."""
+        self._default_live()
+        d = os.path.join(self.roots["claude"], "default")
+        os.makedirs(d)
+        note, refusal = seat_rehome.check_home("default")
+        self.assertIsNone(note)
+        self.assertIsNotNone(refusal, "an ambiguous `default` was admitted")
+        self.assertIn("ambiguous", refusal.reason)
+        os.rmdir(d)
+        note, refusal = seat_rehome.check_home("default")
+        self.assertIsNone(refusal, refusal and refusal.line())
+
+    def test_an_arbitrary_non_credhome_path_is_still_refused(self):
+        """The default is a RESERVED WORD, never an accepted path: the default
+        home's own path and any other directory keep rule 1's refusal. The
+        control is the reserved word itself, accepted over the same home."""
+        self._default_live()
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere)
+        for path in (self.defaults["claude"], elsewhere):
+            note, refusal = seat_rehome.check_home(path)
+            self.assertIsNone(note, path)
+            self.assertIsNotNone(refusal, "%s was accepted" % path)
+        note, refusal = seat_rehome.check_home("default")
+        self.assertIsNone(refusal, refusal and refusal.line())
+        self.assertIn("default", note)
+
+    def test_a_default_home_with_an_expired_token_is_refused(self):
+        """Orca, not helm, refreshes the default home's token, so there is no
+        sync leg to rescue a dead one: an expired refresh chain refuses before
+        the pane is touched, and so does a default home with no credentials.
+        The control is the same home with a live chain."""
+        self._default_live(refresh_hours=-1)
+        note, refusal = seat_rehome.check_home("default")
+        self.assertIsNone(note)
+        self.assertIsNotNone(refusal, "an expired default home was admitted")
+        self.assertIn("EXPIRED", refusal.reason)
+        os.unlink(os.path.join(self.defaults["claude"], ".credentials.json"))
+        cred.cache_clear()
+        note, refusal = seat_rehome.check_home("default")
+        self.assertIsNotNone(refusal, "a default home with no token was "
+                                      "admitted")
+        self._default_live()
+        note, refusal = seat_rehome.check_home("default")
+        self.assertIsNone(refusal, refusal and refusal.line())
+
+    def test_an_unproved_mode_refuses_the_apply_before_the_exit(self):
+        """CURE3: the old argv is unreadable and the pane draws no mode
+        footer, so the live mode is UNKNOWN: --apply refuses before the
+        /exit, naming it, and nothing is typed."""
+        self._old_seat()
+        os.unlink(os.path.join(self.proc, str(SEAT_PID), "cmdline"))
+        self._default_live()
+        self.ad.footer = ""
+        rc, refusal = self._apply(name="default", launch={"home": None})
+        self.assertEqual(rc, 1)
+        self.assertEqual(refusal.check, "permission mode is proved")
+        self.assertIn("UNKNOWN", refusal.reason)
+        self.assertIn("--mode", refusal.remedy)
+        self.assertEqual(self.ad.sent, [], "an UNKNOWN mode typed into the pane")
+
+    def test_an_operator_mode_applies_and_is_verified(self):
+        """The way out: --mode plan over the same unproved pane is recorded as
+        operator-chosen, rides the launch line, and the new process is
+        verified to carry it."""
+        self._old_seat()
+        os.unlink(os.path.join(self.proc, str(SEAT_PID), "cmdline"))
+        self._default_live()
+        self.ad.footer = ""
+        rc, refusal = self._apply(name="default", launch={"home": None},
+                                  mode="plan")
+        self.assertEqual(rc, 0, refusal and refusal.line())
+        line = self._launched()[0][1]
+        self.assertIn("--permission-mode plan", line)
+        self.assertNotIn("UNPROVEN", self.text)
+        row = seat_rehome.events()[0][0]
+        self.assertEqual(row["permission"], ["--permission-mode", "plan"])
+        self.assertIn("operator-chosen", row["permission_note"])
+
+    def test_the_dry_run_shows_an_unknown_mode_and_the_refusal(self):
+        self._old_seat()
+        self._default_live()
+        self.ad.footer = ""
+        self.plant_roster()
+        out = io.StringIO()
+        with self.census([_proc()]):
+            p, refusal = seat_rehome.plan(SEAT, "default", model="opus",
+                                          adapter=self.ad)
+        self.assertIsNone(refusal, refusal and refusal.line())
+        seat_rehome.print_plan(p, out=out)
+        self.assertIn("mode      UNKNOWN", out.getvalue())
+        self.assertIn("--apply refuses before the /exit", out.getvalue())
+        with self.census([_proc()]):
+            _p, refusal = seat_rehome.plan(SEAT, "default", adapter=self.ad,
+                                           mode="yolo")
+        self.assertIn("not a --permission-mode", refusal.reason)
+        # `default` is not in the choice set claude 2.1.284 lists (it only
+        # draws manual), so an operator names manual, never the hidden word
+        with self.census([_proc()]):
+            _p, refusal = seat_rehome.plan(SEAT, "default", adapter=self.ad,
+                                           mode="default")
+        self.assertIsNotNone(refusal, "--mode default was admitted")
+        self.assertIn("manual", refusal.remedy)
+
+    def test_the_default_apply_proves_the_new_process_left_the_pin(self):
+        """THE POSITIVE APPLY: the new process has NO CLAUDE_CONFIG_DIR, is
+        named for the seat, and its argv carries the session, the model and
+        the kept permission flag."""
+        self._old_seat(perm=[SKIP])
+        self._default_live()
+        rc, refusal = self._apply(name="default", launch={"home": None})
+        self.assertEqual(rc, 0, refusal and refusal.line())
+        line = self._launched()[0][1]
+        self.assertIn("env -u CLAUDE_CONFIG_DIR helm launch", line)
+        self.assertIn(SKIP, line)
+        self.assertNotIn("UNPROVEN", self.text)
+        row = seat_rehome.events()[0][0]
+        self.assertEqual(row["home"], "default")
+        self.assertEqual(row["permission"], [SKIP])
+
+    def test_verification_fails_when_the_new_process_keeps_the_old_pin(self):
+        """The launch came up still carrying the OLD CLAUDE_CONFIG_DIR: every
+        other property matches, and it is not on the default home."""
+        _name, old = self._old_seat(perm=[SKIP])
+        self._default_live()
+        rc, refusal = self._apply(name="default", launch={"home": old},
+                                  verify_s=0.05)
+        self.assertEqual(rc, 1)
+        self.assertEqual(refusal.check, "post-launch verification")
+        self.assertIn("pane", refusal.reason)
+        self.assertIn(cred._display_path(old), self.text)
+
+    def test_verification_fails_when_the_new_process_lost_the_mode(self):
+        """A process that came up without the kept flag runs on the new
+        home's settings default, which is the measured defect."""
+        self._old_seat(perm=[SKIP])
+        self._default_live()
+        rc, refusal = self._apply(name="default",
+                                  launch={"home": None, "perm": []},
+                                  verify_s=0.05)
+        self.assertEqual(rc, 1)
+        self.assertEqual(refusal.check, "post-launch verification")
+        self.assertIn(SKIP, self.text)
+
+    def test_the_ledger_and_the_wake_name_what_the_exit_stopped(self):
+        """The exit dialog lists what it will stop, and none of it survives a
+        relaunch: the rows this /exit's dialog listed land in the ledger row,
+        and the seat's post-relaunch wake carries them as a re-arm line."""
+        self._old_seat(perm=[SKIP])
+        self._default_live()
+        # The suite's chat dir is one per PROCESS (tests/__init__.py), so the
+        # lane already holds earlier arms' wakes: only rows after this apply
+        # are this apply's.
+        before = chat.read(chat.dm_room(SEAT))[1]
+        rc, refusal = self._apply_through(_ExitDialogAd(focus=1),
+                                          name="default",
+                                          launch={"home": None})
+        self.assertEqual(rc, 0, refusal and refusal.line())
+        row = seat_rehome.events()[0][0]
+        self.assertEqual(row["stopped"][0], "monitor · example-seat inbox "
+                                            "beacon")
+        self.assertEqual(len(row["stopped"]), 4, row["stopped"])
+        self.assertTrue(row["stopped"][1].startswith("shell · "))
+        self.assertTrue(row["wake"]["posted"], row["wake"])
+        texts = [r.get("text") or "" for r in
+                 chat.read(chat.dm_room(SEAT), since=before)[0]]
+        wake = [t for t in texts if "re-arm" in t]
+        self.assertEqual(len(wake), 1, texts)
+        self.assertIn("monitor · example-seat inbox beacon", wake[0])
 
 
 if __name__ == "__main__":

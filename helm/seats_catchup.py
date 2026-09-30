@@ -10,9 +10,9 @@ from .seats_common import (_seat_key, dm_lane, names_match)
 from .seats_identity import (_mention_re, deliverable, seat_names, seat_scope)
 from .seats_cursor import (_all_cursor_locks, _commit_cursor_updates,
                            _cursor_locks, _cursor_state,
-                           _cursor_transaction_epoch, cursor_path,
-                           normalize_rotated_cursor, parse_cursor_path,
-                           seat_state_lock)
+                           _cursor_transaction_epoch, _occurrence_parts,
+                           cursor_path, normalize_rotated_cursor,
+                           parse_cursor_path, seat_state_lock)
 from .seats_delivery import _scan_rooms
 
 
@@ -101,6 +101,23 @@ def _catchup_cursor(path):
     if pending or after != epoch:
         raise OSError("cursor transaction changed during read")
     return row
+
+
+def _unheld(cur, target):
+    """`cur`, a cursor already at or past the snapshot, less its holds on
+    the rows the snapshot parks. A held token behind the parked delivery
+    cursor is owed to nobody: no hook pass crosses it again, so it would pin
+    the room's rotation at its row and keep the hook from moving the wake
+    cursor on (a beacon doorbell holds every row it rings)."""
+    keep = [t for t in cur.get("held") or ()
+            for p in [_occurrence_parts(t)]
+            if not (p and p[:2] == tuple(target[:2]) and p[2] < target[2])]
+    out = dict(cur)
+    if keep:
+        out["held"] = keep
+    else:
+        out.pop("held", None)
+    return out
 
 
 def _catchup_pending(room, seat):
@@ -256,7 +273,7 @@ def catchup(seat, room=None, apply=False, session=None,
                             and isinstance(cur.get("off"), int) else {}
                         if (cur.get("dev"), cur.get("ino")) == target[:2] \
                                 and target[2] <= cur.get("off", -1) <= st.st_size:
-                            updates[path] = cur
+                            updates[path] = _unheld(cur, target)
                             continue
                         updates[path] = _cursor_state(
                             target, active=cur.get("active"), base=target[2])

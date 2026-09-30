@@ -21,7 +21,8 @@ collisions do not exist.
 
 BEING DERIVED FROM FIXED IDS IS NECESSARY AND IT IS NOT SUFFICIENT, which is
 the correction this module is built around and the reason the table below is
-two rows rather than seven. Four kinds of answer take nothing but object ids
+two rows rather than seven, with one merge form beside it admitted only on the
+terms the second bullet states. Four kinds of answer take nothing but object ids
 and are still not functions of content, and each was MEASURED to move while
 every operand stood still:
 
@@ -48,6 +49,22 @@ every operand stood still:
     anyway, on the ground that a conflicted merge-tree "produces nothing" —
     which is FALSE: measured, the rc 1 run printed a real tree id and left two
     new loose objects in the odb. Both the entry and that reasoning are gone.
+    WHAT CAME BACK, AND ON WHAT TERMS (task/3056): ONE merge-tree form, keyed
+    by the thing that moved it. The view git's merge machinery reads beside
+    the objects — the config git lists, the attributes files, the replacement
+    refs, the grafts file, the git binary and shallowness — is already
+    hashed by `foldckpt.fingerprint`, which the fold checkpoint re-verifies on
+    every restore; each of the three movers above is inside it. So
+    `merge-tree --write-tree --merge-base=<id> <id> <id>` is admitted with
+    that fingerprint IN ITS KEY, only at a git directory (a work tree's own
+    `.gitattributes` also steer the merge and are outside the fingerprint),
+    and only inside a `projscope.scope()`, where the view is read once per
+    projection rather than three spawns per question. A view that moved is a
+    different key: a miss, never a stale answer. What is stored is the exit
+    code and stdout — git's answer, never helm's verdict about it — and the
+    tree id in it names objects this table never wrote: the one caller
+    (`rowworld._replay_is_a_noop`) compares that id against a trunk tree and
+    reads no object behind it. See `_VIEWED`.
   * A RENDERING IS NOT AN ANSWER. `diff --raw A B` prints a listing whose
     SHAPE is the reader's, not the content's: ambient `diff.renames` turns one
     `R100` line into a `D` plus an `A`, ambient `core.abbrev` changes how many
@@ -72,7 +89,10 @@ changes between git releases: a refusal costs one spawn and a wrong admission
 is wrong forever. ITS BOUND, said out loud: a value glued WITHOUT an `=`
 (`-O<orderfile>`, `-S<string>`) is invisible to this check. That is not a hole
 today because neither admitted verb takes one — a fact about the two verbs
-that remain, which the next verb added here owes an answer to.
+that remain, which the next verb added here owes an answer to. `merge-tree`
+paid it: it takes `-X<option>`, and `_VIEWED` admits exactly three words after
+`--write-tree`, the first of them `--merge-base=<id>`, so a glued option has
+no place to stand.
 
 A HISTORY REWRITER DEFEATS THE WHOLE ARGUMENT, so it is a precondition and not
 a footnote. `refs/replace/<oid>` and a graft file both make git return a
@@ -180,11 +200,25 @@ reused NOTHING across them. So a land does not churn part of this table; it
 orphans all of it, and newest-first by WRITE time is not an approximation of
 least-recently-used here — it IS the live generation. `entry_paths` says what
 enforces the ceiling, what the order knows, and what it does not.
+
+THAT MEASUREMENT IS NOW TRUE OF ONE READER, NOT OF THE TABLE (task/3056). The
+dispatch fold replays each carried close against the trunk commit the close
+RECORDED, so its `cherry`, `merge-base --is-ancestor` and `merge-tree`
+questions name that recorded commit and not trunk's head, and they are asked
+again, unchanged, after every land — about 1,250 of them on the live ledger,
+against 8 per land that still name the head. Those entries are the table's
+long-lived generation, and write-time order evicted them FIRST: the
+head-keyed questions of other readers refill the ceiling every few lands, so
+the generation was cut and the next cold fold paid for it again. So a served
+hit now refreshes its entry's mtime, at most once per `_TOUCH_S` (`_used`),
+and the order is LAST USE at that grain. Nothing about correctness moves
+either way: an entry that is cut costs the spawn the uncached world pays.
 """
 import hashlib
 import os
 import re
 import threading
+import time
 
 _V = 2                          # derivation version: bump to orphan every
                                 # entry when the KEY or the value encoding
@@ -209,6 +243,18 @@ _ANSWERS = (
     (("cherry",), (0,)),
 )
 
+# THE ONE QUESTION GIT'S MERGE MACHINERY ANSWERS, admitted on the terms the
+# module docstring states (task/3056): the leading words, the exit codes that
+# are answers, and how many operands follow them. The shape is EXACT —
+# `--merge-base=<id>` and then the two sides — because it is the form
+# `rowworld._replay_is_a_noop` asks and `foldckpt._DERIVED` and
+# `vcs._SCOPE_FORMS` record; another merge-tree spelling is another question
+# nobody measured. A conflict (1) is an answer: the caller reads it as "this
+# witness cannot speak", and most carried closes on the live ledger get it.
+# Every entry of this form carries the VIEW in its key (`_view`).
+_VIEWED = (("merge-tree", "--write-tree"), (0, 1), 3)
+_MERGE_BASE = "--merge-base="
+
 # A WORD CANNOT CARRY AN INTENT, so this set is kept for what it does cover
 # and is no longer trusted for what it does not. `--end-of-options` is argv
 # hygiene: it marks where a `-`-leading operand stops being read as an option.
@@ -231,6 +277,11 @@ UNCACHED = "HELM_GITFACTS_UNCACHED"
 _MAX_BYTES = 1 << 20            # a stdout larger than this is not worth a file
 
 MAX_ENTRIES = 4096              # the CAPACITY ceiling — see `entry_paths`
+
+# A SERVED ENTRY'S RECENCY IS REFRESHED AT MOST THIS OFTEN, so the eviction
+# order is last use at this grain and a hot entry costs one metadata write per
+# interval rather than one per read — see `_used`.
+_TOUCH_S = 600
 
 _LOCK = threading.Lock()
 _DISABLED = [False]
@@ -428,6 +479,13 @@ def _answers_for(argv):
         _name, glued, value = word.partition("=")
         if glued and not _OID.match(value):
             return None                 # a name behind an option is still a name
+    lead, codes, arity = _VIEWED
+    if tuple(argv[:len(lead)]) == lead:  # argv is stripped; see `_viewed`
+        rest = argv[len(lead):]
+        if len(rest) == arity and rest[0].startswith(_MERGE_BASE) \
+                and all(_OID.match(word) for word in rest[1:]):
+            return codes
+        return None                     # another spelling: nobody measured it
     best = None
     for prefix, codes in _ANSWERS:
         if tuple(argv[:len(prefix)]) == prefix:
@@ -436,13 +494,88 @@ def _answers_for(argv):
     return best[1] if best else None
 
 
-def _key(gitdir, argv, env, version):
+def _viewed(argv):
+    """Is this the merge-machinery question, whose key carries the view?
+
+    It takes the argv AS ASKED, global options included, which is why it
+    strips them itself: `_question` hands it the raw argv the key is built
+    from. `_answers_for` has stripped its argv already and compares the lead
+    on it directly rather than stripping twice."""
+    from . import vcs                    # DEFERRED — vcs imports gitfacts.
+    lead = _VIEWED[0]
+    return tuple(vcs._command_argv(argv))[:len(lead)] == lead
+
+
+def _view(gitdir, env):
+    """What git's merge machinery reads beside the objects, for the key of a
+    `_VIEWED` question. -> bytes, or None when this read may not use the table.
+
+    IT IS `foldckpt.fingerprint`, NOT A SECOND COPY OF IT. That fingerprint is
+    what the fold checkpoint re-verifies before it reuses a close this same
+    merge decided, so two implementations of "the view a merge saw" would be
+    two strengths of one proof, and the weaker would define it. It hashes the
+    git binary, shallowness, the config git lists (less `branch.*` and
+    `credential.*`, which no stored question reads), the replacement refs, and
+    the grafts and attributes files git reads.
+
+    ONLY AT A GIT DIRECTORY. A work tree's own `.gitattributes` steer the merge
+    and are not in the fingerprint — the measurement `foldckpt` refuses a fold
+    on — so a question asked from inside a work tree is not stored or served.
+
+    ONLY INSIDE A SCOPE, AND ONCE PER SCOPE. Reading the view costs three git
+    spawns; outside a scope that is paid per question, which is more than the
+    merge it would save on a hit. Inside one the view is read ONCE and held for
+    the projection, under the scope's own law that one projection is one
+    instant — the same interval the fold checkpoint already accepts between its
+    reads and its fingerprint.
+
+    THE VIEW'S OWN READS ARE HIDDEN FROM A FOLD'S RECORDER. A fold being
+    checkpointed records every git question it consumed and refuses to save
+    one it cannot re-verify; `config --list` is not such a question, and it is
+    not one the fold consumed — the checkpoint takes its own fingerprint at its
+    save. Reading it under the recorder would leave every fold with a stored
+    merge unsaveable."""
+    from . import projscope              # DEFERRED — projscope is a leaf, and
+    if not projscope.active():           # this module loads under vcs.
+        return None
+    key = ("gitfacts._view", str(gitdir),
+           tuple(sorted((env or {}).items())))
+    return projscope.memo(key, lambda: _read_view(gitdir, env))
+
+
+def _read_view(gitdir, env):
+    """The unmemoised read behind `_view`. Never raises into the read, except
+    the budget: a spent budget is the caller's answer, not a miss."""
+    from . import foldckpt, projscope, vcs   # DEFERRED — both import this.
+    try:
+        with vcs.observed(None):
+            fp, facts = foldckpt.fingerprint(gitdir, dict(env or {}))
+    except projscope.Expired:
+        raise
+    except Exception:                    # noqa: BLE001 — an unreadable view
+        return None                      # is a MISS, never an answer
+    if fp is None or facts.get("inside") != "false" \
+            or facts.get("shallow") != "false":
+        return None
+    return fp.encode("ascii")
+
+
+def _key(gitdir, argv, env, version, view=None):
     """sha256 over everything the answer depends on.
 
     The repository is keyed by the PATH AS ASKED rather than by its resolved
     common dir, because resolving it costs the spawn this module exists to
     avoid. Two worktrees of one repository therefore keep separate entries —
-    a miss, never a wrong answer, and the miss costs exactly what today costs."""
+    a miss, never a wrong answer, and the miss costs exactly what today costs.
+
+    AS ASKED MEANS THE RESOLVED DIRECTORY. `gitdir` is what `vcs._named_dir`
+    answers, never a relative string or an unresolved symlink: this table
+    outlives the process, and either spelling can name another repository after
+    a chdir or symlink retarget (task/3105). Ordinary absolute paths still hash
+    byte for byte as before; an old symlink-spelled entry becomes a harmless miss.
+
+    `view` is a `_VIEWED` question's; every other key is spelled exactly as
+    before it existed, so no stored answer was orphaned by adding it."""
     h = hashlib.sha256()
     h.update(b"helm.gitfacts\0%d\0" % _V)
     h.update(version + b"\0")
@@ -454,6 +587,8 @@ def _key(gitdir, argv, env, version):
     for name, value in sorted((env or {}).items()):
         h.update(os.fsencode(name) + b"=" +
                  (b"\0unset" if value is None else os.fsencode(value)) + b"\0")
+    if view is not None:
+        h.update(b"\0view\0" + view)
     return h.hexdigest()
 
 
@@ -461,24 +596,51 @@ def _path(digest):
     return os.path.join(_root(), digest[:2], digest[2:])
 
 
-def lookup(gitdir, args, env):
-    """-> (rc, stdout_bytes, stderr_bytes) for a stored answer, else None.
+def _question(gitdir, args, env):
+    """(argv, the exit codes that are answers, the key, whether it is the
+    `_VIEWED` form) when this read may use the table, else None. The one gate
+    `lookup` and `record` both pass, so the two can never disagree about what
+    is a question here.
 
-    Never raises into the read: an unreadable, truncated or half-written entry
-    is a MISS, and a miss costs exactly what this module is removing."""
+    The view is read LAST, after every check that costs nothing, so a question
+    refused for its argv or its overlay never pays the spawns the view costs."""
     if _DISABLED[0] or _declined(env):
         return None
     argv = [str(a) for a in args]
-    if _answers_for(argv) is None or not _pinned(argv, env):
+    codes = _answers_for(argv)
+    if codes is None or not _pinned(argv, env):
         return None
-    if not _complete(gitdir, env):
+    from . import vcs                    # DEFERRED — vcs imports gitfacts.
+    gitdir = vcs._named_dir(gitdir)      # see `_key`: a path from the root
+    if gitdir is None or not _complete(gitdir, env):
         return None
     version = _version()
     if version is None:
         return None
+    view = None
+    if _viewed(argv):
+        view = _view(gitdir, env)
+        if view is None:
+            return None
+    return argv, codes, _key(gitdir, argv, env, version, view), view is not None
+
+
+def lookup(gitdir, args, env):
+    """-> (rc, stdout_bytes, stderr_bytes) for a stored answer, else None.
+
+    Never raises into the read: an unreadable, truncated or half-written entry
+    is a MISS, and a miss costs exactly what this module is removing. So is an
+    entry whose exit code is not an answer for its question — no writer here
+    stores one, so it can only be damage."""
+    asked = _question(gitdir, args, env)
+    if asked is None:
+        return None
+    _argv, codes, key, viewed = asked
+    path = _path(key)
     try:
-        with open(_path(_key(gitdir, argv, env, version)), "rb") as f:
+        with open(path, "rb") as f:
             blob = f.read()
+            touched = os.fstat(f.fileno()).st_mtime
     except OSError:
         return None
     head, _nl, rest = blob.partition(b"\n")
@@ -491,28 +653,66 @@ def lookup(gitdir, args, env):
         return None
     if out_len > len(rest):
         return None                     # a writer that died mid-write
+    if rc not in codes:
+        return None                     # damage: no writer stores a non-answer
+    if viewed and len(rest) != out_len:
+        return None                     # a merge answer stores no stderr
+    _used(path, touched)
     return rc, rest[:out_len], rest[out_len:]
+
+
+def _used(path, touched):
+    """Refresh a SERVED entry's recency, at most once per `_TOUCH_S`.
+
+    THE EVICTION ORDER IS THE FILE'S MTIME (`entry_paths`), and before this a
+    hit never moved it, so the order was write time. Since task/3056 the table
+    holds a generation no land can move: the dispatch fold's questions about
+    each carried close's RECORDED trunk, about a thousand entries for the
+    live ledger, asked again unchanged after every land. Measured on this
+    host, 983 entries were written in the 40 minutes after one hourly prune,
+    so against a 4,096 ceiling write-time order evicted that generation FIRST
+    every few lands, and the next fold paid its cold cost again. A hit that
+    refreshes the mtime makes the order last use, and a generation that is
+    still being asked for stays.
+
+    THROTTLED, because a hit is a ~20µs read and a write on every one would
+    add the cost this module exists to remove. The mtime came off the
+    descriptor the read already holds, so deciding costs one `fstat`; a hot
+    entry is written at most once per interval. The grain is far below the
+    interval between lands, which is what the order has to resolve.
+
+    SILENT ON EVERY FAILURE. An entry a pruner unlinked after the read, or a
+    store this process may read but not write, keeps its old recency: the
+    cost of that is one eviction the next read re-derives, never a wrong
+    answer and never an error raised into the read."""
+    if time.time() - touched < _TOUCH_S:
+        return
+    try:
+        os.utime(path)
+    except OSError:
+        pass
 
 
 def record(gitdir, args, env, rc, out, err):
     """Store one completed answer. Silent on every failure — a cache that
-    cannot write is a slow cache, never a broken read."""
-    if _DISABLED[0] or _declined(env):
+    cannot write is a slow cache, never a broken read.
+
+    A `_VIEWED` answer is stored WITHOUT its stderr. The answer is the exit
+    code and the tree and conflict listing on stdout; what merge-tree writes
+    to stderr is git's advice (the grafts-file hint the history-view pin
+    itself trips on every command), and no caller reads it — the same law
+    `vcs` states for the answers its batch carries."""
+    asked = _question(gitdir, args, env)
+    if asked is None:
         return
-    argv = [str(a) for a in args]
-    codes = _answers_for(argv)
-    if codes is None or rc not in codes or not _pinned(argv, env):
-        return
-    if not _complete(gitdir, env):
-        return
-    version = _version()
-    if version is None:
+    _argv, codes, key, viewed = asked
+    if rc not in codes:
         return
     out = out or b""
-    err = err or b""
+    err = b"" if viewed else (err or b"")
     if len(out) + len(err) > _MAX_BYTES:
         return
-    path = _path(_key(gitdir, argv, env, version))
+    path = _path(key)
     blob = b"%d %d %d\n" % (_V, rc, len(out)) + out + err
     tmp = "%s.%d.%x.tmp" % (path, os.getpid(), threading.get_ident())
     try:
@@ -543,16 +743,17 @@ def entry_paths():
     with no scheduler, which is the exact state gc itself was found in after
     it had grown 11,192 items past budget without ever once running.
 
-    IT IS AGE AND IT IS NOT USE, said here so no reader takes the row for an
-    LRU. The order is the file's mtime — set by `record` when it writes the
-    entry, and never touched by a hit. atime cannot carry it (relatime and
-    noatime both make it a lie), and touching a file on every hit would turn a
-    ~20µs read into a write, which is the cost this module exists to remove.
-    What the order therefore cannot see is an old entry that is still being
-    asked for. The module docstring's measurement is why that is harmless
-    here and not a compromise: one land orphans the entire generation, so the
-    newest MAX_ENTRIES by write time and the entries anything still asks for
-    are the same set.
+    IT IS LAST USE, AT A `_TOUCH_S` GRAIN, and until task/3056 it was write
+    time. The order is the file's mtime — set by `record` when it writes the
+    entry, and refreshed by a served hit at most once per `_TOUCH_S`
+    (`_used`). atime cannot carry it (relatime and noatime both make it a
+    lie), and touching a file on EVERY hit would turn a ~20µs read into a
+    write, which is the cost this module exists to remove; the throttle is why
+    it is one write per entry per interval instead. Write time was sound
+    while one land orphaned the entire generation, because then the newest
+    MAX_ENTRIES by write time and the entries anything still asked for were
+    the same set. The recorded-trunk replay broke that premise: its questions
+    survive every land, and write time evicted them first.
 
     NOBODY LOCKS, AND NOBODY NEEDS TO. Several helm processes read, write and
     prune this table at the same time. Unlinking an entry a reader is mid-read
@@ -560,7 +761,11 @@ def entry_paths():
     name. Unlinking one a writer is about to `os.replace` over is safe too:
     the rename re-creates the name whether or not a pruner just removed it,
     and a writer whose temp file is removed first falls into `record`'s silent
-    OSError path. Every one of those outcomes costs one git spawn, which is
+    OSError path. A hit refreshing an entry a sweep has listed is safe as
+    well: `gc._still_victim` re-sorts by recency right before each unlink and
+    keeps an entry whose refresh moved it back under the ceiling, and a
+    refresh that arrives after the unlink finds no file and is dropped
+    (`_used`). Every one of those outcomes costs one git spawn, which is
     what the uncached world costs, so a lock would buy no correctness and
     would put a contended file on the read path.
 
@@ -568,7 +773,8 @@ def entry_paths():
     the entry and renames over it; a process killed between the two leaves the
     temp behind, and nothing in this tree has ever removed one. Counting the
     STORE rather than the answers inside it is what bounds that residue too,
-    on the same write-time axis.
+    on the same axis: nothing ever serves a temp, so its recency is its write
+    time.
 
     IT RAISES RATHER THAN REPORTING AN EMPTY STORE, which is gc's own law
     about a victim list: a shard this cannot read, handed back as [], is

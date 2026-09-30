@@ -224,10 +224,13 @@ SPECS = (
     # otherwise. The matcher is a list of exact tool names, so the Workflow
     # tool, whose script spawns its agents without an Agent tool call, is
     # not matched.
+    # NOTEBOOKEDIT JOINS for the shared-checkout write rung (task/3301): the
+    # file-tool branch already reads notebook_path, and Claude Code never
+    # routes NotebookEdit unless the matcher names it.
     {"name": "argv-guard", "event": "PreToolUse",
      "args": "chat argv-guard --hook-json", "timeout": 2,
      "own": ("chat argv-guard --hook-json",),
-     "matcher": "Bash|Monitor|Write|Edit|Agent", "gate": True},
+     "matcher": "Bash|Monitor|Write|Edit|NotebookEdit|Agent", "gate": True},
     # continuity: the compaction/session-end handoff contract (sessions lane).
     {"name": "handoff-precompact", "event": "PreCompact",
      "args": "handoff check --hook-json", "timeout": 5,
@@ -324,8 +327,8 @@ def hook_skips_here(verb, rest):
     a hook that might be needed runs. A resolver that ANSWERS a different
     project is a determinate no — that is not trouble, and skipping is right.
 
-    ONE EXCEPTION, the Orca door: the join of a pane Orca opened is never
-    skipped (see `orca_admits`)."""
+    ONE EXCEPTION, the Orca door: the join and the delivery leg of a pane Orca
+    opened are never skipped (see `orca_admits`)."""
     if "--hook-json" not in rest:
         return False
     args = " ".join([verb] + [a for a in rest])
@@ -336,20 +339,71 @@ def hook_skips_here(verb, rest):
     return outside_helm() is True
 
 
-# THE ORCA DOOR, and it opens for JOIN ONLY. The fleet-seat hooks are scoped
-# to helm's project (see `fleet_scoped_args`), but an agent loaded in Orca is
-# part of helm automatically, whatever its project (task/2673 PART C). A pane
-# Orca opened carries ORCA_PANE_KEY in the environment every hook inherits,
-# so that variable is the door. Deliver, stop-guard and delegation-stop stay scoped:
-# enrolment makes a pane addressable, and it does not make its project a
-# helm-building one.
+# THE ORCA DOOR, and it opens for JOIN and DELIVERY only. The fleet-seat hooks
+# are scoped to helm's project (see `fleet_scoped_args`), but an agent loaded
+# in Orca is part of helm automatically, whatever its project (task/2673 PART
+# C). A pane Orca opened carries ORCA_PANE_KEY in the environment every hook
+# inherits, so that variable is the door.
+#
+# THE AXIS IS WHETHER A HOOK DIRECTS WORK. The fleet scope exists so a seat in
+# another project is never blocked or nagged about helm work. Join makes the
+# pane addressable. The delivery leg hands the seat rows addressed to it,
+# which blocks and nags nothing, and without it those rows left only by pull
+# and their held wake tokens pinned room rotation (task/3165). What the leg
+# may hand over outside helm is narrowed in the handler, not here: rows
+# addressed to the seat and its own project's room, never an @all from #main
+# or another project's traffic (`orca_foreign`, `seats_cli` and
+# `seats_identity.deliverable`). Stop-guard, delegation-stop and the whispers
+# direct work, so they stay scoped.
 ORCA_JOIN = "chat join --hook-json"
+ORCA_DELIVER = "chat deliver --hook-json"
 
 
 def orca_admits(args):
-    """True when this hook invocation is the SessionStart join of a pane Orca
-    opened. `args` is the joined verb string `hook_skips_here` builds."""
-    return args.startswith(ORCA_JOIN) and bool(os.environ.get("ORCA_PANE_KEY"))
+    """True when this hook invocation is the SessionStart join or the
+    PostToolUse delivery leg of a pane Orca opened. `args` is the joined verb
+    string `hook_skips_here` builds.
+
+    THE PAIR'S WHISPER PASS IS NOT THE DELIVERY LEG. The installed PostToolUse
+    pair (helm/posttoolrun.py) first runs `chat deliver --hook-json --room
+    main` as its PREPARATION phase, which only builds the per-tool-call
+    whisper, a steer about helm work. Its argv starts like the delivery leg's
+    on purpose, so it shares the leg's scope everywhere else; here the phase,
+    not the argv, tells them apart, the same way seats_cli routes the two."""
+    if not os.environ.get("ORCA_PANE_KEY"):
+        return False
+    if args.startswith(ORCA_JOIN):
+        return True
+    return args.startswith(ORCA_DELIVER) and not _whisper_pass()
+
+
+def _whisper_pass():
+    """True inside the installed pair's whisper PREPARATION phase.
+
+    READ FROM sys.modules, NEVER IMPORTED. This runs on every helm hook, and
+    a standalone hook has no pair: when helm.posttoolrun was never imported,
+    no pair is running, so the answer is no without paying for the import.
+    The key is spelled `__package__ + ".posttoolrun"` so the gate's load
+    recorder resolves it and carries hooks -> posttoolrun as a static edge
+    (tests/test_raw_module_reads)."""
+    pair = sys.modules.get(__package__ + ".posttoolrun")
+    event = pair.current() if pair is not None else None
+    return event is not None and event.phase == "prepare"
+
+
+def orca_foreign():
+    """True when this process is a pane Orca opened, working in a project
+    that is not helm's: the one population the Orca door admits that the
+    fleet scope would otherwise skip. The delivery handler narrows what it
+    hands such a pane (its own mail, its own project's room) and leaves out
+    the whisper and the delegation evidence, whose scoped consumers never
+    run there.
+
+    ONLY AN ORCA PANE PAYS THE REGISTRY READ. Every other pane outside helm
+    was skipped at the door, and inside helm the answer is False without
+    asking. A resolver that cannot tell answers False, the same fail-open
+    polarity as the door: the leg then runs as it does inside helm."""
+    return bool(os.environ.get("ORCA_PANE_KEY")) and outside_helm() is True
 
 
 def outside_helm():
@@ -372,10 +426,6 @@ def outside_helm():
 
 
 SEAT_SPECS = SPECS
-
-# Compatibility for callers written against the old policy name. This is no
-# longer a subset: new code must say SEAT_SPECS so the full contract is explicit.
-DELIVERY_SPECS = SEAT_SPECS
 
 
 def external_env(spec):
@@ -629,18 +679,6 @@ def _launch_of_named_interpreter(interp, _depth):
             "#! interpreter %s is missing" % interp)
 
 
-def _interpreter_gap(path):
-    """The GAP detail for `path`, or None when there is no measured gap.
-
-    KEPT AS A NARROW READER, NOT AS THE CONTRACT: it collapses UNJUDGED into
-    None, which is exactly the coercion that caused the defect, so nothing that
-    decides whether a guard is provisioned may call it. `_interpreter_launch`
-    is the contract; this exists for message text where a gap is already
-    established."""
-    verdict, _key, detail = _interpreter_launch(path)
-    return detail if verdict == LAUNCH_GAP else None
-
-
 def external_status(spec):
     """(path, reason) for an EXTERNAL spec — the ONE resolution every surface
     reads, so install, status and doctor cannot disagree about a host.
@@ -867,7 +905,8 @@ def unresolved_externals(specs=SPECS):
 # either way the harness runs it.
 PERMIT_RULES = ("Bash(helm chat wait:*)", "Monitor(helm chat wait:*)")
 
-# Scalar estate defaults every agent config carries, merged on the same install
+# Estate defaults every agent config carries (a scalar, or an object owning
+# only the sub-keys it names), merged on the same install
 # pass as the hooks + beacon permits — so both launch surfaces get them from ONE
 # codepath: the claude credential homes (orca-launched claude seats read these)
 # AND the isolated seat config dirs (helm-minted codex/kimi/… family seats read
@@ -881,11 +920,19 @@ PERMIT_RULES = ("Bash(helm chat wait:*)", "Monitor(helm chat wait:*)")
 # universal and is NOT re-wired here: it rides cachedGrowthBookFeatures.
 # tengu_workflows_enabled, which every seat inherits wholesale via seat.py's
 # _FEATURE_CACHE_KEYS (measured live: all five family seats carry it True). Unlike
-# the merge-preserving hook/permit rails, a scalar estate policy is AUTHORITATIVE
+# the merge-preserving hook/permit rails, an estate policy is AUTHORITATIVE
 # for its own key — an absent OR drifted value (a seat left at CC's medium
 # default) is written to the estate value, exactly as _merge_event rewrites a
 # stale hook command to canonical. Every sibling settings key survives untouched.
-ESTATE_DEFAULTS = {"workflowSizeGuideline": "small"}
+#
+# `attribution` (task/2962): THE OWNER'S RULE IS NO AI AUTHORING LINE ANYWHERE.
+# Claude Code adds a co-author trailer to the commits and a generated-with line
+# to the PRs a seat makes unless this key says otherwise, and a proxy seat's
+# config dir never carried it. An OBJECT default: the estate owns each of its
+# own sub-keys, and a sub-key it does not name survives (_merge_defaults).
+ESTATE_DEFAULTS = {"workflowSizeGuideline": "small",
+                   "attribution": {"commit": "", "pr": "",
+                                   "sessionUrl": False}}
 
 # THE AUTO-MEMORY BASE of a config dir whose `projects` is a SYMLINK. Every
 # credential home links `projects` to the one shared tree under the default
@@ -1204,10 +1251,10 @@ def spec_command(spec, *, executable=None):
     exits 0 — that law does not move — and it now SAYS the stop went
     unchecked.
 
-    Kill switches unchanged: HELM_STOP_GUARD=0, plus the 11 per-check
+    Kill switches unchanged: HELM_STOP_GUARD=0, plus the 14 per-check
     HELM_STOP_GUARD_*=0 switches (INBOX/CLAIMS/LEASE_TTL/DELEGATION/BEACON/
-    SPIRAL/PUNT/WIRING/CLAIME/WHISPER/INDEX — the complete register is the
-    ENVIRONMENT.md table). The INBOX rung is LATCHED
+    SPIRAL/SEAM/NDP/PUNT/OWED/WIRING/CLAIME/WHISPER/INDEX — the complete
+    register is the ENVIRONMENT.md table). The INBOX rung is LATCHED
     (once per pending-fingerprint) so a re-stop on the same rows passes; the
     CLAIMS rung listed beside it is NOT — it re-fires every stop until the
     lease is released. What keeps any rung from wedging a stop is
@@ -1438,16 +1485,6 @@ def _advisory_command_v1(spec, executable):
 # Ownership reads this; only `spec_command` writes.
 HISTORICAL_COMMANDS = (_advisory_command_v1, _advisory_command_v2,
                        _gate_command_v1, _posttool_command_v1)
-
-
-def hook_command():
-    """The inject spec's command — the name every older caller knows."""
-    return spec_command(SPECS[0])
-
-
-def _segments(cmd):
-    """The segments alone — see _segments_ex, which is the whole walk."""
-    return _segments_ex(cmd)[0]
 
 
 # Shell constructs that CHANGE WHAT A SEPARATOR MEANS and that this walk does
@@ -1740,12 +1777,11 @@ _PRELUDE = {
     # there is the safe direction.
     HOOK_WRAPPER: {"operand_opts": set(), "operands": 5, "no_opts": True},
 }
-_PRELUDE_WORD = re.compile(r"^(?:%s)$" % "|".join(sorted(_PRELUDE)))
 
-# RESERVED WORDS ARE NOT COMMANDS, AND `_segments` HANDS THEM TO US.
+# RESERVED WORDS ARE NOT COMMANDS, AND `_segments_ex` HANDS THEM TO US.
 # MEASURED, not imagined: a census of every hook command on this host — 387
 # strings across 166 settings.json files, third-party repos included — puts
-# `if` SECOND by frequency (17 uses) behind `timeout` (136). `_segments`
+# `if` SECOND by frequency (17 uses) behind `timeout` (136). `_segments_ex`
 # splits on `;`, so `if [ -x helm ]; then helm inject --hook-json; fi` arrives
 # as three segments and the middle one leads with `then`. `then` is shell
 # SYNTAX; it never occupies the executed position. Read as a command it made
@@ -1841,11 +1877,11 @@ def _executed(segment):
     A segment is prelude words, then ONE executed word, then arguments. The
     prelude set is CLOSED on purpose — because an open one would let any
     unknown leading word be stepped over and hand the next word the executed
-    position it never had. `_PRELUDE_WORD` IS THAT SET, and it is the set this
-    function actually consults: it was previously declared naming six words
-    and then hand-checked for three, so `exec`, `command` and `builtin` were
-    never stepped over and every entry behind one of them read as unowned. A
-    declaration that no code reads is not a contract.
+    position it never had. `_PRELUDE` IS THAT SET, and it is the set this
+    function consults: a word is stepped over as a prelude only when its
+    basename has a `_PRELUDE` row, and that row says which options and
+    operands follow it. `exec`, `command` and `builtin` are rows like any
+    other, so an entry behind one of them reads as owned.
 
     SPLITTING IS shlex, NOT str.split. A pin containing a space — an absolute
     path under a directory with one, which is ordinary on a Mac — was split
@@ -2290,7 +2326,7 @@ def _unread(e):
     return "%s: %s" % (type(e).__name__, e.strerror or e)
 
 
-def seat_homes():
+def seat_homes(every=False):
     """(rows, unread) — the seat census WITH its completeness, the same
     contract _project_contexts states one screen down: rows still ship when a
     subtree cannot be read, and the failure rides beside them where no
@@ -2322,7 +2358,13 @@ def seat_homes():
     (parent readable, not traversable) lands in unread rather than passing
     as "not a dir". A vanished dir (ENOENT/ENOTDIR) is a real absence: gone
     when asked about, it was never a seat — and that arm is entered on
-    exactly those two errnos, so it cannot absorb an EACCES."""
+    exactly those two errnos, so it cannot absorb an EACCES.
+
+    every: a config dir two seats' dirs resolve to is named ONCE by default,
+    under the first seat the walk meets, because an install writes it once.
+    `every=True` names it under each seat, for a reader that attributes the
+    dir's contents to a seat and must see its second holder
+    (`holdbackfill.stores_for`, task/3131)."""
     root = os.path.join(home.global_dir(), "seats")
     out, seen, unread = [], set(), []
 
@@ -2345,7 +2387,7 @@ def seat_homes():
                 continue
             real = os.path.realpath(p)
             if n == "claude" and depth >= 2:
-                if real not in seen:
+                if every or real not in seen:
                     seen.add(real)
                     out.append((os.path.basename(d), real))
                 continue              # a config dir's insides are never seats
@@ -2955,8 +2997,9 @@ def _permits_live(settings):
 
 
 def _merge_defaults(out):
-    """Merge ESTATE_DEFAULTS into the settings root IN PLACE -> ok|add|update. A
-    scalar estate policy: the estate owns these keys, so an absent OR drifted
+    """Merge ESTATE_DEFAULTS into the settings root IN PLACE -> ok|add|update. An
+    estate policy: the estate owns these keys (an OBJECT default owns the
+    sub-keys it names, and every other sub-key survives), so an absent OR drifted
     value is written to the estate default (the same authority _merge_event has
     over its own hook command). An ABSENT key reads as `add` (as _merge_permits
     does for a missing rule, so a fresh install still aggregates to `add`); a
@@ -2965,20 +3008,42 @@ def _merge_defaults(out):
     missing = present = False
     for k, v in ESTATE_DEFAULTS.items():
         if k not in out:
-            out[k] = v
+            out[k] = json.loads(json.dumps(v))
             missing = True
+        elif isinstance(v, dict) and isinstance(out[k], dict):
+            # AN OBJECT DEFAULT owns its own sub-keys only: each drifted or
+            # absent one is written, and a sub-key it does not name survives.
+            for sub, want in v.items():
+                if out[k].get(sub, _ABSENT) != want or (
+                        type(out[k].get(sub)) is not type(want)):
+                    out[k][sub] = json.loads(json.dumps(want))
+                    present = True
         elif out[k] != v:
-            out[k] = v
+            out[k] = json.loads(json.dumps(v))
             present = True
     if present:
         return "update"
     return "add" if missing else "ok"
 
 
+_ABSENT = object()
+
+
+def _default_live(have, want):
+    """One estate default present: equal, or for an OBJECT default, every
+    sub-key it names equal (and of the same type: False is not 0)."""
+    if isinstance(want, dict):
+        return isinstance(have, dict) and all(
+            sub in have and have[sub] == value
+            and type(have[sub]) is type(value)
+            for sub, value in want.items())
+    return have == want
+
+
 def _defaults_live(settings):
     """Every ESTATE_DEFAULT present at the settings root (the post-write check)."""
     return isinstance(settings, dict) and all(
-        settings.get(k) == v for k, v in ESTATE_DEFAULTS.items())
+        _default_live(settings.get(k), v) for k, v in ESTATE_DEFAULTS.items())
 
 
 def memory_base(cdir):
@@ -3052,7 +3117,7 @@ def _merge_all(settings, specs=SPECS, path="<settings>", defaults=True, home=Non
     """-> (merged_copy, {spec_name: action}) across `specs` — SPECS for a
     credential home and the identical SEAT_SPECS contract for a seat — plus the
     beacon permit rules (every launch surface must be ABLE to arm the beacon
-    without a human prompt), the scalar estate defaults (workflows default-small
+    without a human prompt), the estate defaults (workflows default-small
     on every home and seat), the auto-memory base (only when `home`, the config
     dir, is given: the answer is read from its `projects` link), and the
     lane-room repair.
@@ -3949,13 +4014,26 @@ def running_panes(proc=None):
     return out
 
 
+def _census_unknown(exc, flag, key, what):
+    """The one row a pane census returns when it raises: UNKNOWN for every
+    running pane, with the exception class named (`census_failed`). An empty
+    list here renders as every pane healthy, which a census that did not
+    finish cannot claim. `pid` is None: the row names no process."""
+    name = exc.__class__.__name__
+    return [{"pid": None, "seat": None, "family": None, flag: True,
+             "census_failed": name,
+             key: "%s UNKNOWN — the %s census FAILED (%s), so no running "
+                  "pane could be judged" % (what, what, name)}]
+
+
 def uncovered_panes(proc=None, quiet_s=900, panes=None):
     """Running claude PTYs whose NAMED chat identity is not live on the
     roster (+reason) — covered = the pane's seat name (HELM_CHAT_NAME, else
     its seat family) has a roster row seen within quiet_s. Un-named home
     panes are NOT judged here: their auto-name binds via session id, which
     a /proc scan cannot see — their coverage check is `helm hooks status`
-    (the hooks ARE the join path). Read-only; fail-open []."""
+    (the hooks ARE the join path). Read-only. A census that raises returns
+    one `coverage_unknown` row naming the exception class, never []."""
     try:
         from . import seats
         scanned = running_panes(proc) if panes is None else panes
@@ -4014,21 +4092,28 @@ def uncovered_panes(proc=None, quiet_s=900, panes=None):
                            "(%.0fm quiet)" % (lbl, (now - (ls or 0)) / 60))
             out.append(p)
         return out
-    except Exception:
-        return []
+    except Exception as exc:              # noqa: BLE001 — reported UNKNOWN
+        return _census_unknown(exc, "coverage_unknown", "reason", "coverage")
 
 
 def _pane_sessions():
-    """{pid: session id} for the claude panes that hold one open, from the
-    pid-keyed session records (`sessions.live_sids`), or {} when that read
-    fails. A claude pane's own environ does not carry its session id — Claude
-    Code sets it only for the processes it starts (measured across every live
-    pane) — so the signing report reads it where it IS written."""
+    """({pid: session id}, None) for the claude panes that hold one open, from
+    the pid-keyed session records (`sessions.live_sids`), or (None, the
+    exception class name) when that read raises. A claude pane's own environ
+    does not carry its session id — Claude Code sets it only for the
+    processes it starts (measured across every live pane) — so the signing
+    report reads it where it IS written.
+
+    A FAILED READ IS NOT AN EMPTY ONE. This answered {} on a raise, and the
+    signing report read the missing entry as "this pane's session is
+    unknown": a definite identity_conflict, filed under the relaunch header.
+    The caller now files such a pane as signing UNKNOWN, naming the class."""
     try:
         from . import sessions
-        return {pid: sid for sid, pid in (sessions.live_sids() or {}).items()}
-    except Exception:                    # noqa: BLE001 — fail-open report
-        return {}
+        live = sessions.live_sids() or {}
+        return {pid: sid for sid, pid in live.items()}, None
+    except Exception as exc:             # noqa: BLE001 — named by the caller
+        return None, exc.__class__.__name__
 
 
 def unsigned_panes(proc=None, panes=None):
@@ -4038,8 +4123,12 @@ def unsigned_panes(proc=None, panes=None):
     the trio since seat-signing landed, so such a pane predates it and posts
     [unsigned] by configuration. A pane whose profile is not its own
     HELM_CHAT_NAME is flagged too, exactly when the signing gate refuses it:
-    its seat is a fleet actor, or the roster cannot be read. Read-only;
-    fail-open [].
+    its seat is a fleet actor, or the roster cannot be read. Read-only. A
+    census that raises returns one `sign_unknown` row naming the exception
+    class, never []. So does one pane whose binding hangs on the pid-keyed
+    session records when that read raises (`_pane_sessions`): its row is
+    `sign_unknown` with `census_failed` naming the class, never the
+    identity_conflict refusal.
 
     A BLIND PANE IS SIGNING-UNKNOWN, NEVER SILENTLY HEALTHY. Its environ is
     unreadable, so the trio cannot be read either — and the first cut left it
@@ -4133,7 +4222,8 @@ def unsigned_panes(proc=None, panes=None):
                 elif cell.is_owner_cell(prof) and not cell.is_owner_cell(key):
                     if pane_sids is None:
                         pane_sids = _pane_sessions()
-                    sid = p.get("session") or pane_sids.get(p["pid"])
+                    sids, unread = pane_sids
+                    sid = p.get("session") or (sids or {}).get(p["pid"])
                     held = [row.get("session")] + list(
                         row.get("sessions") or [])
                     if sid and sid in held:
@@ -4144,6 +4234,22 @@ def unsigned_panes(proc=None, panes=None):
                             "signs as its own seat '%s'" % (
                                 seats._seat_label(prof),
                                 seats._seat_label(key)))
+                        out.append(p)
+                        continue
+                    if not sid and unread:
+                        # THE RECORD READ RAISED, so this pane's session was
+                        # never read. The refusal below means "read, and not
+                        # bound"; a read that failed has proven nothing, and
+                        # the relaunch it recommends discards the context.
+                        p["sign_unknown"] = True
+                        p["census_failed"] = unread
+                        p["sign_reason"] = (
+                            "signing UNKNOWN — the pid-keyed session-record "
+                            "read FAILED (%s), so whether this pane's session "
+                            "is bound to seat '%s' (which sets the owner's "
+                            "profile '%s' aside) could not be judged" % (
+                                unread, seats._seat_label(key),
+                                seats._seat_label(prof)))
                         out.append(p)
                         continue
                     why = ("the signing gate refuses it (identity_conflict): "
@@ -4160,8 +4266,8 @@ def unsigned_panes(proc=None, panes=None):
                 continue
             out.append(p)
         return out
-    except Exception:
-        return []
+    except Exception as exc:              # noqa: BLE001 — reported UNKNOWN
+        return _census_unknown(exc, "sign_unknown", "sign_reason", "signing")
 
 
 def surface_uncovered(out=None):
@@ -4178,6 +4284,10 @@ def surface_uncovered(out=None):
         name = p["seat"] or p["family"] or ""
         return (seats._seat_label(name)
                 if seats._SEAT_TOKEN.fullmatch(name) else "<invalid>")
+
+    def pid(p):
+        # a census-failed row names no process
+        return "?" if p["pid"] is None else p["pid"]
 
     # ONE SCAN FOR THE WHOLE REPORT. This called uncovered_panes() and
     # unsigned_panes() separately and each walked /proc ITSELF, so a report
@@ -4217,7 +4327,7 @@ def surface_uncovered(out=None):
               "— look, do NOT relaunch (a relaunch discards context, and this "
               "is an unread fact, not a proven gap):" % len(unknown), file=out)
         for p in unknown:
-            print("  pid %-7d %-14s %s" % (p["pid"], "UNKNOWN", p["reason"]),
+            print("  pid %-7s %-14s %s" % (pid(p), "UNKNOWN", p["reason"]),
                   file=out)
     scanned_sign = unsigned_panes(panes=one_scan)
     # SAME SPLIT AS THE COVERAGE BUCKET ABOVE, for the same reason. "Posting
@@ -4242,7 +4352,7 @@ def surface_uncovered(out=None):
               "— look, do NOT relaunch (unread, not proven unsigned):"
               % len(sign_unknown), file=out)
         for p in sign_unknown:
-            print("  pid %-7d %-14s %s" % (p["pid"], "UNKNOWN",
+            print("  pid %-7s %-14s %s" % (pid(p), "UNKNOWN",
                                            p["sign_reason"]), file=out)
     if sign_info:
         print("helm hooks: %d running pane(s) launched outside `helm launch` "
@@ -4259,7 +4369,9 @@ _CODEX_PENDING = ("codex: recipe pending — docs/HOOKS.md carries no mechanical
 _USAGE = """usage: helm hooks install [--harness claude|codex] [--home NAME] [--project DIR] [--dry]
        helm hooks status
        helm hooks latency [--json] [--since T] [--until T]   (T carries a zone: a trailing Z or an offset)
+       helm hooks latency --hours H [--json]   (the END window stream: each hook's rows and p95/p99 over H hours, every timed-out row with the raw box readings at its END)
        helm hooks sync [--apply]   (reconcile every home to the canonical set)
+       helm hooks run <EVENT> [--tool NAME] [--hook-json]   (every in-process handler for one event, in one interpreter)
        helm hooks preflight --config-dir DIR   (may a session start here? resolve+refresh+verify; fail-closed)"""
 
 
@@ -4276,12 +4388,18 @@ def _select_homes(name):
 
 
 def cmd_hooks(args):
-    """hooks [install [--harness claude|codex] [--home NAME] [--project DIR] [--dry] | status
-    | sync [--apply] | run <EVENT> [--tool NAME] [--hook-json]] — self-wire the
-    complete hook contract into every claude home and seat config dir; sync
-    (envtidy) reconciles every home to the named canonical hook set, dry-run by
-    default; run dispatches every in-process handler for one event in a SINGLE
-    interpreter (the one-spawn-per-event door, task/630)."""
+    """hooks install [--harness claude|codex] [--home NAME] [--project DIR] [--dry] | status
+    | latency [--json] [--since T] [--until T] | latency --hours H [--json]
+    | sync [--apply]
+    | run <EVENT> [--tool NAME] [--hook-json] | preflight --config-dir DIR —
+    self-wire the complete hook contract into every claude home and seat config
+    dir; latency reports the retained hook stage telemetry (with --hours, the
+    END window stream); sync (envtidy)
+    reconciles every home to the named canonical hook set, dry-run by default;
+    run dispatches every in-process handler for one event in a SINGLE
+    interpreter (the one-spawn-per-event door, task/630); preflight answers
+    whether a session may start in DIR, fail-closed (the call a generated
+    launch.sh makes)."""
     args = list(args)
     if not args:
         print(_USAGE, file=sys.stderr)

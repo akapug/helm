@@ -47,8 +47,14 @@ def setUpModule():
 
 
 def tearDownModule():
+    # BACK TO None, not merely stopped: tests/test_source_clean_landed.py
+    # holds this module, so the slice runner's data audit reads a global left
+    # re-bound as state another unit can see (measured: both sliced whole
+    # suites of a tree carrying that reference failed their leak audit here).
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    _LIVE_SEATS_PATCH = None
 
 
 def _rc(*argv):
@@ -68,8 +74,12 @@ class TrainBase(_landreq.LandReqBase):
         super().setUp()
         self.spawns, self.measures, self.observes = [], [], []
         self.kills, self.gens, self.detached = [], {}, []
+        self.exclusions = []
         self.store = gatewindow.runs_path(
             os.path.join(self.tmp, "helm", "_global"))
+        # The borrowed WindowBase.observe reads the window store as
+        # `self.path` to answer with each row's own tree.
+        self.path = self.store
         # THIS FIXTURE DECLARES ITS TRUNK AUTHORITY, the way the helm checkout
         # does: this repository's own main, with no remote. `--apply` refuses
         # an undeclared or unreadable authority, so an arm about anything else

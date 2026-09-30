@@ -512,7 +512,7 @@ class MemoryBaseDoctorTest(unittest.TestCase):
         self.assertEqual(len(msgs), 1, msgs)
         for want in ("seat-a", "linked-fixture", "permission prompt",
                      "--resume %s" % SID, "helm launch --seat seat-a --home "
-                     "linked-fixture", "never types into a pane"):
+                     "linked-fixture", "does not relaunch a seat itself"):
             self.assertIn(want, msgs[0])
 
     def test_a_current_fleet_is_ok_and_the_fail_arm_is_real(self):

@@ -23,6 +23,7 @@ from unittest import mock
 # nothing about import order.
 from helm import (chat, dispatches, doctor, home, pk, projscope, seat,  # noqa: F401
                   whoami, wiring)
+from tests._tmphome import fake_user_systemd
 
 
 def levels(results, level):
@@ -49,6 +50,11 @@ class DoctorBase(unittest.TestCase):
         self.addCleanup(self.envp.stop)
         os.environ.pop("MELD_HOME", None)
         self.assertTrue(home.helm_home().startswith(self.tmp.name))
+        # A full report reads systemd: the chat node's unit state and every
+        # timer's health. On the host's systemctl the verdict was whatever that
+        # box's user manager said (tests/__init__.py now refuses it), so every
+        # question here gets a box with no systemd.
+        fake_user_systemd(self, rc=1, home=False)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -188,6 +194,73 @@ class TestChecks(DoctorBase):
         results = doctor.check_adoption()
         self.assertTrue(any("adopted-proj" in m and "adoption conflict" in m
                             for m in levels(results, doctor.WARN)))
+
+    def test_check_projects_unreadable_registry_is_fail(self):
+        # An unreadable registry must not be mistaken for a healthy empty one:
+        # the check that reads the projects must surface the exception it
+        # caught, not swallow it into a silent [].
+        from helm import registry
+        with mock.patch.object(registry, "load",
+                               side_effect=ValueError("boom")):
+            res = doctor.check_projects()
+        fails = levels(res, doctor.FAIL)
+        self.assertEqual(len(fails), 1)
+        self.assertIn("registry unreadable", fails[0])
+        self.assertIn("ValueError", fails[0])
+        self.assertIn("project checks skipped", fails[0])
+
+    def test_check_projects_unreadable_registry_oserror_is_fail(self):
+        from helm import registry
+        with mock.patch.object(registry, "load",
+                               side_effect=OSError("boom")):
+            res = doctor.check_projects()
+        fails = levels(res, doctor.FAIL)
+        self.assertEqual(len(fails), 1)
+        self.assertIn("registry unreadable", fails[0])
+        self.assertIn("OSError", fails[0])
+        self.assertIn("project checks skipped", fails[0])
+
+    def test_check_adoption_unreadable_registry_is_fail(self):
+        from helm import registry
+        with mock.patch.object(registry, "load",
+                               side_effect=ValueError("boom")):
+            res = doctor.check_adoption()
+        fails = levels(res, doctor.FAIL)
+        self.assertEqual(len(fails), 1)
+        self.assertIn("registry unreadable", fails[0])
+        self.assertIn("ValueError", fails[0])
+        self.assertIn("adoption checks skipped", fails[0])
+
+    def test_check_adoption_unreadable_registry_oserror_is_fail(self):
+        from helm import registry
+        with mock.patch.object(registry, "load",
+                               side_effect=OSError("boom")):
+            res = doctor.check_adoption()
+        fails = levels(res, doctor.FAIL)
+        self.assertEqual(len(fails), 1)
+        self.assertIn("registry unreadable", fails[0])
+        self.assertIn("OSError", fails[0])
+        self.assertIn("adoption checks skipped", fails[0])
+
+    def test_check_projects_readable_empty_projects_is_silent(self):
+        # CONTROL: a readable registry with no projects is a healthy zero,
+        # not an alarm. The unreadable FAIL must not fire on the empty-but-valid
+        # read, or a well-formed empty registry would read like a broken one.
+        self.seed_home()
+        from helm import registry
+        with mock.patch.object(registry, "load",
+                               return_value={"projects": {}}):
+            res = doctor.check_projects()
+        self.assertEqual(res, [])
+
+    def test_check_adoption_readable_empty_projects_is_silent(self):
+        self.seed_home()
+        from helm import registry
+        with mock.patch.object(registry, "load",
+                               return_value={"projects": {}}):
+            res = doctor.check_adoption()
+        self.assertEqual(res, [])
+        self.assertEqual(levels(res, doctor.FAIL), [])
 
     def test_adopted_store_counts_and_dup_warn(self):
         d = self.seed_adopted()
@@ -2742,16 +2815,16 @@ class IntentActualCheckTest(DoctorBase):
                 "access_token": "hdr.%s.sig" % claims}
 
     def test_UNDER_intent_FIRES_and_names_the_observed_side(self):
-        """THE MUST-HIT. Declared 2 ultra + 1 team, wired 1 ultra + 1 team:
+        """THE MUST-HIT. Declared 2 pro + 1 team, wired 1 pro + 1 team:
         the rung must WARN and name the tier that is short, the observed
         counts, and never the tier that is satisfied."""
         self._pool([self._cred("a@x.example", "pro"),
                     self._cred("b@y.example", "team")])
-        self._intent({"ultra": 2, "team": 1})
+        self._intent({"pro": 2, "team": 1})
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
-        self.assertIn("ultra: 1 wired of 2 declared", warns[0], warns[0])
+        self.assertIn("pro: 1 wired of 2 declared", warns[0], warns[0])
         self.assertNotIn("team: 1 wired of 1", warns[0],
                          "a satisfied tier must not read as short: %r" % warns[0])
 
@@ -2761,7 +2834,7 @@ class IntentActualCheckTest(DoctorBase):
         rung that cries wolf about an unarmed family is muted within a week,
         which is the same harm as the silence it exists to cure."""
         self._pool([self._cred("a@x.example", "pro")])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "matched intent must not warn: %r" % out)
@@ -2781,7 +2854,7 @@ class IntentActualCheckTest(DoctorBase):
         """A wired-but-dead slot occupies the pool and the proxy cannot draw
         on it; even with intent met it is harm and must be named, not passed."""
         self._pool([self._cred("a@x.example", "pro"), None])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -2800,11 +2873,11 @@ class IntentActualCheckTest(DoctorBase):
         files = [r for r in codexhomes.codex_pooled()
                  if r.get("account_id") == "acct-a@x.example"]
         self.assertEqual(len(files), 2, "the fixture must actually double-pool")
-        self._intent({"ultra": 1, "team": 1})
+        self._intent({"pro": 1, "team": 1})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "one account in two files must not warn: %r" % out)
-        self.assertTrue(any("ultra=1" in m for _l, m in out), out)
+        self.assertTrue(any("pro=1" in m for _l, m in out), out)
 
     def test_a_surplus_is_named_not_hidden_in_the_OK(self):
         """MORE wired than declared is a finding too — a stale intent file or
@@ -2812,7 +2885,7 @@ class IntentActualCheckTest(DoctorBase):
         into the OK line."""
         self._pool([self._cred("a@x.example", "pro"),
                     self._cred("b@y.example", "team")])
-        self._intent({"ultra": 1})           # team wired, no team declared
+        self._intent({"pro": 1})           # team wired, no team declared
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -2826,7 +2899,7 @@ class IntentActualCheckTest(DoctorBase):
         cred = self._cred("a@x.example", "pro")
         cred["expired"] = "2020-01-01T00:00:00+00:00"   # a PAST expiry
         self._pool([cred])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -2841,7 +2914,7 @@ class IntentActualCheckTest(DoctorBase):
         cred = self._cred("a@x.example", "pro")
         cred["expired"] = "2099-01-01T00:00:00+00:00"  # a FUTURE expiry = healthy
         self._pool([cred])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "a future expiry must read healthy, not off: %r" % out)
@@ -2853,7 +2926,7 @@ class IntentActualCheckTest(DoctorBase):
         credential."""
         cred = self._cred("a@x.example", "pro")
         self._pool([cred])
-        self._intent({"ultra": 1, "team": 1})   # only one account, two tiers wanted
+        self._intent({"pro": 1, "team": 1})   # only one account, two tiers wanted
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -2864,7 +2937,7 @@ class IntentActualCheckTest(DoctorBase):
         says a tier should hold NOTHING means it, and anything wired there is
         a surplus the want>0 guard would hide."""
         self._pool([self._cred("b@y.example", "team")])
-        self._intent({"ultra": 0, "team": 0})
+        self._intent({"pro": 0, "team": 0})
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -2876,7 +2949,7 @@ class IntentActualCheckTest(DoctorBase):
         everywhere and must surface on every WARN path."""
         self._pool([self._cred("a@x.example", "pro"),
                     self._cred("b@y.example", "team"), None])
-        self._intent({"ultra": 1})           # team surplus + one dead file
+        self._intent({"pro": 1})           # team surplus + one dead file
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -2889,7 +2962,7 @@ class IntentActualCheckTest(DoctorBase):
         duplicate credential."""
         cred = self._cred("a@x.example", "pro", disabled=True)
         self._pool([cred])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -2903,7 +2976,7 @@ class IntentActualCheckTest(DoctorBase):
         cred = self._cred("a@x.example", "pro")
         cred["expired"] = "2099-01-01T00:00:00Z"       # canonical Zulu, healthy
         self._pool([cred])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "a Z-suffixed future expiry must read healthy: %r" % out)
@@ -2925,7 +2998,7 @@ class IntentActualCheckTest(DoctorBase):
         bad = self._cred("a@x.example", "pro")
         bad["expired"] = "not a timestamp"          # present, unreadable
         self._pool([bad])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         self.assertTrue(any("expired" in m for _l, m in out),
                         "a present-but-unparseable expiry must count off: %r" % out)
@@ -2940,7 +3013,7 @@ class IntentActualCheckTest(DoctorBase):
                 cred = self._cred("a@x.example", "pro")
                 cred["expired"] = badval
                 self._pool([cred])
-                self._intent({"ultra": 1})
+                self._intent({"pro": 1})
                 out = doctor.check_intent_actual()
                 self.assertTrue(
                     any("expired" in m for _l, m in out),
@@ -2955,7 +3028,7 @@ class IntentActualCheckTest(DoctorBase):
         creds = [self._cred("a@x.example", "pro", disabled=True),
                  self._cred("b@y.example", "team", disabled=True)]
         self._pool(creds)
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -2979,7 +3052,7 @@ class IntentActualCheckTest(DoctorBase):
         rows = [r for r in codexhomes.codex_pooled()
                 if r.get("account_id") == "acct-a@x.example"]
         self.assertEqual(len(rows), 2, "the fixture must double-pool one id")
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "two records with one account_id must count once: %r" % out)
@@ -2989,18 +3062,18 @@ class IntentActualCheckTest(DoctorBase):
         one credential, not two."""
         self._pool([self._cred("a@x.example", "pro"),
                     self._cred("A@X.EXAMPLE", "pro")])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "case variants of one account must not warn: %r" % out)
-        self.assertTrue(any("ultra=1" in m for _l, m in out), out)
+        self.assertTrue(any("pro=1" in m for _l, m in out), out)
 
     def test_an_all_dead_pool_is_UNKNOWN_never_a_measured_zero(self):
         """EVERY file unparseable reads identically to an empty pool through
         the count — and an unreadable pool collapsing to a measured zero is
         the exact failure this rung refuses. UNKNOWN, with the reason."""
         self._pool([None, None])                      # two unparseable files
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -3013,7 +3086,7 @@ class IntentActualCheckTest(DoctorBase):
         even at the declared count, and the OK line must not swallow it."""
         cred = self._cred("a@x.example", "pro", disabled=True)
         self._pool([cred, self._cred("b@y.example", "pro")])
-        self._intent({"ultra": 1})                  # one live, one off, want one
+        self._intent({"pro": 1})                  # one live, one off, want one
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -3025,7 +3098,7 @@ class IntentActualCheckTest(DoctorBase):
         WARN path, exact match included."""
         cred = self._cred("a@x.example", "pro", disabled=True)
         self._pool([cred, self._cred("b@y.example", "pro"), None])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -3044,11 +3117,11 @@ class IntentActualCheckTest(DoctorBase):
         rows = [r for r in codexhomes.codex_pooled()
                 if r.get("email") == "a@x.example"]
         self.assertEqual(len(rows), 2, "the fixture must actually double-present")
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "one account under two aliases must not warn: %r" % out)
-        self.assertTrue(any("ultra=1" in m for _l, m in out), out)
+        self.assertTrue(any("pro=1" in m for _l, m in out), out)
 
     def test_a_transitive_alias_bridge_counts_once_in_BOTH_orderings(self):
         """THE TRANSITIVE BRIDGE. A legacy record spelling only the old
@@ -3073,20 +3146,20 @@ class IntentActualCheckTest(DoctorBase):
                 rows = codexhomes.codex_pooled()
                 self.assertEqual(len(rows), 3,
                                  "the fixture must actually triple-pool")
-                self._intent({"ultra": 1})
+                self._intent({"pro": 1})
                 out = doctor.check_intent_actual()
                 self.assertFalse(
                     levels(out, doctor.WARN),
                     "one account across a transitive bridge must count once: "
                     "%r" % out)
-                self.assertTrue(any("ultra=1" in m for _l, m in out), out)
+                self.assertTrue(any("pro=1" in m for _l, m in out), out)
         # control: a genuinely distinct second account still counts as two
         self._pool([legacy, bridge, refreshed, self._cred("c@z.example", "pro")])
-        self._intent({"ultra": 2})
+        self._intent({"pro": 2})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "bridge + one distinct account must be two: %r" % out)
-        self.assertTrue(any("ultra=2" in m for _l, m in out), out)
+        self.assertTrue(any("pro=2" in m for _l, m in out), out)
 
     def test_an_OFF_bridge_still_unifies_the_LIVE_account(self):
         """LIVENESS FILTERS THE COUNT, NEVER THE IDENTITY GRAPH.
@@ -3112,10 +3185,10 @@ class IntentActualCheckTest(DoctorBase):
                     ("off" if r.get("disabled") else "live", r.get("email"))
                     for r in order]):
                 self._pool(list(order))
-                self._intent({"ultra": 1})
+                self._intent({"pro": 1})
                 out = doctor.check_intent_actual()
                 self.assertTrue(
-                    any("meets intent (ultra=1)" in m for _l, m in out), out)
+                    any("meets intent (pro=1)" in m for _l, m in out), out)
                 self.assertFalse(
                     any("wired of 1 declared" in m for _l, m in out),
                     "the OFF bridge must keep one live account from "
@@ -3125,9 +3198,9 @@ class IntentActualCheckTest(DoctorBase):
                     "identity evidence must not make the disabled row live: "
                     "%r" % out)
         self._pool([legacy, refreshed])
-        self._intent({"ultra": 2})
+        self._intent({"pro": 2})
         out = doctor.check_intent_actual()
-        self.assertTrue(any("observed live: ultra=2" in m for _l, m in out), out)
+        self.assertTrue(any("observed live: pro=2" in m for _l, m in out), out)
 
     @staticmethod
     def _jwt(claims):
@@ -3166,35 +3239,35 @@ class IntentActualCheckTest(DoctorBase):
         distinct = self._cred("c@z.example", "pro")
         # THE UNCONDITIONAL POSITIVE, on the same observable the loops read:
         # the fixture really does hold three files for one account, and the
-        # rung really does emit an ultra count for them.
+        # rung really does emit a pro count for them.
         from helm import codexhomes
         self._pool([legacy, refreshed, bridge])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         self.assertEqual(len(codexhomes.codex_pooled()), 3,
                          "the fixture must actually triple-pool one account")
-        self.assertTrue(any("ultra=1" in m for _l, m
+        self.assertTrue(any("pro=1" in m for _l, m
                             in doctor.check_intent_actual()),
                         "one account in three files is ONE unit")
         for order in itertools.permutations((legacy, refreshed, bridge)):
             with self.subTest(order=[r.get("account_id", "-") for r in order]):
                 self._pool(list(order))
-                self._intent({"ultra": 1})
+                self._intent({"pro": 1})
                 out = doctor.check_intent_actual()
                 self.assertFalse(
                     levels(out, doctor.WARN),
                     "one account across a bridge must count once in EVERY "
                     "order: %r" % out)
-                self.assertTrue(any("ultra=1" in m for _l, m in out), out)
+                self.assertTrue(any("pro=1" in m for _l, m in out), out)
         for order in itertools.permutations((legacy, refreshed, bridge, distinct)):
             with self.subTest(control=[r.get("account_id", "-") for r in order]):
                 self._pool(list(order))
-                self._intent({"ultra": 2})
+                self._intent({"pro": 2})
                 out = doctor.check_intent_actual()
                 self.assertFalse(
                     levels(out, doctor.WARN),
                     "a bridge plus a DISTINCT account is two in EVERY order: "
                     "%r" % out)
-                self.assertTrue(any("ultra=2" in m for _l, m in out), out)
+                self.assertTrue(any("pro=2" in m for _l, m in out), out)
 
     def test_a_row_whose_identity_cannot_be_READ_is_COUNTED_not_SKIPPED(self):
         """CANNOT-DEDUPE-THEN-COUNT-IT, in the direction the contract names.
@@ -3218,9 +3291,9 @@ class IntentActualCheckTest(DoctorBase):
         self.assertEqual([r.get("account_id") for r in rows], [None, None],
                          "the fixture must actually present NO identity")
         self.assertEqual([r.get("email") for r in rows], [None, None], rows)
-        self._intent({"ultra": 2})
+        self._intent({"pro": 2})
         out = doctor.check_intent_actual()
-        self.assertTrue(any("ultra=2" in m for _l, m in out),
+        self.assertTrue(any("pro=2" in m for _l, m in out),
                         "two identity-less rows are two counted units: %r" % out)
         self.assertFalse(any("wired of 2" in m for _l, m in out),
                          "an unidentifiable row must never be SKIPPED: %r" % out)
@@ -3264,25 +3337,25 @@ class IntentActualCheckTest(DoctorBase):
         rows = codexhomes.codex_pooled()          # control: one email, two ids
         self.assertEqual({r["email"] for r in rows}, {placeholder}, rows)
         self.assertEqual(len({r["account_id"] for r in rows}), 2, rows)
-        self.assertEqual({r["tier"] for r in rows}, {"ultra"}, rows)
-        self._intent({"ultra": 2})
+        self.assertEqual({r["tier"] for r in rows}, {"pro"}, rows)
+        self._intent({"pro": 2})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "two account_ids under one email spelling are TWO "
                          "credentials: %r" % out)
-        self.assertTrue(any("ultra=2" in m for _l, m in out), out)
+        self.assertTrue(any("pro=2" in m for _l, m in out), out)
         self._pool([dict(first, email="shared@x.example"),
                     dict(second, email="shared@x.example")])
         out = doctor.check_intent_actual()
-        self.assertTrue(any("ultra=2" in m for _l, m in out),
+        self.assertTrue(any("pro=2" in m for _l, m in out),
                         "a REAL shared address must not merge two account "
                         "ids either: %r" % out)
         self._pool([first, dict(first)])          # must-miss: ONE account
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "one account in two files still counts once: %r" % out)
-        self.assertTrue(any("ultra=1" in m for _l, m in out), out)
+        self.assertTrue(any("pro=1" in m for _l, m in out), out)
 
     def test_ONE_account_at_TWO_tiers_is_a_CONFLICT_not_first_file_wins(self):
         """A TIER IS A FACT ABOUT AN ACCOUNT; TWO RECORDS THAT DISAGREE HAVE
@@ -3305,13 +3378,13 @@ class IntentActualCheckTest(DoctorBase):
         rows = codexhomes.codex_pooled()
         self.assertEqual(len({r["account_id"] for r in rows}), 1,
                          "the fixture must pool ONE account twice")
-        self.assertEqual({r["tier"] for r in rows}, {"ultra", "team"}, rows)
-        self._intent({"ultra": 1})
+        self.assertEqual({r["tier"] for r in rows}, {"pro", "team"}, rows)
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
         self.assertIn("acct-a@x.example", warns[0], warns[0])
-        self.assertIn("ultra", warns[0], warns[0])
+        self.assertIn("pooled as pro (", warns[0], warns[0])
         self.assertIn("team", warns[0], warns[0])
         self.assertFalse(any("meet declared intent" in m for _l, m in out),
                          "a tier conflict must never read as all-clear: %r" % out)
@@ -3319,12 +3392,12 @@ class IntentActualCheckTest(DoctorBase):
                       access_token=self._jwt({"sub": "no plan claim"}))
         self._pool([self._cred("a@x.example", "pro"), noplan])
         rows = codexhomes.codex_pooled()
-        self.assertEqual({r["tier"] for r in rows}, {"ultra", None},
+        self.assertEqual({r["tier"] for r in rows}, {"pro", None},
                          "the fixture must present one KNOWN and one ABSENT tier")
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN),
                          "an ABSENT tier is not a disagreement: %r" % out)
-        self.assertTrue(any("ultra=1" in m for _l, m in out), out)
+        self.assertTrue(any("pro=1" in m for _l, m in out), out)
 
     def test_OFF_accounts_beside_CORRUPT_files_are_not_ALL_UNPARSEABLE(self):
         """A MIXED POOL HAS NO SINGLE-CAUSE SENTENCE.
@@ -3341,7 +3414,7 @@ class IntentActualCheckTest(DoctorBase):
         still say so — otherwise the cure is just the other single-cause
         sentence."""
         self._pool([self._cred("a@x.example", "pro", disabled=True), None])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         warns = levels(out, doctor.WARN)
         self.assertEqual(len(warns), 1, out)
@@ -3374,8 +3447,8 @@ class IntentActualCheckTest(DoctorBase):
         # THE UNCONDITIONAL POSITIVE, on the same observable each subTest
         # reads: a READABLE identity counts through this same path.
         self._pool([self._cred("a@x.example", "pro")])
-        self._intent({"ultra": 1})
-        self.assertTrue(any("ultra=1" in m for _l, m
+        self._intent({"pro": 1})
+        self.assertTrue(any("pro=1" in m for _l, m
                             in doctor.check_intent_actual()),
                         "a readable identity must count through this path")
         for bad in (123, {"a": 1}, ["x"], True):
@@ -3383,9 +3456,9 @@ class IntentActualCheckTest(DoctorBase):
                 self._pool([dict(self._cred("a@x.example", "pro"), email=bad)])
                 self.assertEqual([r["email"] for r in codexhomes.codex_pooled()],
                                  [bad], "the fixture must carry the raw value")
-                self._intent({"ultra": 1})
+                self._intent({"pro": 1})
                 out = doctor.check_intent_actual()
-                self.assertTrue(any("ultra=1" in m for _l, m in out),
+                self.assertTrue(any("pro=1" in m for _l, m in out),
                                 "a non-string email must not lose the account: "
                                 "%r" % out)
                 self._pool([dict(self._cred("a@x.example", "pro", disabled=True),
@@ -3397,7 +3470,7 @@ class IntentActualCheckTest(DoctorBase):
                              "access_token":
                                  self._cred("a@x.example", "pro")["access_token"]}])
                 out = doctor.check_intent_actual()
-                self.assertTrue(any("ultra=1" in m for _l, m in out),
+                self.assertTrue(any("pro=1" in m for _l, m in out),
                                 "an all-unreadable identity is still ONE "
                                 "counted row: %r" % out)
 
@@ -3418,7 +3491,7 @@ class IntentActualCheckTest(DoctorBase):
         under declared intent IS a real shortfall and must keep saying so, or
         the cure has just moved the vacuity to the other side."""
         auth = self._pool([])
-        self._intent({"ultra": 2})
+        self._intent({"pro": 2})
         out = doctor.check_intent_actual()
         self.assertTrue(any("0 wired of 2 declared" in m for _l, m in out),
                         "a READABLE empty pool is a measured shortfall: %r" % out)
@@ -3445,7 +3518,7 @@ class IntentActualCheckTest(DoctorBase):
         """A pool dir that cannot be read is not a fleet with zero wired —
         the rung must say UNKNOWN, because 'empty' and 'could not look' are
         opposite facts and only one licenses the shortfall sentence."""
-        self._intent({"ultra": 2})
+        self._intent({"pro": 2})
         # no pool dir at all: pool_dir() points at a path that was never made
         from helm import codexhomes
         self.assertFalse(os.path.isdir(codexhomes.pool_dir()),
@@ -3475,7 +3548,7 @@ class IntentActualCheckTest(DoctorBase):
         used. Everything else is the shipped rung over real files."""
         auth = self._pool([self._cred("a@x.example", "pro"),
                            self._cred("b@y.example", "pro")])
-        self._intent({"ultra": 2})
+        self._intent({"pro": 2})
         # THE CONTROL COMES FIRST and is the answer that must survive: the
         # same populated pool, read normally, MEETS the declared intent.
         # Blast radius: one rung call over two real pool files — it goes red
@@ -3511,7 +3584,7 @@ class IntentActualCheckTest(DoctorBase):
 
         Blast radius: three rung calls over the same intent file. Each leg
         asserts a PRESENT answer, so none of them can pass by absence."""
-        self._intent({"ultra": 2})
+        self._intent({"pro": 2})
         from helm import codexhomes
         auth = codexhomes.pool_dir()
         # 1. absent from the start — the isdir guard's own UNKNOWN
@@ -3540,7 +3613,7 @@ class IntentActualCheckTest(DoctorBase):
                       "the rung is defined but doctor will never call it")
         self._pool([self._cred("a@x.example", "pro"),
                     self._cred("b@y.example", "team")])
-        self._intent({"ultra": 2, "team": 1})
+        self._intent({"pro": 2, "team": 1})
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             try:
@@ -3599,10 +3672,10 @@ class IntentActualCheckTest(DoctorBase):
                                  "user-fake-solo", "acct-fake-solo"),
                     self._member("solo@personal.example", "pro", None,
                                  "acct-fake-solo")])
-        self._intent({"ultra": 1})
+        self._intent({"pro": 1})
         out = doctor.check_intent_actual()
         self.assertFalse(levels(out, doctor.WARN), out)
-        self.assertTrue(any("ultra=1" in m for _l, m in out), out)
+        self.assertTrue(any("pro=1" in m for _l, m in out), out)
 
 
 if __name__ == "__main__":
@@ -3805,6 +3878,34 @@ class GuardCensusTest(DoctorBase):
         self.assertFalse(any("guard" in m for m in warns), warns)
         self.assertIsNone(doctor._repo_guard_state(plain))
         self.assertEqual(doctor._repo_guard_state(self.repo), "unguarded")  # positive control
+
+    def test_a_guard_check_that_raises_is_UNKNOWN_naming_it_never_drift(self):
+        """A raise inside the guard check is not a stale guard: the state is
+        UNKNOWN with the exception class, and its WARN says it could not be
+        read instead of sending the operator to refresh a guard."""
+        from helm.work import _guard
+        rc, lines = _guard.install_guard(self.repo, apply=True, profile="leak")
+        self.assertEqual(rc, 0, lines)
+        self.assertEqual(doctor._repo_guard_state(self.repo), "guarded")  # control
+        with mock.patch.object(_guard, "stale_guard_hooks",
+                               side_effect=RuntimeError("boom")):
+            state = doctor._repo_guard_state(self.repo)
+            warns = levels(doctor.check_projects(), doctor.WARN)
+        self.assertEqual(state, "unknown:RuntimeError")
+        hits = [m for m in warns if "COULD NOT BE READ" in m]
+        self.assertEqual(len(hits), 1, warns)
+        self.assertIn("RuntimeError", hits[0])
+        self.assertIn("proj", hits[0])
+        self.assertFalse(any("stale, partial or unreadable" in m
+                             for m in warns), warns)
+
+    def test_a_root_lookup_that_raises_is_UNKNOWN_not_nothing_to_guard(self):
+        """The same law one read earlier: a raise while finding the repo
+        root is UNKNOWN, never the None of a path that is not a repo."""
+        with mock.patch("helm.work._lanes.find_root",
+                        side_effect=OSError("boom")):
+            self.assertEqual(doctor._repo_guard_state(self.repo),
+                             "unknown:OSError")
 
 
 class KeepaliveCadenceRungTest(DoctorBase):
@@ -4242,6 +4343,152 @@ class CredCopyStalenessRungTest(DoctorBase):
         self.assertIn("check_keepalive_cadence", doctor.CHECKS)
 
 
+class BurnFlagsLocalFamilyRungTest(DoctorBase):
+    """A local family has a money reader: the certification by its operator
+    seat, from that seat's own roster-bound session. The burn-flag rung must
+    not call it "a reader nobody built", a local family without a fresh
+    certification is not a fault, and a certification nothing stands behind
+    is."""
+
+    #: seat-a's harness session, in the shape the harness mints one
+    SID = "d0c70001-0000-4000-8000-000000000001"
+    LOCAL = "qwenlocal"  # noqa: SEAT_NAME — a catalog FAMILY key, never a seat
+
+    def setUp(self):
+        super().setUp()
+        # seat-a is the OPERATOR SEAT of every local family, named by this
+        # host's local names as production reads them, and SID is its session
+        # on the roster
+        from helm import localnames
+        from tests._tmphome import corroborate
+        os.makedirs(home.global_dir(), exist_ok=True)
+        with open(os.path.join(home.global_dir(), localnames.CONFIG), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"local-operator-seat": "seat-a"}, fh)
+        localnames._cache["stat"] = None
+        self.addCleanup(corroborate("seat-a", self.SID))
+
+    def _snapshot(self, certified):
+        from helm import burnflags
+        now = time.time()
+        # one file per world: the uncertified world must not read the file
+        # an earlier call in the same arm certified into
+        path = os.path.join(self.tmp.name, "certifications-%s.json"
+                            % (certified or "none"))
+        if certified:
+            ok, err = burnflags.certify_local(certified, now + 7200,
+                                              by="seat-a", session=self.SID,
+                                              now=now, path=path)
+            self.assertTrue(ok, err)
+        return burnflags.fold({"local_certifications":
+                               burnflags.read_local_certifications(path)},
+                              now=now)
+
+    def _rung(self, snap):
+        from helm import burnflags
+        with mock.patch.object(burnflags, "cached_snapshot",
+                               lambda *a, **k: (snap, 5)):
+            return doctor.check_burn_flags()
+
+    def test_a_local_family_is_not_reported_as_a_reader_nobody_built(self):
+        from helm import burnflags
+        local = burnflags.local_families()
+        self.assertIn("qwenlocal", local)
+        rows = self._rung(self._snapshot("qwenlocal"))
+        blind = [m for m in levels(rows, doctor.WARN) if "NO money reader" in m]
+        self.assertEqual(len(blind), 1, rows)
+        for family in local:
+            self.assertNotIn(family, blind[0])
+        # CONTROL: a non-local family with no reader is still named there
+        self.assertIn("kimi", blind[0])
+        said = [m for m in levels(rows, doctor.OK) if "certify-local" in m]
+        self.assertEqual(len(said), 1, rows)
+        self.assertIn("certified now: qwenlocal", said[0])
+        # an uncertified local family is said at OK, never as a WARN
+        bare = self._rung(self._snapshot(None))
+        self.assertFalse([m for m in levels(bare, doctor.WARN)
+                          if "certify-local" in m], bare)
+        self.assertTrue([m for m in levels(bare, doctor.OK)
+                         if "certified now: none" in m], bare)
+
+    def _certify_ago(self, family, lapsed_s, revoke=False):
+        """A two-hour certification through the producer, lapsed `lapsed_s`
+        ago, optionally revoked a minute after it was made."""
+        from helm import burnflags
+        at = time.time() - lapsed_s - 7200
+        ok, err = burnflags.certify_local(family, at + 7200, by="seat-a",
+                                          session=self.SID, now=at)
+        self.assertTrue(ok, err)
+        if revoke:
+            ok, err = burnflags.revoke_local(family, by="seat-a",
+                                             session=self.SID, now=at + 60)
+            self.assertTrue(ok, err)
+
+    def test_a_certification_lapsed_past_one_renewal_period_warns(self):  # noqa: VACUOUS_ASSERTION — the three-hour lapse is asserted to WARN, naming the family and its certifier, at the end of this method
+        from helm import burnflags
+        self.assertEqual(burnflags.CERTIFICATION_LAPSE_WARN_S, 7200)
+
+        def lapse_warns():
+            return [m for m in levels(doctor.check_burn_flags(), doctor.WARN)
+                    if "lapsed" in m]
+        # a certification never made is silent
+        self.assertEqual(lapse_warns(), [])
+        # lapsed an hour, inside one renewal period: silent
+        self._certify_ago("qwenlocal", 3600)
+        self.assertEqual(lapse_warns(), [])
+        # revoked, however long ago: silent
+        self._certify_ago("qwen27", 5 * 3600, revoke=True)
+        self.assertEqual(lapse_warns(), [])
+        # lapsed three hours and never revoked: the timer stopped renewing
+        self._certify_ago("qwenlocal", 3 * 3600)
+        warns = lapse_warns()
+        self.assertEqual(len(warns), 1, warns)
+        self.assertIn("qwenlocal", warns[0])
+        self.assertIn("seat-a", warns[0])
+
+    def test_an_unreadable_certification_file_warns_and_names_itself(self):  # noqa: VACUOUS_ASSERTION — the corrupt file is asserted to WARN once, naming its path
+        from helm import burnflags
+        path = burnflags.local_certifications_path()
+
+        def named():
+            return [m for m in levels(doctor.check_burn_flags(), doctor.WARN)
+                    if path in m]
+        # no file is no certification, and not a fault
+        self.assertEqual(named(), [])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pk.atomic_write(path, "{corrupt")
+        warns = named()
+        self.assertEqual(len(warns), 1, warns)
+        self.assertIn("could not be read", warns[0])
+
+    def test_a_certification_nothing_stands_behind_warns(self):  # noqa: VACUOUS_ASSERTION — the mutated record is asserted to WARN once, naming the family and its operator
+        """A record the fold cannot tie to the operator's session is not the
+        by-design GREY of an uncertified family: it is a certification on
+        file that nothing stands behind, so it is WARNED, read off the
+        snapshot's own cause."""
+        from helm import burnflags
+
+        def unverifiable(snap):
+            return [m for m in levels(self._rung(snap), doctor.WARN)
+                    if "cannot be verified" in m]
+        # the producer's own record is verified, and silent
+        self.assertEqual(unverifiable(self._snapshot(self.LOCAL)), [])
+        # THE ONE MUTATION: the same record with its session key taken off,
+        # the bare `by` a hand-written row carries
+        path = os.path.join(self.tmp.name,
+                            "certifications-%s.json" % self.LOCAL)
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        del payload["families"][self.LOCAL]["session_key"]
+        pk.atomic_write(path, json.dumps(payload))
+        snap = burnflags.fold({"local_certifications":
+                               burnflags.read_local_certifications(path)},
+                              now=time.time())
+        warns = unverifiable(snap)
+        self.assertEqual(len(warns), 1, warns)
+        self.assertIn(self.LOCAL, warns[0])
+        self.assertIn("seat-a", warns[0])
+
 
 class MemoryBaseProbeTest(unittest.TestCase):
     """The memory-base variable is undocumented, so doctor proves Claude Code
@@ -4614,3 +4861,61 @@ class MemoryBaseProbeTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             doctor.cmd_doctor([])
         probe.assert_not_called()
+
+
+class CheckoutImagesCheckTest(DoctorBase):
+    """Images scattered in the helm checkout root go unnoticed and trap
+    text-only seats.  check_checkout_images only reports; it never moves or
+    deletes anything."""
+
+    def test_empty_root_is_clean(self):
+        d = os.path.join(self.tmp.name, "empty-root")
+        os.makedirs(d)
+        self.assertEqual(doctor.check_checkout_images(d)[0],
+                         (doctor.OK, "checkout root holds no image files"))
+
+    def test_images_named_and_counted(self):
+        d = os.path.join(self.tmp.name, "img-root")
+        os.makedirs(d)
+        open(os.path.join(d, "a.png"), "w").close()
+        open(os.path.join(d, "b.JPG"), "w").close()
+        results = doctor.check_checkout_images(d)
+        self.assertEqual(results[0][0], doctor.WARN)
+        self.assertIn("2 image file(s)", results[0][1])
+        self.assertIn("a.png", results[0][1])
+        self.assertIn("b.JPG", results[0][1])
+
+    def test_subdirectory_images_are_not_counted(self):
+        d = os.path.join(self.tmp.name, "sub-img-root")
+        os.makedirs(d)
+        subdir = os.path.join(d, "images")
+        os.makedirs(subdir)
+        open(os.path.join(subdir, "hidden.png"), "w").close()
+        open(os.path.join(d, "readme.txt"), "w").close()
+        results = doctor.check_checkout_images(d)
+        self.assertEqual(results[0][0], doctor.OK)
+
+    def test_seven_images_names_5_and_says_2_more(self):
+        d = os.path.join(self.tmp.name, "big-root")
+        os.makedirs(d)
+        for i in range(7):
+            open(os.path.join(d, "img%d.png" % i), "w").close()
+        results = doctor.check_checkout_images(d)
+        self.assertEqual(results[0][0], doctor.WARN)
+        self.assertIn("7 image file(s)", results[0][1])
+        self.assertIn("and 2 more", results[0][1])
+        for i in range(5):
+            self.assertIn("img%d.png" % i, results[0][1])
+
+    def test_nonexistent_root_warns(self):
+        gone = os.path.join(self.tmp.name, "no-such-dir")
+        results = doctor.check_checkout_images(gone)
+        self.assertEqual(results[0][0], doctor.WARN)
+        self.assertIn("cannot tell (FileNotFoundError)", results[0][1])
+
+    def test_check_is_registered(self):
+        self.assertIn("check_checkout_images", doctor.CHECKS)
+
+
+if __name__ == "__main__":
+    unittest.main()

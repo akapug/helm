@@ -1225,6 +1225,22 @@ def sidechain_beacon_refusal(seat=None):
             "shell." % (who, SIDECHAIN_RULE))
 
 
+def sidechain_spawn_refusal():
+    """Why a subagent's Agent call is refused, and the cure (task/1775).
+
+    A CONTRACT, NOT ADVICE. Measured: a bounded writer re-spawned nested
+    review agents through its coordinator's stop messages, and TaskStop only
+    killed what it minted again. The payload cannot tell a Workflow agent
+    from an Agent-tool subagent (both carry agent_id), so the refusal binds
+    both; a Workflow fans out in its script, and that is no tool call."""
+    return ("Agent called from a subagent. The bounded-delegate contract: a "
+            "subagent or Workflow agent does its own slice and spawns "
+            "nothing. Review or the next slice is its parent's to spawn: "
+            "finish, and report to your parent what should run next. A "
+            "Workflow fans out in its script (agent()), never from inside an "
+            "agent.")
+
+
 def sidechain_authority_refusal(verb, grantable=True):
     """Why a delegate's verdict-class write is refused, and the two doors
     (task/3060). `verb` is "group verb" from helm.delegate_grant.REFUSED.

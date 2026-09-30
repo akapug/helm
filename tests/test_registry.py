@@ -1775,7 +1775,9 @@ class ProjectLightTest(RegistryBase):
         one agents learn from."""
         from helm import burnflags, cli
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        read = lambda *parts: open(os.path.join(root, *parts), encoding="utf-8").read()
+        def read(*parts):
+            with open(os.path.join(root, *parts), encoding="utf-8") as fh:
+                return fh.read()
         help_text = cli._VERB_HELP["burn"]
         card = read("helm", "web_ui", "scripts", "00-core.js.part")
         docs = read("docs", "VERBS.md")
@@ -1801,9 +1803,12 @@ class ProjectLightTest(RegistryBase):
                             if f.endswith((".py", ".md", ".part", ".html", ".js", ".css",
                                            ".txt", ".json"))]
         self.assertGreater(len(shipped), 100, "the walk found no tree to scan")
-        offenders = [(os.path.relpath(path, root), phrase) for path in shipped
-                     for phrase in retired
-                     if phrase in open(path, encoding="utf-8", errors="replace").read()]
+        offenders = []
+        for path in shipped:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            offenders += [(os.path.relpath(path, root), phrase)
+                          for phrase in retired if phrase in text]
         self.assertEqual(offenders, [])
 
     def test_green_is_never_licence_to_speculate(self):

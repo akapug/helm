@@ -355,7 +355,14 @@ class RetipTest(DispatchBase):
             out, err = dispatches.retip(
                 row["id"], candidate, reason="same work on a new base",
                 repo=self.repo, notify=False)
-            proof.assert_called_once_with(row["repo_id"], reviewed, candidate)
+        # ONE call: the primitive owns both readings, and the declared
+        # authority rides in as a lazy trunk it calls only when the pair's
+        # range cannot be read.
+        proof.assert_called_once()
+        self.assertEqual(proof.call_args.args,
+                         (row["repo_id"], reviewed, candidate))
+        self.assertEqual(proof.call_args.kwargs["trunk"](),
+                         (self.git("rev-parse", self.main), None))
         self.assertIsNone(out)
         self.assertIn("identity UNKNOWN", err)
         self.assertIn("patch-id sequence", err)
@@ -395,6 +402,160 @@ class RetipTest(DispatchBase):
                                     reason="incomplete composition",
                                     repo=self.repo, notify=False)
         self.assertIsNone(out)
+        self.assertIn("does not appear as one contiguous run", err)
+        self.assertEqual(dispatches.snapshot()[0][row["id"]]["tip"], reviewed)
+
+    def _train_merged_trunk(self):
+        """(car, trunk): lane commit `car` lands on trunk inside a train
+        MERGE, and a second train merge follows it — the shape trunk takes
+        between a reviewed tip and its rebase."""
+        self.git("checkout", "-q", "-b", "car-landed", self.c)
+        car = self.commit_file("car-landed.txt", "car that landed")
+        self.git("checkout", "-q", "-b", "car-other", self.c)
+        self.commit_file("car-other.txt", "another car")
+        self.git("checkout", "-q", self.main)
+        self.git("merge", "-q", "--no-ff", "-m", "train1", "car-landed")
+        self.git("merge", "-q", "--no-ff", "-m", "train2", "car-other")
+        return car, self.git("rev-parse", "HEAD")
+
+    def test_a_rebase_across_TRAIN_MERGES_verifies_from_each_tips_own_fork(self):
+        """A LIVE REFUSAL, reproduced: a reviewed tip sat on
+        a lane commit that then landed on trunk inside a train merge, and its
+        rebase carried the same one patch — yet retip read UNKNOWN, because
+        the pair's base IS the landed car and the range from it to the
+        rebased tip holds every train merge since (26 of them, live). Each
+        tip's own commits off trunk are one patch apiece, and the same one."""
+        car, trunk = self._train_merged_trunk()
+        reviewed = self._lane_tip(car, "train-reviewed")
+        rebased = self._lane_tip(trunk, "train-rebased")
+        backend = vcs.backend(self.repo)
+        # PREMISE: the pair's base is the landed car, its range carries both
+        # train merges, and so the pair reading is unreadable.
+        self.assertEqual(self.git("merge-base", reviewed, rebased), car)
+        self.assertEqual(self.git("rev-list", "--merges", "--count",
+                                  car + ".." + rebased), "2")
+        self.assertIsNone(backend.patch_sequence(self.repo, car, rebased))
+        row = self.add(recipient="grok", kind="review", ref=reviewed)
+        out, err = dispatches.retip(row["id"], rebased,
+                                    reason="trunk moved through trains",
+                                    repo=self.repo, notify=False)
+        self.assertIsNone(err, err)
+        self.assertEqual((out["tip"], out["identity"]), (rebased, "verified"))
+        self.assertEqual(backend.patch_sequence_containment(
+            self.repo, reviewed, rebased, trunk=trunk),
+            (vcs.PATCH_SEQUENCE_EXACT, 0, 1, 1))
+        # With no declared trunk the primitive falls back to the remote
+        # default branch, and this fixture has no remote, so the same pair on
+        # a fresh row stays UNKNOWN and says why.
+        self._undeclare_authority()
+        bare = self.add(recipient="grok", kind="review", ref=reviewed)
+        out2, err2 = dispatches.retip(bare["id"], rebased, reason="no trunk",
+                                      repo=self.repo, notify=False)
+        self.assertIsNone(out2)
+        self.assertIn("identity UNKNOWN", err2)
+        self.assertIn("no remote default branch resolves", err2)
+        self.assertEqual(dispatches.snapshot()[0][bare["id"]]["tip"], reviewed)
+
+    def test_a_broken_declared_authority_never_falls_back_to_origin_HEAD(self):
+        """A declaration that failed is a contradiction, not permission to
+        discover another authority. The pair reading is deliberately UNKNOWN;
+        origin/HEAD is valid and would authorize this exact move if consulted."""
+        car, trunk = self._train_merged_trunk()
+        reviewed = self._lane_tip(car, "broken-authority-reviewed")
+        rebased = self._lane_tip(trunk, "broken-authority-rebased")
+        backend = vcs.backend(self.repo)
+        self.assertEqual(backend.fork_point(self.repo, reviewed, rebased), car)
+        self.assertIsNone(backend.patch_sequence(self.repo, car, rebased))
+
+        row = self.add(recipient="grok", kind="review", ref=reviewed)
+        self.git("remote", "add", "origin", self.repo)
+        self.git("update-ref", "refs/remotes/origin/main", trunk)
+        self.git("symbolic-ref", "refs/remotes/origin/HEAD",
+                 "refs/remotes/origin/main")
+        self.assertEqual(backend.default_trunk(self.repo),
+                         (trunk, "origin/main"),
+                         "control: discovery could authorize this move")
+        self.git("config", "helm.trunkRef", "refs/heads/nothing-here")
+        ref, _remote, sha, failure = dispatches._declared_authority(
+            row["repo_id"])[0:4]
+        self.assertEqual(ref, "refs/heads/nothing-here")
+        self.assertIsNone(sha)
+        self.assertIn("does not resolve", failure)
+
+        before = pathlib.Path(dispatches.ledger_path()).read_bytes()
+        out, err = dispatches.retip(
+            row["id"], rebased, reason="trunk moved through trains",
+            repo=self.repo, notify=False)
+        self.assertIsNone(out)
+        self.assertIn("identity UNKNOWN", err)
+        self.assertIn("does not resolve", err)
+        self.assertEqual(pathlib.Path(dispatches.ledger_path()).read_bytes(),
+                         before)
+        self.assertEqual(dispatches.snapshot()[0][row["id"]]["tip"], reviewed)
+
+    def test_a_MERGE_inside_the_lanes_own_commits_still_reads_UNKNOWN(self):
+        """The trunk reading forgives trunk's merges, never the lane's: a
+        merge among a tip's own commits has no patch id either."""
+        car, trunk = self._train_merged_trunk()
+        reviewed = self._lane_tip(car, "own-merge-reviewed")
+        rebased = self._lane_tip(trunk, "own-merge-rebased")
+        side = self._lane_tip(trunk, "own-merge-side", body="side\n",
+                              path="side.txt")
+        self.git("checkout", "-q", "-b", "own-merge", rebased)
+        self.git("merge", "-q", "--no-ff", "-m", "merge inside the lane", side)
+        merged = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", self.main)
+        backend = vcs.backend(self.repo)
+        # CONTROL: the same lane without its merge reads EXACT off trunk.
+        self.assertEqual(backend.patch_sequence_containment(
+            self.repo, reviewed, rebased, trunk=trunk),
+            (vcs.PATCH_SEQUENCE_EXACT, 0, 1, 1))
+        self.assertEqual(backend.patch_sequence_containment(
+            self.repo, reviewed, merged, trunk=trunk)[0],
+            vcs.PATCH_SEQUENCE_UNKNOWN)
+        row = self.add(recipient="grok", kind="review", ref=reviewed)
+        out, err = dispatches.retip(row["id"], merged, reason="merged a side",
+                                    repo=self.repo, notify=False)
+        self.assertIsNone(out)
+        self.assertIn("identity UNKNOWN", err)
+        self.assertIn("own commits off trunk " + trunk[:12], err)
+        self.assertEqual(dispatches.snapshot()[0][row["id"]]["tip"], reviewed)
+
+    def test_a_retip_BACK_across_train_merges_is_refused_by_direction(self):
+        """Each tip's own patches are the same in BOTH directions, so the
+        cut alone cannot see direction; the primitive's forward check must."""
+        car, trunk = self._train_merged_trunk()
+        older = self._lane_tip(car, "back-train-older")
+        newer = self._lane_tip(trunk, "back-train-newer")
+        self.assertEqual(vcs.backend(self.repo).patch_sequence_containment(
+            self.repo, newer, older, trunk=trunk),
+            (vcs.PATCH_SEQUENCE_BACKWARD, None, 1, 1))
+        # CONTROL, same pair: FORWARD verifies.
+        fwd = self.add(recipient="grok", kind="review", ref=older)
+        out, err = dispatches.retip(fwd["id"], newer, reason="forward",
+                                    repo=self.repo, notify=False)
+        self.assertIsNone(err, err)
+        self.assertEqual(out["tip"], newer)
+        back = self.add(recipient="grok", kind="review", ref=newer)
+        out2, err2 = dispatches.retip(back["id"], older, reason="backward",
+                                      repo=self.repo, notify=False)
+        self.assertIsNone(out2)
+        self.assertIn("not provably forward", err2)
+        self.assertIn("--supersedes " + back["id"][:12], err2)
+        self.assertEqual(dispatches.snapshot()[0][back["id"]]["tip"], newer)
+
+    def test_a_DIFFERENT_patch_across_train_merges_is_refused_as_absent(self):
+        car, trunk = self._train_merged_trunk()
+        reviewed = self._lane_tip(car, "absent-train-reviewed")
+        other = self._lane_tip(trunk, "absent-train-other",
+                               body="different work\n")
+        row = self.add(recipient="grok", kind="review", ref=reviewed)
+        out, err = dispatches.retip(row["id"], other, reason="other work",
+                                    repo=self.repo, notify=False)
+        self.assertIsNone(out)
+        self.assertIn("does not carry the work reviewed at " + reviewed[:12],
+                      err)
+        self.assertIn("own fork point off trunk " + trunk[:12], err)
         self.assertIn("does not appear as one contiguous run", err)
         self.assertEqual(dispatches.snapshot()[0][row["id"]]["tip"], reviewed)
 

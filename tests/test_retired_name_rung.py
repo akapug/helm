@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end controls for the retired-name pre-commit rung."""
+import ast
 import os
 import shutil
 import subprocess
@@ -585,10 +586,24 @@ class _PkgAFixture(RungBase):
         self.stage("pkg/a.py", self.RETIRED)
         return self.rung()
 
+    def judge(self, src):
+        """`retire_f(src)`, then undo the b commit so the next shape starts
+        from the clean fixture."""
+        r = self.retire_f(src)
+        reset = self.git("reset", "-q", "--hard", "HEAD~1")
+        self.assertEqual(reset.returncode, 0, reset.stderr)
+        return r
+
     def assertRefusesB(self, r):
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn("a.f (retired from pkg/a.py)", r.stderr)
         self.assertIn("pkg/b.py:", r.stderr)
+
+    def assertRefusesAt(self, r, src, text):
+        """`assertRefusesB`, naming the one line of `src` that is `text`."""
+        self.assertRefusesB(r)
+        line = src.splitlines().index(text) + 1
+        self.assertIn("pkg/b.py:%d: %s" % (line, text), r.stderr)
 
     def assertEachRefuses(self, sources):
         """Each source, as pkg/b.py, refuses the retirement of a.f. The b
@@ -752,24 +767,18 @@ class AFilesOwnTopLevelDefIsABindingTest(_PkgAFixture):
     that def. The rung refused with 18 lines of dispatches.py, and the author
     had to commit with HELM_RETIRED_NAME_SKIP=1.
 
-    A BARE spelling in another file is cleared when that file still defines
-    the name by `still_defines`: an unconditional top-level def, async def
-    or class, no module-scope `del` after it, no `global` or `nonlocal` of
-    it. An attribute or an import that can reach the module, an assignment,
-    and a def under a condition all still refuse. Every clearance is paired
-    with a refusal on the same fixture."""
+    The def was the first binder found to clear a bare spelling, and it was
+    cleared by `still_defines` and no wider, so an assignment still refused
+    (task/3418, `ARetiredNameIsKeyedToItsModuleTest`). A BARE spelling in
+    another file is now never a read of the retiring module, whatever binds
+    it there; only a spelling that reads the name FROM the module refuses:
+    `a.f`, an alias of the module, a receiver no import binds, `from pkg.a
+    import f`, a string reach. Every clearance is paired with a refusal on
+    the same fixture."""
 
     OWN = ("from pkg import a\n\n\n"
            "def f():\n    return 0\n\n\n"
            "def run():\n    return a.g(), f()\n")
-
-    def judge(self, src):
-        """`retire_f(src)`, then undo the b commit so the next shape starts
-        from the clean fixture."""
-        r = self.retire_f(src)
-        reset = self.git("reset", "-q", "--hard", "HEAD~1")
-        self.assertEqual(reset.returncode, 0, reset.stderr)
-        return r
 
     def test_a_file_that_DEFINES_the_name_itself_is_not_a_consumer(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same fixture, one real a.f beside the own def, must refuse through assertRefusesB (rc 1 plus the exact refusal line)
         """The 8b9ecd16e00 shape. Red on trunk: `a` is a token in b.py and
@@ -782,9 +791,11 @@ class AFilesOwnTopLevelDefIsABindingTest(_PkgAFixture):
         self.stage("pkg/b.py", self.OWN.replace("a.g(), f()", "a.f(), f()"))
         self.assertRefusesB(self.rung())
 
-    def test_an_own_def_alone_or_an_async_def_or_class_clears(self):  # noqa: VACUOUS_ASSERTION — each shape is paired with the same source plus a module-scope del, which must refuse through assertRefusesB
+    def test_an_own_def_alone_or_an_async_def_or_class_clears(self):  # noqa: VACUOUS_ASSERTION — each shape is paired with the same source plus one real a.f, which must refuse through assertRefusesB
         """The def statement is itself a spelling of the name, so a file
-        whose only use is the def holds the token and is still cleared."""
+        whose only use is the def holds the token and is still cleared. The
+        paired refusal is one read of a.f, not a `del f`: a later `del`
+        unbinds b's own f and reads nothing from a (task/3418)."""
         for own in ("def f():\n    return a.g()\n",
                     "async def f():\n    return a.g()\n",
                     "class f:\n    pass\n"):
@@ -792,7 +803,7 @@ class AFilesOwnTopLevelDefIsABindingTest(_PkgAFixture):
                 src = "from pkg import a\n\n\n" + own
                 r = self.judge(src)
                 self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertRefusesB(self.judge(src + "\n\ndel f\n"))
+                self.assertRefusesB(self.judge(src + "\n\nX = a.f\n"))
 
     def test_a_spelling_that_can_reach_the_module_still_refuses(self):  # noqa: VACUOUS_ASSERTION — assertEachRefuses asserts rc 1 and the exact refusal and path per shape; nothing here asserts an absence
         """CONTROL. Beside the own def: `a.f`, an alias of the module, a
@@ -809,23 +820,39 @@ class AFilesOwnTopLevelDefIsABindingTest(_PkgAFixture):
             "from pkg import a  # noqa: F401" + own
             + "def run():\n    from pkg.a import f\n    return f()\n"))
 
-    def test_a_binder_that_is_not_an_unconditional_def_still_refuses(self):  # noqa: VACUOUS_ASSERTION — assertEachRefuses asserts rc 1 and the exact refusal and path per shape; nothing here asserts an absence
-        """CONTROL. The own-def clearance is `still_defines` and no wider:
-        `from pkg.a import f` with no local def, an assignment, a def under
-        `if` or `try`, a method of the same name, a later module-scope
-        `del`, and a `global` of the name in a function."""
+    def test_a_from_import_of_the_name_still_refuses(self):  # noqa: VACUOUS_ASSERTION — assertEachRefuses asserts rc 1 and the exact refusal and path per shape; nothing here asserts an absence
+        """CONTROL. `from pkg.a import f` binds a's f, with or without an
+        import of the module itself beside it."""
         run = "\n\ndef run():\n    return f()\n"
         self.assertEachRefuses((
             "from pkg import a  # noqa: F401\nfrom pkg.a import f\n\n" + run,
-            "from pkg import a\n\nf = a.g\n\n" + run,
-            "from pkg import a\n\nif a:\n    def f():\n        return 0\n\n"
-            + run,
-            "from pkg import a  # noqa: F401\n\ntry:\n    def f():\n"
-            "        return 0\nexcept NameError:\n    pass\n\n" + run,
-            "from pkg import a  # noqa: F401\n\n\nclass C:\n"
-            "    def f(self):\n        return 0\n\n" + run,
-            self.OWN + "\n\ndel f\n",
-            self.OWN + "\n\ndef drop():\n    global f\n    del f\n"))
+            "from pkg.a import f\n\n" + run))
+
+    def test_any_other_binder_of_the_bare_name_is_admitted(self):  # noqa: VACUOUS_ASSERTION — each shape is paired with the same source plus one real a.f, which must refuse through assertRefusesB
+        """task/3418. These shapes refused while the own-def clearance was
+        `still_defines` and no wider, and the assignment is the incident:
+        helm/dispatches.py binds its own `_FULL_TIP`. A bare `f` in b is b's
+        own name whatever binds it -- an assignment from ANOTHER name of the
+        module, a def under `if` or `try`, nothing at module scope (a method
+        of the name binds none), a def a later `del` or `global` unbinds --
+        and none of them reads a.f. Each is admitted, and one `a.f` beside
+        it refuses. Red on trunk."""
+        run = "\n\ndef run():\n    return f()\n"
+        for src in (
+                "from pkg import a\n\nf = a.g\n\n" + run,
+                "from pkg import a\n\nif a:\n    def f():\n        return 0\n\n"
+                + run,
+                "from pkg import a  # noqa: F401\n\ntry:\n    def f():\n"
+                "        return 0\nexcept NameError:\n    pass\n\n" + run,
+                "from pkg import a  # noqa: F401\n\n\nclass C:\n"
+                "    def f(self):\n        return 0\n\n" + run,
+                self.OWN + "\n\ndel f\n",
+                self.OWN + "\n\ndef drop():\n    global f\n    del f\n"):
+            with self.subTest(src):
+                r = self.judge(src)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("a.f (retired", r.stderr)
+                self.assertRefusesB(self.judge(src + "\n\nX = a.f\n"))
 
     def test_the_8b9ecd16e00_replay_clears_dispatches_own_ledger_write(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same fixture, one real _chat._ledger_write added, must refuse naming chat._ledger_write and the exact line
         """The incident, its spellings copied from 8b9ecd16e00 ("argv-guard:
@@ -902,6 +929,480 @@ class AFilesOwnTopLevelDefIsABindingTest(_PkgAFixture):
                 self.assertEqual(self.judge(plain).returncode, 0)
 
 
+class ARetiredNameIsKeyedToItsModuleTest(RungBase):
+    """A RETIRED NAME IS `M.NAME`, NEVER EVERY `NAME` IN THE TREE (task/3418).
+
+    Deleting `findingspass._FULL_TIP` was refused with every bare
+    `_FULL_TIP` in helm/dispatches.py, and earlier `findingspass._ID` with
+    every bare `_ID` there. dispatches.py imports findingspass inside a
+    function and binds its OWN `_FULL_TIP` and `_ID` with assignments, so no
+    line of it reads either name from findingspass. The only bypass is an
+    owner override, so builders kept the dead names instead.
+
+    A BARE NAME IN ANOTHER MODULE IS THAT MODULE'S OWN BINDING. It reaches
+    the retiring module only through a statement that spells the module --
+    `from M import NAME`, `NAME = M.NAME`, `getattr(M, "NAME")` -- and each
+    of those statements is read in its own right. So the reads of M are the
+    evidence and a bare spelling never is. Every admission here is paired
+    with a refusal on the same fixture, and every kept refusal is asked in a
+    tree where another module still binds the same bare name."""
+
+    FP = ("import re\n\n"
+          "from . import dispatches\n\n"
+          "_ID = re.compile(r'[0-9a-f]{8,64}')\n"
+          "_FULL_TIP = re.compile(r'[0-9a-f]{40,64}')\n\n\n"
+          "def stop_record(rid):\n"
+          "    if not _ID.fullmatch(str(rid or '')):\n"
+          "        return None\n"
+          "    return dispatches.row(rid)\n\n\n"
+          "def examine(tip):\n"
+          "    if not _FULL_TIP.fullmatch(str(tip or '')):\n"
+          "        return 'the row names no full tip to read'\n"
+          "    return tip\n\n\n"
+          "def reader():\n"
+          "    return 'qwen'\n")
+    #: The shapes of helm/dispatches.py at 9774674b853: its own `_ID`, TWO
+    #: module-level bindings of `_FULL_TIP`, each read bare, and findingspass
+    #: imported inside the one function that calls it.
+    DISP = ("import re\n\n"
+            "_ID = re.compile(r'[0-9a-f]{8,64}\\Z')\n"
+            "_FULL_TIP = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})\\Z')\n\n\n"
+            "def row(rid):\n"
+            "    return rid if _ID.fullmatch(rid) else None\n\n\n"
+            "def _findings_readers():\n"
+            "    from . import findingspass\n"
+            "    return {'kimi', findingspass.reader()}\n\n\n"
+            "def dispatched_tip(tip):\n"
+            "    return tip if _FULL_TIP.fullmatch(tip) else None\n\n\n"
+            "_FULL_TIP = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')\n\n\n"
+            "def superseded(tip, rid):\n"
+            "    return _FULL_TIP.fullmatch(tip) and _ID.fullmatch(rid)\n")
+    #: The lines of DISP that spell each name as dispatches' own.
+    OWN_LINES = {"_ID": (3, 8, 24), "_FULL_TIP": (4, 17, 20, 24)}
+    PATTERNS = {"_ID": "r'[0-9a-f]{8,64}'",
+                "_FULL_TIP": "r'[0-9a-f]{40,64}'"}
+
+    def setUp(self):
+        super().setUp()
+        self.stage("helm/__init__.py", "")
+        self.stage("helm/findingspass.py", self.FP)
+        self.stage("helm/dispatches.py", self.DISP)
+        self.assertEqual(self.git("commit", "-qm", "findings").returncode, 0)
+
+    def retire(self, name):
+        """Stage findingspass without `name`: its binding goes, and the one
+        read of it becomes an inline match."""
+        pat = self.PATTERNS[name]
+        self.stage("helm/findingspass.py",
+                   self.FP.replace("%s = re.compile(%s)\n" % (name, pat), "")
+                   .replace("%s.fullmatch(" % name,
+                            "re.fullmatch(%s, " % pat))
+
+    def reads_it(self, name):
+        """(DISP plus one real read of findingspass.`name`, its line, the
+        line's text)."""
+        read = "    return findingspass.%s.fullmatch(tip)" % name
+        src = (self.DISP + "\n\ndef examine(tip):\n"
+               "    from . import findingspass\n" + read + "\n")
+        return src, src.count("\n"), read
+
+    def assertRefuses(self, r, name, where, line, text):
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("findingspass.%s (retired from helm/findingspass.py)"
+                      % name, r.stderr)
+        self.assertIn("%s:%d: %s" % (where, line, text), r.stderr)
+
+    def admitted_beside_its_own_binding(self, name):
+        """The replay: `name` leaves findingspass and dispatches keeps its
+        own. Admitted; then one real `findingspass.NAME` read refuses."""
+        self.retire(name)
+        r = self.rung()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("findingspass.%s" % name, r.stderr)
+        # POSITIVE CONTROL, SAME FIXTURE AND OBSERVABLE: a read of the
+        # retired name through the module, in the file that binds its own.
+        src, line, read = self.reads_it(name)
+        self.stage("helm/dispatches.py", src)
+        self.assertRefuses(self.rung(), name, "helm/dispatches.py", line, read)
+
+    def test_the_FULL_TIP_replay_is_admitted(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same fixture, one real findingspass._FULL_TIP read added, must refuse naming its exact line
+        """Red on trunk: 14 lines of the real dispatches.py were listed."""
+        self.admitted_beside_its_own_binding("_FULL_TIP")
+
+    def test_the_ID_replay_is_admitted(self):  # noqa: VACUOUS_ASSERTION — the second scan on the same fixture, one real findingspass._ID read added, must refuse naming its exact line
+        """Red on trunk: 9 lines of the real dispatches.py were listed."""
+        self.admitted_beside_its_own_binding("_ID")
+
+    def test_the_refusal_names_the_read_not_the_files_own_bindings(self):  # noqa: VACUOUS_ASSERTION — assertRefuses asserts rc 1 and the read's exact path:line on the same stderr before each absence
+        """Red on trunk: another file's refusal listed every line spelling
+        the word, so the one real read sat among dispatches' own lines, and
+        past the eighth it was cut to '... and N more'."""
+        for name in ("_FULL_TIP", "_ID"):
+            with self.subTest(name):
+                self.retire(name)
+                src, line, read = self.reads_it(name)
+                self.stage("helm/dispatches.py", src)
+                r = self.rung()
+                reset = self.git("reset", "-q", "--hard", "HEAD")
+                self.assertEqual(reset.returncode, 0, reset.stderr)
+                self.assertRefuses(r, name, "helm/dispatches.py", line, read)
+                for own in self.OWN_LINES[name]:
+                    self.assertNotIn("helm/dispatches.py:%d:" % own, r.stderr)
+
+    def test_a_bare_spelling_left_in_the_retiring_file_still_refuses(self):  # noqa: VACUOUS_ASSERTION — assertRefuses asserts rc 1 and the retiring file's exact path:line on the same stderr before the absence
+        """CONTROL. Inside findingspass a bare `_FULL_TIP` IS findingspass's
+        own, and dispatches binding the same word does not excuse it. The
+        refusal names that line and no line of dispatches (red on trunk for
+        the second half only)."""
+        self.stage("helm/findingspass.py", self.FP.replace(
+            "_FULL_TIP = re.compile(%s)\n" % self.PATTERNS["_FULL_TIP"], ""))
+        r = self.rung()
+        self.assertRefuses(r, "_FULL_TIP", "helm/findingspass.py", 15,
+                           "    if not _FULL_TIP.fullmatch(str(tip or '')):")
+        self.assertNotIn("helm/dispatches.py:", r.stderr)
+
+    def test_a_from_import_of_the_retired_name_still_refuses(self):  # noqa: VACUOUS_ASSERTION — assertRefuses asserts rc 1, the refusal and the exact path:line per shape; nothing here asserts an absence
+        """CONTROL. `from M import NAME` binds M's name wherever it stands:
+        in a function of the file that binds its own, and as a
+        parenthesized import in a test module."""
+        in_disp = (self.DISP + "\n\ndef examine(tip):\n"
+                   "    from .findingspass import _FULL_TIP as fp_tip\n"
+                   "    return fp_tip.fullmatch(tip)\n")
+        in_test = ("from helm.findingspass import (\n    examine,\n"
+                   "    _FULL_TIP,\n)\n\n\ndef test_tip():\n"
+                   "    assert _FULL_TIP.fullmatch('a' * 40) and examine\n")
+        for where, src, line in (
+                ("helm/dispatches.py", in_disp, in_disp.count("\n") - 1),
+                ("tests/test_findingspass.py", in_test, 3)):
+            with self.subTest(where):
+                self.stage(where, src)
+                self.retire("_FULL_TIP")
+                r = self.rung()
+                reset = self.git("reset", "-q", "--hard", "HEAD")
+                self.assertEqual(reset.returncode, 0, reset.stderr)
+                self.assertRefuses(r, "_FULL_TIP", where, line,
+                                   src.splitlines()[line - 1])
+
+    def test_a_patch_target_naming_it_still_refuses(self):  # noqa: VACUOUS_ASSERTION — each admitted target is followed on the same fixture by one naming findingspass, which must refuse naming its exact line
+        """CONTROL. A dotted target names its own module, so it refuses with
+        no `findingspass` token in the file, and `patch.object` refuses
+        through the module. The same dotted target naming dispatches, whose
+        `_FULL_TIP` is its own, is admitted on the same fixture."""
+        dotted = ("from unittest import mock\n\n\n"
+                  "def test_tip():\n"
+                  "    with mock.patch('helm.%s._FULL_TIP', None):\n"
+                  "        pass\n")
+        by_object = ("from unittest import mock\n\n"
+                     "from helm import findingspass\n\n\n"
+                     "def test_tip():\n"
+                     "    with mock.patch.object(findingspass, '_FULL_TIP',"
+                     " None):\n"
+                     "        pass\n")
+        self.stage("tests/test_tip.py", dotted % "dispatches")
+        self.retire("_FULL_TIP")
+        r = self.rung()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for src, line in ((dotted % "findingspass", 5), (by_object, 7)):
+            with self.subTest(src):
+                self.stage("tests/test_tip.py", src)
+                self.assertRefuses(self.rung(), "_FULL_TIP",
+                                   "tests/test_tip.py", line,
+                                   src.splitlines()[line - 1])
+
+    def test_a_getattr_through_the_module_or_an_alias_still_refuses(self):  # noqa: VACUOUS_ASSERTION — the admitted getattr on dispatches is followed on the same fixture by each getattr on findingspass, which must refuse naming its exact line
+        """CONTROL, and one shape trunk missed: `getattr(fp, '_FULL_TIP')`
+        through `import helm.findingspass as fp`, in a file holding no
+        `_FULL_TIP` NAME token, was dropped before the alias was asked.
+        `getattr(dispatches, '_FULL_TIP')` is dispatches' own and admitted."""
+        self.stage("tests/test_tip.py",
+                   "from helm import dispatches\n\n\ndef test_tip():\n"
+                   "    return getattr(dispatches, '_FULL_TIP')\n")
+        self.retire("_FULL_TIP")
+        r = self.rung()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for src in ("from helm import findingspass\n\n\ndef test_tip():\n"
+                    "    return getattr(findingspass, '_FULL_TIP')\n",
+                    "import helm.findingspass as fp\n\n\ndef test_tip():\n"
+                    "    return getattr(fp, '_FULL_TIP')\n"):
+            with self.subTest(src):
+                self.stage("tests/test_tip.py", src)
+                self.assertRefuses(self.rung(), "_FULL_TIP",
+                                   "tests/test_tip.py", 5,
+                                   src.splitlines()[4])
+
+    def test_a_facade_that_publishes_it_from_the_module_still_refuses(self):  # noqa: VACUOUS_ASSERTION — the two admitted facades are followed on the same fixture by one naming findingspass beside the retiring file, which must refuse naming its exact line
+        """A facade's `_OWNER_NAMES` entry ("findingspass", ("_FULL_TIP",))
+        publishes findingspass's name as the facade's own -- the web_compat
+        form, bound by the satellite's publish loop or by a module
+        `__getattr__` -- so deleting the name breaks every reader of the
+        facade. Red on trunk: the entry holds both words only as strings and
+        the rung asked for NAME tokens. Keyed to the module: the same entry
+        in a facade in another directory names ANOTHER findingspass, and an
+        entry naming dispatches names dispatches' own name; both are
+        admitted."""
+        facade = ('_OWNER_NAMES = (("%s", ("_FULL_TIP",)),)\n\n\n'
+                  "def __getattr__(name):\n"
+                  "    for module, names in _OWNER_NAMES:\n"
+                  "        if name in names:\n"
+                  "            import importlib\n"
+                  "            return getattr(importlib.import_module(\n"
+                  "                '.' + module, __package__), name)\n"
+                  "    raise AttributeError(name)\n")
+        self.stage("tools/ledger.py", facade % "findingspass")
+        self.stage("helm/ledger.py", facade % "dispatches")
+        self.retire("_FULL_TIP")
+        r = self.rung()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.stage("helm/ledger.py", facade % "findingspass")
+        r = self.rung()
+        self.assertRefuses(r, "_FULL_TIP", "helm/ledger.py", 1,
+                           (facade % "findingspass").splitlines()[0])
+        self.assertNotIn("tools/ledger.py:", r.stderr)
+
+    def test_a_dynamic_reach_on_another_module_counts_nothing_here(self):  # noqa: VACUOUS_ASSERTION — the admitted reach on `re` is followed on the same fixture by the same reach on findingspass, which must refuse naming the string's exact line
+        """task/3418 r2. A file that reaches a module by a name it computes
+        reads every string spelling the retired name -- but only for THAT
+        module. dispatches reaching `re` with the key '_FULL_TIP' beside
+        its own bare `_FULL_TIP` is admitted; the same key reaching
+        findingspass refuses at the string."""
+        on_re = (self.DISP + "\n\ndef lookup(key='_FULL_TIP'):\n"
+                 "    return getattr(re, key)\n")
+        on_fp = (self.DISP + "\n\ndef lookup(key='_FULL_TIP'):\n"
+                 "    from . import findingspass\n"
+                 "    return getattr(findingspass, key)\n")
+        self.stage("helm/dispatches.py", on_re)
+        self.retire("_FULL_TIP")
+        r = self.rung()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.stage("helm/dispatches.py", on_fp)
+        text = "def lookup(key='_FULL_TIP'):"
+        self.assertRefuses(self.rung(), "_FULL_TIP", "helm/dispatches.py",
+                           on_fp.splitlines().index(text) + 1, text)
+
+
+class ADynamicReachOnTheModuleReadsItsNameTest(_PkgAFixture):
+    """A FILE THAT REACHES THE MODULE BY A NAME IT COMPUTES READS EVERY
+    STRING AND KEYWORD SPELLING THE RETIRED NAME (task/3418, round 2).
+
+    A non-author approval-tier read of the module key, measured on a
+    git-archive of the lane tip: tests/test_gate_fifo.py has a helper
+    `guard_reason(**patches)` that runs `mock.patch.object(gatechild, name,
+    value)` for each keyword, and calls it with `_arm_parent_death=...` at
+    three lines. Staging a rename of gatechild._arm_parent_death, trunk
+    refused at those three lines, the tip admitted, and the composed train
+    failed AttributeError: the tip followed no name through a variable. The
+    same class, trunk refusing and the tip admitting: `patch.multiple(M,
+    X=1)`, `patch.multiple("pkg.M", X=1)`, `globals().update(vars(M))` then
+    a bare X, and attrgetter, getattr_static, __getattribute__ and
+    vars(M).get with the name held in a variable.
+
+    A DYNAMIC REACH on the module is one of the calls that read a module's
+    name through a string -- getattr, setattr, delattr, hasattr, patch.object,
+    getattr_static, __getattribute__, attrgetter, `vars(M).get`, `vars(M)[k]`
+    -- with a name that is not a constant; `globals().update(vars(M))`; and
+    `patch.multiple` on the module or its dotted string. In a file with one,
+    every keyword argument named NAME and every string constant equal to
+    NAME is a read. A reach on ANOTHER module counts nothing for this one,
+    and a bare NAME is still the file's own binding, except after
+    `globals().update(vars(M))`, which binds it from the module. Every
+    admission is paired with a refusal on the same fixture, and every
+    refusal names its line."""
+
+    def assertEachRefusesAt(self, table):
+        for src, text in table:
+            with self.subTest(src):
+                self.assertRefusesAt(self.judge(src), src, text)
+
+    def assertAdmittedThenRefused(self, admitted, refused, text):
+        """`admitted` clears as pkg/b.py; `refused`, the same file reaching
+        pkg.a instead, refuses at the line `text`."""
+        r = self.judge(admitted)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("a.f (retired", r.stderr)
+        self.assertRefusesAt(self.judge(refused), refused, text)
+
+    def test_a_helper_patching_the_module_for_each_keyword_refuses(self):  # noqa: VACUOUS_ASSERTION — assertAdmittedThenRefused pairs the admitted reach on pkg.c with the same helper on pkg.a, which must refuse naming the keyword's exact line
+        """The gate_fifo shape on the pkg fixture: the keyword is the read.
+        The same helper patching pkg.c is admitted."""
+        src = ("from unittest import mock\n\n"
+               "from pkg import a, c  # noqa: F401\n\n\n"
+               "def patched(**patches):\n"
+               "    return [mock.patch.object(%s, name, value)\n"
+               "            for name, value in patches.items()]\n\n\n"
+               "def test_it():\n"
+               "    a.g()\n"
+               "    return patched(\n"
+               "        f=1)\n")
+        self.assertAdmittedThenRefused(src % "c", src % "a", "        f=1)")
+
+    def test_patch_multiple_on_the_module_or_its_dotted_string_refuses(self):  # noqa: VACUOUS_ASSERTION — assertRefusesAt asserts rc 1 and the exact path:line per shape; nothing here asserts an absence
+        """The keyword of `patch.multiple` is the read, and a dotted target
+        needs no `a` token in the file. `**{'f': 1}` reads through the
+        string."""
+        self.assertEachRefusesAt((
+            ("from unittest import mock\n\nfrom pkg import a\n\n\n"
+             "def test_it():\n    with mock.patch.multiple(a, f=1):\n"
+             "        pass\n", "    with mock.patch.multiple(a, f=1):"),
+            ("from unittest import mock\n\n\ndef test_it():\n"
+             "    with mock.patch.multiple('pkg.a', f=1):\n        pass\n",
+             "    with mock.patch.multiple('pkg.a', f=1):"),
+            ("from unittest.mock import patch\n\nfrom pkg import a\n\n\n"
+             "def test_it():\n    with patch.multiple(a, **{'f': 1}):\n"
+             "        pass\n", "    with patch.multiple(a, **{'f': 1}):")))
+
+    def test_patch_multiple_on_another_module_is_admitted(self):  # noqa: VACUOUS_ASSERTION — assertAdmittedThenRefused pairs each admitted target with the same call on pkg.a, which must refuse naming its exact line
+        """CONTROL. pkg.c binds its own f, and a target inside the module
+        (`pkg.a.Klass`) patches the class, not the module."""
+        src = ("from unittest import mock\n\n"
+               "from pkg import a, c  # noqa: F401\n\n\n"
+               "def test_it():\n    with mock.patch.multiple(%s, f=1):\n"
+               "        return a.g()\n")
+        for other in ("c", "'pkg.c'", "'pkg.a.Klass'"):
+            with self.subTest(other):
+                self.assertAdmittedThenRefused(
+                    src % other, src % "a",
+                    "    with mock.patch.multiple(a, f=1):")
+
+    def test_globals_updated_from_the_module_then_a_bare_name_refuses(self):  # noqa: VACUOUS_ASSERTION — assertAdmittedThenRefused pairs the admitted update from pkg.c with each update from pkg.a, which must refuse naming the bare read's exact line
+        """`globals().update(vars(a))` is `from pkg.a import *` at run time,
+        so the bare `f` after it is a's. The same update from pkg.c is
+        admitted."""
+        src = ("from pkg import a, c  # noqa: F401\n\n"
+               "globals().update(%s)\n\n\n"
+               "def run():\n    return f(), a.g()\n")
+        for mine in ("vars(a)", "a.__dict__"):
+            with self.subTest(mine):
+                self.assertAdmittedThenRefused(
+                    src % "vars(c)", src % mine, "    return f(), a.g()")
+
+    def test_a_name_held_in_a_variable_refuses_where_it_is_spelled(self):  # noqa: VACUOUS_ASSERTION — assertAdmittedThenRefused pairs each admitted reach on pkg.c with the same reach on pkg.a, which must refuse naming the string's exact line
+        """Every call that reads a module's name through a string, with the
+        string bound to a variable first. The same reach on pkg.c is
+        admitted."""
+        head = ("import inspect  # noqa: F401\n"
+                "from operator import attrgetter  # noqa: F401\n"
+                "from unittest import mock  # noqa: F401\n\n"
+                "from pkg import a, c  # noqa: F401\n\n"
+                "NAME = 'f'\n\n\n"
+                "def run():\n    a.g()\n    return %s\n")
+        for reach in ("getattr(@, NAME)", "hasattr(@, NAME)",
+                      "setattr(@, NAME, 1)", "delattr(@, NAME)",
+                      "inspect.getattr_static(@, NAME)",
+                      "@.__getattribute__(NAME)",
+                      "object.__getattribute__(@, NAME)",
+                      "vars(@).get(NAME)", "@.__dict__.get(NAME)",
+                      "vars(@)[NAME]", "@.__dict__[NAME]",
+                      "attrgetter(NAME)(@)",
+                      "mock.patch.object(@, NAME, 1)"):
+            with self.subTest(reach):
+                self.assertAdmittedThenRefused(
+                    head % reach.replace("@", "c"),
+                    head % reach.replace("@", "a"), "NAME = 'f'")
+
+    def test_a_constant_name_through_each_new_reacher_refuses(self):  # noqa: VACUOUS_ASSERTION — assertAdmittedThenRefused pairs each admitted spelling with the same reach naming 'f', which must refuse naming its exact line
+        """attrgetter, getattr_static, __getattribute__ and `.get` on the
+        module's dict read a constant name directly. `attrgetter('x.f')`
+        reads a.x.f, and is admitted."""
+        head = ("import inspect  # noqa: F401\n"
+                "from operator import attrgetter  # noqa: F401\n\n"
+                "from pkg import a\n\n\n"
+                "def run():\n    return a.g(), %s\n")
+        for reach in ("attrgetter('%s')(a)", "attrgetter('%s.x')(a)",
+                      "inspect.getattr_static(a, '%s')",
+                      "a.__getattribute__('%s')",
+                      "object.__getattribute__(a, '%s')",
+                      "vars(a).get('%s')", "a.__dict__.get('%s')"):
+            with self.subTest(reach):
+                refused = head % (reach % "f")
+                self.assertAdmittedThenRefused(
+                    head % (reach % "x.f"), refused,
+                    refused.splitlines()[-1])
+
+    def test_a_dynamic_reach_counts_strings_and_keywords_not_a_bare_binding(self):  # noqa: VACUOUS_ASSERTION — assertAdmittedThenRefused pairs the admitted file with the same file plus one call passing 'f', which must refuse naming its exact line
+        """CONTROL on the width of the cure. b binds its own f and reaches
+        a by a computed key: the bare `f` is b's, and admitted. One call
+        passing the key 'f' refuses at that line."""
+        src = ("from pkg import a\n\n\n"
+               "def f():\n    return 0\n\n\n"
+               "def run(key):\n    return getattr(a, key), f()\n")
+        self.assertAdmittedThenRefused(src, src + "\n\nrun('f')\n",
+                                       "run('f')")
+
+
+class TheGateFifoReplayTest(RungBase):
+    """The approval-tier replay (task/3418, round 2), its shapes copied from
+    tests/test_gate_fifo.py:84-88, :183, :233 and :238 at c4cece950cc:
+    `guard_reason(**patches)` patches gatechild for each keyword, and three
+    calls pass `_arm_parent_death=`. A rename of gatechild._arm_parent_death
+    refused on trunk at the three keyword lines and was admitted on the lane
+    tip; the composed train then failed AttributeError, because
+    `patch.object` without `create=True` needs the attribute to exist."""
+
+    CHILD = ("import os\n\n\n"
+             "def _arm_parent_death(parent, parent_start):\n"
+             "    return bool(parent and parent_start)\n\n\n"
+             "def _proc_rows():\n    return {}\n\n\n"
+             "def _guard(argv):\n"
+             "    if not _arm_parent_death(os.getppid(), 0):\n"
+             "        return 125\n"
+             "    return 0 if _proc_rows() and argv else 125\n")
+    FIFO = ("import io\nimport sys\nimport unittest\n"
+            "from unittest import mock\n\n"
+            "from helm import gate, gatechild  # noqa: F401\n\n\n"
+            "class GuardReasonTest(unittest.TestCase):\n"
+            "    GUARD_ARGV = ['--']\n\n"
+            "    def guard_reason(self, **patches):\n"
+            "        child = io.StringIO()\n"
+            "        managers = [mock.patch.object(sys, 'stderr', child)]\n"
+            "        managers.extend(mock.patch.object(%s, name, value)\n"
+            "                        for name, value in patches.items())\n"
+            "        for manager in managers:\n"
+            "            manager.__enter__()\n"
+            "        self.assertEqual(gatechild._guard(self.GUARD_ARGV), 125)\n"
+            "        return child.getvalue()\n\n"
+            "    def test_reason(self):\n"
+            "        self.guard_reason(\n"
+            "            _arm_parent_death=mock.Mock(return_value=True),\n"
+            "            _proc_rows=mock.Mock(return_value={}))\n\n"
+            "    def test_distinct(self):\n"
+            "        missing = self.guard_reason(\n"
+            "            _arm_parent_death=mock.Mock(return_value=True),\n"
+            "            _proc_rows=mock.Mock(return_value={}))\n"
+            "        denied = self.guard_reason(\n"
+            "            _arm_parent_death=mock.Mock(return_value=True))\n"
+            "        self.assertNotEqual(missing, denied)\n")
+
+    def setUp(self):
+        super().setUp()
+        self.stage("helm/__init__.py", "")
+        self.stage("helm/gate.py", "def _guard_supervisor():\n    return None\n")
+        self.stage("helm/gatechild.py", self.CHILD)
+        self.stage("tests/test_gate_fifo.py", self.FIFO % "gatechild")
+        self.assertEqual(self.git("commit", "-qm", "fifo").returncode, 0)
+        self.stage("helm/gatechild.py", self.CHILD.replace(
+            "_arm_parent_death", "_arm_death_signal"))
+
+    def test_the_rename_refuses_at_each_keyword_line(self):  # noqa: VACUOUS_ASSERTION — asserts rc 1, the refusal and each of the three keyword lines by exact path:line
+        """Red on the lane tip: admitted."""
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("gatechild._arm_parent_death (retired from "
+                      "helm/gatechild.py)", r.stderr)
+        lines = [(n, t) for n, t in enumerate(
+            (self.FIFO % "gatechild").splitlines(), 1)
+            if "_arm_parent_death=" in t]
+        self.assertEqual(len(lines), 3)
+        for n, t in lines:
+            self.assertIn("tests/test_gate_fifo.py:%d: %s" % (n, t), r.stderr)
+
+    def test_the_same_helper_patching_another_module_is_admitted(self):  # noqa: VACUOUS_ASSERTION — the sibling arm refuses the same rename on the same fixture with the helper patching gatechild
+        """CONTROL. The helper patches `gate`, and the file still reads
+        `gatechild._guard`: no keyword there reads gatechild's name."""
+        self.stage("tests/test_gate_fifo.py", self.FIFO % "gate")
+        r = self.rung()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
 class UnparseableSourceIsNotCleanTest(RungBase):
     """A FILE THIS RUNG CANNOT READ IS NOT A FILE IT CLEARED.
 
@@ -928,6 +1429,37 @@ class UnparseableSourceIsNotCleanTest(RungBase):
         self.assertIn("pkg/broken.py", {h[0] for h in hits},
                       "an unreadable candidate must be reported, because "
                       "nothing here can rule it out")
+
+    #: It tokenizes, and `ast.parse` raises MemoryError ("Parser stack
+    #: overflowed"), which no parse site caught: the approval-tier read
+    #: found it uncaught in `consumers` (task/3418, round 2).
+    DEEP = "X = " + "-" * 100000 + "1\n"
+
+    def test_a_parser_stack_overflow_is_unparsed_at_every_parse(self):
+        self.assertTrue(retired_name_rung._source_parses(self.DEEP))
+        with self.assertRaises(MemoryError):
+            ast.parse(self.DEEP)
+        self.assertFalse(retired_name_rung.still_defines(
+            self.DEEP + "def f():\n    pass\n", "f"))
+        self.assertFalse(retired_name_rung.defines_at_top_level(
+            self.DEEP + "f = 1\n", "f"))
+        self.assertIsNone(retired_name_rung.owner_declarations(self.DEEP))
+        self.assertFalse(retired_name_rung._patch_site(
+            "from helm import chat\n" + self.DEEP
+            + "getattr(chat, 'f')\n", "chat", "f"))
+
+    def test_a_consumer_the_parser_overflows_on_is_reported(self):  # noqa: VACUOUS_ASSERTION — asserts the exact (path, line, text) hit is present; nothing here asserts an absence
+        """Red on the lane tip: MemoryError escaped `consumers`, and the
+        rung died with a traceback instead of a refusal."""
+        self.stage("pkg/__init__.py", "")
+        self.stage("pkg/mod.py", "RETIRED = 1\n")
+        self.stage("pkg/deep.py",
+                   "from pkg import mod\n" + self.DEEP + "print(mod.RETIRED)\n")
+        self.assertEqual(self.git("commit", "-qm", "deep").returncode, 0)
+        hits, err = retired_name_rung.consumers(self.root, "pkg/mod.py",
+                                                "RETIRED")
+        self.assertIsNone(err)
+        self.assertIn(("pkg/deep.py", 3, "print(mod.RETIRED)"), hits)
 
 
 class _CellFixture(RungBase):

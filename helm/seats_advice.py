@@ -15,6 +15,7 @@ Returning the string rather than printing it is what makes the property
 testable directly: the sentences are the unit under test, and a test that has
 to scrape stderr cannot say which clause it caught.
 """
+import json
 
 
 #: THE ONE ARMING INSTRUCTION. Every place helm tells a seat how to arm its
@@ -25,6 +26,39 @@ to scrape stderr cannot say which clause it caught.
 #: check-in, re-armed in the same turn, and named by role because the id a seat
 #: wrote down is dead half an hour later.
 BEACON_TIMEOUT_MS = 1800000
+#: The Monitor tool REQUIRES a description beside timeout_ms, and a call that
+#: omits one makes every seat that copies it invent one (task/3435). It rides
+#: every notification the beacon raises, so it is short; it names no seat,
+#: because the command already does, and because a fixed text keeps every
+#: message that embeds the call at one width and free of percent signs. It
+#: does not open with the word helm: a doc naming it would read as a command.
+BEACON_DESCRIPTION = "inbox beacon"
+
+
+def monitor_call(command, description=None):
+    """The Monitor call that runs `command` at the cap: a COMPLETE Monitor
+    input, the command, its description and the deadline.
+
+    THE SHAPE OF EVERY ARMING INSTRUCTION, and the one place its values are
+    rendered: each is ONE json literal, so a seat copies it field for field.
+    The command is whole, never cut or named: a call that carries less than
+    the command no longer runs it. The characters are the ones typed, never
+    a json escape of them: an escaped em dash round-trips through json but
+    is not the text the seat typed (task/3435, 5 measured arms). Printed
+    that way it is no less safe than the escape on any stream the hook can
+    inherit: stderr replaces what its encoding cannot carry rather than
+    raising, and measured on UTF-8, C, POSIX and latin-1 streams the
+    harness reads back the seat's own bytes (an ASCII stream with UTF-8
+    mode off mangles the command where the hook READS it, escaped or not).
+    `description` is the caller's, or BEACON_DESCRIPTION when it has none.
+    `beacon_monitor` renders the canonical command through it, and the
+    argv-guard's beacon-timeout refusal (task/3404) renders a seat's OWN
+    command and description, so a refused call and the advice agree on
+    every character but what the seat typed."""
+    return "Monitor(command: %s, description: %s, timeout_ms: %d)" % (
+        json.dumps(command, ensure_ascii=False),
+        json.dumps(description or BEACON_DESCRIPTION, ensure_ascii=False),
+        BEACON_TIMEOUT_MS)
 
 
 def beacon_monitor(seat, replace=False):
@@ -32,9 +66,8 @@ def beacon_monitor(seat, replace=False):
 
     `seat` may be a format placeholder: the result carries no other percent
     sign, so a caller's template can embed it and fill the seat later."""
-    return ('Monitor(command: "helm chat wait --seat %s --follow%s", '
-            'timeout_ms: %d)' % (seat, " --replace" if replace else "",
-                                 BEACON_TIMEOUT_MS))
+    return monitor_call("helm chat wait --seat %s --follow%s"
+                        % (seat, " --replace" if replace else ""))
 
 
 BEACON_EXPIRY = (

@@ -19,25 +19,9 @@ rather than assumed -- every one of those references sits inside a function
 body and none in the module body, so they resolve at CALL time, after the
 tail import and the publish loop have bound the names back.
 """
-import calendar
-import contextlib
-import functools
-import hashlib
-import json
-import os
-import re
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-import unicodedata
-
 from . import landreq
-from . import dispatches, foldcheck, foldcompose, home, pk, projscope, query, vcs
-from .seats_common import recipient_matches
-from .store import load as store_load
-from .work import _lanes
+from . import (dispatches, foldcheck, foldckpt, home, pk,
+               projscope, query, vcs)
 
 
 def _chain_repo(row):
@@ -58,12 +42,26 @@ def _chain_repo(row):
     same road. The read costs two Git subprocesses per uncached call and is
     paid once per such row per index build; the population is CLOSED — the
     door stamps a repository on every row it accepts now — so it only
-    shrinks."""
+    shrinks.
+
+    BOTH READS GO THROUGH THE FOLD CHECKPOINT'S SEAMS (task/3053). A
+    source-clean close's replay runs this join INSIDE the checkpointed fold,
+    so an environment answer read here decides a close the checkpoint then
+    reuses. `foldckpt.realpath` and `foldckpt.home_repo_id` are the plain
+    reads outside a fold and record their answers inside one, so the key
+    carries — and every restore re-asks — exactly what this join consumed."""
     repo = row.get("repo_id")
     if repo is None:
-        repo, _why = dispatches.home_repo_id()
+        repo, _why = foldckpt.home_repo_id()
     # ABSENT is the legacy home repository; PRESENT empty is damaged evidence.
-    return dispatches._real(repo) if isinstance(repo, str) and repo else None
+    if not (isinstance(repo, str) and repo):
+        return None
+    try:
+        return foldckpt.realpath(str(repo))
+    except (OSError, ValueError):
+        # `dispatches._real`'s contract: a path Python refuses to normalize
+        # is UNKNOWN, and an unknown repository keys no chain.
+        return None
 
 def chain_key(row):
     """(repo, chain_root) — the identity a CHAIN is scoped by, or None.
@@ -92,17 +90,290 @@ def _chain_key(row, repo):
     root = str(root or row.get("id") or "").strip()
     return (repo, root) if repo and root else None
 
+# THE BRANCHES A BUILD'S BASE IS BOUND TO WHEN IT IS TRUNK, as the dispatch
+# door records them in `ref_branch` (`dispatches._resolve_tip`: the branch a
+# ref names, or the one local branch a raw sha is the tip of). That record is
+# the only trunk evidence the join may read: it runs inside the checkpointed
+# fold's replay, which asks git nothing it cannot re-verify, and a trunk
+# ancestry read TODAY would call every tip that later landed "trunk".
+_TRUNK_BRANCHES = ("refs/heads/main", "refs/heads/master")
+
+
+def _tip(value):
+    """A tip as the ledger stores one, lowered, or None."""
+    return value.strip().lower() if isinstance(value, str) and value.strip() \
+        else None
+
+
+def _round_tips(row):
+    """{tip} — every tip one round CARRIES, lowered: its `tip`, its ref, its
+    reviewed tip, the cure its FIX named, and every tip a retip moved it
+    through. It is what a later round of the chain finds already there."""
+    out = [row.get(field) for field in ("tip", "ref", "reviewed_tip",
+                                        "patch_tip")]
+    for hop in row.get("retips") or ():
+        if isinstance(hop, dict):
+            out += [hop.get("tip"), hop.get("old_tip")]
+    return {landreq._tip(t) for t in out} - {None}
+
+
+def _start_tip(row):
+    """The tip a round was SENT at: before its first retip, its `tip`. On a
+    build row it is the BASE the build starts from."""
+    hops = [hop for hop in row.get("retips") or () if isinstance(hop, dict)]
+    return landreq._tip(hops[0].get("old_tip") if hops else row.get("tip"))
+
+
+def _reads(row):
+    """{tip} — the tips `row` asks a seat to READ as work: the tip a row of
+    kind review was sent at, every tip a retip moved the row to, the tip its
+    verdict reviewed and the cure its FIX named.
+
+    A BUILD'S BASE IS NOT READ BY BEING BUILT ON. It is read only when the
+    build's own verdict reviewed exactly it, which is the shape of a seat
+    sending its own revision as a build for review; and even then not when
+    the write door bound it to trunk (`_TRUNK_BRANCHES`), because trunk is
+    nobody's new work."""
+    build = row.get("kind") == "build"
+    out = {landreq._tip(hop.get("tip")) for hop in row.get("retips") or ()
+           if isinstance(hop, dict)}
+    out |= {landreq._tip(row.get("reviewed_tip")),
+            landreq._tip(row.get("patch_tip"))}
+    if not build:
+        out.add(landreq._start_tip(row))
+    elif row.get("ref_branch") in _TRUNK_BRANCHES:
+        out.discard(landreq._start_tip(row))
+    return out - {None}
+
+
+def _brings(row, rows, reads):
+    """[(tip, ts, seat, late)] — every candidate event where `row` brings a
+    tip to the ledger. An ancestor's start tip predates the row and suppresses
+    the duplicate. Its later retips and cures do not: they may postdate this
+    row, so `_first_bringers` orders those candidates instead.
+
+      * a row of kind review brings the tip it was sent at and every retip's
+        tip, and its SENDER is the one seat the ledger can name for them;
+      * a build row brings its base only where some round anywhere READ that
+        base as work (`reads`) and the door did not bind it to trunk: the
+        seat that sent a build of its own revision brought that revision.
+        A retip on a build row binds the BUILDER's committed tip, so its
+        recipient brings that;
+      * a FIX's cure is brought by its patch author.
+    `late` marks a tip brought by a later event on the row (a retip, a
+    verdict), which the ledger orders against other rows only by timestamp;
+    a round's own send is ordered by the fold, exactly."""
+    seen, walked = set(), set()
+    parent = row.get("supersedes")
+    while isinstance(parent, str) and parent in rows and parent not in walked:
+        walked.add(parent)
+        ancestor = rows[parent]
+        seen.add(landreq._start_tip(ancestor))
+        parent = ancestor.get("supersedes")
+    seen.discard(None)
+    build = row.get("kind") == "build"
+    start = landreq._start_tip(row)
+    out = []
+    if not build or (start in reads
+                     and row.get("ref_branch") not in _TRUNK_BRANCHES):
+        out.append((start, row.get("ts"), row.get("sender"), False))
+    for hop in row.get("retips") or ():
+        if isinstance(hop, dict):
+            out.append((landreq._tip(hop.get("tip")), hop.get("ts"),
+                        row.get("recipient") if build else row.get("sender"),
+                        True))
+    if row.get("patch_tip"):
+        out.append((landreq._tip(row.get("patch_tip")), row.get("verdict_ts"),
+                    row.get("patch_author") or row.get("recipient"), True))
+    return [(tip, ts, seat.strip(), late) for tip, ts, seat, late in out
+            if tip and tip not in seen and isinstance(seat, str)
+            and seat.strip()]
+
+
+def _first_bringers(found):
+    """(frozenset(seats), settled) — who FIRST brought one tip, from its
+    candidates [(ts or None, position, late, seat)].
+
+    Sends are ordered by their fold position, which is the ledger's own append
+    order, so they never tie; a send also precedes every later event on its own
+    row or a row appended after it. Candidates append order cannot settle are
+    ordered by timestamp, and equal or unreadable timestamps leave both first.
+    `settled` is False when the first bringers are more than one seat: the
+    ledger cannot say which, and the caller names the carrier too."""
+    def before(one, other):
+        # A send is appended when its row is created. It therefore precedes
+        # every candidate on a row created later, and its own later events,
+        # whatever a wall-clock rollback made their timestamps say.
+        if not one[2] and one[1] <= other[1]:
+            return one[1] < other[1] or other[2]
+        if not other[2] and other[1] <= one[1]:
+            return False
+        return one[0] is not None and other[0] is not None \
+            and one[0] < other[0]
+    # A WALL-CLOCK ROLLBACK CAN MAKE before() CYCLE: append order and the
+    # timestamps then disagree. The minimal set would drop the cycle's members
+    # (the writer may be one) and keep only what the cycle cannot reach, such
+    # as a candidate with an unreadable timestamp. A cycle orders nothing, so
+    # every bringer is named, unsettled.
+    after = {i: [j for j, d in enumerate(found) if j != i and before(c, d)]
+             for i, c in enumerate(found)}
+    state = {}
+
+    def cycles(root):
+        # AN EXPLICIT STACK, NOT RECURSION (task/3562): the walk is as deep
+        # as the candidates are long, and a tip about a thousand rows brought
+        # raised RecursionError, refusing every source-clean close whose
+        # chain read it by accident instead of by rule.
+        state[root] = 1
+        stack = [(root, iter(after[root]))]
+        while stack:
+            node, rest = stack[-1]
+            for j in rest:
+                if state.get(j) == 1:
+                    return True
+                if j not in state:
+                    state[j] = 1
+                    stack.append((j, iter(after[j])))
+                    break
+            else:
+                state[node] = 2
+                stack.pop()
+        return False
+    if any(i not in state and cycles(i) for i in after):
+        first = found
+    else:
+        first = [c for c in found
+                 if not any(before(d, c) for d in found if d is not c)] or found
+    seats = frozenset(c[3] for c in first)
+    return seats, len(seats) == 1
+
+
+def tip_writers(rows):
+    """{tip: (frozenset(seats), settled)} — the seats that FIRST brought each
+    tip anywhere in the fold `rows` (task/3356, finding F3 of the lane's
+    final read).
+
+    TIP PROVENANCE IS LEDGER-WIDE. A seat that wrote a tip and then sends it
+    into another chain is that tip's writer there too, and a seat that
+    carries a tip another seat brought wrote nothing, whichever chain it
+    carries it into. Built ONCE per fold pass (`_contributor_chains`) and
+    read by every chain through `chain_writers`, never rescanned per chain.
+    Measured on a copy of the live fold (5,320 rows, 2,092 chains; median of
+    seven runs on one host), the index costs 0.07 s and the whole join rose
+    from 0.09 s to 0.17 s; the read side pays it once per ledger state
+    (`chain_contributor_index` memoises). A replay does not call it at all:
+    it keeps the same answer per tip in the fold's `_AuthorIndex`
+    (task/3562), because paying it once per source-clean close it validated
+    made one cold replay cost events x ledger.
+
+    Only the ledger answers it, never git: the join runs inside the replay of
+    a source-clean close, and a tip that was a lane's revision when it was
+    sent is an ancestor of trunk once it lands."""
+    reads = set()
+    for row in rows.values():
+        reads |= landreq._reads(row)
+    found = {}
+    for position, row in enumerate(rows.values()):
+        for tip, ts, seat, late in landreq._brings(row, rows, reads):
+            found.setdefault(tip, []).append(
+                (ts if dispatches._valid_ts(ts) else None, position, late,
+                 seat))
+    return {tip: landreq._first_bringers(c) for tip, c in found.items()}
+
+
+def chain_writers(chain, rows, writers=None):
+    """[seat, ...] — the seats one chain records as having WRITTEN code, in
+    the order `chain` lists its rounds (task/3356).
+
+    THE ONE RULE FOR "WHO WROTE THIS LANE". Every door that asks whether a
+    seat is independent of a lane reads it through the join
+    (`_contributor_chains`): the source-clean hold and the close ladder's
+    holder rung, READY-SELF-REVIEW, the non-author rule and the verdict
+    door's fresh-context bound (c). The AUTHORS line a landed close prints
+    reads it too (`chain_credits`). Git cannot answer it: every commit is
+    authored by the operator, so the answer comes from the ledger's records.
+
+    A SEAT WROTE CODE WHEN THE LEDGER RECORDS IT PRODUCING SOME:
+      * every recipient of a BUILD row. A rebind transfers the obligation; it
+        does not prove the first recipient wrote nothing. Keeping both the first
+        and replacement builders is the conservative side of the review door;
+      * the patch author of a round whose FIX named a cure (`patch_tip`);
+      * the seat that FIRST BROUGHT a tip a round of the chain reads, from
+        anywhere on the ledger (`tip_writers`, `writers` when the caller
+        built it once for many chains). That is the sender of the round that
+        first carried it, the patch author of a cure, or the sender of a build
+        whose own revision was read as the work. This is what keeps a seat
+        that cures a FIX without a build row of its own an author, and a seat
+        that sends its own revision into a new chain an author of that chain.
+    DISPATCHING IS NOT AUTHORING. The seat that sent the build row, a seat
+    that carries a tip another seat already brought, into this chain or any
+    other, and a seat that rebound a row (recorded as `acted_by`, and never
+    read here) wrote nothing, so their reads are independent. The symptom
+    this cures: the integrator relayed a tip another seat made, rebound the
+    round to itself, and its source-clean hold was refused as LANE AUTHOR.
+
+    A BUILD'S BASE IS A STARTING POINT, NOT WORK: it names nobody unless a
+    round read it (`_reads`). The ledger records no other trunk evidence, so
+    one exception is followed: a base the door bound to a branch that is not
+    trunk is that branch's work, and its first bringer is named.
+
+    A CHAIN WITH NO BUILD ROW KEEPS THE EARLIER ANSWER: every sender is a
+    writer. There the sender is the only record of who built the lane, so a
+    relay in such a chain stays an author.
+
+    RECORDED WRITERS ARE SUBMISSION PROVENANCE, never proven Git authorship,
+    and the rule leans to naming a writer when the ledger cannot tell: a
+    round with no readable tip names its sender; a tip whose first bringer
+    the ledger cannot order names every candidate and the seat that carried
+    it here; a base the door bound to no branch, once a round read it as the
+    work, names the seat that sent it, because the ledger cannot tell a trunk
+    base from that seat's own commit. `rows` is the fold the chain's rows
+    came from, by id."""
+    if writers is None:
+        writers = landreq.tip_writers(rows)
+    built = any(row.get("kind") == "build" for row in chain)
+    out = []
+    for row in chain:
+        build = row.get("kind") == "build"
+        names = []
+        if build:
+            names.append(row.get("recipient"))
+        elif not built or not landreq._start_tip(row):
+            names.append(row.get("sender"))
+        # Reading is not authorship. The patch recipient contributes only
+        # when this round actually records a cure.
+        if row.get("patch_tip"):
+            names.append(row.get("patch_author") or row.get("recipient"))
+        carried = landreq._reads(row)
+        branch = row.get("ref_branch")
+        if build and isinstance(branch, str) and branch \
+                and branch not in _TRUNK_BRANCHES:
+            carried.add(landreq._start_tip(row))
+        for tip in sorted(carried - {None}):
+            seats, settled = writers.get(tip, ((), True))
+            names += sorted(seats)
+            if not settled:
+                names.append(row.get("sender"))
+        for name in names:
+            if isinstance(name, str) and name.strip() \
+                    and name.strip() not in out:
+                out.append(name.strip())
+    return out
+
+
 def chain_contributor_index():
     """(((repo, root) -> (wrote, approved, unknown)), err), scoped to work.
 
     INDEPENDENCE IS A PROPERTY OF THE CHAIN, NOT OF THE ROW. `wrote` retains
-    every sender and recorded patch author; `approved` retains each raw APPROVE
+    every seat `chain_writers` records as having written code in the chain;
+    `approved` retains each raw APPROVE
     and its ACCEPTED append position, so eligibility uses the same evidence as
     `_lr`, not a polarity string or an invented position in a smaller list.
 
     RECORDED CONTRIBUTORS ARE SUBMISSION PROVENANCE, NOT PROVEN GIT AUTHORSHIP.
-    A patch author is the recipient through whom the cure was submitted, not a
-    claim about the commit's Git author. Display bytes remain unchanged; seat
+    A patch author is the recipient through whom the cure was submitted, a
+    builder is the seat a build row named, and neither is a claim about the
+    commit's Git author. Display bytes remain unchanged; seat
     identity is compared by the canonical recipient owner at the point of use.
 
     The shared fold is memoised by ledger path/size/mtime. Only readable chain
@@ -130,10 +401,43 @@ def chain_contributor_index():
     rows, verdicts, err = landreq._ledger_fold()
     if err:
         return {}, err                       # transient failures are not cached
+    chains, broken = landreq._contributor_chains(rows, verdicts)
+    if key is not None and not broken:
+        landreq._CHAIN_CONTRIB_MEMO.clear()
+        landreq._CHAIN_CONTRIB_MEMO.update(key=key, chains=chains)
+    return chains, None
+
+def _contributor_chains(rows, verdicts):
+    """(((repo, root) -> (wrote, approved, unknown)), broken ids) over ONE fold.
+
+    THE JOIN `chain_contributor_index` HAS ALWAYS DONE, with the fold handed
+    in rather than read. It is its own function for the one caller the
+    memoised index cannot serve: a close event's REPLAY (task/3053), which
+    must judge "is this seat a lane author" against the ledger PREFIX it is
+    folding — `_apply`'s `current` — and cannot re-read the whole ledger from
+    inside the fold that is building it. One rule, two folds; never a second
+    spelling of who counts as having written a chain.
+
+    INSIDE A RUNNING FOLD, `chain_authors` asks the fold's `_AuthorIndex`
+    instead (task/3562): the same derivations, kept per row as the fold
+    changes them, so a replay pays each once rather than once per close it
+    validates. This join answers everywhere else, and wherever the index
+    fails."""
     rows = rows or {}
     chains, members, links, identities, repos, broken = {}, {}, {}, {}, {}, set()
+    grouped = {}
+    # THE HOME REPOSITORY IS ONE ANSWER PER CALL. `_chain_repo` resolves a
+    # repo-less legacy row to the running package's repository, which spawns
+    # git; every such row gets the SAME answer, so it is asked once here
+    # rather than once per row — the join now also runs inside a replay.
+    legacy = []
     for rid, row in rows.items():
-        repos[rid] = landreq._chain_repo(row)
+        if row.get("repo_id") is not None:
+            repos[rid] = landreq._chain_repo(row)
+        else:
+            if not legacy:
+                legacy.append(landreq._chain_repo(row))
+            repos[rid] = legacy[0]
         identities[rid] = landreq._chain_key(row, repos[rid])
         links[rid] = set()
     for rid, row in rows.items():
@@ -153,18 +457,20 @@ def chain_contributor_index():
         peer = members.setdefault(ident, rid)
         links[rid].add(peer)
         links[peer].add(rid)
-        wrote, approved, _unknown = chains.setdefault(ident, (set(), [], None))
-        # Reading is not authorship. The patch recipient contributes only
-        # when this round actually records a cure.
-        names = [row.get("sender")]
-        if row.get("patch_tip"):
-            names.append(row.get("patch_author") or row.get("recipient"))
-        for name in names:
-            if isinstance(name, str) and name.strip():
-                wrote.add(name.strip())
+        _wrote, approved, _unknown = chains.setdefault(ident,
+                                                       (set(), [], None))
+        grouped.setdefault(ident, []).append(row)
         if str(row.get("polarity") or "").strip().lower() == "approve":
             position = dispatches.verdict_index(verdicts, rid)
             approved.append((row, position))
+    # WHO WROTE EACH CHAIN IS A QUESTION ABOUT THE WHOLE CHAIN (whether it
+    # names a builder, which tips its rounds read) AND ABOUT THE WHOLE LEDGER
+    # (who first brought each of those tips), so it is asked once every round
+    # is grouped, in fold order, through the one rule, over ONE provenance
+    # index for the whole fold.
+    writers = landreq.tip_writers(rows)
+    for ident, chain in grouped.items():
+        chains[ident][0].update(landreq.chain_writers(chain, rows, writers))
     pending, seen = list(broken), set()
     while pending:
         rid = pending.pop()
@@ -176,10 +482,353 @@ def chain_contributor_index():
             wrote, approved, _unknown = chains[ident]
             chains[ident] = (wrote, approved, "linked chain identity is UNKNOWN")
         pending.extend(links[rid] - seen)
-    if key is not None and not broken:
-        landreq._CHAIN_CONTRIB_MEMO.clear()
-        landreq._CHAIN_CONTRIB_MEMO.update(key=key, chains=chains)
-    return chains, None
+    return chains, broken
+
+class _AuthorIndex(object):
+    """`_contributor_chains`'s AUTHOR half (who wrote each chain, and whether
+    its identity is linked to an UNKNOWN one), kept current over ONE fold's
+    state map as its rows change (task/3562).
+
+    THE DEFECT, MEASURED on the hub 2026-09-28: auto-land's `fold_apply` held
+    the dispatch ledger write lock 14+ minutes in one cold replay, inside
+    `_source_clean_landed_error -> source_clean_holder_error -> chain_authors
+    -> _contributor_chains -> tip_writers -> _first_bringers`. Every
+    source-clean close the replay validated rebuilt the whole join over the
+    fold prefix (every row's repository, identity, reads and brings, every
+    tip's first bringers), so one replay cost events x ledger.
+
+    THE SAME RULE, ASKED INCREMENTALLY. The join is a question about the
+    prefix, and between two questions the prefix differs only in the rows the
+    fold changed since, which its watch names (`dispatches._FoldWatch`). Each
+    row's derivation (`_chain_repo`, `_chain_key`, `_reads`, `_brings`) is
+    kept per row and redone only when the row object changed (the fold
+    replaces a row it changes and never mutates one), or when an input the
+    derivation reads beyond its own row changed: an ancestor's start tip,
+    `supersedes` or presence (`_brings` walks the ancestors), whether some
+    round reads a build's base (`reads`), a parent's presence or repository
+    (the links). A tip's first bringers (`_first_bringers`) are memoised until
+    a candidate for that tip changes, and a chain's writers (`chain_writers`)
+    until one of its rounds changes or a tip one of them carries changes
+    hands. The answer is the join's answer; tests/test_fold_author_memo.py
+    compares the two through random ledgers.
+
+    THE LINKS ARE THE JOIN'S LINKS, spelled with one node per chain identity
+    instead of a link to its first member: both connect exactly the rounds of
+    one chain, so an UNKNOWN identity reaches the same chains.
+
+    ANY FAILURE HANDS THE QUESTION BACK TO THE WHOLE JOIN (`failed`), which
+    answers, or raises, exactly as it always did; a spent budget is re-raised
+    and leaves the index failed. Each repository answer is asked once per
+    fold, the join's own rule for the legacy home read made per fold rather
+    than per question; both still go through the checkpoint's seams, so the
+    fold's recorder sees them."""
+
+    def __init__(self, rows, born=None):
+        self.rows, self.failed = rows, False
+        self.born = {} if born is None else born
+        self.facts, self.seen, self.pos = {}, {}, {}
+        self.repos, self.legacy = {}, []
+        self.reads, self.members, self.tipver = {}, {}, {}
+        self.bringing, self.cands, self.writers, self.wrote = {}, {}, {}, {}
+        self.sup_kids, self.kids, self.builds_at = {}, {}, {}
+        self.edges, self.edges_of, self.broken = {}, {}, set()
+        self.poisoned = None
+        self.note(list(rows))
+
+    # -- keeping it current --------------------------------------------------
+    def note(self, rids):
+        """Re-derive the rows `rids` names (a fold's log, in fold order)."""
+        try:
+            rebring, reedge, flipped, done = set(), set(), set(), set()
+            for rid in rids:
+                if rid not in done:
+                    done.add(rid)
+                    self._derive(rid, rebring, reedge, flipped)
+            for rid in reedge:
+                self._edge(rid)
+            for tip in flipped:
+                rebring |= self.builds_at.get(tip, set())
+            for rid in rebring:
+                self._bring(rid)
+        except BaseException:
+            self.failed = True
+            raise
+
+    def _repo(self, row):
+        repo = row.get("repo_id")
+        if repo is None:
+            if not self.legacy:
+                self.legacy.append(landreq._chain_repo(row))
+            return self.legacy[0]
+        try:
+            hash(repo)
+        except TypeError:
+            return landreq._chain_repo(row)
+        if repo not in self.repos:
+            self.repos[repo] = landreq._chain_repo(row)
+        return self.repos[repo]
+
+    def _below(self, rid):
+        """Every row whose `supersedes` walk passes through `rid`."""
+        out, pending = set(), list(self.sup_kids.get(rid, ()))
+        while pending:
+            kid = pending.pop()
+            if kid not in out:
+                out.add(kid)
+                pending.extend(self.sup_kids.get(kid, ()))
+        return out
+
+    def _derive(self, rid, rebring, reedge, flipped):
+        row = self.rows.get(rid)
+        prev = self.facts.get(rid)
+        if (prev is None and row is None) \
+                or (prev is not None and row is self.seen.get(rid)):
+            return
+        self.poisoned = None
+        if prev is not None:
+            self._unindex(rid, prev, flipped)
+        if row is None:
+            del self.facts[rid], self.seen[rid]
+            rebring.add(rid)
+            rebring |= self._below(rid)
+            reedge.add(rid)
+            reedge |= self.kids.get(rid, set())
+            return
+        # THE LEDGER'S ORDER, NEVER THE CATCH-UP'S (task/3562): a send's
+        # place among a tip's candidates is the ledger index of the event
+        # that opened its row, the order the join enumerates the fold's rows
+        # in. The fold's log names a row as soon as an event names it, even
+        # one that opened nothing, so an order counted off the log put a row
+        # before one the ledger opened first and named the wrong first
+        # bringer. A row with no readable opening position fails the index,
+        # and the join answers.
+        at = self.born.get(rid)
+        if not at or type(at[0]) is not int:
+            raise LookupError("a row the fold holds has no opening position")
+        self.pos[rid] = at[0]
+        repo = self._repo(row)
+        ident = landreq._chain_key(row, repo)
+        reads = frozenset(landreq._reads(row))
+        build = row.get("kind") == "build"
+        start = landreq._start_tip(row)
+        carried = set(reads)
+        branch = row.get("ref_branch")
+        if build and isinstance(branch, str) and branch \
+                and branch not in _TRUNK_BRANCHES:
+            carried.add(start)
+        carried.discard(None)
+        sup = row.get("supersedes")
+        parents = (sup, row.get("chain_root"))
+        for parent in parents:
+            hash(parent)                 # the join raises on this too
+        self.facts[rid] = (repo, ident, reads, frozenset(carried), start, sup,
+                           parents, build)
+        self.seen[rid] = row
+        if ident is None:
+            self.broken.add(rid)
+        else:
+            self.members.setdefault(ident, set()).add(rid)
+            self.wrote.pop(ident, None)
+        for tip in reads:
+            if not self.reads.get(tip):
+                flipped.add(tip)
+            self.reads[tip] = self.reads.get(tip, 0) + 1
+        for parent in set(parents):
+            self.kids.setdefault(parent, set()).add(rid)
+        self.sup_kids.setdefault(sup, set()).add(rid)
+        if build:
+            self.builds_at.setdefault(start, set()).add(rid)
+        rebring.add(rid)
+        if prev is None or prev[4] != start or prev[5] != sup:
+            rebring |= self._below(rid)
+        reedge.add(rid)
+        if prev is None or prev[0] != repo:
+            reedge |= self.kids.get(rid, set())
+
+    def _unindex(self, rid, prev, flipped):
+        _repo, ident, reads, _carried, start, sup, parents, build = prev
+        if ident is None:
+            self.broken.discard(rid)
+        else:
+            self.members.get(ident, set()).discard(rid)
+            self.wrote.pop(ident, None)
+        for tip in reads:
+            self.reads[tip] -= 1
+            if not self.reads[tip]:
+                del self.reads[tip]
+                flipped.add(tip)
+        for parent in set(parents):
+            self.kids.get(parent, set()).discard(rid)
+        self.sup_kids.get(sup, set()).discard(rid)
+        if build:
+            self.builds_at.get(start, set()).discard(rid)
+
+    def _edge(self, rid):
+        new = set()
+        facts = self.facts.get(rid)
+        if facts is not None:
+            repo, ident = facts[0], facts[1]
+            for parent in facts[6]:
+                if parent not in self.rows or parent == rid:
+                    continue
+                other = self.facts.get(parent)
+                if other is None:
+                    raise LookupError("a row the fold holds was never derived")
+                # Two KNOWN different repositories never share a scope.
+                if repo and other[0] and repo != other[0]:
+                    continue
+                new.add(parent)
+            if ident is not None:
+                new.add(("chain", ident))
+        old = self.edges_of.get(rid, frozenset())
+        if new == old:
+            return
+        for node, step in [(n, -1) for n in old - new] \
+                + [(n, 1) for n in new - old]:
+            for one, two in ((rid, node), (node, rid)):
+                count = self.edges.setdefault(one, {})
+                count[two] = count.get(two, 0) + step
+                if not count[two]:
+                    del count[two]
+        self.edges_of[rid] = frozenset(new)
+        self.poisoned = None
+
+    def _bring(self, rid):
+        old = self.bringing.pop(rid, [])
+        new = []
+        row = self.rows.get(rid)
+        if row is not None and rid in self.facts:
+            for tip, ts, seat, late in landreq._brings(row, self.rows,
+                                                       _ReadsView(self)):
+                new.append((tip, (ts if dispatches._valid_ts(ts) else None,
+                                  self.pos[rid], late, seat)))
+        if new:
+            self.bringing[rid] = new
+        if new == old:
+            return
+        touched = set()
+        for tip, _cand in old:
+            self.cands.get(tip, {}).pop(rid, None)
+            touched.add(tip)
+        for tip, cand in new:
+            self.cands.setdefault(tip, {}).setdefault(rid, []).append(cand)
+            touched.add(tip)
+        for tip in touched:
+            self.writers.pop(tip, None)
+            self.tipver[tip] = self.tipver.get(tip, 0) + 1
+
+    # -- answering -----------------------------------------------------------
+    def writer(self, tip, default):
+        """`tip_writers(rows).get(tip, default)`, memoised per tip."""
+        if tip in self.writers:
+            return self.writers[tip]
+        found = [c for cands in self.cands.get(tip, {}).values()
+                 for c in cands]
+        if not found:
+            return default
+        self.writers[tip] = landreq._first_bringers(found)
+        return self.writers[tip]
+
+    def _poisoned(self):
+        """{chain identity} every UNKNOWN identity reaches by its links."""
+        if self.poisoned is None:
+            out, seen, pending = set(), set(), list(self.broken)
+            while pending:
+                node = pending.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                if isinstance(node, tuple):
+                    out.add(node[1])
+                pending.extend(n for n in self.edges.get(node, ())
+                               if n not in seen)
+            self.poisoned = out
+        return self.poisoned
+
+    def authors(self, lr):
+        """`chain_authors(lr, rows)`'s (wrote, err), from the index."""
+        rid = lr.get("id")
+        facts = self.facts.get(rid) if isinstance(rid, str) else None
+        if facts is not None and self.rows.get(rid) is lr:
+            ident = facts[1]
+        else:
+            ident = landreq._chain_key(lr, self._repo(lr))
+        if ident is None:
+            why = "chain identity is UNKNOWN" \
+                if lr.get("id") or lr.get("chain_root") else None
+            return frozenset(), why
+        members = self.members.get(ident)
+        if not members:
+            return frozenset(), None
+        memo = self.wrote.get(ident)
+        # A CHAIN'S WRITERS STAND while its rounds and the first bringers of
+        # every tip they carry do: each tip's version is kept with the memo.
+        if memo is None or any(self.tipver.get(tip, 0) != ver
+                               for tip, ver in memo[1]):
+            order = sorted(members, key=self.pos.get)
+            wrote = frozenset(landreq.chain_writers(
+                [self.rows[r] for r in order], self.rows,
+                _WritersView(self)))
+            tips = set()
+            for r in order:
+                tips |= self.facts[r][3]
+            memo = self.wrote[ident] = (wrote, tuple(
+                (tip, self.tipver.get(tip, 0)) for tip in tips))
+        err = "linked chain identity is UNKNOWN" \
+            if ident in self._poisoned() else None
+        return memo[0], err
+
+
+class _ReadsView(object):
+    """The ledger-wide `reads` set `_brings` asks membership of."""
+    __slots__ = ("index",)
+
+    def __init__(self, index):
+        self.index = index
+
+    def __contains__(self, tip):
+        return bool(self.index.reads.get(tip))
+
+
+class _WritersView(object):
+    """The `tip_writers` map `chain_writers` reads, answered per tip."""
+    __slots__ = ("index",)
+
+    def __init__(self, index):
+        self.index = index
+
+    def get(self, tip, default=None):
+        return self.index.writer(tip, default)
+
+
+class _FailedIndex(object):
+    """The index a fold keeps once building it failed: the join answers."""
+    failed = True
+
+
+def _fold_author_index(rows):
+    """The author index of the fold running on this thread whose state map
+    IS `rows`, brought up to its last folded event, or None: outside a fold,
+    over any other map, or once the index failed, the whole join answers."""
+    watch = dispatches._fold_watch(rows)
+    if watch is None:
+        return None
+    index = watch.index
+    try:
+        if index is None:
+            del watch.log[:]             # the first scan reads every row
+            watch.index = _FailedIndex()
+            index = watch.index = landreq._AuthorIndex(rows, watch.born)
+        elif watch.log and not index.failed:
+            log = list(watch.log)
+            del watch.log[:]
+            index.note(log)
+    except projscope.Expired:
+        raise
+    except Exception:                    # noqa: BLE001 — the join answers
+        return None
+    return None if index.failed else index
+
 
 def chain_contributors(lr, index=None):
     """(wrote, approved, err) for THIS row's chain — the join, done once."""
@@ -555,7 +1204,8 @@ def _close_result(out, err, reason, dry_run, already_retired=None):
     return out, None
 
 def chain_credits(lr, lrs=None):
-    """Every author this row's chain records, lane owner first.
+    """Every seat this row's chain records as having written code, in the
+    order the chain's rounds were written: the builder first.
 
     ONE LANE, SEVERAL AUTHORS is the shape the review procedure now has: a
     reviewer of either family who finds a MECHANICAL defect commits the cure on
@@ -565,17 +1215,33 @@ def chain_credits(lr, lrs=None):
     say so — the old procedure had no second name to record because the
     reviewer was never allowed to write code.
 
-    DERIVED FROM THE CHAIN, NOT FROM ONE ROW, because the cure that carries a
-    reviewer's commit is usually an EARLIER round than the one that lands. Rows
-    that share this row's work identity (`chain_root`, falling back to the id —
-    landreq's own "a root names itself" seal) contribute their author and their
-    recorded patch author. Sorted by id after this row so two readers of one
-    ledger print the same order.
+    THE SAME WRITERS EVERY INDEPENDENCE DOOR READS (`chain_writers`, task/3356),
+    so the seat that dispatched the build or relayed a tip is never credited
+    with code it did not write. DERIVED FROM THE CHAIN, NOT FROM ONE ROW,
+    because the cure that carries a reviewer's commit is usually an EARLIER
+    round than the one that lands, and FROM THE LEDGER FOLD, because the
+    projection `lrs` drops cancelled rows: a rebound round and a build row
+    cancelled after its delivery are both links the rule has to see.
+
+    A ROW THE FOLD DOES NOT HOLD is credited from `lrs` instead, the rows that
+    share its work identity (`chain_root`, falling back to the id — landreq's
+    own "a root names itself" seal), this row first and then by id, through
+    the same rule. That is a projection built outside the ledger; a readable
+    ledger always holds the row a landed close just wrote.
 
     A name appears ONCE however many rounds it wrote, and an absent or blank
     name contributes nothing: a credit list is a statement about people, and an
     empty string in it is a claim that somebody anonymous wrote code.
     """
+    ident = landreq.chain_key(lr)
+    fold, _verdicts, err = landreq._ledger_fold()
+    if not err and ident is not None:
+        chain = [row for row in (fold or {}).values()
+                 if isinstance(row, dict)
+                 and str(row.get("chain_root") or row.get("id")) == ident[1]
+                 and landreq.chain_key(row) == ident]
+        if chain:
+            return landreq.chain_writers(chain, fold)
     rows = [lr]
     if isinstance(lrs, dict):
         root = lr.get("chain_root") or lr.get("id")
@@ -584,21 +1250,18 @@ def chain_credits(lr, lrs=None):
                         and row.get("id") != lr.get("id")
                         and (row.get("chain_root") or row.get("id")) == root),
                        key=lambda row: str(row.get("id") or ""))
-    out = []
-    for row in rows:
-        names = [row.get("author")]
-        if row.get("patch_tip"):
-            names.append(row.get("patch_author") or row.get("reviewer"))
-        for name in names:
-            if isinstance(name, str) and name.strip() and name not in out:
-                out.append(name)
-    return out
+    # THE PROJECTION SPELLS THE ROUND'S SEATS AS AUTHOR AND REVIEWER, and its
+    # own tip as `pinned_tip`; the rule reads the ledger's spelling.
+    chain = [dict(row, sender=row.get("author"), recipient=row.get("reviewer"),
+                  tip=row.get("pinned_tip")) for row in rows]
+    return landreq.chain_writers(
+        chain, {str(row.get("id")): row for row in chain})
 
 def close(rid, reason, evidence=None, tip=None, repo=None, trunk=None,
           dry_run=False, live=False, needs_restart=None,
           artifact_ref=None, report_ref=None, fan_out=True,
           attester=None, attest=None, compose_manifest=None, compose_gate=None,
-          compose_landed_by=None):
+          compose_landed_by=None, gate=None):
     """(result, err) — the one terminal verb. On a write, `result` is the
     refreshed land request; on an idempotent retry, the standing one; under
     dry_run a normalized summary marks `would_append` versus `idempotent`
@@ -630,6 +1293,10 @@ def close(rid, reason, evidence=None, tip=None, repo=None, trunk=None,
         return None, ("the delivery declaration (--live / --needs-restart) "
                       "belongs to --reason landed — no other terminal claims "
                       "a change reached the running fleet")
+    if gate is not None and reason != "source-clean-landed":
+        return None, ("--gate belongs to --reason source-clean-landed — it "
+                      "names the whole-suite receipt a landed source-clean "
+                      "hold closes on, and no other terminal reads one here")
     if reason not in landreq.CLOSE_CLI_REASONS:
         return None, ("close --reason must be one of %s"
                       % "|".join(landreq.CLOSE_CLI_REASONS))
@@ -676,7 +1343,7 @@ def close(rid, reason, evidence=None, tip=None, repo=None, trunk=None,
         dry_run=dry_run, live=live, needs_restart=needs_restart,
         fan_out=fan_out, raw_rows=raw_rows, attester=attester, attest=attest,
         compose_manifest=compose_manifest, compose_gate=compose_gate,
-        compose_landed_by=compose_landed_by)
+        compose_landed_by=compose_landed_by, gate=gate)
     result = routes[reason]()
     # WHO WROTE THE THING THAT LANDED. A lane may carry several authors — the
     # lane owner, plus any REVIEWER whose committed cure this chain rebased
@@ -696,7 +1363,7 @@ def close_routes(lr, lrs, evidence=None, tip=None, repo=None, trunk=None,
                  dry_run=False, live=False, needs_restart=None, fan_out=True,
                  raw_rows=None, attester=None, attest=None,
                  compose_manifest=None, compose_gate=None,
-                 compose_landed_by=None):
+                 compose_landed_by=None, gate=None):
     """{reason: () -> (result, err)} — the eleven evidence doors, BOUND TO ONE
     PROJECTION.
 
@@ -746,6 +1413,9 @@ def close_routes(lr, lrs, evidence=None, tip=None, repo=None, trunk=None,
             lr, evidence, repo, trunk, dry_run),
         "endorsement-moot": lambda: landreq._close_ladder_endorsement_moot(
             lr, evidence, repo, trunk, dry_run, lrs),
+        "source-clean-landed":
+            lambda: landreq._close_ladder_source_clean_landed(
+                lr, evidence, repo, trunk, gate, dry_run),
     }
 
 def _chain_polarity(lr, lrs):
@@ -760,7 +1430,7 @@ def _chain_polarity(lr, lrs):
     row could never gain the field directly. The chained round b5c7a8df67df
     then declared an explicit SUPERSEDE about the same code — and the doors
     still did not look there. The classifiers already learned that THE CHAIN
-    IS THE WORK IDENTITY (`_successor_owning`, `_measurable_through`); this
+    IS THE WORK IDENTITY; this
     is the same walk, lent to the gates.
 
     THE BOUNDARY, so a chain-aware door is not a door any chained row can
@@ -1361,7 +2031,9 @@ def _close_ladder_landed(lr, evidence, repo, trunk, dry_run, lrs=None,
     preview_options = dict(sweep_options, trunk=trunk, live=live,
                            needs_restart=needs_restart)
     if scoped and lr.get("polarity") != "concur":
-        return None, "compose-land exception belongs only to this row's own CONCUR"
+        return None, ("%s is a %s, not a CONCUR: the compose-land exception "
+                      "belongs only to this row's own CONCUR"
+                      % (lr["id"], str(lr.get("polarity") or "UNKNOWN").upper()))
     if lr.get("closed_by_landing") or lr.get("close_reason") == "landed":
         if scoped:
             from . import compose_contract
@@ -1435,8 +2107,23 @@ def _close_ladder_landed(lr, evidence, repo, trunk, dry_run, lrs=None,
                       "CONTRARY, not a resolution, and this door never takes "
                       "it. %s"
                       % (lr["id"], polarity.upper(), via, _CONTRARY_DOORS))
+    # AN UNBOUNDED CONCUR ENDORSES AND AUTHORIZES NOTHING, so both refusals
+    # name the row and the missing bound. Only the prospective contract that
+    # `compose --bounded-concur` admits (compose_contract.parse) lets a concur
+    # close landed; the locked writer and replay refuse the same row through
+    # that one parser, and this rung only says so first, by name.
     if lr.get("polarity") == "concur" and not scoped:
-        return None, "CONCUR does not authorize landing; prospective compose evidence required"
+        return None, ("%s is a CONCUR, which endorses and authorizes nothing: "
+                      "CONCUR does not authorize landing; prospective compose "
+                      "evidence required" % lr["id"])
+    if scoped:
+        from . import compose_contract
+        _contract, err = compose_contract.parse(
+            (raw_rows or {}).get(lr["id"], {}), raw_rows)
+        if err:
+            return None, ("%s is an unbounded CONCUR, which endorses and "
+                          "authorizes nothing, so no compose close lands it: %s"
+                          % (lr["id"], err))
     gitdir, err = landreq._close_repo(lr, repo)
     if err:
         return None, err
@@ -1853,7 +2540,8 @@ def _close_ladder_superseded(lr, evidence, tip, dry_run, lrs=None):
     return landreq.get(row["id"])
 
 def _close_ladder_subsumed(lr, evidence, repo, trunk, dry_run):
-    """Approved work reimplemented by a later cross-family confirmation."""
+    """Approved work reimplemented by a later confirmation, cross-family or a
+    non-author's (`non_author_error`)."""
     if not evidence:
         return None, ("close --reason subsumed needs --evidence "
                       "<confirmation-row-id-or-prefix>")
@@ -1958,9 +2646,14 @@ def _close_ladder_subsumed(lr, evidence, repo, trunk, dry_run):
             confirmation_recipient, "confirmation recipient")
     if err:
         return None, err
-    if original_family == confirmation_family:
-        return None, ("subsumed needs cross-family confirmation; both rows resolve "
-                      "to %s" % original_family)
+    # A SAME-FAMILY CONFIRMATION COUNTS ONLY BY THE NON-AUTHOR RULE: a reader
+    # the recorded policy admits by its model, who wrote none of the chain.
+    same = original_family == confirmation_family and landreq.non_author_error(
+        confirmation, (original,), current, verdicts)
+    if same:
+        return None, ("subsumed needs cross-family confirmation, or a "
+                      "non-author's: both rows resolve to %s, and %s"
+                      % (original_family, same))
     original_verdict_anchor = verdicts[original["id"]][1]
     confirmation_verdict_anchor = verdicts[confirmation["id"]][1]
     confirmation_gate = str(confirmation.get("gate") or "")
@@ -1983,8 +2676,8 @@ def _close_ladder_subsumed(lr, evidence, repo, trunk, dry_run):
         # A VANISHED ORIGINAL IS ADJUDICATED HERE, BY NAME. `_landing_proof`
         # answers `unknown` for an object this clone cannot resolve, because
         # most doors reading it carry nothing that could stand in for the
-        # missing measurement. This one does: the cross-family confirmation
-        # above is PROVEN on trunk, so the work is answered by the
+        # missing measurement. This one does: the confirmation above, cross-
+        # family or a non-author's, is PROVEN on trunk, so the work is answered by the
         # confirmation and not by the absence (`_vanished_proof` states the
         # bound). A tip that still resolves never reaches the vanished pass
         # and keeps its `unknown`.
@@ -2621,6 +3314,751 @@ def _close_ladder_endorsement_moot(lr, evidence, repo, trunk, dry_run,
     out, oerr = landreq.get(row["id"])
     return out, oerr
 
+#: The ruling's three conditions, by the names every refusal carries
+#: (task/3053). A row qualifies only when all three hold, and a refusal names
+#: EVERY one that failed rather than the first, so the operator reading the
+#: foldcheck listing sees the whole answer for a row in one line.
+SOURCE_CLEAN_CONDITIONS = ("condition 1 (holder)", "condition 2 (ancestry)",
+                           "condition 3 (gate)")
+
+
+class SourceCleanRefusal(str):
+    """A source-clean refusal sentence that also says WHICH refusal it is
+    (task/3053 round 4, the author's ruling 4).
+
+    A STRING, SO EVERY READER THAT PRINTS IT IS UNCHANGED; A KIND, SO THE
+    READERS THAT ACT DIFFERENTLY ON EACH SHAPE DO NOT RE-READ THE SENTENCE.
+    Three do: the hold door appends "ask a seat that wrote none of this lane"
+    to a LANE AUTHOR refusal only, because an UNREADABLE chain is no seat's
+    to fix; `helm train` folds every NO HOLDER exclusion into one counted
+    line; and `source_clean_rehold` words the door a billed reviewer is
+    handed. `kind` is None on a refusal no reader branches on (a lineage
+    refusal, a hold that no longer stands, an unreadable ledger).
+
+    THE KIND DOES NOT SURVIVE SERIALISATION, and nothing needs it to: every
+    reader that branches on it holds the object the predicate returned, and
+    the projection stores the finished door (`source_clean_rehold`), never
+    the bare refusal."""
+
+    NO_HOLDER = "NO HOLDER"
+    NOT_RECIPIENT = "NOT THE RECIPIENT"
+    LANE_AUTHOR = "LANE AUTHOR"
+    UNREADABLE = "UNREADABLE"
+    CONTESTED = "CONTESTED"
+
+    def __new__(cls, text, kind=None):
+        out = super().__new__(cls, text)
+        out.kind = kind
+        return out
+
+
+def source_clean_holder_error(row, rows=None, verdicts=None):
+    """Why condition 1 fails for one HELD row, or None (task/3053) — as a
+    `SourceCleanRefusal` whose kind is NO_HOLDER, NOT_RECIPIENT, or the author
+    rung's own (LANE_AUTHOR, UNREADABLE).
+
+    THE RULING: the hold was recorded by the row's RECIPIENT, or by its
+    sender or custodian on a fresh-context read it recorded on this row at
+    the held tip (`dispatches.holds_on_its_fresh_read`, task/3658), and
+    that seat wrote NO round of the lane, or its claim rests on a reading
+    instance that wrote none of it (task/3483) or on a pair agreement on a
+    reviewer's patch (task/3561). Both halves are the tree's existing reads,
+    not new ones: "the same seat" is `_same_seat` (canonical first, exact
+    string under it), and "a lane author" is `source_clean_author_error` —
+    the chain-contributor join `independent_review` already uses.
+
+    WHICH FOLD THE AUTHORSHIP IS READ FROM IS THE CALLER'S TO SAY (round 4,
+    the author's ruling 5). A WRITER passes the fold it stands on as `rows`:
+    the hold door the snapshot its lock holds, the close ladder its snapshot,
+    and replay its `current` prefix — a writer and its replay must judge one
+    ledger prefix the same way, and replay cannot re-read the ledger it is
+    building. A READ-SIDE caller passes nothing and reads the memoised
+    `chain_contributor_index()`: `source_clean_car` for `helm train` and
+    `lr compose`, and the billing surfaces through `source_clean_rehold`.
+    They answer "may this ride" or "who owes this" across a whole board, so
+    a join rebuilt per held row buys no agreement and costs one join each.
+
+    ABSENT IS NOT A PASS. A hold written before the stamp records no hand, and
+    reading its recipient into that silence is the failure mode this door must
+    not have: an author re-holding a row would look exactly like its reviewer.
+    The refusal names the one move that cures it — the recipient re-holds.
+
+    UNLESS THE RECIPIENT CANNOT (the Fable read's finding on (c)): the hold
+    door refuses that re-hold by name when the recipient wrote a round of the
+    chain, so a NO HOLDER row whose recipient is a LANE AUTHOR was billed to
+    a reviewer and handed a door that does not open — six of the fifty live
+    held source-clean rows when measured. The author rung is asked of the
+    recipient FIRST, over the same join and the same fold the stamped path
+    reads, and its refusal rides out with its own kind, so `source_clean_rehold`
+    names a reader that wrote none of the lane and `helm train` lists the
+    row on its own line instead of inside the NO HOLDER count. The join is
+    memoised per ledger state, so this costs the read side nothing new."""
+    actor = row.get("hold_actor")
+    recipient = str(row.get("recipient") or "").strip()
+    rid = str(row.get("id") or "")[:12]
+    tip = str(row.get("source_clean_tip") or "<tip>")
+    if not isinstance(actor, str) or not actor.strip():
+        aerr = landreq.source_clean_author_error(row, recipient, rows,
+                                                 verdicts) if recipient else None
+        if aerr:
+            return landreq.SourceCleanRefusal(
+                "the hold records NO HOLDER, and its recipient %s cannot "
+                "re-hold it: %s" % (recipient, aerr),
+                getattr(aerr, "kind", None))
+        return landreq.SourceCleanRefusal(
+            "the hold records NO HOLDER — it predates the hold stamp or was "
+            "written by a process that declared no seat, so nothing on the "
+            "ledger says %s recorded it; %s re-holds it: `helm dispatch "
+            "release %s`, then `helm dispatch hold %s <reason> --source-clean "
+            "%s`" % (recipient or "the recipient",
+                     recipient or "the recipient", rid, rid, tip[:12]),
+            landreq.SourceCleanRefusal.NO_HOLDER)
+    if not landreq._same_seat(actor, recipient) \
+            and not dispatches.holds_on_its_fresh_read(
+                row, actor, row.get("source_clean_tip")):
+        return landreq.SourceCleanRefusal(
+            "the hold was recorded by %s, not by the row's recipient %s — only "
+            "the reader the row was sent to can say its read found nothing, "
+            "or a party of the row on a fresh-context read it recorded here "
+            "at the held tip" % (actor, recipient or "(unnamed)"),
+            landreq.SourceCleanRefusal.NOT_RECIPIENT)
+    return landreq.source_clean_author_error(row, actor, rows, verdicts)
+
+
+def _unjoined_author(name, wrote):
+    """`name`, the author a row records for itself, when the join `wrote`
+    names no writer for its chain; else None (task/3356).
+
+    THE ROW-LOCAL RULE IS THE JOIN'S FALLBACK, NOT ITS PEER. For a chain the
+    join holds, it is the whole answer: it knows whether the chain names a
+    builder and which rounds brought new tips, and a sender that relayed a
+    tip already on the ledger wrote nothing, even on a row it rebound to
+    itself. A row the join does not hold (a projection built outside the
+    ledger), or a chain none of whose rounds records a writer, has only its
+    own evidence, and there its sender stands as its author as it always did.
+    Every door that once added the row's sender beside the join asks this
+    instead: `independent_review`, `source_clean_author_error` and
+    `non_author_error`."""
+    name = str(name or "").strip()
+    return name if name and not wrote else None
+
+
+def chain_authors(row, rows=None, verdicts=None):
+    """(wrote, err) — every seat that wrote code in `row`'s chain
+    (`chain_writers`, through `chain_contributors`), over the fold `rows` the
+    caller stands on (`_contributor_chains`), or, with `rows` None, the
+    memoised `chain_contributor_index()`.
+
+    THE ONE "WROTE THIS CHAIN" SET its doors read: the source-clean doors'
+    authorship test (`source_clean_author_error`) and the non-author rule
+    (`non_author_error`). The verdict door's fresh-context arm reads no
+    author: it judges the reading instance by its own run record
+    (`dispatches.reading_instance_is_fresh`, task/3658). `err` is a chain
+    whose authorship could not be read, and each caller refuses on it: an
+    unreadable chain is never a chain nobody wrote."""
+    if rows is None:
+        wrote, _approved, err = landreq.chain_contributors(row)
+        return wrote, err
+    # INSIDE A FOLD, THE FOLD'S INDEX ANSWERS (task/3562, `_AuthorIndex`): a
+    # replay asks this once per source-clean close it validates, and the
+    # whole join per ask made one replay cost events x ledger.
+    index = landreq._fold_author_index(rows)
+    if index is not None:
+        try:
+            return index.authors(row)
+        except projscope.Expired:
+            raise
+        except Exception:                # noqa: BLE001 — the join answers
+            index.failed = True
+    chains, _broken = landreq._contributor_chains(rows, verdicts)
+    wrote, _approved, err = landreq.chain_contributors(row, index=chains)
+    return wrote, err
+
+
+def non_author_error(verdict, works, rows=None, verdicts=None, also=(),
+                     verify=True):
+    """Why `verdict`'s reader does NOT take the NON-AUTHOR rule, or None when
+    it does (the owner's ruling: "I think opus seats should be in the upper
+    tier", and one fresh non-author Opus read can approve alone).
+
+    TWO HALVES, BOTH REQUIRED. The verdict's recorded approval tier gave its
+    reader the rule (`dispatches.non_author_tier_error`: the policy version
+    it was recorded under names, with a `model:` selector, the model its
+    seat's runtime records), and the reader wrote none of the work: it is no
+    seat `chain_authors` records for their chains, no sender of a work whose
+    chain records no writer (`_unjoined_author`), and none of `also`, over
+    the fold `rows` the caller stands on or, with `rows` None, the memoised
+    index.
+
+    The three rules that ask for two families ask this when the families
+    are the same: derived APPROVED (`rowworld.non_author_approvals`),
+    `resolved` and `subsumed`. Any reason keeps the family rule, which is the
+    fail-closed direction: an unreadable chain, an unreadable tier record,
+    and a model no selector names all answer one."""
+    why = dispatches.non_author_tier_error(verdict, verify)
+    if why:
+        return why
+    seat = str((verdict or {}).get("recipient") or "").strip()
+    authors = {str(a).strip() for a in also or () if str(a or "").strip()}
+    for work in works:
+        wrote, err = landreq.chain_authors(work, rows, verdicts)
+        if err:
+            return ("this work's authorship could not be read (%s): an "
+                    "unreadable chain is never a chain nobody wrote" % err)
+        sender = landreq._unjoined_author((work or {}).get("sender"), wrote)
+        authors |= set(wrote) | ({sender} if sender else set())
+    if not seat or any(landreq._same_seat(seat, a) for a in authors):
+        return ("@%s wrote this work (its authors are %s), so its read is "
+                "not a non-author's" % (seat or "?", ", ".join(
+                    "@" + a for a in sorted(authors)) or "unnamed"))
+    return None
+
+
+def source_clean_author_error(row, seat, rows=None, verdicts=None, tip=None,
+                              doors=None):
+    """Why `seat`'s clean read of `tip` (default: the row's held tip) is a LANE
+    AUTHOR's, or None (task/3053) — as a `SourceCleanRefusal` of kind
+    LANE_AUTHOR or UNREADABLE.
+
+    THE ONE AUTHORSHIP READING THE SOURCE-CLEAN DOORS SHARE: the hold door
+    asks it of the corroborated hand about to record a `--source-clean` hold
+    (the integrator's 22:01Z ruling), and condition 1 of the close asks it of
+    the hand the hold recorded. Both read the chain-contributor join
+    (`chain_authors`: every seat the chain records writing code) plus
+    `self_reviewed`'s row-local rule where the join names no writer
+    (`_unjoined_author`) — built over the fold `rows`
+    the caller stands on (`_contributor_chains`), or, with `rows` None, the
+    memoised `chain_contributor_index()`; `source_clean_holder_error` says
+    which callers take which, and why.
+
+    TWO REFUSALS, TYPED APART (the author's ruling 4). LANE_AUTHOR is a seat
+    that wrote a round: another seat, one that wrote none of the lane, can
+    make the claim instead. UNREADABLE is a chain whose authorship could not
+    be read at all — an unreadable chain is never a chain nobody wrote, so
+    it refuses too, but no other seat can cure it, and the hold door must
+    not send its reader to one.
+
+    A LANE AUTHOR'S CLAIM STANDS ON EITHER OF TWO READS BY OTHERS:
+      * a fresh-context read `seat` itself recorded on this row, CONCURring
+        at exactly the held tip (`_fresh_instance_read`). The verdict door
+        admitted it only after judging the run as the reading instance
+        (`dispatches.reading_instance_is_fresh`: its own record and its own
+        lineage, never the session that spawned it, task/3658). It binds a
+        door lane as a reversible one;
+      * PAIR AGREEMENT on a reviewer's patch at exactly the held tip
+        (`_pair_agreement`, task/3561, store premise
+        pair-agreement-lands-a-mechanical-patch-a-door-patch-owes-a-re-read):
+        the patcher read everything under its cure and the lane's author read
+        the cure, so no third reader is owed. It binds a REVERSIBLE lane only.
+        `doors`, from each writer of a holder (the hold door and the holder
+        backfill), is a callable giving the lane's door classes AT THE HELD
+        TIP (`dispatches.held_tip_doors`), and a lane with any, UNKNOWN among
+        them, owes the one fresh-context re-read instead. Replay never probes
+        git: it reads the ledger half those writers already measured.
+    """
+    wrote, err = landreq.chain_authors(row, rows, verdicts)
+    if err:
+        return landreq.SourceCleanRefusal(
+            "this lane's authorship could not be read (%s) — an unreadable "
+            "chain is never a chain nobody wrote" % err,
+            landreq.SourceCleanRefusal.UNREADABLE)
+    held = row.get("source_clean_tip") if tip is None else tip
+    if not (landreq.self_reviewed(landreq._unjoined_author(row.get("sender"),
+                                                           wrote), seat)
+            or any(landreq._same_seat(seat, name) for name in wrote)) \
+            or landreq._fresh_instance_read(row, seat, held):
+        return None
+    authors = ", ".join(sorted(wrote)) or seat
+    pair = _pair_agreement(row, seat, held, rows)
+    found = sorted({cls for cls, _why in doors()}) if pair and doors else []
+    if pair and not found:
+        return None
+    if pair:
+        return landreq.SourceCleanRefusal(
+            "the holder %s is a LANE AUTHOR (this chain records %s), and the "
+            "pair agreement on %s's patch at %s carries only a reversible "
+            "lane: this one is a DOOR (%s), which owes one re-read of that "
+            "tip by a fresh-context reader that wrote none of it"
+            % (seat, authors, pair[0], landreq._tip(held)[:12],
+               ", ".join(found)), landreq.SourceCleanRefusal.LANE_AUTHOR)
+    return landreq.SourceCleanRefusal(
+        "the holder %s is a LANE AUTHOR (this chain records %s) — an "
+        "author's clean read is not an independent one" % (seat, authors),
+        landreq.SourceCleanRefusal.LANE_AUTHOR)
+
+
+def _pair_agreement(row, seat, tip, rows=None):
+    """(patcher, agreeing seat) when `row`'s chain carries a reviewer's patch
+    at exactly `tip` that the pair agreed, with `seat` one of the two, or
+    None (task/3561).
+
+    THE PATCH is a FIX verdict on a round of the chain that names `tip` as
+    its cure (`patch_tip`, whose ancestry holds the tip the patcher read) and
+    carries no design finding and no retraction. THE AGREEMENT is one of:
+      * `seat` is another lane author holding the patch tip itself: its hold
+        is its own agreeing read of the cure;
+      * `seat` is the patcher, and another seat recorded an agreeing verdict
+        (CONCUR or APPROVE, never retracted) at exactly `tip` on a round of
+        the chain.
+    Either way each part of the tip was read by a seat that did not write
+    it. Nothing here reads git: the door half is the caller's."""
+    tip = landreq._tip(tip)
+    if not tip:
+        return None
+    if rows is None:
+        rows, _verdicts, err = landreq._ledger_fold()
+        if err:
+            return None
+    ident = landreq.chain_key(row)
+    if ident is None:
+        return None
+    chain = [r for r in (rows or {}).values() if isinstance(r, dict)
+             and str(r.get("chain_root") or r.get("id") or "") == ident[1]
+             and landreq.chain_key(r) == ident
+             and not r.get("verdict_retracted")]
+    for cure in chain:
+        patcher = str(cure.get("patch_author") or cure.get("recipient")
+                      or "").strip()
+        if cure.get("polarity") != "fix" or not patcher \
+                or landreq._tip(cure.get("patch_tip")) != tip \
+                or cure.get("design_findings"):
+            continue
+        if not landreq._same_seat(seat, patcher):
+            return patcher, seat
+        for agreed in chain:
+            reader = str(agreed.get("recipient") or "").strip()
+            if agreed.get("polarity") in ("concur", "approve") and reader \
+                    and landreq._tip(agreed.get("reviewed_tip")) == tip \
+                    and not landreq._same_seat(reader, patcher):
+                return patcher, reader
+    return None
+
+
+def _fresh_instance_read(row, seat, tip):
+    """The fresh-context advisory read `seat` recorded on `row` CONCURring at
+    exactly `tip`, or None (task/3483) — the reading instance a lane
+    author's source-clean claim may rest on (`source_clean_author_error`).
+    A FIX or SUPERSEDE found something, and a read of another tip read other
+    work, so neither is a clean read of this one."""
+    tip = landreq._tip(tip)
+    for read in (row or {}).get("advisory_reads") or ():
+        if isinstance(read, dict) and tip \
+                and read.get("independence") == "fresh-context" \
+                and read.get("polarity") == "concur" \
+                and landreq._tip(read.get("reviewed_tip")) == tip \
+                and landreq._same_seat(read.get("recorded_by"), seat):
+            return read
+    return None
+
+
+def source_clean_rehold(row):
+    """{"kind", "why", "door"} — the re-hold a billed REVIEWER owes on a held
+    source-clean `row` whose holder rung refuses, or None when the rung
+    passes or the row carries no source-clean hold (task/3053 round 4, the
+    author's ruling 3).
+
+    ONE PREDICATE CALL, ONE ANSWER FOR EVERY SURFACE. A stamped hold whose
+    hand is not the recipient's, or is a LANE AUTHOR's, is excluded by
+    `helm train` and closable by no land, exactly like a hold that records
+    NO HOLDER — so it is billed where that one is, to the reviewer, with the
+    same door: release, then hold `--source-clean` again. `_lr` asks this
+    once per row and carries the answer as `source_clean_rehold`; `lr list`,
+    `lr show`, the obligation sentence and the stale sweep read that field.
+    Only a surface built on the DISPATCH row and not the projection —
+    `dispatches._base_label`, the hold verb's own output and nudge, and the
+    stale sweep for a row the projection did not carry — calls this itself.
+
+    THE READ-SIDE JOIN (`source_clean_holder_error` with no fold): billing is
+    a board question, asked of every held row the board renders.
+
+    `why` is the rung's own sentence plus the door; `door` is the command
+    text alone. A NO HOLDER refusal already names its door, so it is not
+    named twice. A LANE AUTHOR's own re-hold is refused at the hold door, so
+    its door names who can make the claim instead."""
+    clean = str((row or {}).get("source_clean_tip") or "")
+    if not clean:
+        return None
+    why = landreq.source_clean_holder_error(row)
+    if not why:
+        return None
+    kind = getattr(why, "kind", None)
+    rid12 = str(row.get("id") or "")[:12]
+    recipient = str(row.get("recipient") or "").strip() or "its recipient"
+    release = "helm dispatch release %s" % rid12
+    hold = "helm dispatch hold %s <reason> --source-clean %s" % (rid12,
+                                                                clean[:12])
+    if kind == landreq.SourceCleanRefusal.LANE_AUTHOR:
+        fresh = ("`helm dispatch verdict %s %s --concur --reviewer-model opus "
+                 "--reviewer-run <run>`" % (rid12, clean[:12]))
+        door = ("%s; then a seat that wrote none of this lane reads it, and "
+                "its own `helm dispatch hold <its row> <reason> --source-clean "
+                "%s` is the re-hold; or a fresh-context run reads it, and %s "
+                "records that read and the hold" % (release, clean[:12],
+                                                    fresh))
+        return {"kind": kind, "door": door, "why": (
+            "%s; `%s`, then ask a seat that wrote none of this lane to read "
+            "it (`helm dispatch rebind %s --to <that seat> --force --reason "
+            "R` sends it there) — its own `helm dispatch hold <its row> "
+            "<reason> --source-clean %s` is the re-hold a land can close on; "
+            "or spawn a fresh-context subagent to read it, and %s records "
+            "its read and the hold in one verb"
+            % (why, release, rid12, clean[:12], fresh))}
+    door = "%s; %s" % (release, hold)
+    if kind == landreq.SourceCleanRefusal.NO_HOLDER:
+        return {"kind": kind, "door": door, "why": str(why)}
+    return {"kind": kind, "door": door, "why": (
+        "%s; %s re-holds it: `%s`, then `%s`" % (why, recipient, release,
+                                                  hold))}
+
+
+def _source_clean_contest(row, tip):
+    """Why an unanswered FIX or SUPERSEDE on the HELD tip keeps this row off
+    a train, or None (task/3053 round 4, the author's ruling 2) — as a
+    CONTESTED `SourceCleanRefusal` naming the contesting row.
+
+    THE JOIN `ready_rung_why`'s CONTESTED RUNG ASKS FOR AN APPROVE ROW, asked
+    at the held tip: `contest_index()` by tip across every chain, FIX and
+    SUPERSEDE refuse and CONCUR does not, the row's own id never contests
+    itself, and a tip cited by more than CONTEST_WORK_SPAN pieces of work is
+    a shared base, reported elsewhere and never refused here. The span
+    counts THIS row's own chain as citing the tip, because its approve
+    analogue — the recipient approving that tip — would put its chain in the
+    index; without it a held row would be refused where the approve it
+    stands in for is not.
+
+    WHY THE TRAIN AND NOT THE CLOSE DOOR: for an approve row too, CONTESTED
+    is a door-caution no land verb enforces, so `helm train` enforces it for
+    the cars it composes. An unreadable join is UNKNOWN, and UNKNOWN is no
+    car."""
+    verdicts, works, err = landreq.contest_index()
+    if err:
+        return landreq.SourceCleanRefusal(
+            "the refusals on the held tip could not be read (%s), so whether "
+            "an unanswered FIX stands on it is UNKNOWN — UNKNOWN is no car"
+            % err, landreq.SourceCleanRefusal.CONTESTED)
+    hits, _err = landreq._contesting_verdicts(dict(row, reviewed_tip=tip),
+                                              index=verdicts)
+    if not hits:
+        return None
+    root = row.get("chain_root")
+    if root in (None, dispatches.CHAIN_UNKNOWN):
+        root = row.get("id")
+    span = len(set(works.get(tip) or ()) | {str(root)})
+    if span > landreq.CONTEST_WORK_SPAN:
+        return None
+    named = ", ".join("%s by @%s on row %s" % (pol.upper(), seat or "?",
+                                               str(rid)[:12])
+                      for pol, seat, rid in hits[:3])
+    return landreq.SourceCleanRefusal(
+        "CONTESTED — an unanswered FIX or SUPERSEDE stands on the held tip "
+        "(%s%s; %d piece%s of work cite the tip). That is the READY word's "
+        "door-caution rung READY-CONTESTED, and no land verb enforces it, so "
+        "this verb does: `helm lr show %s` names the finding"
+        % (named, "" if len(hits) <= 3 else " and %d more" % (len(hits) - 3),
+           span, "" if span == 1 else "s", str(hits[0][2])[:12]),
+        landreq.SourceCleanRefusal.CONTESTED)
+
+
+def source_clean_car(lr):
+    """(tip, why) — may this land-request row ride a composed train as a
+    SOURCE-CLEAN car? THE ONE PREDICATE for that question (task/3053 F3,
+    ported from task/3039's land-gate-once-doors lane). `helm train` admits
+    exactly the rows it admits; `helm lr compose` asks it too and admits
+    NONE, because it cherry-picks and `source-clean-landed` closes on
+    ancestry only (the author's ruling 1, round 4).
+
+    THREE ANSWERS, AND THE FIRST IS NOT A REFUSAL:
+      (None, None)  not this predicate's row — it carries no source-clean
+                    hold, or it is closed or retired (a closed row keeps its
+                    held tip, and its closure is `live_ready`'s to name);
+      (tip, None)   it rides, at the HELD tip — the commit its recipient
+                    read clean, never the dispatched ref;
+      (None, why)   a held source-clean row that may NOT ride, and `why` — a
+                    `SourceCleanRefusal` — names the condition: NO HOLDER, a
+                    hand that is not the recipient, a LANE AUTHOR, an
+                    unreadable chain, an unanswered FIX or SUPERSEDE on the
+                    held tip, a held tip outside the dispatched ref's
+                    history, a hold that no longer stands, or a finding the
+                    hold did not answer.
+
+    WHY A HOLD MAY RIDE AT ALL. A reviewer who read the delta and found
+    nothing cannot mint an approve: one binds a whole-suite token only the
+    land gate on the composed tree produces. Refusing the car made each lane
+    pay, alone, for the gate a train exists to share. It rides for that
+    gate, owes no approve, and after the land `helm lr foldcheck <head>
+    --gate G --apply` closes it as `source-clean-landed`.
+
+    WHY THESE CONDITIONS: all but one are the ledger half of the door that
+    closes the car after the land, asked with that door's own rules —
+    `held_discharge_error`, `source_clean_holder_error` (condition 1) and
+    `dispatches._source_clean_lineage_error` (the lineage half of condition
+    2), in the repository `_close_repo` binds the row to. A car that door
+    would refuse on a ledger fact is a car nobody can ever close. The one
+    that is not the door's is the CONTESTED rung (`_source_clean_contest`),
+    the train's own door-caution, asked as it is for an approve row. What
+    only the land can make true — the tip on trunk, a verified gate
+    containing it — is exactly what the train is for, so it is not asked.
+
+    A READ-SIDE CALLER: the holder rung reads the memoised contributor join
+    (`source_clean_holder_error` says why), and the contest join is memoised
+    per ledger state too, so a train of N cars pays each join once.
+
+    THE INTEGRATOR'S REPRO (the task/3039 QC that removed these cars) is why
+    the holder is judged at all: a row sent to another seat, never
+    delivered, held source-clean by the integrator, composed as a car with
+    no reviewer read."""
+    if not isinstance(lr, dict) or not lr.get("source_clean_tip") \
+            or lr.get("terminal") or landreq._retired_by(lr):
+        return None, None
+    rid = str(lr.get("id") or "")
+    clean = str(lr.get("source_clean_tip") or "")
+    head = "is HELD source-clean at %s and is no car" % clean[:12]
+
+    def refuse(why):
+        return None, landreq.SourceCleanRefusal(
+            "%s: %s" % (head, why), getattr(why, "kind", None))
+    rows, _verdicts, err = landreq._ledger_fold()
+    if err:
+        return refuse("the dispatch ledger could not be read (%s), so its "
+                      "hold cannot be judged — UNKNOWN is no car" % err)
+    row = (rows or {}).get(rid)
+    tip = dispatches._clean_tip_of(row) if isinstance(row, dict) else ""
+    if not isinstance(row, dict) or row.get("status") != "held" or not tip:
+        return refuse("the ledger holds no standing source-clean hold on it "
+                      "(status %s)" % ((row or {}).get("status") or "absent"))
+    why = dispatches.held_discharge_error(row) \
+        or landreq.source_clean_holder_error(row) \
+        or _source_clean_contest(row, tip)
+    if why:
+        return refuse(why)
+    gitdir, why = landreq._close_repo(lr, None)
+    if why:
+        return refuse(why)
+    root = gitdir[:-5] if gitdir.endswith("/.git") else gitdir
+    why = dispatches._source_clean_lineage_error(root, row, tip)
+    if why:
+        return refuse(why)
+    return tip, None
+
+
+def _source_clean_refusal(rid, failures):
+    return ("%s does not qualify for source-clean-landed: %s"
+            % (rid[:12], "; ".join("%s: %s" % pair for pair in failures)))
+
+
+def _close_ladder_source_clean_landed(lr, evidence, repo, trunk, gate,
+                                      dry_run):
+    """THE LANDED SOURCE-CLEAN HOLD'S DOOR (task/3053).
+
+    THE STATE IT ENDS. A reviewer who reads a delta and finds nothing cannot
+    mint an APPROVE, because an approve binds a verified whole-suite token and
+    only the land gate on the composed tree produces one. So the reviewer
+    holds `--source-clean <tip>` and the row moves to the integrator. The land
+    then gates and ships the tip — and nothing closes the row: the reviewer is
+    not woken after the gate, the integrator is often the lane's author and
+    must not approve its own work, and `close --reason landed` refuses a row
+    with no verdict. Every source-clean land left an open row on the owner
+    board reading "landed, no verdict recorded".
+
+    THE RULING, AND ALL THREE MUST HOLD:
+      1. the hold was recorded by the row's RECIPIENT, and that seat is NOT a
+         lane author (`source_clean_holder_error`);
+      2. the hold's tip is an ANCESTOR of trunk — ancestry, never patch
+         identity, so a rebased or cherry-picked copy refuses — AND it
+         DESCENDS from the row's dispatched tip
+         (`dispatches._source_clean_lineage_error`), so a hold on a commit
+         outside the row's history, which trunk may well contain, never
+         closes a row whose own work did not land. The hold door refuses
+         that claim now; this rung refuses a hold recorded before it did;
+      3. a VERIFIED whole-suite gate receipt passed on a commit whose history
+         contains the tip (`foldcheck.gate_containing`) — a verified
+         whole-suite receipt on a commit containing the tip, which is all the
+         door checks: not that the receipt's commit is the one the land
+         pushed, nor that it reached trunk.
+    The close records the hold AND the token as its evidence and mints NO
+    APPROVE: the row's polarity stays None and no verdict event is written.
+
+    EVERY FAILED CONDITION IS NAMED, not the first: the foldcheck sweep prints
+    one line per row, and a line naming one failure invites a second round to
+    discover the next."""
+    rid = lr["id"]
+    if lr.get("close_reason") == "source-clean-landed":
+        # THE RETRY IDENTITY, first, for the reason `endorsement-moot` states
+        # at the same rung: on the default path the evidence line is DERIVED,
+        # so a retry arrives with `evidence` None and must not read as a
+        # different closure. A DIFFERENT gate or line is one.
+        gitdir, err = landreq._close_repo(lr, repo)
+        if err:
+            return None, err
+        token = foldcheck._GATE_TOKEN.match(str(gate or "").strip())
+        if lr.get("closing_repo_id") == gitdir \
+                and (gate is None or (token and token.group(1)
+                                      == lr.get("source_clean_gate"))) \
+                and (evidence is None or lr.get("close_evidence") == evidence):
+            return lr, None
+        return None, landreq._retired_refusal(lr)
+    if landreq._retired_by(lr):
+        return None, landreq._retired_refusal(lr)
+    current, verdicts, unavailable = dispatches.snapshot_with_verdicts()
+    if unavailable:
+        return None, "dispatch ledger unavailable: %s" % unavailable
+    row = current.get(rid)
+    tip = dispatches._clean_tip_of(row) if isinstance(row, dict) else ""
+    if not isinstance(row, dict) or row.get("status") != "held" or not tip:
+        return None, (
+            "%s carries no source-clean hold — this door closes a HELD row "
+            "whose recipient read it clean and held it `--source-clean <tip>`; "
+            "%s" % (rid, "a verdict row's own polarity owns a door"
+                    if lr.get("verdict_ref") else
+                    "a row nobody has read clean has nothing for a land to "
+                    "close on"))
+    herr = dispatches.held_discharge_error(row)
+    if herr:
+        return None, ("close --reason source-clean-landed refuses HELD %s: %s. "
+                      "What is owed: %s"
+                      % (rid[:12], herr, dispatches.held_rung_remedy(row)))
+    failures = []
+    cerr = landreq.source_clean_holder_error(row, current, verdicts)
+    if cerr:
+        failures.append((SOURCE_CLEAN_CONDITIONS[0], cerr))
+    gitdir, err = landreq._close_repo(lr, repo)
+    if err:
+        return None, err
+    trunk_ref, pinned, _target, terr = landreq._close_trunk(lr, gitdir, trunk)
+    if terr:
+        return None, terr
+    # RUNG 0 — THE POSITIVE CONTROL, `stranded`'s guard reused exactly as the
+    # other presence doors reuse it: a repository that cannot produce its own
+    # trunk object proves nothing about what reached it, in either direction.
+    if landreq._object_exists(gitdir, pinned) is not True:
+        return None, ("the repository at %s cannot prove its own trunk object "
+                      "— refusing to adjudicate a landing over an unreadable "
+                      "substrate" % gitdir)
+    root = gitdir[:-5] if gitdir.endswith("/.git") else gitdir
+    ancestry = []
+    proof = landreq._landing_proof(gitdir, tip, pinned)
+    if proof != "ancestor":
+        ancestry.append({
+            "patch-equivalent":
+                "%s reaches %s only by PATCH IDENTITY — a rebased or "
+                "patch-identical copy proves an identical delta landed, never "
+                "that the tip the reviewer read clean did" % (tip[:12],
+                                                              trunk_ref),
+            "absent": "%s is NOT on %s — the land has not happened"
+                      % (tip[:12], trunk_ref),
+        }.get(proof, "Git could not say whether %s reached %s (%s) — an "
+                     "unknown land is not a land"
+                     % (tip[:12], trunk_ref, proof)))
+    # THE LINEAGE HALF OF CONDITION 2 (task/3053 read, finding b). Trunk
+    # containing the held tip says nothing about THIS row's work unless that
+    # tip is the row's work: a hold on any commit already on trunk met the
+    # ancestry above and the gate below on its own. One rule with the hold
+    # door, so a hold recorded before that door learned it still refuses.
+    lerr = dispatches._source_clean_lineage_error(root, row, tip)
+    if lerr:
+        ancestry.append(lerr)
+    if ancestry:
+        failures.append((SOURCE_CLEAN_CONDITIONS[1], "; and ".join(ancestry)))
+    rung, facts = foldcheck.gate_containing(root, tip, gate)
+    if rung.verdict != foldcheck.PASS:
+        failures.append((SOURCE_CLEAN_CONDITIONS[2], rung.discriminator))
+    if failures:
+        return None, _source_clean_refusal(rid, failures)
+    # THE LINE IS THE MEASUREMENT, bounded to the evidence budget, and it
+    # says in words that no approval was written.
+    why = ("source-clean hold by %s at %s; ancestor of %s@%s; gate:%s "
+           "whole-suite OK on %s, which contains it; no APPROVE minted"
+           % (row.get("hold_actor"), tip[:12], trunk_ref, pinned[:12],
+              facts["gate"], facts["head"][:12]))[:256]
+    out, err = dispatches._record_close_proven(
+        rid, "source-clean-landed", tip, evidence=evidence or why,
+        closing_repo_id=gitdir, closing_trunk_ref=trunk_ref,
+        closing_trunk_sha=pinned, proof_mode="ancestor",
+        source_clean_gate=facts["gate"],
+        source_clean_gate_head=facts["head"],
+        source_clean_gate_tree=facts["tree"], dry_run=dry_run)
+    if err:
+        return None, err
+    if dry_run:
+        return landreq._rehearsed(out, {
+            "dry_run": True, "id": rid, "reason": "source-clean-landed",
+            "proof_mode": "ancestor", "closing_repo_id": gitdir,
+            "closing_trunk_ref": trunk_ref, "closing_trunk_sha": pinned,
+            "source_clean_tip": tip, "hold_actor": row.get("hold_actor"),
+            "gate": facts["gate"], "gate_head": facts["head"], "why": why})
+    return landreq.get(out["id"])
+
+
+def source_clean_landings(repo, head, gate, trunk=None, apply=False):
+    """(entries, err) — every HELD SOURCE-CLEAN row of `repo`, sorted by hold
+    instant, each judged against `head` and the gate named — a verified
+    whole-suite receipt on a commit containing the tip (task/3053). The
+    `helm lr foldcheck --apply` half of the land.
+
+    An entry is {"id", "tip", "holder", "verdict", "why"} with verdict one of
+      NOT-IN-HEAD  the hold's tip is not in `head`'s history, so this land
+                   does not carry it and the row is not this head's to close;
+      REFUSED      the door refused, and `why` names every failed condition;
+      QUALIFIES    all three conditions hold (nothing was appended);
+      CLOSED       it qualified and `apply` recorded the close;
+      FAILED       it qualified on the rehearsal and the real write refused —
+                   the one outcome an `--apply` caller must hear as an error.
+
+    EACH ROW GOES THROUGH THE ONE DOOR, `close --reason source-clean-landed`,
+    and `apply` only ever writes a row the same door's rehearsal admitted a
+    moment before, so the verb closes EXACTLY the rows its dry listing names.
+    The sweep owns no proof of its own: a listing that decided qualification
+    by a second reading would be the instrument that says QUALIFIES over a
+    row the writer then refuses (task/2857's shape)."""
+    info = dispatches._repo_info(repo)
+    if not info:
+        return None, "%s is not a readable Git working tree" % repo
+    backend = vcs.backend(repo)
+    rc, out, _err = backend.text(repo, "rev-parse", "--verify", "--quiet",
+                                 "%s^{commit}" % head)
+    head_sha = (out or "").strip().lower()
+    if rc != 0 or not dispatches._FULL_TIP.fullmatch(head_sha):
+        return None, "%s is not a commit in %s" % (head, repo)
+    current, unavailable = dispatches.snapshot()
+    if unavailable:
+        return None, "dispatch ledger unavailable: %s" % unavailable
+    held = sorted((row for row in current.values()
+                   if isinstance(row, dict) and row.get("status") == "held"
+                   and dispatches._clean_tip_of(row)
+                   and row.get("repo_id") == info["repo_id"]),
+                  key=lambda row: (str(row.get("hold_ts") or ""),
+                                   str(row.get("id"))))
+    entries = []
+    for row in held:
+        tip = dispatches._clean_tip_of(row)
+        entry = {"id": row["id"], "tip": tip, "holder": row.get("hold_actor"),
+                 "verdict": None, "why": None}
+        state = backend.ancestry(repo, tip, head_sha)
+        if state != vcs.ANCESTOR:
+            entry.update(verdict="NOT-IN-HEAD", why=(
+                "%s is not in the history of %s"
+                % (tip[:12], head_sha[:12]) if state == vcs.NOT_ANCESTOR
+                else "whether %s is in %s could not be asked"
+                % (tip[:12], head_sha[:12])))
+            entries.append(entry)
+            continue
+        result, err = landreq.close(row["id"], "source-clean-landed", repo=repo,
+                                    trunk=trunk, gate=gate, dry_run=True)
+        if err:
+            entry.update(verdict="REFUSED", why=err)
+        else:
+            entry.update(verdict="QUALIFIES", why=(result or {}).get("why")
+                         or (result or {}).get("close_evidence"))
+            if apply:
+                result, err = landreq.close(
+                    row["id"], "source-clean-landed", repo=repo, trunk=trunk,
+                    gate=gate)
+                entry["verdict"] = "FAILED" if err else "CLOSED"
+                if err:
+                    entry["why"] = err
+        entries.append(entry)
+    return entries, None
+
 def _close_ladder_resolved(lr, evidence, repo, trunk, dry_run, lrs=None):
     """THE POLARITY-WRONG DOOR — the sibling of #177's polarity-LESS one.
 
@@ -2649,7 +4087,8 @@ def _close_ladder_resolved(lr, evidence, repo, trunk, dry_run, lrs=None):
     dispatches.resolution_statement for why the ANCHOR is load-bearing.
 
     RESIDUAL, NAMED RATHER THAN LAUNDERED (amendment B): this door lets a
-    later cross-family confirmation stand over an earlier reviewer's FIX
+    later cross-family or non-author confirmation stand over an earlier
+    reviewer's FIX
     without that reviewer withdrawing — REVIEWER-SHOPPING. Full independence
     is the same trust any review rests on and no ladder can manufacture it.
     What is mechanizable is done: the overridden reviewer is RECORDED on the
@@ -2848,9 +4287,16 @@ def _close_ladder_resolved(lr, evidence, repo, trunk, dry_run, lrs=None):
         confirmation.get("recipient") or "", "confirmation recipient")
     if err:
         return None, err
-    if original_family == confirmation_family:
+    # A SAME-FAMILY CONFIRMATION COUNTS ONLY BY THE NON-AUTHOR RULE: a reader
+    # the recorded policy admits by its model, who wrote none of the work
+    # being resolved and none of the confirming round's.
+    same = original_family == confirmation_family and landreq.non_author_error(
+        confirmation, (current.get(lr["id"]) or lr, confirmation), current,
+        verdicts)
+    if same:
         return None, ("confirmation recipient is the author's own family (%s) "
-                      "— resolved needs cross-family eyes" % original_family)
+                      "— resolved needs cross-family eyes, or a non-author's: "
+                      "%s" % (original_family, same))
     # amendment D — the PIN travels on the event, so replay validates ancestry
     # against the sha this close was decided on and a later trunk rewrite can
     # never silently invalidate it.
@@ -2875,6 +4321,75 @@ def _close_ladder_resolved(lr, evidence, repo, trunk, dry_run, lrs=None):
             "closing_trunk_sha": pinned,
             "resolution": statement})
     return landreq.get(row["id"])
+
+def _reviewed_patch_twins(gitdir, row, trunk_sha):
+    """(twins, None) / (None, why) / (None, None) — did this FIX's REVIEWED
+    CURE land on trunk under rebased shas? (task/1484)
+
+    THE ROWS THIS IS FOR: a FIX whose reviewer committed the cure and named it
+    (`--fix --patch-tip`), after which the lane rebased onto it and landed.
+    Measured on the live board, two FIX rows sat in exactly that state for
+    three days (their ledger ids are in tests/test_lr_close.py; they are rows,
+    not commits, so a fresh clone cannot resolve them here): every cure commit
+    on trunk under a new sha,
+    none by ancestry, and the lane's own commits beneath the cure landed
+    REWORKED — so `carried`'s reached-trunk witness, which asks the WHOLE lane
+    up to the reviewed tip, read `+` for work the FIX never asked about, and
+    no door opened. `obligation._patch_identity_on_trunk` already answers the
+    same range for the owed list; this answers it as the mapping a close can
+    record.
+
+    THE QUESTION IS THE CURE'S RANGE, `reviewed..patch_tip`, and nothing
+    wider: every commit in it must have exactly ONE commit on the pinned trunk
+    with the same `git patch-id --stable` (and the same `--verbatim` id),
+    within `vcs.PATCH_TWIN_WINDOW` non-merge trunk commits the patch tip does
+    not reach. `vcs.patch_twins` carries the bound and every refusal.
+
+    (None, None) IS "NOT THIS RUNG'S ROW", and the caller keeps its own
+    answer word for word: no FIX polarity, no full patch tip distinct from
+    the reviewed one, a FIX that also recorded a design finding or a reason
+    for having no patch (its cure cannot answer the whole FIX — the same
+    exclusion `obligation._cure_landed` draws), or a patch tip trunk already
+    reaches by ANCESTRY, which is not a rebased land. (None, why) is a
+    refusal that names what failed: an unmatched commit, a collision, or an
+    UNKNOWN measurement. Nothing here is forced and nothing is guessed."""
+    reviewed = str((row or {}).get("reviewed_tip") or "").strip().lower()
+    patch = str((row or {}).get("patch_tip") or "").strip().lower()
+    if (row or {}).get("polarity") != "fix" \
+            or not dispatches._FULL_TIP.fullmatch(reviewed) \
+            or not dispatches._FULL_TIP.fullmatch(patch) or patch == reviewed \
+            or row.get("design_findings") or row.get("no_patch_because"):
+        return None, None
+    be = vcs.backend(gitdir)
+    reached = be.ancestry(gitdir, patch, trunk_sha)
+    if reached == vcs.ANCESTOR:
+        return None, None
+    if reached != vcs.NOT_ANCESTOR:
+        return None, ("the reviewed cure %s..%s could not be measured "
+                      "(UNKNOWN): git could not say whether its patch tip is "
+                      "history of %s — nothing is closed on an unknown"
+                      % (reviewed[:12], patch[:12], str(trunk_sha)[:12]))
+    state, twins, detail = be.patch_twins(gitdir, reviewed, patch, trunk_sha)
+    if state == vcs.PATCH_TWINS_MATCHED:
+        return [{"reviewed": mine, "trunk": theirs, "patch_id": pid}
+                for mine, theirs, pid in twins], None
+    if state == vcs.PATCH_TWINS_UNMATCHED:
+        return None, ("the reviewed cure %s..%s did not land by patch "
+                      "identity: %d commit(s) have no patch-identical commit "
+                      "on %s within the %d-commit trunk window (%s)"
+                      % (reviewed[:12], patch[:12], len(detail),
+                         str(trunk_sha)[:12], vcs.PATCH_TWIN_WINDOW,
+                         ", ".join(sha[:12] for sha in detail)))
+    if state == vcs.PATCH_TWINS_COLLISION:
+        return None, ("the reviewed cure %s..%s is not one-to-one with trunk: "
+                      "its commits %s share one trunk commit or match several, "
+                      "so no mapping can be recorded"
+                      % (reviewed[:12], patch[:12],
+                         ", ".join(sha[:12] for sha in detail)))
+    return None, ("the reviewed cure %s..%s could not be measured (UNKNOWN): "
+                  "%s — nothing is closed on an unknown"
+                  % (reviewed[:12], patch[:12], detail))
+
 
 def _close_ladder_carried(lr, evidence, repo, trunk, dry_run, lrs=None,
                           world=None):
@@ -3004,10 +4519,30 @@ def _close_ladder_carried(lr, evidence, repo, trunk, dry_run, lrs=None,
     carried, detail = dispatches.carriage_proof(
         row, rows, carriers, gitdir, trunk_ref)
     if carried is None:
-        return None, ("carriage could not be MEASURED for %s: %s — carried "
+        unmeasured = ("carriage could not be MEASURED for %s: %s — carried "
                       "is fail-closed on an unaskable question, exactly as "
                       "stranded is on an unknown object state"
                       % (lr["id"][:12], detail))
+        # THE REVIEWED-PATCH RUNG, asked only where both witnesses are silent
+        # and only of a FIX that named its cure (task/1484). A row it does
+        # not apply to keeps the refusal above word for word.
+        twins, why = landreq._reviewed_patch_twins(gitdir, row, pinned)
+        if twins is None:
+            return None, (unmeasured if why is None
+                          else "%s; and %s" % (unmeasured, why))
+        closed, err = dispatches._record_close_proven(
+            lr["id"], "carried", lr.get("reviewed_tip"), evidence=evidence,
+            closing_repo_id=gitdir, closing_trunk_ref=trunk_ref,
+            closing_trunk_sha=pinned, carried_base=row.get("reviewed_tip"),
+            carried_tip=row.get("patch_tip"),
+            proof_mode=dispatches.REVIEWED_PATCH_IDENTITY,
+            patch_twins=twins, dry_run=dry_run)
+        if err or not dry_run:
+            return closed, err
+        return landreq._rehearsed(closed, {
+            "dry_run": True, "id": lr["id"], "reason": "carried",
+            "proof_mode": dispatches.REVIEWED_PATCH_IDENTITY,
+            "patch_twins": twins})
     if carried is False:
         # ONLY THE REPLAY FAMILY CAN REACH HERE, so the replay wording is
         # correct wording rather than lazy wording. The reached-trunk family

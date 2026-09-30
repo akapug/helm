@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -37,7 +38,7 @@ from unittest import mock
 import os as _os, sys as _sys  # noqa: E402
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from helm import dispatches, proxywatch, seat, seats  # noqa: E402
+from helm import dispatches, offpeak, proxywatch, seat, seats  # noqa: E402
 from helm import pk  # noqa: E402
 from helm import orcaadopt as _orcaadopt  # noqa: E402
 from helm import seats_common as _seats_common  # noqa: E402
@@ -72,6 +73,7 @@ def rep(*rows, upstream=None, proxy_runtime=None):
 # and neither depends on the other. Re-exported under the local name every
 # call site here already uses.
 from tests._runtime_proof import runtime_proof  # noqa: E402,F401
+from tests._two_route_catalog import patch_two_routes  # noqa: E402
 
 
 # grok's real starvation line, VERBATIM from its proxy.log — the parser is
@@ -624,7 +626,7 @@ class _HealthRig(unittest.TestCase):
                 include_upstream=False, upstream=None, complete=True,
                 pending=False, write_age=None, work=1, seat_name="codex",
                 runtime_roster=None, parsed_family=("codex", None),
-                suspend_gap=0, whole=False):
+                suspend_gap=0, whole=False, suspend_reader=None):
         """Let health() DECIDE. An earlier draft recomputed hang_candidate in
         this helper and asserted against its own arithmetic — a test that
         cannot fail, which is why the mutation kept passing. A real transcript
@@ -647,6 +649,12 @@ class _HealthRig(unittest.TestCase):
         arms meant to set. The real reader has its own home: HostSuspendGapTest
         asserts it against the live kernel, and TurnStateHostSuspendTest passes
         values straight into the ladder.
+
+        `suspend_reader` REPLACES the knob with a function the mock calls
+        through, with whatever arguments health() passes. SuspendWindowTest
+        hands it the REAL reader over a fake host (kernel clocks and journal
+        sleep records), so the pass-through from the row's age to the reader
+        is exercised and not assumed.
         """
         tp = os.path.join(self.d, "t.jsonl")
         semantic_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ",
@@ -681,7 +689,8 @@ class _HealthRig(unittest.TestCase):
                 mock.patch("helm.seats.roster",
                            return_value=runtime_roster or {}), \
                 mock.patch.object(proxywatch, "host_suspend_gap_s",
-                                  return_value=suspend_gap), \
+                                  return_value=suspend_gap,
+                                  side_effect=suspend_reader), \
                 mock.patch.object(proxywatch, "_inflight_for",
                                   return_value=infl) as self.inflight_reader, \
                 mock.patch.object(proxywatch, "_ctx_pct", return_value=pct), \
@@ -930,7 +939,7 @@ class HealthDerivationTest(_HealthRig):
             "runtime_verified": True}}
         measured = {}
 
-        def current_proof(seat_name, observed_at=None):
+        def current_proof(seat_name, observed_at=None, timeout=None):
             self.assertEqual(seat_name, "seat-under-test")
             self.assertGreater(observed_at, 0)
             measured.update(runtime_proof(
@@ -957,8 +966,9 @@ class HealthDerivationTest(_HealthRig):
         self.assertIsNone(err, err)
         self.assertEqual(derived["family"], "codex")
         endpoint.assert_called_once_with("codex", "seat-under-test")
-        canary.assert_called_once_with("seat-under-test",
-                                       observed_at=mock.ANY)
+        canary.assert_called_once_with(
+            "seat-under-test", observed_at=mock.ANY,
+            timeout=proxywatch.UPSTREAM_PASS_DEADLINE_S)
 
     def test_unverified_runtime_family_cannot_bypass_a_damaged_register(self):  # noqa: VACUOUS_ASSERTION — the positive twin above reaches the same endpoint mock; this arm proves only the unverified authority difference keeps it untouched
         """A display mirror is not identity authority. Its unverified family
@@ -1048,6 +1058,23 @@ class TurnStateFuseTest(unittest.TestCase):
         state, ev = self.fuse(pct=None)
         self.assertEqual(state, "hung-unknown")
         self.assertIn("context%", ev)
+
+    def test_an_UNPROVEN_window_is_context_UNKNOWN_never_compact_needed(self):
+        """task/3534: a percentage of an ASSUMED window is not a reading. The
+        seat's context is UNKNOWN and the ladder says why; it never claims
+        "compact-needed … autocompact owns the fix", because autocompact does
+        not fire on an unproven window, and it never claims a hang it did not
+        measure."""
+        state, ev = proxywatch.turn_state(
+            True, proxywatch.HANG_S + 60, "ok", 0, None, 90, 2 * 3600,
+            open_dispatches=1, ctx_unknown="window unproven")
+        self.assertEqual(state, "hung")
+        self.assertIn("context UNKNOWN (window unproven)", ev)
+        self.assertNotIn("autocompact owns the fix", ev)
+        # CONTROL on the same ladder: a MEASURED percentage over the bar is
+        # still the benign compact class
+        state, ev = self.fuse(pct=93.0)
+        self.assertEqual(state, "compact-needed")
 
     def test_unreadable_spawn_age_is_HUNG_UNKNOWN(self):
         state, ev = self.fuse(spawn=None)
@@ -1349,6 +1376,21 @@ class HungVerdictDerivationTest(_HealthRig):
         self.assertIn("0 in-flight", row["turn_evidence"])
         self.assertTrue(row["hang_candidate"])
 
+    def test_an_unproven_window_derives_context_UNKNOWN_not_a_percentage(self):
+        """task/3534, through the real health(): the context reader answers
+        "window unproven" and the row carries no percentage at all."""
+        row = self._health(live=True, age=self.STALE, infl=0,
+                           pct="window unproven", spawn=2 * 3600)
+        self.assertIsNone(row["ctx_pct"])
+        self.assertEqual(row["ctx_unknown"], "window unproven")
+        self.assertEqual(row["turn_state"], "hung")
+        self.assertIn("context UNKNOWN (window unproven)",
+                      row["turn_evidence"])
+        # CONTROL: the same rig with a measured percentage over the bar
+        row = self._health(live=True, age=self.STALE, infl=0, pct=95.0,
+                           spawn=2 * 3600)
+        self.assertEqual(row["turn_state"], "compact-needed")
+
     def test_an_open_request_derives_THINKING_not_hung(self):
         row = self._health(live=True, age=self.STALE, infl=1, pct=30.0,
                            spawn=2 * 3600)
@@ -1605,6 +1647,35 @@ class UpstreamSnapshotTest(unittest.TestCase):
             self.assertIsNone(perr)
             self.assertEqual(pause["state"], "AUTH-401")
 
+    def test_missing_primary_with_unreadable_last_good_fails_explicitly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            primary = os.path.join(tmp, "proxywatch.json")
+            backup = primary + ".last-good"
+            with open(backup, "w", encoding="utf-8") as handle:
+                handle.write("{corrupt")
+            with mock.patch.object(proxywatch, "_state_path",
+                                   return_value=primary), \
+                    mock.patch.object(proxywatch, "_backup_state_path",
+                                      return_value=backup):
+                state, err, source = proxywatch._read_delivery_snapshot()
+        self.assertEqual(state, {})
+        self.assertIsNone(source)
+        self.assertIn("last-good snapshot unreadable", err)
+
+    def test_dangling_primary_symlink_is_unreadable_not_first_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            primary = os.path.join(tmp, "proxywatch.json")
+            backup = primary + ".last-good"
+            os.symlink(os.path.join(tmp, "missing-state"), primary)
+            with mock.patch.object(proxywatch, "_state_path",
+                                   return_value=primary), \
+                    mock.patch.object(proxywatch, "_backup_state_path",
+                                      return_value=backup):
+                state, err, source = proxywatch._read_delivery_snapshot()
+        self.assertEqual(state, {})
+        self.assertIsNone(source)
+        self.assertIn("not an object", err)
+
     def test_delivery_pause_holds_dark_until_measured_healthy(self):
         dark = {"ts": 1000, "upstream": {"codex": {
             "state": "RATE-LIMITED", "dark": True,
@@ -1804,6 +1875,250 @@ class TurnStateHostSuspendTest(unittest.TestCase):
         without = proxywatch.turn_state(age=7500, **self.BASE)
         self.assertEqual(without, self.verdict(7500, 0))
         self.assertEqual(without[0], "hung")
+
+
+def _fake_host(boot_ago, sleeps, recorded=None):
+    """(clock_gettime double, journal sleep records) for a host that booted
+    `boot_ago` seconds ago and slept `sleeps` = [(start_ago, seconds)], oldest
+    first. `recorded` holds the indexes of the sleeps the journal still has
+    (default: all of them); a sleep left out slept all the same, so the kernel
+    total still counts it.
+
+    The records are what systemd-sleep writes: one entry just before the host
+    sleeps and one on its way back, each stamped with the wall clock and
+    CLOCK_MONOTONIC, which does not advance while the host is asleep."""
+    now = time.time()
+    boot_wall = now - boot_ago
+    slept, marks = 0.0, []
+    for i, (start_ago, seconds) in enumerate(sleeps):
+        start = now - start_ago
+        mono = start - boot_wall - slept
+        if recorded is None or i in recorded:
+            marks += [(start, mono), (start + seconds, mono)]
+        slept += seconds
+    clocks = {time.CLOCK_BOOTTIME: boot_ago,
+              time.CLOCK_MONOTONIC: boot_ago - slept}
+    real = time.clock_gettime
+
+    def clock_gettime(clk):
+        return clocks[clk] if clk in clocks else real(clk)
+    return clock_gettime, marks
+
+
+@contextlib.contextmanager
+def _on_host(boot_ago, sleeps, recorded=None):
+    """The fake host in force: its two kernel clocks and its journal."""
+    clock, marks = _fake_host(boot_ago, sleeps, recorded)
+    with mock.patch.object(proxywatch.time, "clock_gettime",
+                           side_effect=clock), \
+            mock.patch.object(proxywatch, "_sleep_journal_marks", create=True,
+                              return_value=marks) as journal:
+        yield journal
+
+
+H = 3600
+M = 60
+# A MEASURED laptop boot: up ~540 h, one 45h23m sleep in the part
+# of the boot its journal no longer holds, then two recorded sleeps (6h23m,
+# then 26h22m). Its kernel total CLOCK_BOOTTIME - CLOCK_MONOTONIC read 78.14 h.
+MEASURED_LAPTOP = dict(boot_ago=540 * H,
+                sleeps=[(500 * H, 45 * H + 23 * M),
+                        (300 * H, 6 * H + 23 * M),
+                        (248 * H, 26 * H + 22 * M)],
+                recorded=(1, 2))
+
+
+class SuspendWindowTest(_HealthRig):
+    """task/3693: ONLY THE SUSPEND INSIDE THE WINDOW IS TIME THE SEAT LOST.
+
+    MEASURED on a laptop: CLOCK_BOOTTIME - CLOCK_MONOTONIC read 78.14 h and
+    health() subtracted all of it from every seat's age. cursor
+    (last turn 4h51m ago), kimi (23h46m) and ds4pro (78h14m) all read turn=ok
+    against the 45-minute bar, though every one of those suspends had ended
+    days before their windows opened. The kernel total says how long the host
+    slept since boot, never when.
+
+    Every arm runs the REAL health() through the REAL reader; only the host is
+    fake: its two kernel clocks and the journal's sleep records."""
+
+    INPUTS = dict(live=True, infl=0, pct=30.0, spawn=2 * H, work=1)
+
+    def _turn(self, age, boot_ago, sleeps, recorded=None, row=False):
+        # the real reader, captured before the rig mocks its name
+        reader = proxywatch.host_suspend_gap_s
+        with _on_host(boot_ago, sleeps, recorded) as journal:
+            got = self._health(age=age, suspend_reader=reader, **self.INPUTS)
+        self.journal = journal
+        return got if row else (got["turn_state"], got["turn_evidence"] or "")
+
+    def test_a_corrected_fresh_turn_is_not_rebound_as_starved(self):
+        host = dict(boot_ago=100 * H, sleeps=[(45 * M, 40 * M)])
+        fresh = self._turn(50 * M, **host, row=True)
+        stale = self._turn(90 * M, **host, row=True)
+        self.assertEqual(fresh["turn_state"], "ok")
+        self.assertFalse(fresh["hang_candidate"])
+        self.assertEqual(stale["turn_state"], "hung")
+        self.assertTrue(stale["hang_candidate"])
+        from helm import dispatches_rebind
+        with mock.patch.object(proxywatch, "health", return_value=rep(fresh)):
+            self.assertEqual(dispatches_rebind._proxy_evidence("codex"),
+                             (None, None))
+        with mock.patch.object(proxywatch, "health", return_value=rep(stale)):
+            self.assertIn("pane live, transcript silent",
+                          dispatches_rebind._proxy_evidence("codex")[0])
+
+    def test_a_small_unplaced_sleep_near_the_bar_is_not_a_known_hang(self):
+        host = dict(boot_ago=100 * H, sleeps=[(40 * M, 40)])
+        placed = self._turn(45 * M + 30, **host)
+        missing = self._turn(45 * M + 30, **host, recorded=())
+        self.assertEqual(placed[0], "ok")
+        self.assertEqual(missing[0], "hung-unknown")
+        self.assertIn("HOST was suspended", missing[1])
+
+    def test_an_unplaced_sleep_cannot_rebind_a_potentially_fresh_seat(self):
+        from helm import dispatches_rebind
+        host = dict(boot_ago=100 * H, sleeps=[(40 * M, 40)])
+        unknown = self._turn(45 * M + 30, **host, recorded=(), row=True)
+        self.assertEqual(unknown["turn_state"], "hung-unknown")
+        self.assertTrue(unknown["hang_candidate"])
+        with mock.patch.object(proxywatch, "health", return_value=rep(unknown)):
+            self.assertEqual(dispatches_rebind._proxy_evidence("codex"),
+                             (None, None))
+
+    def test_a_suspend_BEFORE_the_window_does_not_make_a_stale_seat_fresh(self):  # noqa: VACUOUS_ASSERTION — the absent host-suspend detail is paired with its presence in the INSIDE arm, and the verdicts here are positive
+        """THE MEASURED CASE, the three live seats on the measured laptop.
+        Their windows opened after the last suspend ended, so none of the 78 h
+        is theirs and each reads its full age: stale, with pending work, hung."""
+        ages = {"cursor": 4 * H + 51 * M, "kimi": 23 * H + 46 * M,
+                "ds4pro": 78 * H + 14 * M}
+        got = {name: self._turn(age, **MEASURED_LAPTOP)
+               for name, age in ages.items()}
+        self.assertEqual({name: v for name, (v, _) in got.items()},
+                         dict.fromkeys(ages, "hung"))
+        self.assertEqual(
+            {name: "stale %dm >" % (age // M) in got[name][1]
+             for name, age in ages.items()}, dict.fromkeys(ages, True))
+        self.assertEqual({name: "host suspend" in ev
+                          for name, (_, ev) in got.items()},
+                         dict.fromkeys(ages, False))
+
+    def test_a_suspend_INSIDE_the_window_is_credited_and_no_more(self):
+        """THE CORRECTION STILL WORKS where it is true: a 40-minute sleep
+        inside a 50-minute window leaves 10 minutes of the seat's own time,
+        which is fresh. And the credit is that sleep ONLY: a 90-minute window
+        over the same host keeps 50 minutes, which is past the bar, however
+        long the host slept before the window opened."""
+        host = dict(boot_ago=100 * H,
+                    sleeps=[(99 * H, 78 * H), (45 * M, 40 * M)])
+        verdict, evidence = self._turn(50 * M, **host)
+        self.assertEqual((verdict, evidence), ("ok", ""))
+        verdict, evidence = self._turn(90 * M, **host)
+        self.assertEqual(verdict, "hung")
+        self.assertIn("stale 50m", evidence)
+        self.assertIn("40m of that is host suspend", evidence)
+        # the host slept, so the journal was read: once per pass, not per seat
+        self.assertEqual(self.journal.call_count, 1)
+
+    def test_a_host_that_never_slept_reads_as_today(self):  # noqa: VACUOUS_ASSERTION — the journal double's positive control (read once on a host that slept) is the INSIDE arm's last assertion
+        """THE CONTROL: no suspend, no correction, and no journal read. A
+        host that never slept pays for nothing new."""
+        host = dict(boot_ago=10 * H, sleeps=[])
+        self.assertEqual(self._turn(30 * M, **host), ("ok", ""))
+        verdict, evidence = self._turn(50 * M, **host)
+        self.assertEqual(verdict, "hung")
+        self.assertIn("stale 50m", evidence)
+        self.assertNotIn("host suspend", evidence)
+        self.assertEqual(self.journal.call_count, 0)
+
+    def test_a_suspend_helm_cannot_place_is_UNKNOWN_never_ok(self):
+        """THE JOURNAL LOST THE RECORD, or never had it. The kernel still
+        counts the sleep, so the host did sleep, and nothing says whether it
+        was before or after the window opened. The age is not shrunk and the
+        verdict is not a confident hang either: hung-unknown, naming the
+        host suspend."""
+        lost = self._turn(5 * H, boot_ago=100 * H, sleeps=[(99 * H, 78 * H)],
+                          recorded=())
+        # the measured box, a window that opens BEFORE its unrecorded sleep:
+        # helm cannot tell which side of the window that sleep fell on
+        early = self._turn(520 * H, **MEASURED_LAPTOP)
+        self.assertEqual((lost[0], early[0]), ("hung-unknown", "hung-unknown"))
+        self.assertIn("HOST was suspended", lost[1])
+        self.assertIn("HOST was suspended", early[1])
+
+    def test_the_reader_answers_for_the_window_it_is_asked_about(self):
+        """The reader itself, without the rig: the suspend inside the last N
+        seconds, against the since-boot total it still reports when asked
+        for no window (the post-suspend sweep reads that one)."""
+        with _on_host(**MEASURED_LAPTOP):
+            total = proxywatch.host_suspend_gap_s()
+            recent = proxywatch.host_suspend_gap_s(within_s=5 * H)
+            both = proxywatch.host_suspend_gap_s(within_s=260 * H)
+            unplaced = proxywatch.host_suspend_gap_s(within_s=520 * H)
+            whole = proxywatch.host_suspend_gap_s(within_s=600 * H)
+        self.assertEqual((total, recent, both, unplaced, whole),
+                         (78 * H + 8 * M, 0, 26 * H + 22 * M, None,
+                          78 * H + 8 * M))
+
+
+# systemd 259 on the measured laptop, `journalctl -b -o json
+# --output-fields=MESSAGE_ID` over the two sleep MESSAGE_IDs (cursor fields
+# trimmed).
+_SLEEP_JOURNAL = "\n".join(json.dumps(d) for d in (
+    {"__REALTIME_TIMESTAMP": "1789637887410535",
+     "MESSAGE_ID": "6bbd95ee977941e497c48be27c254128",
+     "__MONOTONIC_TIMESTAMP": "700261372478"},
+    {"MESSAGE_ID": "8811e6df2a8e40f58a94cea26f8ebf14",
+     "__REALTIME_TIMESTAMP": "1789660881153071",
+     "__MONOTONIC_TIMESTAMP": "700262703857"},
+    {"__MONOTONIC_TIMESTAMP": "866227520316",
+     "__REALTIME_TIMESTAMP": "1789826845969530",
+     "MESSAGE_ID": "6bbd95ee977941e497c48be27c254128"},
+    {"__MONOTONIC_TIMESTAMP": "866229064702",
+     "__REALTIME_TIMESTAMP": "1789921775354108",
+     "MESSAGE_ID": "8811e6df2a8e40f58a94cea26f8ebf14"})) + "\n"
+
+
+class SleepJournalTest(unittest.TestCase):
+    """The journal read: systemd-sleep's records for this boot, as (wall,
+    monotonic) pairs. Measured against the kernel: the second pair's sleep
+    reads 94927.8 s, and /sys/power/suspend_stats/last_hw_sleep read
+    94927.4 s for the same suspend."""
+
+    def _read(self, **done):
+        run = subprocess.CompletedProcess(args=[], returncode=0, stdout="",
+                                          stderr="")
+        for k, v in done.items():
+            setattr(run, k, v)
+        with mock.patch.object(proxywatch.subprocess, "run",
+                               return_value=run) as call:
+            marks = proxywatch._sleep_journal_marks()
+        return marks, call
+
+    def test_it_reads_systemd_sleep_records_for_this_boot(self):
+        marks, call = self._read(stdout=_SLEEP_JOURNAL)
+        argv = call.call_args[0][0]
+        self.assertIn("-b", argv)
+        self.assertIn("MESSAGE_ID=6bbd95ee977941e497c48be27c254128", argv)
+        self.assertIn("MESSAGE_ID=8811e6df2a8e40f58a94cea26f8ebf14", argv)
+        self.assertEqual(marks, [(1789637887.410535, 700261.372478),
+                                 (1789660881.153071, 700262.703857),
+                                 (1789826845.96953, 866227.520316),
+                                 (1789921775.354108, 866229.064702)])
+        (w0, m0), (w1, m1) = marks[2:]
+        self.assertAlmostEqual((w1 - m1) - (w0 - m0), 94927.8, places=0)
+
+    def test_a_journal_helm_cannot_read_gives_no_records(self):  # noqa: VACUOUS_ASSERTION — the first assertion is the positive control: the same double with records gives four
+        """No records is not "no suspend": the reader places a sleep only
+        against a record, so an empty journal leaves every sleep the kernel
+        counted unplaced, and those windows read UNKNOWN."""
+        # the positive control through the same double: a journal that
+        # answers gives its records
+        self.assertEqual(len(self._read(stdout=_SLEEP_JOURNAL)[0]), 4)
+        self.assertEqual(self._read(returncode=1, stdout="x")[0], [])
+        self.assertEqual(self._read(stdout="not json\n")[0], [])
+        with mock.patch.object(proxywatch.subprocess, "run",
+                               side_effect=OSError("no journalctl")):
+            self.assertEqual(proxywatch._sleep_journal_marks(), [])
 
 
 class TurnVerdictFindingsTest(unittest.TestCase):
@@ -2574,6 +2889,8 @@ class ProxyRuntimeProofTest(unittest.TestCase):
         self.assertGreater(proxywatch._PROXY_RUNTIME_V, transitional["v"])
 
     def setUp(self):
+        # ds4pro as ONE alias on TWO vendors: the multi-route proofs pin it
+        patch_two_routes(self)
         self.d = tempfile.mkdtemp(prefix="helm-test-proxy-runtime-")
         keys = ("HELM_HOME", "HELM_CHAT_DIR", "HELM_CHAT_NAME")
         self.old_env = {key: os.environ.get(key) for key in keys}
@@ -2834,6 +3151,25 @@ class ProxyRuntimeProofTest(unittest.TestCase):
             self.assertIsNone(got)
             self.assertIn("does not match cached proof", err)
 
+    def test_peak_snapshot_refuses_before_an_authenticated_reproof_spends(self):
+        proof = runtime_proof()
+        self.write_state({"seat-a": proof})
+        with mock.patch.object(proxywatch, "_roster_identity_for_session",
+                               return_value=("measured-seat", None)), \
+                mock.patch.object(proxywatch, "_proxy_runtime_shape",
+                                  return_value=(self.shape_for(proof), None)), \
+                mock.patch.object(offpeak, "now", return_value=1000), \
+                mock.patch.object(proxywatch, "proxy_runtime_canary",
+                                  side_effect=AssertionError("spent")) as canary, \
+                mock.patch.object(offpeak, "canary_hold",
+                                  return_value="peak gate holds"):
+            family, got, err = proxywatch.proxy_runtime_snapshot(
+                proof["session"], now=1000)
+        self.assertIsNone(family)
+        self.assertIsNone(got)
+        self.assertIn("peak gate holds", err)
+        canary.assert_not_called()
+
     def test_a_roster_stamp_from_the_adjacent_pass_still_authorizes(self):
         """THE task/1067 WINDOW, closed. The watcher writes the state file
         first and re-stamps the roster after, so between those instants the
@@ -3007,7 +3343,7 @@ class ProxyRuntimeProofTest(unittest.TestCase):
     def test_oauth_authority_is_live_model_plus_loaded_credential_provider(self):  # noqa: VACUOUS_ASSERTION — every matrix arm proves the full positive route before secret-absence checks
         cases = (
             ("codex", "gpt-5.6-sol", "gpt-5.6-sol", "codex", 8317, 4301),
-            ("gemini", "gemini-3.6-flash-high", "gemini-3.6-flash",
+            ("gemini", "gemini-3.8-flash-high", "gemini-3.8-flash",
              "antigravity", 8390, 4302),
         )
         for family, model, response_model, provider, port, proxy_pid in cases:
@@ -3067,10 +3403,10 @@ class ProxyRuntimeProofTest(unittest.TestCase):
                 self.assertNotIn("family", proof)
 
     def test_oauth_canary_refuses_an_undeclared_response_projection(self):
-        route = {"alias": "gemini-3.6-flash-high", "provider": "antigravity",
-                 "upstream_model": "gemini-3.6-flash-high"}
+        route = {"alias": "gemini-3.8-flash-high", "provider": "antigravity",
+                 "upstream_model": "gemini-3.8-flash-high"}
         shape = {"url": "http://127.0.0.1:8390", "token": "secret",
-                 "model": "gemini-3.6-flash-high",
+                 "model": "gemini-3.8-flash-high",
                  "auth_routes": {"a" * 16: (route,)},
                  "proof": {"v": 1, "route": route}}
         trace = "20260805050000-%s-deadbeef" % ("a" * 16)
@@ -3079,11 +3415,11 @@ class ProxyRuntimeProofTest(unittest.TestCase):
                 mock.patch.object(
                     proxywatch, "_canary_once",
                     return_value=("HEALTHY", "HTTP 200", 4, 200,
-                                  "gemini-3.6-flash-low", trace)):
+                                  "gemini-3.8-flash-low", trace)):
             proof, err = proxywatch.proxy_runtime_canary("costume")
         self.assertIsNone(proof)
-        self.assertIn("got 'gemini-3.6-flash-low'", err)
-        self.assertIn("expected 'gemini-3.6-flash'", err)
+        self.assertIn("got 'gemini-3.8-flash-low'", err)
+        self.assertIn("expected 'gemini-3.8-flash'", err)
 
     def test_oauth_canary_requires_selected_auth_trace_and_response_model(self):  # noqa: VACUOUS_ASSERTION — positive OAuth matrix above proves these checks admit the exact live shape
         route = {"alias": "gpt-5.6-sol", "provider": "codex",
@@ -3133,15 +3469,16 @@ class ProxyRuntimeProofTest(unittest.TestCase):
         self.assertRegex(next(iter(auth_indexes)), r"^[0-9a-f]{16}$")
         self.assertEqual(proxywatch._proxy_route_family(route), ("codex", None))
         route, token, auth_indexes, err = proxywatch._proxy_config_route(
-            config, "gemini-3.6-flash-high")
+            config, "gemini-3.8-flash-high")
         self.assertIsNone(route)
         self.assertIsNone(token)
         self.assertIn("unknown or ambiguous", err)
 
     def test_oauth_route_accepts_per_tier_names_and_refuses_a_foreign_one(self):  # noqa: VACUOUS_ASSERTION — the generated tiered block is the positive control before each refusal
-        """A family with a subagent_tiers table emits a block whose rows name
-        TWO models (an astra codex seat: astra on opus/fable from the seat's
-        own launch model, sol on sonnet/haiku from the table), and both
+        """A family with a subagent_tiers table emits a block whose rows can
+        name TWO models (a codex pane an operator pinned to gpt-5.6-sol: that
+        model on opus/fable from the pane's own launch model, gpt-6.1-sol on
+        sonnet/haiku from the table), and both
         are ids one codex OAuth serves on the codex channel — so the route
         proof must accept it, or `seat doctor --ensure` would hand the watchdog
         a config it refuses to attest. The name it must still refuse is a model
@@ -3154,7 +3491,7 @@ class ProxyRuntimeProofTest(unittest.TestCase):
             json.dump({"type": "codex", "access_token": "secret"}, f)
         config = os.path.join(self.d, "config.yaml")
 
-        def err(text, alias="gpt-6-astra"):
+        def err(text, alias="gpt-5.6-sol"):
             with open(config, "w", encoding="utf-8") as f:
                 f.write(text)
             route, token, _indexes, why = proxywatch._proxy_config_route(config, alias)
@@ -3165,12 +3502,13 @@ class ProxyRuntimeProofTest(unittest.TestCase):
             return why
 
         # THE POSITIVE POLE, through the production door: the generator's own
-        # tiered block for the family that declares the table.
+        # tiered block for the family that declares the table, on a pinned
+        # pane, the one pane whose rows name two models.
         tiered = seat._config_yaml(8317, auth, "inbound-secret",
-                                   channel="codex", model="gpt-6-astra",
+                                   channel="codex", model="gpt-5.6-sol",
                                    family="codex")
         self.assertIn('    - name: "gpt-5.6-sol"', tiered)   # two models present
-        self.assertIn('    - name: "gpt-6-astra"', tiered)
+        self.assertIn('    - name: "gpt-6.1-sol"', tiered)
         self.assertIsNone(err(tiered))
         # and the same config with NO alias block at all, so the arm's accept
         # is not just "this reader ignores the block"
@@ -3186,7 +3524,7 @@ class ProxyRuntimeProofTest(unittest.TestCase):
         why = err(block('    - name: "kimi-k3"\n      alias: "claude-opus-5"\n'
                         "      fork: true\n"))
         self.assertIn("another family's catalogued model", why)
-        self.assertIn("gpt-6-astra", why)
+        self.assertIn("gpt-6.1-sol", why)
         self.assertIn("kimi-k3", seat.family_catalogued_models(seat.FAMILIES["kimi"]))
         # SAME ROW, OWN-FAMILY NAME: accepted — so the refusal above is about
         # WHOSE model the name is, not about a non-default name.
@@ -3203,24 +3541,25 @@ class ProxyRuntimeProofTest(unittest.TestCase):
         why = err(block('    - name: "gpt-5.6-sol"\n      alias: "claude-opus-5"\n'))
         self.assertIn("no fork", why)
 
-        # THE WHOLE BLOCK A DECLARED SOL SEAT EMITS, through the production
-        # door: `instance_models` puts a declared instance on gpt-5.6-sol, so
-        # every row of
-        # ITS config names sol while its sibling's names astra, and the proof
-        # must accept both -- a refusal here would leave a declared seat
-        # unattestable and `seat doctor --ensure` writing a config the
-        # watchdog reds. The two blocks differ (the assertion below), so this
-        # is not the astra block passing twice.
+        # THE WHOLE BLOCK EVERY CODEX SEAT EMITS, through the production
+        # door: the owner's ruling (seat_catalog.CODEX_MODEL_RULING) puts
+        # every codex instance on gpt-6.1-sol, so every row of its config names
+        # gpt-6.1-sol, and the proof must accept it -- a refusal here would
+        # leave every codex seat unattestable and `seat doctor --ensure`
+        # writing a config the watchdog reds. The two blocks differ (the
+        # assertion below), so this is not the pinned block passing twice.
         from helm import seat_catalog as _catalog
-        declared = _catalog.FAMILIES["codex"]["instance_models"]
-        sol_model = _catalog.instance_launch_model(_catalog.FAMILIES["codex"],
-                                                   sorted(declared)[0])
-        sol_block = seat._config_yaml(8317, auth, "inbound-secret",
-                                      channel="codex", model=sol_model,
-                                      family="codex")
-        self.assertNotIn("gpt-6-astra", sol_block)
-        self.assertNotEqual(sol_block, tiered)
-        self.assertIsNone(err(sol_block, alias=sol_model))
+        default_model = _catalog.instance_launch_model(
+            _catalog.FAMILIES["codex"],
+            "codex-4")  # noqa: SEAT_NAME — a numbered codex instance the superseded table named
+        self.assertEqual(default_model, _catalog.CODEX_MODEL_RULING["model"])
+        default_block = seat._config_yaml(8317, auth, "inbound-secret",
+                                          channel="codex", model=default_model,
+                                          family="codex")
+        self.assertNotIn("gpt-6-astra", default_block)
+        self.assertNotIn("gpt-5.6-sol", default_block)
+        self.assertNotEqual(default_block, tiered)
+        self.assertIsNone(err(default_block, alias=default_model))
 
     def test_oauth_route_refuses_global_and_per_auth_alias_surfaces(self):  # noqa: VACUOUS_ASSERTION — generated config and homogeneous provider controls pass before each alias refusal
         auth = os.path.join(self.d, "auth")
@@ -3648,7 +3987,10 @@ class ProxyRuntimeProofTest(unittest.TestCase):
             self.assertNotIn(index, serialized)
 
     def test_deferred_reproof_refuses_a_removed_cached_route(self):  # noqa: VACUOUS_ASSERTION — the preceding dispatch-resolver arm positively proves this exact deferred owner path
-        proof = runtime_proof()
+        proof = runtime_proof(route={
+            "alias": "ds4-pro", "provider": "opencode-go",
+            "upstream_model": "deepseek-v4-pro",
+            "base_url": "https://opencode.ai/zen/go/v1"})
         replacement = dict(proof["route"], provider="deepseek-direct",
                            base_url="https://api.deepseek.com/v1")
         shape = self.deferred_shape_for(
@@ -4229,20 +4571,14 @@ class UpstreamCanaryTest(unittest.TestCase):
         from helm import seat
         seen = {}
 
-        class Response:
+        class Response(io.BytesIO):     # a body read to its end, as a socket's
             status = 200
-            def read(self, _n=None):
-                return (b'{"type":"message","role":"assistant",'
-                        b'"content":[{"type":"text","text":"OK"}],'
-                        b'"stop_reason":"end_turn"}')
-            def __enter__(self):
-                return self
-            def __exit__(self, *_args):
-                return False
 
         def open_(req, timeout=None):
             seen["req"], seen["timeout"] = req, timeout
-            return Response()
+            return Response(b'{"type":"message","role":"assistant",'
+                            b'"content":[{"type":"text","text":"OK"}],'
+                            b'"stop_reason":"end_turn"}')
 
         with mock.patch("helm.seat._seat_family", return_value=("codex", None)), \
                 mock.patch("helm.pi.seat_port", return_value=(8317, None)), \
@@ -4264,23 +4600,15 @@ class UpstreamCanaryTest(unittest.TestCase):
     def test_request_layer_returns_response_model_and_selected_auth_trace(self):
         trace = "20260805050000-0123456789abcdef-deadbeef"
 
-        class Response:
+        class Response(io.BytesIO):     # a body read to its end, as a socket's
             status = 200
             headers = {"X-CPA-TRACE-ID": trace}
 
-            def read(self, _n=None):
-                return (b'{"type":"message","role":"assistant",'
-                        b'"model":"gpt-5.6-sol",'
-                        b'"content":[{"type":"text","text":"OK"}],'
-                        b'"stop_reason":"end_turn"}')
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-        with mock.patch("urllib.request.urlopen", return_value=Response()):
+        with mock.patch("urllib.request.urlopen", return_value=Response(
+                b'{"type":"message","role":"assistant",'
+                b'"model":"gpt-5.6-sol",'
+                b'"content":[{"type":"text","text":"OK"}],'
+                b'"stop_reason":"end_turn"}')):
             state, _detail, _ms, status, model, got_trace = \
                 proxywatch._canary_once(
                     "http://127.0.0.1:8317", "secret", "gpt-5.6-sol")
@@ -4304,6 +4632,28 @@ class UpstreamCanaryTest(unittest.TestCase):
                    b'"stop_reason":"max_tokens"}')
         self.assertIsNone(proxywatch._valid_canary_payload(numeric))
 
+    def test_a_spoken_OK_beside_a_BLANK_thinking_block_is_healthy(self):
+        # The live openrouter reply that darkened the family MALFORMED200
+        # while its seat kept working: text "OK", then unsigned thinking "\n\n".
+        live = (b'{"id":"gen-1790328457-edxdH3krii9rqpoj7h6g","type":"message",'
+                b'"role":"assistant","model":"nex-agi/nex-n2.5-pro:free",'
+                b'"content":[{"type":"text","text":"OK"},'
+                b'{"type":"thinking","thinking":"\\n\\n"}],'
+                b'"stop_reason":"end_turn","stop_sequence":null,'
+                b'"usage":{"input_tokens":13,"output_tokens":5}}')
+        self.assertEqual(proxywatch._valid_canary_payload(live), "with OK")
+        empty = live.replace(b'"thinking":"\\n\\n"', b'"thinking":""')
+        self.assertEqual(proxywatch._valid_canary_payload(empty), "with OK")
+        # Not a string at all is still a broken envelope, even beside an OK.
+        for bad in (b'"thinking":17', b'"thinking":null', b'"thinking":[]'):
+            self.assertIsNone(proxywatch._valid_canary_payload(
+                live.replace(b'"thinking":"\\n\\n"', bad)), bad)
+        # And the blank block alone, with no OK spoken, proves nothing.
+        alone = (b'{"type":"message","role":"assistant",'
+                 b'"content":[{"type":"thinking","thinking":"\\n\\n"}],'
+                 b'"stop_reason":"end_turn"}')
+        self.assertIsNone(proxywatch._valid_canary_payload(alone))
+
     def test_the_LIVE_gemini_carrier_shape_is_accepted(self):
         """THE REGRESSION PIN, AND THE ONLY FIXTURE HERE TAKEN FROM PRODUCTION.
 
@@ -4326,7 +4676,7 @@ class UpstreamCanaryTest(unittest.TestCase):
         sig = "cpa-gemini-carrier-v1:next:text:" + ("A" * 550)
         payload = json.dumps({
             "id": "msg_live_shape", "type": "message", "role": "assistant",
-            "model": "gemini-3.6-flash-high",
+            "model": "gemini-3.8-flash-high",
             "content": [{"type": "thinking", "thinking": "", "signature": sig},
                         {"type": "text", "text": "OK"}],
             "stop_reason": "end_turn", "stop_sequence": None,
@@ -4466,6 +4816,8 @@ class UpstreamCanaryTest(unittest.TestCase):
                 self.reads.append(n)
                 return self.blob if n is None else self.blob[:n]
 
+            read1 = read                # the canary reads one chunk at a time
+
             def close(self):
                 pass
 
@@ -4559,6 +4911,8 @@ class UpstreamCanaryTest(unittest.TestCase):
                 # When called with cap+1, return more than cap.
                 return huge
 
+            read1 = read                # the canary reads one chunk at a time
+
             def __enter__(self):
                 return self
 
@@ -4624,20 +4978,8 @@ class UpstreamCanaryTest(unittest.TestCase):
             b'{"type":"text","text":"but not exactly"}]}'))
 
     def test_empty_and_malformed_HTTP_200_are_named_by_the_request_layer(self):
-        class Response:
+        class Response(io.BytesIO):     # a body read to its end, as a socket's
             status = 200
-
-            def __init__(self, payload):
-                self.payload = payload
-
-            def read(self, _n=None):
-                return self.payload
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
 
         cases = ((b"", "EMPTY200"),
                  (b'{"error":{"message":"no completion"}}', "MALFORMED200"))
@@ -4651,6 +4993,208 @@ class UpstreamCanaryTest(unittest.TestCase):
                                return_value=Response(payload)):
                 state, _detail, _ms = proxywatch._upstream_once("codex")
             self.assertEqual(state, expected)
+
+
+class CanaryDeadlineTest(unittest.TestCase):
+    """THE CANARY'S TIMEOUT BOUNDS THE WHOLE ANSWER, NOT ONE READ (task/3250).
+
+    A proxy holding a completion open behind a busy local model writes a
+    keepalive chunk every few seconds, so no single read waits out a socket
+    timeout: `helm dispatch send` hung about five minutes in `_read_chunked`
+    on a local seat's proxy (py-spy, 03:13Z). Every arm reads a real chunked
+    response from a listener on 127.0.0.1 that the arm owns; no arm reaches a
+    real proxy or reads a real helm home."""
+
+    LEASH_S = 20      # longer than any deadline an arm sets, so a canary still
+    # reading when the listener answers is a canary the deadline never cut
+    ANSWER = (b'{"type":"message","role":"assistant",'
+              b'"content":[{"type":"text","text":"OK"}],'
+              b'"stop_reason":"end_turn"}')
+
+    def proxy(self, busy, body, beat=0.05, silent=False):
+        """(url, port) of a listener that answers each POST 200 chunked: one
+        keepalive byte every `beat` seconds for `busy` seconds, then `body`,
+        then the last chunk. A `silent` listener sends its headers and then
+        nothing for the whole leash. Cleanup stops it and joins every
+        thread."""
+        import http.server
+        stop, leash = threading.Event(), self.LEASH_S
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if silent:
+                    stop.wait(leash)
+                    return
+                try:
+                    for _beat in range(int(busy / beat)):
+                        if stop.is_set():
+                            return
+                        self.wfile.write(b"1\r\n\n\r\n")
+                        stop.wait(beat)
+                    if body:
+                        self.wfile.write(b"%x\r\n%s\r\n" % (len(body), body))
+                    self.wfile.write(b"0\r\n\r\n")
+                except OSError:
+                    return                  # the canary hung up; nothing to say
+
+            def log_message(self, *_args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        serving = threading.Thread(target=server.serve_forever,
+                                   kwargs={"poll_interval": 0.05})
+        serving.start()
+
+        def close():
+            stop.set()
+            server.shutdown()
+            server.server_close()           # joins every handler thread
+            serving.join()
+        self.addCleanup(close)
+        port = server.server_address[1]
+        return "http://127.0.0.1:%d" % port, port
+
+    def on_pass(self, port, prior, **constants):
+        """(result, record): the pass's `upstream_canary` through the listener
+        on `port` with the named module constants patched, and the seat
+        record `_compose_upstream_seat` writes over the `prior` one."""
+        from helm import seat
+        with contextlib.ExitStack() as stack:
+            for name, value in constants.items():
+                stack.enter_context(mock.patch.object(proxywatch, name, value))
+            stack.enter_context(mock.patch.dict(seat.FAMILIES, {
+                "fam-under-test": {"model": "model-under-test"}}))
+            stack.enter_context(mock.patch("helm.pi.seat_port",
+                                           return_value=(port, None)))
+            stack.enter_context(mock.patch("helm.pi._pi_api_key",
+                                           return_value="tok"))
+            result = proxywatch.upstream_canary(
+                "seat-under-test", family="fam-under-test",
+                sleep=mock.Mock(side_effect=AssertionError(
+                    "a canary the pass reads once was confirmed")))
+        return result, proxywatch._compose_upstream_seat(
+            "seat-under-test", result, dict(prior), 1000)
+
+    def test_keepalive_bytes_never_outlast_the_deadline(self):
+        """MUST-HIT. The listener keeps a 200 open with keepalive chunks for
+        the whole leash and only then answers; a deadline of 0.5 s returns
+        CLIENT-TIMEOUT, having waited at least that long, and never the
+        answer the listener sends at the end of the leash."""
+        url, _port = self.proxy(busy=self.LEASH_S, body=self.ANSWER)
+        state, detail, ms, status, _model, _trace = proxywatch._canary_once(
+            url, "tok", "model-under-test", timeout=0.5)
+        self.assertEqual(state, proxywatch._CLIENT_TIMEOUT, detail)
+        self.assertTrue(detail.startswith("no upstream completion in "),
+                        detail)
+        self.assertIsNone(status)
+        self.assertGreaterEqual(ms, 400)
+
+    def test_a_prompt_answer_is_healthy_and_keepalive_bytes_do_not_spoil_it(self):
+        """CONTROL. The same listener answering at once reads HEALTHY, and so
+        does one that sends keepalive bytes before a body the deadline
+        admits: the leading newlines are whitespace the envelope parse
+        skips."""
+        got = {}
+        for busy in (0, 0.3):
+            url, _port = self.proxy(busy=busy, body=self.ANSWER)
+            state, detail, _ms, status, _m, _t = proxywatch._canary_once(
+                url, "tok", "model-under-test", timeout=10)
+            got[busy] = (state, status, detail)
+        self.assertEqual({busy: seen[:2] for busy, seen in got.items()},
+                         {0: ("HEALTHY", 200), 0.3: ("HEALTHY", 200)}, got)
+
+    def test_an_oversize_chunked_body_is_still_OVERSIZE(self):
+        url, _port = self.proxy(
+            busy=0, body=b"x" * (proxywatch.CANARY_MAX_BODY + 10))
+        state, detail, _ms, status, _m, _t = proxywatch._canary_once(
+            url, "tok", "model-under-test", timeout=10)
+        self.assertEqual((state, status), ("OVERSIZE", 200), detail)
+        self.assertIn("exceeded canary cap", detail)
+
+    def test_a_seat_busy_past_a_readers_deadline_is_no_wall_on_the_pass(self):  # noqa: VACUOUS_ASSERTION — dark False is paired with the unconditional positive control on the same record: the state, HEALTHY with the pass deadline and UNKNOWN with it cut below the busy second
+        """MUST-MISS, NO BAD DATA. The pass waits its own
+        UPSTREAM_PASS_DEADLINE_S, longer than the reader's
+        UPSTREAM_TIMEOUT_S. The listener is busy for one second: a reader's
+        0.5 s canary gives up on it, the pass reads it HEALTHY, and the
+        positive control cuts the pass deadline below the busy second and
+        reads it busy, UNKNOWN, where the pass deadline measured HEALTHY."""
+        self.assertGreater(proxywatch.UPSTREAM_PASS_DEADLINE_S,
+                           proxywatch.UPSTREAM_TIMEOUT_S)
+        url, port = self.proxy(busy=1.0, body=self.ANSWER)
+        reader = proxywatch._canary_once(url, "tok", "model-under-test",
+                                         timeout=0.5)
+        self.assertEqual(reader[0], proxywatch._CLIENT_TIMEOUT, reader)
+        records = {deadline: self.on_pass(
+            port, {}, UPSTREAM_PASS_DEADLINE_S=deadline)[1]
+                   for deadline in (10, 0.5)}
+        self.assertEqual((records[10]["state"], records[10]["dark"]),
+                         ("HEALTHY", False), records[10])
+        self.assertEqual((records[0.5]["state"], records[0.5]["dark"]),
+                         ("UNKNOWN", False), records[0.5])
+
+    def test_keepalive_bytes_past_the_deadline_are_busy_weather_on_the_pass(self):  # noqa: VACUOUS_ASSERTION — dark False beside state UNKNOWN; test_a_silent_proxy_is_still_a_dark_TIMEOUT_500 is the positive control on the same pass and record
+        """CONTROL for the HEALTHY rule (the ruling on busy seats). Body
+        bytes before the deadline mean the proxy accepted the request and its
+        upstream is still working: the seat is BUSY. The canary's
+        CLIENT-TIMEOUT says so, `_busy_timeout` reads it, and with no prior
+        record the pass reads the seat UNKNOWN, weather, never dark."""
+        url, port = self.proxy(busy=self.LEASH_S, body=self.ANSWER)
+        reader = proxywatch._canary_once(url, "tok", "model-under-test",
+                                         timeout=0.5)
+        result, record = self.on_pass(port, {}, UPSTREAM_PASS_DEADLINE_S=0.5)
+        self.assertEqual((reader[0], proxywatch._busy_timeout(reader)),
+                         (proxywatch._CLIENT_TIMEOUT, True), reader)
+        self.assertEqual((result[0], record["state"], record["dark"]),
+                         ("UNKNOWN", "UNKNOWN", False), record)
+
+    def test_a_busy_seat_over_a_healthy_record_stays_healthy(self):
+        """MUST-HIT. Keepalive bytes past the deadline are a measurement: the
+        proxy is up, it accepted the request, and its upstream is working on
+        it with no error (an auth failure answers fast with a status). Over a
+        HEALTHY record the pass keeps it HEALTHY with its own since, and the
+        detail names the busy mark."""
+        _url, port = self.proxy(busy=self.LEASH_S, body=self.ANSWER)
+        healthy = {"state": "HEALTHY", "dark": False,
+                   "since": "2026-09-25T03:00:00Z"}
+        result, record = self.on_pass(port, healthy,
+                                      UPSTREAM_PASS_DEADLINE_S=0.5)
+        self.assertEqual((record["state"], record["dark"], record["since"]),
+                         ("HEALTHY", False, healthy["since"]), record)
+        self.assertEqual(record["detail"], result[1])
+        self.assertIn("; busy: ", record["detail"])
+
+    def test_a_silent_proxy_is_still_a_dark_TIMEOUT_500(self):
+        """CONTROL, exactly as before the ruling. Zero body bytes is silence,
+        not work: a listener that sends its headers and then nothing reads
+        TIMEOUT-500 and dark on the pass, whether the silence bound (cut to
+        0.3 s) or the deadline (cut to 0.3 s) ends the read."""
+        _url, port = self.proxy(busy=0, body=b"", silent=True)
+        got = {bound: self.on_pass(port, {}, **{bound: 0.3})
+               for bound in ("UPSTREAM_TIMEOUT_S", "UPSTREAM_PASS_DEADLINE_S")}
+        self.assertEqual({bound: (result[0], record["dark"])
+                          for bound, (result, record) in got.items()},
+                         {"UPSTREAM_TIMEOUT_S": ("TIMEOUT-500", True),
+                          "UPSTREAM_PASS_DEADLINE_S": ("TIMEOUT-500", True)},
+                         got)
+
+    def test_a_busy_seat_never_clears_the_wall_it_stands_behind(self):
+        """MUST-MISS, NO BAD DATA. A busy reading is weather over a wall too:
+        the prior dark AUTH-UNAVAILABLE stays dark with its own since, where
+        a TIMEOUT-500 would restart the episode and a HEALTHY would end it."""
+        _url, port = self.proxy(busy=self.LEASH_S, body=self.ANSWER)
+        wall = {"state": "AUTH-UNAVAILABLE", "dark": True,
+                "since": "2026-09-25T03:38:03Z"}
+        result, record = self.on_pass(port, wall, UPSTREAM_PASS_DEADLINE_S=0.5)
+        self.assertEqual((result[0], record["dark"], record["since"]),
+                         ("UNKNOWN", True, wall["since"]), record)
 
 
 class UpstreamFamilyHealthTest(unittest.TestCase):
@@ -4799,6 +5343,44 @@ class UpstreamFamilyHealthTest(unittest.TestCase):
         self.assertEqual(got["members"], {})
         report = rep(upstream={"codex": got})
         self.assertEqual(proxywatch.findings(report)[0][0], "FAMILY-DARK")
+
+    def test_a_frozen_future_reset_family_spends_zero_canaries_repeatedly(self):  # noqa: ORPHANED_MOCK — upstream_health reaches the observation double through ThreadPoolExecutor.submit, which the static modeled graph does not follow
+        """Two consecutive recovery measurements each have two viable families:
+        codex is due, while kimi's validated quota wall is held to a future
+        reset. Neither the family canary nor the session-bound proof canary may
+        touch kimi merely because codex triggered the unrestricted health pass."""
+        kimi = {"state": proxywatch._QUOTA_WALL, "dark": True,
+                "since": "1970-01-01T00:15:00Z",
+                "resets_at_ms": 2000000, "reset_kind": "vendor",
+                "reset_source": "canary", "seats": {"kimi": {
+                    "state": proxywatch._QUOTA_WALL, "dark": True,
+                    "since": "1970-01-01T00:15:00Z",
+                    "resets_at_ms": 2000000, "reset_kind": "vendor",
+                    "reset_source": "canary"}}}
+        prior = {"upstream": {"kimi": kimi}}
+        rows = [row(seat="codex", family="codex", probe="healthy"),
+                row(seat="kimi", family="kimi", probe="healthy")]
+        with mock.patch.object(
+                proxywatch, "_seat_canary_observation",
+                return_value=(("HEALTHY", "OK", 1), "birth", "VERIFIED")) \
+                as family_canary, \
+                mock.patch.object(proxywatch, "proxy_runtime_canary",
+                                  return_value=(None, "fixture")) as proof_canary:
+            for _ in range(2):
+                got = proxywatch.upstream_health(
+                    rows, now=1000, prior=prior, frozen_families=("kimi",))
+                proxywatch.proxy_runtime_proofs(
+                    rows, observed_at=1000, frozen_families=("kimi",))
+                self.assertEqual(got["kimi"], kimi)
+                self.assertEqual(got["codex"]["state"], "HEALTHY")
+        self.assertEqual([call.args[0] for call in family_canary.call_args_list],
+                         ["codex", "codex"])
+        self.assertEqual([call.args[0] for call in proof_canary.call_args_list],
+                         ["codex", "codex"])
+        self.assertNotIn("kimi", [call.args[0]
+                                  for call in family_canary.call_args_list])
+        self.assertNotIn("kimi", [call.args[0]
+                                  for call in proof_canary.call_args_list])
 
 
 class PerSeatCooldownTest(unittest.TestCase):
@@ -5508,6 +6090,64 @@ class TimerUnitTest(unittest.TestCase):
         _sp, service, _tp, _t = proxywatch.timer_units()
         self.assertIn("SuccessExitStatus=1", service)
 
+    def test_full_and_dark_oneshots_have_separate_cadence_bounds(self):
+        """A oneshot that hangs while holding `.proxywatch.lock` otherwise
+        stays active forever: its own timer never starts it again, and the
+        sibling cadence blocks or stands down on the same lock. The full pass
+        gets its slow-rung allowance; the opportunistic minute pass yields
+        before its next tick so it cannot freeze the recovery cadence."""
+        _sp, full, _tp, _timer = proxywatch.timer_units()
+        _dsp, dark, _dtp, _dtimer = proxywatch.dark_timer_units()
+        self.assertIn("TimeoutStartSec=%ds" % proxywatch.SERVICE_TIMEOUT_S,
+                      full)
+        self.assertIn("TimeoutStartSec=%ds" %
+                      proxywatch.DARK_SERVICE_TIMEOUT_S, dark)
+        self.assertLess(proxywatch.SERVICE_TIMEOUT_S, proxywatch.INTERVAL_S)
+        self.assertLess(proxywatch.DARK_SERVICE_TIMEOUT_S,
+                        proxywatch.SERVICE_TIMEOUT_S)
+
+    def test_the_dark_bound_admits_the_recovery_measurement_it_runs(self):
+        """A HEALTHY reading makes the dark pass run the FULL measurement:
+        a probe, then an upstream canary and a runtime-proof canary, each up
+        to the pass's UPSTREAM_PASS_DEADLINE_S. A bound shorter than that
+        kills every recovery before it persists, so the latch only clears on the
+        fifteen-minute pass and the recheck is dead weight. A systemd oneshot
+        still running at its next tick is not started twice, so a bound past
+        the tick costs a skipped tick, never a second pass."""
+        floor = 2 * proxywatch.UPSTREAM_PASS_DEADLINE_S + \
+            proxywatch.PROBE_TIMEOUT_S
+        self.assertGreaterEqual(proxywatch.DARK_SERVICE_TIMEOUT_S, floor)
+
+    def test_a_held_outbox_lock_never_blocks_the_dark_cadence(self):  # noqa: VACUOUS_ASSERTION — rc==0, the stands-down line and elapsed bound are positive controls that the contended lock path ran; zero canaries is the claimed behavior
+        """The service timeout is the last bound, not the normal lock path:
+        while another pass holds the real flock, the dark recheck returns 0
+        without spending a canary instead of waiting behind it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "proxywatch.json")
+            payload = {"ts": 1000, "upstream": {"codex": {
+                "state": "AUTH-401", "dark": True, "since": "t0",
+                "seats": {"codex": {"state": "AUTH-401", "dark": True,
+                                      "since": "t0"}}}}}
+            with open(state, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            with mock.patch.object(proxywatch, "_state_path",
+                                   return_value=state), \
+                    mock.patch.object(proxywatch, "_dark_trigger") as trigger, \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                lock_fd = os.open(proxywatch._outbox_lock_path(),
+                                  os.O_CREAT | os.O_RDWR, 0o644)
+                proxywatch.fcntl.flock(lock_fd, proxywatch.fcntl.LOCK_EX)
+                try:
+                    started = time.monotonic()
+                    rc = proxywatch.dark_pass(post=True)
+                finally:
+                    proxywatch.fcntl.flock(lock_fd, proxywatch.fcntl.LOCK_UN)
+                    os.close(lock_fd)
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertLess(time.monotonic() - started, 1)
+        trigger.assert_not_called()
+        self.assertIn("stands down", out.getvalue())
+
 
 class CmdTest(unittest.TestCase):
     def test_exit_code_reports_findings(self):
@@ -5906,6 +6546,31 @@ class VendorResetTest(unittest.TestCase):
         upstream, _ = proxywatch._compose_upstream_records(rep, {})
         self.assertNotIn("resets_at_ms", upstream["codex"],
                          "a family with no owner input must not gain one")
+
+    def test_a_log_measured_seat_keeps_its_port_and_count_detail(self):
+        """task/3199: the WALLED row idle-dispatch builds names the port and
+        the count only if the persisted seat record keeps the detail the log
+        rung wrote. Only a log-measured record keeps it, since that detail is
+        helm's own text; any other seat's detail can be vendor prose and is
+        still dropped (the control, on the same composed record)."""
+        rep = {"ts": "2026-08-06T08:00:00Z",
+               "upstream": {"codex": {
+                   "state": "AUTH-401", "dark": True,
+                   "since": "2026-08-06T07:00:00Z",
+                   "seats": {
+                       "seat-a": {"state": "AUTH-401", "dark": True,
+                                  "detail": proxywatch._auth_failure_detail(
+                                      8502, 10),
+                                  "measured_by": proxywatch._LOG_MEASURED},
+                       "seat-b": {"state": "AUTH-401", "dark": True,
+                                  "detail": "vendor prose about the key"}}}},
+               "proxy_runtime": {}}
+        upstream, _ = proxywatch._compose_upstream_records(rep, {})
+        seats = upstream["codex"]["seats"]
+        self.assertEqual(seats["seat-a"]["detail"],
+                         "port 8502: 10 requests failed on upstream auth")
+        self.assertEqual(seats["seat-a"]["measured_by"], "proxy-log")
+        self.assertNotIn("detail", seats["seat-b"])
 
     def test_a_future_owner_horizon_covers_an_unknown_walled_member(self):  # noqa: VACUOUS_ASSERTION — the owner-filled reset is positively asserted on the same composed record before the no-owner absence
         """task/2935, the integrator's ruling: the family reset is UNKNOWN
@@ -7189,7 +7854,8 @@ class TheRebuildRecipeReachesTheWriterTest(unittest.TestCase):
         """The R7 prose promised `helm registry`, which is not a root verb —
         an operator typing what the comment printed got 'unknown verb'. The
         positive reads the SHIPPED comment block and the SHIPPED recipe."""
-        source = open(proxywatch.__file__, encoding="utf-8").read()
+        with open(proxywatch.__file__, encoding="utf-8") as fh:
+            source = fh.read()
         self.assertIn("the rebuild recipe for", source,
                       "the R7 comment block moved; re-anchor this arm")
         self.assertEqual(self._unresolvable(source), [])
@@ -7637,6 +8303,42 @@ class CodexPoolBudgetRidesThePassTest(unittest.TestCase):
                                    side_effect=RuntimeError("fold exploded")):
                 self.assertIsNone(proxywatch._burn_flags_pass(report))
 
+    def test_the_posting_pass_reads_a_local_certification(self):  # noqa: VACUOUS_ASSERTION — the same pass after a revoke is asserted GREY, so GREEN here is the certification
+        """THE PASS IS THE ONLY PRODUCTION WRITER OF THE SNAPSHOT, and it
+        builds its own inputs rather than calling `read_inputs`. A
+        certification only a hand-fed `fold` can see reads GREY on every
+        surface while `helm burn certify-local` tells the certifier it reads
+        GREEN."""
+        from helm import burnflags
+        local = "qwenlocal"
+        report = rep(row("codex"))
+        report["codex_budget"] = self.rows(20.0)
+        _operate_local_families(self)
+        ok, err = burnflags.certify_local(local, report["ts"] + 7200,
+                                          by="seat-a", session=_OPERATOR_SID,
+                                          now=report["ts"] - 60)
+        self.assertTrue(ok, err)
+        with mock.patch.object(burnflags, "usage_history", return_value=[]):
+            payload = proxywatch._burn_flags_pass(report)
+        flag = payload["families"][local]
+        self.assertEqual((flag["colour"], flag["axes"]["money"],
+                          flag["money_provenance"]),
+                         (burnflags.GREEN, burnflags.GREEN,
+                          burnflags.CERTIFIED_LOCAL))
+        self.assertIn(local, payload["readers"]["certified_local"])
+        # and the snapshot every reader opens carries the same flag
+        written = burnflags.family_flag(local, now=report["ts"])
+        self.assertEqual(written["money_provenance"], burnflags.CERTIFIED_LOCAL)
+        # CONTROL: the same pass after a revoke reads the family GREY
+        ok, err = burnflags.revoke_local(local, by="seat-a",
+                                         session=_OPERATOR_SID,
+                                         now=report["ts"] - 30)
+        self.assertTrue(ok, err)
+        with mock.patch.object(burnflags, "usage_history", return_value=[]):
+            revoked = proxywatch._burn_flags_pass(report)["families"][local]
+        self.assertEqual((revoked["colour"], revoked["cause_id"]),
+                         (burnflags.GREY, "money:no-reader"))
+
     def test_a_reader_that_raises_never_takes_the_watchdog_down(self):
         from helm import codexbudget
         # THE POSITIVE CONTROL: with a pool present and a reader that answers,
@@ -7662,6 +8364,156 @@ class CodexPoolBudgetRidesThePassTest(unittest.TestCase):
         with mock.patch.object(codexbudget, "pool_census",
                                return_value=([], codexbudget.CENSUS_EMPTY)):
             self.assertEqual(proxywatch._codex_budget_pass(), [])
+
+
+#: seat-a's harness session in the local-certification arms, in the shape the
+#: harness mints one
+_OPERATOR_SID = "9a55e5e5-0000-4000-8000-000000000001"
+
+
+def _operate_local_families(case):
+    """seat-a is the OPERATOR SEAT of every local family, named by this host's
+    local names as production reads them, and `_OPERATOR_SID` is its session
+    on the roster: the one certifier the fold honours."""
+    from helm import home, localnames
+    from tests._tmphome import corroborate
+    os.makedirs(home.global_dir(), exist_ok=True)
+    with open(os.path.join(home.global_dir(), localnames.CONFIG), "w",
+              encoding="utf-8") as fh:
+        json.dump({"local-operator-seat": "seat-a"}, fh)
+    localnames._cache["stat"] = None
+    case.addCleanup(corroborate("seat-a", _OPERATOR_SID))
+
+
+class LocalCertificationRidesThePassTest(unittest.TestCase):
+    """A local family's certification, read where production reads it.
+
+    THE POSTING PASS IS THE ONLY PRODUCTION WRITER OF THE BURN-FLAG SNAPSHOT
+    and it builds its own inputs, so every arm here certifies through the
+    producer, runs `_burn_flags_pass` on a report, and reads the family off
+    the pass's payload. No arm hands the fold an input of its own."""
+
+    LOCAL = "qwenlocal"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-pw-local-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.envp = mock.patch.dict(
+            os.environ, {"HELM_HOME": os.path.join(self.tmp, "helm"),
+                         "HELM_CACHE_DIR": os.path.join(self.tmp, "cache")})
+        self.envp.start()
+        self.addCleanup(self.envp.stop)
+        _operate_local_families(self)
+
+    def _pass(self, record=None):
+        from helm import burnflags
+        report = rep(row("codex"),
+                     upstream={self.LOCAL: record} if record else None)
+        with mock.patch.object(burnflags, "usage_history", return_value=[]):
+            payload = proxywatch._burn_flags_pass(report)
+        self.assertIsNotNone(payload)
+        return payload
+
+    def _certify(self):
+        from helm import burnflags
+        ok, err = burnflags.certify_local(self.LOCAL, 1000 + 7200,
+                                          by="seat-a", session=_OPERATOR_SID,
+                                          now=940)
+        self.assertTrue(ok, err)
+
+    @staticmethod
+    def _record(state, dark=True):
+        """A family record past its own falsification bar at the report's
+        instant, in the shape the pass's upstream block carries."""
+        return {"state": state, "dark": dark, "falsification_bar_s": 900,
+                "since": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                       time.gmtime(1000 - 960))}
+
+    def test_a_live_reading_that_contradicts_the_certification_withdraws_it(self):  # noqa: VACUOUS_ASSERTION — the same certification beside a HEALTHY record is asserted GREEN at the end of this method
+        """"RUNNING OPTIMALLY" IS A CLAIM A LIVE READING CAN REFUTE. While
+        the family's own upstream record reads anything but HEALTHY, the
+        certification is withdrawn and the family reads exactly as it would
+        uncertified: an answer our validation rejected, a dispute between
+        its seats, and an outage alike."""
+        from helm import burnflags
+        self._certify()
+        records = [self._record("EMPTY200"), self._record("MALFORMED200"),
+                   self._record("UNKNOWN", dark=False),
+                   self._record("UPSTREAM-5XX"),
+                   self._record("AUTH-UNAVAILABLE")]
+        certified = []
+        for record in records:
+            payload = self._pass(record)
+            flag = payload["families"][self.LOCAL]
+            self.assertEqual(flag["axes"]["money"], burnflags.GREY,
+                             record["state"])
+            self.assertNotEqual(flag["money_provenance"],
+                                burnflags.CERTIFIED_LOCAL, record["state"])
+            self.assertNotIn(self.LOCAL, payload["readers"]["certified_local"])
+            certified.append(flag)
+        self.assertEqual([f["colour"] for f in certified],
+                         [burnflags.GREY, burnflags.GREY, burnflags.GREY,
+                          burnflags.RED, burnflags.RED])
+        # exactly as uncertified: the same passes with no file at all
+        os.remove(burnflags.local_certifications_path())
+        self.assertEqual(certified, [self._pass(r)["families"][self.LOCAL]
+                                     for r in records])
+        # CONTROL: the same certification beside a HEALTHY record answers
+        self._certify()
+        healthy = self._pass(self._record("HEALTHY", dark=False))
+        self.assertEqual(healthy["families"][self.LOCAL]["money_provenance"],
+                         burnflags.CERTIFIED_LOCAL)
+        self.assertEqual(healthy["families"][self.LOCAL]["colour"],
+                         burnflags.GREEN)
+
+    def test_an_unreadable_certification_file_reads_grey_and_names_itself(self):  # noqa: VACUOUS_ASSERTION — a well-formed certification in the same place is asserted GREEN at the end of this method
+        from helm import burnflags
+        path = burnflags.local_certifications_path()
+        bare = self._pass()["families"][self.LOCAL]
+        self.assertEqual(bare["cause_id"], "money:no-reader")
+        self.assertNotIn(path, bare["cause"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        for text in ("{corrupt", "[]", '{"families": []}'):
+            pk.atomic_write(path, text)
+            flag = self._pass()["families"][self.LOCAL]
+            self.assertEqual(flag["colour"], burnflags.GREY, text)
+            self.assertEqual(flag["cause_id"],
+                             "money:certification-unreadable", text)
+            self.assertIn(path, flag["cause"], text)
+            self.assertNotEqual(flag["cause"], bare["cause"], text)
+        # a directory where the file belongs cannot be read either
+        os.remove(path)
+        os.makedirs(path)
+        flag = self._pass()["families"][self.LOCAL]
+        self.assertEqual(flag["cause_id"], "money:certification-unreadable")
+        self.assertIn(path, flag["cause"])
+        # CONTROL: a well-formed certification in the same place answers
+        os.rmdir(path)
+        self._certify()
+        self.assertEqual(self._pass()["families"][self.LOCAL]["colour"],
+                         burnflags.GREEN)
+
+    def test_a_certification_longer_than_the_ceiling_reads_grey(self):  # noqa: VACUOUS_ASSERTION — the same record at exactly the ceiling is asserted GREEN
+        from helm import burnflags
+        self._certify()
+        path = burnflags.local_certifications_path()
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        # THE ONE MUTATION: the producer's own record with its `until` moved
+        # one second past the ceiling from its own `certified_at`, the record
+        # the producer refuses to write and a hand edit can
+        rec = payload["families"][self.LOCAL]
+        rec["until"] = rec["certified_at"] + \
+            burnflags.CERTIFICATION_CEILING_S + 1
+        pk.atomic_write(path, json.dumps(payload))
+        flag = self._pass()["families"][self.LOCAL]
+        self.assertEqual((flag["colour"], flag["cause_id"]),
+                         (burnflags.GREY, "money:no-reader"))
+        # CONTROL: the same record at exactly the ceiling answers
+        rec["until"] = rec["certified_at"] + burnflags.CERTIFICATION_CEILING_S
+        pk.atomic_write(path, json.dumps(payload))
+        self.assertEqual(self._pass()["families"][self.LOCAL]["colour"],
+                         burnflags.GREEN)
 
 
 class ProxyUsagePassTest(unittest.TestCase):
@@ -8025,6 +8877,10 @@ class ResolvedModelIsLegibleTest(unittest.TestCase):
             "upstream_model": "deepseek-v4-pro",
             "base_url": "https://api.deepseek.com/v1"}
 
+    def setUp(self):
+        # one alias, two vendors, two rungs: the two-route pool entry
+        patch_two_routes(self)
+
     def test_the_same_alias_on_two_rungs_renders_two_different_routes(self):
         free = proxywatch.resolved_from_proof(runtime_proof(route=self.FREE))
         paid = proxywatch.resolved_from_proof(runtime_proof(route=self.PAID))
@@ -8318,3 +9174,850 @@ class EmptyTurnReaderTest(unittest.TestCase):
         r = row()
         r["log_empty_turns"] = empty
         return r
+
+
+class DarkFamilyRechecksFastTest(unittest.TestCase):
+    """`helm proxywatch --dark-only --post`: while a family's dark latch holds,
+    a one-minute timer re-probes ONLY that family, and a HEALTHY reading makes
+    it persist the same measured pass the fifteen-minute timer writes.
+
+    The latch is the one state the dispatch door, `helm chat seats` and
+    delivery all read, and only a persisted HEALTHY pass clears it. On the
+    fifteen-minute cadence alone, a family whose upstream is back one minute
+    after a blip stays refused by every door for up to fifteen minutes.
+
+    Every arm drives `cmd_proxywatch` against a temp state file, with the
+    canary, the measured pass, chat, the phone push and every quarter-hour rung
+    stubbed, so no arm reaches the network, the live fleet or systemd."""
+
+    DARK_SINCE = "2026-09-25T10:12:21Z"
+    OK_SINCE = "2026-09-25T10:20:39Z"
+    #: The rungs that belong to the fifteen-minute pass and never to the recheck.
+    QUARTER_HOUR = ("_cred_follow_pass", "_codex_budget_pass",
+                    "_sidecar_rosters_pass", "_codex_cooldown_pass",
+                    "_codex_reset_pass", "_proxy_usage_pass", "_money_pass",
+                    "_burn_flags_pass")
+    UNCHANGED = "dark latch is unchanged"
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="helm-test-pw-dark-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {
+            "HELM_HOME": os.path.join(self.d, "helm-home"),
+            "HELM_CHAT_DIR": os.path.join(self.d, "chat"),
+            "HELM_CHAT_NAME": "measured-seat"})
+        env.start()
+        self.addCleanup(env.stop)
+        os.makedirs(os.environ["HELM_HOME"])
+        os.makedirs(os.environ["HELM_CHAT_DIR"])
+        self.state = os.path.join(self.d, "state", "proxywatch.json")
+        for patch in (mock.patch.object(proxywatch, "_state_path",
+                                        side_effect=lambda: self.state),
+                      mock.patch.object(proxywatch, "read_vendor_resets",
+                                        return_value=({}, None))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _pass(self, state, since, detail, ts, seat_extra=None):
+        dark = state != "HEALTHY"
+        seat_record = dict({"state": state, "dark": dark, "since": since,
+                            "detail": detail, "ms": 7}, **(seat_extra or {}))
+        family = {"state": state, "dark": dark, "since": since,
+                  "detail": detail, "ms": 7, "seat": "codex",
+                  "seats": {"codex": seat_record},
+                  "members": {"codex": state}}
+        report = rep(row(upstream=state, upstream_since=since,
+                         upstream_detail=detail, upstream_ms=7),
+                     upstream={"codex": family})
+        report["ts"] = ts
+        return report
+
+    def dark(self, ts=1000):
+        return self._pass("UPSTREAM-5XX", self.DARK_SINCE, "HTTP 502", ts)
+
+    def healthy(self, ts=2000):
+        return self._pass("HEALTHY", self.OK_SINCE, "OK", ts)
+
+    def seed(self, report):
+        """The latch exactly as a posting pass persists it -> its bytes."""
+        self.assertTrue(proxywatch.record(report, prior_state={}))
+        with open(self.state, "rb") as f:
+            return f.read()
+
+    def on_disk(self):
+        with open(self.state, "rb") as f:
+            return f.read()
+
+    def latched(self):
+        """What delivery reads for the family's seat: a pause, or None."""
+        return proxywatch.delivery_pause("codex", now=3000)[0]
+
+    @contextlib.contextmanager
+    def rungs(self, canary=("HEALTHY", "OK", 5), measured=None):
+        with contextlib.ExitStack() as stack:
+            m = {name: stack.enter_context(mock.patch.object(
+                proxywatch, name, return_value=None))
+                for name in self.QUARTER_HOUR}
+            m["poolwall"] = stack.enter_context(mock.patch(
+                "helm.poolwall.announcements", return_value=[]))
+            m["canary"] = stack.enter_context(mock.patch.object(
+                proxywatch, "_upstream_once", return_value=canary))
+            m["network"] = stack.enter_context(mock.patch.object(
+                proxywatch, "_canary_once",
+                side_effect=AssertionError("an arm reached the network")))
+            m["health"] = stack.enter_context(mock.patch.object(
+                proxywatch, "health", return_value=measured))
+            m["post"] = stack.enter_context(mock.patch("helm.chat.post"))
+            m["push"] = stack.enter_context(mock.patch.object(
+                proxywatch, "_owner_push", return_value=True))
+            m["out"] = stack.enter_context(
+                contextlib.redirect_stdout(io.StringIO()))
+            yield m
+
+    def test_a_latched_family_that_reads_HEALTHY_is_cleared_and_resumed(self):
+        """(a) One recheck: the canary on the dark family's seat reads
+        HEALTHY, the full measurement runs, and the persisted latch clears,
+        which is what resumes every paused waiter. The recovered edge reaches
+        the room and the phone once, and no quarter-hour rung runs."""
+        self.seed(self.dark())
+        self.assertIsNotNone(self.latched(),
+                             "control: the seeded latch pauses delivery")
+        with self.rungs(measured=self.healthy()) as m:
+            rc = proxywatch.cmd_proxywatch(["--dark-only", "--post"])
+        self.assertEqual(rc, 0, m["out"].getvalue())
+        m["canary"].assert_called_once_with("codex", family="codex")
+        m["health"].assert_called_once()
+        for name in self.QUARTER_HOUR + ("poolwall",):
+            self.assertEqual(m[name].call_count, 0,
+                             "the recheck ran the quarter-hour rung %s" % name)
+        self.assertIsNone(self.latched(),
+                          "the recovery write must resume delivery")
+        saved = json.loads(self.on_disk())
+        self.assertEqual(saved["upstream"]["codex"]["state"], "HEALTHY")
+        self.assertIs(saved["upstream"]["codex"]["dark"], False)
+        posted = [c.args[0] for c in m["post"].call_args_list]
+        self.assertEqual(len(posted), 1, posted)
+        self.assertIn("FAMILY-RECOVERED codex: HEALTHY", posted[0])
+        pushed = [t["kind"] for c in m["push"].call_args_list
+                  for t in c.args[0]]
+        self.assertEqual(pushed, ["family-recovered"])
+
+    def test_the_recovery_write_is_the_one_a_fifteen_minute_pass_writes(self):  # noqa: VACUOUS_ASSERTION — the full pass's (1, 1) rung counts and its one posted body are the must-hit controls on the same observables the recheck's (0, 0) reads
+        """(a) SAME STATE, SAME WORDS. From the same dark latch and the same
+        measured world, the recheck and the full `--post` pass persist the
+        same watch state, post the same report and push the same edge. The
+        transition identity is minted fresh by each (a change mints one), so
+        it is compared for being new rather than for its value."""
+        written = {}
+        for label, argv in (("recheck", ["--dark-only", "--post"]),
+                            ("full", ["--post"])):
+            self.state = os.path.join(self.d, label, "proxywatch.json")
+            prior = json.loads(self.seed(self.dark()))
+            with self.rungs(measured=self.healthy()) as m:
+                self.assertEqual(proxywatch.cmd_proxywatch(argv), 0,
+                                 m["out"].getvalue())
+            saved = json.loads(self.on_disk())
+            minted = saved["upstream"]["codex"].pop("transition_id")
+            self.assertNotEqual(
+                minted, prior["upstream"]["codex"]["transition_id"],
+                "%s: a recovery is a change and mints a new identity" % label)
+            written[label] = {
+                "state": saved,
+                "posted": [c.args[0] for c in m["post"].call_args_list],
+                "pushed": [c.args[0] for c in m["push"].call_args_list],
+                "quarter_hour": (m["_cred_follow_pass"].call_count,
+                                 m["_proxy_usage_pass"].call_count)}
+        # MUST-HIT: the full pass runs the rungs the recheck leaves out
+        self.assertEqual(written["full"]["quarter_hour"], (1, 1))
+        self.assertEqual(written["recheck"]["quarter_hour"], (0, 0))
+        self.assertEqual(written["recheck"]["state"], written["full"]["state"])
+        self.assertEqual(written["recheck"]["posted"],
+                         written["full"]["posted"])
+        self.assertEqual(written["recheck"]["pushed"],
+                         written["full"]["pushed"])
+        self.assertEqual(len(written["full"]["posted"]), 1)
+
+    def test_no_latched_family_means_no_canary_no_lock_and_no_chat(self):  # noqa: VACUOUS_ASSERTION — the closing must-hit drives the same fixture latched dark and counts one canary on the same double
+        """(b) The minute timer on a healthy fleet: it reads the latch and
+        exits 0 with no canary, no measured pass, no lock and no post."""
+        seen = []
+
+        def quiet_run():
+            with self.rungs(measured=self.healthy()) as m, \
+                    mock.patch.object(proxywatch.fcntl, "flock") as flock:
+                rc = proxywatch.cmd_proxywatch(["--dark-only", "--post"])
+            self.assertEqual(rc, 0, m["out"].getvalue())
+            for name in ("canary", "network", "health", "post", "push",
+                         "poolwall") + self.QUARTER_HOUR:
+                self.assertEqual(m[name].call_count, 0, name)
+            self.assertEqual(flock.call_count, 0)
+            seen.append(m["out"].getvalue())
+
+        quiet_run()                               # never measured: no file
+        self.assertFalse(os.path.exists(self.state))
+        before = self.seed(self.healthy())        # measured, nothing dark
+        quiet_run()
+        self.assertEqual(self.on_disk(), before)
+        self.assertTrue(all("no family is latched dark" in text
+                            for text in seen), seen)
+        # MUST-HIT: the same fixture with the family latched dark re-probes it
+        self.seed(self.dark())
+        with self.rungs(canary=("UPSTREAM-5XX", "HTTP 502", 5)) as m:
+            proxywatch.cmd_proxywatch(["--dark-only", "--post"])
+        self.assertEqual(m["canary"].call_count, 1)
+
+    def test_a_primary_deleted_dark_latch_is_rechecked_from_last_good(self):
+        """Delivery already treats the byte-equivalent last-good snapshot as
+        canonical. The minute census must ask the same question: deleting the
+        primary during a dark episode cannot make it report no family latched."""
+        self.seed(self.dark())
+        backup = self.state + ".last-good"
+        self.assertTrue(os.path.exists(backup),
+                        "control: the writer produced its canonical fallback")
+        os.unlink(self.state)
+        with self.rungs(measured=self.healthy()) as m:
+            rc = proxywatch.cmd_proxywatch(["--dark-only", "--post"])
+        self.assertEqual(rc, 0, m["out"].getvalue())
+        m["canary"].assert_called_once_with("codex", family="codex")
+        m["health"].assert_called_once()
+        self.assertIn("canonical last-good delivery snapshot",
+                      m["out"].getvalue())
+        saved = json.loads(self.on_disk())
+        self.assertEqual(saved["upstream"]["codex"]["state"], "HEALTHY")
+        posted = [call.args[0] for call in m["post"].call_args_list]
+        self.assertEqual(len(posted), 1, posted)
+        self.assertIn("FAMILY-RECOVERED codex: HEALTHY", posted[0])
+
+    def test_a_family_still_failing_keeps_its_latch_and_posts_nothing(self):  # noqa: VACUOUS_ASSERTION — the loop is a literal range(2); each pass asserts the canary ran once and the latch still pauses before its absence assertions
+        """(c) A canary that still fails writes nothing at all: the latch,
+        its `since` and its transition identity stay the ones the last pass
+        wrote, and two rechecks in a row post nothing either time."""
+        before = self.seed(self.dark())
+        for _ in range(2):
+            with self.rungs(canary=("AUTH-UNAVAILABLE", "HTTP 503", 5),
+                            measured=self.healthy()) as m:
+                rc = proxywatch.cmd_proxywatch(["--dark-only", "--post"])
+            self.assertEqual(rc, 1, m["out"].getvalue())
+            m["canary"].assert_called_once_with("codex", family="codex")
+            m["health"].assert_not_called()
+            m["post"].assert_not_called()
+            m["push"].assert_not_called()
+            self.assertEqual(self.on_disk(), before)
+            self.assertIsNotNone(self.latched())
+            self.assertIn("still dark", m["out"].getvalue())
+
+    def test_a_trigger_the_measurement_does_not_confirm_invents_no_edge(self):
+        """(c) The canary reads HEALTHY and the full measurement a moment
+        later reads the family dark again. The pass persists what it measured,
+        exactly as a quarter-hour pass would: no edge, no post, the same
+        transition identity, and the latch still holds."""
+        prior = json.loads(self.seed(self.dark()))
+        with self.rungs(measured=self.dark(ts=2000)) as m:
+            rc = proxywatch.cmd_proxywatch(["--dark-only", "--post"])
+        self.assertEqual(rc, 1, m["out"].getvalue())
+        m["health"].assert_called_once()
+        m["post"].assert_not_called()
+        self.assertEqual([c.args[0] for c in m["push"].call_args_list
+                          if c.args[0]], [])
+        saved = json.loads(self.on_disk())
+        self.assertEqual(saved["ts"], 2000, "the measurement was persisted")
+        self.assertEqual(saved["upstream"]["codex"]["transition_id"],
+                         prior["upstream"]["codex"]["transition_id"])
+        self.assertIsNotNone(self.latched())
+
+    def test_recovery_measurement_freezes_another_family_held_to_its_reset(self):
+        """The fast census can have both answers at once: codex is due and
+        reads HEALTHY, while kimi is a quota wall with a future reset. The
+        recovery health pass receives kimi as a validated frozen family instead
+        of turning codex's recovery into an unrestricted kimi canary."""
+        now = int(time.time())
+        report = self.dark(ts=now)
+        held = self._pass(
+            "QUOTA-WALL", proxywatch._iso(now), "HTTP 429 usage limit", now,
+            seat_extra={"wall_observed_at": proxywatch._iso(now),
+                        "resets_at_ms": (now + 3600) * 1000,
+                        "reset_source": "canary"})["upstream"]["codex"]
+        held["seat"] = "kimi"
+        held["seats"] = {"kimi": held["seats"].pop("codex")}
+        held["members"] = {"kimi": "QUOTA-WALL"}
+        report["upstream"]["kimi"] = held
+        self.seed(report)
+        measured = self.healthy(ts=now + 1)
+        measured["upstream"]["kimi"] = held
+        with self.rungs(measured=measured) as m:
+            rc = proxywatch.cmd_proxywatch(["--dark-only", "--post"])
+        self.assertIn(rc, (0, 1), m["out"].getvalue())
+        m["canary"].assert_called_once_with("codex", family="codex")
+        self.assertEqual(m["health"].call_args.kwargs["frozen_families"],
+                         ("kimi",))
+        self.assertIn("kimi held for the fifteen-minute pass",
+                      m["out"].getvalue())
+        saved = json.loads(self.on_disk())
+        self.assertEqual(saved["upstream"]["kimi"]["state"], "QUOTA-WALL")
+        self.assertTrue(saved["upstream"]["kimi"]["dark"])
+
+    def test_a_money_wall_is_rechecked_only_after_its_recorded_reset(self):  # noqa: VACUOUS_ASSERTION — the loop is a literal three-case tuple and its `passed` case asserts exactly one canary on the same double the held cases count at zero
+        """A quota wall lifts on the vendor's clock. Re-probing it every
+        minute before its recorded reset only sends refused requests to a
+        walled account, so it waits for the quarter-hour pass until the reset
+        it recorded has passed; an unknown reset is never passed."""
+        now = int(time.time())
+        cases = (("ahead", now - 600, (now + 3600) * 1000, 0),
+                 ("unknown", now - 600, None, 0),
+                 ("passed", now - 3600, (now - 60) * 1000, 1))
+        for label, ts, reset, probes in cases:
+            with self.subTest(label):
+                self.state = os.path.join(self.d, label, "proxywatch.json")
+                extra = {"wall_observed_at": proxywatch._iso(ts),
+                         "reset_source": "canary"}
+                if reset is not None:
+                    extra["resets_at_ms"] = reset
+                self.seed(self._pass("QUOTA-WALL", proxywatch._iso(ts),
+                                     "HTTP 429 usage limit", ts,
+                                     seat_extra=extra))
+                self.assertIsNotNone(self.latched())
+                with self.rungs(canary=("QUOTA-WALL", "usage limit", 5)) as m:
+                    rc = proxywatch.cmd_proxywatch(["--dark-only", "--post"])
+                self.assertEqual(rc, 1, m["out"].getvalue())
+                self.assertEqual(m["canary"].call_count, probes)
+                if not probes:
+                    self.assertIn("held for the fifteen-minute pass",
+                                  m["out"].getvalue())
+
+    def test_a_latched_family_with_no_recorded_seat_waits_for_the_full_pass(self):  # noqa: VACUOUS_ASSERTION — the held line is asserted on the same stdout, and the (b) must-hit counts one canary on the same double for a family with a recorded seat
+        """A latch with no recorded seat has nothing to carry a canary, so the
+        recheck names it held and takes no lock for it."""
+        report = self.dark()
+        report["upstream"]["codex"]["seats"] = {}
+        self.seed(report)
+        self.assertIsNotNone(self.latched())
+        with self.rungs() as m, \
+                mock.patch.object(proxywatch.fcntl, "flock") as flock:
+            rc = proxywatch.cmd_proxywatch(["--dark-only", "--post"])
+        self.assertEqual(rc, 1, m["out"].getvalue())
+        self.assertIn("codex held for the fifteen-minute pass — no recorded "
+                      "seat carries a canary", m["out"].getvalue())
+        self.assertEqual((m["canary"].call_count, flock.call_count), (0, 0))
+
+    def test_a_bare_read_that_measures_a_latched_family_HEALTHY_says_so(self):  # noqa: VACUOUS_ASSERTION — the first half asserts exactly one such line on the same stdout the controls read, and each control asserts its report printed
+        """(d) The bare verb spends a canary and persists nothing. When it
+        measures a latched family HEALTHY it says the latch did not move and
+        names the command that moves it, instead of printing HEALTHY while
+        every door still reads the family dark."""
+        before = self.seed(self.dark())
+        with self.rungs(measured=self.healthy()) as m:
+            proxywatch.cmd_proxywatch([])
+        lines = [line for line in m["out"].getvalue().splitlines()
+                 if self.UNCHANGED in line]
+        self.assertEqual(len(lines), 1, m["out"].getvalue())
+        self.assertIn("codex measured HEALTHY", lines[0])
+        self.assertIn("`helm proxywatch --post`", lines[0])
+        self.assertEqual(self.on_disk(), before)
+        self.assertIsNotNone(self.latched())
+        # CONTROLS: a latch that is not dark, and a read that measures the
+        # family still dark, print no such line.
+        for label, latch, measured in (
+                ("latch-healthy", self.healthy(ts=1000), self.healthy()),
+                ("still-dark", self.dark(), self.dark(ts=2000))):
+            with self.subTest(label):
+                self.state = os.path.join(self.d, label, "proxywatch.json")
+                self.seed(latch)
+                with self.rungs(measured=measured) as m:
+                    proxywatch.cmd_proxywatch([])
+                self.assertNotIn(self.UNCHANGED, m["out"].getvalue())
+                self.assertIn("codex", m["out"].getvalue())
+
+    def test_a_dark_only_read_reprobes_but_persists_nothing(self):  # noqa: VACUOUS_ASSERTION — the canary is asserted called once and the not-persisted line printed before the absence of a measured pass, a post and a write
+        """`--dark-only` without `--post` is the same read for the dark
+        families alone: one canary, no measured pass, no write, and the same
+        not-persisted line when the family reads HEALTHY."""
+        before = self.seed(self.dark())
+        with self.rungs(measured=self.healthy()) as m:
+            rc = proxywatch.cmd_proxywatch(["--dark-only"])
+        self.assertEqual(rc, 1, m["out"].getvalue())
+        m["canary"].assert_called_once_with("codex", family="codex")
+        m["health"].assert_not_called()
+        m["post"].assert_not_called()
+        self.assertEqual(self.on_disk(), before)
+        self.assertIn(self.UNCHANGED, m["out"].getvalue())
+        self.assertIn("`helm proxywatch --post`", m["out"].getvalue())
+
+    def test_dark_only_combines_with_post_and_nothing_else(self):  # noqa: VACUOUS_ASSERTION — each refusal names the combination rule on stderr, and the (a) arm is the must-hit where --dark-only --post runs the canary and the measurement
+        """`--force`, `--json` and `--install-timer` have no dark-only form;
+        the combination is refused before any rung runs."""
+        self.seed(self.dark())
+        for extra in ("--force", "--json", "--install-timer"):
+            with self.subTest(extra), self.rungs(measured=self.healthy()) \
+                    as m, contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = proxywatch.cmd_proxywatch(["--dark-only", extra])
+            self.assertEqual(rc, 2)
+            self.assertIn("--dark-only combines only with --post",
+                          err.getvalue())
+            for name in ("canary", "health", "post") + self.QUARTER_HOUR:
+                self.assertEqual(m[name].call_count, 0, name)
+
+    def test_install_timer_writes_both_units_with_the_recheck_every_minute(self):
+        """(e) `--install-timer` writes and enables the fifteen-minute unit
+        and the dark-family recheck unit, with systemctl, the unit writes and
+        the checkout root stubbed."""
+        home_dir = os.path.join(self.d, "home")
+        helm_bin = os.path.join(home_dir, ".local", "bin", "helm")
+        done = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.dict(os.environ, {"HOME": home_dir}), \
+                mock.patch("shutil.which",
+                           return_value="/fixture/bin/systemctl"), \
+                mock.patch("helm.work.find_root",
+                           return_value="/fixture/helm"), \
+                mock.patch.object(pk, "atomic_write") as write, \
+                mock.patch.object(proxywatch.subprocess, "run",
+                                  return_value=done) as run, \
+                mock.patch.object(proxywatch, "_cred_follow_pass") as follow, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = proxywatch.cmd_proxywatch(["--install-timer"])
+        self.assertEqual(rc, 0, out.getvalue())
+        units = {os.path.basename(c.args[0]): c.args[1]
+                 for c in write.call_args_list}
+        self.assertEqual(sorted(units), [
+            "helm-proxywatch-dark.service", "helm-proxywatch-dark.timer",
+            "helm-proxywatch.service", "helm-proxywatch.timer"])
+        udir = os.path.join(home_dir, ".config", "systemd", "user")
+        self.assertEqual({os.path.dirname(c.args[0])
+                          for c in write.call_args_list}, {udir})
+        full_service = units["helm-proxywatch.service"]
+        self.assertIn("ExecStart=%s proxywatch --post\n" % helm_bin,
+                      full_service)
+        self.assertIn("TimeoutStartSec=%ds\n" % proxywatch.SERVICE_TIMEOUT_S,
+                      full_service)
+        dark_service = units["helm-proxywatch-dark.service"]
+        self.assertIn("ExecStart=%s proxywatch --dark-only --post\n" % helm_bin,
+                      dark_service)
+        self.assertIn("WorkingDirectory=/fixture/helm\n", dark_service)
+        self.assertIn("SuccessExitStatus=1", dark_service)
+        self.assertIn("TimeoutStartSec=%ds\n" %
+                      proxywatch.DARK_SERVICE_TIMEOUT_S, dark_service)
+        self.assertIn("OnUnitActiveSec=900s\n", units["helm-proxywatch.timer"])
+        self.assertEqual(proxywatch.DARK_INTERVAL_S, 60)
+        dark_timer = units["helm-proxywatch-dark.timer"]
+        self.assertIn("OnBootSec=60s\n", dark_timer)
+        self.assertIn("OnUnitActiveSec=60s\n", dark_timer)
+        self.assertEqual(
+            [c.args[0] for c in run.call_args_list],
+            [["/fixture/bin/systemctl", "--user", "daemon-reload"],
+             ["/fixture/bin/systemctl", "--user", "enable", "--now",
+              "helm-proxywatch.timer", "helm-proxywatch-dark.timer"]])
+        follow.assert_not_called()
+        self.assertIn("every 60s", out.getvalue())
+
+
+class SeatAuthFailingProxyReadsLiveTest(unittest.TestCase):
+    """When a seat's recent REAL requests all fail on upstream auth, the
+    upstream rung reads AUTH-401, naming the proxy port and the count
+    (task/3199). The rule is the module's own refusal-cluster rule: at least
+    STREAK_N rows spanning at least STREAK_MIN_WINDOW_S, each classified
+    AUTH-401 by `_upstream_state`, the newest younger than
+    UPSTREAM_CACHE_FRESH_S, and ended by any later success, including an
+    authenticated canary's 2xx through the same proxy.
+
+    Timestamps are relative to the real clock, in the proxy log's own naive
+    local form, so freshness is exercised the way a live pass sees it."""
+
+    # Bodies as the fork logs them: the vendor's JSON TEXT, quoted.
+    AUTH = json.dumps({"type": "error", "error": {
+        "type": "authentication_error",
+        "message": "Incorrect API key provided"}})
+    KIMI_WEEKLY = json.dumps({"type": "error", "error": {
+        "type": "access_terminated_error",
+        "message": "You've reached your weekly (7-day) usage limit"}})
+    CANARY = "/v1/messages?beta=true&helm_canary=1"
+
+    def setUp(self):
+        super().setUp()
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.p = os.path.join(self.d, "proxy.log")
+
+    @staticmethod
+    def ago(seconds):
+        return time.strftime("%Y-%m-%d %H:%M:%S",
+                             time.localtime(time.time() - seconds))
+
+    def _observe(self, lines):
+        with open(self.p, "w") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+        return proxywatch.log_observation(self.p)
+
+    def incident(self, newest_ago=60, n=10, span=240, code=401, body=None,
+                 path="/v1/messages?beta=true"):
+        """n unmarked refusals spread evenly over `span` seconds, the newest
+        `newest_ago` seconds old — the helm-codex shape from 2026-09-25."""
+        step = span / float(n - 1)
+        return [gin(code, path=path, origin="unknown",
+                    body=self.AUTH if body is None else body,
+                    ts=self.ago(newest_ago + span - i * step))
+                for i in range(n)]
+
+    def upstream(self, family, seat_name, auth_failed, canary=None,
+                 port=8502):
+        """One upstream_health pass over one seat row. `canary` None means
+        the seat is not a canary candidate (no locally healthy probe)."""
+        row = {"seat": seat_name, "family": family, "port": port,
+               "probe": "healthy" if canary else None, "error": None,
+               "log_auth_failed": auth_failed}
+        with mock.patch.object(proxywatch, "_seat_canary_observation",
+                               return_value=(canary, None, "VERIFIED")) \
+                as observed:
+            up = proxywatch.upstream_health([row], now=time.time(), prior={})
+        self.assertEqual(observed.called, bool(canary))
+        return up[family], up[family]["seats"][seat_name]
+
+    def test_the_live_incident_shape_reads_AUTH_401_naming_port_and_count(self):
+        """The incident: helm's own invalid-key probe rows (marked, a 401 is
+        their HEALTHY answer) beside 10 unmarked agent 401s over 4 minutes.
+        No canary carried a verdict, and the log names the wall."""
+        lines = [gin(401, path="/v1/chat/completions?helm_canary=1",
+                     ts=self.ago(400))] * 8 + self.incident()
+        observed = self._observe(lines)
+        self.assertEqual(observed["auth_failed"], 10)
+        self.assertEqual(observed["status_401"]["helm_marked"], 8)
+        family, seat_rec = self.upstream("codex", "helm-codex",
+                                         observed["auth_failed"])
+        self.assertEqual(seat_rec["state"], "AUTH-401")
+        self.assertIs(seat_rec["dark"], True)
+        self.assertIn("port 8502", seat_rec["detail"])
+        self.assertIn("10 requests", seat_rec["detail"])
+        self.assertEqual((family["state"], family["dark"]), ("AUTH-401", True))
+
+    def test_a_stale_streak_older_than_the_freshness_bound_reads_as_today(self):
+        """codex-8, measured live: 10 real 401s at 16:07-16:11 still read
+        AUTH-401 at 17:39. Past the freshness bound the log says nothing."""
+        stale = proxywatch.UPSTREAM_CACHE_FRESH_S + 600
+        self.assertIsNone(
+            self._observe(self.incident(newest_ago=stale))["auth_failed"])
+        # positive control: the same rows inside the bound
+        self.assertEqual(self._observe(self.incident())["auth_failed"], 10)
+
+    def test_a_retried_pair_stays_clear_before_and_after_its_200(self):
+        """A request and its immediate retry, 3s apart — measured five times
+        in the live logs, each cleared by a 200 within 1-40s. Sampled before
+        the 200 it is still no wall, and the 200 keeps it clear."""
+        lines = [gin(200, ts=self.ago(120))] * 5 + [
+            gin(401, origin="unknown", body=self.AUTH, ts=self.ago(33)),
+            gin(401, origin="unknown", body=self.AUTH, ts=self.ago(30))]
+        self.assertIsNone(self._observe(lines)["auth_failed"])
+        lines.append(gin(200, ts=self.ago(10)))
+        self.assertIsNone(self._observe(lines)["auth_failed"])
+
+    def test_a_kimi_quota_403_streak_reads_QUOTA_WALL_not_AUTH_401(self):
+        """A vendor quota wall is not a bad key: kimi's weekly-limit 403s
+        stay on the money axis, and the canary's QUOTA-WALL stands."""
+        observed = self._observe(self.incident(n=4, span=220, code=403,
+                                               body=self.KIMI_WEEKLY))
+        # control: the fixture's body reaches the classifier as a quota wall
+        rows, _err, _scope = proxywatch._proxy_log_rows(
+            self.p, proxywatch._TAIL_BYTES)
+        self.assertEqual(proxywatch._upstream_state(
+            rows[-1][1], rows[-1][3], origin=rows[-1][4]),
+            proxywatch._QUOTA_WALL)
+        self.assertIsNone(observed["auth_failed"])
+        _family, seat_rec = self.upstream(
+            "kimi", "kimi", observed["auth_failed"],
+            canary=(proxywatch._QUOTA_WALL,
+                    "HTTP 403 You've reached your weekly usage limit", 900))
+        self.assertEqual(seat_rec["state"], proxywatch._QUOTA_WALL)
+
+    def test_an_authenticated_canary_2xx_after_the_streak_clears_it(self):
+        """Measured recovery through the same proxy ends the streak. The
+        invalid-key probe's 200 does not: a 200 to an INVALID key is an auth
+        failure of its own (EMPTY200), never a recovery."""
+        recovered = self.incident(newest_ago=90) + [
+            gin(200, path=self.CANARY, ts=self.ago(30))]
+        self.assertIsNone(self._observe(recovered)["auth_failed"])
+        probe_200 = self.incident(newest_ago=90) + [
+            gin(200, path="/v1/chat/completions?helm_canary=1",
+                ts=self.ago(30))]
+        self.assertEqual(self._observe(probe_200)["auth_failed"], 10)
+
+    def test_a_fresher_canary_verdict_is_not_overridden_by_the_log(self):
+        """The canary runs this pass, after every row the log holds, so its
+        named verdict is the fresher measurement. The log fills only a canary
+        that could not say."""
+        _family, seat_rec = self.upstream(
+            "codex", "codex-8", 10, canary=("HEALTHY", "HTTP 200", 900))
+        self.assertEqual(seat_rec["state"], "HEALTHY")
+        _family, blind = self.upstream(
+            "codex", "codex-8", 10,
+            canary=("UNKNOWN", "proxy port, token, or model unavailable",
+                    None))
+        self.assertEqual(blind["state"], "AUTH-401")
+
+    def test_a_marked_canary_401_on_the_agent_path_is_not_real_traffic(self):
+        """The authenticated canary writes /v1/messages?beta=true&helm_canary=1,
+        a path the agent-path filter KEEPS, so only the marker can exclude it.
+        The control drops the marker from the same rows and they count."""
+        marked = self.incident(path=self.CANARY)
+        self.assertIsNone(self._observe(marked)["auth_failed"])
+        self.assertEqual(self._observe(self.incident())["auth_failed"], 10)
+
+    def test_must_miss_one_401_among_successes(self):  # noqa: VACUOUS_ASSERTION — positive control is the incident arm
+        """One 401 among 200s is not persistent auth failure and must miss."""
+        lines = [gin(200, ts=self.ago(90))] * 5 + [
+            gin(401, origin="provider", body=self.AUTH, ts=self.ago(30))]
+        self.assertIsNone(self._observe(lines)["auth_failed"])
+
+    def test_must_miss_seat_with_no_requests_in_window(self):  # noqa: VACUOUS_ASSERTION — positive control is the incident arm
+        """A seat with an empty log must miss."""
+        self.assertIsNone(self._observe([])["auth_failed"])
+
+    def test_must_miss_proxywatch_own_invalid_key_probe_rows(self):  # noqa: VACUOUS_ASSERTION — positive control is the incident arm
+        """8 marked probe 401s and 0 unmarked agent 401s is healthy."""
+        lines = [gin(401, path="/v1/chat/completions?helm_canary=1",
+                     ts=self.ago(60))] * 8
+        self.assertIsNone(self._observe(lines)["auth_failed"])
+
+    BLIND = ("UNKNOWN", "proxy port, token, or model unavailable", None)
+
+    def passes(self, family, seat_name, steps):
+        """Consecutive watch passes over one seat. Each step is
+        (log_auth_failed, canary); each pass composes against the record the
+        last one PERSISTED (`_compose_upstream_records`, which drops detail
+        and ms), the way the timer pass and the dark recheck read it."""
+        prior, out = {}, []
+        for auth_failed, canary in steps:
+            row = {"seat": seat_name, "family": family, "port": 8315,
+                   "probe": "healthy", "error": None,
+                   "log_auth_failed": auth_failed}
+            now = time.time()
+            with mock.patch.object(proxywatch, "_seat_canary_observation",
+                                   return_value=(canary, None, "VERIFIED")):
+                up = proxywatch.upstream_health([row], now=now, prior=prior)
+            with mock.patch.object(proxywatch, "read_vendor_resets",
+                                   return_value=({}, None)):
+                persisted, _err = proxywatch._compose_upstream_records(
+                    {"upstream": up, "ts": int(now)}, prior.get("upstream")
+                    or {})
+            prior = {"upstream": persisted, "ts": int(now)}
+            record, err = proxywatch.upstream_record(prior, family)
+            self.assertIsNone(err)
+            out.append(record)
+        return out
+
+    def test_a_log_born_wall_ends_with_its_log_evidence_on_a_blind_canary(self):
+        """cursor, measured 2026-09-25: probe healthy, and its authenticated
+        canary never reaches the proxy (UNKNOWN on every pass, no marked
+        /v1/messages row in its log), while real agent traffic fills the log.
+        That is exactly the seat the log rung exists for, and the one seat
+        whose only exit from a dark latch (a canary HEALTHY, here or in the
+        minute recheck's `_upstream_once`) can never be measured. A wall the
+        LOG opened must close when the log stops showing a fresh auth streak,
+        or one auth episode leaves a single-seat family RED and paused for
+        good: the codex-8 symptom, made permanent by the latch."""
+        walled, after = self.passes("cursor", "cursor",
+                                    [(10, self.BLIND), (None, self.BLIND)])
+        self.assertEqual((walled["state"], walled["dark"]),
+                         ("AUTH-401", True))
+        self.assertTrue(proxywatch.beacon_paused(walled))
+        self.assertIs(after["dark"], False)
+        self.assertFalse(proxywatch.beacon_paused(after))
+        self.assertIs(after["seats"]["cursor"]["dark"], False)
+
+    def test_a_log_born_wall_holds_while_its_streak_stays_fresh(self):
+        """The same latch, still fed: the log keeps reading AUTH-401 and the
+        episode keeps its since."""
+        first, second = self.passes("cursor", "cursor",
+                                    [(10, self.BLIND), (12, self.BLIND)])
+        self.assertEqual((second["state"], second["dark"]), ("AUTH-401", True))
+        self.assertEqual(second["seats"]["cursor"]["since"],
+                         first["seats"]["cursor"]["since"])
+
+    def test_a_canary_born_wall_still_holds_through_a_blind_pass(self):
+        """The control: a wall the CANARY measured keeps the module's rule.
+        A later UNKNOWN is not recovery, and the log clearing proves nothing
+        about a wall the log did not open, even after the log re-read it."""
+        canary = ("AUTH-401", "HTTP 401 then HTTP 401 (3s apart)", 900)
+        _walled, blind = self.passes("cursor", "cursor",
+                                     [(None, canary), (None, self.BLIND)])
+        self.assertIs(blind["dark"], True)
+        self.assertTrue(proxywatch.beacon_paused(blind))
+        _walled, refilled, cleared = self.passes(
+            "cursor", "cursor",
+            [(None, canary), (10, self.BLIND), (None, self.BLIND)])
+        self.assertEqual(refilled["state"], "AUTH-401")
+        self.assertIs(cleared["dark"], True)
+        self.assertTrue(proxywatch.beacon_paused(cleared))
+
+    def test_weather_mid_outage_neither_breaks_nor_extends_the_streak(self):
+        """helm-codex, 2026-09-25 15:40-15:48: 'HTTP 401 x20 (also
+        429/520)'. A 520, a vendor rate-limit 429 and the proxy's own
+        cooldown 429 say nothing about the key, so an auth streak runs
+        through them instead of going clear for minutes mid-outage. A 200 in
+        the same place still ends it."""
+        outage = self.incident(newest_ago=60, n=6, span=240)
+        rate = json.dumps({"type": "error", "error": {
+            "type": "rate_limit_error",
+            "message": "Rate limit reached for requests"}})
+        cooling = json.dumps({"type": "error", "error": {
+            "type": "rate_limit_error",
+            "message": "no available credential: 1 cooling down"}})
+        at = self.ago(130)                  # between outage[3] and outage[4]
+        self.assertEqual(proxywatch._upstream_state(429, rate,
+                                                    origin="unknown"),
+                         "RATE-LIMITED")
+        for weather in (gin(520, origin="unknown", body="error code: 520",
+                            ts=at),
+                        gin(429, origin="unknown", body=rate, ts=at),
+                        gin(429, origin="local", body=cooling, ts=at)):
+            self.assertEqual(self._observe(
+                outage[:4] + [weather] + outage[4:])["auth_failed"], 6)
+        self.assertIsNone(self._observe(
+            outage[:4] + [gin(200, ts=at)] + outage[4:])["auth_failed"])
+
+# A Claude-Code-over-proxy viewport after its last request failed. The body
+# carries no credential shape.
+_DEAD_FOOTER = ("────────────────────────────────\n❯ \n"
+                "────────────────────────────────\n"
+                "  ⏵⏵ bypass permissions on · ← for agents")
+_DIED_401 = ("● Bash(helm chat read)\n"
+             "  ⎿  3 rows\n"
+             "● API Error: 401 {\"type\":\"error\",\"error\":{\"type\":"
+             "\"authentication_error\",\"message\":\"Incorrect API key "
+             "provided\"}}\n"
+             "✻ Worked for 2s\n" + _DEAD_FOOTER)
+
+
+class DeadTurnHungVerdictTest(unittest.TestCase):
+    """A HUNG SEAT WHOSE TURN DIED ON AN UPSTREAM ERROR OVER A HEALTHY PROXY IS
+    WOKEN BY ONE PROMPT, NOT A RELAUNCH (task/3217).
+
+    The HUNG verdict prescribes `helm seat resume` and then a reseed, which
+    relaunches the seat and can discard its context. A pane that ended on an
+    API error, over a proxy that has read HEALTHY since, with no beacon
+    listening, needs one prompt: the same wake `helm beacons` names. A live
+    beacon, or one nobody measured, keeps the resume prescription."""
+
+    DIED = {"state": "IDLE", "blocked_on": None, "evidence": "pane-tail",
+            "seat": "seat-a",
+            "turn_died": {"error": "API Error: 401", "upstream": "HEALTHY",
+                          "since": "T0"}}
+
+    def _findings(self, liveness, beacon_none):
+        r = row(seat="seat-a", turn="hung", liveness=liveness,
+                turn_evidence="semantic entry stale 57m")
+        r["beacon_none"] = beacon_none
+        return proxywatch.findings(rep(r))
+
+    def test_a_dead_turn_with_no_beacon_prescribes_one_prompt(self):
+        f = self._findings(self.DIED, True)
+        self.assertEqual([level for level, _t in f], ["HUNG"])
+        text = f[0][1]
+        for part in ("turn died on upstream error (API Error: 401)",
+                     "proxy healthy since T0", "wake with one prompt",
+                     "`helm seat resume-turn --nudge --seat seat-a`"):
+            self.assertIn(part, text)
+        self.assertNotIn("`helm seat resume seat-a`", text)
+        self.assertNotIn("reseed", text)
+
+    def test_a_live_or_unmeasured_beacon_keeps_the_resume_prescription(self):
+        live = self._findings(self.DIED, False)
+        self.assertEqual([level for level, _t in live], ["HUNG"])
+        self.assertIn("`helm seat resume seat-a`", live[0][1])
+        self.assertNotIn("turn died", live[0][1])
+        unmeasured = self._findings(self.DIED, None)
+        self.assertEqual([level for level, _t in unmeasured], ["HUNG"])
+        self.assertIn("`helm seat resume seat-a`", unmeasured[0][1])
+        self.assertNotIn("turn died", unmeasured[0][1])
+
+
+class DeadTurnHealthDerivationTest(_HealthRig):
+    """health() measures the beacon for a hung seat whose pane shows a dead
+    turn, from the REAL pane-tail reader over a planted tail, a planted
+    proxywatch record and a planted beacon."""
+
+    STALE = proxywatch.HANG_S + 60
+
+    def _dead(self, beacon_pids, seat_state="HEALTHY", dark=False):
+        record = {"state": seat_state, "dark": dark, "since": "T0",
+                  "detail": "fixture"}
+        snapshot = ({"fam-a": dict(record, seats={"seat-a": record})}, None)
+        ad = mock.Mock()
+        ad.read.return_value = _DIED_401
+        spawn = {"seat": "seat-a", "harness": "orca", "handle": "term_x",
+                 "worktree": "/w", "room": "helm", "ts": "T"}
+        with mock.patch("helm.seat._spawn_record", return_value=spawn), \
+                mock.patch("helm.seat._resolve_registered_pane",
+                           return_value=(ad, "term_x", "")), \
+                mock.patch("helm.proxywatch.upstream_snapshot",
+                           return_value=snapshot), \
+                mock.patch("helm.seats.beacon_procs",
+                           return_value=(beacon_pids, "")):
+            return self._health(live=True, age=self.STALE, infl=0, pct=30.0,
+                                spawn=2 * 3600, pending=True,
+                                seat_name="seat-a",
+                                parsed_family=("fam-a", None))
+
+    def test_health_samples_the_beacon_and_findings_prescribe_one_prompt(self):
+        r = self._dead([])
+        self.assertEqual(r["turn_state"], "hung")
+        self.assertEqual((r["liveness"] or {}).get("state"), "IDLE")
+        self.assertIs(r.get("beacon_none"), True)
+        f = proxywatch.findings(rep(r))
+        self.assertEqual([level for level, _t in f], ["HUNG"])
+        self.assertIn("wake with one prompt", f[0][1])
+        self.assertIn("helm seat resume-turn --nudge --seat seat-a", f[0][1])
+
+    def test_a_live_beacon_is_measured_as_live(self):
+        r = self._dead([4242])
+        self.assertEqual(r["turn_state"], "hung")
+        self.assertIs(r.get("beacon_none"), False)
+        f = proxywatch.findings(rep(r))
+        self.assertEqual([level for level, _t in f], ["HUNG"])
+        self.assertNotIn("turn died", f[0][1])
+        self.assertIn("`helm seat resume seat-a`", f[0][1])
+
+
+class ContextReaderFailsClosedOnAnUnprovenWindowTest(unittest.TestCase):
+    """task/3534: `_ctx_pct` asks autocompact, and a row whose window is only
+    ASSUMED (status `window-unproven`) answers "window unproven", never its
+    percentage."""
+
+    def test_an_unproven_window_answers_window_unproven(self):
+        with mock.patch("helm.autocompact.read", return_value={
+                "status": "window-unproven", "pct": 85.0}):
+            self.assertEqual(proxywatch._ctx_pct("seat-x"), "window unproven")
+        # CONTROL: a declared window's measured row answers its percentage
+        with mock.patch("helm.autocompact.read", return_value={
+                "status": "ok", "pct": 85.0}):
+            self.assertEqual(proxywatch._ctx_pct("seat-x"), 85.0)
+
+
+class AnUnprovenWindowStillVerdictsTheSeatTest(unittest.TestCase):
+    """task/3534, non-author read. Autocompact never acts on an assumed
+    window, so `compact-needed` is never the answer for such a seat and its
+    context cannot change the verdict: it is not an unread input. Every OTHER
+    input here is measured, so the verdict is measured too."""
+
+    def verdict(self, open_dispatches):
+        return proxywatch.turn_state(
+            True, proxywatch.HANG_S + 60, "ok", 0, None, 80, 2 * 3600,
+            open_dispatches=open_dispatches, ctx_unknown="window unproven")
+
+    def test_a_measured_hang_on_an_unproven_window_is_hung(self):
+        state, ev = self.verdict(1)
+        self.assertEqual(state, "hung", ev)
+        self.assertIn("context UNKNOWN (window unproven)", ev)
+
+    def test_a_measured_idle_on_an_unproven_window_is_idle(self):
+        state, ev = self.verdict(0)
+        self.assertEqual(state, "idle", ev)
+
+    def test_a_hung_seat_on_an_unproven_window_is_not_routable(self):
+        # `hung-unknown` is in none of seat_usability's turn-state tuples, so
+        # it lands on DEGRADED, which CAN take work: routing sent work to a
+        # hung seat. `hung` is a measured refusal: UNUSABLE.
+        from helm import seat_usability
+        state, ev = self.verdict(1)
+        row = {"seat": "x", "turn_state": state, "turn_evidence": ev,
+               "semantic_age_s": proxywatch.HANG_S + 60, "pane": True,
+               "reachable": True, "unknown": {}, "registered": True}
+        verdict, why = seat_usability.verdict(row)
+        self.assertEqual(verdict, seat_usability.UNUSABLE,
+                         "turn=%s -> %s: %s" % (state, verdict, why))

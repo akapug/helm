@@ -1,0 +1,231 @@
+/* ================= WORK, START TO FINISH (task/3643) =================
+   One card surface (the backlog's), one sticky band that says which stages
+   are the backlog and which the pipeline, one head row that is both the
+   stage count and the stage switch, and five columns under it. Hairlines,
+   not boxes: the cards are the ink. Colour carries signal only: warn =
+   stuck, bad = a fix still owed on work that already landed, accent = where
+   a card is now. */
+.wk{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px 6px;margin:12px 0 16px;min-width:0;scroll-margin-top:calc(var(--navh,48px) + 8px)}
+.bdetail .wk{margin:4px 0 8px;scroll-margin-top:calc(var(--navh,48px) + var(--bstickh,0px) + 8px)}
+.wktop{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;margin:0 0 2px}
+.wktop h1{margin:0;font-size:var(--f4);font-weight:var(--w-bold);letter-spacing:-.01em}
+.wklens{margin-left:auto;display:inline-flex;border:1px solid var(--line2);border-radius:var(--r);overflow:hidden}
+.wklens button{border:0;background:none;color:var(--mut);padding:4px 12px;font-size:var(--f1);font-weight:600;cursor:pointer}
+.wklens button+button{border-left:1px solid var(--line2)}
+.wklens button.on{background:var(--accent-soft);color:var(--accent)}
+.wksay{margin:4px 0 10px;font-size:var(--f1);color:var(--mut);max-width:96ch}
+.wksay b{color:var(--fg);font-weight:600}
+.wksay .wkw{color:var(--warn)}
+.wkonyou{font-size:var(--f1);color:var(--mut);text-decoration:none}
+.wkonyou b{color:var(--ok)}
+a.wkonyou{color:var(--warn)}
+.wkread{margin:0 0 8px;font-size:var(--f1);color:var(--mut)}
+.wkread:empty{display:none}
+.wkunk{color:var(--warn);font-weight:700}
+.wkbd{font-size:.72em;font-weight:600;color:var(--mut)}
+/* THE STICKY BAND: the backlog / pipeline / done brackets over the head row */
+.wkstick{position:sticky;top:var(--navh,90px);z-index:5;background:var(--card);border-bottom:1px solid var(--line2);margin:6px -14px 0;padding:4px 14px 0}
+.bdetail .wkstick{top:calc(var(--navh,90px) + var(--bstickh,0px))}
+.wkbrackets{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:0 12px}
+.wkbr{display:flex;align-items:center;gap:8px;border:0;background:none;padding:2px 0 0;cursor:pointer;color:var(--sub);font-size:var(--f0);font-weight:700;letter-spacing:.12em;text-transform:uppercase;min-width:0}
+.wkbr::before,.wkbr::after{content:"";flex:1 1 0;height:6px;margin-top:6px;border-top:1px solid var(--line2);min-width:6px}
+.wkbr::before{border-left:1px solid var(--line2);border-top-left-radius:3px}
+.wkbr::after{border-right:1px solid var(--line2);border-top-right-radius:3px}
+.wkbr span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wkbr i{font-style:normal;font-weight:400;letter-spacing:0;text-transform:none;color:var(--sub)}
+.wkbr:hover,.wkbr.on{color:var(--accent)}
+.wkbr.on::before,.wkbr.on::after{border-color:var(--accent)}
+.wkbr.b1{grid-column:1/2}.wkbr.b2{grid-column:2/5}.wkbr.b3{grid-column:5/6}
+.wkheads{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:0 12px;padding:0 0 6px}
+.wkhead{position:relative;min-width:0;text-align:left;border:0;border-top:2px solid transparent;background:none;color:var(--fg);padding:5px 6px 2px 2px;cursor:pointer;border-radius:0;font:inherit}
+.wkhead:hover .wkhn,.wkhead.on .wkhn{color:var(--accent)}
+.wkhead.on{border-top-color:var(--accent)}
+.wkhead:not(:last-child)::after{content:"›";position:absolute;right:-10px;top:24px;color:var(--sub);font-size:var(--f4);line-height:1}
+.wkhl{display:block;font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--sub);white-space:nowrap}
+.wkhn{display:block;font-size:var(--f5);font-weight:var(--w-bold);line-height:1.15;font-variant-numeric:tabular-nums}
+.wkhs{display:block;font-size:var(--f1);color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wkhf{display:block;font-size:var(--f0);min-height:1.35em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--mut)}
+.wkhf .w{color:var(--warn);font-weight:700}
+.wkhf .x{color:var(--bad);font-weight:700}
+/* THE RIVER: the same five columns, a hairline between them */
+.wkriver{display:grid;grid-template-columns:repeat(var(--cols,5),minmax(0,1fr));gap:0 12px;align-items:start}
+.wkcol{min-width:0;padding:4px 0 8px}
+.wkcol+.wkcol{border-left:1px solid var(--line);padding-left:10px;margin-left:-11px}
+.wksecthead{display:none}
+.wkfocus{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:0 16px;align-items:start;padding:4px 0 8px}
+.wkfocus>.wkwide,.wkfocus>.wkdrawer{grid-column:1/-1}
+/* the project tab's link to the whole page, in the page's link colour */
+.wk .dslink{color:var(--accent);cursor:pointer;white-space:nowrap;text-decoration:none}
+.wk .dslink:hover{text-decoration:underline}
+/* ONE CARD: the backlog row's look, stacked for a column */
+.wkcard{display:block;border-bottom:1px solid var(--line);font-size:var(--f1);padding:7px 6px 7px 8px;cursor:pointer;outline:none;min-width:0}
+.wkcard:hover{background:var(--hover)}
+.wkcard:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
+.wkcard.warn{box-shadow:inset 2px 0 0 var(--warn)}
+.wkcard.bad{box-shadow:inset 2px 0 0 var(--bad)}
+.wkcard.sel{background:var(--elev);box-shadow:inset 0 0 0 1px var(--accent),inset 3px 0 0 var(--accent)}
+.wkline1{display:flex;align-items:center;gap:5px;flex-wrap:wrap;min-width:0;overflow:hidden}
+.wkline1>*{flex:none}
+.wkline1>.wkproj{flex:0 1 auto;min-width:0}
+.wkline1 .odqid{font-variant-numeric:tabular-nums;white-space:nowrap}
+.wknotask{font-size:var(--f0);color:var(--sub);border:1px dashed var(--line2);border-radius:var(--r-sm);padding:0 5px;white-space:nowrap}
+.wkproj{font-size:var(--f0);color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:9em}
+.wkback{margin-left:auto;font-size:var(--f0);font-weight:700;color:var(--warn);white-space:nowrap}
+.wkback.bad{color:var(--bad)}
+/* the came-back mark never truncates (its count is the point); the
+   project name takes the squeeze, or wraps */
+.wkline1>.wkback{flex:0 0 auto;overflow:visible;text-overflow:clip}
+.wkpause{font-size:var(--f0);font-weight:700;color:var(--mut);white-space:nowrap}
+.wktitle{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin:2px 0 3px;font-weight:600;font-size:var(--f2);line-height:1.3;color:var(--fg);overflow-wrap:anywhere}
+.wkline3{display:flex;align-items:center;gap:4px 8px;flex-wrap:wrap;color:var(--mut);min-width:0}
+.wkball{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+.wkball.nobody{color:var(--warn);font-weight:700}
+.wkage{margin-left:auto;font-variant-numeric:tabular-nums;white-space:nowrap}
+.wkwhy{margin-top:2px;font-size:var(--f1);line-height:1.3;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;color:var(--mut)}
+.wkwhy.warn,.wkwhy.back{color:var(--warn)}
+.wkwhy.bad{color:var(--bad)}
+.wkact{margin-top:3px;font-size:var(--f0);color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* THE STAGE TRACK: filled = passed · lit = now · hollow = reached, then sent back */
+.wktrack{display:inline-flex;gap:3px;align-items:center;flex:none}
+.wktrack i{width:7px;height:7px;border-radius:50%;background:var(--line2)}
+.wktrack i.p{background:color-mix(in srgb,var(--accent) 45%,var(--line2))}
+.wktrack i.n{background:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.wktrack i.n.w{background:var(--warn);box-shadow:0 0 0 2px color-mix(in srgb,var(--warn) 22%,transparent)}
+.wktrack i.n.b{background:var(--bad);box-shadow:0 0 0 2px color-mix(in srgb,var(--bad) 22%,transparent)}
+.wktrack i.n.d{background:var(--ok);box-shadow:0 0 0 2px color-mix(in srgb,var(--ok) 20%,transparent)}
+.wktrack i.r{background:transparent;box-shadow:inset 0 0 0 1.5px var(--warn)}
+.wkmore{margin:6px 0 4px 6px;padding:3px 9px;font-size:var(--f1)}
+.wk .chip .blcnt{margin-left:0;padding-left:4px}
+.wkempty{padding:8px 6px;color:var(--mut);font-size:var(--f1)}
+.wkline{padding:8px 6px 7px 8px;font-size:var(--f1);color:var(--mut);border-bottom:1px solid var(--line)}
+.wkline b{color:var(--fg);font-weight:600}
+.wktoday{display:flex;gap:6px;padding:6px 6px 6px 8px}
+.wktoday .chip{padding:2px 9px;font-size:var(--f0)}
+.wktrainh{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px;padding:9px 6px 3px 8px;font-size:var(--f0);color:var(--sub);border-bottom:1px solid var(--line)}
+.wktrainh b{color:var(--ok);font-weight:700;font-size:var(--f1)}
+.wktrainh span{white-space:nowrap}
+/* THE DRAWER: where this piece of work has been, one line per crossing */
+.wkdrawer{grid-column:1/-1;margin:8px 0 12px;border:1px solid var(--line2);border-radius:12px;background:var(--elev);box-shadow:var(--shadow);overflow:hidden;scroll-margin-top:calc(var(--navh,90px) + 150px)}
+.wklist .wkdrawer{margin:0 0 8px;border-radius:0 0 10px 10px;border-top:0;box-shadow:none}
+.wkdtop{display:flex;align-items:flex-start;gap:10px;padding:12px 14px 4px;background:var(--elev)}
+.wkdt{flex:1;min-width:0;font-size:var(--f4);font-weight:700;line-height:1.3;overflow-wrap:anywhere}
+.wkx{flex:none;width:30px;height:30px;border:1px solid var(--line2);border-radius:var(--r-sm);background:var(--card);color:var(--mut);cursor:pointer;font-size:var(--f3);line-height:1}
+.wkx:hover{color:var(--fg)}
+.wkdmeta{display:flex;flex-wrap:wrap;gap:3px 12px;padding:0 14px 8px;font-size:var(--f1);color:var(--mut)}
+.wkstrack{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin:0 14px 2px;padding:8px 10px;border:1px solid var(--line);border-radius:var(--r);background:var(--card);font-size:var(--f1)}
+.wkstrack .s{white-space:nowrap;color:var(--sub)}
+.wkstrack .s.past{color:var(--mut)}
+.wkstrack .s.now{color:var(--accent);font-weight:700}
+.wkstrack .s.now.w,.wkstrack .s.left{color:var(--warn)}
+.wkstrack .s.now.b{color:var(--bad)}
+.wkstrack .s.now.d{color:var(--ok)}
+.wkstrack .a{color:var(--sub)}
+.wkstrack .bk{margin-left:auto;color:var(--warn);font-weight:700;white-space:nowrap}
+.wkdbody{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:0 22px;padding:10px 14px 14px}
+.wkdside{min-width:0}
+.wknn{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 10px;align-items:baseline;margin:2px 0 10px;font-size:var(--f2)}
+.wknn dt{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+.wknn dd{margin:0;overflow-wrap:anywhere}
+.wknn dd.next{color:var(--fg);font-weight:600}
+.wkalarm{margin:0 0 8px;padding:6px 9px;border-left:2px solid var(--warn);background:color-mix(in srgb,var(--warn) 8%,transparent);font-size:var(--f1);color:var(--fg)}
+.wkalarm.bad{border-left-color:var(--bad);background:color-mix(in srgb,var(--bad) 8%,transparent)}
+.wkprov{margin:10px 0 0;padding:6px 9px;border-left:2px solid var(--line2);font-size:var(--f1);color:var(--mut)}
+.wkfacts{margin:10px 0 0;font-size:var(--f1);color:var(--mut);overflow-wrap:anywhere}
+.wkfacts b{color:var(--fg);font-weight:600}
+.wkdside .odqacts{display:flex;gap:6px;margin:8px 0 0}
+.wkdside .odqcomment{flex:1 1 auto;min-width:0}
+.wkseamh{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin:0 0 4px;font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+.wkseamh span{font-weight:400;text-transform:none;letter-spacing:0}
+.wktl{list-style:none;margin:0 0 0 4px;padding:0;border-left:1px solid var(--line2)}
+.wktl li{position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:0 12px;padding:3px 0 5px 14px;font-size:var(--f1);color:var(--fg)}
+.wktl li::before{content:"";position:absolute;left:-4px;top:9px;width:7px;height:7px;border-radius:50%;background:var(--line2)}
+.wktl li.fwd::before{background:color-mix(in srgb,var(--accent) 60%,var(--line2))}
+.wktl li.ok::before{background:var(--ok)}
+.wktl li.back{color:var(--warn)}
+.wktl li.back::before{background:var(--warn)}
+.wktl li.bad{color:var(--bad)}
+.wktl li.bad::before{background:var(--bad)}
+.wktl li.hold,.wktl li.quiet{color:var(--mut)}
+.wktl li.hold::before{background:var(--sub)}
+.wktl li.gap{color:var(--mut);font-style:italic}
+.wktl li.gap::before{background:var(--elev);border:1px dashed var(--sub);width:5px;height:5px}
+.wktl li.nowl{font-weight:700}
+.wktl li.nowl::before{background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.wktl li.fold{display:block}
+.wktl li.fold::before{display:none}
+.wktl time{color:var(--mut);font-variant-numeric:tabular-nums;white-space:nowrap;font-style:normal;font-weight:400;text-align:right}
+.wktl time small{color:var(--sub);font-size:var(--f0)}
+.wktl .fold button{border:1px dashed var(--line2);background:none;color:var(--mut);border-radius:var(--r-sm);padding:1px 8px;font-size:var(--f0);cursor:pointer}
+.wktl .fold button:hover{color:var(--fg)}
+/* THE LIST LENS: the backlog's one line per item, a stage column added */
+.wkhdr,.wklist .wkrow{display:grid;grid-template-columns:30px 84px minmax(0,1fr) 196px minmax(0,136px) 72px;gap:0 10px;align-items:baseline}
+.wklist.allp .wkhdr,.wklist.allp .wkrow{grid-template-columns:30px 84px minmax(0,1fr) 104px 196px minmax(0,130px) 72px}
+.wkhdr{padding:0 10px 5px;font-size:var(--f0);color:var(--sub);text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--line)}
+.wkhdr span:last-child{text-align:right}
+.wklist .wkrow{padding:6px 10px;border-bottom:1px solid var(--line);font-size:var(--f1);cursor:pointer;outline:none}
+.wklist .wkrow:hover{background:var(--hover)}
+.wklist .wkrow:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
+.wklist .wkrow.warn{box-shadow:inset 2px 0 0 var(--warn)}
+.wklist .wkrow.bad{box-shadow:inset 2px 0 0 var(--bad)}
+.wklist .wkrow.sel{background:var(--elev);box-shadow:inset 3px 0 0 var(--accent)}
+.wkrow .odqtitle{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600;font-size:var(--f2)}
+.wkrow .odqid{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wkrow .wkproj{max-width:none}
+.wkstage{display:flex;align-items:center;gap:6px;white-space:nowrap;min-width:0;overflow:hidden;color:var(--mut)}
+.wkstage .wkback{margin-left:0}
+.wkrow .wkball{color:var(--mut)}
+.wkrow .wkball.nobody{color:var(--warn)}
+.wkrow .wkage{text-align:right;color:var(--mut)}
+.wkrow .wkage>i,.wkrow .lbl{display:none;font-style:normal}
+.wklist.wkrecs .wkrow{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,3fr) 90px;cursor:default}
+.wkrecs .cfgmut{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wklistnote{padding:6px 10px 8px;font-size:var(--f1);color:var(--mut)}
+.wkpager{justify-content:center}
+/* the folds under the page */
+.wkfoldbody{padding:0 16px 12px}
+.wklefts{margin:0 0 10px;padding:0 0 0 18px;font-size:var(--f1);color:var(--mut)}
+.wklefts li{margin:3px 0}
+.wklefts b{color:var(--fg)}
+.wkelse{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.wkelse .htile{min-width:0;padding:10px 14px 12px;background:var(--bg);border:1px solid var(--line);border-radius:12px}
+/* THE PHONE: the band stays the five-stage switch; the columns stack as
+   stage sections, each with its own heading; list rows wrap like the
+   backlog's; the drawer is a full-screen sheet with its close always in
+   reach; nothing scrolls sideways. */
+@media (max-width:680px){
+  .wk{padding:10px 10px 4px}
+  .wkstick{margin:6px -10px 0;padding:3px 10px 0}
+  .wkbrackets,.wkheads{gap:0 4px}
+  .wkbr{font-size:.6rem;letter-spacing:.06em;gap:3px}
+  .wkbr::before,.wkbr::after{min-width:2px}
+  .wkbr span{overflow:visible}
+  .wkbr i{display:none}
+  .wkhead{padding:3px 1px 2px;text-align:center}
+  .wkhead:not(:last-child)::after{display:none}
+  .wkhl{font-size:.6rem;letter-spacing:.02em;overflow:hidden;text-overflow:ellipsis}
+  .wkhn{font-size:var(--f4)}
+  .wkhs{display:none}
+  .wkhf{font-size:.6rem;letter-spacing:0}
+  .wkhf .lbl{display:none}
+  .wkriver{grid-template-columns:minmax(0,1fr)}
+  .wkcol+.wkcol{border-left:0;padding-left:0;margin-left:0}
+  .wksecthead{display:flex;align-items:baseline;flex-wrap:wrap;gap:2px 8px;padding:14px 2px 6px;border-bottom:1px solid var(--line2);font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--sub)}
+  .wksecthead span{font-weight:400;text-transform:none;letter-spacing:0;color:var(--mut);font-size:var(--f1)}
+  .wkfocus{grid-template-columns:minmax(0,1fr)}
+  .wkhdr{display:none}
+  .wklist .wkrow,.wklist.allp .wkrow,.wklist.wkrecs .wkrow{display:flex;flex-wrap:wrap;align-items:baseline;gap:1px 8px;padding:7px 8px;font-size:var(--f0)}
+  .wkrow .odqtitle{flex:1 0 100%;order:-1;font-size:var(--f1);white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+  .wkrow .wkage>i,.wkrow .lbl{display:inline}
+  .wkrow .wkage{text-align:left}
+  .wkrow .wkball{max-width:60%}
+  .wkrecs .cfgmut{white-space:normal;flex:1 0 100%}
+  .wkdrawer,.wklist .wkdrawer{position:fixed;inset:0;z-index:60;margin:0;border:0;border-radius:0;overflow-y:auto;overflow-x:hidden;box-shadow:none}
+  .wkdtop{position:sticky;top:0;z-index:1;border-bottom:1px solid var(--line)}
+  .wkdbody{grid-template-columns:minmax(0,1fr)}
+  .wkdside{margin-bottom:10px}
+  .wktl li{grid-template-columns:minmax(0,1fr)}
+  .wktl time{text-align:left}
+  .wkelse{grid-template-columns:minmax(0,1fr)}
+  .wklens{margin-left:0}
+  .wkstrack .bk{margin-left:0}
+}

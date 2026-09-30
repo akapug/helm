@@ -2943,8 +2943,8 @@ class ResidualIsReachedThroughTheREALCallerTest(unittest.TestCase):
                 lock.close()
         # AND NOTHING WAS WRITTEN ON TOP OF THE CORRUPTION.
         with self.assertRaises(todos.ManifestCorrupt):
-            todos._frames(open(os.path.join(qdir, todos.CLAIM_META),
-                               "rb").read())
+            with open(os.path.join(qdir, todos.CLAIM_META), "rb") as fh:
+                todos._frames(fh.read())
 
 
 class NoModuleLevelConstantIsBoundTwiceTest(unittest.TestCase):
@@ -2969,7 +2969,8 @@ class NoModuleLevelConstantIsBoundTwiceTest(unittest.TestCase):
     INTENTIONAL = {}
 
     def test_no_module_level_constant_is_bound_twice(self):
-        src = open(todos.__file__, encoding="utf-8").read()
+        with open(todos.__file__, encoding="utf-8") as fh:
+            src = fh.read()
         seen = {}
         for node in ast.parse(src).body:      # MODULE LEVEL ONLY — a name
             if isinstance(node, ast.Assign):  # rebound inside a function is
@@ -3649,7 +3650,8 @@ class ThePUBLISHBindsTheJudgedINODETest(unittest.TestCase):
                     os.path.join(self.tmp, "helm")):
                 for n in files:
                     try:
-                        got = json.load(open(os.path.join(root, n)))
+                        with open(os.path.join(root, n), encoding="utf-8") as fh:
+                            got = json.load(fh)
                     except Exception:
                         continue
                     self.assertNotEqual(got.get("subject"),
@@ -3713,8 +3715,9 @@ class TheDOUBLERaceNeverLosesTheJudgedBytesTest(unittest.TestCase):
             for n in files:
                 fp = os.path.join(root, n)
                 try:
-                    if json.load(open(fp)).get("subject") == subject:
-                        hits.append(fp)
+                    with open(fp, encoding="utf-8") as fh:
+                        if json.load(fh).get("subject") == subject:
+                            hits.append(fp)
                 except Exception:
                     pass
         return hits
@@ -6024,7 +6027,8 @@ class TheManifestSurvivesACrashMidTRANSITIONTest(unittest.TestCase):
         q = os.path.dirname(rep["residuals"][0]["payload"]
                             or os.path.join(self.d, "x"))
         meta = os.path.join(q, todos.CLAIM_META)
-        blob = open(meta, "rb").read()
+        with open(meta, "rb") as fh:
+            blob = fh.read()
         # EVERY TRANSITION IS STILL THERE. A normal removal makes three: the
         # initial record, the digest-bound one, and the terminal residual.
         # Counting RS is too weak — the manifest is opened O_APPEND, so even a
@@ -6107,7 +6111,8 @@ class TheManifestSurvivesACrashMidTRANSITIONTest(unittest.TestCase):
         through the write is the crash this format exists for, and the arm
         that claimed to cover it injected nothing at all."""
         q, meta = self._claim_with_manifest()
-        before = todos._frames(open(meta, "rb").read())
+        with open(meta, "rb") as fh:
+            before = todos._frames(fh.read())
         self.assertTrue(before, "fixture: no baseline record")
 
         fired = []
@@ -6144,7 +6149,8 @@ class TheManifestSurvivesACrashMidTRANSITIONTest(unittest.TestCase):
         finally:
             os.close(qfd)
         self.assertTrue(fired, "the fault never fired — arm is vacuous")
-        after = todos._frames(open(meta, "rb").read())
+        with open(meta, "rb") as fh:
+            after = todos._frames(fh.read())
         self.assertEqual(after, before,
                          "a crash mid-append changed the readable record: "
                          "%r -> %r" % (before, after))
@@ -6167,8 +6173,9 @@ class TheManifestSurvivesACrashMidTRANSITIONTest(unittest.TestCase):
         finally:
             os.close(qfd)          # OURS to close; an inline open has no owner
         _assert_no_leak(self, fds_before, _fd_targets(), 1)
-        self.assertEqual(todos._frames(open(meta, "rb").read())[-1], wanted,
-                         "the retry did not become the readable state")
+        with open(meta, "rb") as fh:
+            self.assertEqual(todos._frames(fh.read())[-1], wanted,
+                             "the retry did not become the readable state")
 
     def test_death_AT_the_fsync_still_leaves_a_complete_state(self):  # noqa: VACUOUS_ASSERTION — every assertion is a required PRESENCE on the disk: the fault must have fired, the manifest must still parse to a non-empty chain, and its latest frame must be one of the two known states. There is no absence assertion here
         """the frame is COMPLETE and the fsync is what dies. The
@@ -6176,7 +6183,8 @@ class TheManifestSurvivesACrashMidTRANSITIONTest(unittest.TestCase):
         the old state or the new one — and never nothing, because the baseline
         was already durable."""
         q, meta = self._claim_with_manifest()
-        before = todos._frames(open(meta, "rb").read())
+        with open(meta, "rb") as fh:
+            before = todos._frames(fh.read())
         self.assertTrue(before, "fixture: no baseline record")
         wanted = {"claim_id": "at-the-fsync", "sid": self.SID}
         fired, real_fsync = [], os.fsync
@@ -6211,7 +6219,8 @@ class TheManifestSurvivesACrashMidTRANSITIONTest(unittest.TestCase):
                          "the fault did not fire on the MANIFEST's inode; "
                          "saw %r, wanted %r" % (fired, mid))
         self.assertIsNotNone(why, "an unsynced append reported success")
-        frames = todos._frames(open(meta, "rb").read())
+        with open(meta, "rb") as fh:
+            frames = todos._frames(fh.read())
         self.assertTrue(frames,
                         "the claim has NO readable record after a death at "
                         "the fsync — the durable baseline was lost")
@@ -6467,7 +6476,8 @@ class TheManifestSurvivesACrashMidTRANSITIONTest(unittest.TestCase):
         with open(outside, "w") as fh:
             json.dump({"claim_id": os.path.basename(q), "sid": self.SID,
                        "row": "1.json", "payload": "1.json"}, fh)
-        before = open(outside, "rb").read()
+        with open(outside, "rb") as fh:
+            before = fh.read()
         meta = os.path.join(q, todos.CLAIM_META)
         if os.path.exists(meta):
             os.unlink(meta)
@@ -6476,9 +6486,10 @@ class TheManifestSurvivesACrashMidTRANSITIONTest(unittest.TestCase):
 
         out = todos.recover_claims(self.SID, apply=True)
         # THE EXTERNAL BYTES ARE UNCHANGED.
-        self.assertEqual(open(outside, "rb").read(), before,
-                         "recovery wrote onto a shared inode and changed "
-                         "bytes outside this transaction")
+        with open(outside, "rb") as fh:
+            self.assertEqual(fh.read(), before,
+                             "recovery wrote onto a shared inode and changed "
+                             "bytes outside this transaction")
         self.assertTrue(out, "recovery reported nothing at all")
         self.assertTrue(all(o.get("outcome") == "unreadable" for o in out),
                         "a shared manifest was acted on rather than refused: "
@@ -6506,7 +6517,8 @@ class TheManifestSurvivesACrashMidTRANSITIONTest(unittest.TestCase):
             self.assertIsNotNone(first, "fixture could not lock: %r" % (why,))
             try:
                 # REPLACE THE MEMBER with a byte-identical distinct inode
-                body = open(meta, "rb").read()
+                with open(meta, "rb") as fh:
+                    body = fh.read()
                 os.rename(meta, meta + ".aside")
                 with open(meta, "wb") as fh:
                     fh.write(body)
@@ -7408,8 +7420,9 @@ class DurabilityHappensBEFORETheStateSaysSoTest(unittest.TestCase):
         descriptor. That is four lines of AST and it cannot be satisfied by
         enumeration."""
         import ast as _ast
-        src = open(os.path.join(os.path.dirname(todos.__file__),
-                                "todos.py")).read()
+        with open(os.path.join(os.path.dirname(todos.__file__),
+                               "todos.py"), encoding="utf-8") as fh:
+            src = fh.read()
         # WIDENED, AND ITS LIMIT STATED IN THE TEST (item 15). The
         # first version matched three spellings on `os.`, so shutil.rmtree,
         # Path(p).unlink, an imported alias, or os.removedirs all walked past
@@ -7564,7 +7577,8 @@ class EveryStandInMatchesTheFunctionItReplacesTest(unittest.TestCase):
     def test_every_patched_stand_in_accepts_the_real_calls(self):  # noqa: VACUOUS_ASSERTION — the empty-offenders assertion is the point and it is guarded by an unconditional presence in the same arm: `checked` must be non-empty, so a scan that finds no stand-ins fails before any verdict is reached. Mutation-proven against the CALLED arity, which is the regression that matters: reverting a stand-in to the pre-`judged` 5-positional signature reddens it. An earlier version of this comment claimed proof it did not have — it compared to REQUIRED arity and missed exactly the optional-parameter case
         import ast as _ast
         import inspect
-        src = open(__file__).read()
+        with open(__file__, encoding="utf-8") as fh:
+            src = fh.read()
         tree = _ast.parse(src)
         # RESOLVED BY SCOPE, NOT BY NAME (found by this property's own first
         # sharpening). A global name->def map accused `mangle` of standing in
@@ -7620,8 +7634,9 @@ class EveryStandInMatchesTheFunctionItReplacesTest(unittest.TestCase):
             # 6, which is precisely the regression that cost a gate cycle. My
             # noqa claimed this was mutation-proven; it was proven for the
             # easy half only, and that sentence is corrected with the code.
-            prod = _ast.parse(open(os.path.join(
-                os.path.dirname(todos.__file__), "todos.py")).read())
+            with open(os.path.join(os.path.dirname(todos.__file__),
+                                   "todos.py"), encoding="utf-8") as fh:
+                prod = _ast.parse(fh.read())
             called = 0
             for c in _ast.walk(prod):
                 if isinstance(c, _ast.Call) and (
@@ -7832,8 +7847,9 @@ class TheCapabilityCensusIsDERIVEDNotRecalledTest(unittest.TestCase):
     @staticmethod
     def _used():
         import ast as _ast
-        src = open(os.path.join(os.path.dirname(todos.__file__),
-                                "todos.py")).read()
+        with open(os.path.join(os.path.dirname(todos.__file__),
+                               "todos.py"), encoding="utf-8") as fh:
+            src = fh.read()
         used = set()
         for n in _ast.walk(_ast.parse(src)):
             if (isinstance(n, _ast.Call)

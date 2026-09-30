@@ -27,6 +27,7 @@ class PostToolRunTest(unittest.TestCase):
         # too, including its fd-relative directory cleanup, then restore it.
         os.chdir(self.root)
         self.hits, self.order, self.specs, self.results = {}, [], [], []
+        self.armed = []
         self.mode = None
         self.row = True
         self.fresh = True
@@ -137,8 +138,14 @@ class PostToolRunTest(unittest.TestCase):
             phase = posttoolrun.current().phase
             self.specs.append((phase, spec["args"], spec["timeout"]))
             self.order.append("stage:" + phase)
-            # Assert installed budgets independently; shorten ONLY fixture timers.
-            result = self.run_one(dict(spec, timeout=.03), payload, **kwargs)
+            # THE INSTALLED BUDGET IS THE ONE ARMED. A 30 ms override here held
+            # the REAL stage work to a wall clock too: the first delivery
+            # imports helm.beacons, a 5,000-line compile of 14-20 ms on one fab
+            # node and 35-46 ms on another. The alarm cut that import, the
+            # import rolled back, and each later arm paid it again: 34 of 36
+            # red alone on the slower node, green wherever another module had
+            # already imported it. Only `slow` ends a stage early now.
+            result = self.run_one(spec, payload, **kwargs)
             self.results.append((phase, result, dict(kwargs["outcome"])))
             return result
 
@@ -196,8 +203,16 @@ class PostToolRunTest(unittest.TestCase):
         return value
 
     def slow(self, name):
+        """A call that outlives its stage's budget. It brings the timer the
+        dispatcher armed forward to now, so the dispatcher's own handler
+        cancels it here and nowhere earlier. No timer armed: the sleep
+        completes and the arm's `:interrupted` count is red."""
         self.hit(name + ":sleep")
+        left = signal.getitimer(signal.ITIMER_REAL)[0]
+        self.armed.append((posttoolrun.current().phase, left))
         try:
+            if left:
+                signal.setitimer(signal.ITIMER_REAL, min(left, .001))
             time.sleep(.2)
         except hookrun._Timeout:
             self.hit(name + ":interrupted")
@@ -306,6 +321,8 @@ class PostToolRunTest(unittest.TestCase):
             self.assertEqual(budget, 10 if phase == "record" else 2)
             if phase == "prepare":
                 self.assertEqual(args, "chat deliver --hook-json --room main")
+        for phase, left in self.armed:
+            self.assertTrue(0 < left <= (10 if phase == "record" else 2), (phase, left))
         self.assertEqual(out.getvalue(), "")
         if failed_stderr is None:
             self.assertEqual(rc, 0)

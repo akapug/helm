@@ -94,8 +94,8 @@ def code_drift():
                 "stale_seconds": int(now - _LOADED_STAMP),
                 "note": "this server is running code it loaded at start; "
                         "helm source has changed since. The page you are "
-                        "reading is current, the server behind it is not — "
-                        "restart helm web to load it."}
+                        "reading is current, the server behind it is not, "
+                        "until it restarts and loads the new code."}
     except Exception:
         return None
 

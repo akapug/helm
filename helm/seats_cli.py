@@ -16,7 +16,7 @@ import json
 import os
 import sys
 import time
-from . import actors, chat, freetext, home, pk
+from . import actors, chat, freetext, home, hooks, pk
 from .seats_common import (DEFAULT_TTL, STATUS_BYTES, _clip, _scrub,
                            _seat_label, own_name,
                            status_write_refused, ttl_flag)
@@ -29,7 +29,7 @@ from .seats_delivery import deliver_any, dm, receipt_cli
 from .seats_catchup import catchup, render_catchup
 from .seats_join import (_beacon_identity_refusal, _emit_line, join, paid_join,
                          join_cli, wait)
-from .seats_ack import _ts_epoch, ack, render_pending
+from .seats_ack import _ts_epoch, render_ack, render_pending
 from .seats_delegation import (_clear_posttool_delegation,
                                _record_posttool_delegation)
 from .seats_claims import (claim, claim_marks, claims_list, own_leases,
@@ -316,8 +316,11 @@ def _payload_homing(cwd, room, room_source):
     cwd would home the seat to the wrong project. So: a DERIVED
     pre-resolution is re-resolved through THE one resolver against the
     payload cwd when one is present; explicit rooms (--room, operator env)
-    pass through untouched."""
-    if not cwd or room_source != "derived":
+    pass through untouched. A payload cwd that IS the hook's own cwd, the
+    ordinary case, was derived by that pre-resolution already, so it is not
+    derived again: that cost two git processes and a registry read on every
+    hook (task/3556)."""
+    if not cwd or room_source != "derived" or cwd == safe_cwd():
         return room, room_source
     r2, s2 = resolve_homing(None, cwd)
     if not r2:
@@ -332,7 +335,7 @@ def _cmd_wait(args, room):
     from .cli import guard_tail
     grc = guard_tail("helm chat wait", args, valued=("--seat", "--timeout"),
                      flags=("--any", "--follow", "--replace", "--ambient",
-                            "--on-behalf"),
+                            "--on-behalf", "--per-row"),
                      usage=chat.HELP["wait"].splitlines()[0])
     if grc is not None:
         return grc
@@ -437,7 +440,8 @@ def _cmd_wait(args, room):
         try:
             from . import beacons
             spec = beacons.requested_waiter_spec(
-                room, any_row=any_row, ambient=ambient, timeout=timeout)
+                room, any_row=any_row, ambient=ambient, timeout=timeout,
+                per_row="--per-row" in args)
             armed = beacons.arm(claimed, session=session, replace=replace,
                                 reap=may_reap, waiter=spec)
         except Exception:               # noqa: BLE001
@@ -484,7 +488,8 @@ def _cmd_wait(args, room):
                     # --ambient opts the beacon back into home-room wakes
                     # (quiet rooms); absent, wait() resolves the shape
                     # default (--follow ⇒ mention-only, single-shot ⇒ full).
-                    ambient=True if ambient else None)
+                    ambient=True if ambient else None,
+                    doorbell="--per-row" not in args)   # beacon_doorbell
     finally:
         # The row names a PROCESS, so it must die with the process. A beacon
         # SIGTERMed mid-life never reaches here, which is why the census prunes
@@ -577,7 +582,7 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
     if verb == "deliver":
         try:
             session = cwd = agent = None
-            unread = ""
+            unread, foreign = "", {}    # outside helm: own mail only; inside: no new kwarg
             if "--hook-json" in args:
                 _UNPARSED[0] = ""
                 d = _hook_stdin()
@@ -593,11 +598,12 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                 session, cwd = d.get("session_id"), d.get("cwd")
                 hooklatency.bind(session)
                 room, _ = _payload_homing(cwd, room, room_source)
-                # Producer-side delegation evidence: `agent_id` is the hook
-                # contract's positive subagent discriminator. Its own fail-
-                # closed path must never cost the ordinary delivery boundary.
+                # Producer-side delegation evidence (`agent_id` is the hook's
+                # subagent discriminator), never at the boundary's own cost.
+                foreign = {"project_only": True} if hooks.orca_foreign() else {}
                 try:
-                    _record_posttool_delegation(d)
+                    if not foreign:     # only the scoped SubagentStop clears it
+                        _record_posttool_delegation(d)
                 except Exception as exc:
                     hooklatency.mark("exception")
                     if pair:
@@ -628,7 +634,7 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             # consumes exactly as before.
             deliver_any(session=session, room=room, seat=claimed, emit=emit,
                         cwd=cwd, channel="hook" if "--hook-json" in args else None,
-                        sink_usable=not (agent or unread)
+                        **foreign, sink_usable=not (agent or unread)
                         and _seats_join.destination_usable(emit, follower=False))
             getattr(emit, "flush_owed", lambda: None)()
             if pair:
@@ -638,12 +644,11 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             # bound by its own no-output law ("a recorder must never block or
             # noise a turn") while deliver already speaks at this exact
             # boundary and owns the emit contract. record runs FIRST in the
-            # hook order, so the edit destination it just logged is on disk
-            # before this reads it. Walled in its own try: a steer must never
-            # cost a delivery.
+            # hook order, so the edit destination it just logged is on disk.
+            # Never outside helm (a helm steer), never at a delivery's cost.
             try:
                 from . import toolwhisper
-                line = toolwhisper.for_hook(session)
+                line = None if foreign else toolwhisper.for_hook(session)
                 if line:
                     emit(line)
             except Exception:
@@ -725,28 +730,7 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                 return _nrc
             note = (note or "").strip() or None
             del args[i:]                 # --note eats the rest of the line
-        tid = args[0] if args else None
-        if not tid:
-            print("usage: helm chat ack <id> [done|blocked] [--note ...] "
-                  "[--seat S]", file=sys.stderr)
-            return 2
-        state = args[1] if len(args) > 1 else "done"
-        res, err = ack(tid, state, note=note, who=seat,
-                       session=_env_session())
-        if err:
-            print("helm chat: " + err, file=sys.stderr)
-            return 1
-        tgt = str(res["target"].get("id") or "")[:8]
-        lbl = res["state"].upper()
-        sender = chat._dsan(str(res["target"].get("from") or "?"))
-        if res["dup"]:
-            print("helm chat: %s already acked %s by %s — no new row "
-                  "(idempotent)" % (tgt, lbl, _seat_label(seat)))
-            return 0
-        tail = (': "%s"' % _clip(_scrub(note), 80)) if note else ""
-        print("helm chat: acked %s %s%s — @%s watches it leave `helm chat "
-              "pending`" % (tgt, lbl, tail, sender))
-        return 0
+        return render_ack(args, seat, note, _env_session())
     if verb == "receipts":
         return receipt_cli(args)
     if verb == "pending":
@@ -855,11 +839,14 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
               file=sys.stderr)
         return 2
     if verb == "stop-guard":
-        from . import (projscope, seats_stop_budget, seats_stop_response,
+        from . import (projscope, record, seats_stop_budget,
+                       seats_stop_claims, seats_stop_response,
                        seats_stop_timing)
         from .seats_stop_signals import _off
         if _off("STOP_GUARD"):
             return 0
+        if "--detail" in args and "--hook-json" not in args:  # a read, no ladder
+            return seats_stop_claims.lease_detail(room, _flag(args, "--seat"))
         session, stop_active, transcript, cwd = None, False, None, None
         # THE LADDER IS ARMED HERE. `State()` constructs the RungTiming, which
         # emits its first line and schedules the streaming flush, so THIS door
@@ -892,21 +879,22 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                 except projscope.Expired:
                     raise
                 except Exception as exc:
-                    return seats_stop_response.publish_failure(exc, budget)
+                    return record.turn_closed(
+                        session, seats_stop_response.publish_failure(exc, budget))
                 # bug-class empty-reason-refusal: content and exit status are
                 # one decision. Blank blockers fail open; blank warns are noise.
-                warns = [w for w in warns
-                         if isinstance(w, str) and w.strip()]
-                blocks = [b for b in blocks
-                          if isinstance(b, str) and b.strip()]
+                warns = [w for w in warns if isinstance(w, str) and w.strip()]
+                blocks = [b for b in blocks if isinstance(b, str) and b.strip()]
                 budget.blocks, budget.warns = blocks, warns
                 if budget.expired:
                     raise projscope.Expired("Stop ladder coverage incomplete")
-                return seats_stop_response.publish(blocks, warns, budget)
+                # rc 0 ENDS THE TURN, so the door dates it (helm/seat_idle.py)
+                return record.turn_closed(
+                    session, seats_stop_response.publish(blocks, warns, budget))
         except projscope.Expired:
             blocks, warns = budget.expire()
-            return seats_stop_response.publish_expired(
-                blocks, warns, stop_active=stop_active)
+            return record.turn_closed(session, seats_stop_response.publish_expired(
+                blocks, warns, stop_active=stop_active))
         finally:
             seats_stop_timing.settle()
     if verb == "wait":
@@ -970,10 +958,13 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
         if aerr:
             print("helm chat: " + aerr, file=sys.stderr)
             return 2
-        ok, msg, _lease = claim(
-            args[0], actor.canonical_name,
-            ttl=ttl,
-            lease=_flag(args, "--lease"), session=_env_session())
+        try:
+            ok, msg, _lease = claim(
+                args[0], actor.canonical_name,
+                ttl=ttl,
+                lease=_flag(args, "--lease"), session=_env_session())
+        except OSError as exc:      # an unreadable ledger: UNKNOWN, unwritten
+            ok, msg = False, "REFUSED — %s; nothing claimed" % exc
         print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
     if verb == "release":
@@ -986,8 +977,11 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
         # holder was handed the nonce, so presenting it IS the proof.
         # `--seat` ADDRESSES the holder row.
         seat = _flag(args, "--seat") or acting_seat(_env_session(), safe_cwd())
-        ok, msg = release(args[0], seat,
-                          lease=_flag(args, "--lease"), session=_env_session())
+        try:
+            ok, msg = release(args[0], seat, lease=_flag(args, "--lease"),
+                              session=_env_session())
+        except OSError as exc:      # an unreadable ledger: UNKNOWN, unwritten
+            ok, msg = False, "REFUSED — %s; nothing released" % exc
         print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
     if verb == "claims":

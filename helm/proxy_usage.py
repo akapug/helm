@@ -110,9 +110,12 @@ UNREADABLE = "UNREADABLE"
 READ = "READ"
 # THE POP IS DESTRUCTIVE, SO PERSISTENCE IS PART OF THE READ. A pass whose
 # ledger append refused (lock, write, fsync, or the read marker itself) is
-# neither READ nor UNREADABLE: the records left the sidecar and did not all
-# reach disk. It is its own state, every entrypoint exits on it, and the
-# row carries exactly how many records were lost.
+# neither READ nor UNREADABLE: it is its own state, and two refusals
+# feed it. When records did not all reach disk the row counts them in
+# `lost` (non-zero, `persisted` < `records`); when every record reached disk
+# and only the read marker did not, `lost` is zero and `marker` is False.
+# Every entrypoint exits on it, and the row carries exactly how many
+# records were lost.
 FAILED_PERSIST = "FAILED-PERSIST"
 
 # The producer's record keys the ledger KEEPS. Everything else is dropped:

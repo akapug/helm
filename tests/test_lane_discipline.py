@@ -158,7 +158,39 @@ class ScriptVenueTest(RungBase):
         self.assertIn("INHERITS", r.stderr,
                       "the refusal teaches the failure MODE, not just the rule")
 
-    def test_a_lane_worktree_commit_is_admitted(self):
+    def test_the_refusal_leads_with_the_way_out_and_names_no_stash(self):
+        """A local seat reads the first line of a refusal and does what it
+        says. The way out — move the change into a lane — must lead the
+        instruction block, and must name `git stash` nowhere: every brief
+        forbids stashing in a shared worktree, and the old refusal told
+        seats to run it first.
+
+        Proving the way out is at the top and that no line says `git stash`
+        (or `stash -u`, the old form) means the refusal can no longer be
+        followed as written into a broken state.
+        """
+        self.seed()
+        self.room()
+        self.stage("pkg/mod.py", "X = 1\n")
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        lines = [l for l in r.stderr.splitlines() if l]
+        # find the line right after "REFUSED:"
+        try:
+            ref_idx = next(i for i, l in enumerate(lines)
+                           if l.startswith("[helm lane-discipline] REFUSED"))
+        except StopIteration:
+            self.fail("no REFUSED line in stderr")
+        way_out = lines[ref_idx + 1]
+        self.assertIn("claim one", way_out,
+                      "the line right after REFUSED: must lead with the way out")
+        # no line may contain the forbidden word
+        for l in lines:
+            self.assertNotIn("git stash", l)
+            self.assertNotIn("stash -u", l)
+            self.assertNotIn("git stash pop", l)
+
+    def test_a_lane_commit_is_the_hot_path_and_is_admitted(self):
         """THE MUST-PASS, and the hot path: every seat working correctly is
         here, so this arm is what keeps the rung from costing the fleet."""
         self.seed()

@@ -653,7 +653,7 @@ class TransportTest(V2Base):
         self.assertEqual(chat.public_rows([legacy])[0]["transport"]["profile"],
                          clean)
 
-        self.assertTrue(chat._clear_sign_failure(raw))
+        self.assertEqual(chat._clear_sign_failure(raw), (True, None))
         remaining = chat.sign_failures()
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0]["profile"], clean)
@@ -692,7 +692,8 @@ class TransportTest(V2Base):
             os.replace(backup, path)
 
         self.assertEqual(chat.sign_failures()[0]["reason"], "real incident")
-        self.assertTrue(chat._clear_sign_failure(raw, succeeded_at=300))
+        self.assertEqual(chat._clear_sign_failure(raw, succeeded_at=300),
+                         (True, None))
         self.assertEqual(chat.sign_failures(), [])
         with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "node_head", return_value={"chain_index": 9}):
@@ -733,7 +734,7 @@ class TransportTest(V2Base):
             recovered = chat.post("recovered", who="a1", profile=raw, sign=True)
         self.assertEqual(recovered["chain"], 7)
         self.assertEqual([r["profile"] for r in chat.sign_failures()], [other])
-        self.assertEqual(chat.acknowledge_sign_failures(other), [other])
+        self.assertEqual(chat.acknowledge_sign_failures(other), ([other], None))
         self.assertEqual(chat.sign_failures(), [])
 
     def test_write_failure_fallback_is_concurrency_safe(self):
@@ -764,7 +765,8 @@ class TransportTest(V2Base):
         row = chat.sign_failures()[0]
         self.assertEqual((row["profile"], row["reason"], row["failure_count"]),
                          (profile, "failure-7", 8))
-        self.assertTrue(chat._clear_sign_failure(profile, succeeded_at=200))
+        self.assertEqual(chat._clear_sign_failure(profile, succeeded_at=200),
+                         (True, None))
         self.assertEqual(chat.sign_failures(), [])
 
     def test_lock_failure_retains_incident_until_exact_signed_success(self):
@@ -780,7 +782,7 @@ class TransportTest(V2Base):
         with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "node_head", return_value={"chain_index": 11}):
             self.assertEqual(chat.transport_status()["mode"], "degraded")
-        self.assertTrue(chat._clear_sign_failure(raw))
+        self.assertEqual(chat._clear_sign_failure(raw), (True, None))
         self.assertEqual(chat.sign_failures(), [])
 
     def test_configured_ready_signer_with_unreachable_node_is_degraded(self):
@@ -828,6 +830,66 @@ class TransportTest(V2Base):
                             event_epoch=chat.time.time() + 1, event_ts="future")
         chat._record_sign_failure("dead-old", future)
         self.assertEqual(chat.sign_failures()[0]["reason"], "new failure")
+
+    def test_an_ack_that_cannot_reach_the_state_says_FAILED_not_no_incident(self):
+        """An ACK whose incident state cannot be locked or written names the
+        exception class and exits 3. "no matching active incident" answers
+        only a read that succeeded and found nothing to retire."""
+        import fcntl
+        chat._record_sign_failure("dead-old", chat._diag("send_failed", "gone"))
+        err = io.StringIO()
+        with mock.patch.object(fcntl, "flock",
+                               side_effect=PermissionError(13, "lock denied")), \
+             contextlib.redirect_stderr(err):
+            rc = chat.cmd_chat(["transport", "ack", "--profile", "dead-old"])
+            got = chat.acknowledge_sign_failures("dead-old")
+        self.assertEqual(rc, 3, err.getvalue())
+        self.assertIn("ack FAILED: PermissionError", err.getvalue())
+        self.assertNotIn("no matching active incident", err.getvalue())
+        self.assertEqual(got, ([], "PermissionError"))
+        self.assertEqual([f["profile"] for f in chat.sign_failures()],
+                         ["dead-old"], "a failed ACK retired the incident")
+        # control: the same ACK with a working lock retires it, and a second
+        # ACK is the true "nothing to retire" answer
+        self.assertEqual(chat.acknowledge_sign_failures("dead-old"),
+                         (["dead-old"], None))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = chat.cmd_chat(["transport", "ack", "--profile", "dead-old"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no matching active incident", err.getvalue())
+
+    def test_a_clear_that_cannot_reach_the_state_is_told_apart_from_none(self):
+        """_clear_sign_failure answers (cleared, err): a raise is (False,
+        <exception class>), never the (False, None) of a profile with no
+        active incident."""
+        import fcntl
+        chat._record_sign_failure("p1", chat._diag("send_failed", "one"))
+        later = time.time() + 5
+        with mock.patch.object(fcntl, "flock",
+                               side_effect=PermissionError(13, "lock denied")):
+            failed = chat._clear_sign_failure("p1", succeeded_at=later)
+        self.assertEqual(failed, (False, "PermissionError"))
+        self.assertEqual(chat.sign_failures()[0]["profile"], "p1")
+        self.assertEqual(chat._clear_sign_failure("p1", succeeded_at=later),
+                         (True, None))
+        self.assertEqual(chat._clear_sign_failure("p1", succeeded_at=later),
+                         (False, None))
+
+    def test_a_signed_post_whose_clear_fails_leaves_an_event_naming_it(self):
+        """The signed row keeps its receipt, and the watermark that could not
+        be written is recorded as a pk.event naming the exception class."""
+        with mock.patch.object(chat, "_sign_send",
+                               return_value=(dict(SENT), None)), \
+             mock.patch.object(chat, "_clear_sign_failure",
+                               return_value=(False, "PermissionError")), \
+             mock.patch.object(pk, "event") as ev:
+            row = chat.post("signed", who="a1", profile="p1", sign=True)
+        self.assertEqual(row["chain"], 7)
+        named = [c for c in ev.call_args_list
+                 if "PermissionError" in " ".join(map(str, c[0]))]
+        self.assertEqual(len(named), 1, ev.call_args_list)
+        self.assertIn("p1", " ".join(map(str, named[0][0])))
 
     def test_failure_persists_in_ram_status_and_signed_success_clears_it(self):
         """Two unsigned fallbacks land, first/last/count/age persist, every
@@ -896,15 +958,18 @@ class TransportTest(V2Base):
     def test_older_signed_completion_cannot_clear_a_newer_failure(self):
         with mock.patch.object(chat.time, "time", return_value=200):
             chat._record_sign_failure("p1", chat._diag("send_failed", "later"))
-        self.assertFalse(chat._clear_sign_failure("p1", succeeded_at=100))
+        self.assertEqual(chat._clear_sign_failure("p1", succeeded_at=100),
+                         (False, None))
         self.assertEqual(chat.sign_failures()[0]["reason"], "later")
-        self.assertTrue(chat._clear_sign_failure("p1", succeeded_at=300))
+        self.assertEqual(chat._clear_sign_failure("p1", succeeded_at=300),
+                         (True, None))
         self.assertEqual(chat.sign_failures(), [])
 
     def test_delayed_older_failure_cannot_redegrade_after_success(self):
         with mock.patch.object(chat.time, "time", return_value=200):
             delayed = chat._diag("send_failed", "stale delayed failure")
-        self.assertFalse(chat._clear_sign_failure("p1", succeeded_at=300))
+        self.assertEqual(chat._clear_sign_failure("p1", succeeded_at=300),
+                         (False, None))
         with mock.patch.object(chat.time, "time", return_value=400):
             row_diag = chat._record_sign_failure("p1", delayed)
         self.assertEqual(row_diag["reason"], "stale delayed failure")
@@ -1487,7 +1552,7 @@ class PostsSignThroughTheIdentityGateTest(V2Base):
             chat.post("refused", who=self.SEAT)
             readings.append(chat.transport_status())
             self.assertEqual(chat.acknowledge_sign_failures(self.SEAT),
-                             [self.SEAT])
+                             ([self.SEAT], None))
             readings.append(chat.transport_status())
         # .get, so a SIGNED reading (which carries no code) fails by naming
         # its state instead of dying on a KeyError
@@ -1509,8 +1574,12 @@ class PostsSignThroughTheIdentityGateTest(V2Base):
 
     def test_a_FLEET_reader_skips_its_own_identity(self):
         """A fleet panel describes the system. The process rendering it being a
-        conflicted seat is not a fleet incident; the seat's retained incident
-        is, once it has posted."""
+        conflicted seat is not a fleet incident. Once the seat has posted, its
+        retained incident is that seat's own line: the profile it runs under
+        names no seat, so it was started outside helm launch under a shell's
+        profile, the expected state (console walk 4, P1 2). The same incident
+        under ANOTHER seat's profile leads the fleet DEGRADED
+        (test_a_seat_under_ANOTHER_SEATS_profile_stays_DEGRADED_on_the_fleet_read)."""
         with self._world(self.SEAT, self.ACTOR, self.OWNER):
             chat._clear_sign_failure(self.OWNER)
             st = chat.transport_status(fleet=True)
@@ -1518,8 +1587,97 @@ class PostsSignThroughTheIdentityGateTest(V2Base):
                              ("SIGNED", self.OWNER))
             chat.post("refused", who=self.SEAT)
             st = chat.transport_status(fleet=True)
+        self.assertEqual((st.get("state"), st.get("fleet_signer")),
+                         ("SIGNED", self.OWNER))
+        self.assertEqual([(f["profile"], f["code"])
+                          for f in st.get("expected_failures") or ()],
+                         [(self.SEAT, "identity_conflict")])
+
+    def test_a_seat_under_a_SHELLS_profile_is_the_EXPECTED_state_on_the_fleet_read(self):
+        """Console walk 4, P1 2. meta-claude runs in the owner's own session,
+        which carries his profile and none of the seat's, so its posts are
+        unsigned by design, and History led with "signing DEGRADED" and two
+        helm verbs. A profile that names no seat is the shell's, not another
+        pane's settings: the fleet read files the incident as the seat's own
+        line and says in plain words that it is expected. The agents' line
+        keeps its verbs; the seat's own read stays DEGRADED
+        (test_a_conflicted_seats_STATUS_is_DEGRADED_not_the_owners_SIGNED)."""
+        from tests._ownerverbs import owner_verbs
+        with self._world(self.SEAT, self.ACTOR, self.OWNER):
+            chat._clear_sign_failure(self.OWNER)
+            m = chat.post("refused", who=self.SEAT)
+            st = chat.transport_status(fleet=True)
+            row = chat.public_rows([m])[0]["transport"]
+        self.assertEqual((st.get("state"), st.get("fleet_signer")),
+                         ("SIGNED", self.OWNER))
+        expected = st.get("expected_failures") or [{}]
+        self.assertEqual((expected[0].get("profile"),
+                          expected[0].get("inherited_profile")),
+                         (self.SEAT, self.OWNER))
+        said = st.get("owner_scoped") or [""]
+        self.assertEqual(len(said), 1, said)
+        for word in (self.SEAT, self.OWNER, "expected", "nobody needs to act"):
+            self.assertIn(word, said[0])
+        self.assertEqual(owner_verbs(said[0]), [], said[0])
+        # the agents' line for the same incident keeps its verb
+        self.assertIn("helm launch", " ".join(st.get("scoped") or ()))
+        # THE ROW THE CHAT VIEW DRAWS says the same thing, and says it quietly
+        self.assertEqual((row.get("state"), row.get("expected_unsigned")),
+                         ("DEGRADED", True))
+        self.assertEqual(row.get("owner_say"), said[0])
+        self.assertIn("helm launch", row["remediation"])
+
+    def test_a_seat_under_ANOTHER_SEATS_profile_stays_DEGRADED_on_the_fleet_read(self):
+        """CONTROL for the arm above, on the same world: an ambient profile
+        that names another seat is the pane-contagion shape, a pane that took
+        another seat's settings, and stays loud. Its owner copy names who
+        repairs it and no helm verb."""
+        from tests._ownerverbs import owner_verbs
+        with self._world(self.SEAT, self.ACTOR, self.OTHER):
+            chat._clear_sign_failure(self.OWNER)
+            m = chat.post("refused", who=self.SEAT)
+            st = chat.transport_status(fleet=True)
+            row = chat.public_rows([m])[0]["transport"]
         self.assertEqual((st.get("state"), st.get("code"), st.get("profile")),
                          ("DEGRADED", "identity_conflict", self.SEAT))
+        self.assertEqual(st.get("expected_failures") or [], [])
+        self.assertNotIn("inherited_profile", st)
+        say = st.get("owner_say") or ""
+        self.assertIn(self.SEAT, say)
+        self.assertIn("its lead", say)
+        self.assertEqual(owner_verbs(say), [], say)
+        self.assertIn("helm launch", st["remediation"])
+        self.assertNotIn("expected_unsigned", row)
+        self.assertEqual(row.get("owner_say", "").split(";")[0],
+                         say.split(";")[0])
+
+    def test_only_a_profile_the_roster_proves_is_no_seat_is_inherited(self):
+        """`_inherited_profile` answers the ambient name only when a clean
+        roster read proves no seat carries it, by key or by a live rename
+        alias; any read it cannot trust keeps the incident loud."""
+        from helm import seats, seats_common
+        until = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                              time.gmtime(time.time() + 3600))
+        rows = {"seat-a": {"home_room": "helm"},
+                "seat-b": {"home_room": "helm", seats_common.RENAME_ALIAS_FIELD:
+                           {"old": "old-b", "until": until}},
+                "observer": {"cwd": "/tmp/x"}}     # an observed session
+        self.assertEqual(seats_common.live_alias("old-b", rows)[0], "seat-b")
+        with mock.patch.object(seats, "roster_checked",
+                               return_value=(rows, False)):
+            self.assertEqual(chat._inherited_profile("owner-profile"),
+                             "owner-profile")
+            # an observed session's row is not a seat (cell.seat_reading)
+            self.assertEqual(chat._inherited_profile("observer"), "observer")
+            self.assertIsNone(chat._inherited_profile("SEAT-A"))
+            self.assertIsNone(chat._inherited_profile("old-b"))
+            self.assertIsNone(chat._inherited_profile(""))
+        with mock.patch.object(seats, "roster_checked",
+                               return_value=(rows, True)):
+            self.assertIsNone(chat._inherited_profile("owner-profile"))
+        with mock.patch.object(seats, "roster_checked",
+                               side_effect=OSError("EIO")):
+            self.assertIsNone(chat._inherited_profile("owner-profile"))
 
     def test_an_UNDECLARED_name_over_a_torn_roster_heals_with_NO_ack(self):  # noqa: VACUOUS_ASSERTION — every observable is asserted positively: the refusal's code and label, the repaired post's chain, and both status readings equal to SIGNED
         """HELM_CHAT_NAME unset (the owner's own ad-hoc session): the name is
@@ -1565,7 +1723,7 @@ class PostsSignThroughTheIdentityGateTest(V2Base):
             chat._clear_sign_failure(self.OWNER)
             chat._record_sign_failure("seat-z", chat._diag("send_failed", "x"))
             self.assertEqual(chat.acknowledge_sign_failures("seat-z"),
-                             ["seat-z"])
+                             (["seat-z"], None))
             st = chat.transport_status(fleet=True)
         self.assertEqual((st.get("state"), st.get("fleet_signer")),
                          ("SIGNED", self.OWNER))
@@ -1713,6 +1871,65 @@ class OwnerExportPostsSignAsTheSeatTest(V2Base):
         self.assertEqual((m["transport"]["code"], m["transport"]["profile"]),
                          ("identity_conflict", "seat-a"))
         self.assertIn("set aside", m["transport"]["reason"])
+
+    def _fleet_after_refusal(self, owners=None, **world):
+        """One refused post in `world`, then the fleet read (the web console,
+        the signing watchdog) and the post's public row. `owners` replaces
+        the world's owner set (HELM_CHAT_OWNER_NAMES)."""
+        with self._world(**world) as ss:
+            if owners is not None:
+                os.environ["HELM_CHAT_OWNER_NAMES"] = owners
+            m = chat.post("refused", room="main")
+            st = chat.transport_status(fleet=True)
+            row = chat.public_rows([m])[0]["transport"]
+        ss.assert_not_called()
+        return m, st, row
+
+    def _assert_loud(self, st, row, profile):
+        self.assertEqual((st.get("state"), st.get("code"), st.get("profile")),
+                         ("DEGRADED", "identity_conflict", profile))
+        self.assertEqual(st.get("expected_failures") or [], [])
+        self.assertNotIn("inherited_profile", st)
+        self.assertNotIn("nobody needs to act", st.get("owner_say") or "")
+        self.assertEqual((row.get("state"), row.get("expected_unsigned")),
+                         ("DEGRADED", None))
+
+    def test_a_REFUSED_SWAP_under_the_OWNERS_profile_stays_LOUD_on_the_fleet_read(self):
+        """Walk 4 cure, reviewer arm. Under a RECOGNISED owner profile the gate
+        has a lawful way to sign the seat as itself (task/3049, the admitted
+        swap), so a refusal there is the swap failing, a fault and not the
+        expected state of a seat run in the owner's session. Here the identity
+        layer raises, the regression that refuses EVERY owner-export seat at
+        once: the fleet read, the watchdog's and doctor's input, must stay
+        DEGRADED. RED on 92d76ce9051: scoped as expected_failures, SIGNED."""
+        with mock.patch("helm.actors.admitted_name",
+                        side_effect=RuntimeError("identity layer regressed")):
+            m, st, row = self._fleet_after_refusal()
+        self.assertIn("set aside", m["transport"]["reason"])
+        self._assert_loud(st, row, "seat-a")
+
+    def test_a_STALE_CHAT_NAME_under_the_OWNERS_profile_stays_LOUD_on_the_fleet_read(self):
+        """The task/3049 expired-alias arm: the session is bound to fleet seat
+        seat-a while HELM_CHAT_NAME names nothing, so the gate refuses the
+        owner's profile and prescribes re-exporting the name. A real
+        misconfiguration, filed under the ambient label. RED on 92d76ce9051:
+        scoped as the expected state, SIGNED."""
+        m, st, row = self._fleet_after_refusal(name="stale-name")
+        self.assertIn("bound to fleet seat 'seat-a'", m["transport"]["reason"])
+        self._assert_loud(st, row, self.OWNER)
+
+    def test_a_shells_profile_the_owner_set_does_not_name_is_still_EXPECTED(self):
+        """CONTROL for the two arms above, on the same world and roster: the
+        owner set names someone else, so the ambient profile is a shell's the
+        gate has no swap for, as meta-claude's 'david' is on the owner's box
+        (owner names akapug, pug). It stays the expected state."""
+        m, st, row = self._fleet_after_refusal(owners="someone-else")
+        self.assertIn("identity conflict", m["transport"]["reason"])
+        self.assertEqual([(f["profile"], f.get("inherited_profile"))
+                          for f in st.get("expected_failures") or ()],
+                         [("seat-a", self.OWNER)])
+        self.assertNotEqual(st.get("state"), "DEGRADED")
+        self.assertTrue(row.get("expected_unsigned"))
 
 
 class DreggSignerBinTest(V2Base):

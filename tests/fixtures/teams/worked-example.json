@@ -1,0 +1,18 @@
+{
+  "note": "The spec's worked example (task/3156 Part A), measured on the live fleet 2026-09-25 ~11:20 PDT and re-keyed onto neutral project and seat names because tests/ is public-bound. codex is ORANGE; the fleet burns 73M tokens/h; the pool lasts to the next Pro reset (85 h away) at 54 h of runway, so the sustainable rate is 54 x 73 / 85 = 46.4M/h. The 3 h burn split was 45 / 31 / 15 percent, and the last 9 percent is INFERRED to be the fourth project. Shares 30 / 35 / 25 / 10 give RED / ORANGE / YELLOW / ORANGE.",
+  "family": "codex",
+  "family_colour": "ORANGE",
+  "pace": {"runway_h": 54, "tokens_per_hour": 73000000, "horizon_h": 85},
+  "sustainable_per_h_rounded_m": 46.4,
+  "projects": {
+    "alpha": {"seat": "alpha-codex", "share": 30, "burn_per_h": 32850000,
+              "budget_m": 13.9, "burn_m": 32.9, "ratio": 2.4, "colour": "RED"},
+    "beta": {"seat": "beta-codex", "share": 35, "burn_per_h": 22630000,
+             "budget_m": 16.2, "burn_m": 22.6, "ratio": 1.4, "colour": "ORANGE"},
+    "gamma": {"seat": "gamma-codex", "share": 25, "burn_per_h": 10950000,
+              "budget_m": 11.6, "burn_m": 11.0, "ratio": 0.94, "colour": "YELLOW"},
+    "delta": {"seat": "delta-codex", "share": 10, "burn_per_h": 6570000,
+              "budget_m": 4.6, "burn_m": 6.6, "ratio": 1.4, "colour": "ORANGE"}
+  },
+  "line_alpha": "share codex 30% → 13.9M/h budget, burning 32.9M/h (2.4×) → RED for alpha"
+}

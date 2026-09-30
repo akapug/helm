@@ -92,7 +92,7 @@ def _serialized(fn):
 # need to know how helm is made, so the project declares and helm asks.
 # See `gate.suite_command` for the shape and `gate.DECLARED_GATE_FIELD`.
 AUTHORED_FIELDS = ("edges", "notes", "aliases", "external", "retired", "adopt",
-                   "gate", "state", "residency")
+                   "gate", "state", "residency", "team")
 
 # The project STOPLIGHT — and it is the SAME light the registry already shows,
 # with the vocabulary it was always missing, NOT a second mark beside it.
@@ -151,7 +151,13 @@ STATE_COLOURS = ("green", "yellow", "orange", "red")
 # the operator's LAN for an outside scorer, and sending data off the LAN cannot
 # be undone, so only a person may say yes. A projection that could mint one
 # would let a discovery pass publish a client's text in the owner's name.
-NEVER_MIGRATED_FIELDS = ("gate", "state", "residency")
+#
+# `team` IS THE FOURTH, FOR THE LIGHT'S REASON (task/3156). It names the seats
+# a router draws a project's bench from and the share of a short family the
+# project may spend, so a projection that could mint one would let a discovery
+# pass seat a stranger on a project, or hand it a family's budget, in the
+# owner's name. `teams.read` takes it from the authored layer only.
+NEVER_MIGRATED_FIELDS = ("gate", "state", "residency", "team")
 
 
 def _unowned(entry):
@@ -1532,6 +1538,11 @@ def _state(name, colour, reason, by, apply):
                           "by": by or "", "ts": int(time.time())}
     if apply:
         pk.write_json(home.authored_path(), auth)
+        # ONE HISTORY FOR THE CARD: a light change lands in the team history
+        # beside the team writes (task/3156). Best effort — a history line
+        # that could not be written never un-writes the light.
+        from . import teams
+        teams.record_light(name, was, entry.get("state"), by, apply)
     return {"name": name, "path": path, "was": was,
             "state": entry.get("state")}, None
 
@@ -2216,11 +2227,36 @@ def projections():
         # sit in a root that has a manifest — a new store that does not declare
         # itself inherits exactly that rot.
         row("task-ledger", "events", "home", ("_global/tasks.jsonl*",)),
-        # One file per dispatch BRIEF, named for the brief's own blake2b-128
-        # digest, written before the ledger row that references it. AUTHORED,
-        # not a projection: the text is the sender's, nothing derives it, and
-        # deleting a file loses the only whole copy — the row keeps a bounded
-        # one and every reader says so out loud when the file is gone.
+        # THE TEAM HISTORY (task/3156): one line per team write and per light
+        # change, so a project's card reads one history. Events — the reason
+        # and the diff of a write exist nowhere else once it is made. The
+        # eventledger lock sibling rides the glob.
+        row("team-events", "events", "home", ("_global/team-events.jsonl*",)),
+        # THE OWNER'S GOALS, PROJECTED (helm/goals.py): each goal row's
+        # derived state, criteria, card and children, so a stop hook or the
+        # web page reads one small file instead of folding the task ledger.
+        # Refreshed under the task ledger's lock by every write that touches a
+        # goal's story; its reader names it STALE from the ledgers' appended
+        # tails, never serving an old answer as current. The tmp glob is
+        # `pk.atomic_write`'s per-writer temporary.
+        row("goals-projection", "projection", "home",
+            ("_global/goals-projection.json",
+             "_global/goals-projection.json.*.tmp"),
+            source="the task ledger's goal rows and their children, with "
+                   "their criteria cards from the decision ledger",
+            sources=(os.path.join(home.global_dir(), "tasks.jsonl"),
+                     os.path.join(home.global_dir(), "owner-decisions.jsonl")),
+            rebuild="helm goal sync"),
+        # One file per stored TEXT, named for its own blake2b-128 digest,
+        # written before the ledger row that references it (helm/refstore.py,
+        # the one content-addressed store). Its tenants: dispatch briefs,
+        # findings-pass outputs, and task comment archives plus task comments
+        # too big for their row. AUTHORED, not a projection: the text is its
+        # writer's, nothing derives it, and deleting a file loses the only
+        # whole copy — a dispatch row keeps a bounded one, a task row keeps
+        # only the archive's summary, and every reader says so out loud when
+        # the file is gone. No gc stream reaps it (`gc` touches `exhaust`
+        # only), which is what makes a row's reference safe to keep forever.
         # Declared at birth for the reason the comment above gives: the
         # dispatch ledger's own neighbours are unclassified squatters, and a
         # new store that does not declare itself inherits exactly that rot.
@@ -2280,6 +2316,22 @@ def projections():
             sources=(os.path.join(home.global_dir(), "dispatches.jsonl"),),
             rebuild="delete; the next read of that ledger folds the whole "
                     "ledger and writes it again"),
+        # BESIDE THE STORE, NOT IN IT (helm/foldckpt.py `save_lock_path`,
+        # `misses_path`): the one save lock per ledger, and the miss log that
+        # says why a read replayed instead of restoring (task/3043). Two rows
+        # of their own kinds rather than globs on the projection row above,
+        # because a lock or a log outliving its ledger is not an ORPHANED
+        # projection, and the survey read both as squatters (measured on the
+        # live home: the lock was the one squatter under ledger-fold).
+        row("ledger-fold-lock", "state", "home",
+            ("_global/.state/ledger-fold/*.lock",)),
+        row("ledger-fold-misses", "events", "home",
+            ("_global/.state/ledger-fold/*.misses.jsonl*",)),
+        # THE LAND'S FIRST LEDGER READ (helm/postland.py, task/3538): one JSON
+        # line per landed head, beside the miss log and rolled once like it;
+        # its lock is the `*.lock` above.
+        row("ledger-fold-postland", "events", "home",
+            ("_global/.state/ledger-fold/*.postland.jsonl*",)),
         # THE CARRIAGE REPLAY'S DERIVATIONS (task/2813): the tri-state answer
         # for each (repository, trunk object, base, tip) the off-frontier
         # census's replay witness was asked about, one file per code
@@ -2308,10 +2360,34 @@ def projections():
         row("gate-window", "state", "home",
             ("_global/.state/gate-window/*.json",
              "_global/.state/gate-window/*.tmp",
-             "_global/.state/gate-window/*.lock"),
+             "_global/.state/gate-window/*.lock",
+             # the detached client's log per job (gatewindow.log_path)
+             "_global/.state/gate-window/logs/*.log"),
             source="helm gate window launch, written before it dispatches",
             rebuild="delete; the next launch records itself again, and every "
                     "read re-measures liveness against the node"),
+        # THE SLICED SHADOW OF EVERY TRAIN GATE (helm/gateshadow.py): one
+        # record per serial window run under records/, the pass lock, the
+        # detached cancels' logs, and `home/`, a helm home of the shadow's own
+        # whose ledger holds the sliced receipts. That ledger is deliberately
+        # outside `_global/gate-receipts.jsonl`: no land door, bind or window
+        # read may ever see a shadow's receipt. A record is the only copy of
+        # its comparison, so deleting one erases a measurement.
+        row("gate-shadow", "state", "home",
+            ("_global/.state/gate-shadow/*",),
+            source="helm gate window launch schedules a record; helm gate "
+                   "shadow run fills it and imports into home/",
+            rebuild="none for the records, which are measurements; home/ "
+                    "is re-imported by the next pass over a record"),
+        # THE NIGHTLY CANARY'S STATE (helm/gatecanary.py): the last verdict
+        # and the sliced-at-land DISABLE marker with its archived clearings.
+        # The marker is durable by design and cleared only by a reason.
+        row("gate-canary", "state", "home",
+            ("_global/.state/gate-canary/*",),
+            source="helm gate canary run; the marker is cleared only by "
+                   "helm gate canary clear --reason",
+            rebuild="none: the marker is a veto a person clears, and "
+                    "last.json is rewritten by the next canary run"),
         row("events-journal", "events", "home", ("_global/.state/events.jsonl*",)),
         # THE PRE-READ ESTATE, declared at birth for the reason two rows up:
         # an undeclared store is a squatter. The config is AUTHORED (an
@@ -2333,12 +2409,16 @@ def projections():
         # its one rotated generation, and the script's `--out` file while a
         # run is in flight (read, stored by reference, then removed). The
         # RESULT is not here — it is a `findings-note` on the dispatch ledger
-        # and a content-addressed file under dispatch-briefs.
+        # and a content-addressed file under dispatch-briefs — except for a
+        # row the pass STOPPED on (task/3382): the ledger takes no note on a
+        # row no longer owed one, so the stop's record lives here, one per
+        # row, naming the stored output of the reads that finished.
         row("findings-pass", "state", "home",
             ("_global/.state/findings-pass/*.lock",
              "_global/.state/findings-pass/*.log",
              "_global/.state/findings-pass/*.log.1",
-             "_global/.state/findings-pass/run-*.md"),
+             "_global/.state/findings-pass/run-*.md",
+             "_global/.state/findings-pass/stopped/*.json"),
             source="helm/findingspass.py, a detached worker per review row",
             rebuild="delete while no pass runs; the next pass recreates the "
                     "lock and the log"),
@@ -2365,6 +2445,11 @@ def projections():
         # layer reads a seat's worst guard from it. The glob covers the single
         # rotated generation and the append lock beside it.
         row("friction-ledger", "events", "home", ("_global/.state/friction.jsonl*",)),
+        # one line per sending idle-dispatch pass: each owing seat's idle
+        # reading and ring (helm/seat_idle.py); `helm seat idle-dispatch
+        # --owing` measures the idle bars from it. One rotated generation.
+        row("idle-owing-ledger", "events", "home",
+            ("_global/.state/idle-owing.jsonl*",)),
         row("attest-queue", "state", "home", ("_global/.state/attest-queue.jsonl",)),
         row("inject-seen", "state", "home", ("_global/.state/inject-seen/*",)),
         row("coinages", "state", "home", ("_global/.state/coinages.json",)),
@@ -2399,6 +2484,21 @@ def projections():
              "_global/.state/upstream-watch.json.*.tmp",
              "_global/.state/upstream-watch.json.lock",
              "_global/.state/upstream-watch/*")),
+        # THE REMOTE-SESSION RELAY (helm/remote_session.py, helm/remote_relay.py).
+        # The host facts file is what the operator wrote: the remote seats,
+        # the accounts that pay, and each project's drop and brief. The
+        # journal is events: every launch, delivery, report, recorded read,
+        # credit reading and falsifier latch, and every session state is
+        # folded from it on read. The work dir holds the bundle repositories a
+        # launch uploads, the task files it passes and the scratch clones a
+        # cure is checked in; the lock serializes ticks.
+        row("remote-sessions-config", "authored", "home",
+            ("_global/remote-sessions.json",)),
+        row("remote-sessions-journal", "events", "home",
+            ("_global/.state/remote-sessions/journal.jsonl",)),
+        row("remote-sessions-work", "state", "home",
+            ("_global/.state/remote-sessions/tick.lock",
+             "_global/.state/remote-sessions/work/*")),
         row("autocompact", "state", "home",
             ("_global/.state/autocompact.json*",)),
         # THE RECIPE NAMES THE VERB THAT ACTUALLY WRITES, AND SAYS WHAT ELSE IT
@@ -2460,12 +2560,63 @@ def projections():
                     "newly spent"),
         row("codex-walls", "state", "home",
             ("_global/.state/codex-walls.json*",)),
+        # THE PER-SEAT BURN, EVERY PROXY FAMILY (task/3156): the same ledger
+        # read the runway takes, summed per seat over three hours, so a
+        # project's share is measured against one small file. A PROJECTION —
+        # the ledger re-derives every number in it.
+        # WHICH PROJECT-BUDGET CROSSINGS ALREADY SPOKE, AND WHICH COLOURS
+        # ARE STILL HOLDING FOR THE DWELL (task/3156): STATE — losing it
+        # re-announces each project's standing colour once, after the dwell.
+        row("project-budget-latch", "state", "home",
+            ("_global/.state/project-budget.json*",)),
+        # EACH LOCAL FAMILY'S LANE CAPACITY (task/3156, the owner's slots
+        # direction): STATE — a measurement the measuring seat records with
+        # `helm team capacity`; losing it reads "capacity not measured" until
+        # it is measured again. Its lock sibling rides the glob.
+        row("slot-capacity", "state", "home",
+            ("_global/.state/slot-capacity.json*",)),
+        row("seat-burn", "projection", "home",
+            ("_global/.state/seat-burn.json",
+             "_global/.state/seat-burn.json.*.tmp"),
+            source="the proxy-usage ledger, tokens per hour per seat per "
+                   "family over the last three hours (seat names, never an "
+                   "account)",
+            sources=(os.path.join(home.global_dir(), ".state"),),
+            rebuild="helm proxywatch --post  # the posting pass writes it "
+                    "beside the codex runway; SIDE EFFECTS as for "
+                    "codex-runway"),
+        # THE CLAUDE 5H PACE (pace5h): a PROJECTION of the native usage
+        # history the creds probe cycle writes. It carries each account's
+        # held state for the hysteresis, so a lost file re-reads a held WATCH
+        # in the 90-100% band as OK until the projection crosses 100% again.
+        row("claude-pace5h", "projection", "home",
+            ("_global/.state/claude-pace5h.json",
+             "_global/.state/claude-pace5h.json.*.tmp"),
+            source="the native usage history, read into each Claude "
+                   "account's 5h pace, projection and state (masked "
+                   "addresses, never a token)",
+            sources=(os.path.join(home.global_dir(), ".state"),),
+            rebuild="helm proxywatch --post  # the posting pass writes it "
+                    "beside the codex runway; it reads the usage history "
+                    "and makes no vendor call of its own"),
         # THE DECLARATIONS ARE AUTHORED, NOT DERIVED: the owner types a colour
         # and an expiry, nothing recomputes them, and losing the file loses
         # what he said rather than a cache.
         row("burn-declarations", "authored", "home",
             ("_global/.state/burn-declarations.json",),
             source="the owner, through `helm burn declare`"),
+        # THE OWNER'S REST, ONE RECORD PER SEAT (helm/seat_rest.py). AUTHORED:
+        # it is the owner's words, recorded by the seat or the integrator, and
+        # nothing re-derives them. The glob takes `pk.atomic_write`'s temp.
+        row("seat-rest", "authored", "home", ("_global/.state/seat-rest/*",),
+            source="the owner's words, through `helm seat rest <seat> "
+                   "--because ...`"),
+        # THE LOCAL CERTIFICATIONS ARE STATE: the operator seat renews each
+        # one from its own session, a lost file reads every local family GREY
+        # until the next renewal, and the `.lock` sibling and the
+        # `pk.atomic_write` temp ride the glob.
+        row("burn-local-certifications", "state", "home",
+            ("_global/.state/burn-local-certifications.json*",)),
         # THE BOARD'S REPOSITORY BADGES: whether each GitHub repository a
         # project pushes to is public or private, as gh answered, kept a day.
         # A PROJECTION with no rebuild recipe of its own: every entry is asked
@@ -2474,8 +2625,9 @@ def projections():
         row("repo-visibility", "projection", "home",
             ("_global/.state/repo-visibility.json",
              "_global/.state/repo-visibility.json.*.tmp"),
-            source="gh repo view <owner/name> --json visibility, for the "
-                   "remotes of each project the Work page shows",
+            source="gh repo view github.com/<owner/name> --json "
+                   "visibility, for the remotes of each project the Work "
+                   "page shows",
             sources=(os.path.join(home.global_dir(), ".state"),),
             rebuild="open the Work page (helm web): it asks what is missing"),
         row("drift-snapshot", "projection", "home",
@@ -2487,6 +2639,11 @@ def projections():
         row("cells", "state", "home", ("_global/.state/cells.json",)),
         row("reflex-state", "state", "home", ("_global/.state/reflex-state/*",)),
         row("beacons", "state", "home", ("_global/.state/beacons/*",)),
+        # The beacon doorbell's per-seat state: rows a waiter drained and has
+        # not rung yet, rows rung and not yet read, and the ring history the
+        # hourly cap reads. The glob covers its lock and atomic_write's temp.
+        row("beacon-doorbell", "state", "home",
+            ("_global/.state/beacon-doorbell/*",)),
         row("seats", "state", "home", ("_global/seats/*",)),
         row("catalog-cache", "projection", "cache", ("catalog-cache.json",),
             source="local claude/codex transcripts (cv ls, or the scanner)",
@@ -2517,6 +2674,12 @@ def projections():
         row("mints", "events", "cache", ("mints.jsonl", "mints.jsonl.*")),
         row("keepalive-log", "events", "cache", ("keepalive-log.jsonl", "keepalive-log.jsonl.*")),
         row("usage-history", "events", "cache", ("native-usage-history.jsonl", "native-usage-history.jsonl.*")),
+        # one row per `helm classify` call and per labelled example, never a
+        # text (helm/classify.py); the glob covers the one rotated generation
+        # and the append lock beside it
+        row("classify-config", "authored", "home", ("_global/classify.json",)),
+        row("classify-metrics", "events", "cache",
+            ("classify/metrics.jsonl", "classify/metrics.jsonl.*")),
         row("backups", "backup", "cache",
             ("config-backups/*", "settings-backups/*", "skills-backups/*",
              "skills-trash/*")),

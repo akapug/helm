@@ -94,11 +94,16 @@ backfill in `dev-process.md`.)
 6. **Cross-family xrev before "done"** (#14). A non-trivial fix gets a different-model refuter hunting
    for what it breaks/misses — not a same-family "looks good." (Today codex's REFUTE caught 4 real bugs
    in my fixes, including a silent-pass that violated our own #19. Per-fix xrev beats batching — it
-   catches earlier and costs no more.) The refuter is an equal counterpart whatever its family: it
-   COMMITS the mechanical cures it finds, off the exact reviewed tip in its own worktree, and names
-   the tip with `--patch-tip` on the FIX verdict — you rebase onto it. Design findings meld instead.
-   Your fix then has two authors, and the composed tip gets one re-read by someone who wrote neither
-   half before it lands (`reviewer-implements-own-findings`).
+   catches earlier and costs no more.) The refuter is an equal counterpart whatever its family:
+   follow the row's REVIEW FIX MODE for a mechanical cure. PATCH commits off the exact reviewed
+   tip in its own room or a shared clone, then names `--patch-tip` on FIX for you to adopt;
+   MELD-DIFF posts the exact diff in the pair meld for you to apply and answers FIX with
+   validated `--diff-handoff ROOM/MSGID` and `--no-patch-because`. Only the typed
+   receipt plus send/add proof that your advancing direct child applies its diff
+   make that child a cure confirmation, suppressing T1; an unrelated child is
+   an ordinary round. Prose alone, including historical rows, proves no cure
+   and leaves an ordinary round and T1 nudge. Design findings meld instead. The composed tip owes the re-read required
+   by reviewer-implements-own-findings step 7 before it lands.
 
 ## Red flags — these thoughts mean STOP, you're skipping the discipline
 
@@ -122,6 +127,8 @@ verify is yours to make. (Fast path = the 5 questions in `decision-spirit`; full
 Symptom reproduced→resolved (evidence quoted) · history read · class named · owner-layer diff ·
 regression-guard added + fails-loud · old path retired · cross-family xrev clean · doc/task updated.
 `compiles` ≠ done. `I think` ≠ done.
+If agents were working around the bug, the fix is a tax cut: report the friction tax it removed
+(steps x times per day) beside the land.
 
 ## Cross-refs
 - Cross-family analysis: when a fix won't converge, `helm dispatch` a seat of another model family to diagnose it while you trace in parallel; before claiming done, a cross-family review (`reviewer-implements-own-findings`).

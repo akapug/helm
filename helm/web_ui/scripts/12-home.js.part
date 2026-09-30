@@ -1,0 +1,185 @@
+/* ================= HOME (task/3445 L3) =================
+   The console's first page: headlines only, one plain line per tile, each
+   clicking through to the page that holds its detail. Every tile is drawn by
+   a small headline function below, each reading what the page's own polls
+   already hold (the board, the work read, the land pipeline, the presence,
+   the signing read, the accounts, chat, the notes) and computing nothing a
+   detail page does not also say. A headline that was not read says so, and never a
+   zero. */
+
+/* THE OWNER READS TOTALS (task/3445 L3): a tile is its one or two numbers and
+   at most one plain line — no command, no read time, no internal subtotal;
+   those are the detail pages' (and the hover titles'). A reading that is past
+   its bound says only "stale", one that was not read "not read", and neither
+   draws a number — except the work tile (`wkHomeTile`), whose reading says
+   its own age (task/3632, kept by task/3643): it keeps its numbers, dated,
+   "stale, 22m old", never passed off as current; and its partial reading is
+   a floor, "at least", never a 0 over projects nobody read. */
+function homeWord(w) { return '<span class="hstale">' + esc(w) + "</span>"; }
+function homeTile(big, line) {
+  return '<div class="hbig">' + big + "</div>" + (line ? '<div class="dsub">' + line + "</div>" : "");
+}
+
+/* PROJECTS: green and active; the lanes running and the teams to accept. PURE. */
+function homeProjects(d, rows) {
+  if (!d || d.unavailable) return homeWord("not read");
+  const head = d.headline || {}, lanes = head.lanes || {};
+  const lst = boardSecState(boardSec(d, "lights"));
+  if (lst === "stale") return homeWord("stale");
+  if (lst !== "ok" || typeof head.green !== "number") return homeWord("not read");
+  const seats = boardSecState(boardSec(d, "seats")) === "ok" && typeof lanes.running === "number";
+  const tst = boardSecState(boardSec(d, "teams"));
+  const teams = Object.keys(d.projects || {}).map(k => (d.projects[k] || {}).team).filter(Boolean);
+  const proposed = teams.filter(t => !t.authored).length;
+  return homeTile("<b>" + head.green + "</b> green · <b>" + boardActive(rows || []) + "</b> active",
+    [seats ? lanes.running + " lanes running" : "",
+     tst === "ok" && proposed ? proposed + " team" + (proposed === 1 ? "" : "s") + " to accept" : ""].filter(Boolean).join(" · "));
+}
+
+/* WORK: the Work page's stage row, word for word, and its stuck count
+   (task/3643, `wkHomeTile` over /api/work): one tile where the pipeline and
+   backlog tiles counted the same work two ways with two reads. */
+/* SUPPLY: how many model families are short, and the tightest. PURE. */
+function homeSupply(d) {
+  const sec = boardSec(d, "flags"), st = boardSecState(sec);
+  if (st === "stale") return homeWord("stale");
+  if (st !== "ok") return homeWord("not read");
+  const fams = sec.families || {}, n = c => Object.keys(fams).filter(f => (fams[f] || {}).colour === c).length;
+  const red = n("RED"), orange = n("ORANGE"), ov = sec.overall || {};
+  return homeTile('<b style="color:' + FLAGCOL.RED + '">' + red + "</b> red · "
+      + '<b style="color:' + FLAGCOL.ORANGE + '">' + orange + "</b> orange",
+    ov.family ? "tightest: " + esc(ov.family) : "");
+}
+
+/* ACCOUNTS: the credit table's own count (task/3635) — `census` is what it
+   last drew (ACCT_CENSUS), null until both of its reads landed — with its
+   scope, and how many want him: a spent one is spent until its reset, never
+   a login chore (task/3634). PURE. */
+function homeAccounts(census) {
+  if (!census) return homeWord("not read");
+  const c = census, need = c.login === 1 ? " needs" : " need", free = c.free || 0;
+  return homeTile("<b>" + c.total + "</b> account" + (c.total === 1 ? "" : "s"),
+    [(c.total - free) + " paid", free ? free + " free" : "", c.measured + " measured",
+     c.walled ? '<span class="dwarn">' + c.walled + " spent until reset</span>" : "",
+     c.login ? c.login + need + " a new login" : "",
+     c.walled || c.login ? "" : "all fine"].filter(Boolean).join(" · "));
+}
+
+/* SEATS: the seats active right now and the ones a vendor walled off, then
+   whether work may resume (`helm ready`). "active" is the one word for this
+   count, on every roster row and the Seats strip too; "able to work" is the
+   Projects headline's count, which leaves a walled-off seat out, and "at work"
+   its claimless seats (console walk 3, finding 4). `list` is the presence
+   poll's rows, `stale` true once that poll has stopped answering. PURE. */
+function homeSeats(list, ready, stale) {
+  if (!Array.isArray(list)) return homeWord("not read");
+  if (stale) return homeWord("stale");
+  const seats = list.filter(s => s && s.seat && !s.ephemeral && !s.owner);
+  const act = seats.filter(s => !s.unverified && s.presence === "fresh").length;
+  const walled = seats.filter(s => s.availability === "UNAVAILABLE").length;
+  const w = ready && !ready.pending && !ready.unavailable ? String(ready.ready || "") : "";
+  return homeTile("<b>" + act + "</b> active · " + (walled ? '<b class="dbad">' + walled + "</b>" : "<b>0</b>") + " unavailable",
+    w === "READY" ? "ready to resume" : w === "NOT READY" ? '<span class="dwarn">not ready to resume</span>' : "");
+}
+
+/* CHAT: unread, and whether any of it names him. PURE. */
+function homeChat(n, mention, read) {
+  if (!read) return homeWord("not read");
+  return n ? homeTile("<b>" + n + "</b> unread" + (mention ? ' · <span class="dwarn">@you</span>' : ""), "")
+    : homeTile("nothing unread", "");
+}
+
+/* SIGNING RECORD: whether signing is live on the SHARED record, and the same
+   comparison the HISTORY page draws beside the signed entries — the
+   signed·shared count (dregg's d.status.dag_height, the same field History
+   reads as its "signed·shared" number) vs the LOCAL chain's count
+   (lr.native_chain.count), with the chain's own check. The two are different
+   contents: signed entries exist on the shared node, provable anywhere; local
+   notes exist only on this host. "verified" (premise.verify_chain) is the
+   LOCAL chain's hash check, not the shared record's signing, so it is drawn as
+   "chain ✓ / chain ✗" on the local side, never as a claim the shared record
+   is signed (console walk 1, finding 9). Either count unread reads UNKNOWN,
+   never 0 or blank (History's rule). The local count is drawn only while the
+   lr read is inside its bound; the shared count rides the signing poll itself.
+   One pure function, one subline. PURE. */
+function homeRecord(dregg, lr, now) {
+  if (!dregg) return homeWord("not read");
+  if ((now || Date.now()) - dregg.at > 60e3) return homeWord("stale");
+  const d = dregg.d || {}, tp = d.transport;
+  const big = d.offline ? '<b class="dbad">signing down</b>'
+    : tp && tp.mode === "signed" ? '<b class="dok">signing live</b>'
+    : '<b class="dwarn">signing ' + esc((tp && (tp.label || tp.mode)) || "unknown") + "</b>";
+  // the lr read's own bound (`lrStale`, task/3632)
+  const nc = lr && !lr.pending && !lrStale(lr) ? lr.native_chain : null;
+  const local = nc && !nc.unavailable && typeof nc.count === "number"
+    ? esc(String(nc.count | 0)) + " local-only · "
+      + (nc.verified ? "chain ✓" : '<span class="dwarn">chain ✗</span>')
+    : "UNKNOWN local-only";
+  // offline: the shared record is down — there is nothing to count, so the
+  // shared side is the one word "signing down" and carries no count (UNKNOWN
+  // would claim a record nobody read); only the local side is drawn.
+  if (d.offline) return homeTile(big, local);
+  const s = d.status || {};
+  const sharedN = (typeof s.dag_height === "number") ? s.dag_height : null;
+  const shared = sharedN === null ? "UNKNOWN" : esc(String(sharedN | 0));
+  return homeTile(big, shared + " signed · " + local);
+}
+
+/* FLEET NOTES: how many are new, and the newest one. PURE. */
+function homeNotes(d) {
+  if (!d || d.unavailable || !Array.isArray(d.notes)) return homeWord("not read");
+  const fresh = d.notes.filter(n => !n.stale), older = d.notes.length - fresh.length;
+  return homeTile("<b>" + fresh.length + "</b> new" + (older ? " · " + older + " older" : ""),
+    fresh.length ? esc(fresh[0].headline || fresh[0].text || fresh[0].key) : "");
+}
+
+/* Is Home on screen? */
+function homeShown() {
+  const v = $("#view-home");
+  return !!v && v.classList.contains("on") && !document.hidden;
+}
+
+/* Draw the headline tiles this file owns, from what the page holds. */
+function homeRender() {
+  if (!homeShown()) return;
+  const set = (id, html) => { const el = $("#" + id); if (el) el.innerHTML = html; };
+  set("hprojects", homeProjects(BOARD, projects));
+  set("hwork", wkHomeTile(WORK && WORK.d, WORK ? (Date.now() - WORK.at) / 1e3 : null));
+  set("hsupply", homeSupply(BOARD));
+  set("haccounts", homeAccounts(ACCT_CENSUS));
+  set("hseats", homeSeats(FLEET_LAST, READY_LAST, dashChatExpired(DASH_FLEET_TS) !== null));
+  set("hchat", homeChat(NAV_CHAT, NAV_CHAT_MENTION, CHAT_SIGNAL_READ));
+  set("hrecord", homeRecord(DREGG_LAST, LR_LAST));
+  set("hnotes", homeNotes(NOTES_LAST));
+}
+
+/* SHOWN: draw what the page holds, read the accounts once (the credit page's
+   own read), and — coming back from another page — read the board again. */
+let HOME_CREDS_READ = false;
+let CHAT_SIGNAL_READ = false;      // has a chat poll answered (chatSignal) yet
+let FLEET_LAST = null;             // the presence poll's rows (dashFleet)
+let DREGG_LAST = null;             // {d, at}: the signing poll's ledger read
+function initHome(was) {
+  homeRender();
+  if (!HOME_CREDS_READ) loadCreds().then(() => { HOME_CREDS_READ = true; homeRender(); }).catch(() => {});
+  if (was && was !== "home") boardReload();
+}
+setInterval(homeRender, 5000);
+
+/* A TILE CLICKS THROUGH to its page (its `data-go`), keeping that page's own
+   state, and opens the fold it names (`data-open`). A control inside a tile —
+   a link a renderer drew, the away switch — does its own thing. Only HOME's
+   tiles: the Work page's "same numbers" fold draws tiles too, and a click
+   there is reading, never a trip to Home. */
+document.addEventListener("click", ev => {
+  const tile = ev.target.closest("#view-home .htile, #view-home .hstrip");
+  if (!tile) return;
+  const label = ev.target.closest(".hlab");
+  if (!label && ev.target.closest("a, button, input, textarea, select, summary, details")) return;
+  ev.preventDefault();
+  const r = hashView(String(tile.dataset.go || "#home").slice(1));
+  // a tile that names a view's state (the backlog's) opens it at that state
+  if (VIEWS.includes(r.v)) { if (r.query) viewRoute(r.v, r.query); showView(r.v); }
+  const open = tile.dataset.open && $("#" + tile.dataset.open);
+  if (open) { open.open = true; open.scrollIntoView({block: "start"}); }
+});

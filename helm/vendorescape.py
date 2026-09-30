@@ -37,7 +37,7 @@ import time
 # module behind it. Reaching the chooser through the facade is not
 # ceremony: it is what keeps the split honest, and the tree has a
 # rung that refuses an impl import without it.
-from . import harness, home, resumeturn, seat
+from . import harness, home, panetail, resumeturn, seat
 
 # ---------------------------------------------------------------------------
 # the budget — its OWN counters, deliberately
@@ -272,7 +272,7 @@ def consider(name, state, escape, handle=None, session=None, pids=None,
             if on_typed is not None:
                 on_typed(handle_seen, text)
         return ad.choose_in_modal(handle_, seat.ESCAPE_CONTINUE,
-                                  on_typed=note)
+                                  on_typed=note, awaiting=_awaiting(pids))
 
     mode, proof = send(name, digit, session, adapter=adapter, pids=pids,
                        on_submit=on_submit, operation=choose)
@@ -314,6 +314,22 @@ def consider(name, state, escape, handle=None, session=None, pids=None,
                             "the key was typed but the pane could not be "
                             "re-read, so this is NOT a proven escape — %s"
                             % proof)
+
+
+def _awaiting(pids):
+    """The dialog door's WITNESS for this seat: the vendor's own presence
+    record, read by the stamped process the delivery was authorized on.
+
+    A REGISTERED seat's row legitimately carries no pids (see `consider`), so
+    it has no process to read a record by, and the witness says so: the door
+    refuses a dialog it cannot prove awaits input, whatever the tail shows.
+    """
+    stamped = [x for x in (pids or ()) if getattr(x, "start", None)]
+    if not stamped:
+        return lambda: (None, "the seat's row carries no stamped process, so "
+                              "the vendor's presence record cannot be read")
+    return harness.presence_witness(int(stamped[0]), stamped[0].start,
+                                    panetail.VENDOR_KIND.waiting_for)
 
 
 def _refusal_text(kind):

@@ -78,11 +78,13 @@ putting it in `dir()`.
 """
 
 import ast
+import gc
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SELF = os.path.abspath(__file__)
@@ -110,7 +112,9 @@ _CHILD_ENV = "HELM_SUITE_COLLECTION_CHILD"
 #
 # Module scope only, on purpose — a duplicated METHOD inside one of the classes
 # here is caught by the full census below, which reads this file like any other.
-_SELF_DEFS = [n.name for n in ast.parse(open(_SELF, encoding="utf-8").read()).body
+with open(_SELF, encoding="utf-8") as _f:
+    _SELF_SRC = _f.read()
+_SELF_DEFS = [n.name for n in ast.parse(_SELF_SRC).body
               if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))]
 _SELF_DUPES = sorted({n for n in _SELF_DEFS if _SELF_DEFS.count(n) > 1})
 if _SELF_DUPES:
@@ -248,11 +252,25 @@ def shadowed_definitions(source):
 
 
 def _shadowed_in_tree(tree):
-    found = []
+    return _scope_census(tree)[0]
+
+
+def _scope_census(tree):
+    """(shadowed_definitions's answer, number of definitions) from ONE walk.
+
+    The walk visits every definition in the file: a def or class can only sit
+    in a statement list, and scope_definitions covers every statement list of
+    a scope while the recursion below enters every definition's own. So the
+    count is what `ast.walk` finds (CensusCostTest pins that over a def in
+    every construct) without a second pass over every expression node.
+    """
+    found, count = [], 0
 
     def scope(node, path):
+        nonlocal count
         seen = {}
         for stmt, branch in scope_definitions(node.body):
+            count += 1
             seen.setdefault(stmt.name, []).append((stmt.lineno, branch))
             scope(stmt, path + "." + stmt.name)
         for name, defs in seen.items():
@@ -265,7 +283,25 @@ def _shadowed_in_tree(tree):
                 found.append((path, name, sorted(clash)))
 
     scope(tree, "<module>")
-    return sorted(found)
+    return sorted(found), count
+
+
+def _without_function_bodies(tree):
+    """`tree` with every function body emptied, in place.
+
+    The collected-twice resolver reads module scope, class bodies and the
+    expressions they bind, never a function body, and most of a test file's
+    nodes are function bodies. Emptying them once the per-file detectors
+    have run means the resolver's view of the whole tree fits in a fraction
+    of the memory the whole trees took. A class body is walked, not emptied:
+    its defs are the arms the resolver counts.
+    """
+    for stmt, _branch in scope_definitions(tree.body):
+        if isinstance(stmt, ast.ClassDef):
+            _without_function_bodies(stmt)
+        else:
+            stmt.body = []
+    return tree
 
 
 # ─── THE THIRD ROUTE: COLLECTED TWICE ───────────────────────────────────────
@@ -502,27 +538,39 @@ def census(paths, root):
     real-tree verdict and by its planted controls alike, so a control exercises
     the code the verdict actually comes from rather than a sibling that
     resembles it.
+
+    THE CYCLIC COLLECTOR IS OFF WHILE IT RUNS. The parse builds millions of
+    AST nodes and the census keeps them, so every full collection rescans all
+    of them, and a parsed tree holds no reference cycle for one to free:
+    measured over the real tree, the same parse takes 9.7 s with the
+    collector on and 3.9 s with it off. The census hands it back in
+    `finally`, as it found it.
     """
-    shadow, bare, defs, trees = {}, {}, {}, {}
-    for path in paths:
-        name = os.path.relpath(path, root)
-        with open(path, encoding="utf-8") as f:
-            source = f.read()
-        try:
-            tree = ast.parse(source)
-        except SyntaxError as exc:      # a file that cannot parse cannot run
-            shadow[name] = bare[name] = ["<unparseable: %s>" % exc]
-            defs[name] = 0
-            continue
-        trees[path] = tree
-        defs[name] = sum(1 for n in ast.walk(tree) if isinstance(n, _DEFS))
-        dupes = _shadowed_in_tree(tree)
-        if dupes:
-            shadow[name] = dupes
-        loose = _bare_in_tree(tree)
-        if loose:
-            bare[name] = loose
-    doubled, foreign = _doubled_in_trees(trees)
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        shadow, bare, defs, trees = {}, {}, {}, {}
+        for path in paths:
+            name = os.path.relpath(path, root)
+            with open(path, encoding="utf-8") as f:
+                source = f.read()
+            try:
+                tree = ast.parse(source)
+            except SyntaxError as exc:  # a file that cannot parse cannot run
+                shadow[name] = bare[name] = ["<unparseable: %s>" % exc]
+                defs[name] = 0
+                continue
+            dupes, defs[name] = _scope_census(tree)
+            if dupes:
+                shadow[name] = dupes
+            loose = _bare_in_tree(tree)
+            if loose:
+                bare[name] = loose
+            trees[path] = _without_function_bodies(tree)
+        doubled, foreign = _doubled_in_trees(trees)
+    finally:
+        if collecting:
+            gc.enable()
     return {"shadow": shadow, "bare": bare, "definitions": defs,
             "doubled": {os.path.relpath(p, root): v
                         for p, v in doubled.items()},
@@ -537,8 +585,11 @@ def verify_real_tree():
     subject: a check that lives inside `class Foo` is deleted, silently, by a
     second `class Foo`. At module level it runs at import, so a finding is an
     ImportError that `unittest discover` reports as an error — red, loud, and
-    unshadowable. The cost is one AST pass over tests/ per suite run (~2s),
-    which is LESS than the two passes the two test methods used to make.
+    unshadowable. The cost is one AST parse of tests/ per PROCESS that
+    imports this module, and every whole-suite gate worker is such a
+    process: about 5 s over 522 files on a 40-core build node near idle,
+    nearly all of it the parse itself. CensusCostTest pins the three costs
+    that nearly tripled it.
 
     THE MUST-HITS RIDE IN THE SAME PASS as the real census, so the observable
     is never an empty set whose emptiness might mean the pipeline died. Two
@@ -632,11 +683,13 @@ def verify_real_tree():
 
 
 # ─── THE REAL-TREE VERDICT, AT MODULE LEVEL, ON PURPOSE ─────────────────────
-# REACH, measured 2026-08-12: 241 files under tests/, 16,268 definitions, 0
-# offenders, ~3s of the suite's wall clock. The traversal was reconciled
-# against helm's existing authority on test identities — vacuous_assertion's
-# `_test_functions` — over all 241 files: 10,654 identities each, zero
-# disagreements, which is what a second parser over one tree is for.
+# REACH: over 500 files under tests/, some 41,000 definitions, 0 offenders;
+# `_REACH` carries the exact live numbers and
+# test_the_real_tree_verdict_ran_and_reports_its_reach reports them. The
+# traversal was reconciled against helm's existing authority on test
+# identities — vacuous_assertion's `_test_functions` — over the 241 files the
+# tree then held: 10,654 identities each, zero disagreements, which is what a
+# second parser over one tree is for.
 # WHAT IT STILL CANNOT SEE — stated here, in the code, because a blind spot
 # that lives only in a report is a blind spot nobody will meet again:
 #
@@ -1311,6 +1364,188 @@ class CollectedTwiceByDiscoverTest(unittest.TestCase):
         self.assertEqual(rc, 0, green)
         self.assertIn("OK", green, green)
         self.assertNotIn("test_planted_binder.py", green, green)
+
+
+# Every construct whose body binds in the enclosing scope, each holding a
+# def, plus a lambda that is no definition: 24 definitions by hand.
+_EVERY_SCOPE = '''\
+import unittest
+
+
+def top(): pass
+
+
+async def atop(): pass
+
+
+class Outer(unittest.TestCase):
+    def test_a(self):
+        def local(): pass
+
+        class Local:
+            def method(self): pass
+        return local, Local
+
+    class Inner:
+        async def ameth(self): pass
+
+
+async def agen():
+    async with ctx:
+        def in_async_with(): pass
+    async for i in xs:
+        def in_async_for(): pass
+
+
+if FLAG:
+    def branch_if(): pass
+elif OTHER:
+    def branch_elif(): pass
+else:
+    def branch_else(): pass
+try:
+    def in_try(): pass
+except ValueError:
+    def in_handler(): pass
+else:
+    def in_else(): pass
+finally:
+    def in_finally(): pass
+for i in xs:
+    def in_for(): pass
+else:
+    def in_for_else(): pass
+while cond:
+    def in_while(): pass
+else:
+    def in_while_else(): pass
+with ctx:
+    def in_with(): pass
+key = lambda x: x
+'''
+
+
+class CensusCostTest(unittest.TestCase):
+    """What the census costs, pinned at three causes that are not its questions.
+
+    The real-tree verdict runs at import in EVERY process that loads this
+    module, and the whole-suite gate runs one full discovery per worker, so
+    each worker pays it before its first test. Over 522 files on a 40-core
+    build node near idle, three things the census never asks about made that
+    import take 15.1 to 15.9 s, 92% of a worker's whole discovery, with
+    1.1 GiB of peak RSS:
+
+      * THE CYCLIC COLLECTOR. The parse builds millions of AST nodes and the
+        census holds them, so each full collection scans every node built so
+        far. The same parse takes 9.7 s with the collector on and 3.9 s with
+        it off. A parsed tree has no reference cycles, so a collection there
+        finds nothing to free.
+      * A SECOND WALK. Counting definitions by walking every node of every
+        tree again costs 3.2 s, for the definitions the scope walk already
+        visits.
+      * WHOLE TREES HELD. The collected-twice resolver reads module scope and
+        class bodies, never a function body; holding every tree whole until
+        it runs is where the peak RSS comes from.
+
+    Without the three, on the same node, the import takes 5.2 to 5.4 s with
+    173 MiB of peak RSS, and the census asks exactly what it asked: the same
+    522 files, the same definition count file for file, the same findings.
+    """
+
+    def test_the_census_parses_with_the_cyclic_collector_off(self):
+        """Every parse runs with the collector off, and the census hands it
+        back on, on success and when a parse raises."""
+        was = gc.isenabled()
+        gc.enable()
+        self.addCleanup(gc.enable if was else gc.disable)
+        states, real = [], ast.parse
+
+        def spy(source, *args, **kwargs):
+            states.append(gc.isenabled())
+            return real(source, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("test_one.py", "test_two.py"):
+                with open(os.path.join(tmp, name), "w",
+                          encoding="utf-8") as f:
+                    f.write("def helper(): pass\n")
+            with mock.patch.object(ast, "parse", spy):
+                result = census(collectible_test_files(tmp), tmp)
+        # POSITIVE CONTROL: the census read both files through the spy, so
+        # the recorded states are the census's own parses and not an empty
+        # list that any assertion over it would accept.
+        self.assertEqual(result["definitions"],
+                         {"test_one.py": 1, "test_two.py": 1})
+        self.assertEqual(states, [False, False],
+                         "the census parsed with the cyclic collector on")
+        self.assertTrue(gc.isenabled(),
+                        "the census left the cyclic collector off")
+
+        def broken(source, *args, **kwargs):
+            raise RuntimeError("planted parse failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "test_one.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("def helper(): pass\n")
+            with mock.patch.object(ast, "parse", broken):
+                with self.assertRaisesRegex(RuntimeError, "planted"):
+                    census(collectible_test_files(tmp), tmp)
+        self.assertTrue(gc.isenabled(),
+                        "a census that raised left the cyclic collector off")
+
+    def test_the_definition_count_is_every_def_ast_walk_finds(self):
+        """The count comes from the scope walk now, not a second walk of
+        every node; over a def in every construct the two must agree."""
+        sources = {"test_every_scope.py": (_EVERY_SCOPE, 24)}
+        if _MATCH is not None:
+            sources["test_match_scope.py"] = (
+                "match v:\n    case 1:\n        def f(): pass\n"
+                "    case _:\n        def g(): pass\n", 2)
+        if hasattr(ast, "TryStar"):
+            sources["test_trystar_scope.py"] = (
+                "try:\n    def f(): pass\nexcept* ValueError:\n"
+                "    def g(): pass\n", 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, (source, _count) in sources.items():
+                with open(os.path.join(tmp, name), "w",
+                          encoding="utf-8") as f:
+                    f.write(source)
+            result = census(collectible_test_files(tmp), tmp)
+        # POSITIVE CONTROL ON THE SAME OBSERVABLE: the census counts the
+        # hand count in the file that holds a def in every construct, so the
+        # agreement below is not two walks that both stopped seeing defs.
+        self.assertEqual(result["definitions"]["test_every_scope.py"], 24)
+        walked = {name: sum(1 for n in ast.walk(ast.parse(source))
+                            if isinstance(n, _DEFS))
+                  for name, (source, _count) in sources.items()}
+        self.assertEqual(walked["test_every_scope.py"], 24)
+        self.assertEqual(walked, {name: count for name, (_source, count)
+                                  in sources.items()})
+        self.assertEqual(result["definitions"], walked)
+
+    def test_the_resolver_is_handed_no_function_body(self):
+        """The resolver still finds the planted binding, from trees that no
+        longer carry a single function body."""
+        handed, real = [], _doubled_in_trees
+
+        def spy(trees):
+            handed.extend(trees.values())
+            return real(trees)
+
+        with mock.patch.object(sys.modules[__name__], "_doubled_in_trees",
+                               spy):
+            doubled, _foreign = planted_census({
+                "test_planted_base.py": _PLANTED_BASE,
+                "test_planted_binder.py": _PLANTED_BINDER})
+        # POSITIVE CONTROL: the finding is the one the whole trees gave, so
+        # what the resolver reads survived the reduction.
+        self.assertEqual(doubled, {"test_planted_binder.py": _BOUND})
+        bodies = [n.body for tree in handed for n in ast.walk(tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        self.assertEqual(len(bodies), 1, "the planted arm is one def")
+        self.assertEqual(bodies, [[]],
+                         "the resolver was handed a whole function body")
 
 
 if __name__ == "__main__":

@@ -22,10 +22,20 @@ Sections (headline-first; an empty section is omitted entirely):
                     (no cache -> "quota: run `helm creds`", never a probe)
   WAITING ON YOU  — estate-health gates and distinct fleet-filed owner asks,
                     including the board-recorded age of each ask
+
+THE MORNING REPORT (`--report`, task/3537) is the part of the owner's report
+that was written by hand: one plain line per LAND, its words from trunk's
+first-parent subjects (`plain_words`), its number from the LAND counter's
+land log (`autoland.land_log`), its gate from the receipt that passed its
+tree; every open owner ask, none folded; and a CHECKLIST it verifies, which
+prints a MISSING line for every LAND n..m no line carries, for trunk that no
+LAND number records, and for an open ask the report does not name.
+`--check FILE` holds a report written by hand to the same checklist.
 """
 import glob
 import json
 import os
+import re
 import sys
 import time
 
@@ -731,26 +741,469 @@ def render(b):
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------ morning report
+
+#: How many of trunk's first-parent commits the report reads, newest first. A
+#: bound, not a window: a recorded land past it reads MISSING, never absent.
+REPORT_SCAN = 2000
+#: A LAND's line carries each merge's first clause of plain words, up to
+#: MERGE_WORDS characters, for its first LAND_MERGES merges.
+MERGE_WORDS = 160
+LAND_MERGES = 8
+#: The widest "LAND a-b" a hand-written report may name as one range.
+RANGE_CAP = 500
+
+# A train merge's subject, as `helm train`, auto-land and the integrator
+# write it: "<train>: merge lane <lane>[ at [its retip ]<sha>][ (<detail>)]
+# [: <words>]".
+_MERGE_SUBJECT = re.compile(
+    r"\A(?P<train>[A-Za-z0-9][A-Za-z0-9._-]*): merge lane "
+    r"(?P<lane>[^\s:()]+)(?: at (?:its retip )?[0-9a-f]{7,40})?(?P<rest>.*)\Z")
+# A clause that says who built, held, patched or read a lane, its row, or
+# auto-land's priority-and-door label, never what it changed: where a
+# subject's plain words stop. The clause auto-land opens with a task's title
+# ("task/N: <title>") is that title's words, whatever verdict it names.
+_DOOR_LABEL = r"P(?:[0-9]+|\?), (?:not a door|a DOOR\b|doors UNKNOWN)"
+_TITLED = r"(?:task/[^\s:,;]+|no task): "
+_PROVENANCE = re.compile(
+    r"\A(?:(?:built|author|held|reviewer|re-read|patch|row|round)\b|"
+    + _DOOR_LABEL + r"|(?!" + _TITLED + r").*?\b(?:SOURCE-CLEAN|APPROVE)\b)")
+# Auto-land's detail for a car whose task has no title: labels, no words.
+_LABEL_ONLY = re.compile(r"\A(?:task/\S+|no task), " + _DOOR_LABEL)
+# "LAND 389", "LANDs 319-323", "LAND 376–377": the lands a report names.
+_LAND_NAMED = re.compile(
+    r"\bLANDs?\s+(\d{1,6})(?:\s*[-–]\s*(\d{1,6}))?(?!\d)")
+# A markdown table whose first column is the LAND number ("| Land | ...").
+_TABLE_HEAD = re.compile(r"\A\s*\|\s*land\s*\|", re.I)
+_TABLE_ROW = re.compile(r"\A\s*\|\s*(\d{1,6})\s*\|")
+
+
+def _closing(text, start):
+    """The index of the parenthesis that closes the one at `start`, or
+    None when it never closes."""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _clauses(text, short=False):
+    """`text`'s clauses up to the first that is provenance, rejoined; only
+    the first of them when `short`."""
+    kept = []
+    for clause in (text or "").split(";"):
+        clause = clause.strip()
+        if _PROVENANCE.search(clause):
+            break
+        if clause:
+            kept.append(clause)
+    return "; ".join(kept[:1] if short else kept)
+
+
+def _without_note(text):
+    """`text` without a trailing parenthesis that is a reader's note."""
+    text = text.rstrip()
+    if not text.endswith(")"):
+        return text
+    depth = 0
+    for i in range(len(text) - 1, -1, -1):
+        depth += {")": 1, "(": -1}.get(text[i], 0)
+        if depth == 0:
+            return text[:i] if _PROVENANCE.search(text[i:]) else text
+    return text
+
+
+def plain_words(subject, short=False):
+    """What a trunk subject says the land changed, in plain words: a train
+    merge's detail and words without the mechanics that merged it (`<train>:
+    merge lane <lane> at <sha>`) or the clauses that say who built, held or
+    read it; its lane first when the rest is only auto-land's labels, and
+    alone when that is all it says. Any other subject is its own plain
+    words. `short` keeps the first clause of the detail and of the words,
+    which is what a LAND's line carries."""
+    subject = " ".join(str(subject or "").split())
+    m = _MERGE_SUBJECT.match(subject)
+    if not m:
+        return (_clauses(subject, short) or subject) if short else subject
+    head, rest = "", m.group("rest")
+    if rest.startswith(" ("):
+        end = _closing(rest, 1)
+        head, rest = (rest[2:], "") if end is None \
+            else (rest[2:end], rest[end + 1:])
+    words = _clauses(_without_note(rest[1:] if rest.startswith(":")
+                                   else rest), short)
+    head, lane = _clauses(head, short), "lane %s" % m.group("lane")
+    if head and not words and _LABEL_ONLY.match(head):
+        return "%s: %s" % (lane, head)
+    return ("%s: %s" % (head, words) if head and words else head or words
+            or lane)
+
+
+def _gate_words(row, commit, receipts):
+    """The gate that passed a land: the one the land log recorded, else the
+    newest whole-suite OK receipt on the land's head or its exact tree."""
+    if row.get("gate"):
+        return "gate:%s%s" % (row["gate"], "" if row.get("ran") is None
+                              else " Ran %s" % row["ran"])
+    rows, why = receipts()
+    if why:
+        return "gate UNKNOWN (the receipts do not read: %s)" % why
+    hits = [r for r in rows if r.get("suite") is True
+            and r.get("status") == "OK" and not r.get("dirty")
+            and (r.get("head") == commit[0] or r.get("tree") == commit[1])]
+    if not hits:
+        return "no whole-suite receipt on its tree here"
+    best = max(hits, key=lambda r: str(r.get("ts") or ""))
+    return "gate:%s Ran %s" % (best.get("id"), best.get("ran"))
+
+
+def _receipts_once():
+    """A reader of the gate receipts that reads them at most once."""
+    got = []
+
+    def read():
+        if not got:
+            from . import gate
+            try:
+                rows, why, _skipped = gate.receipts()
+            except Exception as exc:  # noqa: BLE001 — a line, never a crash
+                rows, why = [], "%s: %s" % (type(exc).__name__, exc)
+            got.append((rows, why))
+        return got[0]
+    return read
+
+
+def _report_lands(repo, cutoff, first=None):
+    """The LANDED section and its two checklist items, read from trunk's
+    first-parent line, the land log and the gate receipts.
+
+    -> {repo, ref, published, error, log_error, first, last, lands: [{n,
+    sha, words, gate}], missing: [MISSING line], tail: [MISSING line]}.
+    `first` is the first LAND the report names; None takes the oldest land
+    the log records inside the window, or the number just past the nearest
+    lower land trunk carries when that is earlier. A LAND's merges are trunk's
+    first-parent commits after the nearest lower land trunk carries, up to
+    and including its own head, so a number the log never recorded reads
+    MISSING and its merges read under the next number it did."""
+    from . import autoland, vcs
+    from .work import _lanes
+    out = {"repo": repo, "ref": None, "published": True, "error": None,
+           "log_error": None, "first": first, "last": None, "lands": [],
+           "missing": [], "tail": []}
+    root = _lanes.find_root(repo)
+    if not root:
+        out["error"] = "%s is not inside a git repository" % repo
+        return out
+    v = vcs.backend(root)
+    ref = out["ref"] = v.trunk_ref(root)
+    out["published"] = v.text(root, "rev-parse", "--verify", "--quiet",
+                              "refs/remotes/" + ref)[0] == 0
+    rc, text, err = v.text(root, "log", ref, "--first-parent", "-n",
+                           str(REPORT_SCAN), "--format=%H%x09%T%x09%ct%x09%s")
+    if rc != 0:
+        out["error"] = ((err or "git log failed").splitlines() or ["?"])[0]
+        return out
+    commits = [tuple(line.split("\t", 3)) for line in text.splitlines()
+               if line.count("\t") >= 3]
+    recorded, out["log_error"] = autoland.land_log(root)
+    if not recorded:
+        out["tail"].append(
+            "MISSING LAND numbers: no land-log line or LAND counter records "
+            "a land of this repository; `helm train auto seed <n> <sha>` "
+            "records the last land")
+        return out
+    at, place = {c[0]: i for i, c in enumerate(commits)}, {}
+    for n, row in recorded.items():
+        sha = str(row["sha"])
+        place[n] = at.get(sha) if len(sha) == 40 else next(
+            (i for i, c in enumerate(commits) if c[0].startswith(sha)), None)
+    last = out["last"] = max(recorded)
+    if first is None:
+        inside = [n for n, i in place.items()
+                  if i is not None and int(commits[i][2]) >= cutoff]
+        first = min(inside) if inside else None
+        # the range opens just past the nearest lower land trunk carries: a
+        # land no line records at the window's edge (a hand land nobody
+        # seeded) reads MISSING below, never a range that starts past it
+        below = [n for n, i in place.items()
+                 if i is not None and first is not None and n < first]
+        first = out["first"] = max(below) + 1 if below else first
+    receipts = _receipts_once()
+    unrecorded = []
+    for k in range(first, last + 1) if first is not None else ():
+        row, idx = recorded.get(k), place.get(k)
+        if row is None:
+            unrecorded.append(k)
+            continue
+        if idx is None:
+            out["missing"].append((k, (
+                "MISSING LAND %d: its recorded head %s is not on %s's "
+                "first-parent line (the newest %d commits); `helm train auto "
+                "seed %d <its head>` corrects it"
+                % (k, str(row["sha"])[:12], ref, REPORT_SCAN, k))))
+            continue
+        # its merges stop at the nearest lower land from `first - 1` on that
+        # trunk carries: a gap inside the range reads MISSING above, and one
+        # below it would be a land no line names, so the head stands alone
+        older = [place[j] for j in range(first - 1, k)
+                 if place.get(j) is not None and place[j] > idx]
+        span = range(idx, min(older)) if older else [idx]
+        words = []
+        for i in reversed(list(span)):
+            said = _clip(pk.launder(plain_words(commits[i][3], short=True)),
+                         MERGE_WORDS)
+            if said not in words:
+                words.append(said)
+        more = len(words) - LAND_MERGES
+        tail = " (+%d more merge%s)" % (more, "s"[:more != 1]) \
+            if more > 0 else ""
+        if not older:
+            tail += (" (merges before its head not shown: LAND %d is not "
+                     "recorded on this trunk)" % (k - 1))
+        out["lands"].append({"n": k, "sha": commits[idx][0],
+                             "words": "; ".join(words[:LAND_MERGES]) + tail,
+                             "gate": _gate_words(row, commits[idx],
+                                                 receipts)})
+    for a, b in _runs(unrecorded):
+        out["missing"].append((a, (
+            "MISSING LAND %d: no land-log line records its head, so its "
+            "merges read under the next LAND that is recorded; `helm train "
+            "auto seed %d <its head>` records it" % (a, a)) if a == b else (
+            "MISSING LANDs %d-%d: no land-log line records their heads, so "
+            "their merges read under the next LAND that is recorded; `helm "
+            "train auto seed <n> <its head>` records each" % (a, b))))
+    out["missing"] = [text for _k, text in sorted(out["missing"])]
+    top = place.get(last)
+    if top is None and (first is None or first > last):
+        out["tail"].append(
+            "MISSING LAND %d: its recorded head %s is not on %s's "
+            "first-parent line, so what trunk carries past it is UNKNOWN; "
+            "`helm train auto seed %d <its head>` corrects it"
+            % (last, str(recorded[last]["sha"])[:12], ref, last))
+    elif top:
+        newest = commits[0]
+        out["tail"].append(
+            "MISSING LAND %d: trunk carries %d merge%s past LAND %d that no "
+            "LAND number records (newest %s: %s); `helm train auto seed %d "
+            "%s` records it when they are one land"
+            % (last + 1, top, "s"[:top != 1], last, newest[0][:12],
+               _clip(pk.launder(plain_words(newest[3], short=True)),
+                     MERGE_WORDS),
+               last + 1, newest[0][:12]))
+    return out
+
+
+def _clip(text, width):
+    return text if len(text) <= width else text[:width - 1].rstrip() + "…"
+
+
+def _runs(numbers):
+    """The consecutive runs in `numbers`, as (first, last) pairs."""
+    runs = []
+    for n in sorted(numbers):
+        if runs and n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    return [tuple(r) for r in runs]
+
+
+def morning_report(hours=12.0, repo=None, first=None):
+    """(text, rc): the morning report and its checklist; rc is 1 when any
+    checklist line is MISSING or UNKNOWN, else 0."""
+    now = time.time()
+    repo = repo or os.getcwd()
+    got = _report_lands(repo, now - hours * 3600, first)
+    asks, asks_err = _owner_asks(now)
+    where = "%s%s" % (got["ref"] or repo, "" if got["published"] else
+                      " (a LOCAL ref: local history is not proof of "
+                      "publication)")
+    ranged = got["first"] is not None and got["last"] is not None \
+        and got["first"] <= got["last"]
+    span = ("LANDs from %d to %d" % (got["first"], got["last"]) if ranged
+            else "no LAND")
+    lines = ["helm morning report — %s — %s on %s (last %gh)"
+             % (pk.now_ts(), span, where, hours), "", "LANDED"]
+    if got["error"]:
+        lines.append("  trunk unreadable: %s" % got["error"])
+    for land in got["lands"]:
+        lines.append("  LAND %d: %s — %s · %s" % (
+            land["n"], land["words"], land["gate"], land["sha"][:11]))
+    if not got["lands"] and not got["error"]:
+        lines.append("  none in the last %gh%s" % (
+            hours, "; the last recorded is LAND %d" % got["last"]
+            if got["last"] is not None else ""))
+    lines += ["", "WAITING ON YOU — %s" % (
+        "UNKNOWN: " + str(asks_err) if asks_err else
+        "%d open owner ask%s" % (len(asks), "s"[:len(asks) != 1]))]
+    for rec in asks:
+        age = _age_s(rec.get("age_s")) if rec.get("age_known") \
+            else "age unknown"
+        lines.append("  - %s · %s%s" % (
+            age, rec.get("plain_title") or rec.get("title") or "owner input",
+            " — " + _clip(rec["detail"], 160) if rec.get("detail") else ""))
+    bad = 0
+    lines += ["", "CHECKLIST"]
+    if got["error"] or got["log_error"]:
+        bad += 1
+        lines.append("  every LAND present: UNKNOWN (%s)" % (
+            got["error"] or "the land log does not read: %s"
+            % got["log_error"]))
+    if not got["error"]:
+        items = (("every LAND from %d to %d present" % (got["first"],
+                                                        got["last"])
+                  if ranged else "every LAND present (none in the window)",
+                  got["missing"]),
+                 ("no trunk merge past the last LAND without a number",
+                  got["tail"]))
+        for item, missing in items:
+            bad += bool(missing)
+            lines.append("  %s: %s" % (item, "MISSING %d" % len(missing)
+                                       if missing else "OK"))
+            lines += ["    " + m for m in missing]
+    bad += bool(asks_err)
+    lines.append("  every open owner ask present: %s" % (
+        "UNKNOWN (%s)" % asks_err if asks_err else "OK (%d)" % len(asks)))
+    return "\n".join(lines), 1 if bad else 0
+
+
+def lands_named(text):
+    """The LAND numbers a report names: "LAND n", "LANDs a-b" (a hyphen or
+    an en dash, at most RANGE_CAP wide) and the first cell of a table whose
+    header's first cell is "Land". A line that says MISSING names no land:
+    a checklist's word for a land is not the land."""
+    named, table = set(), False
+    for line in (text or "").splitlines():
+        if line.strip().lstrip("-*•> ").startswith("MISSING"):
+            continue
+        if _TABLE_HEAD.match(line):
+            table = True
+            continue
+        table = table and line.lstrip().startswith("|")
+        row = _TABLE_ROW.match(line) if table else None
+        if row:
+            named.add(int(row.group(1)))
+        for m in _LAND_NAMED.finditer(line):
+            a = int(m.group(1))
+            b = int(m.group(2)) if m.group(2) else a
+            named.update(range(a, b + 1 if a <= b <= a + RANGE_CAP
+                               else a + 1))
+    return named
+
+
+def check_report(text, repo=None, first=None):
+    """(lines, rc): `text`, a report written by hand, held to the morning
+    report's checklist. Every LAND from `first` (else the first it names)
+    to the last it names, or the land log's last when that is later, must
+    be named, and every open owner ask's title must appear in it; each one
+    that is not prints MISSING, and an owner queue that does not read is
+    UNKNOWN. rc is 1 on any MISSING or UNKNOWN."""
+    from . import autoland
+    from .work import _lanes
+    repo = repo or os.getcwd()
+    named = lands_named(text)
+    lines, bad, log_last = [], 0, None
+    root = _lanes.find_root(repo)
+    if root:
+        recorded, why = autoland.land_log(root)
+        log_last = max(recorded) if recorded else None
+        if why:
+            bad += 1
+            lines.append("UNKNOWN land log: it reads in part (%s), so its "
+                         "last LAND may be later" % why)
+    else:
+        lines.append("the land log is not read: %s is not inside a git "
+                     "repository" % repo)
+    lo = first if first is not None else min(named) if named else None
+    hi = max([n for n in (max(named) if named else None, log_last)
+              if n is not None] or [None])
+    if lo is None or hi is None:
+        bad += 1
+        lines.append("UNKNOWN LANDs: the report names none; `--from N` "
+                     "names the first it should")
+    else:
+        lines.insert(0, "every LAND from %d to %d%s" % (
+            lo, hi, " (the land log's last)" if log_last == hi
+            and (not named or hi > max(named)) else ""))
+        for a, b in _runs(k for k in range(lo, hi + 1) if k not in named):
+            bad += 1
+            lines.append("MISSING LAND %d" % a if a == b
+                         else "MISSING LANDs %d-%d" % (a, b))
+    asks, asks_err = _owner_asks(time.time())
+    flat = " ".join(text.lower().split())
+    if asks_err:
+        bad += 1
+        lines.append("UNKNOWN owner asks: %s" % asks_err)
+    for rec in asks:
+        title = rec.get("plain_title") or rec.get("title") or ""
+        if " ".join(title.lower().split()) not in flat:
+            bad += 1
+            lines.append("MISSING owner ask: %s" % title)
+    lines.append("CHECKLIST: %s" % ("%d not OK" % bad if bad else "OK"))
+    return lines, 1 if bad else 0
+
+
+USAGE = ("helm brief [--hours N] [--json] | --report [--hours N] [--from N] "
+         "[--repo PATH] | --check FILE [--from N] [--repo PATH]")
+
+
 def cmd_brief(args):
     """brief [--hours N] [--json] — the operator's morning brief: session
     activity, trunk lands (the WHAT WE BUILT gauge, read from the repo the
     brief is asked from), knowledge delta, cached seat reality, owner gates.
-    Read-only, never probes the network."""
+    Read-only, never probes the network. `--report` prints the morning report
+    and its checklist, `--check FILE` holds a report written by hand to that
+    checklist; both exit 1 on a MISSING or UNKNOWN line."""
     # flags-only membership reader — guard the tail before compose():
     # `brief --bogus` silently rendered the brief and exited 0.
     from .cli import guard_tail
-    rc = guard_tail("helm brief", args, flags=("--json",),
-                    valued=("--hours",),
-                    usage="brief [--hours N] [--json]")
+    rc = guard_tail("helm brief", args, flags=("--json", "--report"),
+                    valued=("--hours", "--check", "--from", "--repo"),
+                    usage=USAGE)
     if rc is not None:
         return rc
-    hours = 12.0
-    if "--hours" in args:
+    opts = {a: args[i + 1] for i, a in enumerate(args)
+            if a in ("--hours", "--check", "--from", "--repo")}
+    # one mode; --from and --repo only beside --report or --check, and a
+    # hand-written report has no window
+    modes = [a for a in ("--json", "--report", "--check") if a in args]
+    scoped = "--from" in opts or "--repo" in opts
+    if len(modes) > 1 or scoped and modes in ([], ["--json"]) \
+            or "--check" in opts and "--hours" in opts:
+        print("usage: " + USAGE, file=sys.stderr)
+        return 2
+    hours, first = 12.0, None
+    try:
+        if "--hours" in opts:
+            hours = float(opts["--hours"])
+        if "--from" in opts:
+            first = int(opts["--from"])
+    except ValueError:
+        print("usage: " + USAGE, file=sys.stderr)
+        return 2
+    if "--report" in args:
+        text, rc = morning_report(hours=hours, repo=opts.get("--repo"),
+                                  first=first)
+        print(text)
+        return rc
+    if "--check" in opts:
         try:
-            hours = float(args[args.index("--hours") + 1])
-        except (IndexError, ValueError):
-            print("usage: helm brief [--hours N] [--json]", file=sys.stderr)
-            return 2
+            with open(opts["--check"], encoding="utf-8",
+                      errors="replace") as fh:
+                text = fh.read()
+        except OSError as exc:
+            print("helm brief: %s does not read (%s)" % (opts["--check"],
+                                                        exc), file=sys.stderr)
+            return 1
+        lines, rc = check_report(text, repo=opts.get("--repo"), first=first)
+        print("helm brief --check %s" % opts["--check"])
+        print("\n".join(lines))
+        return rc
     b = compose(hours=hours)
     if "--json" in args:
         print(json.dumps(b, indent=2, ensure_ascii=False))

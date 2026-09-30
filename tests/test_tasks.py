@@ -1020,6 +1020,40 @@ class ClaimIncumbentTest(CliBase):
         self.assertIn("no incumbent-owner authority", err)
         self.assertEqual(self.filed("kimi's work")["owner"], "kimi")
 
+    def test_claim_refuses_unknown_flags_and_leaves_row_untouched(self):
+        """task/2269 — `helm task claim <id> --seat X` silently drops the
+        unknown flag and claims the row for the current seat. After --force
+        was refused on its own door, the next door (owner, then update) must
+        NOT silently swallow what is left: it refuses, names the flag, and
+        leaves the row UNTOUCHED. The house pattern from `list` (consume own
+        flags, then check leftovers) is applied here."""
+        # (a) --seat is an unknown flag: exits 2, stderr names it, row unchanged.
+        rc, _o, err = self.cli("add", "free task a")
+        self.assertEqual(rc, 0, err)
+        row_a = self.filed("free task a")
+        rc, _o, err = self.cli("claim", row_a["id"], "--seat", "qwen27")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("--seat", err)
+        self.assertIsNone(self.filed("free task a")["owner"])
+        self.assertEqual(self.filed("free task a")["status"], "open")
+        # (b) stray word (non-flag): exits 2, stderr mentions it, row unchanged.
+        rc, _o, err = self.cli("add", "free task b")
+        self.assertEqual(rc, 0, err)
+        row_b = self.filed("free task b")
+        rc, _o, err = self.cli("claim", row_b["id"], "some-stray-word")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("some-stray-word", err)
+        self.assertIsNone(self.filed("free task b")["owner"])
+        self.assertEqual(self.filed("free task b")["status"], "open")
+        # (c) control: --owner SEAT still works (exit 0, owner set to SEAT).
+        rc, _o, err = self.cli("add", "free task c")
+        self.assertEqual(rc, 0, err)
+        row_c = self.filed("free task c")
+        rc, out, err = self.cli("claim", row_c["id"], "--owner", "qwen27")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.filed("free task c")["owner"], "qwen27")
+        self.assertEqual(self.filed("free task c")["status"], "in_progress")
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -4647,7 +4681,9 @@ class TaskRowsRecordTheirFilingSessionAsAUDITONLYTest(TasksBase):
         hand-edit or a foreign writer would — never through update(), which
         refuses the field by design and is the thing under test."""
         out = []
-        for ln in open(self.path, encoding="utf-8").read().splitlines():
+        with open(self.path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        for ln in lines:
             try:
                 obj = json.loads(ln)
             except ValueError:
@@ -4656,7 +4692,8 @@ class TaskRowsRecordTheirFilingSessionAsAUDITONLYTest(TasksBase):
             if obj.get("id") == tid:
                 obj["reported_session"] = value
             out.append(json.dumps(obj))
-        open(self.path, "w", encoding="utf-8").write("\n".join(out) + "\n")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out) + "\n")
 
 
 class CloseReasonUsesTheSameDoorTest(CliBase):
@@ -5379,3 +5416,139 @@ class ExpectedRowTest(TasksBase):
                                  path=self.path, expect=current)
         self.assertIsNone(err, err)
         self.assertEqual(len(got["comments"]), 2)
+
+
+class OwnerCommentDoorTest(CliBase):
+    """D1 of the goal-ledger design: the owner's note on a task was stored
+    with NO author. The web door called `tasks.comment(rid, text)`, so every
+    note he typed on the backlog landed as `by: None`, and `helm task show`
+    printed it as `?` — task/2435's "omg get this live!!!" among them. The
+    decision card's door has recorded `by: owner, door: web` since task/2997;
+    a task comment now takes the same OwnerDoor and records the same shape.
+
+    The 586 old unattributed comments are NOT rewritten. They render as
+    LEGACY, which is the truth about them: they were written before this
+    store recorded who wrote a web note."""
+
+    OWNER_ENV = {"HELM_CHAT_OWNER_NAMES": "daria"}
+
+    def test_an_owner_door_comment_records_the_owner_and_his_door(self):
+        from helm import ownerasks
+        row = self.file("get the goal ledger live", "seat-a")
+        got, err = tasks.comment(row["id"], "omg get this live!!!",
+                                 by=ownerasks.owner_door("web"),
+                                 path=self.path)
+        self.assertIsNone(err, err)
+        last = got["comments"][-1]
+        self.assertEqual((last["by"], last["door"]), ("owner", "web"))
+        stored = tasks.rows(path=self.path)[row["id"]]["comments"][-1]
+        self.assertEqual((stored["by"], stored["door"]), ("owner", "web"))
+        # CONTROL, same row, same writer: a seat's comment records the seat,
+        # and its door is recorded as none rather than left out, so a comment
+        # written from now on is told apart from a legacy one.
+        got, err = tasks.comment(row["id"], "on it", by="seat-a",
+                                 path=self.path)
+        self.assertIsNone(err, err)
+        self.assertEqual(got["comments"][-1]["by"], "seat-a")
+        self.assertIn("door", got["comments"][-1])
+        self.assertIsNone(got["comments"][-1]["door"])
+
+    def test_a_caller_stated_owner_name_is_refused_and_writes_nothing(self):  # noqa: VACUOUS_ASSERTION — the unchanged line count is the refusal contract; the seat comment at the end grows the SAME ledger by one line, the unconditional positive control
+        row = self.file("a row the owner cares about", "seat-a")
+        before = len(self.lines())
+        with mock.patch.dict(os.environ, self.OWNER_ENV):
+            for forged in ("owner", "Owner", "daria"):
+                got, err = tasks.comment(row["id"], "in his voice",
+                                         by=forged, path=self.path)
+                self.assertIsNone(got, forged)
+                self.assertIn("owner's name", err, forged)
+                self.assertIn("web", err, "the refusal names his door")
+        self.assertEqual(len(self.lines()), before, "nothing was written")
+        got, err = tasks.comment(row["id"], "in a seat's voice",
+                                 by="seat-a", path=self.path)
+        self.assertIsNone(err, err)
+        self.assertEqual(len(self.lines()), before + 1)
+
+    def test_the_author_label_tells_legacy_from_owner_from_seat(self):
+        label = tasks.comment_author
+        self.assertEqual(label({"ts": 1.0, "text": "x", "by": None}),
+                         "legacy: no author recorded")
+        self.assertEqual(label({"ts": 1.0, "text": "x", "by": None,
+                                "door": None}), "no author recorded")
+        self.assertEqual(label({"ts": 1.0, "text": "x", "by": "owner",
+                                "door": "web"}), "owner (web)")
+        self.assertEqual(label({"ts": 1.0, "text": "x", "by": "seat-a",
+                                "door": None}), "seat-a")
+        self.assertEqual(label({"ts": 1.0, "text": "x", "by": "seat-a"}),
+                         "seat-a")
+
+    def test_show_renders_a_legacy_comment_as_legacy_never_a_question_mark(self):  # noqa: VACUOUS_ASSERTION — the '?' absence rides the two assertIn arms on the same output, which prove both comments were printed
+        from helm import eventledger, ownerasks
+        self.cli("add", "legacy carrier", "--mine")
+        tid = self.filed("legacy carrier")["id"]
+        # THE LIVE SHAPE, PLANTED: a comment row as the old web door wrote it
+        planted = dict(tasks.rows(path=tasks.ledger_path())[tid])
+        planted["comments"] = [{"ts": 1758000000.0,
+                                "text": "omg get this live!!!", "by": None}]
+        self.assertTrue(eventledger.append(tasks.ledger_path(), planted))
+        _got, err = tasks.comment(tid, "and now it is",
+                                  by=ownerasks.owner_door("web"))
+        self.assertIsNone(err, err)
+        rc, out, err = self.cli("show", tid)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("legacy: no author recorded: omg get this live!!!", out)
+        self.assertIn("owner (web): and now it is", out)
+        self.assertNotIn("?: omg", out)
+
+    def test_a_caller_stated_owner_label_is_refused_like_his_name(self):  # noqa: VACUOUS_ASSERTION — the unchanged line count is the refusal contract; the seat comment at the end grows the SAME ledger by one line, the unconditional positive control
+        """THE LABEL IS THE NAME'S SIBLING. `comment_author` renders the
+        owner's note as "owner (web)", so a caller-stated `by` that already
+        reads that way ("owner (web)", "owner(web)", his handle with a door)
+        passed the name refusal and printed byte-identical to his own note on
+        `helm task show` and the notes route. The leading token of a stated
+        author is judged as the name is."""
+        row = self.file("a row the owner cares about", "seat-a")
+        before = len(self.lines())
+        with mock.patch.dict(os.environ, self.OWNER_ENV):
+            for forged in ("owner (web)", "owner(web)", "Owner  (phone)",
+                           "daria (web)"):
+                got, err = tasks.comment(row["id"], "in his voice",
+                                         by=forged, path=self.path)
+                self.assertIsNone(got, forged)
+                self.assertIn("owner's name", err, forged)
+        self.assertEqual(len(self.lines()), before, "nothing was written")
+        got, err = tasks.comment(row["id"], "in a seat's voice",
+                                 by="seat-a", path=self.path)
+        self.assertIsNone(err, err)
+        self.assertEqual(len(self.lines()), before + 1)
+        self.assertEqual(tasks.comment_author(got["comments"][-1]), "seat-a")
+
+    def test_a_control_prefixed_owner_label_cannot_reshape_the_author(self):  # noqa: VACUOUS_ASSERTION — unchanged line count pins the refused write; the sibling test's ordinary seat comment is the positive control on this door
+        """A terminal control before `owner (web)` must not evade the leading-
+        token check and then erase the real prefix when the comment renders."""
+        row = self.file("a row the owner cares about", "seat-a")
+        before = len(self.lines())
+        forged = "\x1b[2K\rowner (web)"
+        got, err = tasks.comment(row["id"], "in his voice", by=forged,
+                                 path=self.path)
+        self.assertIsNone(got)
+        self.assertIn("exact seat token", err)
+        self.assertEqual(len(self.lines()), before)
+
+    def test_an_at_prefixed_owner_name_is_refused_not_canonicalized_to_his(self):  # noqa: VACUOUS_ASSERTION — the unchanged line count is the refusal contract; the '@seat-a' comment at the end grows the SAME ledger by one line and records 'seat-a', the positive control
+        """Canonicalizing a stated author strips a leading '@'. A check on the
+        typed string alone let '@owner' through and wrote 'owner'."""
+        row = self.file("a row the owner cares about", "seat-a")
+        before = len(self.lines())
+        with mock.patch.dict(os.environ, self.OWNER_ENV):
+            for forged in ("@owner", "@Owner", "@@owner", " @daria"):
+                got, err = tasks.comment(row["id"], "in his voice",
+                                         by=forged, path=self.path)
+                self.assertIsNone(got, forged)
+                self.assertIn("owner's name", err, forged)
+        self.assertEqual(len(self.lines()), before, "nothing was written")
+        got, err = tasks.comment(row["id"], "in a seat's voice",
+                                 by="@seat-a", path=self.path)
+        self.assertIsNone(err, err)
+        self.assertEqual(len(self.lines()), before + 1)
+        self.assertEqual(got["comments"][-1]["by"], "seat-a")

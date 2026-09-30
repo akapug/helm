@@ -25,6 +25,9 @@ APPROVE while NONE of the unusable seats was busy reviewing anything.
 Eligibility was hand-computed three times in one night, each time after a
 routing mistake, and each time from a DIFFERENT SURFACE that no verb joined:
 
+    input   whether the seat's RESOLVED model reads as input only
+            (codex-spark, gemini, a local model, Sonnet, Haiku). The seat lists under INPUT,
+            apart from both other blocks, and never approves.
     tier    the approval-tier policy in the typed store. A seat outside it is
             a valid reviewer whose findings are INPUT; its APPROVE cannot
             close the row.
@@ -35,8 +38,8 @@ routing mistake, and each time from a DIFFERENT SURFACE that no verb joined:
     chain   whether this seat is already recorded as an author of this chain.
             A contributor's APPROVE is not an independent read.
     awake   whether helm can reach the seat and the seat can complete a turn:
-            a gone pane, a DEAF seat with no live beacon, a dark vendor, a
-            starved or hung turn.
+            a gone pane, a DEAF seat with no live beacon, a RESTING seat the
+            owner paused, a dark vendor, a starved or hung turn.
     budget  whether the credential pool underneath the seat can still pay.
     idle    whether the seat is between turns right now — the pane fact the
             owner reads by looking.
@@ -132,6 +135,7 @@ all about the other six.
 """
 
 import json
+import re
 import sys
 import time
 
@@ -139,6 +143,7 @@ import time
 # the vocabulary
 # ---------------------------------------------------------------------------
 
+INPUT = "input"
 TIER = "tier"
 MINT = "mint"
 CHAIN = "chain"
@@ -148,12 +153,18 @@ PANE = "pane"
 IDLE = "idle"
 
 # THE LADDER ORDER IS THE ARGUMENT — see the module docstring. Repair distance
-# descending: policy, recorded authorship, reachability, money, a dead pane,
-# the clock.
-LADDER = (TIER, MINT, CHAIN, AWAKE, BUDGET, PANE, IDLE)
+# descending: the resolved model, policy, recorded authorship, reachability,
+# money, a dead pane, the clock.
+LADDER = (INPUT, TIER, MINT, CHAIN, AWAKE, BUDGET, PANE, IDLE)
 
 ELIGIBLE = "ELIGIBLE"
 EXCLUDED = "EXCLUDED"
+# A THIRD STATE, NOT AN EXCLUSION: an input-only model's read is cheap INPUT,
+# never the approving read, and it prints in its own block.
+INPUT_ONLY = "INPUT"
+_SPARK = re.compile(r"(?:^|[^a-z])spark(?:[^a-z]|$)")
+# Owner: "Sonnet and Haiku never review anything".
+_NEVER_REVIEWS = re.compile(r"(?:^|[^a-z])(sonnet|haiku)(?:[^a-z]|$)")
 
 # The shapes of "awake says no". These are LABELS for a verdict seat_usability
 # already reached, read off the same row fields its own ladder reads, in the
@@ -357,6 +368,106 @@ def _read_pane(seat, liveness=None):
     return row, None
 
 
+def read_model(seat, runtime_model=None, at=None):
+    """The seat's RESOLVED model through `dispatches._runtime_model`, the
+    resolver the approval tier reads, or None. A native claude seat's comes
+    from its own transcript (task/3508). `at` is a RECORDED read's moment (a
+    hold, a verdict), judged on the model in force then; None is routing,
+    the newest turn, and asks the resolver with the seat alone, so a
+    one-argument seam still serves it."""
+    from . import dispatches
+    fn = runtime_model or dispatches._runtime_model
+    try:
+        model = fn(seat) if at is None else fn(seat, at=at)
+    except Exception:                                   # noqa: BLE001
+        return None
+    return model if isinstance(model, str) and model.strip() else None
+
+
+#: What `read_context` answers for a seat whose window is only ASSUMED.
+CONTEXT_WINDOW_UNPROVEN = "window unproven"
+
+
+def read_context(seat):
+    """The seat's context percent, or None where `autocompact.read` cannot tie
+    its reading to the live pane (its own unmeasured words say why).
+
+    A PERCENTAGE OF AN ASSUMED WINDOW IS NOT A READING (task/3534): a row
+    autocompact marks `window-unproven` answers CONTEXT_WINDOW_UNPROVEN, a str
+    naming why the context is UNKNOWN. `context_bucket` ranks any non-number
+    in the unknown middle bucket, and `split_context` turns the answer into
+    the (percent, why-unknown) pair a report row carries."""
+    from . import autocompact
+    try:
+        row = autocompact.read(seat) or {}
+    except Exception:                                   # noqa: BLE001
+        return None
+    if row.get("status") == "window-unproven" or (
+            row.get("window_src") == autocompact.ASSUMED_WINDOW_SRC
+            and _number(row.get("pct"))):
+        return CONTEXT_WINDOW_UNPROVEN
+    if row.get("unmeasured_why") or row.get("status") in (
+            "session-mismatch", "proxy-log-unattributed"):
+        return None
+    return row.get("pct") if _number(row.get("pct")) else None
+
+
+def split_context(answer):
+    """(percent or None, why-unknown or None) from one context answer."""
+    return (None, answer) if isinstance(answer, str) else (answer, None)
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def queue_bucket(holding):
+    """0 holds no row, 1 holds one, 2 UNREADABLE, 3 holds two or more. AN
+    UNREAD COUNT IS ITS OWN MIDDLE BUCKET, NEVER 0: reading it as idle would
+    route to the seat nobody measured, and reading it as piled would bury it."""
+    if not _number(holding):
+        return 2
+    return 0 if holding <= 0 else 1 if holding == 1 else 3
+
+
+def context_bucket(pct, threshold):
+    """0 under `autocompact.threshold_pct()`, 1 UNREADABLE (a None, or the
+    str `read_context` names an unknown context with), 2 at or above."""
+    return 1 if not _number(pct) else 2 if pct >= threshold else 0
+
+
+def input_only(model, family=None):
+    """(True | False | None, why) — is this resolved model's read INPUT only?
+
+    The tier is judged on the RESOLVED MODEL (the owner's approval-tier
+    ruling, route's E3): codex-spark, gemini, local, Sonnet and Haiku models
+    never approve,
+    and the FAMILY-KEYED tier check passes a spark seat as codex. An
+    UNREADABLE model is None (a caveat) only where the family serves spark."""
+    from . import burnflags, dispatches, seat as _seat
+    key = dispatches._model_key(model)
+    fam = (dispatches._model_family(model) if key else None) or family
+    if _SPARK.search(key):
+        return True, "resolved model %s is codex-spark" % model
+    if _NEVER_REVIEWS.search(key):
+        return True, ("resolved model %s is %s, which never reviews"
+                      % (model, _NEVER_REVIEWS.search(key).group(1)))
+    if fam == "gemini" or key.startswith("gemini"):
+        return True, "resolved model %s is gemini" % (model or "UNREADABLE")
+    if fam in burnflags.local_families():
+        return True, "resolved model %s is local (%s)" % (
+            model or "UNREADABLE", fam)
+    if key:
+        return False, None
+    entry = _seat.FAMILIES.get(family) if family else None
+    served = dispatches._catalog_models(entry) if isinstance(entry, dict) \
+        else ()
+    if family is None or any(_SPARK.search(m) for m in served):
+        return None, ("resolved model UNREADABLE: helm cannot rule out "
+                      "codex-spark on family %s" % (family or "UNRESOLVED"))
+    return False, None
+
+
 # ---------------------------------------------------------------------------
 # the rungs — each returns (verdict, detail) where verdict is
 # "pass" | "exclude" | "unknown". `_rung_mint` returns a third value because
@@ -430,19 +541,41 @@ def _rung_mint(seat, identity_families=None):
         frozenset(families or ())
 
 
-def _rung_chain(seat, wrote, wrote_why):
-    """Is this seat already recorded as an author of this chain?
+def _rung_input(model, family):
+    """INPUT when the resolved model's read is input only; a NOTE when the
+    model is unreadable, because an unread model is a caveat, never a
+    refusal."""
+    verdict, why = input_only(model, family)
+    if verdict:
+        return "input", ("%s: its read is cheap INPUT, never the approving "
+                         "read" % why)
+    return "pass", why
 
-    RECORDED CONTRIBUTORS ARE SUBMISSION PROVENANCE, not proven Git
-    authorship, and the comparison is `landreq._same_seat` — the one shared
-    rule, whose fallback errs toward calling two spellings the SAME seat. In
-    this direction that is the conservative error: it can only ADD an
-    exclusion, never quietly admit a contributor as an outsider.
+
+def _rung_chain(seat, wrote, wrote_why, sender=None):
+    """Is this seat recorded as having written code in the row's chain?
+
+    `chain_contributors` is the one authorship answer every review door reads:
+    a row sender that only asked for a read wrote nothing, while a builder,
+    a patch author or the first bringer of a tip the chain reads stays
+    excluded (`landreq.chain_writers`). The row-local sender is the
+    fallback only where that join names no writer (`landreq._unjoined_author`),
+    matching the source-clean, readiness, non-author and fresh-context doors.
+
+    RECORDED CONTRIBUTORS ARE SUBMISSION PROVENANCE, not proven Git authorship,
+    and the comparison is `landreq._same_seat` — the shared rule whose fallback
+    errs toward calling two spellings the SAME seat. In this direction that
+    conservative error can only add an exclusion, never quietly admit a
+    contributor as an outsider.
     """
+    from . import landreq
     if wrote is None:
         return "unknown", wrote_why
-    from . import landreq
-    for name in sorted(wrote):
+    names = set(wrote)
+    author = landreq._unjoined_author(sender, wrote)
+    if author:
+        names.add(author)
+    for name in sorted(names):
         if landreq._same_seat(name, seat):
             return "exclude", ("recorded on this chain as an author (as %r) — "
                                "a contributor's APPROVE is not the independent "
@@ -484,6 +617,12 @@ def _rung_awake(seat, row, join_why):
         return "unknown", (join_why or "no joined usability row for this seat")
     can = row.get("can_take_work")
     from . import seat_usability
+    if can is False and isinstance(row.get("rest"), dict):
+        # RESTING IS NAMED IN ITS OWN WORDS (task/3280): the owner paused
+        # this seat, so it is neither waited on nor repaired, and the reason
+        # already opens with RESTING (or UNKNOWN for a record helm cannot
+        # read), so no shape label is put in front of it.
+        return "exclude", row.get("reason") or row["rest"].get("reason")
     if seat_usability.deaf_only(row):
         return "pass", ("%s (nudge pending) — %s; a row filed now waits in "
                         "the ledger until it re-arms"
@@ -548,6 +687,14 @@ def _rung_budget(seat, family, flags, budget_why):
         # repair and hide the one the reader has to make.
         return "pass", ("%s is RED on the %s axis%s — %s"
                         % (family, flag.get("axis") or "?", when, cause))
+    if flag.get("money_provenance") == burnflags.CERTIFIED_LOCAL:
+        # A CERTIFIED LOCAL FAMILY IS ATTESTED, NOT MEASURED. Its GREEN is
+        # the word of the seat that runs the hardware, so this conjunct
+        # answers exactly as for the GREY that certification replaces, and
+        # the seat never lists as every conjunct MEASURED.
+        return "unknown", ("%s money is CERTIFIED by the seat that runs its "
+                           "local hardware, not MEASURED — %s"
+                           % (family, cause))
     if colour == burnflags.ORANGE:
         return "pass", ("%s is ORANGE%s — %s; %s"
                         % (family, when, cause,
@@ -681,20 +828,36 @@ def _caveats(seat_row):
     return len(seat_row["unknown"]) + len(seat_row["notes"])
 
 
-def _rank(seat_row):
-    """Most idle first, then least loaded, then least caveated.
+def _rank(seat_row, threshold):
+    """Least queued, then coolest context, then most idle pane, then least
+    caveated, then fewest rows held.
 
-    IDLENESS LEADS because it is the owner's own question. A seat carrying a
-    caveat — an unreadable conjunct, a pooled budget already over the ceiling
-    for some account — sorts BELOW a clean one at the same idleness, so the
-    seat a reader takes off the top is the one helm knows most about.
-    """
+    THE QUEUE LEADS (landing refactor item 5, "no lane waits while a
+    qualified reader is idle"): leading on the pane put an IDLE seat holding
+    seven door-read rows above a LIVE one holding none. An unreadable count
+    or context is its own middle bucket and moves no rank."""
     holding = seat_row.get("holding")
-    return (0 if seat_row.get("pane") == "IDLE" else
+    return (queue_bucket(holding),
+            context_bucket(seat_row.get("context_pct"), threshold),
+            0 if seat_row.get("pane") == "IDLE" else
             1 if seat_row.get("pane") in _PANE_IDLE else 2,
             1 if _caveats(seat_row) else 0,
-            holding if isinstance(holding, int) else 1 << 30,
+            holding if _number(holding) else 0,
             seat_row["seat"])
+
+
+def idle_readers(rid, seams=None, report=None):
+    """(seats, why-not) — the measured-eligible APPROVING seats holding no
+    rows, best first. The ladder already refused the sender and chain authors
+    and set input-only models apart. Nobody idle is [], never a refusal:
+    `eligible` still ranks the least-loaded reader first."""
+    if report is None:
+        report, err = eligibility(rid, seams=seams)
+        if err:
+            return None, err
+    rows = {r["seat"]: r for r in report["seats"]}
+    return [s for s in report["measured_eligible"]
+            if queue_bucket(rows[s].get("holding")) == 0], None
 
 
 def eligibility(rid, all_seats=False, now=None, seams=None):
@@ -744,7 +907,7 @@ def _eligibility(rid, all_seats=False, now=None, seams=None):
                        "chain_root", "repo_id", "kind", "state")},
               "project": project, "measured_at": now,
               "seats": [], "eligible": [], "measured_eligible": [],
-              "out_of_scope": {}, "unreadable": {}}
+              "idle": [], "input": [], "out_of_scope": {}, "unreadable": {}}
     if project_why:
         report["unreadable"]["project"] = project_why
     if reg_why:
@@ -797,17 +960,19 @@ def _eligibility(rid, all_seats=False, now=None, seams=None):
             seat, seams.get("identity_families"))
         if out["family"] is None and families and len(families) == 1:
             out["family"] = next(iter(families))
+        out["model"] = read_model(seat, seams.get("runtime_model"))
         rungs = [
+            (INPUT,) + _rung_input(out["model"], out["family"]),
             (TIER, tier_state, tier_why),
             (MINT, mint_state, mint_why),
-            (CHAIN,) + _rung_chain(seat, wrote, wrote_why),
+            (CHAIN,) + _rung_chain(seat, wrote, wrote_why, lr.get("author")),
             (AWAKE,) + _rung_awake(seat, urow, join_why),
             (BUDGET,) + _rung_budget(seat, out["family"], budget, budget_why),
         ]
         for name, state, detail in rungs:
-            if state == "exclude":
+            if state in ("exclude", "input"):
                 out["state"], out["conjunct"], out["reason"] = \
-                    EXCLUDED, name, detail
+                    EXCLUDED if state == "exclude" else INPUT_ONLY, name, detail
                 break
             if state == "unknown":
                 out["unknown"].append((name, detail))
@@ -823,10 +988,19 @@ def _eligibility(rid, all_seats=False, now=None, seams=None):
                     break
                 if state == "unknown":
                     out["unknown"].append((name, detail))
+        if out["state"] == ELIGIBLE:
+            # ASKED ONLY OF A SEAT THAT CAN REVIEW, where it orders the rank.
+            out["context_pct"], unknown = split_context(
+                (seams.get("context") or read_context)(seat))
+            if unknown:
+                out["context_unknown"] = unknown   # why, only when unknown
         report["seats"].append(out)
 
+    from . import autocompact
+    threshold = report["context_threshold_pct"] = autocompact.threshold_pct()
     report["seats"].sort(key=lambda r: (r["state"] != ELIGIBLE,
-                                        _rank(r) if r["state"] == ELIGIBLE
+                                        _rank(r, threshold)
+                                        if r["state"] == ELIGIBLE
                                         else (LADDER.index(r["conjunct"]),
                                               r["seat"])))
     report["eligible"] = [r["seat"] for r in report["seats"]
@@ -838,6 +1012,9 @@ def _eligibility(rid, all_seats=False, now=None, seams=None):
     # top of a list they trusted.
     report["measured_eligible"] = [r["seat"] for r in report["seats"]
                                    if r["state"] == ELIGIBLE and not r["unknown"]]
+    report["input"] = [r["seat"] for r in report["seats"]
+                       if r["state"] == INPUT_ONLY]
+    report["idle"] = idle_readers(rid, report=report)[0]
     return report, None
 
 
@@ -856,9 +1033,13 @@ def _row_headline(report):
 
 
 def _seat_line(r):
-    return "    %-22s pane=%-7s holding=%-4s family=%s" % (
+    ctx = r.get("context_pct")
+    return "    %-22s pane=%-7s holding=%-4s ctx=%-7s family=%s" % (
         r["seat"], r["pane"] or "UNKNOWN",
         "UNKNOWN" if r["holding"] is None else r["holding"],
+        "-" if "context_pct" not in r else
+        "UNKNOWN (%s)" % r["context_unknown"] if r.get("context_unknown")
+        else "UNKNOWN" if ctx is None else "%d%%" % ctx,
         r["family"] or "UNKNOWN")
 
 
@@ -896,6 +1077,13 @@ def render(report):
             out.append(_seat_line(r))
             for name, why in r["notes"]:
                 out.append("      %-7s NOTE — %s" % (name, why))
+        top = measured[0]
+        out.append("  IDLE, holding no rows: %s" % ", ".join(report["idle"])
+                   if report.get("idle") else
+                   "  NOBODY IDLE — a pile never excludes; the least-loaded is "
+                   "%s (holding %s)" % (top["seat"], "UNKNOWN"
+                                        if top["holding"] is None
+                                        else top["holding"]))
     elif report["unreadable"]:
         # THE SENTENCE THIS VERB EXISTS FOR. An unreadable input and a measured
         # empty set are different worlds, and printing the second one for the
@@ -922,8 +1110,9 @@ def render(report):
     if not measured:
         # AN EMPTY SEAT LIST IS NOT AN EMPTY REVIEWER LIST (task/2948), on
         # EVERY branch that reaches here — unreadable, busy or excluded. A seat
-        # is one way to get another family's or Fable's fresh read, and a
-        # surface that stopped at the seats told the reader the row was stuck.
+        # is one way to get a fresh read, and the default is not a seat at all
+        # (a fresh-context Opus subagent), so a surface that stopped at the
+        # seats told the reader the row was stuck.
         from . import dispatches
         row = report["row"]
         out.append("  " + dispatches.review_fallback_text(
@@ -938,6 +1127,13 @@ def render(report):
                 out.append("      %-7s NOTE — %s" % (name, why))
             for name, why in r["unknown"]:
                 out.append("      %-7s UNKNOWN — %s" % (name, why))
+    inputs = [r for r in report["seats"] if r["state"] == INPUT_ONLY]
+    if inputs:
+        out.append("  INPUT (%d) — a read here is cheap INPUT and never the "
+                   "approving read" % len(inputs))
+        for r in inputs:
+            out.append(_seat_line(r))
+            out.append("      %-7s %s" % (INPUT, r["reason"]))
 
     excluded = [r for r in report["seats"] if r["state"] == EXCLUDED]
     if excluded:
@@ -952,13 +1148,19 @@ def render(report):
 
 LEGEND = (
     "  conjuncts, in ladder order — the seat is named under the FURTHEST-OUT "
-    "reason it cannot review: tier=its APPROVE cannot close the row (route "
+    "reason it cannot review: input=its resolved model (codex-spark, gemini, "
+    "a local model, Sonnet, Haiku) reads as INPUT and never approves; listed under INPUT, "
+    "an unreadable model is only a NOTE · tier=its APPROVE cannot close the "
+    "row (route "
     "elsewhere) · mint=no immutable verdict-time runtime family evidence, so "
-    "no authorizing verdict can be written in its name · chain=already "
-    "recorded as an author of this chain, so its APPROVE is not an "
+    "no authorizing verdict can be written in its name · chain=the row's "
+    "sender or already recorded as an author of this chain, so its APPROVE "
+    "is not an "
     "independent read (route elsewhere) · awake=helm cannot reach it or it "
     "cannot complete a turn — DEAF is no live beacon (`helm chat wait --seat "
-    "S --follow` re-arms it), WALL/<state> is its vendor path not answering "
+    "S --follow` re-arms it), RESTING is the owner's pause (`helm seat rest "
+    "S --end` ends it; nothing else wakes it), WALL/<state> is its vendor "
+    "path not answering "
     "and a PROXY-COOLDOWN or PROXY-LOCAL-403 there is HELM'S OWN proxy and "
     "says nothing about the vendor (repair) · budget=its family is walled on "
     "MONEY, every readable account at or past the ceiling (wait for the "

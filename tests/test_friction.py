@@ -960,8 +960,10 @@ class DialCardSourceTest(unittest.TestCase):
     def test_the_section_renderer_write_and_boot_all_exist(self):
         ui = web_ui_loader.read_text()
         self.assertIn("<!doctype html>", ui)
-        home_view = ui[ui.index('id="view-work"'):ui.index('id="view-quota"')]
-        self.assertIn('<section id="frictionsec"></section>', home_view)
+        # the card sits with the fleet's configs (task/3445 L3)
+        configs = ui[ui.index('id="view-configs"'):]
+        configs = configs[:configs.index('<div class="view')]
+        self.assertIn('<section id="frictionsec"></section>', configs)
         for needle in ("function frictionCardHTML(", 'j("/api/friction"',
                        'post("/api/friction/dial"',
                        "frictionShow({pending: true});",

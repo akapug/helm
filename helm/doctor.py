@@ -145,11 +145,13 @@ def check_projects():
     one. Fold only where the remedy is shared."""
     try:
         projects = registry.load(strict=True).get("projects") or {}
-    except (OSError, ValueError):
-        projects = {}
+    except (OSError, ValueError) as e:
+        return [(FAIL, "registry unreadable (%s: %s): project checks skipped; fix or "
+                        "restore the registry file"
+                % (type(e).__name__, e))]
     out = []
     missing_home, path_gone, mem_stale = [], [], []
-    unguarded, guard_drift, merge_blind = [], [], []
+    unguarded, guard_drift, merge_blind, guard_unknown = [], [], [], []
     healthy = 0
     checked = 0
     for name in sorted(projects):
@@ -159,7 +161,7 @@ def check_projects():
         checked += 1
         issues = (len(out) + len(missing_home) + len(path_gone)
                   + len(mem_stale) + len(unguarded) + len(guard_drift)
-                  + len(merge_blind))
+                  + len(merge_blind) + len(guard_unknown))
         p = home.project_dir(name)
         if not rec.get("external"):
             if os.path.islink(p) and not os.path.exists(p):
@@ -180,9 +182,12 @@ def check_projects():
             merge_blind.append((name, path))
         elif state == "drift":
             guard_drift.append((name, path))
+        elif state and state.startswith("unknown:"):
+            guard_unknown.append((name, state.split(":", 1)[1]))
         healthy += issues == (len(out) + len(missing_home) + len(path_gone)
                               + len(mem_stale) + len(unguarded)
-                              + len(guard_drift) + len(merge_blind))
+                              + len(guard_drift) + len(merge_blind)
+                              + len(guard_unknown))
     out.extend(_folded(WARN, missing_home, "with no home dir — run `helm sync`",
                         "`helm projects` lists them all"))
     # The phrase "repo moved or deleted" is load-bearing and stays intact:
@@ -224,20 +229,29 @@ def check_projects():
                        "`helm work install-guard --apply --repo <path>` "
                        "refreshes each",
                        "`helm projects` lists them all"))
+    # A CHECK THAT RAISED IS NOT A STALE GUARD. Its state is unknown, and the
+    # line says so with the exception class instead of prescribing a refresh.
+    out.extend(_folded(WARN, guard_unknown,
+                       "whose git guard COULD NOT BE READ — the check FAILED "
+                       "(%s); state unknown, not drift: `helm work "
+                       "install-guard --repo <path>` shows the failure"
+                       % ", ".join(sorted({e for _n, e in guard_unknown})),
+                       "`helm projects` lists them all"))
     if checked:
         out.append((OK, "projects: %d of %d healthy" % (healthy, checked)))
     return out
 
 
 def _repo_guard_state(path):
-    """'guarded' | 'unguarded' | 'merge-blind' | 'drift' | None for a
-    registry project path: None when the path is not a git work tree (nothing
-    to guard), 'unguarded' when every planned hook is MISSING, 'merge-blind'
-    when the repo's hooks dir has no pre-merge-commit hook git will run
-    (absent, or present and not executable) while some other planned hook is
-    there, 'drift' when any other planned hook or scanner is STALE or
-    UNKNOWN. The predicate is stale_guard_hooks — the
-    same one check_work_guard reads — under whatever profile the repo
+    """'guarded' | 'unguarded' | 'merge-blind' | 'drift' |
+    'unknown:<exception class>' | None for a registry project path: None when
+    the path is not a git work tree (nothing to guard), 'unguarded' when every
+    planned hook is MISSING, 'merge-blind' when the repo's hooks dir has no
+    pre-merge-commit hook git will run (absent, or present and not
+    executable) while some other planned hook is there, 'drift' when any other
+    planned hook or scanner is STALE or UNKNOWN, and 'unknown:' when finding
+    the root or running the check raised. The predicate is stale_guard_hooks
+    — the same one check_work_guard reads — under whatever profile the repo
     declared, so a leak-profile repo is judged against its three hooks and a
     rail repo against six."""
     if not path or not os.path.isdir(path):
@@ -246,15 +260,15 @@ def _repo_guard_state(path):
     from .work._lanes import find_root
     try:
         root = find_root(path)
-    except Exception:
-        root = None
+    except Exception as exc:              # noqa: BLE001 — reported unknown
+        return "unknown:" + exc.__class__.__name__
     if not root or os.path.realpath(root) != os.path.realpath(path):
         return None
     try:
         findings = _guard.stale_guard_hooks(root)
         plan = _guard._guard_plan(root)[1]
-    except Exception:
-        return "drift"
+    except Exception as exc:              # noqa: BLE001 — reported unknown
+        return "unknown:" + exc.__class__.__name__
     if not findings:
         return "guarded"
     # UNGUARDED means every hook the repo's profile PLANS is absent — the
@@ -279,8 +293,10 @@ def check_adoption():
     (not the adoption symlink) = WARN — sync kept user data, doctor surfaces it."""
     try:
         projects = registry.load(strict=True).get("projects") or {}
-    except (OSError, ValueError):
-        projects = {}
+    except (OSError, ValueError) as e:
+        return [(FAIL, "registry unreadable (%s: %s): adoption checks skipped; fix or "
+                        "restore the registry file"
+                % (type(e).__name__, e))]
     homes = registry.adopted_homes()
     out = []
     for name in sorted(set(projects) & set(homes)):
@@ -359,9 +375,6 @@ def check_projection_registry():
                 % (len(rows), n_proj, "s"[:n_proj != 1], n_sq, "s"[:n_sq != 1])))
     return out
 
-
-def _doctor_ok_path():
-    return os.path.join(home.helm_home(), "_global", ".doctor-ok")
 
 
 def _is_genesis():
@@ -1422,6 +1435,19 @@ def check_filesystems():
                        "inode pressure UNKNOWN" % (e.__class__.__name__, e))]
 
 
+def check_build_skew():
+    """Each built tool's installed commit against its source checkout's HEAD
+    (buildskew.py, task/2963): SAME is OK; a SKEW names the installed commit
+    and how to read the code that runs; an unreadable side is UNKNOWN, never
+    OK. Read-only."""
+    try:
+        from . import buildskew
+        return [(OK if r["state"] == buildskew.SAME else WARN, buildskew.line(r))
+                for r in buildskew.readings()]
+    except Exception as e:
+        return [(WARN, "build skew UNKNOWN (%s: %s)" % (e.__class__.__name__, e))]
+
+
 def check_seat_memory_ceilings(census=None, root=None, proc=None):
     """Warns ONLY when the throttle observation cannot be obtained.
 
@@ -1817,8 +1843,10 @@ def check_memory_base_sessions():
     reads green (seatstale.memory_base_state holds the measurement).
 
     A NAMED FAIL, because the cost is certain and the remedy is one relaunch.
-    The relaunch is the owner's or the integrator's: helm never types into a
-    pane, so the row names the exact line rather than doing it."""
+    The prompt-stall watch answers each of those prompts as it stalls, but a
+    relaunch is the owner's or the integrator's to time: helm does not
+    relaunch a seat itself, so the row names the exact line rather than
+    doing it."""
     from . import seatstale
     from .hooks import MEMORY_BASE_ENV
     st = seatstale.memory_base_state()
@@ -1833,9 +1861,11 @@ def check_memory_base_sessions():
                           "dir when a session starts, so this session still "
                           "writes memory through the linked path and EVERY "
                           "memory write it makes stops on a permission prompt "
-                          "until it is relaunched. The owner or the integrator "
-                          "relaunches it with --resume: %s. helm never types "
-                          "into a pane"
+                          "until it is relaunched. The prompt-stall watch "
+                          "answers each such prompt; the owner or the "
+                          "integrator relaunches it with --resume at a "
+                          "convenient moment: %s. helm does not relaunch a "
+                          "seat itself"
                     % (("seat %s" % row["seat"]) if row["seat"] else
                        "an unnamed session", row["pid"], row["home"],
                        MEMORY_BASE_ENV, memory_relaunch(row))))
@@ -2124,9 +2154,14 @@ def check_chat_node():
     url = chat.node_url()
     transport = chat.transport_status()
     signer = _cell.bin_status()
+    # UNKNOWN WARNS BESIDE DEGRADED: a failure whose cause could not be
+    # re-probed is not healthy. A failure scoped to a DARK seat is reported
+    # and does not warn — it is that seat's, and nothing signs from it.
     degraded = ([(WARN, "chat signing " +
                   chat.transport_failure_summary(transport))]
-                if transport.get("mode") == "degraded" else [])
+                if transport.get("mode") in ("degraded", "unknown") else [])
+    degraded += [(OK, "chat signing scoped: " + line)
+                 for line in transport.get("scoped") or ()]
     if signer["configured"] and not signer["usable"] \
             and transport.get("code") != "signer_unavailable":
         degraded.append((WARN, "chat signer UNAVAILABLE — %s" %
@@ -2177,6 +2212,13 @@ def check_chat_node():
                                   "back to [unsigned]; `helm chat node up`" % url)]
     out = [(OK, "chat room node LIVE at %s — chain head %s" % (
         url, head.get("chain_index") if head else "(no receipts yet)"))] + degraded
+    # LIVE IS NOT UNLOCKED. A rebased node answers /status healthy:true while
+    # its cipherclerk is locked and refuses every signed turn, so a locked
+    # node FAILS and a lock helm cannot read WARNS (the line status prints).
+    lock = _node.lock_state(url)
+    if lock["state"] != "unlocked":
+        out.append((FAIL if lock["state"] == "locked" else WARN,
+                    "chat room node " + _node.locked_line(url, lock)))
     if transport.get("mode") == "ready":
         out.append((WARN, "chat signing %s — %s" % (
             chat.transport_label(transport), transport.get("detail") or
@@ -2383,6 +2425,13 @@ def check_record():
     (record.py owns the logic)."""
     from . import record
     return record.doctor_rows()
+
+
+def check_fold_checkpoint():
+    """Why the dispatch fold replayed instead of restoring its checkpoint
+    (foldckpt.py owns the log and the reading of it)."""
+    from . import dispatches, foldckpt
+    return foldckpt.doctor_rows(dispatches.ledger_path())
 
 
 def check_resume_state():
@@ -2639,6 +2688,40 @@ def check_work_guard(root=None):
                  % (root, ", ".join(stale), remedy, note))]
     return [(OK, "git guard rail current in %s (%s)"
              % (root, ", ".join(current)))]
+
+
+def check_gate_canary(root=None):
+    """The nightly gate canary, which the rail installs (`helm work
+    install-guard --apply`): its timer, and what its record lets the land door
+    do with a sliced receipt. Silent outside a repo whose guard profile is the
+    rail; a project repo runs no canary."""
+    from .work import _guard
+    from .work._lanes import find_root
+    root = root or find_root()
+    if not root:
+        return []
+    try:
+        if _guard.guard_profile(root) != "rail":
+            return []
+        from . import gate, gatecanary
+        installed = gatecanary.timer_installed()
+        held = gatecanary.standing()
+        disabled = gate.sliced_land_disabled()
+    except Exception as e:                  # noqa: BLE001 — say it, never raise
+        return [(WARN, "gate canary state unknown (%s: %s)"
+                 % (e.__class__.__name__, e))]
+    door = ("the land door ADMITS a sliced receipt" if held["met"]
+            and not disabled else "the land door refuses a sliced receipt")
+    record = "record %d of %d agreeing tree(s), RED both caught: %d; %s" % (
+        held["agree"], held["needed"], len(held["red"]), door)
+    if not installed:
+        return [(WARN, "gate canary timer %s is NOT installed — nothing "
+                       "records the serial-vs-sliced verdicts the land door "
+                       "reads; `helm work install-guard --apply --profile "
+                       "rail` installs it with the rail (%s)"
+                 % (gatecanary.TIMER_NAME, record))]
+    return [(OK, "gate canary timer %s installed, nightly at %s (%s)"
+             % (gatecanary.TIMER_NAME, gatecanary.TIMER_AT, record))]
 
 
 def check_metaharness(detect=None, which=None):
@@ -3126,7 +3209,7 @@ def check_intent_actual():
                        for v in accounts.values()):
         return [(WARN, "intent-vs-actual: codex intent at %s does not "
                        "name account tier counts ({\"accounts\": "
-                       "{\"ultra\": N, \"team\": M}}) — refusing to guess "
+                       "{\"pro\": N, \"team\": M}}) — refusing to guess "
                        "the intent it cannot read" % path)]
     auth_dir = codexhomes.pool_dir()
     if not os.path.isdir(auth_dir):
@@ -3717,6 +3800,60 @@ def check_timers(census=None):
     return out
 
 
+def check_unit_drift(drift=None):
+    """EVERY installed helm unit against what its module's template renders
+    NOW (task/3405).
+
+    check_timers ASKS WHETHER A TIMER FIRES, and a timer that fires can still
+    run what an older template said. helm-release-nightly.service did: it was
+    installed before its template gained the SOURCE line, so every timer night
+    recorded as manual and the release streak could never count, while the
+    timer rung read it healthy. This asks the text question of every module in
+    timerhealth.UNIT_TEMPLATES, so a template changed by a land but never
+    re-installed on this box is named with the command that re-installs it.
+
+    READ-ONLY, and UNMEASURED IS NEVER CLEAN: a unit that could not be
+    compared is warned and left out of the count the OK line names.
+    """
+    from . import timerhealth
+    # A rung that cannot look says so, and never takes the report down.
+    try:
+        rows = (drift or timerhealth.drift)()
+    except Exception as exc:              # noqa: BLE001 — reported as a WARN
+        return [(WARN, "unit drift: cannot tell (%s)" % type(exc).__name__)]
+    out = []
+    drifted = [r for r in rows if r["verdict"] == timerhealth.DRIFTED]
+    for module in sorted({r["module"] for r in drifted}):
+        mine = [r for r in drifted if r["module"] == module]
+        out.append((WARN,
+                    "unit drift: %s DRIFTED from helm/%s.py's current "
+                    "template — the installed text is not what a re-install "
+                    "writes, so a land that changed the template never "
+                    "reached this box. `%s`"
+                    % ("; ".join("%s (%s)" % (r["unit"], r["detail"])
+                                 for r in mine), module, mine[0]["command"])))
+    unknown = [r for r in rows if r["verdict"] == timerhealth.UNKNOWN]
+    if unknown:
+        shown = "; ".join("%s: %s" % (r["unit"], r["detail"])
+                          for r in unknown[:3])
+        more = ("" if len(unknown) <= 3
+                else "; and %d more" % (len(unknown) - 3))
+        out.append((WARN, "unit drift: %d unit(s) could not be compared "
+                          "with their template (%s%s) — UNMEASURED, not clean"
+                    % (len(unknown), shown, more)))
+    if not out:
+        installed = [r for r in rows if r["verdict"] != timerhealth.ABSENT]
+        absent = {r["module"] for r in rows
+                  if r["verdict"] == timerhealth.ABSENT}
+        out.append((OK, "unit drift: %d of %d installed helm unit file(s) "
+                        "match what their module's current template renders; "
+                        "%d timer module(s) not installed here"
+                    % (sum(1 for r in installed
+                           if r["verdict"] == timerhealth.CLEAN),
+                       len(installed), len(absent))))
+    return out
+
+
 def check_stop_timings(read=None):
     """THE LOG THE GUARD WROTE, READ IN THE SAME BREATH IT IS WRITTEN.
 
@@ -3950,9 +4087,11 @@ def check_chat_dir_debris():
                        "UNMEASURED, not small" % type(exc).__name__)]
     per = c["entries"] / float(max(1, c["rooms"]))
     line = ("chat dir: %d entries for %d rooms (%.0f per room): %d cursors, "
-            "%d cursor-sibling locks, %d meld rooms idle %d+ days"
+            "%d cursor-sibling locks, %d meld rooms idle %d+ days (or "
+            "finished and quiet %d+)"
             % (c["entries"], c["rooms"], per, c["cursors"],
-               c["sibling_locks"], idle, chatdebris.IDLE_DAYS))
+               c["sibling_locks"], idle, chatdebris.IDLE_DAYS,
+               chatdebris.CLOSED_IDLE_DAYS))
     if per <= chatdebris.PER_ROOM_WARN and \
             c["entries"] <= chatdebris.ENTRIES_WARN:
         return [(OK, line)]
@@ -3962,11 +4101,50 @@ def check_chat_dir_debris():
                      "sessions that are over")
     if idle:
         fixes.append("`helm chat retire-rooms --apply` archives the idle "
-                     "meld rooms with their cursors")
+                     "and finished meld rooms with their cursors")
     return [(WARN, line + " — over budget (%d per room, %d entries); every "
                           "delivery hook lists them all%s"
              % (chatdebris.PER_ROOM_WARN, chatdebris.ENTRIES_WARN,
                 "; " + "; ".join(fixes) if fixes else ""))]
+
+
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+
+def check_checkout_images(root=None):
+    """Image files in the helm checkout root — they trap text-only seats.
+
+    A stray image left in the shared checkout root can freeze a text-only
+    seat that opens it until /clear; nothing had noticed them.  This check
+    only reports; it never moves or deletes anything.
+    """
+    where = root or _checkout_root()
+    try:
+        images = []
+        with os.scandir(where) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.lower().endswith(_IMAGE_SUFFIXES):
+                    images.append(entry.name)
+    except OSError as exc:
+        return [(WARN, "checkout images: cannot tell (%s)"
+                 % type(exc).__name__)]
+    if not images:
+        return [(OK, "checkout root holds no image files")]
+    images.sort()
+    first5 = ", ".join(images[:5])
+    more = len(images) - 5
+    if more > 0:
+        first5 += " and %d more" % more
+    return [(WARN,
+             "checkout root holds %d image file(s) (%s): a text-only seat "
+             "that opens one is stuck until /clear; move them out of the "
+             "checkout (for example into .playwright-mcp/strays/ beside it)"
+             % (len(images), first5))]
+
+
+def _checkout_root():
+    """Return the path to the helm checkout (parent of the helm package)."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def check_burn_flags():
@@ -3995,14 +4173,58 @@ def check_burn_flags():
         out.append((OK, "burn flags: overall %s, folded %ds ago"
                     % ((snap.get("overall") or {}).get("colour"), age)))
     flags = (snap or {}).get("families") or {}
-    blind = [f for f in burnflags.families() if f not in burnflags.MONEY_READERS]
+    # A LOCAL FAMILY'S MONEY READER IS ITS CERTIFICATION by its operator seat,
+    # made from that seat's own roster-bound session, so it is never "a
+    # reader nobody built", and one with no fresh certification reads GREY by
+    # design: a lapse inside one renewal period is said, not warned. Past it,
+    # with no revocation, the renewals stopped; a file that cannot be read is
+    # a fault with a repair; and a record the fold cannot tie to the
+    # operator's session is a certification nothing stands behind.
+    local = burnflags.local_families()
+    now = time.time()
+    certs = burnflags.read_local_certifications()
+    if certs.get("unreadable"):
+        out.append((WARN, "burn flags: the local certification file %s "
+                          "could not be read, so every local family reads "
+                          "GREY until `helm burn certify-local` rewrites it"
+                    % certs["unreadable"]))
+    for family in local:
+        rec = certs["families"].get(family)
+        until = rec.get("until") if isinstance(rec, dict) else None
+        if isinstance(rec, dict) and rec.get("revoked_at") is None \
+                and isinstance(until, (int, float)) \
+                and now - until > burnflags.CERTIFICATION_LAPSE_WARN_S:
+            out.append((WARN, "burn flags: %s's local certification by %s "
+                              "lapsed %.1fh ago and was neither renewed nor "
+                              "revoked — the certifier's renewal has stopped, "
+                              "and the family reads GREY until it runs again"
+                        % (family, rec.get("by") or "an unnamed seat",
+                           (now - until) / 3600.0)))
+        # read off the snapshot, never re-derived here
+        flag = flags.get(family) or {}
+        if flag.get("cause_id") == burnflags.CERTIFICATION_UNVERIFIABLE:
+            out.append((WARN, "burn flags: %s — %s" % (family,
+                                                        flag.get("cause"))))
+    blind = [f for f in burnflags.families()
+             if f not in burnflags.MONEY_READERS and f not in local]
     if blind:
         out.append((WARN, "burn flags: %d famil%s have NO money reader (%s), "
                           "so their budget axis is permanently GREY — that is "
                           "a reader nobody built, not a transient gap"
                     % (len(blind), "y" if len(blind) == 1 else "ies",
                        ", ".join(sorted(blind)))))
-    now = time.time()
+    if local:
+        certified = [f for f in local if (flags.get(f) or {}).get(
+            "money_provenance") == burnflags.CERTIFIED_LOCAL]
+        operators = sorted({burnflags.local_operator(f) or "none declared"
+                            for f in local})
+        out.append((OK, "burn flags: %s served on the operator's own GPU; "
+                        "money reads GREEN only while its operator seat "
+                        "certifies it from its own roster-bound session "
+                        "(`helm burn certify-local`), and GREY otherwise, "
+                        "which is not a fault — operator seat: %s; certified "
+                        "now: %s" % (", ".join(local), ", ".join(operators),
+                                     ", ".join(certified) or "none")))
     for family in sorted(flags):
         flag = flags[family]
         if flag.get("colour") != burnflags.RED or flag.get("expires_at"):
@@ -4087,7 +4309,7 @@ def check_board_reads():
     return out
 
 
-def check_web_servers():
+def check_web_servers(proc_dir=None):
     """How many `helm web` servers are running here, and from WHERE.
 
     THE COST THIS MAKES VISIBLE. A web server polls its own endpoints for as
@@ -4104,11 +4326,19 @@ def check_web_servers():
     almost every case, so the count itself is the finding and no judgement about
     which one is "real" is attempted here.
 
+    EVERY AD HOC SERVER IS NAMED WITH WHAT IT COSTS (task/3715). Any `helm web`
+    that is not the owner's helm-web unit runs under no memory limit: one left
+    polling from one open tab reached 4.5 GB in about 54 minutes, from a lane
+    worktree 83 commits behind trunk. So a second line lists each ad hoc server
+    with its port, its resident memory (and swap, which RSS alone hides), its
+    age and the tree it serves, and says "none" when there is none.
+
     ABSENCE IS NOT HEALTH AND IS NOT REPORTED AS IT. A host serving nothing and
     a registry that could not be read are different answers, and a stale record
     (a server killed before it could tidy up) is a third. Each is named."""
-    from . import webserve
-    st = webserve.live()
+    from . import rearm, webserve
+    st = webserve.live(proc_dir=proc_dir)
+    console = rearm.WEB_UNIT + ".service"
     out = []
     if st["unreadable"]:
         out.append((WARN, "web servers: %d record%s in %s do not parse — the "
@@ -4116,12 +4346,43 @@ def check_web_servers():
                     % (st["unreadable"], "s"[:st["unreadable"] != 1],
                        st["dir"])))
     n = st["count"]
+    adhoc = [x for x in st["servers"] if x.get("unit") != console]
+
+    def mem(x):
+        # RSS WITH ITS SWAP: the console's RSS read 1.2 GB while 1.45 GB more
+        # sat in swap, and a figure without it was the one that misled.
+        rss, swap = x.get("rss_bytes"), x.get("swap_bytes")
+        if rss is None:
+            return "RSS unknown"
+        return "RSS %s%s" % (_size(rss), " + %s swap" % _size(swap)
+                             if swap else "")
+
+    def age(x):
+        return "up %dm" % (x["age_s"] // 60) if x["age_s"] is not None \
+            else "start time unknown"
+
+    def adhoc_line():
+        if not adhoc:
+            return (OK, "ad hoc web servers: none — %s" % (
+                "every `helm web` here is the owner's console (the %s unit)"
+                % rearm.WEB_UNIT if n else "no `helm web` is running here"))
+        return (WARN, "ad hoc web servers: %d — %s. An ad hoc `helm web` runs "
+                      "under no memory limit (the %s unit has one), so it "
+                      "grows for as long as a page polls it; whoever started "
+                      "it stops it once its work is done"
+                % (len(adhoc), ", ".join(
+                    "%s (pid %d, %s, %s, tree %s)" % (
+                        "port %d" % x["port"] if x["port"] >= 0
+                        else "port unknown", x["pid"], mem(x), age(x),
+                        x.get("tree") or "unknown")
+                    for x in adhoc), rearm.WEB_UNIT))
     if not n:
         out.append((OK, "web servers: none recorded as running here. A host "
                         "serving no console is not a fault%s"
                     % (" (%d stale record%s cleared)"
                        % (st["stale"], "s"[:st["stale"] != 1])
                        if st["stale"] else "")))
+        out.append(adhoc_line())
         return out
     def one(x):
         # EVERY FIELD SAYS WHEN IT DOES NOT KNOW. A server found in the process
@@ -4129,14 +4390,15 @@ def check_web_servers():
         # port in argv, and inventing either would put a number in front of the
         # owner that nothing measured.
         port = "port %d" % x["port"] if x["port"] >= 0 else "port unknown"
-        age = "up %dm" % (x["age_s"] // 60) if x["age_s"] is not None \
-            else "start time unknown"
         tail = "" if x.get("registered", True) else ", UNREGISTERED"
-        return "%s (pid %d, %s, %s%s)" % (port, x["pid"], age,
-                                          x["cwd"] or "cwd unknown", tail)
+        role = ", the owner's console" if x.get("unit") == console else ""
+        return "%s (pid %d, %s, %s%s%s)" % (port, x["pid"], age(x),
+                                            x["cwd"] or "cwd unknown", role,
+                                            tail)
     where = ", ".join(one(x) for x in st["servers"])
     if n == 1:
         out.append((OK, "web servers: one running — %s" % where))
+        out.append(adhoc_line())
         return out
     # THE REMEDY LINE IS FOR THE OWNER, who does not open a terminal. It says
     # what is wrong and what it costs him, and names the seats' job rather than
@@ -4148,7 +4410,14 @@ def check_web_servers():
                       "including the owner's own turns. Exactly one console is "
                       "wanted; whichever agent started the extras owes shutting "
                       "them down" % (n, where)))
+    out.append(adhoc_line())
     return out
+
+
+def _size(n):
+    """Bytes as GiB from one GiB up, else MiB."""
+    return ("%.1f GiB" % (n / float(1 << 30)) if n >= 1 << 30
+            else "%d MiB" % (n // (1 << 20)))
 
 
 def check_stop_facts(read=None):
@@ -4557,23 +4826,26 @@ CHECKS = ("check_home", "check_actuator_wiring", "check_harness_mirror",
           "check_projection_registry",
           "check_adopted_store", "check_lexicon_dead_vocabulary",
           "check_know_your_user", "check_cv", "check_filesystems",
-          "check_seat_memory_ceilings",
+          "check_seat_memory_ceilings", "check_build_skew",
           "check_inject_coverage", "check_guard_contract", "check_hook_scopes",
           "check_startup_doors",
           "check_env",
           "check_local_names",
           "check_physics_currency", "check_memory_base_honoured",
           "check_memory_base_sessions",
-          "check_record", "check_resume_state",
+          "check_record", "check_fold_checkpoint", "check_resume_state",
           "check_chat_node", "check_chat_durability",
           "check_cred_families", "check_cred_drift", "check_skills_hub",
           "check_home_benefits",
           "check_git",
-          "check_work_guard", "check_metaharness", "check_stale_bot",
+          "check_work_guard", "check_gate_canary", "check_metaharness",
+          "check_stale_bot",
           "check_keepalive_cadence", "check_cred_copy_staleness",
-          "check_timers", "check_stop_timings", "check_injection_budget",
+          "check_timers", "check_unit_drift", "check_stop_timings",
+          "check_injection_budget",
           "check_fixed_text",
           "check_gitfacts_table", "check_chat_dir_debris", "check_burn_flags",
+          "check_checkout_images",
           "check_board_reads", "check_web_servers", "check_stop_facts",
           "check_seat_physics_currency",
           "check_trunk_authority", "check_dispatch_seq_collisions",

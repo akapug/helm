@@ -400,7 +400,15 @@ def _prune_source(path):
 def _newest_seat_session(instance_dir, prefer_source=None):
     """(session_id, cwd) of the seat's newest claude session, from its OWN
     isolated CLAUDE_CONFIG_DIR (<instance>/claude/projects/<slug>/<uuid>.jsonl);
-    (None, None) when the seat never ran. The id feeds `--resume <id>`, the
+    (None, None) when the seat never ran.
+
+    A RANKING OF TRANSCRIPTS, NOT THE LIVE SESSION. It answers which session a
+    seat with no live process should come back on. A seat whose process is
+    alive has already said which session it holds, in its own presence record,
+    and a caller with a live process asks `live_seat_session` first
+    (task/3208: right after a /clear this ranking answers the OLD session).
+
+    The id feeds `--resume <id>`, the
     sniffed cwd re-homes the pane where the session actually worked. Only
     uuid-named files count — a sidecar must fall through to --continue, never
     resume the wrong transcript. (Every helm seat runs the `claude` binary —
@@ -450,8 +458,14 @@ def _newest_seat_session(instance_dir, prefer_source=None):
     return os.path.basename(p)[:-len(".jsonl")], harnesses._sniff_cwd(p)
 
 
-def _seat_session_path_by_id(instance_dir, sid):
-    """One exact real transcript path in this seat's own config home."""
+def _seat_session_path_by_id(instance_dir, sid, real_turn=True):
+    """One exact real transcript path in this seat's own config home.
+
+    `real_turn=False` accepts a transcript with no assistant turn: the one a
+    /clear writes for its new session holds only the /clear records, and it
+    is still that session's transcript — claude resumes it (MEASURED on
+    2.1.283). A caller that already knows WHICH session it wants asks this
+    way; the stub bar is for a caller choosing among sessions."""
     if not sid or not _SESSION_JSONL.match(str(sid) + ".jsonl"):
         return None
     paths = glob.glob(os.path.join(instance_dir, "claude", "projects", "*",
@@ -462,21 +476,22 @@ def _seat_session_path_by_id(instance_dir, sid):
             st = os.stat(p)
         except OSError:
             continue
-        if not _has_real_turn(p, st.st_size):
+        if real_turn and not _has_real_turn(p, st.st_size):
             continue
         unique.setdefault(os.path.realpath(p), p)
     return next(iter(unique.values())) if len(unique) == 1 else None
 
 
-def _seat_session_by_id(instance_dir, sid):
+def _seat_session_by_id(instance_dir, sid, real_turn=True):
     """(sid, cwd) for one exact session in this seat's own config home.
 
     Recovery must resume the COPY cv just minted, never whichever transcript
     happens to win a newest-mtime race. Multiple project-slug symlinks to the
     same file are one identity; distinct files carrying one UUID are ambiguous
-    and refuse rather than selecting by directory order.
+    and refuse rather than selecting by directory order. `real_turn` is
+    `_seat_session_path_by_id`'s.
     """
-    p = _seat_session_path_by_id(instance_dir, sid)
+    p = _seat_session_path_by_id(instance_dir, sid, real_turn=real_turn)
     if not p:
         return None, None
     from . import harnesses

@@ -18,14 +18,19 @@ true of every possible cause, so it pointed nowhere; meanwhile the service had
 already printed the exact remedy. Relaying a subordinate's precise diagnosis is
 not optional for a provisioner that owns it.
 
-The invariant these tests pin, in both directions: helm MIRRORS an existing
-operator declaration and NEVER mints one. A machine that has not opted out of
-verification must keep dregg's refusal.
+The invariant these tests pin, in both directions: helm MIRRORS the posture the
+operator's team node RUNS WITH and NEVER mints one. Each flag that loosens
+dregg's verification is written on every `up`: the value the running peer was
+started with, or EMPTY, which dregg reads as refusal, when the peer runs
+without it or its environment cannot be proven. Writing nothing is not
+refusal: our unit inherits the user manager's environment, so a bypass the
+manager exports reached our node (task/3432 round 2, helm-codex's F1).
 """
 import contextlib
 import io
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -35,22 +40,145 @@ import os as _os, sys as _sys  # noqa: E402
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 from helm import chatnode  # noqa: E402
+# How systemd 259 reads an Environment= line (an oracle pinned to measured
+# lines, independent of the module under test).
+from tests.test_timerhealth import _environment_set  # noqa: E402
+
+
+# THE POSTURE FLAGS dregg's own gates read (emberian/dregg c93404d81): the
+# boot refusal's escape hatch (node/src/lib.rs:2218), the unaudited-PQ bypass
+# (dregg-pq/src/audit.rs:98), and the switch that revokes it (:104, applied
+# at :166-171).
+UNVERIFIED = "DREGG_ALLOW_UNVERIFIED_CONSENSUS"
+UNAUDITED = "DREGG_ALLOW_UNAUDITED_PQ"
+REQUIRE_LEAN = "DREGG_REQUIRE_LEAN"
+# DREGG_ NAMES dregg defines that are no posture: tokens, a bearer, keys, a
+# seed, a DSN, and a trusted-proxy list (emberian/dregg a31590c37; meta-claude
+# listed them on 907400b780f). Each one mirrored while the filter was the
+# prefix.
+DREGG_SECRETS = ("DREGG_ADMIN_TOKEN", "DREGG_API_TOKEN", "DREGG_NODE_BEARER",
+                 "DREGG_LLM_API_KEY", "DREGG_PAY_SEED", "DREGG_DEVNET_KEY",
+                 "DREGG_ROOT_KEY", "DREGG_PG_DSN", "DREGG_TRUSTED_PROXIES")
+# A VALUE ONLY THE PEER'S ENVIRONMENT HOLDS: no output, reason or file may
+# carry it.
+SECRET = "fixture-secret-value"
+
+
+# HOW dregg READS EACH FLAG: an oracle independent of the module under test,
+# written from emberian/dregg c93404d81. The escape hatch is on for exactly
+# 1, true, TRUE, on or ON (node/src/lib.rs:4048; node/src/blocklace_sync.rs
+# :3895 reads it the same way). The unaudited-PQ bypass is on for exactly "1"
+# (dregg-pq/src/audit.rs:111), unless DREGG_REQUIRE_LEAN, trimmed, is 1,
+# true, on or yes (audit.rs:123-128, blocklace_sync.rs:3940), which revokes
+# it (audit.rs:166-171). So unset and EMPTY are refusal for both bypasses.
+def _dregg_runs_unverified(env):
+    return env.get(UNVERIFIED) in ("1", "true", "TRUE", "on", "ON")
+
+
+def _dregg_requires_lean(env):
+    return env.get(REQUIRE_LEAN, "").strip() in ("1", "true", "on", "yes")
+
+
+def _dregg_runs_unaudited_pq(env):
+    return env.get(UNAUDITED) == "1" and not _dregg_requires_lean(env)
+
+
+def _effective(dropin, manager=()):
+    """The posture environment our unit's node starts with: the user
+    manager's own `manager` first, which a user unit inherits, then each
+    Environment= line of our posture drop-in's text `dropin` (None when
+    there is none), read as systemd 259 reads it (systemd.exec(5): what
+    Environment= sets overrides what the manager passes)."""
+    env = dict(manager)
+    env.update(_environment_set(dropin or ""))
+    return env
+
+
+# THE PEER AS THE KERNEL SHOWS IT. Its main process in a /proc of the arm's
+# own: /proc/<pid>/environ holds each entry and a NUL after it, and
+# /proc/<pid>/cgroup, on cgroup v2, one "0::" line naming the process's
+# control group, which for a user unit runs through the user's manager,
+# user@<uid>.service, its slice and the unit.
+PEER_PID = 4242
+PEER_ASKED = ["show", chatnode.PEER_UNIT, "-p", "LoadState", "-p", "MainPID"]
+
+
+def _environ(entries):
+    """/proc/<pid>/environ's bytes: each entry (str or bytes), NUL-ended."""
+    return b"".join((e.encode("utf-8") if isinstance(e, str) else e) + b"\0"
+                    for e in entries)
+
+
+def _cgroup(*path, uid=None):
+    """/proc/<pid>/cgroup of a process of this user's manager: its one
+    cgroup v2 line, through user@<uid>.service and then `path` (by default
+    app.slice and the peer's unit, where a user unit's process lives)."""
+    uid = os.getuid() if uid is None else uid
+    return "0::/user.slice/user-%d.slice/user@%d.service/%s\n" % (
+        uid, uid, "/".join(path or ("app.slice", chatnode.PEER_UNIT)))
 
 
 class PostureBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-posture-")
-        self.prior_home = os.environ.get("HOME")
-        os.environ["HOME"] = self.tmp
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # HOME COMES BACK IN A CLEANUP, NOT tearDown: cleanups run after
+        # tearDown, the last registered first, so an arm's own later patch of
+        # the environment (fake_user_systemd) is undone before this one.
+        home = mock.patch.dict(os.environ, {"HOME": self.tmp})
+        home.start()
+        self.addCleanup(home.stop)
         self.units = os.path.join(self.tmp, ".config", "systemd", "user")
         os.makedirs(self.units)
+        # THE PEER UNIT AS systemctl DESCRIBES IT: one line per property, and
+        # only the properties a reader asks for (systemctl prints no other,
+        # measured). The mirror asks for two; the others say what the unit
+        # declares, which the mirror no longer reads. Every arm answers here,
+        # through the runner the reader shares with the timer census, and
+        # never reaches the host's systemctl. `answer` replaces the whole
+        # answer. By default there is no such unit.
+        from helm import timerhealth
+        self.props = {"LoadState": "not-found", "MainPID": "0",
+                      "NeedDaemonReload": "no", "Environment": "",
+                      "UnsetEnvironment": "", "PAMName": ""}
+        self.answer, self.asked = None, []
+        self.peer_patch = mock.patch.object(timerhealth, "_systemctl",
+                                            self.peer_systemctl)
+        self.peer_patch.start()
+        self.addCleanup(self.peer_patch.stop)
+        # THE KERNEL THE READER ASKS is this /proc, which holds only what an
+        # arm plants (peer_runs): no arm reads a real process. create=True
+        # lets an arm run on a module that reads no /proc at all; one that
+        # read the host's would find no process of the peer's unit at
+        # PEER_PID, and every arm expecting a proven posture fails there.
+        self.proc = os.path.join(self.tmp, "proc")
+        os.makedirs(self.proc)
+        proc = mock.patch.object(chatnode, "PROC", self.proc, create=True)
+        proc.start()
+        self.addCleanup(proc.stop)
 
-    def tearDown(self):
-        if self.prior_home is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = self.prior_home
-        shutil.rmtree(self.tmp, ignore_errors=True)
+    def peer_systemctl(self, argv, timeout=10):
+        self.asked.append(list(argv))
+        if self.answer is not None:
+            return self.answer
+        asked = {b for a, b in zip(argv, argv[1:]) if a == "-p"}
+        return 0, "".join("%s=%s\n" % (k, v) for k, v in self.props.items()
+                          if k in asked)
+
+    def peer_runs(self, env=(), raw=None, cgroup=None, pid=PEER_PID, **unit):
+        """The peer unit loaded, its main process `pid` started with `env`
+        (NAME=value entries; `raw` is the environ's bytes instead), in the
+        peer's control group unless `cgroup` is another's. `unit` sets what
+        systemctl says the unit declares (Environment=...). Returns the
+        process's /proc directory."""
+        d = os.path.join(self.proc, str(pid))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "environ"), "wb") as f:
+            f.write(_environ(env) if raw is None else raw)
+        with open(os.path.join(d, "cgroup"), "w", encoding="utf-8") as f:
+            f.write(_cgroup() if cgroup is None else cgroup)
+        self.props.update(LoadState="loaded", MainPID=str(pid), **unit)
+        return d
 
     def node_bin(self, name="dregg-node"):
         """A node binary `up` can hash and record; the unit never runs it.
@@ -63,163 +191,476 @@ class PostureBase(unittest.TestCase):
         return mock.patch.object(chatnode, "bin_resolution", return_value={
             "path": b, "source": "env", "reason": None})
 
-    def declare(self, body, unit=None, name="override.conf"):
-        d = os.path.join(self.units, (unit or chatnode.PEER_UNIT) + ".d")
-        os.makedirs(d, exist_ok=True)
-        p = os.path.join(d, name)
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(body)
-        return p
+    def grants(self):
+        """(the posture assignments proven, sorted; why none)."""
+        posture, why = chatnode.running_posture()
+        return sorted(a for _s, a in posture), why
+
+    def mirror(self):
+        """The text `up` writes into our unit's posture drop-in."""
+        p = chatnode.write_posture_dropin(chatnode.running_posture()[0])
+        with open(p, encoding="utf-8") as fh:
+            return fh.read()
+
+    def assert_neutralised(self, text):
+        """Our drop-in's `text` sets both loosening flags EMPTY and leaves
+        DREGG_REQUIRE_LEAN alone: a bypass the user manager exports never
+        reaches our node, and a tightening it exports does."""
+        for manager in ({UNVERIFIED: "1", UNAUDITED: "1"},
+                        {UNVERIFIED: "1", UNAUDITED: "1", REQUIRE_LEAN: "1"}):
+            env = _effective(text, manager)
+            self.assertEqual((env[UNVERIFIED], env[UNAUDITED]), ("", ""),
+                             "a loosening flag is not set empty: %r" % text)
+            self.assertFalse(_dregg_runs_unverified(env))
+            self.assertFalse(_dregg_runs_unaudited_pq(env))
+            self.assertEqual(env.get(REQUIRE_LEAN), manager.get(REQUIRE_LEAN),
+                             "DREGG_REQUIRE_LEAN was written: %r" % text)
 
 
-class DeclaredPostureTest(PostureBase):
-    def test_reads_the_operators_dregg_flags_from_a_dropin(self):
-        src = self.declare("[Service]\n"
-                           "Environment=DREGG_ALLOW_UNVERIFIED_CONSENSUS=1\n"
-                           "Environment=DREGG_ALLOW_UNAUDITED_PQ=1\n")
-        got = chatnode.declared_posture()
-        self.assertEqual([a for _s, a in got],
-                         ["DREGG_ALLOW_UNVERIFIED_CONSENSUS=1",
-                          "DREGG_ALLOW_UNAUDITED_PQ=1"])
-        self.assertTrue(all(s == src for s, _a in got), "source must be named")
+class RunningPostureTest(PostureBase):
+    """THE MIRROR READS THE RUNNING PEER (task/3432 round 2).
 
-    def test_only_dregg_names_are_mirrored(self):
-        """A drop-in may hold anything at all. Copying arbitrary Environment=
-        lines into a second unit file would propagate unrelated — possibly
-        secret-bearing — values onto disk in a new place. Only the flags that
-        gate startup travel."""
-        self.declare("[Service]\n"
-                     "Environment=DREGG_ALLOW_UNVERIFIED_CONSENSUS=1\n"
-                     "Environment=AWS_SECRET_ACCESS_KEY=hunter2\n"
-                     "Environment=RUST_LOG=debug\n")
-        got = [a for _s, a in chatnode.declared_posture()]
-        self.assertEqual(got, ["DREGG_ALLOW_UNVERIFIED_CONSENSUS=1"])
+    Every earlier reader rebuilt the peer's environment from what systemd
+    reports about its unit: its Environment= (task/3423), then its
+    EnvironmentFile= and PAMName= (round 1). Each rebuild missed a source
+    systemd applies when it starts the unit, and helm-codex's gap check found
+    more (F2-F4: a newline in an env file's path, a file that changes after
+    the read, an ExecStart= wrapper). The one account of what the peer runs
+    with is its main process's own environment. So the mirror asks systemd
+    for the unit's LoadState and MainPID, shows that the process is the
+    peer's, reads /proc/<pid>/environ and keeps the posture flags alone; and
+    when it cannot, it proves nothing and says why in fixed words."""
 
-    def test_a_multi_assignment_line_cannot_smuggle_a_secret(self):
-        """kimi's HOLE 2, reproduced live before the fix. systemd's Environment=
-        takes N whitespace-separated assignments on ONE line, so
+    def test_the_flags_the_peer_runs_with_are_mirrored_exactly(self):
+        self.peer_runs([UNVERIFIED + "=1", "PATH=/usr/bin",
+                        "DREGG_ADMIN_TOKEN=" + SECRET, UNAUDITED + "=1"])
+        posture, why = chatnode.running_posture()
+        self.assertIsNone(why)
+        self.assertEqual(sorted(a for _s, a in posture),
+                         [UNAUDITED + "=1", UNVERIFIED + "=1"])
+        self.assertEqual({s for s, _a in posture},
+                         {chatnode.POSTURE_SOURCE % chatnode.PEER_UNIT})
+        self.assertEqual(self.asked, [PEER_ASKED],
+                         "one show, in the scope of timerhealth's runner")
+        env = _effective(self.mirror())
+        self.assertTrue(_dregg_runs_unverified(env))
+        self.assertTrue(_dregg_runs_unaudited_pq(env))
 
-            Environment=DREGG_ALLOW_UNVERIFIED_CONSENSUS=1 AWS_SECRET_ACCESS_KEY=x
+    def test_it_asks_the_user_manager_the_peer_runs_under(self):
+        """dregg-cave.service is a USER unit: the mirror asks `systemctl
+        --user`, through timerhealth's runner, and an answer it cannot parse
+        (this fake prints nothing) proves nothing."""
+        from tests._tmphome import fake_user_systemd
+        self.peer_patch.stop()
+        fake = fake_user_systemd(self)
+        self.assertEqual(chatnode.running_posture(),
+                         ([], chatnode.POSTURE_WHY["unparsed"]))
+        self.assertEqual(fake.calls(), [["--user"] + PEER_ASKED])
 
-        is two. The old filter asked whether the WHOLE string started with
-        DREGG_, said yes, and mirrored the line whole — writing the secret into
-        a second 0600 file on disk, which is exactly the leak the filter was
-        cited as preventing. Validating the first token of an N-token grammar is
-        not validation."""
-        self.declare("[Service]\n"
-                     "Environment=DREGG_ALLOW_UNVERIFIED_CONSENSUS=1 "
-                     "AWS_SECRET_ACCESS_KEY=hunter2\n")
-        got = [a for _s, a in chatnode.declared_posture()]
-        self.assertEqual(got, ["DREGG_ALLOW_UNVERIFIED_CONSENSUS=1"])
-        p = chatnode.write_posture_dropin(chatnode.declared_posture())
-        self.assertNotIn("hunter2", open(p, encoding="utf-8").read(),
-                         "a secret rode a multi-assignment line into the mirror")
+    def test_the_posture_names_are_the_flags_dreggs_gates_read(self):
+        """ONE SET, and each name is one dregg's own startup gates read: the
+        boot refusal's escape hatch, the unaudited-PQ bypass and the switch
+        that revokes that bypass. The first two LOOSEN, and are the two the
+        drop-in writes on every `up`. No token, key, seed, DSN or proxy list
+        is among them."""
+        self.assertEqual(chatnode.POSTURE_NAMES,
+                         frozenset((UNVERIFIED, UNAUDITED, REQUIRE_LEAN)))
+        self.assertEqual(chatnode.LOOSENING, (UNVERIFIED, UNAUDITED))
+        self.assertEqual(chatnode.POSTURE_NAMES & {UNAUDITED, *DREGG_SECRETS},
+                         {UNAUDITED}, "a flag in, every secret out")
 
-    def test_quoted_assignments_are_split_the_way_systemd_splits_them(self):
-        self.declare('[Service]\n'
-                     'Environment="DREGG_A=one two" SECRET_B=nope\n')
-        self.assertEqual([a for _s, a in chatnode.declared_posture()],
-                         ["DREGG_A=one two"])
+    def test_no_dregg_secret_is_ever_mirrored(self):  # noqa: VACUOUS_ASSERTION — the loop is over the non-empty literal DREGG_SECRETS; every row first asserts the posture flag beside the secret mirrored (its positive control on the same environment), then the secret's absence
+        """Each DREGG_ name dregg defines for a token, a bearer, a key, a
+        seed, a DSN or a trusted-proxy list, beside a posture flag and alone:
+        the flag mirrors, the secret never does, and a secret alone proves
+        a peer running with no posture flag."""
+        self.assertTrue(DREGG_SECRETS)
+        for name in DREGG_SECRETS:
+            with self.subTest(name):
+                self.peer_runs([name + "=" + SECRET, UNAUDITED + "=1"])
+                self.assertEqual(self.grants(), ([UNAUDITED + "=1"], None))
+                body = self.mirror()
+                self.assertIn("\nEnvironment=%s=1\n" % UNAUDITED, body)
+                self.assertNotIn(name, body)
+                self.assertNotIn(SECRET, body)
+                self.peer_runs([name + "=" + SECRET])
+                self.assertEqual(self.grants(), ([], None))
+                body = self.mirror()
+                self.assert_neutralised(body)
+                self.assertNotIn(name, body)
+                self.assertNotIn(SECRET, body)
 
-    def test_an_unbalanced_quote_mirrors_nothing_rather_than_guessing(self):
-        """A line we cannot parse is not a line we may half-parse. Guessing at
-        malformed input is how the multi-assignment hole would come back."""
-        self.declare('[Service]\nEnvironment=DREGG_A=1 "unclosed\n')
-        self.assertEqual(chatnode.declared_posture(), [])
+    def test_a_revoked_pq_bypass_is_mirrored_revoked(self):
+        """DREGG_REQUIRE_LEAN=1 revokes DREGG_ALLOW_UNAUDITED_PQ=1
+        (dregg-pq/src/audit.rs:166-171). A mirror that carried the bypass
+        without its revocation would hand our node the opt-out the operator
+        withdrew from theirs."""
+        self.peer_runs([UNAUDITED + "=1", REQUIRE_LEAN + "=1"])
+        self.assertEqual(self.grants(),
+                         ([UNAUDITED + "=1", REQUIRE_LEAN + "=1"], None))
+        env = _effective(self.mirror())
+        self.assertEqual(env[REQUIRE_LEAN], "1")
+        self.assertFalse(_dregg_runs_unaudited_pq(env))
 
-    def test_a_name_merely_containing_DREGG_is_not_a_posture_flag(self):
-        self.declare("[Service]\nEnvironment=NOT_DREGG_ALLOW=1\n")
-        self.assertEqual(chatnode.declared_posture(), [])
+    def test_every_value_is_mirrored_byte_for_byte(self):  # noqa: VACUOUS_ASSERTION — the loop is over a non-empty literal table; every row asserts the exact grant and the exact line written for it
+        """The mirror writes each value through env_assignment: quoted when
+        systemd would split or drop it, "%" doubled so our unit expands no
+        specifier, and a multi-byte character (NBSP, which Python's strip
+        would lose) kept. An empty value is the refusal it is."""
+        for value, line in (
+                ("one two", '"%s=one two"'),
+                ("a\"b\\c`d$e'f", '"%s=a\\"b\\\\c`d$e\'f"'),
+                ("café ", "%s=café "),
+                ("100%", '"%s=100%%%%"'),
+                ("", "%s=")):
+            with self.subTest(value):
+                self.peer_runs([UNAUDITED + "=" + value])
+                self.assertEqual(self.grants(),
+                                 ([UNAUDITED + "=" + value], None))
+                self.assertIn("\nEnvironment=%s\n" % (line % UNAUDITED),
+                              self.mirror())
 
-    def test_no_dropin_directory_is_empty_not_an_error(self):
-        self.assertEqual(chatnode.declared_posture(), [])
+    def test_a_posture_value_no_line_can_carry_proves_nothing(self):  # noqa: VACUOUS_ASSERTION — the loop is over a non-empty literal tuple; every row asserts the exact empty posture, its exact fixed reason and the neutralised drop-in, and the secret row after it is its control
+        """A posture value holding a control character, or bytes that are
+        not UTF-8, is one no Environment= line helm writes carries exactly:
+        nothing is proven, since a partial grant is a guess at what the rest
+        meant. A secret's value is not mirrored, so it blocks nothing."""
+        for label, entry in (("a tab", UNAUDITED + "=1\t"),
+                             ("a control character", UNAUDITED + "=1\x01"),
+                             ("bytes that are not UTF-8",
+                              UNAUDITED.encode("ascii") + b"=1\xff")):
+            with self.subTest(label):
+                self.peer_runs([UNVERIFIED + "=1", entry])
+                self.assertEqual(chatnode.running_posture(),
+                                 ([], chatnode.POSTURE_WHY["unwritable"]))
+                self.assert_neutralised(self.mirror())
+        self.peer_runs(["DREGG_ADMIN_TOKEN=a\tb", b"DISCORD_TOKEN=\xff",
+                        UNAUDITED + "=1"])
+        self.assertEqual(self.grants(), ([UNAUDITED + "=1"], None))
 
-    def test_multiple_dropins_are_read_in_systemd_order(self):
-        self.declare("[Service]\nEnvironment=DREGG_A=1\n", name="05-a.conf")
-        self.declare("[Service]\nEnvironment=DREGG_B=2\n", name="90-b.conf")
-        self.assertEqual([a for _s, a in chatnode.declared_posture()],
-                         ["DREGG_A=1", "DREGG_B=2"])
+    def test_an_entry_ends_at_a_nul_alone(self):
+        """The kernel ends each entry with a NUL, and getenv(3) matches a
+        name only from an entry's start up to its first "=". So a flag's name
+        after a newline or a U+2028 inside another entry's value, one without
+        "=", one with a blank before or after its name, and a longer name
+        ending in a flag's are no flag."""
+        self.peer_runs(["OTHER=x\n%s=1" % UNVERIFIED,
+                        "OTHER2=x %s=1" % UNVERIFIED, UNVERIFIED,
+                        " %s=1" % UNVERIFIED, "%s =1" % UNVERIFIED,
+                        "X_%s=1" % UNVERIFIED, UNAUDITED + "=1"])
+        self.assertEqual(self.grants(), ([UNAUDITED + "=1"], None))
 
-    def test_non_conf_files_are_ignored(self):
-        self.declare("[Service]\nEnvironment=DREGG_REAL=1\n", name="live.conf")
-        self.declare("[Service]\nEnvironment=DREGG_STALE=1\n",
-                     name="override.conf.bak")
-        self.assertEqual([a for _s, a in chatnode.declared_posture()],
-                         ["DREGG_REAL=1"])
+    def test_a_flag_set_twice_proves_nothing(self):
+        """An environment can hold one name twice, and which one a reader
+        takes is its own semantics: nothing is proven."""
+        self.peer_runs([UNAUDITED + "=1", UNVERIFIED + "=1"])
+        self.assertEqual(self.grants(),
+                         ([UNAUDITED + "=1", UNVERIFIED + "=1"], None),
+                         "the control: each once proves both")
+        self.peer_runs([UNAUDITED + "=", UNVERIFIED + "=1", UNAUDITED + "=1"])
+        posture, why = chatnode.running_posture()
+        self.assertEqual(why, chatnode.POSTURE_WHY["twice"])
+        self.assertEqual(posture, [])
+        self.assert_neutralised(self.mirror())
+
+    def test_a_peer_systemd_cannot_describe_proves_nothing(self):  # noqa: VACUOUS_ASSERTION — the loop is over a non-empty literal table after its control (the same running peer, answered as systemctl answers, proves both flags); every row asserts the exact empty posture, its exact fixed reason and the neutralised drop-in
+        """FAIL CLOSED: an answer the reader cannot trust proves nothing, and
+        the reason is one of the fixed sentences, never systemctl's text. The
+        peer runs with both flags throughout."""
+        self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"])
+        self.assertEqual(self.grants(),
+                         ([UNAUDITED + "=1", UNVERIFIED + "=1"], None),
+                         "the control: systemctl's own answer proves both")
+        good = "LoadState=loaded\nMainPID=%d\n" % PEER_PID
+        pid = "MainPID=%d" % PEER_PID
+        cases = (
+            ("no systemctl", (None, ""), "unrun"),
+            ("show failed", (1, good), "refused"),
+            ("no MainPID line", (0, "LoadState=loaded\n"), "unparsed"),
+            ("MainPID twice", (0, good + pid + "\n"), "unparsed"),
+            ("a line of another property", (0, good + "Id=x.service\n"),
+             "unparsed"),
+            ("a line without an equals sign", (0, good + "MainPID\n"),
+             "unparsed"),
+            ("no final newline", (0, good[:-1]), "unparsed"),
+            ("nothing", (0, ""), "unparsed"),
+            ("a negative pid", (0, good.replace(pid, "MainPID=-1")),
+             "unparsed"),
+            ("a pid with a suffix", (0, good.replace(pid, pid + "x")),
+             "unparsed"),
+            ("an empty pid", (0, good.replace(pid, "MainPID=")), "unparsed"),
+            ("digits that are not ASCII",
+             (0, good.replace(pid, "MainPID=٤٢")), "unparsed"),
+            ("no such unit", (0, "LoadState=not-found\nMainPID=0\n"),
+             "absent"),
+            ("masked", (0, good.replace("loaded", "masked")), "unloaded"),
+        )
+        for label, answer, why in cases:
+            with self.subTest(label):
+                self.answer = answer
+                self.assertEqual(chatnode.running_posture(),
+                                 ([], chatnode.POSTURE_WHY[why]))
+                self.assert_neutralised(self.mirror())
+
+    def test_a_stopped_peer_proves_nothing(self):  # noqa: VACUOUS_ASSERTION — the control asserts the exact grants of the same running peer; the loop is over a non-empty literal tuple, and every row asserts the exact empty posture, its fixed reason and the neutralised drop-in
+        """A peer with no main process (MainPID=0, what systemd reports for
+        a unit that is not running) runs with nothing to read, and a main
+        process that has exited since systemd named it is gone."""
+        self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"])
+        self.assertEqual(self.grants(),
+                         ([UNAUDITED + "=1", UNVERIFIED + "=1"], None),
+                         "the control")
+        for label, pid in (("MainPID=0", "0"),
+                           ("its main process has exited",
+                            str(PEER_PID + 1))):
+            with self.subTest(label):
+                self.props["MainPID"] = pid
+                self.assertEqual(chatnode.running_posture(),
+                                 ([], chatnode.POSTURE_WHY["stopped"]))
+                self.assert_neutralised(self.mirror())
+
+    def test_a_process_not_shown_to_be_the_peers_proves_nothing(self):  # noqa: VACUOUS_ASSERTION — the controls first assert a proven posture for the peer's own control group, a sub-cgroup of it and a nested slice; every row of the non-empty literal table then asserts the exact empty posture and fixed reason, no secret in it, and the neutralised drop-in
+        """The pid systemd names is read only when the kernel shows it is
+        the peer's: a process of this user (its /proc entry's owner) in the
+        control group of the peer's unit under this user's manager, or a
+        sub-cgroup of it. Anything else, a process of another unit, the
+        system manager's unit of the same name, another user's, a v1-only
+        or doubled cgroup record, or a deleted control group, is not shown
+        to be the peer."""
+        uid = os.getuid()
+        for label, cgroup in (
+                ("its own control group", _cgroup()),
+                ("a sub-cgroup of its own",
+                 _cgroup("app.slice", chatnode.PEER_UNIT, "payload")),
+                ("a nested slice",
+                 _cgroup("app.slice", "app-dregg.slice", chatnode.PEER_UNIT))):
+            with self.subTest("control: " + label):
+                self.peer_runs([UNVERIFIED + "=1"], cgroup=cgroup)
+                self.assertEqual(self.grants(), ([UNVERIFIED + "=1"], None))
+        env = [UNVERIFIED + "=1", UNAUDITED + "=1", "DREGG_ADMIN_TOKEN=" + SECRET]
+        cases = (
+            ("another unit", _cgroup("app.slice", "other.service")),
+            ("the system manager's unit of that name",
+             "0::/system.slice/%s\n" % chatnode.PEER_UNIT),
+            ("another user's manager", _cgroup(uid=uid + 1)),
+            ("a sub-cgroup of another unit, named like the peer",
+             _cgroup("app.slice", "other.service", chatnode.PEER_UNIT)),
+            ("a cgroup v1 record alone",
+             "1:name=systemd:" + _cgroup()[len("0::"):]),
+            ("two unified records", _cgroup() + _cgroup()),
+            ("a deleted control group",
+             _cgroup().replace("\n", " (deleted)\n")),
+            ("no record", ""),
+        )
+        self.assertTrue(cases)
+        for label, cgroup in cases:
+            with self.subTest(label):
+                self.peer_runs(env, cgroup=cgroup)
+                posture, why = chatnode.running_posture()
+                self.assertEqual((posture, why),
+                                 ([], chatnode.POSTURE_WHY["stranger"]))
+                self.assertNotIn(SECRET, why)
+                self.assert_neutralised(self.mirror())
+        with self.subTest("no cgroup file"):
+            d = self.peer_runs(env)
+            os.remove(os.path.join(d, "cgroup"))
+            self.assertEqual(chatnode.running_posture(),
+                             ([], chatnode.POSTURE_WHY["stranger"]))
+        with self.subTest("another user's process"):
+            self.peer_runs(env, cgroup=_cgroup(uid=uid + 1))
+            with mock.patch.object(chatnode.os, "getuid",
+                                   return_value=uid + 1):
+                self.assertEqual(chatnode.running_posture(),
+                                 ([], chatnode.POSTURE_WHY["stranger"]))
+
+    def test_an_environment_that_cannot_be_read_proves_nothing(self):  # noqa: VACUOUS_ASSERTION — the loop is over a non-empty table; every row first asserts its own control (the same process, readable, proves the flag), then the exact empty posture, the fixed reason and the neutralised drop-in
+        """What the peer runs with is unknown when its environ cannot be
+        read: missing, not a file, one this user may not read, or empty, as
+        the kernel shows a process that is exiting."""
+        def empty(p):
+            open(p, "wb").close()
+
+        def directory(p):
+            os.remove(p)
+            os.mkdir(p)
+        cases = [("empty", empty), ("missing", os.remove),
+                 ("a directory", directory)]
+        if os.geteuid():
+            cases.append(("not permitted", lambda p: os.chmod(p, 0)))
+        self.assertTrue(cases)
+        for i, (label, spoil) in enumerate(cases):
+            with self.subTest(label):
+                d = self.peer_runs([UNVERIFIED + "=1"], pid=PEER_PID + 10 + i)
+                self.assertEqual(self.grants(), ([UNVERIFIED + "=1"], None),
+                                 "the control")
+                spoil(os.path.join(d, "environ"))
+                self.assertEqual(chatnode.running_posture(),
+                                 ([], chatnode.POSTURE_WHY["unreadable"]))
+                self.assert_neutralised(self.mirror())
 
 
 class MirrorTest(PostureBase):
-    def test_nothing_declared_writes_nothing(self):
-        """THE LOAD-BEARING ONE. helm must never be the layer that quietly opts a
-        node out of verification. No operator declaration => no drop-in => dregg's
-        refusal stands, which is the correct outcome."""
-        self.assertIsNone(chatnode.write_posture_dropin([]))
-        d = chatnode._dropin_dir(chatnode.UNIT)
-        self.assertFalse(os.path.exists(d), "minted a posture nobody declared")
+    """THE DROP-IN IS WRITTEN ON EVERY `up` AND NEVER REMOVED (task/3432
+    round 2). Our unit inherits the user manager's environment, so no
+    drop-in, or one without a loosening flag, lets a bypass the manager
+    exports through. Each loosening flag is therefore always written: the
+    value the running peer has, else empty."""
+
+    def read(self, p):
+        with open(p, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_nothing_proven_writes_both_loosening_flags_empty(self):
+        """THE LOAD-BEARING ONE. helm must never be the layer that opts a
+        node out of verification, and writing nothing does not keep it out:
+        an empty value is dregg's refusal, and it overrides what the manager
+        exports."""
+        p = chatnode.write_posture_dropin([])
+        body = self.read(p)
+        self.assertEqual([ln for ln in body.splitlines()
+                          if not ln.startswith("#")],
+                         ["[Service]", "Environment=%s=" % UNVERIFIED,
+                          "Environment=%s=" % UNAUDITED])
+        self.assert_neutralised(body)
+        self.assertEqual(oct(os.stat(p).st_mode)[-3:], "600")
+        self.assertEqual(os.listdir(os.path.dirname(p)),
+                         ["10-helm-posture.conf"],
+                         "no temporary file is left beside it")
+
+    def test_F1_a_manager_exported_bypass_never_reaches_our_node(self):
+        """helm-codex's F1 on 3b7a8f92ad9: a peer that runs without a
+        bypass wrote no drop-in, and our node took the manager's
+        DREGG_ALLOW_UNAUDITED_PQ=1. Nor does a flag the peer runs with carry
+        the other one in."""
+        self.peer_runs(["PATH=/usr/bin", "DREGG_ADMIN_TOKEN=" + SECRET])
+        body = self.mirror()
+        self.assertIn("\nEnvironment=%s=\n" % UNAUDITED, body)
+        self.assert_neutralised(body)
+        self.peer_runs([UNVERIFIED + "=1"])
+        env = _effective(self.mirror(), {UNAUDITED: "1"})
+        self.assertTrue(_dregg_runs_unverified(env))
+        self.assertEqual(env[UNAUDITED], "")
+        self.assertFalse(_dregg_runs_unaudited_pq(env))
+
+    def test_a_tightening_is_written_when_it_runs_and_never_blanked(self):
+        """DREGG_REQUIRE_LEAN only tightens. The peer running with it is
+        mirrored; the peer running without it writes no line, so one the
+        manager exports still reaches our node and still revokes the PQ
+        bypass."""
+        self.peer_runs([UNAUDITED + "=1", REQUIRE_LEAN + "=1"])
+        env = _effective(self.mirror())
+        self.assertEqual(env[REQUIRE_LEAN], "1")
+        self.assertFalse(_dregg_runs_unaudited_pq(env))
+        self.peer_runs([UNAUDITED + "=1"])
+        env = _effective(self.mirror(), {REQUIRE_LEAN: "1"})
+        self.assertEqual(env[REQUIRE_LEAN], "1", "a tightening was blanked")
+        self.assertFalse(_dregg_runs_unaudited_pq(env))
 
     def test_mirrors_the_flags_and_names_its_source(self):
-        src = self.declare("[Service]\nEnvironment=DREGG_ALLOW_UNVERIFIED_CONSENSUS=1\n")
-        p = chatnode.write_posture_dropin(chatnode.declared_posture())
-        body = open(p, encoding="utf-8").read()
-        self.assertIn("Environment=DREGG_ALLOW_UNVERIFIED_CONSENSUS=1", body)
+        self.peer_runs([UNVERIFIED + "=1"])
+        p = chatnode.write_posture_dropin(chatnode.running_posture()[0])
+        body = self.read(p)
+        self.assertIn("\nEnvironment=%s=1\n" % UNVERIFIED, body)
         self.assertIn("[Service]", body)
-        self.assertIn(src, body, "a mirrored opt-out must cite where it came from")
+        self.assertIn(chatnode.POSTURE_SOURCE % chatnode.PEER_UNIT, body,
+                      "a mirrored opt-out must cite where it came from")
         self.assertIn("MIRRORED, not decided here", body)
         self.assertEqual(oct(os.stat(p).st_mode)[-3:], "600")
 
     def test_rewriting_replaces_rather_than_appends(self):
-        self.declare("[Service]\nEnvironment=DREGG_ONE=1\n")
-        chatnode.write_posture_dropin(chatnode.declared_posture())
-        os.remove(os.path.join(self.units, chatnode.PEER_UNIT + ".d",
-                               "override.conf"))
-        self.declare("[Service]\nEnvironment=DREGG_TWO=2\n")
-        p = chatnode.write_posture_dropin(chatnode.declared_posture())
-        body = open(p, encoding="utf-8").read()
-        self.assertIn("DREGG_TWO=2", body)
-        self.assertNotIn("DREGG_ONE=1", body,
-                         "a withdrawn declaration must not survive in the mirror")
+        self.peer_runs([UNVERIFIED + "=1"])
+        self.mirror()
+        self.peer_runs([UNAUDITED + "=2"])
+        body = self.mirror()
+        self.assertIn("\nEnvironment=%s=2\n" % UNAUDITED, body)
+        self.assertIn("\nEnvironment=%s=\n" % UNVERIFIED, body,
+                      "a withdrawn value must not survive in the mirror")
+        self.assertNotIn("%s=1" % UNVERIFIED, body)
 
-    def test_withdrawal_deletes_the_mirror_it_must_not_outlive_its_source(self):
-        """kimi's HOLE 1, reproduced live before the fix. rewrite-replaces
-        handled an EDIT; full WITHDRAWAL is a different terminal state. The
-        operator deletes their declaration, declared_posture() returns [], and
-        the previously-mirrored file stayed on disk still carrying
-        Environment=DREGG_ALLOW_*=1 — so our copy kept granting an opt-out the
-        operator had rescinded, and the node went on running unverified on an
-        authority that no longer existed.
+    def test_the_writer_carries_only_posture_names_whoever_calls_it(self):
+        """BY CONSTRUCTION, not by the reader alone: the writer is handed a
+        list, and a DREGG_ name in it that is no posture flag is never
+        written, whoever built the list. A list holding none writes the
+        loosening flags empty."""
+        src = "a caller's list"
+        alone = self.read(chatnode.write_posture_dropin(
+            [(src, "DREGG_ADMIN_TOKEN=" + SECRET)]))
+        self.assertIn("\nEnvironment=%s=\n" % UNAUDITED, alone)
+        self.assertNotIn(SECRET, alone)
+        self.assert_neutralised(alone)
+        body = self.read(chatnode.write_posture_dropin(
+            [(src, "DREGG_ADMIN_TOKEN=" + SECRET), (src, UNAUDITED + "=1"),
+             (src, "DREGG_TRUSTED_PROXIES=0.0.0.0/0")]))
+        self.assertIn("\nEnvironment=%s=1\n" % UNAUDITED, body)
+        for leak in ("DREGG_ADMIN_TOKEN", SECRET, "DREGG_TRUSTED_PROXIES",
+                     "0.0.0.0"):
+            with self.subTest(leak):
+                self.assertNotIn(leak, body)
 
-        Empty posture has two meanings: never-declared (write nothing) and
-        withdrawn (clear). Conflating them is the whole bug."""
-        src = self.declare("[Service]\nEnvironment=DREGG_ALLOW_UNVERIFIED_CONSENSUS=1\n")
-        mirror = chatnode.write_posture_dropin(chatnode.declared_posture())
-        self.assertTrue(os.path.exists(mirror))
-        os.remove(src)                                   # operator rescinds
-        self.assertEqual(chatnode.declared_posture(), [])
-        returned = chatnode.write_posture_dropin(chatnode.declared_posture())
-        self.assertFalse(os.path.exists(mirror),
-                         "a withdrawn opt-out outlived its source")
-        self.assertEqual(returned, mirror, "the removal must be reported")
+    def test_a_doubled_or_unwritable_list_writes_the_flags_empty(self):  # noqa: VACUOUS_ASSERTION — the loop is over a non-empty literal tuple; every row asserts the neutralised drop-in
+        """A list naming one flag twice, or holding a value no line carries
+        exactly, is a guess at what the peer meant: the loosening flags are
+        written empty and no tightening is written from it."""
+        src = "a caller's list"
+        for posture in ([(src, UNAUDITED + "=1"), (src, UNAUDITED + "=0")],
+                        [(src, UNAUDITED + "=1\t")],
+                        [(src, UNVERIFIED + "=1"),
+                         (src, REQUIRE_LEAN + "=1\x01")]):
+            with self.subTest(posture):
+                self.assert_neutralised(self.read(
+                    chatnode.write_posture_dropin(posture)))
 
-    def test_never_declared_still_writes_nothing_after_the_withdrawal_fix(self):
-        """The other half of the same discrimination: clearing on withdrawal must
-        not turn into writing on never-declared."""
-        self.assertIsNone(chatnode.write_posture_dropin([]))
-        self.assertFalse(os.path.exists(chatnode._dropin_dir(chatnode.UNIT)))
+    def test_a_withdrawn_or_unproven_grant_is_written_empty_never_deleted(self):  # noqa: VACUOUS_ASSERTION — the loop is over a non-empty literal tuple; every row asserts its control (the mirror grants both), then the same path returned, still on disk, and neutralised
+        """A grant must not outlive its source (kimi's HOLE 1), and a
+        deleted mirror lets our unit inherit the manager's environment, so
+        withdrawing it never deletes the file. Every way the grant ends
+        (the peer runs without it, stops, is gone, cannot be asked, or its
+        process is not shown to be the peer's) rewrites the same file with
+        both loosening flags empty."""
+        gone = (
+            ("it runs without them now",
+             lambda: self.peer_runs(["PATH=/usr/bin"])),
+            ("it is stopped", lambda: self.props.update(MainPID="0")),
+            ("no such unit",
+             lambda: self.props.update(LoadState="not-found", MainPID="0")),
+            ("systemctl cannot be run",
+             lambda: setattr(self, "answer", (None, ""))),
+            ("its process is another unit's",
+             lambda: self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"],
+                                    cgroup=_cgroup("app.slice",
+                                                   "other.service"))),
+        )
+        for label, withdraw in gone:
+            with self.subTest(label):
+                self.answer = None
+                self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"])
+                p = chatnode.write_posture_dropin(
+                    chatnode.running_posture()[0])
+                self.assertTrue(_dregg_runs_unaudited_pq(
+                    _effective(self.read(p))), "the control")
+                withdraw()
+                self.assertEqual(chatnode.write_posture_dropin(
+                    chatnode.running_posture()[0]), p)
+                self.assertTrue(os.path.exists(p),
+                                "removed: our unit inherits the manager's "
+                                "environment")
+                self.assert_neutralised(self.read(p))
 
-    def test_the_generated_comment_does_not_promise_what_the_code_skips(self):
-        """The first version's file said 'remove the source declaration and this
-        file becomes empty on the next node up'. It did not. A false guarantee
-        inside a generated file is worse than no comment — it is what a future
-        reader checks INSTEAD of the code."""
-        self.declare("[Service]\nEnvironment=DREGG_ALLOW_UNVERIFIED_CONSENSUS=1\n")
-        body = open(chatnode.write_posture_dropin(chatnode.declared_posture()),
-                    encoding="utf-8").read()
-        self.assertIn("DELETES", body)
-        self.assertNotIn("becomes empty", body)
+    def test_the_generated_comment_says_what_the_code_does(self):
+        """A false guarantee inside a generated file is worse than no
+        comment: it is what a future reader checks INSTEAD of the code. The
+        file is rewritten, never deleted, and says so."""
+        self.peer_runs([UNVERIFIED + "=1"])
+        comment = "\n".join(ln for ln in self.mirror().splitlines()
+                            if ln.startswith("#"))
+        self.assertIn("EMPTY", comment)
+        self.assertIn("never deleted", comment)
+        self.assertNotIn("DELETES", comment)
+        self.assertNotIn("becomes empty", comment)
 
     def test_the_mirror_targets_our_unit_not_the_peers(self):
-        self.declare("[Service]\nEnvironment=DREGG_ALLOW_UNVERIFIED_CONSENSUS=1\n")
-        p = chatnode.write_posture_dropin(chatnode.declared_posture())
+        self.peer_runs([UNVERIFIED + "=1"])
+        p = chatnode.write_posture_dropin(chatnode.running_posture()[0])
         self.assertIn(chatnode.UNIT + ".d", p)
         self.assertNotIn(chatnode.PEER_UNIT + ".d", p,
                          "never write back into the operator's own declaration")
@@ -249,6 +690,43 @@ class FailureRelayTest(PostureBase):
     def test_journalctl_missing_degrades_to_None(self):
         with mock.patch("helm.chatnode.subprocess.run", side_effect=OSError("nope")):
             self.assertIsNone(chatnode.last_failure())
+
+    @unittest.skipIf(_sys.flags.utf8_mode,
+                     "UTF-8 mode reads every child as UTF-8 whatever the locale")
+    def test_the_services_words_are_read_as_utf8_in_any_locale(self):  # noqa: VACUOUS_ASSERTION — the loop is over two literal locales; every row first asserts the simulated locale mis-reads the same fakes (its control), then each reader's exact result
+        """dregg's refusal carries an em dash (node/src/lib.rs), and
+        journalctl and systemctl print UTF-8 whatever the locale. chatnode's
+        readers decoded with the locale: a Latin-1 locale relayed the dash as
+        three characters, and an ASCII one raised out of `up`. They read
+        UTF-8 (task/3423, the same class as timerhealth._systemctl), and a
+        byte that is not UTF-8 is replaced, never raised: each answer is
+        read for words, and none is mirrored anywhere."""
+        import locale
+        from tests._tmphome import fake_user_systemd
+        said = (self.REFUSAL.replace("is false ...", "is false — ...")
+                + " é")
+        self.assertIn("—", said)
+        fake = fake_user_systemd(self)
+        bindir = os.path.dirname(fake.systemctl)
+        for name in ("journalctl", "systemctl"):
+            with open(os.path.join(bindir, name), "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nprintf '%s\\n'\n" % "".join(
+                    "\\%03o" % b for b in said.encode("utf-8")))
+            os.chmod(os.path.join(bindir, name), 0o755)
+        for encoding in ("iso-8859-1", "ascii"):
+            with self.subTest(encoding), mock.patch.object(
+                    locale, "getencoding", return_value=encoding):
+                try:
+                    control = subprocess.run(
+                        [os.path.join(bindir, "journalctl")],
+                        capture_output=True, text=True).stdout
+                except UnicodeDecodeError:
+                    control = ""
+                self.assertNotIn("—", control,
+                                 "the control: this locale mis-reads")
+                self.assertEqual(chatnode.last_failure(), said)
+                self.assertEqual(chatnode._systemctl("show", chatnode.UNIT),
+                                 (0, said))
 
 
 
@@ -536,6 +1014,35 @@ class BootWaitTest(BootBase):
                       "identity", err)
         self.assertNotIn(ESC, err)
 
+    def test_a_refusal_carries_the_readers_own_reason_for_no_mirror(self):  # noqa: VACUOUS_ASSERTION — the loop is over two literal peers; every row asserts rc 1, the relayed refusal and the exact reason sentence in the same stderr
+        """meta-claude's B, its second half: `up` held the posture reader's
+        reason in `why`, reused the name for the journal line, and for any
+        empty posture then said "no DREGG_* posture is declared", right after
+        printing that the peer's posture could not be read. A refusal naming
+        the escape hatch carries the reader's actual reason; only a peer
+        proven to run without the flags reads as running without them."""
+        os.environ["HELM_CHAT_NODE_BOOT_WAIT_S"] = "30"
+        for peer, said in (
+                (lambda: self.props.update(LoadState="loaded", MainPID="0"),
+                 "no posture was proven for %s: %s, so both are set empty "
+                 "here" % (chatnode.PEER_UNIT,
+                           chatnode.POSTURE_WHY["stopped"])),
+                (lambda: self.peer_runs(["DREGG_ADMIN_TOKEN=" + SECRET]),
+                 "the running %s does not run with %s or %s, so both are set "
+                 "empty here" % (chatnode.PEER_UNIT, UNVERIFIED, UNAUDITED))):
+            with self.subTest(said):
+                peer()
+                self.shows = [_show("inactive", "dead"),
+                              _show("failed", "failed", 1, "exit-code",
+                                    "b" * 32)]
+                with self.journal("Started helm-chat-node.service\n"
+                                  + FailureRelayTest.REFUSAL + "\n"):
+                    rc, _out, err = self._up()
+                self.assertEqual(rc, 1)
+                self.assertIn("the service said:", err)
+                self.assertIn(said, err)
+                self.assertNotIn("no DREGG_* posture is declared", err)
+                self.assertNotIn(SECRET, err)
 
 class RefusalRemedyTest(BootBase):
     LINES = {
@@ -805,6 +1312,390 @@ class UnreachableDiagnosisTest(BootBase):
         self.assertTrue(any(level == "WARN" and "UNREACHABLE" in t
                             for level, t in rows), rows)
         self.assertEqual([t for level, t in rows if level == "FAIL"], [])
+
+
+class PriorityTest(BootBase):
+    """THE NODE YIELDS THE CPU TO THE OWNER'S PANES, and `up` keeps it so.
+
+    Measured on the owner's 8-core laptop while his typing lagged: load
+    38.7, CPU pressure some=55-63%, the node at 303% CPU proving signed chat
+    turns. A runtime CPUWeight=20 and renice +10 brought
+    pressure to 32% within a minute and were lost at the next restart; the
+    drop-in `up` writes is what outlives one. Proofs attach after a turn
+    commits, so the priority delays proofs, never delivery."""
+
+    def dropin(self):
+        return os.path.join(chatnode._dropin_dir(chatnode.UNIT),
+                            chatnode.PRIORITY_DROPIN)
+
+    def body(self):
+        with open(self.dropin(), encoding="utf-8") as f:
+            return f.read()
+
+    @staticmethod
+    def keys(body):
+        return [ln.split("=", 1)[0] for ln in body.splitlines()
+                if "=" in ln and not ln.startswith("#")]
+
+    def up(self):
+        """`up` as far as the boot wait, which reads as still initializing:
+        the drop-ins and the daemon-reload are behind it by then. Returns
+        stdout and, per daemon-reload, whether the drop-in was on disk."""
+        loaded = []
+
+        def systemctl(*args):
+            if args[:1] == ("daemon-reload",):
+                loaded.append(os.path.exists(self.dropin()))
+            return self.systemctl(*args)
+        out = io.StringIO()
+        with mock.patch.object(chatnode, "_systemctl", systemctl), \
+                self.node_bin(), \
+                mock.patch.object(chatnode, "wait_boot",
+                                  return_value=("initializing", 1)), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            chatnode.cmd_node(["up"])
+        return out.getvalue(), loaded
+
+    def test_up_writes_the_priority_even_with_no_posture_declared(self):
+        out, loaded = self.up()
+        body = self.body()
+        self.assertIn("[Service]", body.splitlines())
+        self.assertEqual(self.keys(body), ["CPUWeight", "Nice"],
+                         "exactly the two keys, and no IOWeight")
+        self.assertIn("CPUWeight=%d" % chatnode.CPU_WEIGHT, body.splitlines())
+        self.assertIn("Nice=%d" % chatnode.NICE, body.splitlines())
+        self.assertLess(chatnode.CPU_WEIGHT, 100,
+                        "systemd weighs every sibling 100 by default")
+        self.assertGreater(chatnode.NICE, 0)
+        self.assertTrue(any(ln.startswith("#") and "delivery" in ln
+                            for ln in body.splitlines()),
+                        "the file must say why it delays proofs, not turns")
+        self.assertEqual(loaded, [False, True],
+                         "first reload is before drop-in write (False), "
+                         "second reload is after (True)")
+        self.assertIn(chatnode.PRIORITY_DROPIN, out)
+
+    def test_rerunning_up_leaves_one_identical_file(self):
+        self.up()
+        first = self.body()
+        self.assertIn("[Service]", first.splitlines())
+        out, _loaded = self.up()
+        self.assertIn("recorded", out, "the second `up` ran and printed")
+        self.assertEqual(self.body(), first)
+        self.assertEqual(sorted(os.listdir(chatnode._dropin_dir(chatnode.UNIT))),
+                         ["10-helm-posture.conf", chatnode.PRIORITY_DROPIN],
+                         "one of each, the posture one written every `up`")
+        self.assertNotIn(chatnode.PRIORITY_DROPIN, out,
+                         "an unchanged drop-in is not news")
+
+    def test_the_dropin_is_0600_like_its_sibling(self):
+        self.peer_runs([UNVERIFIED + "=1"])
+        self.up()
+        d = chatnode._dropin_dir(chatnode.UNIT)
+        self.assertEqual(sorted(os.listdir(d)),
+                         ["10-helm-posture.conf", chatnode.PRIORITY_DROPIN])
+        for name in os.listdir(d):
+            self.assertEqual(oct(os.stat(os.path.join(d, name)).st_mode)[-3:],
+                             "600", name)
+
+    def test_an_edited_or_loosened_dropin_is_put_back(self):
+        self.up()
+        want = self.body()
+        self.assertIn("[Service]", want.splitlines())
+        with open(self.dropin(), "w", encoding="utf-8") as f:
+            f.write("[Service]\nCPUWeight=100\n")
+        out, _loaded = self.up()
+        self.assertEqual(self.body(), want)
+        self.assertIn(chatnode.PRIORITY_DROPIN, out)
+        os.chmod(self.dropin(), 0o644)          # the same bytes, loosened
+        self.up()
+        self.assertEqual(oct(os.stat(self.dropin()).st_mode)[-3:], "600")
+
+    def test_up_says_why_it_proved_nothing_and_what_it_set_empty(self):
+        """`up` reloads first, then reads the peer, then reloads again after
+        writing drop-ins. A peer that is not running has no environment to
+        read: `up` says so in the fixed words, and rewrites the mirror an
+        earlier `up` wrote with both loosening flags empty, naming them. A
+        flag the peer runs without is named the same way beside the one it
+        mirrors."""
+        self.peer_runs([UNVERIFIED + "=1"])
+        out, _loaded = self.up()
+        self.assertIn("helm chat node: mirrored 1 posture flag from the "
+                      "running %s; 10-helm-posture.conf sets %s empty, which "
+                      "dregg reads as refusal" % (chatnode.PEER_UNIT,
+                                                  UNAUDITED), out)
+        self.props["MainPID"] = "0"
+        out, _loaded = self.up()
+        self.assertIn("helm chat node: no posture proven for %s: %s; "
+                      "10-helm-posture.conf sets %s and %s empty, which dregg "
+                      "reads as refusal" % (
+                          chatnode.PEER_UNIT, chatnode.POSTURE_WHY["stopped"],
+                          UNVERIFIED, UNAUDITED), out)
+        self.assertEqual(sorted(os.listdir(chatnode._dropin_dir(chatnode.UNIT))),
+                         ["10-helm-posture.conf", chatnode.PRIORITY_DROPIN])
+        self.assertIn(PEER_ASKED, self.asked)
+
+    def test_up_says_a_peer_running_with_no_posture_flag_runs_with_none(self):
+        """A peer that runs with a DREGG_ secret and no posture flag has
+        nothing the mirror carries: `up` says the running peer runs with no
+        posture flag, never that it has no DREGG_ variable, which it has,
+        and never names the secret."""
+        self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"])
+        out, _loaded = self.up()
+        self.assertIn("helm chat node: mirrored 2 posture flags from the "
+                      "running %s; 10-helm-posture.conf written"
+                      % chatnode.PEER_UNIT, out)
+        self.peer_runs(["DREGG_ADMIN_TOKEN=" + SECRET])
+        out, _loaded = self.up()
+        self.assertIn("helm chat node: the running %s runs with no posture "
+                      "flag; 10-helm-posture.conf sets %s and %s empty, which "
+                      "dregg reads as refusal" % (chatnode.PEER_UNIT,
+                                                  UNVERIFIED, UNAUDITED), out)
+        self.assertNotIn(SECRET, out)
+        self.assertNotIn("DREGG_ADMIN_TOKEN", out)
+
+    def test_up_adds_no_restart_to_the_reload_it_already_does(self):
+        self.up()
+        verbs = {c[0] for c in self.calls if c}
+        self.assertIn("daemon-reload", verbs)
+        self.assertEqual(verbs & {"restart", "try-restart", "reload-or-restart",
+                                  "stop", "kill"}, set())
+
+    def test_up_reloads_before_reading_peer_and_again_after_dropins(self):
+        """The first daemon-reload runs BEFORE posture reading so that
+        pending unit changes are applied when `running_posture` queries the
+        peer (task/3433: first `up` sees NeedDaemonReload=yes on its own
+        unit and fails closed).  A second reload runs AFTER writing the
+        posture and priority drop-ins so they are loaded into the start
+        that follows."""
+        self.peer_runs([UNVERIFIED + "=1"])
+        reload_positions = []
+        posture_asked = None
+
+        def track_chatnode_systemctl(*args):
+            nonlocal posture_asked
+            if args[:1] == ("daemon-reload",):
+                reload_positions.append(len(self.calls))
+            return self.systemctl(*args)
+
+        def track_timerhealth_systemctl(argv, timeout=10):
+            nonlocal posture_asked
+            if list(argv)[:2] == ["show", chatnode.PEER_UNIT]:
+                posture_asked = len(self.calls)
+            return self.systemctl(argv, timeout)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(chatnode, "_systemctl", track_chatnode_systemctl), \
+                mock.patch("helm.timerhealth._systemctl",
+                           track_timerhealth_systemctl), \
+                self.node_bin(), \
+                mock.patch.object(chatnode, "wait_boot",
+                                  return_value=("initializing", 1)), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            chatnode.cmd_node(["up"])
+        self.assertEqual(len(reload_positions), 2,
+                         "exactly two daemon-reloads: %s" % reload_positions)
+        self.assertIsNotNone(posture_asked)
+        self.assertLess(reload_positions[0], posture_asked,
+                        "first reload must precede peer posture read")
+        self.assertLess(posture_asked, reload_positions[1],
+                        "posture read must precede second reload")
+
+    def status(self, weight, nice, running):
+        """`status` over a unit systemd describes with these values. The
+        main process's nice is `running`; None is a stopped node, MainPID 0,
+        and getpriority then answers 0 — what the kernel says for PID 0, the
+        CALLER — so a read that asks it anyway prints a nice it must not."""
+        asked = []
+
+        def systemctl(*args):
+            if any(a.startswith("--property=CPUWeight") for a in args):
+                asked.extend(args)
+                return 0, "CPUWeight=%s\nNice=%s\nMainPID=%d" % (
+                    weight, nice, 0 if running is None else 4242)
+            return self.systemctl(*args)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(chatnode, "_systemctl", systemctl), \
+                mock.patch.object(chatnode.os, "getpriority",
+                                  return_value=running or 0), \
+                mock.patch.object(chatnode.cell, "get_json", return_value=None), \
+                mock.patch("helm.chat.transport_status",
+                           return_value={"mode": "unsigned"}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = chatnode.cmd_node(["status"])
+        return rc, out.getvalue(), err.getvalue(), asked
+
+    def test_status_reports_the_priority_the_unit_runs_with(self):
+        rc, out, err, asked = self.status(20, 10, 10)
+        line = [ln for ln in out.splitlines() if "CPUWeight" in ln]
+        self.assertEqual(len(line), 1, out)
+        self.assertIn("CPUWeight 20, Nice 10, main process nice 10", line[0])
+        self.assertNotIn("CPUWeight", err)
+        self.up()
+        props = [a for a in asked if a.startswith("--property=")][0]
+        self.assertLessEqual(set(self.keys(self.body())),
+                             set(props.split("=", 1)[1].split(",")),
+                             "status must read every key the drop-in sets")
+        self.assertEqual(self.status("[not set]", 0, 0)[0], rc,
+                         "the priority line informs; it never fails status")
+
+    def test_status_says_when_the_unit_does_not_yield(self):
+        _rc, out, err, _asked = self.status("[not set]", 0, 0)
+        self.assertNotIn("CPUWeight", out)
+        self.assertIn("does NOT yield", err)
+        self.assertIn("CPUWeight unset, Nice 0", err)
+        self.assertIn("helm chat node up", err)
+
+    def test_status_says_when_the_running_process_predates_the_nice(self):
+        _rc, _out, err, _asked = self.status(20, 10, 0)
+        self.assertIn("main process nice 0", err)
+        self.assertIn("next start", err)
+
+    def test_a_stopped_node_is_judged_by_its_unit_alone(self):
+        _rc, out, err, _asked = self.status(20, 10, None)
+        self.assertIn("CPUWeight 20, Nice 10, main process nice -", out)
+        self.assertNotIn("CPUWeight", err)
+
+    def test_a_systemd_that_does_not_describe_the_unit_prints_nothing(self):
+        out = io.StringIO()
+        with mock.patch.object(chatnode, "_systemctl", self.systemctl), \
+                mock.patch.object(chatnode.cell, "get_json", return_value=None), \
+                mock.patch("helm.chat.transport_status",
+                           return_value={"mode": "unsigned"}), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(out):
+            chatnode.cmd_node(["status"])
+        self.assertIn("helm chat node: unit " + chatnode.UNIT, out.getvalue())
+        self.assertNotIn("CPUWeight", out.getvalue())
+        self.assertIn(("show", chatnode.UNIT,
+                       "--property=CPUWeight,Nice,MainPID"), self.calls,
+                      "the silence must be systemd's, not a skipped read")
+
+
+class RunningPeerUpTest(BootBase):
+    """`up` WRITES WHAT THE RUNNING PEER PROVES AND WRITES THE REST EMPTY
+    (task/3432 round 2), through the verb itself. The peer unit's own
+    declarations (what systemctl reports for its Environment=) are beside
+    each arm, so a reader that rebuilt the environment from them is judged
+    by the same arm: it wrote no drop-in when it found no flag or could not
+    answer, and our unit then inherited what the user manager exports."""
+
+    def up(self):
+        """`up` as far as the boot wait: (stdout, stderr, the posture
+        drop-in's text, or None when there is none)."""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(chatnode, "_systemctl", self.systemctl), \
+                self.node_bin(), \
+                mock.patch.object(chatnode, "wait_boot",
+                                  return_value=("initializing", 1)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            chatnode.cmd_node(["up"])
+        p = os.path.join(chatnode._dropin_dir(chatnode.UNIT),
+                         "10-helm-posture.conf")
+        try:
+            with open(p, encoding="utf-8") as fh:
+                text = fh.read()
+        except FileNotFoundError:
+            text = None
+        return out.getvalue(), err.getvalue(), text
+
+    def test_F1_a_manager_exported_bypass_is_written_empty(self):
+        """helm-codex's F1 on 3b7a8f92ad9: the peer runs with neither
+        loosening flag and declares none, so the mirror wrote nothing, and
+        our unit inherits the manager's DREGG_ALLOW_UNAUDITED_PQ=1. `up`
+        writes both loosening flags empty."""
+        self.peer_runs(["PATH=/usr/bin", "DREGG_ADMIN_TOKEN=" + SECRET])
+        _out, _err, text = self.up()
+        self.assert_neutralised(text)
+        self.assertIn("\nEnvironment=%s=\n" % UNAUDITED, text)
+
+    def test_a_reader_failure_writes_the_flags_empty_and_keeps_the_file(self):  # noqa: VACUOUS_ASSERTION — the loop is over a non-empty literal tuple; every row asserts its control (the mirror `up` wrote grants both), then the drop-in still on disk and neutralised
+        """meta-claude on LAND 410: every path where the reader cannot
+        answer wrote nothing and removed the earlier mirror, which is F1
+        again. Each writes the loosening flags empty over the same file. The
+        peer declares both flags throughout, and runs with both until the
+        failure."""
+        declared = {"Environment": "%s=1 %s=1" % (UNVERIFIED, UNAUDITED)}
+        failures = (
+            ("systemctl cannot be run",
+             lambda: setattr(self, "answer", (None, ""))),
+            ("show exits non-zero", lambda: setattr(self, "answer", (1, ""))),
+            ("an answer the reader cannot parse",
+             lambda: setattr(self, "answer", (0, "garbage\n"))),
+            ("no such unit",
+             lambda: self.props.update(LoadState="not-found", MainPID="0")),
+            ("it is stopped", lambda: self.props.update(MainPID="0")),
+            ("its process is another unit's",
+             lambda: self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"],
+                                    cgroup=_cgroup("app.slice",
+                                                   "other.service"),
+                                    **declared)),
+            ("its environment cannot be read",
+             lambda: self.peer_runs(raw=b"", **declared)),
+        )
+        self.assertTrue(failures)
+        for label, fail in failures:
+            with self.subTest(label):
+                self.answer = None
+                self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"],
+                               **declared)
+                _out, _err, text = self.up()
+                self.assertTrue(_dregg_runs_unaudited_pq(_effective(text)),
+                                "the control: the running peer's bypass "
+                                "is mirrored")
+                fail()
+                _out, _err, text = self.up()
+                self.assertIsNotNone(text, "the drop-in was removed")
+                self.assert_neutralised(text)
+
+    def test_the_mirror_follows_the_running_process_not_its_unit(self):
+        """An env-file revocation: the unit declares both bypasses (its
+        Environment= says 1), and its process runs without the PQ bypass and
+        with DREGG_REQUIRE_LEAN=1, as an EnvironmentFile=, UnsetEnvironment=
+        or an ExecStart= wrapper leaves it. `up` writes what the process
+        runs with."""
+        self.peer_runs([UNVERIFIED + "=1", REQUIRE_LEAN + "=1"],
+                       Environment="%s=1 %s=1" % (UNVERIFIED, UNAUDITED))
+        _out, _err, text = self.up()
+        env = _effective(text, {UNAUDITED: "1"})
+        self.assertEqual(env[UNAUDITED], "",
+                         "mirrored a bypass the running peer does not have")
+        self.assertEqual(env.get(REQUIRE_LEAN), "1",
+                         "dropped a tightening the running peer has")
+        self.assertEqual(env[UNVERIFIED], "1")
+        self.assertFalse(_dregg_runs_unaudited_pq(env))
+
+    def test_a_peer_running_with_both_bypasses_mirrors_both(self):
+        """The control: the peer declares both and runs with both, and our
+        node runs with both, as the team node does (the two posture names
+        a running team node was measured with)."""
+        self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"],
+                       Environment="%s=1 %s=1" % (UNVERIFIED, UNAUDITED))
+        out, _err, text = self.up()
+        env = _effective(text)
+        self.assertTrue(_dregg_runs_unverified(env))
+        self.assertTrue(_dregg_runs_unaudited_pq(env))
+        self.assertIn("mirrored 2 posture flags from", out)
+
+    def test_no_secret_the_peer_runs_with_reaches_any_output(self):  # noqa: VACUOUS_ASSERTION — the loop is over a non-empty literal tuple of peers; every row asserts that none of the non-empty literal leaks reaches stdout, stderr or the drop-in
+        """The peer's environment holds dregg's tokens and whatever else it
+        was started with. Whether `up` mirrors, finds a posture value it
+        cannot write, or finds a process that is not the peer's, none of it
+        reaches its output, its reasons or the drop-in."""
+        secrets = ["DREGG_ADMIN_TOKEN=" + SECRET, "DISCORD_TOKEN=" + SECRET]
+        peers = (("mirrored", [UNAUDITED + "=1"] + secrets, None),
+                 ("unwritable", [UNAUDITED + "=1\t"] + secrets, None),
+                 ("not the peer", [UNAUDITED + "=1"] + secrets,
+                  _cgroup("app.slice", "other.service")))
+        self.assertTrue(peers)
+        for label, env, cgroup in peers:
+            with self.subTest(label):
+                self.peer_runs(env, cgroup=cgroup)
+                out, err, text = self.up()
+                for leak in (SECRET, "DREGG_ADMIN_TOKEN", "DISCORD_TOKEN"):
+                    self.assertNotIn(leak, out + err + (text or ""))
 
 
 if __name__ == "__main__":

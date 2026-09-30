@@ -311,8 +311,10 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(set(table), {"codex"})     # kimi unminted -> absent
         self.assertEqual(table["codex"]["port"], seat.FAMILIES["codex"]["port"])
         self.assertEqual(table["codex"]["token"], "tok-from-disk")
-        self.assertIn("gpt-5.6-sol", table["codex"]["models"])
-        self.assertIn("gpt-6-astra", table["codex"]["models"])
+        # The new default and its retained fallback are the two probe routes;
+        # models the ruling moved off are not conducted to codex.
+        self.assertEqual(table["codex"]["models"],
+                         {"gpt-6.1-sol", "gpt-6-sol"})
 
     # -- CLI surface --------------------------------------------------------
     def test_parent_line_oauth_only_no_pin(self):
@@ -361,12 +363,14 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         ad = os.path.join(base, ".claude", "agents")
         names = sorted(os.listdir(ad))
-        self.assertEqual(names, ["helm-probe-gpt-5-6-sol.md",
-                                 "helm-probe-gpt-6-astra.md"])
-        with open(os.path.join(ad, "helm-probe-gpt-6-astra.md")) as f:
-            body = f.read()
-        self.assertIn("model: gpt-6-astra", body)
-        self.assertIn("name: helm-probe-gpt-6-astra", body)
+        self.assertEqual(names, ["helm-probe-gpt-6-1-sol.md",
+                                 "helm-probe-gpt-6-sol.md"])
+        for name, model in (("helm-probe-gpt-6-1-sol", "gpt-6.1-sol"),
+                            ("helm-probe-gpt-6-sol", "gpt-6-sol")):
+            with open(os.path.join(ad, name + ".md")) as f:
+                body = f.read()
+            self.assertIn("model: %s" % model, body)
+            self.assertIn("name: %s" % name, body)
         # no seats minted -> loud unblock, rc 1
         shutil.rmtree(os.path.dirname(d))
         out, err = io.StringIO(), io.StringIO()

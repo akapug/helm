@@ -6,10 +6,10 @@ was ever plugged in; this suite pins the plug. Two seams, both pinned from
 THIS side only:
   * the settled row contract with helm.tasks (task-corpus-destination lane):
     snapshot() -> (rows_by_id, unavailable), sort_key over rows, in-row
-    comments via comment(). helm.tasks may land BEFORE or AFTER this
-    surface, so the endpoint import-guards and every arm here runs against a
-    STUB implementing exactly the settled contract — plus one arm against
-    the genuinely-absent module (the land-order-independence case itself).
+    comments via comment(). Every arm here runs against a STUB
+    implementing exactly the settled contract, and one class makes the
+    import itself fail, which every task surface names by its exception
+    class.
   * the owner-visible laws: unavailable is NEVER drawn as empty (a console
     that draws them the same says "fleet idle" at the exact moment it lost
     the ability to answer), the home badge counts DECISIONS ONLY (the
@@ -59,7 +59,8 @@ def _stub_tasks(rows, unavailable=None):
     mod = types.ModuleType("helm.tasks")
     mod.calls = {"snapshot": 0, "sort_key": 0, "rank_key": 0, "board_key": 0,
                  "board_order": 0, "row_ages": 0, "queue_totals": 0,
-                 "stamp_epoch": 0, "last_note": 0, "comment": []}
+                 "stamp_epoch": 0, "last_note": 0, "comment": [],
+                 "comment_by": []}
 
     def snapshot():
         mod.calls["snapshot"] += 1
@@ -71,8 +72,11 @@ def _stub_tasks(rows, unavailable=None):
         tail = rid.rsplit("/", 1)[-1]
         return (0, int(tail)) if tail.isdigit() else (1, tail)
 
-    def comment(rid, text):
+    def comment(rid, text, by=None):
         mod.calls["comment"].append((rid, text))
+        # WHO THE SURFACE SAID WROTE IT (goal-ledger D1): the web door is the
+        # owner's, so it hands the store an OwnerDoor, never a string.
+        mod.calls["comment_by"].append(by)
         hit = rows.get(rid)
         if not hit:
             return None, "no such task: %s" % rid
@@ -292,26 +296,63 @@ class TasksBase(unittest.TestCase):
                 return e.code, (body if raw else json.loads(body or b"null"))
 
 
-class LandOrderIndependenceTest(TasksBase):
-    def test_absent_module_reads_unavailable_never_empty(self):
-        # The other lane may land after this one: helm.tasks genuinely does
-        # not exist on this tree, and the surface must say CANNOT-SEE, not
-        # "backlog clear" and not 500.
-        # THE PREDICATE ASKS WHETHER THE MODULE EXISTS, NOT WHETHER SOMETHING
-        # HAPPENED TO IMPORT IT ALREADY. `self._tasks_prior` is a sys.modules
-        # snapshot kept for tearDown's restore, and it is None whenever nothing
-        # in THIS process has imported helm.tasks yet — which is exactly the
-        # case when this method is run ALONE, the one way the fab suite guard
-        # permits a local run. So after helm.tasks landed, the arm skipped
-        # inside the full suite (something imports it first) and FAILED
-        # standalone, on trunk, for anyone following the mandated workflow.
-        if importlib.util.find_spec("helm.tasks") is not None:
-            self.skipTest("helm.tasks landed — the absent arm is history")
-        status, d = self.req("/api/tasks")
+class _ImportRaises:
+    """Make `from . import tasks` inside helm raise ImportError for a block:
+    the shape an import failure inside helm/tasks.py, or a module it imports,
+    takes. A meta-path finder whose loader raises, with the cached module and
+    the package attribute set aside (TasksBase.tearDown restores both)."""
+
+    FULL = "helm.tasks"
+
+    def find_spec(self, fullname, path=None, target=None):
+        return (importlib.util.spec_from_loader(fullname, self)
+                if fullname == self.FULL else None)
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise ImportError("cannot import name 'gone' from 'helm.pk'")
+
+    def __enter__(self):
+        sys.modules.pop(self.FULL, None)
+        if hasattr(_helm_pkg, "tasks"):
+            delattr(_helm_pkg, "tasks")
+        sys.meta_path.insert(0, self)
+        return self
+
+    def __exit__(self, *exc):
+        sys.meta_path.remove(self)
+        sys.modules.pop(self.FULL, None)
+        return False
+
+
+class ImportFailureTest(TasksBase):
+    """helm.tasks is on trunk, so an ImportError from importing it is a real
+    failure inside the module or below it. Every task surface names the
+    exception class; none of them claims the module has not landed."""
+
+    def test_the_backlog_is_UNAVAILABLE_naming_the_import_failure(self):
+        with _ImportRaises():
+            status, d = self.req("/api/tasks")
         self.assertEqual(status, 200)
         self.assertTrue(d.get("unavailable"))
-        self.assertIn("not landed", d.get("why", ""))
-        self.assertNotIn("entries", d)
+        self.assertIn("ImportError", d.get("why", ""))
+        self.assertNotIn("not landed", d.get("why", ""))
+        self.assertIsNone(d.get("queue"))
+        self.assertEqual(d.get("entries"), [])
+
+    def test_notes_and_comment_answer_500_naming_the_import_failure(self):
+        with _ImportRaises():
+            notes = self.req("/api/task/notes?id=task/1")
+            comment = self.req("/api/tasks/comment",
+                               {"id": "task/1", "text": "x"})
+        self.assertEqual(notes[0], 500, notes[1])
+        self.assertIn("ImportError", notes[1].get("error", ""))
+        self.assertNotIn("not landed", json.dumps(notes[1]))
+        self.assertEqual(comment[0], 500, comment[1])
+        self.assertIn("ImportError", comment[1].get("error", ""))
+        self.assertNotIn("not landed", json.dumps(comment[1]))
 
 
 class SettledContractTest(TasksBase):
@@ -367,6 +408,38 @@ class CommentPathTest(TasksBase):
         self.assertTrue(d.get("ok"))
         self.assertEqual(d["comments"], 1)
         self.assertEqual(stub.calls["comment"], [("task/263", "ship it")])
+        by, = stub.calls["comment_by"]
+        self.assertEqual(type(by).__name__, "OwnerDoor",
+                         "the owner's web note reached the store as %r, not "
+                         "as his door" % (by,))
+        self.assertEqual(by.door, "web")
+
+    def test_the_owners_note_lands_on_the_real_ledger_as_his_and_legacy_reads_legacy(self):
+        """D1 end to end, through the REAL store: the note he types on the
+        backlog is recorded `by: owner, door: web`, and the notes route names
+        each comment's author the way the store labels it, so a comment the
+        old door wrote with no author reads as LEGACY instead of a blank."""
+        import importlib
+        from helm import eventledger
+        real = self.install(importlib.import_module("helm.tasks"))
+        row, err = real.add("get the goal ledger live", "seat-a")
+        self.assertIsNone(err, err)
+        planted = dict(row, comments=[{"ts": 1758000000.0,
+                                       "text": "omg get this live!!!",
+                                       "by": None}])
+        self.assertTrue(eventledger.append(real.ledger_path(), planted))
+        status, d = self.req("/api/tasks/comment",
+                             {"id": row["id"], "text": "and now it is"})
+        self.assertEqual(status, 200, d)
+        last = real.rows()[row["id"]]["comments"][-1]
+        self.assertEqual((last["text"], last["by"], last["door"]),
+                         ("and now it is", "owner", "web"))
+        status, d = self.req("/api/task/notes?id=" + row["id"])
+        self.assertEqual(status, 200, d)
+        self.assertEqual([(c["text"], c["author"]) for c in d["comments"]],
+                         [("omg get this live!!!",
+                           "legacy: no author recorded"),
+                          ("and now it is", "owner (web)")])
 
     def test_missing_fields_refuse_without_touching_the_store(self):
         stub = self.install(_stub_tasks({
@@ -388,17 +461,20 @@ class CommentPathTest(TasksBase):
 
 class OwnerSurfaceLawsTest(TasksBase):
     def test_the_section_joins_the_socket_after_decisions(self):  # noqa: VACUOUS_ASSERTION — body.index() RAISES on any missing marker, so presence is asserted before order can compare
+        """The task backlog's section moved into the Work page (task/3643):
+        a task's note, its comments and the comment box are its card's
+        drawer. It sits on Work, after the decision queue, and it reads a
+        task's notes and writes a note through the same two routes."""
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
         work = body.index('id="view-work"')
         odq = body.index('id="odq"')
-        sections = body.index('id="worksections"')
-        otq = body.index('id="otq"')
+        page = body.index('id="wkmain"')
         nxt = body.index('id="view-quota"')
-        self.assertTrue(work < odq < sections < otq < nxt,
-                        "the task section must sit on the Work page, in its "
-                        "socket, after the decision queue")
-        for route in ("/api/tasks", "/api/tasks/comment"):
+        self.assertTrue(work < odq < page < nxt,
+                        "the task drawer must sit on the Work page, after "
+                        "the decision queue")
+        for route in ("/api/task/notes?id=", "/api/tasks/comment"):
             self.assertIn(route, body)
 
     def test_the_owner_can_SEE_which_rows_he_asked_for(self):
@@ -476,87 +552,58 @@ class OwnerSurfaceLawsTest(TasksBase):
         status, d = self.req("/api/task/notes?id=task/1")
         self.assertEqual(status, 200)
         self.assertTrue(d.get("unavailable"))
+        self.assertIn("OSError", d.get("why", ""),
+                      "a store outage names its exception class")
 
-    def test_an_OPEN_comment_holds_the_SNAPSHOT_not_just_the_render(self):  # noqa: VACUOUS_ASSERTION — the ordering assertions are the observable; the unconditional controls on the same slice are the assertIn("function tqNotesOpen") and the assertIsNotNone(m) regex match, either of which fails if the shipped segment is empty or the function moved
-        """The alternative was reproduced at the exact tip: task/329 open
-        with 8,148 chars and scrolled, tqInit fires on its 45s timer, the
-        list is replaced via innerHTML — disclosure closed, fetched body
-        discarded, card 1,671px above the viewport. Reading a long ruling is
-        the use case this feature exists for, so a 45-second guillotine made
-        it worse than the counter it replaced.
-
-        THE HOLD IS PINNED AT ACCEPTANCE, NOT AT RENDER, AND THE DIFFERENCE
-        IS A SPLIT VERSION. A hold inside `tqRender` holds ONE of the two
-        cells this payload feeds: the board home's queue cell advances to the
-        new read while the card stays on the old one, off a single fetch, with
-        nothing on either saying so. Holding at acceptance parks the snapshot
-        in TQ_PENDING and leaves TQ_VIEW where it was, so both cells stay on
-        one version — and that version expires on the clock rather than
-        standing forever."""
+    def test_an_OPEN_comment_holds_the_SNAPSHOT_not_just_the_render(self):  # noqa: VACUOUS_ASSERTION — str.index() raises on each missing statement, so the busy test, the swap and the paint are asserted present before their order is compared
+        """The alternative was reproduced on the old backlog: task/329 open
+        with 8,148 chars and scrolled, the 45s refresh replaced the list —
+        disclosure closed, fetched body discarded, card 1,671px above the
+        viewport. On the Work page (task/3643) a task's notes are its card's
+        drawer, and the 45s read repaints the page under it: a drawer whose
+        notes are open is carried into the fresh paint whole, never drawn
+        again from the read."""
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
-        tq = body[body.index("task backlog (#218"):body.index(
-            "setInterval(tqInit")]
-        self.assertIn("function tqNotesOpen", tq)
-        self.assertIn(".otqnotes[open]", tq)
-        accept = tq[tq.index("function tqAccept"):tq.index("function tqPaint")]
-        m = re.search(r"if \(tqNotesOpen\(\)\) \{ TQ_PENDING = d; return;",
-                      accept)
-        self.assertIsNotNone(
-            m, "the hold must be an EARLY RETURN in tqAccept that parks the "
-               "body — if this moved, re-pin here with the reason")
-        self.assertLess(m.start(), accept.index("TQ_VIEW = "),
-                        "a snapshot reached TQ_VIEW before the hold could "
-                        "park it, so the card and the board home would be "
-                        "showing two versions of one queue")
-        # AND THE PARKED VERSION IS NOT ABANDONED. A hold that never releases
-        # is a card frozen for as long as a reader leaves a disclosure open.
-        self.assertIn("if (TQ_PENDING && !tqNotesOpen()) tqAccept(TQ_PENDING);",
-                      tq, "nothing lands the parked snapshot when the reader "
-                          "closes the disclosure")
+        busy = _extract_fn(body, "wkDrawerBusy")
+        self.assertIn('.wknotes[open]', busy)
+        paint = _extract_fn(body, "wkPaint")
+        keep = paint.index("wkDrawerBusy(was) ? was : null")
+        swap = paint.index("fresh.replaceWith(keep)")
+        slots = paint.index("WK_SLOTS.forEach(")
+        self.assertLess(keep, slots, "the busy drawer must be taken before "
+                        "the paint replaces it")
+        self.assertGreater(swap, slots, "the busy drawer must be put back "
+                           "after the paint, or the fresh one wins")
 
-    def test_the_shipped_card_marks_owner_rows_and_ONLY_owner_rows(self):
-        """The mark is gated on STRICT equality with "owner" in the shipped
-        asset. A truthiness test (`r.origin ?`) would mark every agent-filed
-        row as the owner's own — the loudest possible way to get provenance
-        wrong, on the one surface built to show it."""
-        # THE SHIPPED PAGE, not the source file: the assertion is about what
-        # the owner's browser actually received. Same slice the typing-guard
-        # arm takes, for the same reason.
+    def test_the_shipped_card_marks_owner_rows_and_ONLY_owner_rows(self):  # noqa: VACUOUS_ASSERTION — the card is asserted to carry the owner mark and its strict condition before the origin absence is read
+        """The mark is the SERVER'S strict `origin == "owner"` (the work
+        reader's `asked`, helm/work_model.py): the page reads that one flag
+        and never the raw origin, whose field carries a third state a
+        truthiness test would draw as the owner's."""
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
-        tq = body[body.index("task backlog (#218"):body.index(
-            "setInterval(tqInit")]
-        card = tq[tq.index("function tqCard"):tq.index("async function tqAct")]
+        card = _extract_fn(body, "wkCardHTML")
         self.assertIn("otqasked", card)
-        self.assertIn('r.origin === "owner"', card)
-        self.assertNotIn("r.origin ?", card)
-        # and the COUNT beside it uses the same strict predicate
-        render = tq[tq.index("function tqRender"):tq.index("function tqCard")]
-        self.assertIn('r.origin === "owner"', render)
+        self.assertIn("c.asked ?", card)
+        work = body[body.index("WORK, START TO FINISH (task/3643"):]
+        self.assertNotIn(".origin", work)
+        from helm import work_model
+        with open(work_model.__file__, encoding="utf-8") as fh:
+            self.assertIn('get("origin") == "owner"', fh.read())
 
     def test_the_shipped_card_CHIPS_a_rank_and_draws_nothing_for_UNRANKED(self):
         """THE OWNER ASKED WHETHER TASKS ARE PRIORITIZED, so the answer has
         to be legible on the card he reads. The chip is drawn on a truthy
-        `r.priority` — safe HERE because the server normalizes the wire value
-        to one of four ranks or null, unlike `origin`, whose raw field carries
-        a third state and whose arm above forbids exactly this test. An
-        UNRANKED row draws NO chip: a dash or a "P3" would render
-        nobody-has-judged-this as judged-lowest."""
+        rank — safe because the server sends one of four ranks or null — and
+        an UNRANKED card draws NO chip; the Rank menu counts the cards
+        nobody ranked, "not ranked"."""
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
-        tq = body[body.index("task backlog (#218"):body.index(
-            "setInterval(tqInit")]
-        card = tq[tq.index("function tqCard"):tq.index("async function tqAct")]
-        self.assertIn("otqrank", card)
-        self.assertIn("r.priority ?", card)
-        # THE COUNT BESIDE IT, on the same shipped slice: the meta line says
-        # how many rows carry no rank, because a board showing four ranked
-        # rows at the top and nothing about the rest answers the owner's
-        # question optimistically.
-        render = tq[tq.index("function tqRender"):tq.index("function tqCard")]
-        self.assertIn("UNRANKED", render)
-        self.assertIn("!r.priority", render)
+        rank = _extract_fn(body, "wkRankHTML")
+        self.assertIn("otqrank", rank)
+        self.assertIn("c.rank ?", rank)
+        self.assertIn('"not ranked"', _extract_fn(body, "wkMenusHTML"))
 
     def test_the_api_SENDS_a_rank_and_orders_P0_FIRST(self):
         """THE ORDER IS THE SERVER'S, and that is the point: a second
@@ -637,136 +684,91 @@ class OwnerSurfaceLawsTest(TasksBase):
     def test_the_shipped_card_FETCHES_the_notes_instead_of_printing_a_count(self):
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
-        tq = body[body.index("task backlog (#218"):body.index(
-            "setInterval(tqInit")]
-        self.assertIn("otqnotes", tq)
-        self.assertIn("/api/task/notes?id=", tq)
+        self.assertIn("wknotes", _extract_fn(body, "wkDrawerHTML"))
+        self.assertIn("/api/task/notes?id=", _extract_fn(body, "wkNotes"))
         # capture:true — `toggle` does not bubble, so a listener without it
         # silently never fires and the panel stays on its placeholder
-        self.assertIn("}, true);", tq)
+        work = body[body.index("const WK_STAGES = ["):]
+        self.assertIn('det.classList.contains("wknotes") && det.open', work)
+        self.assertIn("}, true);", work)
 
     def test_the_on_you_line_counts_decisions_only(self):
         # The 19-row collapse law, pinned at the text level on the shipped
         # page: what is waiting on HIM (the ON YOU section and the badge
-        # function) references no task surface, and the task block writes no
-        # badge. Presence controls first — the markers this absence is
-        # measured against exist.
+        # function) references no task surface, and the Work page writes no
+        # decisions badge. Presence controls first.
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
         self.assertIn("odqBadge", body)               # the decisions badge
-        self.assertIn("task backlog (#218", body)     # the task block
+        self.assertIn("WORK, START TO FINISH (task/3643", body)
         onyou = body[body.index('<section id="onyou">'):
                      body.index('<section id="board">')]
         self.assertIn('id="odq"', onyou)             # the section WAS cut
-        self.assertNotIn("otq", onyou)
+        self.assertNotIn("wkmain", onyou)
         self.assertNotIn("/api/tasks", onyou)
         badge = body[body.index("function odqBadge("):]
         badge = badge[:badge.index("\n}\n")]
-        self.assertNotIn("otq", badge)
+        self.assertNotIn("/api/work", badge)
         self.assertNotIn("/api/tasks", badge)
-        # bound to MY segment (its own end marker), not to end-of-page —
-        # later parts legitimately reference the decisions badge.
-        tq_start = body.index("task backlog (#218")
-        tq_block = body[tq_start:body.index("setInterval(tqInit", tq_start)]
-        self.assertNotIn("odqBadge", tq_block)
-        self.assertNotIn("odqbadge", tq_block)
+        # the Work page's SCRIPT, its first line to its boot (its stylesheet
+        # carries the same banner, so the script's own first line anchors it)
+        work = body[body.index("const WK_STAGES = ["):]
+        work = work[:work.index("setTimeout(wkLoad, 0);")]
+        self.assertNotIn("odqBadge", work)
+        self.assertNotIn("odqbadge", work)
 
     def test_a_typing_reader_KEEPS_the_draft_AND_the_caret(self):
-        """RE-PINNED FROM A HOLD TO A PRESERVATION, and the reason is that the
-        hold was buying the wipe protection at the price of a split version.
-
-        WHAT WAS HERE: `tqRender` returned early while a task composer had
-        focus, so a refresh under a typing reader was dropped — and the board
-        home's queue cell, fed off the same fetch outside that guard,
-        advanced anyway. One read, two versions, neither saying so.
-
-        WHAT IS HERE NOW: the draft text lives in TQ_DRAFTS and the caret in
-        `tqFocusState`, both OUTSIDE the rows being replaced, so the render
-        happens and the reader loses nothing. This is the shape the decision
-        queue beside it has always used (odqComposerState). The atoms pinned
-        below are the ones a gutting cannot keep: the focus reader must READ
-        THE FOCUSED ELEMENT and scope it to the task composer, it must carry
-        the SELECTION and not merely the id, and the restore must run AFTER
-        the replacement — a restore before it would put the caret into a node
-        about to be discarded, which is a wipe with extra steps.
+        """A REFRESH LANDS UNDER A TYPING READER AND HE LOSES NOTHING. The
+        backlog parked drafts in TQ_DRAFTS and the caret in its focus state;
+        the Work page's drawer (task/3643) carries the drawer itself over the
+        paint when he is in it — the box keeps its text because it is the
+        same element — and puts the caret back where it was. The atoms a
+        gutting cannot keep: the caret is read off the focused element, the
+        SELECTION is carried and not merely the element, and it is restored
+        AFTER the replacement.
 
         A static suite cannot EXECUTE this (there is no DOM under node in
-        this tree), so these are byte-and-order pins and the behavioural layer
-        is the recorded browser run — the same honest ceiling the guard this
-        replaces declared."""
+        this tree), so these are byte-and-order pins and the behavioural
+        layer is the recorded browser run."""
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
-        tq = body[body.index("task backlog (#218"):body.index(
-            "setInterval(tqInit")]
-        fn = tq[tq.index("function tqFocusState"):]
-        fn = fn[:fn.index("function tqRestoreFocus")]
-        self.assertIn("document.activeElement", fn,
-                      "the focus reader stopped reading the focused element")
-        self.assertIn('a.classList.contains("otqcomment")', fn,
-                      "the focus reader is no longer scoped to the task "
-                      "composer, so any focused input would be restored into "
-                      "a comment box")
-        self.assertIn("a.selectionStart", fn,
-                      "the caret position is not carried, so a restored draft "
-                      "sends the cursor to the front of the text")
-        self.assertIn("a.selectionEnd", fn)
-        restore = tq[tq.index("function tqRestoreFocus"):]
-        restore = restore[:restore.index("function tqWhen")]
-        self.assertIn("box.focus();", restore)
-        self.assertIn("box.setSelectionRange(f.start, f.end);", restore)
-        render = tq[tq.index("function tqRender"):tq.index(
-            "function tqFocusState")]
-        self.assertLess(render.index("tqFocusState()"),
-                        render.index("innerHTML"),
+        busy = _extract_fn(body, "wkDrawerBusy")
+        self.assertIn("d.contains(document.activeElement)", busy)
+        paint = _extract_fn(body, "wkPaint")
+        self.assertIn("document.activeElement", paint)
+        self.assertIn("caret.selectionStart", paint)
+        self.assertIn("caret.selectionEnd", paint)
+        self.assertIn("caret.setSelectionRange(sel[0], sel[1])", paint)
+        self.assertLess(paint.index("caret.selectionStart"),
+                        paint.index("WK_SLOTS.forEach("),
                         "the caret must be captured before the replacement")
-        self.assertLess(render.index("tqComposerState()"),
-                        render.index("innerHTML"),
-                        "drafts must be parked before the replacement")
-        self.assertGreater(render.index("tqRestoreFocus(focus)"),
-                           render.rindex("innerHTML"),
+        self.assertGreater(paint.index("caret.focus();"),
+                           paint.index("fresh.replaceWith(keep)"),
                            "the caret is restored into markup that is about "
                            "to be replaced")
-        # AND THE HOLD IT REPLACES IS GONE, not merely unused: a surviving
-        # typing hold would bring the split version straight back.
-        self.assertNotIn("function tqTyping", tq,
-                         "the typing hold survived the cure that replaced it")
-        self.assertNotIn("refresh held — you are typing", tq)
 
     def test_the_231_composer_protections_exist_in_the_shipped_js(self):
-        # The owner reported the wipe on THIS tab (#231). The shipped JS must
-        # park drafts before every list replacement and put them back after —
-        # which is now the WHOLE protection, because the render no longer
-        # refuses to run while somebody is typing. Text-level pins on the
-        # assembled page — crude, but they fail loudly if someone strips it.
+        # The owner reported the wipe on the backlog (#231). A drawer with a
+        # comment being written is a drawer the paint carries over, so the
+        # draft is never replaced by an empty box.
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
-        tq = body[body.index("task backlog (#218"):]
-        self.assertIn("const TQ_DRAFTS = {}", tq,
-                      "the draft store the whole protection rests on is gone")
-        self.assertIn("function tqComposerState", tq)
-        render = tq[tq.index("function tqRender"):tq.index(
-            "function tqFocusState")]
-        self.assertLess(render.index("tqComposerState()"),
-                        render.index("innerHTML"),
-                        "drafts must be parked before the replacement")
-        self.assertIn("if (box && saved[el.dataset.id]) box.value = "
-                      "saved[el.dataset.id];", render,
-                      "drafts are parked and never put back, which is the "
-                      "wipe with one extra step")
-
+        busy = _extract_fn(body, "wkDrawerBusy")
+        self.assertIn('.wkcomment")].some(x => x.value)', busy)
+        comment = _extract_fn(body, "wkComment")
+        # a failed send hands the text back rather than eating it
+        self.assertIn("if (box.isConnected && !box.value) box.value = text;", comment)
 
 class ProjectAxisSurfaceTest(TasksBase):
-    """task/974 — the project axis on the owner surface. The card NAMES the
-    project it renders (two projects' consoles must be distinguishable),
-    WITHHOLDS foreign-project rows as a count (the measured leak: a
-    sibling project's row rendering inside helm's own pipeline), and serves the
-    UNSCOPED legacy bucket separately — disclosed, never guessed into a
-    scope, never silently dropped (it is the whole pre-axis live board).
+    """task/974, then task/3445 L1b — the project axis on the owner surface.
 
-    The stub gains the two axis functions EXPLICITLY per arm: the contract
-    extension is opt-in, so the degrade arm below proves a pre-axis
-    helm.tasks still serves the whole ledger (land-order independence, this
-    surface's founding law)."""
+    The route once scoped itself to the console's cwd project and withheld
+    every other project's rows as a count, from when the console drew one
+    project. The console now lists every project a page at a time
+    (`/api/backlog`, which filters by project), so the withholding is
+    retired: the route serves every row, each row NAMES its project, and the
+    project-less rows are named as such rather than hidden or guessed into a
+    scope. The keys the old shape carried stay, empty, for an old reader."""
 
     ROWS = {
         "task/1": _row("task/1", "ours row", "open", project="fixproj"),
@@ -785,37 +787,24 @@ class ProjectAxisSurfaceTest(TasksBase):
             str(row.get("project") or "").strip() or None)
         return self.install(stub)
 
-    def test_the_surface_names_its_project_and_withholds_foreign_rows(self):
+    def test_every_project_is_served_and_each_row_names_its_own(self):
         self._axis_stub()
         status, d = self.req("/api/tasks")
         self.assertEqual(status, 200)
-        self.assertEqual(d.get("project"), "fixproj")
-        self.assertEqual([e["id"] for e in d["entries"]], ["task/1"])
-        # the withheld population is a COUNT on the wire — the foreign rows
-        # themselves appear NOWHERE in the payload, which is the no-leak
-        # claim measured on the serialized whole rather than one key. The
-        # needles are the rows' CONTENT (titles + project name), never the
-        # bare word "foreign": the gate measured that spelling matching the
-        # payload's own `withheld_foreign` key — a true reading bound to the
-        # schema instead of the leak it was written to catch.
-        self.assertEqual(d.get("withheld_foreign"), 2)
-        payload = json.dumps(d)
-        self.assertTrue("ours row" in payload, d)      # the probe can see rows
-        self.assertFalse("foreign row" in payload, d)
-        self.assertFalse("foreign closed" in payload, d)
-        self.assertFalse("otherproj" in payload, d)
+        self.assertIsNone(d.get("project"))
+        self.assertEqual(d.get("withheld_foreign"), 0)
+        by = {e["id"]: e for e in d["entries"]}
+        self.assertEqual(sorted(by), ["task/1", "task/2", "task/3", "task/4"])
+        self.assertEqual(by["task/2"]["project"], "otherproj")
+        self.assertEqual(by["task/1"]["project"], "fixproj")
+        self.assertIsNone(by["task/3"]["project"])
 
-    def test_the_unscoped_bucket_is_separate_never_inside_the_scope(self):
+    def test_the_counts_describe_every_row_served(self):
         self._axis_stub()
         _status, d = self.req("/api/tasks")
-        self.assertEqual([e["id"] for e in d.get("unscoped") or []],
-                         ["task/3"])
-        self.assertEqual([e["id"] for e in d["entries"]], ["task/1"])
-        self.assertEqual((d.get("unscoped") or [{}])[0].get("project"), None)
-        # counts describe what the card RENDERS (scoped + bucket), so the
-        # meta line and the visible rows cannot disagree
+        self.assertEqual(d.get("unscoped"), [])
         self.assertEqual(d["counts"],
-                         {"open": 2, "in_progress": 0, "closed": 0})
+                         {"open": 3, "in_progress": 0, "closed": 1})
 
     def test_a_pre_axis_store_still_serves_the_whole_ledger(self):
         # NO current_project/project_of_row on the stub: helm.tasks may
@@ -829,23 +818,18 @@ class ProjectAxisSurfaceTest(TasksBase):
         self.assertEqual(d.get("unscoped"), [])
         self.assertEqual(d.get("withheld_foreign"), 0)
 
-    def test_the_shipped_card_names_the_project_and_the_bucket(self):
-        # THE SHIPPED PAGE, not the source file — the same slice the other
-        # shipped-asset arms take, for the same reason.
+    def test_the_shipped_row_names_its_project_and_the_line_its_scope(self):  # noqa: VACUOUS_ASSERTION — the row and the line are asserted to name the project and the scope before the one absence is read
+        # THE SHIPPED PAGE, not the source file: a row names its project
+        # (and a project-less one says so), and the line names its scope
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
-        tq = body[body.index("task backlog (#218"):body.index(
-            "setInterval(tqInit")]
-        render = tq[tq.index("function tqRender"):tq.index("function tqCard")]
-        self.assertTrue("d.project" in render,
-                        "the card never names its project")
-        self.assertTrue("withheld_foreign" in render,
-                        "the withheld count never reaches the owner")
-        self.assertTrue("unscoped legacy row" in render,
-                        "the legacy bucket is not disclosed as such")
-        self.assertTrue("otqbucket" in render,
-                        "the bucket is not rendered as its own section")
-
+        row = _extract_fn(body, "wkRowHTML")
+        self.assertIn("c.project", row, "the row never names its project")
+        self.assertIn('"no project"', row, "a project-less row is not named")
+        line = _extract_fn(body, "wkLineHTML")
+        self.assertIn("every project", line)
+        self.assertIn("items with no project", line)
+        self.assertNotIn("withheld_foreign", body)
 
 class CommentRouteShapeTest(TasksBase):
     """WHICH VERB THE ROUTE ANSWERS, measured — the client arm's premise.
@@ -869,7 +853,8 @@ class CommentRouteShapeTest(TasksBase):
 
 
 class CommentClientRuntimeTest(unittest.TestCase):
-    """The CLIENT leg, EXECUTED: the page's own j/post/tqAct run under node.
+    """The CLIENT leg, EXECUTED: the page's own j/post and the Work drawer's
+    comment door (`wkComment`, task/3643) run under node.
 
     EVERY SOURCE-TEXT ARM IN THIS FILE PASSED WHILE THE SURFACE WAS BROKEN.
     The composer called `j("/api/tasks/comment", 8000, {method: "POST", body})`
@@ -908,36 +893,39 @@ global.fetch = (url, init) => {
                           json: async () => r.body});
 };
 function toast(m, ms) { TOASTS.push({text: m, ms: ms === undefined ? null : ms}); }
-function tqInit() { REFRESHES++; }
+// the drawer's notes fold, open: a written note re-reads it
+function wkNotes(det) { REFRESHES++; }
 
 function card(text) {
-  const box = {value: text};
-  return {box, el: {style: {}, dataset: {id: "task/263"}, isConnected: true,
-                    querySelector: s => s === ".otqcomment" ? box : null}};
+  const box = {value: text, isConnected: true};
+  const notes = {open: true, dataset: {filled: "1"}};
+  const drawer = {querySelector: s => s === ".wknotes" ? notes : null};
+  return {box, el: {dataset: {id: "task/263"},
+                    parentNode: {querySelector: s => s === ".wkcomment" ? box : null},
+                    closest: s => s === ".wkdrawer" ? drawer : null}};
 }
 function reset(reply) {
   REQ = []; TOASTS = []; REFRESHES = 0; REFRESHED = 0; REPLY = reply;
   HANG = false;
-  for (const k of Object.keys(TQ_DRAFTS)) delete TQ_DRAFTS[k];
 }
 
 const out = {};
 (async () => {
   let c = card("ship it");
   reset({ok: true, status: 200, body: {ok: true, id: "task/263", comments: 2}});
-  await tqAct({id: "task/263", text: "ship it"}, c.el);
+  await wkComment(c.el);
   out.sent = {requests: REQ, toasts: TOASTS, box: c.box.value,
               refreshes: REFRESHES};
 
   c = card("ship it");
   reset({ok: true, status: 200, body: {ok: true, id: "task/263", comments: 2,
                                        warning: "the board did not sync"}});
-  await tqAct({id: "task/263", text: "ship it"}, c.el);
+  await wkComment(c.el);
   out.warned = {toasts: TOASTS};
 
   c = card("ship it");
   reset({ok: false, status: 400, body: {error: "id and text are required"}});
-  await tqAct({id: "task/263", text: "ship it"}, c.el);
+  await wkComment(c.el);
   out.refused = {toasts: TOASTS, box: c.box.value, refreshes: REFRESHES};
 
   reset({ok: true, status: 200, body: {}});
@@ -971,12 +959,12 @@ const out = {};
             raise unittest.SkipTest("node not available")
         src = web_ui_loader.read_text()
         decls = []
-        for pat in (r"^let TOKEN = .+$", r"^const TQ_DRAFTS = .+$"):
+        for pat in (r"^let TOKEN = .+$",):
             m = re.search(pat, src, re.M)
             assert m, "declaration not found in assembled web UI: " + pat
             decls.append(m.group(0))
         body = "\n".join(decls) + "\n" + "\n\n".join(
-            _extract_fn(src, n) for n in ("j", "post", "tqAct"))
+            _extract_fn(src, n) for n in ("j", "post", "wkComment"))
         cls.tmp = tempfile.mkdtemp(prefix="helm-tqact-runtime-")
         cls.path = os.path.join(cls.tmp, "run.js")
         with open(cls.path, "w", encoding="utf-8") as f:
@@ -997,7 +985,7 @@ const out = {};
         """THE DEFECT ITSELF. One request, and it is the mutation: the method,
         the payload and the per-process bearer all on the wire."""
         got = self.out["sent"]
-        # MUST-HIT: the harness's fetch really ran. A tqAct that returned
+        # MUST-HIT: the harness's fetch really ran. A wkComment that returned
         # early would leave this list empty and every assertion below would be
         # vacuously about nothing.
         self.assertEqual(len(got["requests"]), 1, got)
@@ -1014,7 +1002,8 @@ const out = {};
         self.assertEqual([t["text"] for t in got["toasts"]],
                          ["commented on task/263"])
         self.assertEqual(got["box"], "", "a delivered comment was resurrected")
-        self.assertEqual(got["refreshes"], 1, "the list never refreshed")
+        self.assertEqual(got["refreshes"], 1, "the open notes never re-read "
+                         "the comment just written")
 
     def test_a_warning_on_a_written_row_reaches_the_toast(self):
         """A note that landed CARRYING A COMPLAINT is not the same event as
@@ -1472,43 +1461,23 @@ class PayloadBoundsTest(TasksBase):
                          "the full note is not served where the excerpt "
                          "says it is")
 
-    def test_the_SHIPPED_card_draws_the_door_and_only_on_the_strict_flag(self):
-        """THE SERVER'S FLAG IS ONLY HONEST IF THE PAGE DRAWS IT. Everything
-        above proves the wire distinguishes "that is all of it" from "there is
-        more"; this proves the thing the owner actually looks at does too. On
-        the SHIPPED page, not the source file, for the reason the provenance
-        arm above takes the same slice: the assertion is about what his
-        browser received.
-
-        STRICT `=== true`, and the falsifier is the point. A truthy test would
-        draw a door off any value a future server put in that field, and a
-        door that leads nowhere is worse than no door — it tells the reader
-        text was withheld when none was. The absence of the door is this card
-        saying THAT IS ALL OF IT, so it may only ever appear on the one value
-        that means it."""
+    def test_the_SHIPPED_card_draws_the_whole_note_from_the_route_that_bounds_nothing(self):
+        """THE SERVER'S BOUND IS ONLY HONEST IF THE PAGE NEVER PASSES THE
+        EXCERPT OFF AS THE NOTE. The old backlog row drew the bounded excerpt
+        and a door to the rest on the strict `note_more === true`; the Work
+        page's drawer (task/3643) reads the task's WHOLE note from the notes
+        route, the one that bounds nothing, so there is no excerpt to cut and
+        no door to draw — and it never reads the excerpt fields at all."""
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
-        tq = body[body.index("task backlog (#218"):body.index(
-            "setInterval(tqInit")]
-        card = tq[tq.index("function tqCard"):tq.index("async function tqAct")]
-        # THE MUST-HIT, unconditional and on the same slice every claim below
-        # is made about: the note itself renders here. Without it the arm is
-        # searching a card that never drew a note and passing on its absence.
-        self.assertIn("r.note ?", card,
-                      "the excerpt is not rendered on the shipped card at "
-                      "all, so no arm here reads the surface it claims to")
-        self.assertIn("r.note_more === true", card,
-                      "the card never draws the door the bounded note owes")
-        self.assertNotIn("r.note_more ?", card,
-                         "a truthy test would draw a door for any value the "
-                         "field ever carries")
-        self.assertIn('data-kind="note"', card)
-        # AND THE DOOR OPENS ON THE ROUTE THAT BOUNDS NOTHING. The filler and
-        # the toggle that picks it ride the same shipped slice, so a door
-        # wired to nothing cannot ship past this arm.
-        self.assertIn("async function tqNoteFull", tq)
-        self.assertIn('det.dataset.kind === "note"', tq)
-        self.assertIn("/api/task/notes", tq)
+        notes = _extract_fn(body, "wkNotes")
+        self.assertIn("/api/task/notes?id=", notes)
+        self.assertIn("d.note", notes)
+        work = body[body.index("const WK_STAGES = ["):]
+        work = work[:work.index("setTimeout(wkLoad, 0);")]
+        self.assertIn("function wkNotes(", work)       # the slice is the script
+        self.assertNotIn("note_more", work)
+        self.assertNotIn("r.note", work)
 
     def test_a_CLOSED_row_is_a_tombstone_and_the_payload_says_which(self):
         """A closed row renders as id, title and why it closed. Serving the
@@ -1593,3 +1562,73 @@ class PayloadBoundsTest(TasksBase):
         # always did.
         self.assertEqual(3, len(d["entries"]) + len(d["unscoped"]),
                          "the byte trim dropped a row")
+
+
+class NotesAuthorRuntimeTest(unittest.TestCase):
+    """The comment list's AUTHOR, EXECUTED: the Work drawer's own `wkNotes`
+    (task/3643) under node.
+
+    The notes route names each comment's author the way the store labels it
+    (`author`), and the page must draw THAT: a legacy comment reads "legacy:
+    no author recorded" and the owner's own note reads "owner (web)". An
+    older server that sends no `author` still draws the raw `by`, and a row
+    with neither reads "unattributed" rather than an empty cell."""
+
+    HARNESS = r"""
+function wkWhen(epoch) { return "when"; }
+let REPLY = null;
+async function j(url, ms) { return REPLY; }
+const out = {};
+(async () => {
+  const run = async reply => {
+    REPLY = reply;
+    const body = {innerHTML: ""};
+    const det = {dataset: {id: "task/1"},
+                 querySelector: s => s === ".otqnotebody" ? body : null};
+    await wkNotes(det);
+    return body.innerHTML;
+  };
+  out.labelled = await run({id: "task/1", note: "", comments: [
+    {ts: "1", ts_epoch: 1, by: null, author: "legacy: no author recorded",
+     text: "omg get this live!!!"},
+    {ts: "2", ts_epoch: 2, by: "owner", author: "owner (web)",
+     text: "and now it is"}]});
+  out.older = await run({id: "task/1", note: "", comments: [
+    {ts: "1", ts_epoch: 1, by: "seat-a", text: "x"},
+    {ts: "2", ts_epoch: 2, by: null, text: "y"}]});
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node not available")
+        src = web_ui_loader.read_text()
+        m = re.search(r"^const esc = .+$", src, re.M)
+        assert m, "esc not found in the assembled web UI"
+        body = m.group(0) + "\n" + _extract_fn(src, "wkNotes")
+        cls.tmp = tempfile.mkdtemp(prefix="helm-tqnotes-runtime-")
+        cls.path = os.path.join(cls.tmp, "run.js")
+        with open(cls.path, "w", encoding="utf-8") as f:
+            f.write(body + cls.HARNESS)
+        p = subprocess.run([cls.node, cls.path], capture_output=True,
+                           text=True, timeout=60)
+        assert p.returncode == 0, p.stderr
+        cls.out = json.loads(p.stdout)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
+
+    def test_the_store_label_is_what_the_owner_reads(self):
+        html = self.out["labelled"]
+        self.assertIn(">legacy: no author recorded<", html)
+        self.assertIn(">owner (web)<", html)
+        self.assertIn("omg get this live!!!", html)
+
+    def test_an_older_server_still_draws_the_raw_author(self):
+        html = self.out["older"]
+        self.assertIn(">seat-a<", html)
+        self.assertIn(">unattributed<", html)

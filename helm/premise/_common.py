@@ -21,7 +21,6 @@ from .. import cell, home, pk, store
 DIGEST_TAG = "prem:b2b:"          # blake2b-256 (see module docstring)
 CHAIN_V = 2                       # native attestation-chain schema/evidence version
 DEFAULT_PROFILE = "helm-test"     # recording label default — never the user's cell
-RETRY_PAUSE_S = 2                 # pause between queued anchor-retry failures
 # premise-check exit contract: 0 = primary proof VERIFIED (digest matches AND the
 # native record recomputes AND binds to this premise); 1 = present but BROKEN
 # (mismatch/tamper/foreign record); EXIT_NO_NATIVE_PROOF = the primary proof is

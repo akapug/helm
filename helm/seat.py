@@ -366,21 +366,34 @@ def _restore_launch(path, snapshot, survivor=None):
               file=sys.stderr)
 
 
+def _gated_proxy_before_pane(family, seat_name):
+    """Reconcile a money-gated proxy before any pane may send through it."""
+    from . import offpeak
+    if not offpeak.gated_providers(FAMILIES.get(family) or {}):
+        return None, None
+    _label, state, detail = _ensure_row(family, seat_name)
+    return state, detail
+
+
 def _resume(seat_name, rest, _locked=False, target_sid=None,
             expected_session=None, adapter=None, reboot_dead=False,
             reboot_sid=None):
     """seat resume <seat> — relaunch the seat's pane at its drain point via
     the detected metaharness: the pane runs the seat's freshly re-minted
     launch.sh (latest env/identity/hooks) with claude's own continuity flag
-    appended (--resume <id> when the seat's config dir names a session, else
-    --continue), so the SESSION survives while the environment refreshes.
+    appended, so the SESSION survives while the environment refreshes: the
+    session the seat's LIVE process holds, from its presence record
+    (`--resume <id>`, or `--session-id <id>` for one with no transcript yet —
+    task/3208, a /clear moves the live session before any transcript does);
+    with no live process the newest transcript's (`_newest_seat_session`);
+    else --continue.
     TOKEN LAW: the pane command is the launch.sh PATH — the expanded launch
     line (which carries the proxy token) never crosses the adapter seam.
 
     target_sid/expected_session/adapter are the internal CONTEXT_FULL recovery
     seam: resume the exact cv-pruned copy only while the measured old session
     still owns the authoritative pane. The normal CLI leaves them unset and
-    retains newest-session behavior.
+    reads the live session, then the newest transcript.
 
     --cwd DIR overrides where the relaunched pane lands (the owner's measured
     workarounds — editing spawn.json's worktree, rehoming the transcript slug
@@ -562,9 +575,73 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
                   seat_name, str(expected_session)[:12], str(prior_sid)[:12]),
               file=sys.stderr)
         return 1
-    sid, sess_cwd = (_seat_session_by_id(d, target_sid) if target_sid
-                     else _seat_session_by_id(d, reboot_sid) if reboot_sid
-                     else _newest_seat_session(d, prefer_source=prior_sid))
+    # THE LIVE PROCESS NAMES ITS OWN SESSION (task/3208). A seat whose claude
+    # is still running has already said which session it holds, in its own
+    # presence record — admitted only on the register's evidence, so a helper
+    # claude's record never speaks for the seat (`live_seat_session`) — and a
+    # transcript ranking answers a different question:
+    # right after a /clear it answered the PRE-clear session (measured twice on
+    # a fleet host, and on claude 2.1.283 in a scratch config dir). Only the
+    # unpinned hand resume asks; the pins below name their session already.
+    # A session with no transcript yet is not resumable (claude: "No
+    # conversation found", exit 1, MEASURED) and `--continue` takes the newest
+    # transcript, the old session again; so that pane starts FRESH under the
+    # same id, which claude accepts for an id with no transcript (MEASURED).
+    fresh = False
+    if target_sid:
+        sid, sess_cwd = _seat_session_by_id(d, target_sid)
+    elif reboot_sid:
+        sid, sess_cwd = _seat_session_by_id(d, reboot_sid)
+    else:
+        from .seat_lifecycle_runtime import (LIVE_FOREIGN, LIVE_SESSION,
+                                             LIVE_UNKNOWN, live_seat_session)
+        live, sid, live_cwd, live_why = live_seat_session(
+            d, prior if prior.get("seat") == seat_name else {})
+        if live == LIVE_UNKNOWN:
+            print("helm seat: refusing to resume %s — the session its live "
+                  "claude process holds is UNKNOWN: %s. Picking one from the "
+                  "transcripts instead can bring back a session the process "
+                  "already left (a /clear), so nothing was reaped or "
+                  "re-minted" % (seat_name, live_why), file=sys.stderr)
+            return 1
+        if live == LIVE_SESSION:
+            print("  resuming the session the seat's live process holds: %s"
+                  % live_why)
+            # A PRUNED COPY OF THAT SESSION IS STILL THE RESCUE (the
+            # 2026-08-04 rank-3 rule in `_newest_seat_session`): a seat walled
+            # at context-full keeps its claude alive, and that process naming
+            # its own walled session must not outrank the copy cv minted.
+            rescue = _newest_seat_session(d, prefer_source=sid)[0]
+            path = (_seat_session_path_by_id(d, rescue)
+                    if rescue and rescue != sid else None)
+            if path and _prune_source(path) == sid:
+                print("  session %s… is a pruned copy of it, the rescue, so "
+                      "the pane resumes the copy" % rescue[:8])
+                sid = rescue
+            sess_cwd = _seat_session_by_id(d, sid, real_turn=False)[1] \
+                or live_cwd
+            fresh = not glob.glob(os.path.join(
+                glob.escape(d), "claude", "projects", "*", sid + ".jsonl"))
+            if fresh:
+                print("  session %s… has no transcript yet (claude writes one "
+                      "at its first message) and cannot be resumed, so the "
+                      "pane starts FRESH under the same id (--session-id)"
+                      % sid[:8])
+        else:
+            if live == LIVE_FOREIGN:
+                print("  %s; the transcripts decide" % live_why)
+            sid, sess_cwd = _newest_seat_session(d, prefer_source=prior_sid)
+
+    def continuity():
+        """The relaunch's continuity flag, asked again after the reap: a
+        session that wrote its first transcript before the reap stopped it
+        is resumable after all, and `--session-id` would then be refused."""
+        if not sid:
+            return ("--continue",)
+        if fresh and not glob.glob(os.path.join(
+                glob.escape(d), "claude", "projects", "*", sid + ".jsonl")):
+            return ("--session-id", sid)
+        return ("--resume", sid)
     if reboot_sid and not sid:
         # NO NEW SESSION IS EVER MINTED by a reboot relaunch: the pinned
         # session is resumed or nothing is — never `--continue` (a fresh
@@ -668,6 +745,11 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
     # guard moves ahead of the write; the write does not move behind the guard.
     if _refuse_in_flight_spawn(d):
         return 1
+    from . import seat_sidecar
+    refusal = seat_sidecar.launch_refusal(family, seat_name, "resume")
+    if refusal:
+        print("helm seat: " + refusal, file=sys.stderr)
+        return 1
     # ALLOCATE THE ENDPOINT NOW — the same point in the same order `_spawn`
     # reaches it: past EVERY deterministic refusal (the launch-asset check, the
     # persisted role, the runtime model, the requested/expected session, the
@@ -688,9 +770,10 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
         print("helm seat: %s cannot be resumed — %s"
               % (seat_name, endpoint_err), file=sys.stderr)
         return 1
-    command = _seat_lifecycle_impl._launch_command(
-        launch_sh, role,
-        tail=("--resume", sid) if sid else ("--continue",))
+    # The flag the relaunch line carries is kept, so the closing line names
+    # the one used rather than asking again after the new claude has run.
+    tail = continuity()
+    command = _seat_lifecycle_impl._launch_command(launch_sh, role, tail=tail)
     from . import harness
     ad = adapter or harness.detect()
     if ad is None:
@@ -736,6 +819,15 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
             defer_orca_terminal=True)
         for note in notes:
             print("  " + note)
+    if fresh and continuity()[0] == "--resume":
+        # The reaped process wrote its first transcript between the live read
+        # and the stop: that session is resumable now, and --session-id on an
+        # id with a transcript is refused ("already in use", MEASURED).
+        print("  session %s… wrote its first transcript before the reap; "
+              "resuming it instead" % sid[:8])
+        tail = continuity()
+        command = _seat_lifecycle_impl._launch_command(launch_sh, role,
+                                                       tail=tail)
     prove = reboot_dead or bool(errors)
     terminal_proof = None
 
@@ -798,8 +890,10 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
     try:
         # env refresh half of the contract: the relaunch rides the LATEST
         # assets (identity vars, delivery hooks, context env), room preserved.
+        # workdir=resume_cwd, the cwd the pane is started in below, so a lite
+        # seat's instruction excludes name the project it will run in.
         if _write_launch_assets(
-                family, d, room, seat_name,
+                family, d, room, seat_name, workdir=resume_cwd,
                 room_source=room_source, multi=multi,
                 model=prior_model, identity=identity) \
                 is _SEAT_SURFACE_REFUSED:
@@ -812,11 +906,38 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
         fam = FAMILIES[family]
         if seat_name != family and fam["mode"] == "proxy":
             _mint_instance_proxy(family, seat_name)
-        if os.path.exists(os.path.join(_proxy_home(family, seat_name),
-                                       "config.yaml")) \
-                and not _running_pid(family, seat_name):
-            if _up(family, quiet=True, seat=seat_name) == 0:
-                print("  (proxy was down — auto-started)")
+        # A DESIRED-DOWN SEAT'S PROXY STAYS DOWN HERE. This start is not the
+        # operator's: an operator's `seat resume <seat>` cleared the record
+        # before reaching this line, so a record still present means the
+        # caller is the reboot sweep or the context-wall recovery, and neither
+        # may overrule `helm seat down`. An UNREADABLE record starts the proxy
+        # (the supervised direction, helm/seat_down.py) and says so.
+        from . import seat_down
+        down, unreadable = seat_down.read(family, seat_name)
+        if down:
+            print("  (proxy NOT started: %s — %s)"
+                  % (seat_down.describe(down),
+                     seat_down.resume_hint(seat_name)))
+        else:
+            seat_cfg = os.path.join(_proxy_home(family, seat_name),
+                                    "config.yaml")
+            if os.path.exists(seat_cfg):
+                gate_state, gate_detail = _gated_proxy_before_pane(
+                    family, seat_name)
+                if gate_state == "unknown":
+                    print("helm seat: refusing to resume %s — paid proxy "
+                          "closure is unproved: %s" % (seat_name, gate_detail),
+                          file=sys.stderr)
+                    return _unwound()
+                if gate_state == "respawned":
+                    print("  (paid proxy reconciled before resume)")
+                elif gate_state is None and not _running_pid(family,
+                                                             seat_name):
+                    if unreadable:
+                        print("  (%s)" % seat_down.unreadable_text(seat_name,
+                                                                   unreadable))
+                    if _up(family, quiet=True, seat=seat_name) == 0:
+                        print("  (proxy was down — auto-started)")
         # Resolved ONCE before any reap and reused for spawn + register below:
         # exact recovery uses spawn.json's authoritative worktree, never a
         # transcript sniff or the timer process's cwd.
@@ -931,7 +1052,11 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
            # this field already spell `rec.get("room") or "main"` themselves.
            "room": room, "room_source": room_source,
            "room_worktree": room_worktree,
-           "launch_sh": launch_sh, "model": prior_model, "ts": pk.now_ts(),
+           "launch_sh": launch_sh, "model": prior_model,
+           # the carried model keeps its recorded source: a resume decides
+           # nothing about whether it was a choice or a default
+           "model_source": prior.get("model_source") if prior_model else None,
+           "ts": pk.now_ts(),
            "harness": ad.name, "handle": handle, "session": sid}
     if not _register_spawn(seat_name, identity, d, rec):
         try:
@@ -1009,7 +1134,7 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
           "wake-path re-arm prompt sent (the beacon is per-session — the "
           "restart killed it)"
           % (identity, ad.name, handle,
-             ("session %s… (--resume)" % sid[:8]) if sid
+             ("session %s… (%s)" % (sid[:8], tail[0])) if sid
              else "--continue (newest session)", launch_sh))
     return 0
 
@@ -1767,7 +1892,7 @@ def _refuse_in_flight_spawn(d):
 
 
 def _spawn_native(seat_name, project, d, room, cwd, role, replace, ad,
-                  model=None):
+                  model=None, model_source=None):
     """`seat spawn <project>-claude` — ONLY WHAT NATIVE DIFFERS IN.
 
     NOT A SECOND LIFECYCLE, and that is the point. Everything a spawn owes its
@@ -1821,8 +1946,12 @@ def _spawn_native(seat_name, project, d, room, cwd, role, replace, ad,
            "room_source": "explicit" if room else None,
            "harness": ad.name, "handle": None,
            "config_home": config_home,
-           "launch_sh": None, "model": model, "ts": pk.now_ts(),
-           "session": None}
+           "launch_sh": None, "model": model,
+           # a model carried from the prior register keeps that register's
+           # word for it: a choice stays a choice, an unmarked one unknown
+           "model_source": model_source or (
+               (prior or {}).get("model_source") if model else None),
+           "ts": pk.now_ts(), "session": None}
     # THE REGISTER GOES DOWN BEFORE THE PANE CAN RUN — the producer-authoritative
     # half of the session handshake. A pane's FIRST SessionStart is the only
     # authority for its session id, and every consumer of it resolves the seat's
@@ -2058,6 +2187,7 @@ def _spawn(seat_name, rest, _locked=False):
         # else the seat's own register carries the one it last launched on, so
         # `--replace` relaunches on the same model instead of the credhome's
         # settings default (the proxy leg's `_persisted_model` law).
+        model_source = "explicit" if model else None
         model = model or _persisted_model(d, seat_name)
         if dry_run:
             return _spawn_native_plan(seat_name, project, room, cwd, role, model)
@@ -2070,7 +2200,7 @@ def _spawn(seat_name, rest, _locked=False):
         if _spawn_reap(seat_name, d, ad, replace):
             return 1
         rc = _spawn_native(seat_name, project, d, room, cwd, role, replace, ad,
-                           model)
+                           model, model_source=model_source)
         if rc == 0:
             _ensure_autocompact_timer()
         return rc
@@ -2164,6 +2294,11 @@ def _spawn(seat_name, rest, _locked=False):
     # child starts, so only the PENDING attempt can say another spawn owns it.
     if _refuse_in_flight_spawn(d):
         return 1
+    from . import seat_sidecar
+    refusal = seat_sidecar.launch_refusal(family, seat_name, "spawn")
+    if refusal:
+        print("helm seat: " + refusal, file=sys.stderr)
+        return 1
     # ALLOCATE THE ENDPOINT NOW: past every refusal — the plan above, the
     # argument parse, the model check, the workspace proof, the identity gate,
     # the in-flight attempt — and immediately before the reap and the re-mint,
@@ -2192,6 +2327,17 @@ def _spawn(seat_name, rest, _locked=False):
     if surface_refusal:
         print("helm seat: " + surface_refusal, file=sys.stderr)
         return 1
+    # A money-gated proxy is another read-only pre-reap refusal. Reconcile its
+    # running listener now: if closure is unproved, leave the current pane alive
+    # rather than destroy it and only then discover the new pane may not start.
+    gate_state = gate_detail = None
+    existing_cfg = os.path.join(_proxy_home(family, seat_name), "config.yaml")
+    if os.path.exists(existing_cfg):
+        gate_state, gate_detail = _gated_proxy_before_pane(family, seat_name)
+        if gate_state == "unknown":
+            print("helm seat: refusing to spawn %s — paid proxy closure is "
+                  "unproved: %s" % (seat_name, gate_detail), file=sys.stderr)
+            return 1
     # Same pre-reap identity gate as resume: a refusal must leave the current
     # pane and launch asset alive, not discover the conflict after replacement
     # has already destroyed the runtime it was meant to refresh.
@@ -2244,25 +2390,39 @@ def _spawn(seat_name, rest, _locked=False):
     if seat_name != family and fam["mode"] == "proxy":
         _mint_instance_proxy(family, seat_name)
     seat_cfg = os.path.join(_proxy_home(family, seat_name), "config.yaml")
-    if os.path.exists(seat_cfg) and not _running_pid(family, seat_name):
-        if _up(family, quiet=True, seat=seat_name) == 0:
-            print("  (proxy was down — auto-started)")
-        else:
-            print("helm seat: WARN — %s proxy not running and auto-start "
-                  "failed; the seat errors until `helm seat up %s`"
-                  % (seat_name, seat_name), file=sys.stderr)
+    if os.path.exists(seat_cfg):
+        if gate_state not in ("healthy", "respawned"):
+            gate_state, gate_detail = _gated_proxy_before_pane(
+                family, seat_name)
+        if gate_state == "unknown":
+            print("helm seat: refusing to spawn %s — paid proxy closure is "
+                  "unproved: %s" % (seat_name, gate_detail), file=sys.stderr)
+            return _unwound()
+        if gate_state == "respawned":
+            print("  (paid proxy reconciled before spawn)")
+        elif gate_state is None and not _running_pid(family, seat_name):
+            if _up(family, quiet=True, seat=seat_name) == 0:
+                print("  (proxy was down — auto-started)")
+            else:
+                print("helm seat: WARN — %s proxy not running and auto-start "
+                      "failed; the seat errors until `helm seat up %s`"
+                      % (seat_name, seat_name), file=sys.stderr)
     from . import pk
     # `model` and `role` are PERSISTED, not just minted: launch.sh is
     # REFRESHED by every launch/resume/add, and each writer must re-derive the
     # explicit model while resume reasserts lead posture. Dropping either
     # silently turns a spark seat back into sol or a lead back into a worker.
+    # `model` here is only ever the operator's --model, so it is recorded as
+    # a CHOICE: `_persisted_model` lets a choice outrank the catalog, never a
+    # default (helm/seat_remint.py).
     prior_rec = _spawn_record(d)
     rec = {"v": 1, "seat": seat_name, "identity": identity,
            "family": family, "project": project,
            "role": role, "worktree": cwd,
            "room": room, "room_source": room_source,
            "room_worktree": room_worktree, "launch_sh": launch_sh,
-           "model": model, "ts": pk.now_ts(), "session": None}
+           "model": model, "model_source": "explicit" if model else None,
+           "ts": pk.now_ts(), "session": None}
     if ad is None:
         # PUBLISH BEFORE THE CHILD RUNS, the same producer-authoritative rule the
         # native leg follows. A PROJECT seat's family is not in its name — it is
@@ -2653,6 +2813,9 @@ def cmd_seat(args):
             print("helm seat silent-drop: rogue-compute pass failed: %s" % e,
                   file=sys.stderr)
         return rc
+    if verb == "hold":
+        from . import seat_hold
+        return seat_hold.cmd_hold(rest)
     if verb == "idle-dispatch":
         from . import idle_dispatch
         return idle_dispatch.cmd_idle_dispatch(rest)
@@ -2673,6 +2836,15 @@ def cmd_seat(args):
                   "[--model M] [--role worker|lead] [--replace] [--print]",
                   file=sys.stderr)
             return 2
+        if "--print" not in rest:
+            # THE OPERATOR SAYING "RUN IT" clears a desired-down record before
+            # anything else happens; a dry run says nothing and clears nothing.
+            # helm/seat_down.py owns the record and why only these doors write
+            # or clear it.
+            from . import seat_down
+            rc = seat_down.operator_run(rest[0], "spawn")
+            if rc is not None:
+                return rc
         return _spawn(rest[0], rest[1:])
     if verb == "rehome":
         # THE ONE-VERB FORM of a hand procedure the integrator ran twice in a
@@ -2684,6 +2856,11 @@ def cmd_seat(args):
         # stale token rather than declining.
         from . import seat_rehome
         return seat_rehome.cmd_rehome(rest)
+    if verb == "rest":
+        # THE OWNER PAUSE (task/3280): RESTING, beside IDLE and DEAF. It
+        # guards its own tail; helm/seat_rest.py says who may write it.
+        from . import seat_rest
+        return seat_rest.cmd_rest(rest)
     if verb == "where":
         if not rest:
             print("usage: helm seat where <seat> [--json]", file=sys.stderr)
@@ -2723,6 +2900,12 @@ def cmd_seat(args):
         # RETIRED_SPAWN_DENIES). Dry-run default; it guards its own tail.
         from . import seat_launch_assets as _assets
         return _assets.cmd_retire_deny(rest)
+    if verb == "remint":
+        # RE-MINT WITHOUT LAUNCHING: a seat's launch.sh brought back to what
+        # the catalog (or the seat's explicit choice) says, through the same
+        # refresh launch/resume run. Dry-run default; it guards its own tail.
+        from . import seat_remint
+        return seat_remint.cmd_remint(rest)
     if verb == "retitle":
         # THE TITLE half of the post-reboot repair, on demand. The sweep
         # re-stamps titles after the boot that reverts them; this is the same
@@ -2776,6 +2959,13 @@ def cmd_seat(args):
                               "[--role worker|lead] [--force]")
         if rc is not None:
             return rc
+        # The operator's resume clears a desired-down record; `_resume` itself
+        # never does, because the reboot sweep and the context-wall recovery
+        # call it too and neither of them is an operator saying "run it".
+        from . import seat_down
+        rc = seat_down.operator_run(rest[0], "resume")
+        if rc is not None:
+            return rc
         return _resume(rest[0], rest[1:])
     if verb in ("add", "up", "down", "launch", "smoke"):
         if not rest:
@@ -2787,7 +2977,7 @@ def cmd_seat(args):
         tails = {"add": ((), ("--room", "--auth-from", "--key-from",
                               "--provider")),
                  "up": ((), ()),
-                 "down": ((), ()),
+                 "down": ((), ("--reason",)),
                  "smoke": (("--multi",), ()),
                  "launch": (("--multi",),
                             ("--room", "--model", "-i", "--instance"))}
@@ -2834,8 +3024,22 @@ def cmd_seat(args):
                       "it." % (seat_name, verb, seat_name, seat_name),
                       file=sys.stderr)
                 return 2
-            fn = _up if verb == "up" else _down
-            return fn(fam_name, seat=seat_name)
+            # THE OPERATOR'S TWO VERBS CARRY A DESIRED STATE, not just an act.
+            # `down` records desired-down BEFORE it stops the proxy, so the
+            # */3 `doctor --ensure` pass, the reboot sweep and proxywatch leave
+            # the seat down instead of respawning it three minutes later; `up`
+            # clears that record first. Every internal stop/start (the
+            # post-suspend bounce, ensure's own respawn, resume's proxy start)
+            # calls `_up`/`_down` directly and never touches the record.
+            from . import seat_down
+            if verb == "down":
+                reason = rest[rest.index("--reason") + 1] \
+                    if "--reason" in rest else None
+                return seat_down.operator_down(fam_name, seat_name, reason)
+            rc = seat_down.operator_run(seat_name, "up")
+            if rc is not None:
+                return rc
+            return _up(fam_name, seat=seat_name)
         if verb == "smoke":
             return _smoke(family, multi=multi)
         fam = _require_seat(family)

@@ -20,11 +20,18 @@
     <div class="raildrag" id="cfgraildrag" title="drag to resize — double-click resets"></div>
     <div id="cfgdetail"><div class="empty">pick a cwd or a home to see what its agents load →</div></div>
   </div>
+  <!-- GUARD REFUSALS, AND THE OWNER'S DIAL (moved here from the Work page,
+       task/3445: the fleet's own machinery sits with its configs). How often a guard stopped an
+       agent this week (`helm friction`'s own numbers), and the one number
+       that decides when an agent is told it may stop and repair a guard. It
+       sits beside readiness because both answer "is the fleet's own machinery
+       getting in its way", and it is a control he turns here because he does
+       not type verbs. It boots saying "Not read yet", and an unreadable
+       record is never drawn as zero refusals. -->
+  <section id="frictionsec"></section>
+  <!-- THE STORE COUNTS AND THE SKILLS (moved here from the Work page,
+       task/3445): what the fleet has learned and can load, beside the configs
+       that load it. -->
+  <section id="store"></section>
+  <section id="skillsec"></section>
 </div>
-
-<!-- WORK: the owner⇄fleet surface (owner ruling 2026-08-04, live at the
-     console — supersedes both earlier placements): decisions, the task
-     backlog, and store review COMPOSE here as sibling sections. This lane
-     ships only the decisions section; #218 adds the siblings into the same
-     #worksections container — a section list, never a page hard-coded to
-     one feature. -->

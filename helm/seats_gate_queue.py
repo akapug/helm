@@ -286,7 +286,7 @@ def _gate_queue_txn(repo, mutate, proc_dir="/proc"):
     chat._ensure_dir()
     path = _gate_queue_file(repo_id)
     try:
-        with _flocked(path + ".lock") as lock:
+        with _flocked(path + ".lock", check=True) as lock:
             if lock.f is None:
                 return None, "gate FIFO lock is unavailable"
             state, err = _gate_queue_load(path, repo_id)
@@ -550,7 +550,7 @@ def gate_queue_terminals(repo):
         return [], err
     path = _gate_queue_file(repo_id)
     try:
-        with _flocked(path + ".lock") as lock:
+        with _flocked(path + ".lock", check=True) as lock:
             if lock.f is None:
                 return [], "gate FIFO lock is unavailable"
             state, err = _gate_queue_load(path, repo_id)
@@ -626,7 +626,7 @@ def gate_queue_orphans(repo, proc_dir="/proc"):
         return [], err
     path = _gate_queue_file(repo_id)
     try:
-        with _flocked(path + ".lock") as lock:
+        with _flocked(path + ".lock", check=True) as lock:
             if lock.f is None:
                 return [], "gate FIFO lock is unavailable"
             state, err = _gate_queue_load(path, repo_id)
@@ -645,7 +645,7 @@ def gate_queue_snapshot(repo, proc_dir="/proc"):
         return [], err
     path = _gate_queue_file(repo_id)
     try:
-        with _flocked(path + ".lock") as lock:
+        with _flocked(path + ".lock", check=True) as lock:
             if lock.f is None:
                 return [], "gate FIFO lock is unavailable"
             state, err = _gate_queue_load(path, repo_id)

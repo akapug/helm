@@ -4,6 +4,7 @@ Agent/Workflow inventory. Moved verbatim from the pre-split helm/work.py.
 """
 import json
 import os
+import re
 import stat
 import time
 
@@ -95,9 +96,10 @@ def worktrees(root):
     return _worktree_records(root)[0]
 
 
-def _occupants_many(paths):
+def _occupants_many(paths, proc_root="/proc"):
     """One /proc pass for many rooms -> ({path: [pids]}, census_complete).
     Cwd links are the positive proof; an unreadable census is explicit UNKNOWN.
+    `proc_root` is the process table read, so a fixture can plant one.
 
     COMPLETE MEANT ONLY THAT /proc COULD BE LISTED, which is the smaller half
     of the question. Every per-pid cwd read could fail — a hidepid mount, a
@@ -113,11 +115,19 @@ def _occupants_many(paths):
     ordinary (a process exits between the listing and the readlink), so only
     the TOTAL failure is evidence about the instrument. The scanning process
     can always read its own cwd, so a healthy box cannot reach the incomplete
-    branch — the must-hit is built into the mechanism."""
+    branch — the must-hit is built into the mechanism.
+
+    THE LINK IS READ WITH readlink, AND ONLY ITS TARGET IS RESOLVED.
+    `os.path.realpath` does not raise on a cwd link it cannot read: it answers
+    with the link's own path, which is inside no room, so every unreadable pid
+    would count as a read that proved it absent and the incomplete branch
+    could never run. A blind pass answers each room with the unlistable-table
+    shape, because `_occupants` hands gc, reap, release and drop a list with
+    no completeness flag beside it, and an empty one reads as nobody there."""
     roots = {p: os.path.realpath(p).rstrip(os.sep) for p in paths}
     out = {p: [] for p in paths}
     try:
-        names = os.listdir("/proc")
+        names = os.listdir(proc_root)
     except OSError:
         return {p: ["unknown"] for p in paths}, False
     read = attempted = 0
@@ -126,21 +136,241 @@ def _occupants_many(paths):
             continue
         attempted += 1
         try:
-            cwd = os.path.realpath(os.path.join("/proc", pid, "cwd")).rstrip(os.sep)
+            cwd = os.path.realpath(os.readlink(
+                os.path.join(proc_root, pid, "cwd"))).rstrip(os.sep)
         except OSError:
             continue
         read += 1
         for path, root in roots.items():
             if cwd == root or cwd.startswith(root + os.sep):
                 out[path].append(pid)
+    if attempted and not read:
+        return {p: ["unknown"] for p in paths}, False
     for p in out:
         out[p].sort(key=lambda n: int(n) if n.isdigit() else -1)
-    return out, not (attempted and not read)
+    return out, True
 
 
 def _occupants(path):
     """Live PIDs whose cwd is `path` or beneath it; UNKNOWN fails closed."""
     return _occupants_many([path])[0][path]
+
+
+# ---------------------------------------------------------------------------
+# who is in a room — what an OCCUPIED refusal names, so nobody guesses
+# ---------------------------------------------------------------------------
+#
+# THE FAILURE MODE: a refusal of the shape "OCCUPIED by cwd pid(s) N — room
+# and lease kept; move every live pane/process out before release" reads as
+# permission to kill N, and a local model read it exactly that way when N
+# was helm's OWN detached `python -m helm.findingspass`, which exits by itself.
+# It runs with its cwd in the checkout helm runs from, so a lane room
+# supplying the running helm is exactly where one sits. A pid list plus an
+# imperative names no owner, so the reader supplies one, and "move a process
+# out" means a signal.
+#
+# So the refusal names each occupant by pid AND command line, and says WHOSE
+# it is: helm's own worker that ends by itself (wait), helm's own daemon (its
+# stop verb), an idle harness placeholder (the release stops it), or somebody
+# else's live work (its owner moves it). No line suggests a signal.
+
+# HELM'S OWN WORKERS THAT END BY THEMSELVES: every helm spawn of a
+# `python -m helm...` process (`git grep -n "python -m helm\."` and the
+# `[sys.executable, "-m", "helm", ...]` Popen sites) that is bounded, plus the
+# gate's child scripts, which it runs by path. Matched by argv PREFIX.
+_HELM_SELF_EXITING = (
+    (("helm.findingspass",),
+     "helm's findings pass, a local-model read of one review row"),
+    (("helm", "gate", "run"), "a helm gate run"),
+    (("helm", "relevance", "score-turn"), "helm's per-turn relevance scorer"),
+    (("helm", "proxywatch"), "a helm proxywatch pass"),
+    (("helm/gatechild.py",), "a helm gate's test child"),
+    (("helm/gateshard.py",), "a helm gate shard"),
+    (("helm/gateslice.py",), "a helm gate slice runner"),
+)
+# helm's own DAEMONS: they do not end by themselves, and each has a stop verb.
+_HELM_DAEMONS = (
+    (("helm", "router", "run"), "helm's model router daemon", "helm router down"),
+)
+_CMDLINE_CAP = 160
+_HELM_SCRIPT = re.compile(r"(?:^|/)(helm/[a-z_]+\.py)$")
+_PY_INTERP = re.compile(r"(?:python|graalpy|pypy)[\d.]*\Z")
+# The wrappers that FORK and stay in the process table above the program they
+# run: `timeout` (these options take a value) and the findings pass's
+# `sh -c 'exec "$@" &' NAME`, whose program is "$@". An exec-style wrapper
+# (env, nice, nohup) replaces itself, so its argv is never read.
+_TIMEOUT_VALUED = ("-k", "-s", "--kill-after", "--signal")
+_RUNS_ITS_ARGS = re.compile(r'exec "\$@"(?:\s*&)?')
+_ANCESTRY_HOPS = 32
+
+
+def _proc_argv(pid, proc_root="/proc"):
+    try:
+        with open(os.path.join(proc_root, str(pid), "cmdline"), "rb") as f:
+            return [os.fsdecode(a) for a in f.read(65536).split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def _proc_ppid(pid, proc_root="/proc"):
+    """The parent pid from /proc/<pid>/stat, or 0. The comm field may itself
+    hold spaces and parentheses, so the fields are read after its LAST ')'."""
+    try:
+        with open(os.path.join(proc_root, str(pid), "stat"), "rb") as f:
+            return int(f.read(4096).rsplit(b")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def _python_runs(args):
+    """What a Python interpreter runs, from the argv AFTER the interpreter:
+    ("m", module, rest), ("script", path, rest), or None for a `-c` program,
+    stdin, or no program. CPython's own option grammar: short options cluster
+    (`-Bm x`), and `-c`, `-m`, `-W`, `-X` take the rest of their token or the
+    next one. Everything after the program is the program's data."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--check-hash-based-pycs":
+            i += 1
+        elif a == "--":
+            return ("script", args[i], args[i + 1:]) if i < len(args) else None
+        elif a.startswith("--"):
+            continue
+        elif a == "-":
+            return None
+        elif not a.startswith("-"):
+            return "script", a, args[i:]
+        else:
+            for j, c in enumerate(a[1:], 2):
+                if c in "cmWX":
+                    val = a[j:]
+                    if not val:
+                        val = args[i] if i < len(args) else ""
+                        i += 1
+                    if c == "c":
+                        return None
+                    if c == "m":
+                        return "m", val, args[i:]
+                    break
+    return None
+
+
+def _program(argv):
+    """The argv of the program a process runs: argv[0] and its arguments, or,
+    under a wrapper that forks (`timeout`, `sh -c 'exec "$@" &' NAME`), the
+    command that wrapper's own grammar says it runs. Nothing later in an argv
+    is ever a program."""
+    while argv:
+        name = os.path.basename(argv[0])
+        if name == "timeout":
+            i = 1
+            while i < len(argv) and argv[i].startswith("-"):
+                i += 2 if argv[i] in _TIMEOUT_VALUED else 1
+            argv = argv[i + 1:]                 # past the DURATION
+        elif name in ("sh", "bash", "dash") and argv[1:2] == ["-c"] \
+                and len(argv) > 2 and _RUNS_ITS_ARGS.fullmatch(argv[2].strip()):
+            argv = argv[4:]                     # past the script and its $0
+        else:
+            return argv
+    return argv
+
+
+def _helm_entry(argv):
+    """What helm entry an argv runs, as a tuple the tables above match by
+    prefix: ("helm", verb, sub) for the package or its bin/helm script,
+    ("helm.<module>",) for a module, ("helm/<script>.py",) for a helm script
+    run by path (a gate child, a seat supervisor), () for anything else.
+
+    THE PROGRAM DECIDES, NEVER A TOKEN ANYWHERE. A process runs helm when its
+    program (_program: argv[0], or what a `timeout` or the findings pass's
+    `sh -c 'exec "$@" &'` above it runs) is the helm launcher, or is a Python
+    interpreter running `-m helm...` or a helm script. An editor, pager or
+    git on helm's own sources, a `-c` program or a script handed `-m helm.x`
+    as arguments, and a pytest marker all carry a helm entry as DATA; matched
+    anywhere, each read as helm's own, and an editor on helm/gatechild.py
+    read "exits by itself: WAIT". An interpreter's NAME is data too when it
+    is not the program: `vim +/python3 helm/gatechild.py`, `less -p python3`,
+    `git log -S python3 --`. What descends from a real helm worker is still
+    helm's, by ancestry (describe_occupants)."""
+    argv = _program(argv)
+    name = os.path.basename(argv[0]) if argv else ""
+    if name == "helm":
+        return ("helm",) + tuple(argv[1:3])
+    runs = _python_runs(argv[1:]) if _PY_INTERP.match(name) else None
+    if not runs:
+        return ()
+    kind, what, rest = runs
+    if kind == "m":
+        return ("helm",) + tuple(rest[:2]) if what == "helm" else \
+            (what,) if what.startswith("helm.") else ()
+    path = what.replace(os.sep, "/")
+    if os.path.basename(path) == "helm":
+        return ("helm",) + tuple(rest[:2])
+    script = _HELM_SCRIPT.search(path)
+    return (script.group(1),) if script else ()
+
+
+def _helm_role(argv):
+    """(kind, what, stop verb) for helm's own entries, or None."""
+    entry = _helm_entry(argv)
+    for prefix, what in _HELM_SELF_EXITING:
+        if entry[:len(prefix)] == prefix:
+            return "self-exiting", what, None
+    for prefix, what, verb in _HELM_DAEMONS:
+        if entry[:len(prefix)] == prefix:
+            return "daemon", what, verb
+    return None
+
+
+def describe_occupants(pids, disposable=(), proc_root="/proc"):
+    """One line per room occupant: its pid, its command line (truncated), and
+    what the reader does about it — which is never to signal it. A process
+    that is not itself a helm entry but descends from a self-exiting one (a
+    gate's unittest child) is helm's too, by its ancestry."""
+    out = []
+    for pid in pids:
+        if not str(pid).isdigit():
+            out.append("  pid %s  — the process table could not be read, so "
+                       "occupancy is UNKNOWN; the room is kept until a census "
+                       "can be made" % pid)
+            continue
+        argv = _proc_argv(pid, proc_root)
+        # ONE LINE PER OCCUPANT: an argv may carry newlines (a `sh -c` script)
+        # or control bytes, and either would forge the next line of the list.
+        cmd = re.sub(r"[\s\x00-\x1f\x7f]+", " ", " ".join(
+            [os.path.basename(argv[0])] + argv[1:])).strip() if argv else ""
+        if len(cmd) > _CMDLINE_CAP:
+            cmd = cmd[:_CMDLINE_CAP - 1] + "…"
+        shown = "`%s`" % cmd if cmd else "(command line unreadable; it may have exited)"
+        role, via, hop = _helm_role(argv) if argv else None, None, int(pid)
+        for _ in range(_ANCESTRY_HOPS):
+            if role or hop <= 1:
+                break
+            hop = _proc_ppid(hop, proc_root)
+            role = _helm_role(_proc_argv(hop, proc_root)) if hop > 1 else None
+            via = hop
+        part = "part of %s (pid %d)" % (role[1], via) if role and via else \
+            role[1] if role else ""
+        if str(pid) in disposable:
+            why = ("an idle harness shell placeholder — the release stops it "
+                   "itself once the room holds nothing else")
+        elif role and role[0] == "self-exiting":
+            why = ("HELM'S OWN, exits by itself — %s: WAIT for it to finish, "
+                   "then run the release again" % part)
+        elif role:
+            why = ("HELM'S OWN daemon, it does not exit by itself — %s: stop "
+                   "it with `%s` if it should not run here" % (part, role[2]))
+        elif _helm_entry(argv):
+            why = ("a helm command a seat or person is running, not a helm "
+                   "worker — only whoever started it ends it or moves out")
+        else:
+            why = ("NOT helm's — someone's live pane, seat, shell or editor: "
+                   "only its owner moves it out (cd elsewhere, or close the "
+                   "pane)")
+        out.append("  pid %s  %s  — %s" % (pid, shown, why))
+    return out
 
 
 def _disposable_worktree_occupant(pid, proc_root="/proc"):

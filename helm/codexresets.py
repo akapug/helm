@@ -19,6 +19,24 @@ available, helm spends exactly ONE credit, journals the attempt, re-reads the
 account, and posts one room line. Never for a 5h wall alone. Never twice for
 one exhaustion. Never on a reading it cannot trust.
 
+THE SPEND ORDER, owner-set (`spend_order`). A codex credit restarts its
+account's week, so a credit held is worth more than one burned early. A PRO
+credit is spent only when it is the ONLY unblock option: every pooled account
+walled, no non-Pro credit the rung could spend, and no natural reset landing
+within that credit's week of burn at the measured fleet rate; otherwise, and
+whenever that rate is unknown or stale, it is HELD and the dry run names the
+option that comes first. A non-Pro credit is spent at empty: a smaller
+account's week is spent again in under a day, so its clock costs little.
+Every non-Pro row is decided before any Pro row, because only a row's
+listing is sure of its balance, and a Pro is released only once every
+walled non-Pro row has been RESOLVED by this pass: its own listing measured
+no credit, or its reading binds to no single pooled credential (a credit
+helm cannot list it cannot spend, so that row is never the unblock; the
+pass reports it blocked by name). Any other answer (a listing that could
+not be read or timed out, a cool-down) holds every Pro and names that row.
+Within each group the credit that forfeits the least clock
+(week x (168 - h)/168) goes first. The manual door is not bound by it.
+
 LAWS:
   - NO TOKEN AND NO ACCOUNT ID REACHES STDOUT, THE LEDGER, OR AN ERROR
     STRING. Rows carry the email, or a truncated account id, and nothing else
@@ -286,18 +304,41 @@ NOTICE_TAG = "CODEX-RESET"
 
 # --------------------------------------------------- what kind of wall it is
 
-#: THE ONE REACHED-TYPE A RESET CREDIT ANSWERS. The vendor names why an
-#: account is walled, `codexbudget` already parses it onto every row, and a
-#: RATE-LIMIT reset credit lifts a RATE-LIMIT wall and nothing else.
+#: THE REACHED-TYPES A RESET CREDIT IS MEASURED TO LIFT. The vendor names why
+#: an account is walled and `codexbudget` already parses it onto every row. A
+#: RATE-LIMIT wall is the credit's own case.
 RATE_LIMIT_REACHED = "rate_limit_reached"
 
-#: THE WALLS A RESET CREDIT CANNOT LIFT. Both name the WORKSPACE'S CREDIT
-#: BALANCE rather than a rate-limit window, so a rate-limit reset buys nothing
-#: and the credit is gone. Whether the vendor would even accept one against
-#: such a wall is UNVERIFIED, and it cannot be verified without spending the
-#: owner's asset to ask — which is precisely why this refuses instead.
+#: THE WORKSPACE WALLS, AND A RESET LIFTS THEM TOO. Their names say the
+#: workspace's credit balance, which reads as a wall no rate-limit reset
+#: could touch. MEASURED otherwise: three Team members walled at 100% weekly with
+#: `workspace_owner_credits_depleted` were each redeemed one credit through
+#: this rung's own guards, and the next usage read put all three at 0% weekly,
+#: no reached-type, allowed. They are kept by name for display and for
+#: `wall_kind`, and `decide` treats them as a liftable weekly wall.
 CREDITS_DEPLETED_TYPES = ("workspace_member_credits_depleted",
                           "workspace_owner_credits_depleted")
+
+#: WHAT KIND OF WALL A REACHED-TYPE NAMES, for a reader that says which wall
+#: a held credit would be spent against (`codexpace`). The table is the two
+#: constants above; `decide` reads the same two. Both known kinds are
+#: liftable; an unrecognised one is not known to be.
+WALL_RATE_LIMIT = "rate-limit"
+WALL_CREDIT_BALANCE = "credit-balance"
+WALL_UNRECOGNISED = "unrecognised"
+
+
+def wall_kind(reached):
+    """The kind of wall the vendor's reached-type names, or None when it
+    names none."""
+    if reached is None:
+        return None
+    if reached in CREDITS_DEPLETED_TYPES:
+        return WALL_CREDIT_BALANCE
+    if reached == RATE_LIMIT_REACHED:
+        return WALL_RATE_LIMIT
+    return WALL_UNRECOGNISED
+
 
 #: HOW THE WEEKLY WALL WAS ESTABLISHED, on the row and in the reason text.
 WALL_MEASURED = "measured"   # the usage endpoint reads 100% used
@@ -317,8 +358,9 @@ WALL_OBSERVED = "observed"   # a 429 helm already recorded, naming this window
 #: AND IT IS A SIGNAL OF ZERO ONLY, NEVER OF WHY. Measured across every
 #: cooling pooled credential on this fleet, the vendor's 429 body reads
 #: error.type `usage_limit_reached` for the rate-limited accounts and for the
-#: credits-depleted ones alike. The reached-type gate below is therefore not
-#: something a 429 can satisfy.
+#: credits-depleted ones alike. The reached-type gate below, which admits only
+#: the reasons a reset is measured to lift, is therefore not something a 429
+#: can satisfy.
 WEEKLY_NEAR_WALL_PCT = 90.0
 
 #: WHICH WINDOW THAT 429 WAS ABOUT. A sidecar's cooldown instant comes from
@@ -655,6 +697,33 @@ def _usable(credits):
             and c.get("supported") is not False]
 
 
+def usage_balance(data):
+    """The reset-credit counts a `wham/usage` body already carries, or None.
+
+    NOT A SECOND CENSUS. `codexbudget.probe_record` reads this body for every
+    pooled account on every watchdog pass, and the vendor puts the balance in
+    it beside the windows (`rate_limit_reset_credits`); the upstream
+    metaharness reads the same block. Measured on this fleet across six
+    pooled accounts: the block carries exactly `available_count` and
+    `applicable_available_count`, and no per-credit entries.
+
+    {available, applicable}. `available` is the HELD count. `applicable` is
+    kept and not acted on: measured, it reads 0 on a Pro account at 37% with
+    one credit held and 1 on Team accounts walled by a depleted credit
+    balance, so it tracks "a wall is up now" and does not say whether a
+    rate-limit reset would lift that wall. A block that is absent or carries
+    no numeric `available_count` is None — an unread balance, never 0."""
+    block = data.get("rate_limit_reset_credits") \
+        if isinstance(data, dict) else None
+    if not isinstance(block, dict):
+        return None
+    available = _int(block.get("available_count"))
+    if available is None:
+        return None
+    return {"available": available,
+            "applicable": _int(block.get("applicable_available_count"))}
+
+
 def _list_result(status, available=None, total_earned=None, credits=None,
                  note=None):
     credits = list(credits or ())
@@ -967,6 +1036,10 @@ NO_ACT = "NO-ACT"
 #: yet. Splitting this out is what keeps the vendor listing off the hot path:
 #: an account that is not exhausted never costs a round-trip.
 NEED_CREDITS = "NEED-CREDITS"
+#: The account is empty and a credit could be spent, and the owner's spend
+#: order keeps it: a Pro credit waits until it is the only unblock option
+#: (`spend_order`).
+HOLD = "HOLD"
 
 R_NO_READING = "no-reading"
 R_STALE_READING = "stale-reading"
@@ -982,8 +1055,6 @@ R_PASS_BUDGET = "pass-budget"
 R_RUNG_ERROR = "rung-error"
 R_NO_CREDIT = "no-credit"
 R_READY = "ready"
-#: The wall is real and the vendor says it is not a rate-limit one.
-R_CREDITS_DEPLETED = "credits-depleted"
 #: The vendor names a wall reason helm does not recognise.
 R_REACHED_UNRECOGNISED = "wall-reason-unrecognised"
 #: The vendor names no reason at all and no 429 helm observed names one.
@@ -1000,6 +1071,8 @@ R_LEDGER_LOCKED = "ledger-locked"
 R_NO_BASE_URL = "no-base-url"
 #: The pool could not be enumerated on this host.
 R_NO_POOL = "pool-unread"
+#: A Pro credit the owner's spend order holds (`spend_order`).
+R_HOLD_PRO = "pro-credit-held"
 
 Decision = collections.namedtuple("Decision", "action reason detail reuse_key")
 
@@ -1099,7 +1172,7 @@ def decide(reading, reading_age_s, credits, account_attempts, now,
            refusal_run_max=REFUSAL_RUN_MAX,
            reset_floor_s=NATURAL_RESET_FLOOR_S,
            near_wall_pct=WEEKLY_NEAR_WALL_PCT,
-           tolerance_s=COOLING_MATCH_TOLERANCE_S):
+           tolerance_s=COOLING_MATCH_TOLERANCE_S, hold=None):
     """Should helm spend a credit on this account right now, and why.
 
     PURE: no clock, no network, no disk — every input is an argument, so the
@@ -1118,6 +1191,10 @@ def decide(reading, reading_age_s, credits, account_attempts, now,
       cooling_reset_at the instant a proxy sidecar that loads this pool says
                        it will retry THIS credential, or None for "no 429 on
                        record"
+      hold             why the owner's spend order keeps this account's credit
+                       (`spend_order`), or None. It is asked only once the
+                       account is known empty on a rate-limit wall, so a HOLD
+                       never hides a reason the credit could not be spent.
 
     The order of the gates is the order of their cost. Everything that can
     refuse from LOCAL state refuses before the vendor is consulted, so the
@@ -1163,16 +1240,13 @@ def decide(reading, reading_age_s, credits, account_attempts, now,
                             "" if not _epoch(cooling_reset_at) else
                             ", and the 429 on record for this credential does "
                             "not name the weekly window"), None)
-    # WHY IT IS WALLED DECIDES WHETHER A RESET CREDIT CAN HELP AT ALL. The
-    # vendor says so on the row helm already parses, and a rate-limit reset
-    # lifts a rate-limit wall and nothing else.
+    # WHY IT IS WALLED DECIDES WHETHER A RESET CREDIT IS KNOWN TO HELP. The
+    # vendor says so on the row helm already parses. A rate-limit wall and
+    # the two workspace walls are measured to lift (`CREDITS_DEPLETED_TYPES`);
+    # a reason helm does not know is not.
     reached = reading.get("reached_type")
-    if reached in CREDITS_DEPLETED_TYPES:
-        return Decision(NO_ACT, R_CREDITS_DEPLETED,
-                        "this wall is %s — the workspace's CREDIT balance is "
-                        "spent, not a rate-limit window, and a rate-limit "
-                        "reset does not lift it" % reached, None)
-    if reached is not None and reached != RATE_LIMIT_REACHED:
+    if reached is not None and reached != RATE_LIMIT_REACHED \
+            and reached not in CREDITS_DEPLETED_TYPES:
         return Decision(NO_ACT, R_REACHED_UNRECOGNISED,
                         "the vendor calls this wall %r, which this helm does "
                         "not recognise — re-diff the reached types before "
@@ -1184,22 +1258,29 @@ def decide(reading, reading_age_s, credits, account_attempts, now,
         # and for every cooling pooled credential on this fleet — the
         # rate-limited ones AND the credits-depleted ones alike — that body
         # reads error.type `usage_limit_reached`. The refusal says WALLED; it
-        # does not say WHY, and the two reasons differ in whether a reset
-        # credit does anything at all. Only the usage endpoint's reached type
-        # separates them, so a reading that carries none refuses — the credit
-        # keeps, the wall does not, and the row says which.
+        # does not say WHY, and only a reason a reset is measured to lift
+        # authorizes a spend. Only the usage endpoint's reached type names
+        # one, so a reading that carries none refuses — the credit keeps,
+        # the wall does not, and the row says which.
         return Decision(NO_ACT, R_REACHED_UNKNOWN,
                         "the weekly window is spent and the vendor names no "
                         "reason for it; a 429 says this credential is walled "
                         "and never says whether a reset credit would lift it",
                         None)
     left = weekly.get("reset_after_seconds")
+    if isinstance(left, (int, float)) and not isinstance(left, bool):
+        left = max(0, left - max(0, reading_age_s))
     if isinstance(left, (int, float)) and not isinstance(left, bool) \
             and left <= reset_floor_s:
         return Decision(NO_ACT, R_NATURAL_RESET_NEAR,
                         "the weekly window resets naturally in %dm, inside the "
                         "%dm floor — a credit would buy that much and no more"
                         % (left // 60, reset_floor_s // 60), None)
+    if hold:
+        # THE OWNER'S SPEND ORDER, asked by the pass when it decides this
+        # row: a Pro credit waits until it is the only unblock option.
+        # Local, so it costs no vendor listing.
+        return Decision(HOLD, R_HOLD_PRO, str(hold), None)
     if credential_error:
         # WHOSE CREDENTIAL IS THIS. A reading that cannot be bound to exactly
         # one pooled credential cannot be acted on at all: the listing would
@@ -1280,6 +1361,257 @@ def decide(reading, reading_age_s, credits, account_attempts, now,
                             "never answered about"), reuse)
 
 
+# ------------------------------------------------------- the spend order
+
+#: One week, in hours: the clock a spent codex credit restarts.
+WEEK_H = 168.0
+
+
+def _is_pro(plan):
+    from . import codexhomes
+    return codexhomes.tier(plan) != codexhomes.tier("team")
+
+
+def _h(hours):
+    return "%.1fh" % hours if hours < 10 else "%.0fh" % hours
+
+
+def _tok(n):
+    return "%.1fB" % (n / 1e9) if n >= 1e9 else "%.0fM" % (n / 1e6)
+
+
+def pace_now(now=None):
+    """{tokens_per_hour, week_tokens: {member: tokens}} from the codex runway
+    snapshot, or None when it is absent or past the burn flags' freshness
+    bound. The keys are `codexpace.member_key`'s. Local and read-only."""
+    from . import codexpace
+    reading, _age = codexpace.cached_reading(now=now)
+    if not reading:
+        return None
+    weeks = {}
+    for a in reading.get("accounts") or ():
+        tpp = a.get("tokens_per_pct") if isinstance(a, dict) else None
+        if a.get("member") and isinstance(tpp, (int, float)) and tpp > 0:
+            weeks[a["member"]] = 100.0 * tpp
+    return {"tokens_per_hour": (reading.get("fleet") or {})
+            .get("tokens_per_hour"), "week_tokens": weeks}
+
+
+def pace_key(row, account=None):
+    """The runway's member key for a budget row, from the resolved pooled
+    credential when there is one: a snapshot row carries no user id, and a
+    Team member is keyed on the account id AND the user id."""
+    from . import codexpace
+    src = account or row or {}
+    key, _proven = codexpace.member_key(
+        {"account_id": src.get("account_id"), "user_id": src.get("user_id"),
+         "plan": (row or {}).get("plan") or src.get("plan"),
+         "file": (row or {}).get("file"), "files": (row or {}).get("files")})
+    return key
+
+
+def _fact(i, row, key, cool_at, weeks, now, reading_age_s=0.0):
+    """What the spend order needs to know about one budget row."""
+    row = row if isinstance(row, dict) else {}
+    weekly = weekly_window(row) or {}
+    left = _epoch(weekly.get("reset_after_seconds"))
+    if left is not None:
+        left = max(0.0, left - max(0.0, reading_age_s))
+    read = bool(row) and row.get("state") != "unknown" \
+        and row.get("longest_pct") is not None
+    week = weeks.get(key) if key else None
+    h = None if left is None else left / 3600.0
+    # NO CACHED CREDIT COUNT. The usage body's count and the row's own
+    # listing disagree in both directions, and only the listing, read when
+    # the pass decides the row, is sure (`_answer`).
+    return {"i": i, "name": label(row), "plan": row.get("plan"),
+            "pro": _is_pro(row.get("plan")),
+            "read": read, "pct": _pct(weekly.get("used_percent")),
+            "wall": weekly_wall(row, cool_at, now) if read else None,
+            "kind": wall_kind(row.get("reached_type")),
+            "h": h, "week": week,
+            # THE CLOCK A SPEND FORFEITS: a credit spent h hours before the
+            # natural reset nets week*h/168 and gives up the rest.
+            "forfeit": (week * (WEEK_H - min(max(h, 0.0), WEEK_H)) / WEEK_H
+                        if week and h is not None else None)}
+
+
+def _credit_eligible(f):
+    """An empty account on a wall a reset is known to lift."""
+    return bool(f["wall"]) and \
+        f["kind"] in (WALL_RATE_LIMIT, WALL_CREDIT_BALANCE)
+
+
+#: What a row the pass has already decided says to a Pro decided after it.
+ANSWER_CREDIT = "credit"     # a credit spent on it, or ready and deferred
+ANSWER_NONE = "none"         # its own listing measured no spendable credit
+ANSWER_UNUSABLE = "unusable"  # no single pooled credential serves it
+
+
+def _answer(row):
+    """What a row THIS PASS has already decided tells a Pro decided after
+    it, or None while that row is unresolved.
+
+    ANSWER_CREDIT  a credit was spent on it (or would be, in a dry run), or
+                   it was ready and the pass budget deferred it: an unblock
+                   option that comes before any Pro.
+    ANSWER_NONE    its own listing, read this pass, measured no spendable
+                   credit (`decide` answers R_NO_CREDIT only on a listing
+                   it could read).
+    ANSWER_UNUSABLE its reading binds to no single pooled credential. A
+                   credit helm cannot list it cannot spend either, so it is
+                   never the unblock, and holding a Pro behind it would
+                   strand the fleet behind a broken account for good. The
+                   row itself is a blocked wall (`wanted_and_could_not`), so
+                   the room hears it by name.
+    Every other answer is UNRESOLVED, and that is the fail-closed default: a
+    listing that could not be read or timed out, a cool-down, a row that
+    raised, a row the pass never decided. Those clear on their own within
+    the pass window, and the Pro waits for them."""
+    row = row or {}
+    if row.get("action") == CONSUME or row.get("reason") == R_PASS_BUDGET:
+        return ANSWER_CREDIT
+    if row.get("reason") == R_NO_CREDIT:
+        return ANSWER_NONE
+    if row.get("reason") in (R_NO_CREDENTIAL, R_AMBIGUOUS_CREDENTIAL):
+        return ANSWER_UNUSABLE
+    return None
+
+
+def _pro_hold(f, facts, rate, settled=None):
+    """Why this Pro credit is held, or None when it is the only unblock
+    option. The first option that comes before it is named.
+
+    `settled` is {row index: the report row} for every row the pass has
+    already decided. A walled non-Pro row a reset lifts is an option until
+    its OWN answer there says it holds no credit (`_answer`); no cached count
+    stands in for that answer."""
+    head = "Pro credit held until it is the only unblock option"
+    settled = settled or {}
+    # AN OPTION THAT COMES FIRST IS NAMED BEFORE THE RATE IS ASKED FOR: none
+    # of them needs the rate, and the row a pass could not resolve is the
+    # one the owner can act on.
+    week_h = f["week"] / rate if rate and f["week"] else None
+    value = ("; spent now it would net ~%s of fleet burn (its %s week "
+             "x %s/168)" % (_h(week_h * f["h"] / WEEK_H), _h(week_h),
+                            _h(f["h"]))
+             if week_h is not None and f["h"] is not None else "")
+    others = [g for g in facts if g is not f]
+    first = None
+    unread = [g for g in others if not g["read"]]
+    serving = [g for g in others if g["read"] and not g["wall"]]
+    # THE PASS'S OWN STATE. A credit this pass spent (or deferred) is an
+    # unblock option on any plan; a cheaper row it has not resolved may
+    # still hold one.
+    credit = [g for g in others
+              if _answer(settled.get(g["i"])) == ANSWER_CREDIT]
+    unresolved = [g for g in others if not g["pro"] and _credit_eligible(g)
+                  and _answer(settled.get(g["i"])) is None]
+    if unread:
+        first = ("%d pooled account(s) unread, which may still serve"
+                 % len(unread))
+    elif serving:
+        g = min(serving, key=lambda g: g["pct"] if g["pct"] is not None
+                else 100.0)
+        first = ("a %s account at %s still serves"
+                 % ((g["plan"] or "?").capitalize(),
+                    "?" if g["pct"] is None else "%.0f%%" % g["pct"]))
+    elif credit:
+        g = credit[0]
+        first = ("a %s account's reset credit, %s (%s)"
+                 % ((g["plan"] or "?").capitalize(),
+                    "spent at empty in this pass"
+                    if settled[g["i"]].get("action") == CONSUME
+                    else "ready at empty and deferred to the next pass",
+                    g["name"]))
+    elif unresolved:
+        g = unresolved[0]
+        row = settled.get(g["i"])
+        first = ("an empty %s account (%s) that this pass has not resolved "
+                 "(%s), so it may hold a credit"
+                 % ((g["plan"] or "?").capitalize(), g["name"],
+                    (row.get("reason") or row.get("action") or "?")
+                    if row else "not yet decided"))
+    elif not rate:
+        return ("%s: the fleet's codex token rate is unknown or stale (no "
+                "fresh codex runway reading), so that cannot be shown"
+                % head)
+    elif week_h is None:
+        return ("%s: its week in tokens is unknown (no tokens-per-percent "
+                "weight), so its week of burn cannot be set against the "
+                "natural resets" % head)
+    else:
+        blind = [g for g in facts if g["h"] is None]
+        lands = sorted((g for g in facts if g["h"] is not None
+                        and g["h"] <= week_h), key=lambda g: g["h"])
+        if blind:
+            first = ("a natural reset whose time is unread may land inside "
+                     "this credit's %s week of burn" % _h(week_h))
+        elif lands:
+            g = lands[0]
+            first = ("%s natural reset in %s, inside this credit's %s week "
+                     "of burn at %s tokens/h"
+                     % ("its own" if g is f else "a %s account's"
+                        % (g["plan"] or "?").capitalize(),
+                        _h(g["h"]), _h(week_h), _tok(rate)))
+    return None if first is None else "%s; first: %s%s" % (head, first,
+                                                            value)
+
+
+def spend_order(rows, pace, now, keys=None, cooling_at=None,
+                reading_age_s=0.0, settled=None):
+    """(the order the pass decides its rows in, {row index: why a Pro credit
+    is held}). PURE: every input is an argument. `settled` is what the pass
+    has decided so far ({row index: its report row}); the pass asks again
+    as it reaches each row (`_order`).
+
+    THE OWNER'S ORDER. A codex credit restarts its account's week, so a
+    credit held is worth more than one burned early:
+      (a) never spend on an account that is not empty (`decide` owns that);
+      (b) spend a Pro credit only when it is the ONLY unblock option: every
+          pooled account read and walled, no credit spent or deferred in
+          this pass, every walled non-Pro row RESOLVED (its own listing at
+          no credit, or no pooled credential that could spend it), and no
+          natural reset landing at or within that credit's week of burn at
+          the measured fleet rate. Unknown plans are treated as Pro until
+          classified. Anything else HOLDS it, naming the option that comes
+          first; an unknown or stale rate holds it too;
+      (c) every non-Pro row is decided before any Pro row. A Team row's
+          usage count and its listing disagree in both directions, and the
+          listing, read only when the row is decided, is the one that is
+          sure; so the Pro is asked about only once every non-Pro row has
+          its own answer (`_answer`). With nothing settled, a walled non-Pro
+          row holds every Pro. Within each group the one that forfeits the
+          least clock goes first: a credit spent h hours before its natural
+          reset nets week*h/168, so the order is by week*(168-h)/168,
+          smallest first. A row whose forfeit is unknown keeps its place
+          after the known ones of its group.
+    A non-Pro credit is never held here; it is spent at empty, in order —
+    the owner's ruling: a smaller account's week is spent again in under a
+    day, so the clock its reset moves costs little."""
+    rows = list(rows or ())
+    keys = list(keys) if keys is not None else [
+        pace_key(r) if isinstance(r, dict) else None for r in rows]
+    cooling_at = list(cooling_at) if cooling_at is not None \
+        else [None] * len(rows)
+    weeks = (pace or {}).get("week_tokens") or {}
+    rate = _pct((pace or {}).get("tokens_per_hour")) or None
+    facts = [_fact(i, row, keys[i], cooling_at[i], weeks, now,
+                   reading_age_s)
+             for i, row in enumerate(rows)]
+    order = sorted(range(len(rows)), key=lambda i: (
+        facts[i]["pro"],
+        (0, facts[i]["forfeit"]) if facts[i]["forfeit"] is not None
+        else (1, 0)))
+    holds = {}
+    for f in facts:
+        if f["pro"] and _credit_eligible(f):
+            why = _pro_hold(f, facts, rate, settled)
+            if why:
+                holds[f["i"]] = why
+    return order, holds
+
+
 # ------------------------------------------------------------------ the rung
 
 def _pool_accounts():
@@ -1316,9 +1648,17 @@ def safe_error(exc, accounts=None):
     return "%s: %s" % (name, _redact(exc, *secrets))
 
 
+#: `reset_pass`'s pace default: read the codex runway snapshot. A caller
+#: that passes None says "no pace", which holds every Pro credit.
+LIVE_PACE = object()
+#: The one source the owner's spend order does not bind: the manual door.
+MANUAL = "manual"
+
+
 def reset_pass(budget_rows, reading_age_s=0.0, now=None, url_base=None,
                timeout=None, accounts=None, ledger=None, probe=None,
-               source="auto", only=None, dry_run=False, cooling=None):
+               source="auto", only=None, dry_run=False, cooling=None,
+               pace=LIVE_PACE):
     """Decide and, unless `dry_run`, act for every account in `budget_rows`.
 
     Returns one row per account — the decision, its reason, and the outcome
@@ -1334,9 +1674,19 @@ def reset_pass(budget_rows, reading_age_s=0.0, now=None, url_base=None,
     per credential, taken ONLY from the sidecars that load this pool. Absent,
     the policy runs on the measured percentage alone.
 
+    `pace` is the fleet's token rate and each member's week in tokens
+    (`pace_now`, the default, reads the codex runway snapshot). The OWNER'S
+    SPEND ORDER (`spend_order`) is taken over every row of the pass before
+    any is decided: the rows are decided least-forfeit first, non-Pro before
+    Pro. Each Pro row's hold is asked AS IT IS DECIDED, from the rows this
+    pass has already decided: a Pro credit that is not the only unblock
+    option is HELD, and so is one behind a non-Pro row the pass could not
+    resolve. The manual door (`source` "manual") is not bound by it: the
+    owner names the account.
+
     `probe` re-reads an account after a successful reset so the room line can
     carry the before and the after; it is `codexbudget.probe_record` by
-    default and is read-only.
+    default and is read-only. That read can lag the vendor (`result_line`).
 
     THE MUTUAL EXCLUSION THIS HOLDS, AND THE ONE IT DOES NOT. Within this
     host, the ledger lock spans re-read -> cool-down -> write-ahead append, so
@@ -1362,13 +1712,22 @@ def reset_pass(budget_rows, reading_age_s=0.0, now=None, url_base=None,
     else:
         pass_error = None
     rows, history_err = attempts(ledger)
-    out, sent = [], 0
-    for reading in budget_rows or ():
+    budget_rows = list(budget_rows or ())
+    order, hold = _order(budget_rows, accounts, cooling, now, source, pace,
+                         reading_age_s)
+    # THE PASS'S OWN STATE: {row index: the row it decided}. A Pro's hold is
+    # asked from this when the Pro is reached, never from a snapshot taken
+    # before the cheaper rows' listings were read.
+    out, sent, settled = [], 0, {}
+    for i in order:
+        reading = budget_rows[i]
+        mark = len(out)
         try:
             sent += _one_account(reading, out, rows, reading_age_s, now,
                                  url_base, timeout, accounts, ledger, probe,
                                  source, only, dry_run, cooling, pass_error,
-                                 budget_left=MAX_CONSUMES_PER_PASS - sent)
+                                 budget_left=MAX_CONSUMES_PER_PASS - sent,
+                                 hold=hold(i, settled))
         except Exception as e:                  # noqa: BLE001 — see below
             # ONE CREDENTIAL'S FAILURE IS ONE ROW. The pass reports on a pool,
             # and a reading helm could not even decide about must not take the
@@ -1382,10 +1741,65 @@ def reset_pass(budget_rows, reading_age_s=0.0, now=None, url_base=None,
                             action=NO_ACT, reason=R_RUNG_ERROR,
                             detail="this account could not be decided (%s)"
                                    % e.__class__.__name__))
+        if len(out) > mark:
+            settled[i] = out[-1]
     if history_err:
         for row in out:
             row["ledger_error"] = history_err
     return out
+
+
+def _order(budget_rows, accounts, cooling, now, source, pace,
+           reading_age_s=0.0):
+    """(the order to decide the rows in, hold) where hold(i, settled) says
+    why row i's Pro credit is held, given {row index: report row} for the
+    rows the pass has already decided, or None. The manual door keeps the
+    rows' own order and holds nothing.
+
+    THE ORDER IS TAKEN ONCE AND THE HOLD IS ASKED PER ROW. The inputs (the
+    pace, each row's member key and 429) are read here once, so a runway
+    snapshot rewritten mid-pass cannot give two rows two paces.
+
+    NEVER RAISES, and neither does `hold`: an order this pass cannot take
+    holds every Pro credit that could be spent (the owner prefers holding)
+    and keeps the rows' order, rather than costing the pass its report."""
+    ident = list(range(len(budget_rows)))
+    if source == MANUAL:
+        return ident, lambda _i, _settled: None
+    pro = {i for i, row in enumerate(budget_rows)
+           if isinstance(row, dict) and _is_pro(row.get("plan"))}
+
+    def failed(e):
+        why = ("Pro credit held until it is the only unblock option: the "
+               "spend order could not be taken (%s)" % e.__class__.__name__)
+        return lambda i, _settled: why if i in pro else None
+
+    try:
+        pace = pace_now(now) if pace is LIVE_PACE else pace
+        keys, cool_at = [], []
+        for row in budget_rows:
+            account = None
+            if isinstance(row, dict):
+                account, _err = resolve_credential(accounts, row)
+            keys.append(pace_key(row, account)
+                        if isinstance(row, dict) else None)
+            cool_at.append(_cooling_for(cooling, account))
+        order, _holds = spend_order(budget_rows, pace, now, keys=keys,
+                                    cooling_at=cool_at,
+                                    reading_age_s=reading_age_s)
+    except Exception as e:                  # noqa: BLE001 — see docstring
+        return ident, failed(e)
+
+    def hold(i, settled):
+        try:
+            return spend_order(budget_rows, pace, now, keys=keys,
+                               cooling_at=cool_at,
+                               reading_age_s=reading_age_s,
+                               settled=settled)[1].get(i)
+        except Exception as e:              # noqa: BLE001 — see docstring
+            return failed(e)(i, settled)
+
+    return order, hold
 
 
 def _blank_row(name):
@@ -1398,7 +1812,7 @@ def _blank_row(name):
 
 def _one_account(reading, out, rows, reading_age_s, now, url_base, timeout,
                  accounts, ledger, probe, source, only, dry_run, cooling,
-                 pass_error, budget_left):
+                 pass_error, budget_left, hold=None):
     """One account's leg of `reset_pass`: appends at most one row to `out` and
     answers how many redemptions it spent (0 or 1)."""
     name = label(reading)
@@ -1436,7 +1850,7 @@ def _one_account(reading, out, rows, reading_age_s, now, url_base, timeout,
     # `decide` can only answer CONSUME once it has a listing, so the
     # balance is read on the NEED-CREDITS leg below, and nowhere else.
     decision = decide(reading, reading_age_s, None, mine, now,
-                      credential_error, cooling_reset_at=cool_at)
+                      credential_error, cooling_reset_at=cool_at, hold=hold)
     if decision.action == NEED_CREDITS:
         # THE LISTING GOES OUT UNDER THE RESOLVED CREDENTIAL, so "a credit is
         # available" is a fact about the walled member and about nobody else.
@@ -1445,7 +1859,8 @@ def _one_account(reading, out, rows, reading_age_s, now, url_base, timeout,
         row["spendable"] = listing.get("spendable")
         row["note"] = listing.get("note")
         decision = decide(reading, reading_age_s, listing, mine, now,
-                          credential_error, cooling_reset_at=cool_at)
+                          credential_error, cooling_reset_at=cool_at,
+                          hold=hold)
     if decision.action == CONSUME and budget_left <= 0:
         # THE POOL-WIDE BUDGET, applied after the per-account decision so
         # the row still says the account WAS ready — an operator reading
@@ -1484,7 +1899,7 @@ def _one_account(reading, out, rows, reading_age_s, now, url_base, timeout,
         final = decide(reading, reading_age_s, listing,
                        attempts_for(fresh, member) if fresh_err is None
                        else None, now, credential_error,
-                       cooling_reset_at=cool_at)
+                       cooling_reset_at=cool_at, hold=hold)
         if final.action != CONSUME:
             row["action"], row["reason"] = final.action, final.reason
             row["detail"] = final.detail
@@ -1590,7 +2005,7 @@ def wanted_and_could_not(rows):
     # every other blocked wall, so each is said once and not every pass.
     blocked = (R_NO_CREDIT, R_CREDITS_UNREAD, R_LEDGER_UNKNOWN,
                R_JOURNAL_UNWRITABLE, R_RUNG_ERROR, R_LEDGER_LOCKED,
-               R_NO_CREDENTIAL, R_AMBIGUOUS_CREDENTIAL, R_CREDITS_DEPLETED,
+               R_NO_CREDENTIAL, R_AMBIGUOUS_CREDENTIAL,
                R_REACHED_UNRECOGNISED, R_REACHED_UNKNOWN,
                R_NO_BASE_URL, R_NO_POOL)
     return [r for r in rows or ()
@@ -1682,11 +2097,11 @@ def watch_notice(rows, prior_blocked=None):
     often that line can post. Measured through the real pass: a credential the
     listing accepts and the redemption refuses spoke on every one of eight
     passes. Both states are latched on (account, state) — measured on this
-    fleet, four accounts sit blocked at a spent week for days at a stretch
-    (two whose wall is a credit balance a reset does not lift, two with no
-    credit left to spend), and the pass that decides this runs every fifteen
-    minutes, so an unlatched line would post the same four sentences a hundred
-    times a day and bury the one pass where something actually happened.
+    fleet, four accounts sat blocked at a spent week for days at a stretch
+    (two with no credit left to spend), and the pass that decides this runs
+    every fifteen minutes, so an unlatched line would post the same four
+    sentences a hundred times a day and bury the one pass where something
+    actually happened.
 
     The latch is `codexbudget.watch_notice`'s shape, for the same reason it
     has one. A pass that could not run the rung at all returns nothing here
@@ -1745,9 +2160,17 @@ def result_line(r):
         # balance unread left" is not English — the one line that announces an
         # irreversible act is the last place to make a reader parse a
         # template.
-        return ("    %-30s weekly window RESET (%s -> %s); 1 credit spent, %s"
-                % (name, _used(r.get("weekly_pct")),
-                   _used(r.get("after_weekly_pct")),
+        # THE AFTER-READ CAN RACE THE VENDOR. Measured: a usage read taken
+        # right after three redemptions still showed 100% on two of them,
+        # and the next read showed 0% on all three. A reading that has not
+        # moved is said to be early, never taken as the reset failing.
+        after = r.get("after_weekly_pct")
+        early = (after is not None and r.get("weekly_pct") is not None
+                 and after >= r["weekly_pct"])
+        return ("    %-30s weekly window RESET (%s -> %s%s); 1 credit spent, %s"
+                % (name, _used(r.get("weekly_pct")), _used(after),
+                   ", a read taken this soon can lag the vendor; the next "
+                   "pass re-reads it" if early else "",
                    "and the balance left could not be read"
                    if r.get("spendable_after") is None
                    else "%d left" % r["spendable_after"]))
@@ -1840,7 +2263,7 @@ def _listing_rows(url_base, timeout=None, now=None):
 
 
 def cmd_resets(args):
-    """codex resets [--dry-run] [--consume <account>] [--json] — the earned
+    """codex resets [--dry-run | --consume <account>] [--json] — the earned
     rate-limit reset credits: what each pooled account holds, what the
     automatic policy would do with them right now, and the explicit manual
     door for spending one."""
@@ -1848,7 +2271,7 @@ def cmd_resets(args):
     args = list(args)
     rc = guard_tail("helm codex resets", args, flags=("--dry-run", "--json"),
                     valued=("--consume",),
-                    usage="codex resets [--dry-run] [--consume <account>] "
+                    usage="codex resets [--dry-run | --consume <account>] "
                           "[--json]")
     if rc is not None:
         return rc
@@ -1856,6 +2279,11 @@ def cmd_resets(args):
     # `guard_tail` has already refused a `--consume` carrying no value, which
     # is the whole reason this door cannot pick an account for you.
     target = args[args.index("--consume") + 1] if "--consume" in args else None
+    if target and "--dry-run" in args:
+        import sys
+        print("helm codex resets: --dry-run cannot be combined with --consume",
+              file=sys.stderr)
+        return 2
     if target:
         return _run_consume(target, as_json=as_json)
     if "--dry-run" in args:
@@ -1910,7 +2338,16 @@ def _run_list(as_json=False):
     print(list_header())
     for r in sorted(rows, key=lambda r: r["account"]):
         print(list_line(r))
+    print(runway_line())
     return 0
+
+
+def runway_line():
+    """The codex runway line `helm burn` prints, read from the same snapshot:
+    it values every held credit against the horizon, so the verb whose job is
+    the balance says what the runway made of it. Never raises."""
+    from . import codexpace
+    return codexpace.burn_line()
 
 
 #: NOTHING IS SPENT IS NOT NOTHING IS SENT. A dry run still asks the vendor
@@ -1962,6 +2399,7 @@ def _run_dry_run(as_json=False):
     print(DRY_RUN_BANNER % ((age or 0) // 60))
     for r in sorted(rows, key=lambda r: r["account"]):
         print(dry_run_line(r))
+    print(runway_line())
     return 0
 
 
@@ -2001,7 +2439,7 @@ def _run_consume(target, as_json=False):
               file=sys.stderr)
         return 2
     rows = reset_pass(readings, reading_age_s=age, now=now, only=target,
-                      source="manual", url_base=live_base_url(),
+                      source=MANUAL, url_base=live_base_url(),
                       cooling=_cooling_now())
     if as_json:
         print(json.dumps({"rows": rows}, indent=2, sort_keys=True))

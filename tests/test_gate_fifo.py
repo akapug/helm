@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 from helm import chat, gate, gatechild, pk, seats, seats_claims, seats_common
+from tests import _lockwait
 from tests._tmphome import corroborate as _tmp_corroborate
 from tests._tmphome import helm_tree
 from tests._tmphome import declare as _tmp_declare
@@ -1110,19 +1111,25 @@ class LegacyLossFixture(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "lock is unavailable"):
                 seats.claim("gatelock:repo", "strict", strict=True)
 
-    def _fake_proc(self, ino, pid, state):
-        """A /proc naming `pid` as the FLOCK holder of `ino`, in `state`.
+    def _fake_proc(self, dev, ino, pid, state):
+        """A /proc naming `pid` as the FLOCK holder of the file on
+        (dev, ino), in `state`.
 
         Synthetic rather than a live SIGSTOP on purpose: a fixture that
         stops a real process to observe a lock is the shape that produced
         the flake this diagnostic exists to explain. The parser is what is
-        under test, so feed it bytes, not timing.
+        under test, so feed it bytes, not timing. The line carries the
+        file's REAL device — the kernel writes it as hex major:minor before
+        the decimal inode, and the holder match is on (device, inode), so a
+        hardcoded device names a file on some other filesystem.
         """
         proc = tempfile.mkdtemp(prefix="helm-fakeproc-")
         self.addCleanup(shutil.rmtree, proc, True)
+        devstr = "%x:%02x" % (dev >> 8, dev & 0xff)
         with open(os.path.join(proc, "locks"), "w") as f:
             f.write("1: POSIX  ADVISORY  WRITE 1 00:2f:1 0 EOF\n")
-            f.write("2: FLOCK  ADVISORY  WRITE %d 00:2f:%d 0 EOF\n" % (pid, ino))
+            f.write("2: FLOCK  ADVISORY  WRITE %d %s:%d 0 EOF\n"
+                    % (pid, devstr, ino))
         if state is not None:
             os.makedirs(os.path.join(proc, str(pid)))
             tail = " ".join([state, "1"] + ["0"] * 17 + ["99999"])
@@ -1135,10 +1142,11 @@ class LegacyLossFixture(unittest.TestCase):
         holder's state tells them apart, so the message must carry it."""
         path = os.path.join(self.tmp, "probe.lock")
         open(path, "w").close()
-        ino = os.stat(path).st_ino
+        st = os.stat(path)
+        ino = st.st_ino
 
         stopped = seats._lock_unavailable(
-            path, proc_dir=self._fake_proc(ino, 424242, "T"))
+            path, proc_dir=self._fake_proc(st.st_dev, ino, 424242, "T"))
         self.assertIn("STOPPED pid 424242", stopped)
         self.assertIn("never releases", stopped)
         self.assertIn("lock is unavailable", stopped)
@@ -1147,14 +1155,14 @@ class LegacyLossFixture(unittest.TestCase):
         # this arm a _flock_holder that always returned None would pass every
         # assertion above by falling through to the bare sentence.
         running = seats._lock_unavailable(
-            path, proc_dir=self._fake_proc(ino, 515151, "R"))
+            path, proc_dir=self._fake_proc(st.st_dev, ino, 515151, "R"))
         self.assertIn("pid 515151", running)
         self.assertNotIn("STOPPED", running)
 
         # FALLBACK — no FLOCK row for this inode at all. A diagnostic that
         # raises here would be worse than a vague one.
         bare = seats._lock_unavailable(
-            path, proc_dir=self._fake_proc(ino + 1, 626262, "T"))
+            path, proc_dir=self._fake_proc(st.st_dev, ino + 1, 626262, "T"))
         self.assertEqual(bare, "claim lock is unavailable")
 
         # A VANISHED DIRECTORY IS NOT CONTENTION, AND USED TO SAY IT WAS.
@@ -1166,7 +1174,7 @@ class LegacyLossFixture(unittest.TestCase):
         # two need opposite operator moves: wait, versus fix your HELM_HOME.
         vanished = os.path.join(self.tmp, "no-such-dir", "claims.json.lock")
         gone_msg = seats._lock_unavailable(
-            vanished, proc_dir=self._fake_proc(ino, 424242, "T"))
+            vanished, proc_dir=self._fake_proc(st.st_dev, ino, 424242, "T"))
         self.assertIn("directory does not exist", gone_msg)
         self.assertIn("NOTHING HOLDS IT", gone_msg)
         self.assertNotEqual(gone_msg, bare)
@@ -1179,7 +1187,8 @@ class LegacyLossFixture(unittest.TestCase):
         never_created = os.path.join(self.tmp, "not-yet.lock")
         self.assertEqual(
             seats._lock_unavailable(
-                never_created, proc_dir=self._fake_proc(ino + 1, 1, "R")),
+                never_created, proc_dir=self._fake_proc(st.st_dev, ino + 1,
+                                                       1, "R")),
             "claim lock is unavailable")
 
     def test_a_leaking_sibling_is_caught_by_the_post_class_witness(self):  # noqa: VACUOUS_ASSERTION — the assertRaises IS the must-hit, and it carries THREE unconditional same-observable controls above it: the witness accepts a clean env, the poisoner is asserted to PASS, and HELM_HOME is asserted to equal the temp value so the two layers demonstrably disagree
@@ -1339,32 +1348,50 @@ class LegacyLossFixture(unittest.TestCase):
                 self.assertEqual(f.read(), malformed)
 
     def test_strict_claim_lifecycle_waits_through_brief_lock_contention(self):
+        """Each strict door MEETS the held claims lock and then succeeds once
+        the holder lets go: it waited through the contention instead of
+        refusing it. The holder lets go when the arm has seen the door's
+        take refused, never after a fixed sleep, and nothing here is judged
+        by elapsed time, so a loaded host cannot turn it red."""
         resource = "gatelock:contention"
+        lock = seats.claims_path() + ".lock"
         os.makedirs(os.path.dirname(seats.claims_path()), exist_ok=True)
         def contend(action):
             ready = os.path.join(self.tmp, "claims-lock-ready")
-            try:
-                os.unlink(ready)
-            except FileNotFoundError:
-                pass
+            release = os.path.join(self.tmp, "claims-lock-release")
+            for path in (ready, release):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
             code = """import fcntl
+import os
 import time
 f = open(%r, "a")
 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
 open(%r, "w").close()
-time.sleep(0.12)
-""" % (seats.claims_path() + ".lock", ready)
+while not os.path.exists(%r):
+    time.sleep(0.01)
+""" % (lock, ready, release)
             holder = subprocess.Popen((sys.executable, "-c", code))
-            self.wait_for(lambda: os.path.exists(ready))
-            started = time.monotonic()
+            done = []
             try:
-                result = action()
-                elapsed = time.monotonic() - started
+                self.wait_for(lambda: os.path.exists(ready),
+                              timeout=_lockwait.HANG_S)
+                with _lockwait.observed() as waits:
+                    door = threading.Thread(
+                        target=lambda: done.append(action()))
+                    door.start()
+                    self.assertTrue(waits.wait_refused(lock),
+                                    "the door never met the held lock")
+                    open(release, "w").close()
+                    door.join(_lockwait.HANG_S)
             finally:
-                holder.communicate(timeout=1)
-            self.assertGreater(elapsed, 0.08)
-            self.assertLess(elapsed, 1)
-            return result
+                open(release, "w").close()
+                holder.communicate(timeout=_lockwait.HANG_S)
+            self.assertFalse(door.is_alive())
+            self.assertEqual(len(done), 1)
+            return done[0]
 
         ok, message, lease = contend(lambda: seats.claim(
             resource, "strict", ttl=60, session="strict-session",
@@ -1976,11 +2003,13 @@ class ParentDeathFixture(unittest.TestCase):
                                   "import time; time.sleep(10)"])
         from tests._gate_pid import host_child, host_self
         child_pid, _starttime = host_child(child.pid)
-        with open(%r, "w") as f:
+        tmp = %r + ".tmp"
+        with open(tmp, "w") as f:
             f.write(str(child_pid))
+        os.replace(tmp, %r)
         open(%r, "w").close()
         time.sleep(10)
-""" % (descendant_path, log))
+""" % (descendant_path, descendant_path, log))
         launcher = self.worker("doomed")
         self.wait_for(lambda: os.path.exists(log)
                       and os.path.exists(descendant_path))
@@ -2020,12 +2049,14 @@ class StoppedSupervisorFixture(unittest.TestCase):
                                  start_new_session=True)
         from tests._gate_pid import host_child, host_self
         child_pid, starttime = host_child(child.pid)
-        with open(%r, "w") as f:
+        tmp = %r + ".tmp"
+        with open(tmp, "w") as f:
             f.write("%%d %%s" %% (child_pid, starttime))
+        os.replace(tmp, %r)
         while not os.path.exists(%r):
             time.sleep(0.01)
         time.sleep(10)
-""" % (descendant_path, stop_path))
+""" % (descendant_path, descendant_path, stop_path))
         launcher = self.worker("stopped-supervisor")
         launcher_start = seats._get_pid_starttime(launcher.pid)
         self.assertIsNotNone(launcher_start)
@@ -2075,7 +2106,8 @@ class StoppedSupervisorFixture(unittest.TestCase):
 
     def test_stopped_guard_resumes_cleanup_after_launcher_death(self):  # noqa: VACUOUS_ASSERTION — exact stopped guard and detached generation exist before launcher death, then the external watchdog must remove both without FIFO activity
         descendant_path = os.path.join(self.tmp, "stopped-guard-descendant")
-        self.fixture_suite("""import subprocess
+        self.fixture_suite("""import os
+import subprocess
 import sys
 import time
 import unittest
@@ -2087,10 +2119,12 @@ class StoppedGuardFixture(unittest.TestCase):
                                   "import time; time.sleep(10)"],
                                  start_new_session=True)
         child_pid, starttime = host_child(child.pid)
-        with open(%r, "w") as f:
+        tmp = %r + ".tmp"
+        with open(tmp, "w") as f:
             f.write("%%d %%s" %% (child_pid, starttime))
+        os.replace(tmp, %r)
         time.sleep(10)
-""" % descendant_path)
+""" % (descendant_path, descendant_path))
         launcher = self.worker("stopped-guard")
         launcher_start = seats._get_pid_starttime(launcher.pid)
         self.assertIsNotNone(launcher_start)
@@ -2192,10 +2226,12 @@ class StoppedLauncherFixture(unittest.TestCase):
     def test_waits(self):
         from tests._gate_pid import host_child, host_self
         pid, starttime = host_self()
-        with open(%r, "w") as f:
+        tmp = %r + ".tmp"
+        with open(tmp, "w") as f:
             f.write("%%d %%s" %% (pid, starttime))
+        os.replace(tmp, %r)
         time.sleep(600)
-""" % suite_path)
+""" % (suite_path, suite_path))
         env = dict(os.environ)
         env["HELM_CHAT_NAME"] = "stopped-launcher"
         env["CODEX_SESSION_ID"] = "session-stopped-launcher"
@@ -2439,11 +2475,13 @@ class SigkillSupervisorFixture(unittest.TestCase):
         from tests._gate_pid import host_child, host_self
         suite_pid, suite_start = host_self()
         child_pid, starttime = host_child(child.pid)
-        with open(%r, "w") as f:
+        tmp = %r + ".tmp"
+        with open(tmp, "w") as f:
             f.write("%%d %%s %%d %%s" %% (
                 suite_pid, suite_start, child_pid, starttime))
+        os.replace(tmp, %r)
         time.sleep(15)
-""" % descendant_path)
+""" % (descendant_path, descendant_path))
         launcher = self.worker("sigkill-supervisor")
         suite = descendant = supervisor = None
         try:
@@ -2495,11 +2533,13 @@ class SigkillGuardFixture(unittest.TestCase):
         from tests._gate_pid import host_child, host_self
         suite_pid, suite_start = host_self()
         child_pid, starttime = host_child(child.pid)
-        with open(%r, "w") as f:
+        tmp = %r + ".tmp"
+        with open(tmp, "w") as f:
             f.write("%%d %%s %%d %%s" %% (
                 suite_pid, suite_start, child_pid, starttime))
+        os.replace(tmp, %r)
         time.sleep(15)
-""" % descendant_path)
+""" % (descendant_path, descendant_path))
         launcher = self.worker("sigkill-guard")
         guard = supervisor = suite = descendant = None
         try:
@@ -2541,7 +2581,8 @@ class SigkillGuardFixture(unittest.TestCase):
 
     def test_sigkill_guard_and_supervisor_cannot_release_detached_work(self):  # noqa: VACUOUS_ASSERTION — guard, supervisor, suite, and detached generations are live in one cgroup before both cleanup owners die; cgroup.kill must remove the latter two before an old claim succeeds
         descendant_path = os.path.join(self.tmp, "sigkill-both-descendant")
-        self.fixture_suite("""import subprocess
+        self.fixture_suite("""import os
+import subprocess
 import sys
 import time
 import unittest
@@ -2554,11 +2595,13 @@ class SigkillBothFixture(unittest.TestCase):
                                  start_new_session=True)
         suite_pid, suite_start = host_self()
         child_pid, starttime = host_child(child.pid)
-        with open(%r, "w") as f:
+        tmp = %r + ".tmp"
+        with open(tmp, "w") as f:
             f.write("%%d %%s %%d %%s" %% (
                 suite_pid, suite_start, child_pid, starttime))
+        os.replace(tmp, %r)
         time.sleep(15)
-""" % descendant_path)
+""" % (descendant_path, descendant_path))
         launcher = self.worker("sigkill-both")
         guard = supervisor = suite = descendant = lease = None
         resource, err = gate._legacy_gate_resource(self.repo)
@@ -3974,3 +4017,118 @@ class GateListIsNotDestructiveTest(unittest.TestCase):
                          "these dispositions are declared for call sites that "
                          "do not exist, so they assert coverage of nothing: %s"
                          % unused)
+
+
+class FlockHolderDeviceMatchTest(unittest.TestCase):
+    """The holder match is on (device, inode), not the inode alone.
+
+    /proc/locks writes the device as hex major:minor before the decimal
+    inode, so two files on different filesystems can carry the same inode
+    number. A match on the inode alone named the OTHER filesystem's holder
+    in a refusal an operator acts on. Both traps were measured on a live
+    machine: the hex encoding (a /tmp flock prints "103:05:<ino>",
+    /dev/shm prints "00:1b:<ino>"), and the waiter's extra '->' token,
+    which shifts every column after it right by one — the old positional
+    read took the WAITER's pid out of the wrong column and could never see
+    a device at all. The synthetic shapes below are byte-identical to the
+    kernel's lines."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-fakeproc-holder-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, "probe.lock")
+        open(self.path, "w").close()
+        self.st = os.stat(self.path)
+        self.ino = self.st.st_ino
+
+    def _proc(self, lines):
+        proc = os.path.join(self.tmp, "proc")
+        os.makedirs(proc)
+        with open(os.path.join(proc, "locks"), "w") as f:
+            f.write("".join(lines))
+        return proc
+
+    def _stat(self, proc, pid, state):
+        os.makedirs(os.path.join(proc, str(pid)))
+        tail = " ".join([state, "1"] + ["0"] * 17 + ["99999"])
+        with open(os.path.join(proc, str(pid), "stat"), "w") as f:
+            f.write("%d (fake) %s\n" % (pid, tail))
+
+    def test_a_holder_on_another_filesystem_with_the_same_inode_is_not_named(self):
+        """THE REGRESSION. The inode matches exactly; the device does not —
+        a FLOCK on a different filesystem with the same inode number. The
+        old read matched the inode alone and named this pid; the fix must
+        name nothing, so the refusal keeps its honest bare form."""
+        proc = self._proc([
+            # 103:05: major 0x103=259, minor 0x05 — the same inode number,
+            # another filesystem.
+            "1: FLOCK  ADVISORY  WRITE 55 103:05:%d 0 EOF\n" % self.ino])
+        self._stat(proc, 55, "T")
+        self.assertIsNone(
+            seats_claims._flock_holder(self.path, proc_dir=proc),
+            "named a holder on another filesystem with the same inode")
+        msg = seats_claims._lock_unavailable(self.path, proc_dir=proc)
+        self.assertEqual(msg, "claim lock is unavailable")
+
+    def test_a_holder_on_the_same_device_and_inode_is_named(self):
+        """The kernel's own line shape for this file: hex major:minor from
+        the path's real st_dev, then the decimal inode. The pid is named
+        and its /proc state carried."""
+        devstr = "%x:%02x" % (self.st.st_dev >> 8, self.st.st_dev & 0xff)
+        proc = self._proc([
+            "1: FLOCK  ADVISORY  WRITE 66 %s:%d 0 EOF\n" % (devstr, self.ino)])
+        self._stat(proc, 66, "T")
+        self.assertEqual(
+            seats_claims._flock_holder(self.path, proc_dir=proc),
+            (66, "T"))
+        msg = seats_claims._lock_unavailable(self.path, proc_dir=proc)
+        self.assertIn("STOPPED pid 66 (state T)", msg)
+        self.assertIn("kill -CONT 66", msg)
+
+    def test_a_waiters_line_for_the_file_names_no_holder(self):  # noqa: VACUOUS_ASSERTION — the same-device arms beside it name real holders; this one pins that a BLOCKED waiter is never the answer
+        """A BLOCKED flock on this very file: the kernel's line carries an
+        extra '->' token, so the pid and the device field each sit one
+        column right. It is a process queued BEHIND the holder, and the
+        diagnostic must not name it — a waiter that never acquired is the
+        opposite of a wedge, and telling the operator to kill it names a
+        victim. The line is byte-identical to the kernel's, measured."""
+        devstr = "%x:%02x" % (self.st.st_dev >> 8, self.st.st_dev & 0xff)
+        proc = self._proc([
+            "1: -> FLOCK  ADVISORY  WRITE 77 %s:%d 0 EOF\n"
+            % (devstr, self.ino)])
+        self._stat(proc, 77, "T")
+        self.assertIsNone(
+            seats_claims._flock_holder(self.path, proc_dir=proc),
+            "named a BLOCKED waiter as the holder")
+
+    def test_the_holder_is_named_when_a_waiter_sits_alongside_it(self):
+        """CONTROL: the real shape of the table — a WAITER line followed by
+        the genuine HOLDER line for the same file. The scan must keep past
+        the waiter and land on the holder: skip the first, name the
+        second. (The kernel lists the waiter before the holder it is
+        queued behind.)"""
+        devstr = "%x:%02x" % (self.st.st_dev >> 8, self.st.st_dev & 0xff)
+        proc = self._proc([
+            "1: -> FLOCK  ADVISORY  WRITE 77 %s:%d 0 EOF\n"
+            % (devstr, self.ino),
+            "2: FLOCK  ADVISORY  WRITE 88 %s:%d 0 EOF\n"
+            % (devstr, self.ino)])
+        self._stat(proc, 77, "R")
+        self._stat(proc, 88, "T")
+        self.assertEqual(
+            seats_claims._flock_holder(self.path, proc_dir=proc),
+            (88, "T"))
+
+    def test_a_vanished_locks_table_names_no_holder(self):
+        """UNREADABLE IS NOT EMPTY. /proc/locks gone from under the reader
+        must read as declining to answer — None out of the holder — never
+        as 'nobody holds this': the refusal keeps its honest bare form,
+        and a wedge is not exonerated by a vanished table."""
+        proc = self._proc([])
+        os.remove(os.path.join(proc, "locks"))
+        self.assertIsNone(
+            seats_claims._flock_holder(self.path, proc_dir=proc),
+            "a vanished table read as an empty table")
+        self.assertEqual(
+            seats_claims._lock_unavailable(self.path, proc_dir=proc),
+            "claim lock is unavailable")

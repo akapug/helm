@@ -48,7 +48,8 @@ class TheVerbSurfaceIsPublishedByTheLedgerTest(unittest.TestCase):
         """
         declared = self._declared()
         self.assertEqual(21, len(declared), _POPULATED)
-        tree = ast.parse(io.open(_SATELLITE, encoding="utf-8").read())
+        with io.open(_SATELLITE, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
         defined = {n.name for n in tree.body
                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
                                      ast.ClassDef))}
@@ -106,7 +107,8 @@ class TheVerbSurfaceIsPublishedByTheLedgerTest(unittest.TestCase):
         UNPACKING were left bare by the first cut of this split, and the only
         thing that caught them was driving the code.
         """
-        owned = owner_globals(io.open(_OWNER, encoding="utf-8").read())
+        with io.open(_OWNER, encoding="utf-8") as fh:
+            owned = owner_globals(fh.read())
         owned |= {n for _, names in landreq._OWNER_NAMES for n in names}
         self.assertTrue(owned, _POPULATED)
         self.assertIn("R_NONE", owned,
@@ -125,7 +127,8 @@ class TheVerbSurfaceIsPublishedByTheLedgerTest(unittest.TestCase):
         """THE CONTROL, because an empty finding and a blind instrument look
         identical. A checker that never fires would pass the arm above on a
         file that was never rewritten at all."""
-        owned = owner_globals(io.open(_OWNER, encoding="utf-8").read())
+        with io.open(_OWNER, encoding="utf-8") as fh:
+            owned = owner_globals(fh.read())
         self.assertNotIn("json", owned,
                          "an IMPORTED name is not an owner name; if it were, "
                          "the split would rewrite `json` to `landreq.json`")

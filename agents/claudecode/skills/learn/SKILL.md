@@ -118,6 +118,8 @@ resolve earns a new id.
 One question, every capture: **do we own the thing that misbehaved?** If the
 misbehaving code is ours (helm, our scripts, our hooks), this is a FIX LANE,
 not a rule — open it, and store at most a class pointer until the fix lands.
+Put the friction tax on that lane (the steps agents spend routing around the
+bug x times per day), so the fix ranks by payback days.
 Rules are for truths we cannot change. A store entry teaching agents to route
 around our own bug is self-bug-canonization (the --help incident, 2026-07-22:
 a 3-line cli.py fix lived as a fleet-wide behavioral prior instead).

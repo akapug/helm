@@ -49,11 +49,24 @@ _FUTURE_TS_GRACE_S = 60.0
 # 5: each card carries `on_main_unverdicted`, the one predicate's answer the
 # pipeline wall's ALREADY ON TRUNK mark reads (task/2381); a body saved
 # without it would draw no mark on a row the owner's count line counts.
-_PERSIST_SCHEMA = 5
+# 6: each card carries `source_clean_tip`, `source_clean_rehold` and
+# `source_clean_on_main` (task/3053): the one predicate exempts a HELD
+# source-clean row on trunk by the first, and every board surface prints the
+# last; a body saved without them would fold that row as "no verdict
+# recorded" and the wall would call a clean read a review that never happened.
+_PERSIST_SCHEMA = 6
 
 _qstate = {}
 
 _qinflight = {}
+
+#: The `_swr_rebuild` threads this server life spawned, keyed by their key.
+#: The events in `_qinflight` carry completion; the THREADS carry the leak the
+#: slice audit measures — a test that kicks a rebuild and never joins it leaves
+#: the worker alive, and its late write to `_qstate` corrupts the next module's
+#: fixtures (task/3304). `drain_swr` joins them; a test that starts one owes the
+#: drain in its tearDown.
+_qthreads = {}
 
 _PROVIDER = None  # lazy singleton; tests may inject a stub here
 
@@ -374,9 +387,11 @@ def _cached_swr(key, ttl, hard_ttl, fn, cold_body=None, cold_wait=None,
                 ev = threading.Event()
                 _qinflight[key] = ev
                 try:
-                    threading.Thread(
+                    worker = threading.Thread(
                         target=_swr_rebuild, args=(key, fn, ev, snapshot),
-                        daemon=True).start()
+                        daemon=True)
+                    _qthreads[key] = worker
+                    worker.start()
                 except BaseException:
                     # The review blockers, both rounds. Round one: a spawn
                     # that fails before any worker exists orphans the event —
@@ -391,6 +406,17 @@ def _cached_swr(key, ttl, hard_ttl, fn, cold_body=None, cold_wait=None,
                     # neither ever pops the other's.
                     if _qinflight.get(key) is ev:
                         _qinflight.pop(key)
+                    # A start() that raised BEFORE the OS thread launched leaves
+                    # an UNSTARTED worker here; drain_swr's join() on it would
+                    # raise "cannot join thread before it is started". A start()
+                    # that raised AFTER it launched has ident set, and the
+                    # worker's own finally pops it as now. Guard `worker` itself
+                    # (an unassigned name if Thread(...) raised) and use
+                    # getattr so a non-Thread stand-in in the probe never
+                    # turns this catch block into the very thing that raised.
+                    if "worker" in locals() and _qthreads.get(key) is worker \
+                            and getattr(worker, "ident", None) is None:
+                        _qthreads.pop(key)
                     ev.set()
                     raise
             return ent[1]
@@ -410,13 +436,18 @@ def _cached_swr(key, ttl, hard_ttl, fn, cold_body=None, cold_wait=None,
                 cold_waiter = threading.Event()
                 _qinflight[key] = cold_waiter
                 try:
-                    threading.Thread(
+                    worker = threading.Thread(
                         target=_swr_rebuild,
                         args=(key, fn, cold_waiter, snapshot),
-                        daemon=True).start()
+                        daemon=True)
+                    _qthreads[key] = worker
+                    worker.start()
                 except BaseException:
                     if _qinflight.get(key) is cold_waiter:
                         _qinflight.pop(key)
+                    if "worker" in locals() and _qthreads.get(key) is worker \
+                            and getattr(worker, "ident", None) is None:
+                        _qthreads.pop(key)
                     cold_waiter.set()
                     raise
     if cold_waiter is not None:
@@ -439,15 +470,17 @@ def _cached_swr(key, ttl, hard_ttl, fn, cold_body=None, cold_wait=None,
 
 
 
-# ONE BACKGROUND READ PER KEY, JOINED UNDER EACH CALLER'S OWN BUDGET. A body
-# composed of several reads must answer inside a bound even when one of them
-# is cold (`web_board._board_build`, whose first read after a restart took 70s
+# ONE BACKGROUND READ PER KEY, JOINED UNDER ITS OWN BUDGET. A body composed of
+# several reads must answer inside a bound even when one of them is cold
+# (`web_board._board_build`, whose first read after a restart took 70s
 # against the page's 45s). Each read runs on its own daemon thread; a caller
 # that runs out of budget abandons that thread and never cancels it, and the
 # next caller joins the SAME thread rather than starting a second read of the
-# same thing. A reading younger than `ttl` is served as it is; one younger
-# than `hard_ttl` is served while a read runs behind it; an older one is
-# never served.
+# same thing, for what is left of that read's budget (its box's `began`):
+# one an earlier caller already waited out is still being read, and a
+# second full wait on it answers nothing new. A reading younger than `ttl`
+# is served as it is; one younger than `hard_ttl` is served while a read
+# runs behind it; an older one is never served.
 #
 # ONLY A READING IS KEPT. `refuse(answer)` names why an answer is not one — a
 # source that could not be read, or one still warming — and that answer goes
@@ -500,8 +533,11 @@ def _read_behind(key, ttl, hard_ttl, fn, refuse=None, changed=None):
 
 
 def _read_start(key, fn, refuse):
-    """Start one read of `key`, under `_qreads_lock` -> (thread, box)."""
-    box = {}
+    """Start one read of `key`, under `_qreads_lock` -> (thread, box). The
+    box carries `began`, the monotonic instant the read started, so a caller
+    that bounds its wait by the READ's own budget can tell how much of it an
+    earlier caller already spent (`web_board._legs`)."""
+    box = {"began": time.monotonic()}
 
     def read():
         try:
@@ -809,6 +845,8 @@ def _swr_rebuild(key, fn, own_ev, snapshot=None):
                 # The reason outlives nothing: it describes the rebuild that
                 # was in flight, and there is no longer one.
                 _qcapkick.pop(key, None)
+            if _qthreads.get(key) is threading.current_thread():
+                _qthreads.pop(key, None)
         own_ev.set()
     # WRITE-BEHIND MEANS *BEHIND*, INCLUDING BEHIND THE WAITERS. Taking the
     # save off the global lock was not enough: it still sat on the COMPLETION
@@ -818,6 +856,27 @@ def _swr_rebuild(key, fn, own_ev, snapshot=None):
     # needs the file, so it is written after every waiter has been released.
     if stored is not None:
         _persist_store(key, stored[0], stored[1], wit)
+
+
+def drain_swr(timeout=15.0):
+    """Join every `_swr_rebuild` worker this server life spawned. -> None
+
+    A test that triggers a cold read or a rebuild starts a daemon worker; it
+    must join it in tearDown, or the worker's late `_qstate` write corrupts
+    the next module's fixtures (task/3304). This is the one test-scope drain:
+    it joins the threads (not merely waits on their events, which the worker
+    sets before its write-behind save), and is a no-op when none are live."""
+    with _qlock:
+        workers = list(_qthreads.values())
+    for worker in workers:
+        # A worker tracked by us is always a real threading.Thread (spawned
+        # only by the two paths above); the .ident guard is the "already
+        # started, so joinable" test. Use getattr so a test that swapped
+        # in a non-Thread stand-in for Thread (which is the whole point of
+        # these probes) never turns `drain_swr` itself into the thing under
+        # test that raises.
+        if getattr(worker, "ident", None) is not None:
+            worker.join(timeout)
 
 
 

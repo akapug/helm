@@ -14,17 +14,27 @@ nothing ever; so each refusal arm is paired, in the same method, with the one
 changed fact that makes the same door dispatch — a moved trunk head, a
 retired run, a room that does contain the running head. The pair is the arm.
 """
+import contextlib
 import hashlib
 import io
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 from tests._tmphome import own_env
-from helm import fabgate, gatewindow, vcs
+from helm import fabgate, gatewindow, landwindow, vcs
+
+# The routing knobs, spelled once: HELM_GATE_HOSTS is the ordered host list,
+# FAB_EXCLUDE_HOSTS the exclusion Fab's own placement honours, and
+# HELM_GATE_WINDOW_KEY what one gate at a time is keyed by.
+HOSTS_ENV = "HELM_GATE_HOSTS"
+EXCLUDE_ENV = "FAB_EXCLUDE_HOSTS"
+KEY_ENV = "HELM_GATE_WINDOW_KEY"
 
 
 # WHAT `fab gate measure` AND `fab gate submit` REALLY EMIT — one JSON event on
@@ -46,9 +56,13 @@ RECEIPT_ID = "0123456789abcdef"
 
 
 def measured(host):
-    return json.dumps({"v": 2, "event": "gate-measure", "host": host,
-                       "interpreter": INTERPRETER, "runner": RUNNER,
-                       "route_preimage": "f" * 64}) + "\n"
+    return json.dumps({
+        "v": 2, "event": "gate-measure", "host": host,
+        "interpreter": INTERPRETER, "runner": RUNNER,
+        "route_preimage": "f" * 64,
+        "submit_options": [gatewindow.LABEL_OPTION,
+                           gatewindow.LAND_AUTHORITY_OPTION,
+                           gatewindow.SHADOW_OPTION]}) + "\n"
 
 
 def snapshot(state="RUNNING", exit_code=None, receipt=None, live=None):
@@ -67,11 +81,67 @@ def job_event(key, generation, host, disposition="LAUNCHED", **snap):
         "request": {"v": 2, "key": key}}) + "\n"
 
 
+def observed_event(key, generation, host, tree, disposition="JOINED", **snap):
+    """The real `fab gate observe` shape, distinct from submit's handle event."""
+    return json.dumps({
+        "v": 2, "event": "gate-job", "key": key,
+        "job_id": "gate-" + key, "tree": tree, "sha": "a" * 40,
+        "disposition": disposition, "node": host, "generation": generation,
+        "identity": {"tree": tree},
+        "budgets": {"queue_s": None, "execution_s": None},
+        "snapshot": snapshot(**snap), "reason": None}) + "\n"
+
+
 def unknown_event():
     return json.dumps({
         "v": 2, "event": "gate-job", "disposition": "UNKNOWN",
         "handle": None, "snapshot": snapshot(state="UNKNOWN"),
         "reason": "AUTHORITY_ABSENT", "request": None}) + "\n"
+
+
+def QUIET_CLIENT(argv, log):
+    """A detached client that is never spawned, for arms that dispatch."""
+    return type("P", (), {"pid": 4242})()
+
+
+# WHAT `fab gate submit` ANSWERS WHEN IT LAUNCHED NOTHING (task/3114): the build
+# stopped before the node registered anything, so fab exits 75 with the null
+# authority, AUTHORITY_ABSENT, and the handle it would have named with a null
+# generation — fab-gate-job's own emit_submit shape, field for field.
+FAB_LAUNCHED_NOTHING = ("Fab launched nothing on node-a (exit 75, retry the "
+                        "submit): RETRY: the build stopped before the node "
+                        "registered the job")
+
+
+def null_snapshot(code):
+    """fab's `unknown_snapshot(code)`: the exact ten-field null authority."""
+    return {"state": "UNKNOWN", "exit": None, "exit_class": None,
+            "artifact": None, "artifact_sha256": None, "receipt": None,
+            "queue_elapsed_s": None, "execution_elapsed_s": None,
+            "live": False, "reason": code}
+
+
+def absent_event(key, host="node-a", generation=None, code="AUTHORITY_ABSENT",
+                 reason=FAB_LAUNCHED_NOTHING):
+    return json.dumps({
+        "v": 2, "event": "gate-job", "disposition": "UNKNOWN",
+        "handle": {"v": 2, "key": key, "job_id": "gate-" + key,
+                   "host": host, "generation": generation},
+        "snapshot": null_snapshot(code), "reason": reason,
+        "request": {"v": 2, "key": key}}) + "\n"
+
+
+def no_record_event(key, host="node-a", code="AUTHORITY_ABSENT",
+                    reason="canonical gate record is absent"):
+    """What `fab gate observe` prints when the node holds NO by-key record:
+    fab-gate-state's observe answer, passed through remote_observe."""
+    return json.dumps({
+        "v": 2, "event": "gate-job", "key": key, "job_id": "gate-" + key,
+        "tree": None, "sha": None, "disposition": "UNKNOWN", "node": host,
+        "generation": None, "identity": None,
+        "budgets": {"queue_s": None, "execution_s": None},
+        "snapshot": null_snapshot(code), "reason": reason}) + "\n"
+
 
 # WHAT `fab status <host>` REALLY WRITES, copied from its own printf shapes.
 # The unreachable notice is the load-bearing one: fab prints it on STDOUT and
@@ -105,11 +175,22 @@ class WindowBase(unittest.TestCase):
         self.git("checkout", "-q", self.main)
         self.path = gatewindow.runs_path(os.path.join(self.tmp, "helm",
                                                       "_global"))
+        # THE ROUTING CONFIG IS THE ARM'S, never the box's: an operator's
+        # FAB_EXCLUDE_HOSTS or HELM_GATE_HOSTS must not steer a fixture launch.
+        for key in (HOSTS_ENV, EXCLUDE_ENV):
+            own_env(self, key, "")
+        # THESE ARMS ARE THE TRUNK-KEYED WINDOW'S: its same-window refusal is
+        # what most of them measure, so they pin the key that keeps it. The
+        # default, host, has its own arms (FastHostRouting, WindowKeyDefault).
+        own_env(self, KEY_ENV, "trunk")
         self.kills = []
         self.spawns = []
         self.measures = []
         self.observes = []
         self.gens = {}
+        # FAB_EXCLUDE_HOSTS on each measure and submit, as the door passed it
+        # (None: the door passed no environment of its own).
+        self.exclusions = []
 
     def git(self, *args):
         out = subprocess.run(("git",) + args, cwd=self.repo, text=True,
@@ -140,17 +221,23 @@ class WindowBase(unittest.TestCase):
         self.gens[gen] = run_id
         return gen
 
-    def fab(self, run_id="r1", host="snoozy", measure=None, unknown=False):
+    def fab(self, run_id="r1", host="snoozy", measure=None, unknown=False,
+            answer=None):
         """The fab seam: `gate measure` then `gate submit`, answering fab's own
         bytes. Only the SUBMIT lands in self.spawns, because submit is the
-        dispatch and a count of dispatches is what every refusal arm asserts."""
-        def _fab(argv, timeout=None):
+        dispatch and a count of dispatches is what every refusal arm asserts.
+        `answer(key)` is the whole (rc, stdout, stderr) of one submit."""
+        def _fab(argv, timeout=None, env=None):
+            self.exclusions.append((argv[2], None if env is None
+                                    else env.get(EXCLUDE_ENV)))
             if argv[:3] == [gatewindow.FAB_BINARY, "gate", "measure"]:
                 self.measures.append(list(argv))
                 return (0, measured(host), "") if measure is None else measure
             if argv[:3] == [gatewindow.FAB_BINARY, "gate", "submit"]:
                 self.spawns.append(list(argv))
                 body = json.loads(argv[argv.index("--request-json") + 1])
+                if answer is not None:
+                    return answer(body["key"])
                 if unknown:
                     return 94, unknown_event(), ""
                 return 0, job_event(body["key"], self.generation(run_id),
@@ -171,13 +258,15 @@ class WindowBase(unittest.TestCase):
             gen = argv[argv.index("--generation") + 1]
             key = argv[argv.index("--job") + 1][len("gate-"):]
             host = argv[argv.index("--host") + 1]
+            row = next((r for r in gatewindow.read_runs(self.path)
+                        if r.get("generation") == gen), {})
+            tree = row.get("tree") or self.git("rev-parse", "HEAD^{tree}")
             if self.gens.get(gen) in live:
-                return 0, job_event(key, gen, host, disposition="JOINED",
-                                    live=True), ""
-            return 0, job_event(key, gen, host, disposition="RECEIPT",
-                                state=state or "COMPLETED",
-                                exit_code=exit_code, receipt=receipt,
-                                live=False), ""
+                return 0, observed_event(key, gen, host, tree, live=True), ""
+            return 0, observed_event(
+                key, gen, host, tree, disposition="RECEIPT",
+                state=state or "COMPLETED", exit_code=exit_code,
+                receipt=receipt, live=False), ""
         return _observe
 
     def no_fab_status(self):
@@ -377,7 +466,8 @@ class JobIdentity(WindowBase):
         relative = json.dumps({
             "v": 2, "event": "gate-measure", "host": "snoozy",
             "interpreter": dict(INTERPRETER, executable="python3"),
-            "runner": RUNNER, "route_preimage": "f" * 64}) + "\n"
+            "runner": RUNNER, "route_preimage": "f" * 64,
+            "submit_options": [gatewindow.LAND_AUTHORITY_OPTION]}) + "\n"
         room = self.room("train01", self.c)
         rc, text, _req = self.door(room, label="train01",
                                    fab=self.fab(measure=(0, relative, "")))
@@ -390,6 +480,101 @@ class JobIdentity(WindowBase):
         self.assertEqual(len(self.spawns), 1, self.spawns)
 
 
+class FlakeAttempt(WindowBase):
+    """A recorded FLAKE earns the next gate attempt (task/3298).
+
+    Fab keys a whole-suite job by its identity, so relaunching an unchanged
+    tree returns the same red receipt. N FLAKED rows for this tree put
+    attempt N+1 on that identity and change the key. No row for this tree
+    leaves the field off, byte-identical to a request built without it.
+    """
+
+    def tree_of(self, room):
+        out = subprocess.run(("git", "-C", room, "rev-parse", "HEAD^{tree}"),
+                             text=True, capture_output=True, check=True)
+        return out.stdout.strip()
+
+    def _bytes(self, identity):
+        return json.dumps(identity, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), allow_nan=False)
+
+    def identity(self):
+        request = {"project": "p", "room": self.repo, "head": self.c,
+                   "trunk": self.c, "label": "train01"}
+        caught = io.StringIO()
+        with contextlib.redirect_stderr(caught):
+            got, err = gatewindow.job_identity(
+                request, fab=lambda argv, timeout=None, **_rest: (
+                    0, measured("snoozy"), ""))
+        return got, err, caught.getvalue()
+
+    def bare(self):
+        job, err = fabgate.request(
+            self.repo, self.tree_of(self.repo), fabgate.whole_scope(),
+            INTERPRETER, RUNNER)
+        self.assertIsNone(err, err)
+        return job
+
+    def flake(self, tree, test="tests.test_b.Case.test_b"):
+        _row, err = landwindow.record_flake(self.repo, {
+            "tree": tree, "gate": "ab" * 8, "train": "train01",
+            "tests": [test], "why": "flake"})
+        self.assertIsNone(err, err)
+
+    def test_no_flaked_row_leaves_the_identity_byte_identical(self):
+        got, err, _said = self.identity()
+        self.assertIsNone(err, err)
+        self.assertEqual(got["mode"], "serial")
+        bare = self.bare()
+        self.assertEqual(self._bytes(got["request"]["identity"]),
+                         self._bytes(bare["identity"]))
+        self.assertEqual(got["key"], bare["key"])
+
+    def test_one_flaked_row_for_this_tree_is_attempt_two(self):
+        self.flake(self.tree_of(self.repo))
+        got, err, _said = self.identity()
+        self.assertIsNone(err, err)
+        self.assertEqual(got["request"]["identity"]["attempt"], 2)
+        argv = gatewindow.submit_argv(
+            self.repo, got["request"], land_authority=True)
+        sent = json.loads(argv[argv.index("--request-json") + 1])
+        self.assertEqual(sent["identity"]["attempt"], 2)
+        self.assertEqual(sent["key"], got["key"])
+        self.assertNotEqual(got["key"], self.bare()["key"])
+
+    def test_two_flaked_rows_are_attempt_three(self):
+        tree = self.tree_of(self.repo)
+        self.flake(tree)
+        self.flake(tree, test="tests.test_c.Case.test_c")
+        got, err, _said = self.identity()
+        self.assertIsNone(err, err)
+        self.assertEqual(got["request"]["identity"]["attempt"], 3)
+
+    def test_a_flake_for_another_tree_leaves_the_identity_unchanged(self):
+        self.flake("ab" * 20)
+        got, err, _said = self.identity()
+        self.assertIsNone(err, err)
+        self.assertEqual(got["mode"], "serial")
+        bare = self.bare()
+        self.assertEqual(self._bytes(got["request"]["identity"]),
+                         self._bytes(bare["identity"]))
+        self.assertEqual(got["key"], bare["key"])
+
+    def test_an_unreadable_flake_store_reuses_the_last_receipt(self):
+        path = landwindow.flakes_path(self.repo)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("{not json\n")
+        got, err, said = self.identity()
+        self.assertIsNone(err, err)
+        bare = self.bare()
+        self.assertEqual(self._bytes(got["request"]["identity"]),
+                         self._bytes(bare["identity"]))
+        self.assertIn(
+            "the flake store could not be read, so this relaunch reuses "
+            "the last receipt", said)
+
+
 class LaunchLabel(WindowBase):
     """THE LAUNCH LABEL RIDES THE JOB (task/3066). MEASURED: `--label
     train200` reached the window record and never receipt a8385c943e5d7a54,
@@ -399,7 +584,7 @@ class LaunchLabel(WindowBase):
 
     def measure_with(self, options):
         event = json.loads(measured("snoozy"))
-        event["submit_options"] = options
+        event["submit_options"] = [gatewindow.LAND_AUTHORITY_OPTION] + options
         return 0, json.dumps(event) + "\n", ""
 
     def test_a_fab_that_takes_the_label_carries_it_on_the_submit(self):
@@ -418,7 +603,9 @@ class LaunchLabel(WindowBase):
         submit Fab would refuse whole is sent unchanged, and the dispatch
         names the label that stays on the record only."""
         room = self.room("train01", self.c)
-        rc, text, _req = self.door(room, label="train01")
+        rc, text, _req = self.door(
+            room, label="train01",
+            fab=self.fab(measure=self.measure_with([])))
         self.assertEqual(rc, 0, text)
         self.assertNotIn("--label", self.spawns[0])
         self.assertIn("recorded here only", text)
@@ -721,6 +908,556 @@ class ShowRecovers(WindowBase):
         self.assertEqual(rc2, 1, text2)
         self.assertIn("STRANDED", text2)
 
+    def test_an_unreadable_store_is_UNKNOWN_never_nothing_in_flight(self):  # noqa: VACUOUS_ASSERTION — each unreadable shape asserts rc 1, UNKNOWN and its own reason PRESENT in the same text; the absent-store control asserts "no whole-suite gate is in flight" PRESENT on the same `show` text and ([], None) by equality
+        """task/3129: `read_runs` folds a store it cannot read to [], which
+        is right for the door (an unreadable store must not wall a landing)
+        and wrong for a reader: `show` printed "no whole-suite gate is in
+        flight" over it. Every unreadable shape is UNKNOWN, exits nonzero and
+        is left as it was, --recover included; an ABSENT store is the
+        control, and says nothing is in flight."""
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        for name, body in (("not json", "{not json"),
+                           ("another version", '{"v": 99, "runs": []}'),
+                           ("no runs list", '{"v": 1, "runs": {}}')):
+            with self.subTest(store=name):
+                with open(self.path, "w") as fh:
+                    fh.write(body)
+                rows, why = gatewindow.read_runs_checked(self.path)
+                self.assertIsNone(rows)
+                self.assertIn(self.path, why)
+                self.assertEqual(gatewindow.read_runs(self.path), [],
+                                 "the door's reading changed")
+                for recover in (False, True):
+                    rc, text = self.shown(observe=self.observe(()),
+                                          receipts=self.ledger(),
+                                          recover_owed=recover)
+                    self.assertEqual(rc, 1, text)
+                    self.assertIn("UNKNOWN", text)
+                    self.assertIn(why, text)
+                    self.assertNotIn("no whole-suite gate is in flight", text)
+                    with open(self.path) as fh:
+                        self.assertEqual(fh.read(), body)
+        os.unlink(self.path)
+        self.assertEqual(gatewindow.read_runs_checked(self.path), ([], None))
+        rc, text = self.shown(observe=self.observe(()), receipts=self.ledger())
+        self.assertEqual(rc, 0, text)
+        self.assertIn("no whole-suite gate is in flight", text)
+
+
+class LaunchedNothing(WindowBase):
+    """FAB LAUNCHED NOTHING, SO NOTHING HOLDS THE WINDOW (task/3114).
+
+    Measured at trunk 00988cc4296: fab's absent-authority answer — exit 75,
+    disposition UNKNOWN, snapshot AUTHORITY_ABSENT, a handle whose generation
+    is null — was rejected on the null generation, fab's reason was dropped,
+    the job was recorded LOST and the window was held for an hour over a suite
+    that never existed. Every arm drives the shipped door; the controls are the
+    near-misses that must keep today's handling, because the cure may only
+    fire on the whole shape.
+    """
+
+    def launched_nothing(self, rc=75, **kw):
+        return self.fab(host="node-a",
+                        answer=lambda key: (rc, absent_event(key, **kw), ""))
+
+    def test_fab_launching_nothing_is_NOT_DISPATCHED_and_the_retry_is_admitted(self):
+        room = self.room("train01", self.c)
+        rc, text, _req = self.door(room, label="train01",
+                                   fab=self.launched_nothing(),
+                                   observe=self.observe(()))
+        self.assertEqual(rc, 3, text)
+        self.assertIn("NOT DISPATCHED", text)
+        # FAB'S REASON, VERBATIM, where every other refusal prints its own.
+        self.assertIn("fab said: " + FAB_LAUNCHED_NOTHING, text)
+        self.assertIn("retry: helm gate window launch --repo %s --label "
+                      "train01" % os.path.realpath(room), text)
+        self.assertNotIn("HELD", text)
+        self.assertNotIn("without exact v2 safe identities", text)
+        # NO LOST ROW AND NO HOLD: the store names no run for this window.
+        self.assertEqual(gatewindow.read_runs(self.path), [])
+        self.assertEqual(len(self.spawns), 1, self.spawns)
+
+        # THE RETRY, ON ITS NEXT PASS: the same room on the same window is
+        # dispatched at once — nothing an hour-long hold would have refused.
+        rc2, text2, _r2 = self.door(room, label="train01",
+                                    fab=self.fab("r1", "node-a"),
+                                    observe=self.observe(("r1",)),
+                                    detach=QUIET_CLIENT)
+        self.assertEqual(rc2, 0, text2)
+        self.assertIn("DISPATCHED", text2)
+        self.assertEqual(len(self.spawns), 2, self.spawns)
+        self.assertEqual([r.get("announce")
+                          for r in gatewindow.read_runs(self.path)], ["SEEN"])
+
+    def test_fabs_own_reason_reaches_the_HELD_refusal(self):
+        """The answer fab really gave when a helm too old to slice was asked
+        for a sliced suite: exit 94, disposition UNKNOWN, NO handle and NO
+        request, and fab's reason naming the cause. The HELD refusal names
+        the missing handle AND says what fab said, so the operator reads the
+        cause instead of a symptom."""
+        reason = ("helm cannot run /var/tmp/helm-train305 as slices: helm's "
+                  "plan answer carries no slice field (a helm that predates "
+                  "`gate run --sliced`)")
+        snapshot = {"artifact": None, "artifact_sha256": None,
+                    "execution_elapsed_s": None, "exit": None,
+                    "exit_class": None, "live": False, "queue_elapsed_s": None,
+                    "reason": reason, "receipt": None, "state": "UNKNOWN"}
+        event = json.dumps({"disposition": "UNKNOWN", "event": "gate-job",
+                            "reason": reason, "snapshot": snapshot,
+                            "v": 2}) + "\n"
+        room = self.room("train01", self.c)
+        rc, text, _req = self.door(
+            room, label="train01",
+            fab=self.fab(host="node-a", answer=lambda key: (94, event, "")),
+            observe=self.observe(()))
+        self.assertEqual(rc, 4, text)
+        self.assertIn("UNKNOWN and the window is HELD", text)
+        self.assertIn("no exact v2 durable job handle; fab said: helm cannot "
+                      "run /var/tmp/helm-train305 as slices", text)
+
+    def test_every_near_miss_of_the_shape_keeps_todays_HELD_rejection(self):  # noqa: VACUOUS_ASSERTION — a fixed four-row table; every row asserts rc 4, the HELD text and a LOST row positively, and the NOT DISPATCHED arm above is the control on the same door
+        """A null generation WITHOUT AUTHORITY_ABSENT, or the absent shape on
+        any exit but 75 (94 is fab's "the launch's answer is UNKNOWN": it may
+        be running), is the old answer: LOST row, window HELD, rc 4."""
+        near = (("null generation, TRANSIENT_AUTHORITY, exit 75",
+                 dict(rc=75, code="TRANSIENT_AUTHORITY")),
+                ("null generation, AUTHORITY_REFUSED, exit 75",
+                 dict(rc=75, code="AUTHORITY_REFUSED")),
+                ("the whole absent shape on exit 94", dict(rc=94)),
+                ("the whole absent shape on exit 0", dict(rc=0)))
+        room = self.room("train01", self.c)
+        for name, kw in near:
+            with self.subTest(name):
+                gatewindow.write_runs(self.path, [])
+                rc, text, _req = self.door(room, label="train01",
+                                           fab=self.launched_nothing(**kw),
+                                           observe=self.observe(()))
+                self.assertEqual(rc, 4, text)
+                self.assertIn("UNKNOWN and the window is HELD", text)
+                self.assertIn("without exact v2 safe identities", text)
+                self.assertNotIn("NOT DISPATCHED", text)
+                self.assertEqual([r.get("announce") for r in
+                                  gatewindow.read_runs(self.path)], ["LOST"])
+
+    def test_exit_75_with_a_real_handle_is_handled_as_today(self):
+        """The exit alone decides nothing. Exit 75 over a LAUNCHED event with a
+        real generation dispatches as it always did; exit 75 over the absent
+        snapshot with a real generation is the old UNKNOWN hold."""
+        room = self.room("train01", self.c)
+        gen = self.generation("r1")
+        rc, text, _req = self.door(
+            room, label="train01", observe=self.observe(("r1",)),
+            detach=QUIET_CLIENT,
+            fab=self.fab(host="node-a", answer=lambda key: (
+                75, job_event(key, gen, "node-a", live=True), "")))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("DISPATCHED gate-", text)
+        self.assertNotIn("NOT DISPATCHED", text)
+        self.assertEqual([r.get("generation") for r in
+                          gatewindow.read_runs(self.path)], [gen])
+
+        gatewindow.write_runs(self.path, [])
+        rc2, text2, _r2 = self.door(room, label="train01",
+                                    fab=self.launched_nothing(generation=gen),
+                                    observe=self.observe(()))
+        self.assertEqual(rc2, 4, text2)
+        self.assertIn("UNKNOWN and the window is HELD", text2)
+        self.assertNotIn("NOT DISPATCHED", text2)
+
+
+class UnnamedRowRetires(WindowBase):
+    """A ROW NOBODY CAN NAME RETIRES WHEN THE AUTHORITY SAYS NO SUCH JOB EXISTS
+    (task/3115, the second half of task/3114's lane).
+
+    A submit whose answer was UNKNOWN leaves a row with no generation and no
+    pid, and on its own the window holds that row for up to an hour, whatever
+    the node knows. `show --recover` asks the node that owns the job key, and
+    retires the row only when the node affirmatively holds no record for that
+    key. Every other answer — none, unreadable, a matching job — keeps the
+    hold.
+    """
+
+    ledger = ShowRecovers.ledger
+    shown = ShowRecovers.shown
+    stood = ShowRecovers.stood
+
+    def unnamed(self, name="train01"):
+        """The phantom, through the shipped door: an UNKNOWN submit."""
+        room = self.room(name, self.c)
+        rc, text, _req = self.door(room, label="train01",
+                                   fab=self.fab("r1", "node-a", unknown=True),
+                                   observe=self.observe(()))
+        self.assertEqual(rc, 4, text)
+        (row,) = gatewindow.read_runs(self.path)
+        self.assertIsNone(row["generation"])
+        self.assertIsNone(row["pid"])
+        return room, row
+
+    def asked(self, answer):
+        """The observe seam: every argv it was asked, and `answer(argv)`."""
+        self.asks = []
+
+        def _observe(argv, timeout=None):
+            self.asks.append(list(argv))
+            return answer(argv)
+        return _observe
+
+    @staticmethod
+    def key_of(argv):
+        return argv[argv.index("--job") + 1][len("gate-"):]
+
+    def no_record(self, argv):
+        return 94, no_record_event(self.key_of(argv)), ""
+
+    def past_floor(self):
+        """A clock past the retire floor and still inside the lost-announce
+        grace, so the row is live and old enough to be put to its node."""
+        return (time.time() + gatewindow.SUBMIT_TIMEOUT_S
+                + gatewindow.FAB_ROLLOUT_DRAIN_S + 1)
+
+    def recovered(self, observe, now=None):
+        """`show --recover`, on a clock past the retire floor unless told."""
+        return self.shown(recover_owed=True, receipts=self.ledger(),
+                          observe=observe, now=now or self.past_floor)
+
+    def retire_log(self):
+        path = os.path.join(os.path.dirname(self.path), gatewindow.LOGS_SUBDIR,
+                            "retired.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_the_node_holding_no_such_job_retires_the_row_and_frees_the_window(self):
+        room, row = self.unnamed()
+        # CONTROL on the store before the answer: the phantom is there.
+        self.assertEqual([r["token"] for r in gatewindow.read_runs(self.path)],
+                         [row["token"]])
+        rc, text = self.recovered(self.asked(self.no_record))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("RETIRED", text)
+        self.assertIn(row["job_id"], text)
+        # FAB'S EVIDENCE, in its own words, printed and logged.
+        self.assertIn("canonical gate record is absent", text)
+        self.assertEqual(gatewindow.read_runs(self.path), [])
+        (logged,) = self.retire_log()
+        self.assertEqual(logged["row"]["job_id"], row["job_id"])
+        self.assertEqual(logged["fab"]["rc"], 94)
+        self.assertEqual(logged["fab"]["event"]["reason"],
+                         "canonical gate record is absent")
+        # IT ASKED THE NODE THAT OWNS THE KEY, through fab's observe door.
+        (argv,) = self.asks
+        self.assertEqual(argv[:3], ["fab", "gate", "observe"])
+        self.assertEqual(argv[argv.index("--host") + 1], "node-a")
+        self.assertEqual(argv[argv.index("--job") + 1], row["job_id"])
+        # It asks existence itself, never a stand-in generation: a row
+        # nobody can name has no generation to offer.
+        self.assertIn("--exists", argv)
+        self.assertNotIn("--generation", argv)
+
+        # THE WINDOW IS FREE ON THE NEXT PASS: the same room dispatches.
+        rc2, text2, _r2 = self.door(room, label="train01",
+                                    fab=self.fab("r1", "node-a"),
+                                    observe=self.observe(("r1",)),
+                                    detach=QUIET_CLIENT)
+        self.assertEqual(rc2, 0, text2)
+        self.assertEqual([r.get("announce") for r in
+                          gatewindow.read_runs(self.path)], ["SEEN"])
+
+    def test_an_answer_that_is_not_an_affirmative_no_keeps_the_hold(self):  # noqa: VACUOUS_ASSERTION — each subTest asserts the positive HELD line and fab's words; the retiring arm above is the control on the same row shape
+        cases = (
+            ("fab could not be run",
+             lambda argv: (None, "", "FileNotFoundError: fab"),
+             "FileNotFoundError: fab"),
+            ("no event on stdout",
+             lambda argv: (94, "ssh: connect to host node-a\n", ""),
+             "ssh: connect to host node-a"),
+            ("the node could not be reached",
+             lambda argv: (94, no_record_event(
+                 self.key_of(argv), code="TRANSIENT_AUTHORITY",
+                 reason="gate authority is unreachable"), ""),
+             "gate authority is unreachable"),
+            ("the absent shape on exit 0",
+             lambda argv: (0, no_record_event(self.key_of(argv)), ""),
+             "canonical gate record is absent"),
+            ("the absent shape for another key",
+             lambda argv: (94, no_record_event("e" * 64), ""),
+             "canonical gate record is absent"),
+            # A fab that predates --exists refuses the flag at its argument
+            # parser: exit 2 and no event, never the affirmative no.
+            ("a fab that predates --exists",
+             lambda argv: (2, "", "fab-gate-job observe: error: "
+                                  "unrecognized arguments: --exists"),
+             "unrecognized arguments: --exists"),
+        )
+        for n, (name, answer, words) in enumerate(cases):
+            with self.subTest(name):
+                gatewindow.write_runs(self.path, [])
+                _room, row = self.unnamed("train%02d" % n)
+                rc, text = self.recovered(self.asked(answer))
+                self.assertIn("HELD", text)
+                self.assertIn(words, text)
+                self.assertNotIn("RETIRED", text)
+                self.assertEqual([r["token"] for r in
+                                  gatewindow.read_runs(self.path)],
+                                 [row["token"]])
+        self.assertEqual(self.retire_log(), [])
+
+    def test_UNKNOWN_without_AUTHORITY_ABSENT_never_retires(self):  # noqa: VACUOUS_ASSERTION — a fixed two-code table, each asserting HELD, fab's code and one ask positively; AUTHORITY_ABSENT on the same row retires it after the loop
+        """Keyed on the snapshot reason, never on UNKNOWN alone. fab answers a
+        node it could not reach, or one that refused the read, UNKNOWN on exit
+        94 with TRANSIENT_AUTHORITY or AUTHORITY_REFUSED — every other field
+        exactly the absent shape — and neither says the job is absent. The node
+        WAS asked each time, so the hold is the answer's and not the floor's;
+        AUTHORITY_ABSENT on the same row is the control and retires it."""
+        for n, code in enumerate(("TRANSIENT_AUTHORITY", "AUTHORITY_REFUSED")):
+            with self.subTest(code):
+                gatewindow.write_runs(self.path, [])
+                _room, row = self.unnamed("unknown%02d" % n)
+                rc, text = self.recovered(self.asked(lambda argv: (
+                    94, no_record_event(self.key_of(argv), code=code,
+                                        reason="fab said %s" % code), "")))
+                self.assertIn("HELD", text)
+                self.assertIn("[%s]" % code, text)
+                self.assertNotIn("RETIRED", text)
+                self.assertEqual(len(self.asks), 1)
+                self.assertEqual([r["token"] for r in
+                                  gatewindow.read_runs(self.path)],
+                                 [row["token"]])
+        self.assertEqual(self.retire_log(), [])
+        rc, text = self.recovered(self.asked(self.no_record))
+        self.assertIn("RETIRED", text)
+        self.assertEqual(gatewindow.read_runs(self.path), [])
+        self.assertEqual([e["row"]["token"] for e in self.retire_log()],
+                         [row["token"]])
+
+    def test_an_unreadable_launch_time_is_LIVE_and_HELD_and_never_raises(self):  # noqa: VACUOUS_ASSERTION — every case asserts the row LIVE by token, show names it and the refused launch is rc 3; the readable control retires the same row by token
+        """An age nobody can read is never an expired one. A row whose `ts` is
+        a string, missing, non-finite or a bool is LIVE — held, exactly as
+        under the retire floor — and reading the store never raises over it.
+        The same row with a readable launch time past the grace is the control
+        and retires."""
+        room = self.room("train01", self.c)
+        row = {"project": gatewindow.project_id(room), "room": room,
+               "head": self.c, "trunk": self.c, "label": "train01",
+               "pid": None, "ts": "yesterday", "token": "t0",
+               "host": "node-a", "run_id": None, "key": "e" * 64,
+               "job_id": "gate-" + "e" * 64, "generation": None,
+               "announce": "LOST"}
+        later = time.time() + gatewindow.LOST_ANNOUNCE_GRACE_S + 1
+        missing = dict(row)
+        del missing["ts"]
+        for case in (row, missing, dict(row, ts=float("inf")),
+                     dict(row, ts=True)):
+            with self.subTest(ts=case.get("ts", "<missing>")):
+                live, retired, _unknown = gatewindow.live_runs(
+                    [case], observe=self.observe(()),
+                    pid_alive=lambda pid: False, now=lambda: later)
+                self.assertEqual([r["token"] for r in live], ["t0"])
+                self.assertEqual(retired, [])
+
+        gatewindow.write_runs(self.path, [row])
+        rc, text = self.shown(observe=self.observe(()),
+                              receipts=self.ledger(), now=lambda: later)
+        self.assertEqual(rc, 0, text)
+        self.assertIn(row["job_id"], text)
+        self.assertIn("launch time is unreadable", text)
+        self.assertNotIn("no whole-suite gate is in flight", text)
+        # AND IT HOLDS THE WINDOW: a launch on the same window is refused.
+        rc2, text2, _r2 = self.door(self.room("train02", self.c),
+                                    label="train02", fab=self.fab("r2"),
+                                    observe=self.observe(()),
+                                    now=lambda: later)
+        self.assertEqual(rc2, 3, text2)
+        self.assertEqual(self.spawns, [])
+
+        # CONTROL on the same row and clock: a readable launch time past the
+        # grace retires it, so the hold above is the unreadable time's.
+        readable = dict(row, ts=later - gatewindow.LOST_ANNOUNCE_GRACE_S - 1)
+        live, retired, _unknown = gatewindow.live_runs(
+            [readable], observe=self.observe(()),
+            pid_alive=lambda pid: False, now=lambda: later)
+        self.assertEqual(live, [])
+        self.assertEqual([r["token"] for r in retired], ["t0"])
+
+    def test_a_job_the_node_does_hold_is_not_retired(self):
+        _room, row = self.unnamed()
+        gen = self.generation("r1")
+
+        def held(argv):
+            key = self.key_of(argv)
+            return 0, json.dumps({
+                "v": 2, "event": "gate-job", "key": key,
+                "job_id": "gate-" + key, "tree": "a" * 40, "sha": self.c,
+                "disposition": "JOINED", "node": "node-a",
+                "generation": gen, "identity": {}, "budgets": {},
+                "snapshot": snapshot(state="SUPERSEDED", exit_code=93,
+                                     live=False),
+                "reason": "requested generation is superseded by canonical "
+                          "authority"}) + "\n", ""
+
+        rc, text = self.recovered(self.asked(held))
+        self.assertIn("HELD", text)
+        self.assertIn(gen, text)
+        self.assertNotIn("RETIRED", text)
+        self.assertEqual([r["token"] for r in
+                          gatewindow.read_runs(self.path)], [row["token"]])
+        self.assertEqual(self.retire_log(), [])
+        # CONTROL on the same row and the same log: the node's affirmative no
+        # retires it, so the hold above is the node's yes and not a door that
+        # never retires.
+        rc2, text2 = self.recovered(self.asked(self.no_record))
+        self.assertIn("RETIRED", text2)
+        self.assertEqual(gatewindow.read_runs(self.path), [])
+        self.assertEqual([e["row"]["token"] for e in self.retire_log()],
+                         [row["token"]])
+
+    def test_a_row_with_a_real_generation_is_never_asked_or_retired_here(self):
+        """This door is for rows nobody can name. A named row's liveness is its
+        own generation-bound observation, so an existence answer — even an
+        affirmative no — never reaches it. The unnamed row beside it in the
+        same store, under the same answer, is the control: it IS asked and
+        retired."""
+        _room, named = self.stood()
+        unnamed = dict(named, key="e" * 64, job_id="gate-" + "e" * 64,
+                       generation=None, pid=None, host="node-a",
+                       token="t-unnamed", announce="LOST")
+        gatewindow.write_runs(self.path, [named, unnamed])
+        gens = set(self.gens)
+        live = self.observe(("r1",))
+
+        def either(argv):
+            if "--exists" not in argv \
+                    and argv[argv.index("--generation") + 1] in gens:
+                return live(argv)
+            return self.no_record(argv)
+
+        rc, text = self.recovered(self.asked(either))
+        self.assertEqual(text.count("RETIRED"), 1, text)
+        self.assertIn(unnamed["job_id"], text)
+        self.assertEqual([r["token"] for r in
+                          gatewindow.read_runs(self.path)], [named["token"]])
+        self.assertEqual([e["row"]["token"] for e in self.retire_log()],
+                         ["t-unnamed"])
+        existence = [a[a.index("--job") + 1] for a in self.asks
+                     if "--exists" in a]
+        self.assertEqual(existence, [unnamed["job_id"]])
+
+    def test_a_row_younger_than_the_retire_floor_is_HELD_with_its_age(self):  # noqa: VACUOUS_ASSERTION — the HELD line, its age and its retirable time are positive; the same row past the floor retires below, on the same store and log
+        """The race the floor closes: a submit helm's own timeout killed can
+        leave fab's build child still registering the job, so for helm's
+        submit timeout plus a grace the node's "no such job" is not yet
+        evidence. A row meeting every other retire condition is HELD, is not
+        even asked about, and says its age and when it becomes retirable. The
+        same row past the floor, under the same answer, is the control."""
+        _room, row = self.unnamed()
+        rc, text = self.recovered(self.asked(self.no_record),
+                                  now=lambda: row["ts"] + 60)
+        self.assertNotIn("RETIRED", text)
+        self.assertIn("HELD", text)
+        self.assertIn("is 60s old", text)
+        self.assertEqual(self.asks, [])
+        self.assertEqual([r["token"] for r in
+                          gatewindow.read_runs(self.path)], [row["token"]])
+        self.assertEqual(self.retire_log(), [])
+        # THE RULED FLOOR: helm's 900 s submit timeout plus fab's 300 s
+        # rollout drain, built from the two named constants.
+        floor = gatewindow.SUBMIT_TIMEOUT_S + gatewindow.FAB_ROLLOUT_DRAIN_S
+        self.assertEqual((floor, gatewindow.RETIRE_FLOOR_S), (1200, 1200))
+        self.assertIn("retirable at %s" % time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(row["ts"] + floor)), text)
+
+        rc2, text2 = self.recovered(self.asked(self.no_record),
+                                    now=lambda: row["ts"] + floor + 1)
+        self.assertIn("RETIRED", text2)
+        self.assertEqual(gatewindow.read_runs(self.path), [])
+        self.assertEqual([e["row"]["token"] for e in self.retire_log()],
+                         [row["token"]])
+
+    def test_a_row_with_no_readable_launch_time_is_too_young_to_retire(self):  # noqa: VACUOUS_ASSERTION — a fixed four-value table, each asserting HELD and "unreadable" positively; the readable row after it retires under the same answer and clock
+        """Fail closed: an age nobody can measure is never old enough. The
+        readable row beside each case, under the same answer and clock, is the
+        control and retires."""
+        _room, row = self.unnamed()
+        later = row["ts"] + gatewindow.SUBMIT_TIMEOUT_S \
+            + gatewindow.FAB_ROLLOUT_DRAIN_S + 1
+        for ts in (None, "yesterday", float("inf"), True):
+            with self.subTest(ts=ts):
+                out = io.StringIO()
+                kept = gatewindow.clear_unnamed(
+                    self.path, [dict(row, ts=ts)],
+                    observe=self.asked(self.no_record), out=out,
+                    now=lambda: later)
+                self.assertEqual([r["token"] for r in kept], [row["token"]])
+                self.assertIn("HELD", out.getvalue())
+                self.assertIn("unreadable", out.getvalue())
+                self.assertNotIn("RETIRED", out.getvalue())
+                self.assertEqual(self.asks, [])
+        self.assertEqual(self.retire_log(), [])
+        out = io.StringIO()
+        kept = gatewindow.clear_unnamed(self.path, [row],
+                                        observe=self.asked(self.no_record),
+                                        out=out, now=lambda: later)
+        self.assertEqual(kept, [])
+        self.assertIn("RETIRED", out.getvalue())
+
+    def test_a_launch_time_no_float_or_calendar_holds_is_HELD_and_never_raises(self):  # noqa: VACUOUS_ASSERTION — each case asserts LIVE by token, HELD, no ask and the door's refusal positively; the readable row after them retires under the same answer and clock
+        """Two numbers a finite-looking `ts` can still break the reader with.
+        An int too large for a float (a 400-digit ts, which JSON reads back
+        as an int) overflowed `_row_ts` and, through it, EVERY read of the
+        store — the launch door's included. A finite float past the
+        calendar's range (1e18, 1e300) overflowed the retirable-time render
+        under `show --recover`, a verb that held such a row before the retire
+        door existed. Each is held, never asked and never raises, on every
+        road: the store read, the recover door and the launch door. The
+        readable row is the control and retires."""
+        _room, row = self.unnamed()
+        later = row["ts"] + gatewindow.SUBMIT_TIMEOUT_S \
+            + gatewindow.FAB_ROLLOUT_DRAIN_S + 1
+        spawned = len(self.spawns)
+        for n, ts in enumerate((10 ** 400, 1e18, 1e300)):
+            with self.subTest(ts=ts):
+                case = dict(row, ts=ts)
+                live, retired, _unknown = gatewindow.live_runs(
+                    [case], observe=self.observe(()),
+                    pid_alive=lambda pid: False, now=lambda: later)
+                self.assertEqual([r["token"] for r in live], [row["token"]])
+                self.assertEqual(retired, [])
+                out = io.StringIO()
+                kept = gatewindow.clear_unnamed(
+                    self.path, [case], observe=self.asked(self.no_record),
+                    out=out, now=lambda: later)
+                self.assertEqual([r["token"] for r in kept], [row["token"]])
+                self.assertIn("HELD", out.getvalue())
+                self.assertNotIn("RETIRED", out.getvalue())
+                self.assertEqual(self.asks, [])
+                # THE VERB ITSELF, over the store: it renders and holds.
+                gatewindow.write_runs(self.path, [case])
+                rc, text = self.recovered(self.asked(self.no_record),
+                                          now=lambda: later)
+                self.assertIn(row["job_id"], text)
+                self.assertNotIn("RETIRED", text)
+                self.assertEqual(self.asks, [])
+                self.assertEqual([r["token"] for r in
+                                  gatewindow.read_runs(self.path)],
+                                 [row["token"]])
+                # AND THE LAUNCH DOOR, whose read of the store must refuse
+                # over the held row rather than raise.
+                rc2, text2, _r2 = self.door(self.room("held%02d" % n, self.c),
+                                            label="train02",
+                                            fab=self.fab("r2", "node-a"),
+                                            observe=self.observe(()),
+                                            now=lambda: later)
+                self.assertEqual(rc2, 3, text2)
+                self.assertIn("REFUSED", text2)
+                self.assertEqual(len(self.spawns), spawned)
+        self.assertEqual(self.retire_log(), [])
+        gatewindow.write_runs(self.path, [row])
+        rc, text = self.recovered(self.asked(self.no_record),
+                                  now=lambda: later)
+        self.assertIn("RETIRED", text)
+        self.assertEqual(gatewindow.read_runs(self.path), [])
+
 
 class Supersede(WindowBase):
 
@@ -1022,6 +1759,59 @@ class LivenessIsMeasured(WindowBase):
         self.assertEqual(len(self.spawns), 1, self.spawns)
 
 
+class AuthorityObservation(unittest.TestCase):
+    """A terminal snapshot is authority only for the exact requested job."""
+
+    def setUp(self):
+        self.key = "a" * 64
+        self.generation = "run-%s-4114-%s" % ("b" * 32, "c" * 16)
+        self.tree = "d" * 40
+        self.row = {"key": self.key, "job_id": "gate-" + self.key,
+                    "host": "snoozy", "generation": self.generation,
+                    "tree": self.tree}
+
+    def event(self, **change):
+        event = json.loads(observed_event(
+            self.key, self.generation, "snoozy", self.tree,
+            disposition="RECEIPT", state="COMPLETED", exit_code=0,
+            receipt=RECEIPT_ID, live=False))
+        event.update(change)
+        return json.dumps(event) + "\n"
+
+    def state(self, text):
+        return gatewindow.job_state(
+            self.row, observe=lambda argv, timeout=None: (0, text, ""))
+
+    def test_only_the_exact_authority_identity_is_accepted(self):  # noqa: VACUOUS_ASSERTION — an exact COMPLETED control is asserted before every mismatched identity is rejected
+        valid = self.state(self.event())
+        self.assertEqual(valid["state"], "COMPLETED")
+        other_key = "e" * 64
+        mismatches = {
+            "key": self.event(key=other_key, job_id="gate-" + other_key),
+            "job": self.event(job_id="gate-" + "f" * 64),
+            "host": self.event(node="drowsy"),
+            "generation": self.event(
+                generation="run-%s-4114-%s" % ("1" * 32, "2" * 16)),
+        }
+        wrong_tree = json.loads(self.event())
+        wrong_tree["tree"] = "3" * 40
+        wrong_tree["identity"]["tree"] = "3" * 40
+        mismatches["tree"] = json.dumps(wrong_tree) + "\n"
+        for name, text in mismatches.items():
+            with self.subTest(name=name):
+                self.assertIsNone(self.state(text))
+
+    def test_SUPERSEDED_requires_a_different_valid_generation(self):
+        newer = "run-%s-4114-%s" % ("4" * 32, "5" * 16)
+        event = json.loads(self.event())
+        event.update(generation=newer, disposition="JOINED")
+        event["snapshot"].update(state="SUPERSEDED", exit=93, live=False)
+        self.assertEqual(self.state(json.dumps(event) + "\n")["state"],
+                         "SUPERSEDED")
+        event["generation"] = self.generation
+        self.assertIsNone(self.state(json.dumps(event) + "\n"))
+
+
 class NodeReading(unittest.TestCase):
     """`fab status` is an EXTERNAL producer; its spellings are its own."""
 
@@ -1156,6 +1946,41 @@ class WindowLock(WindowBase):
         with gatewindow._Lock(lock, pid_alive=lambda pid: True):
             pass
 
+    def asked_by_a_child(self):
+        """What `dispatching` answers in a REAL child of this process, which
+        is where `fab gate submit` asks helm its sizing question from."""
+        src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        proc = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); "
+             "from helm import gatewindow; "
+             "print(gatewindow.dispatching(path=sys.argv[2]))",
+             src, self.path], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def test_the_windows_own_dispatch_is_known_by_its_lineage(self):
+        """task/3463 item 14: a process asks whether the landing window's own
+        dispatch is asking it, and the answer is the lock: held by this
+        process or one of its ancestors. A child of the holder is inside the
+        dispatch; a process beside the holder is not, whatever it runs."""
+        lock = self.lockpath()
+        with gatewindow._Lock(lock):
+            self.assertEqual(self.asked_by_a_child(), "True")
+        # CONTROL: the window free, the same child is outside any dispatch.
+        self.assertEqual(self.asked_by_a_child(), "False")
+        # A LIVE HOLDER THAT IS NOT AN ANCESTOR: a sibling of the asker.
+        sibling = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(sibling.wait)
+        self.addCleanup(sibling.kill)
+        with open(lock, "w") as fh:
+            fh.write("%d\n" % sibling.pid)
+        self.assertEqual(self.asked_by_a_child(), "False")
+        # AN UNREADABLE HOLDER names nobody's lineage.
+        with open(lock, "w") as fh:
+            fh.write("\n")
+        self.assertEqual(self.asked_by_a_child(), "False")
+        os.unlink(lock)
+
 
 class Surface(WindowBase):
 
@@ -1229,6 +2054,370 @@ class Containment(WindowBase):
             request, row, lambda tip, ref: vcs.ANCESTOR)
         self.assertIsNone(err2)
         self.assertEqual(plan2["run_id"], "r1")
+
+
+def finished_event(host, seconds, scope, key, exit_code=0, state="COMPLETED"):
+    """WHAT A FINISHED LAND GATE LEAVES IN ITS JOB LOG: Fab's terminal
+    gate-job event as `fab gate --join` prints it — the node Fab placed the
+    gate on, the scope, and the execution seconds Fab measured — the one
+    record that names both the routing host and how long the gate took."""
+    snap = snapshot(state=state, exit_code=exit_code, receipt=RECEIPT_ID,
+                    live=False)
+    snap.update(execution_elapsed_s=seconds,
+                exit_class="OK" if exit_code == 0 else "FAILED")
+    return {"v": 2, "event": "gate-job", "key": key, "job_id": "gate-" + key,
+            "tree": "a" * 40, "sha": "a" * 40, "disposition": "RECEIPT",
+            "node": host, "node_id": "0" * 16,
+            "generation": "run-%s-4114-%s" % ("c" * 32, "d" * 16),
+            "identity": {"scope": scope, "tree": "a" * 40},
+            "budgets": {"queue_s": None, "execution_s": None},
+            "snapshot": snap, "reason": None}
+
+
+class FastHostRouting(WindowBase):
+    """A LAND GATE GOES WHERE IT FINISHES FIRST, AND NEVER ONTO A BUSY HOST.
+
+    The measured baseline: a land gate took a median 18.3 min on the fast
+    build host and 52.7 min on the slow one, and Fab's placement fell through
+    to the slow host whenever the fast one was at its cap. The door now routes
+    each gate to the host with the lowest EXPECTED FINISH — its median green
+    land gate from the window's own job logs, plus what is left of the gate
+    running there — and pins that host on Fab by excluding every other.
+
+    THE FAB SEAM HERE PLACES LIKE FAB: the first host of its OWN preference
+    that FAB_EXCLUDE_HOSTS leaves. Its preference puts the SLOW host first
+    wherever the arm is about the door's choice, so a gate that lands on the
+    fast host was put there by the door's pin and not by Fab's taste. Hosts
+    are fixture names; the config lists the slow host first, so config order
+    alone would choose wrong.
+    """
+
+    FAST, SLOW = "fastbox", "slowbox"
+    T0 = 1800000000.0
+
+    def setUp(self):
+        super().setUp()
+        self.placed = []
+        self.logged = 0
+
+    def finished(self, host, seconds, count=3, mode="serial", exit_code=0,
+                 state="COMPLETED"):
+        """Plant `count` finished land gates of `host` in the window's logs,
+        each newer than the last, exactly where the door writes them."""
+        scope = fabgate.whole_scope() if mode == "serial" \
+            else fabgate.slice_scope()
+        for _n in range(count):
+            self.logged += 1
+            key = hashlib.sha256(("%s %d" % (host, self.logged))
+                                 .encode()).hexdigest()
+            log = gatewindow.log_path(self.path, "gate-" + key)
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(finished_event(
+                    host, seconds, scope, key, exit_code, state)) + "\n")
+                fh.write(json.dumps({"exit": exit_code, "receipt": RECEIPT_ID,
+                                     "state": state,
+                                     "verdict": "imported"}) + "\n")
+            stamp = self.T0 - 1000000 + self.logged
+            os.utime(log, (stamp, stamp))
+
+    def measured_fast_and_slow(self, fast=1000, slow=3000):
+        own_env(self, HOSTS_ENV, "%s %s" % (self.SLOW, self.FAST))
+        self.finished(self.FAST, fast)
+        self.finished(self.SLOW, slow)
+
+    def placing(self, prefer, run_id="r1", down=(), obey=True):
+        """Fab's placement: the first host of `prefer` that FAB_EXCLUDE_HOSTS
+        leaves (every host when `obey` is False) and that is not `down`; a
+        failed measure when none is left. The submit launches on the host
+        the measure named."""
+        def _fab(argv, timeout=None, env=None):
+            given = None if env is None else env.get(EXCLUDE_ENV)
+            self.exclusions.append((argv[2], given))
+            shut = set((given or "").split()) if obey else set()
+            if argv[:3] == [gatewindow.FAB_BINARY, "gate", "measure"]:
+                self.measures.append(list(argv))
+                left = [h for h in prefer if h not in shut and h not in down]
+                if not left:
+                    return 1, "", ("fab: no build node admitted this gate "
+                                   "(probed: %s)" % " ".join(prefer))
+                self.placed.append(left[0])
+                return 0, measured(left[0]), ""
+            if argv[:3] == [gatewindow.FAB_BINARY, "gate", "submit"]:
+                self.spawns.append(list(argv))
+                body = json.loads(argv[argv.index("--request-json") + 1])
+                return 0, job_event(body["key"], self.generation(run_id),
+                                    self.placed[-1], live=True), ""
+            raise AssertionError("the door ran an unexpected fab command: %r"
+                                 % (argv,))
+        return _fab
+
+    def launch(self, room, label, at, run_id="r1", live=(), **kw):
+        kw.setdefault("fab", self.placing((self.SLOW, self.FAST), run_id))
+        return self.door(room, label=label, observe=self.observe(live),
+                         now=lambda: at, **kw)
+
+    def moved_room(self, name):
+        return self.room(name, self.commit(name))
+
+    def test_with_both_hosts_free_the_fast_host_is_chosen(self):
+        self.measured_fast_and_slow()
+        rc, text, _req = self.launch(self.room("train01", self.c), "train01",
+                                     self.T0)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.placed, [self.FAST])
+        self.assertEqual([r["host"] for r in gatewindow.read_runs(self.path)],
+                         [self.FAST])
+        # PINNED BY EXCLUSION, on both calls: the measure and the submit
+        # exclude the slow host, and only it.
+        self.assertEqual(self.exclusions,
+                         [("measure", self.SLOW), ("submit", self.SLOW)])
+        self.assertIn("ROUTED to %s" % self.FAST, text)
+        self.assertIn("~16.7 min", text)    # the fast median, 1,000 s
+        self.assertIn("~50.0 min", text)    # the slow median, 3,000 s
+
+    def test_a_busy_fast_host_that_still_finishes_first_is_waited_for(self):
+        self.measured_fast_and_slow(fast=1000, slow=3000)
+        rc, text, _req = self.launch(self.room("train01", self.c), "train01",
+                                     self.T0)
+        self.assertEqual(rc, 0, text)
+        # A NEW WINDOW 200 s LATER: the fast host has ~800 s left, so it
+        # finishes this gate in ~1,800 s against the slow host's 3,000 s.
+        second = self.moved_room("train02")
+        rc2, text2, _r2 = self.launch(second, "train02", self.T0 + 200, "r2",
+                                      live=("r1",))
+        self.assertEqual(rc2, 3, text2)
+        self.assertIn("REFUSED", text2)
+        self.assertIn("WAIT", text2)
+        self.assertIn(self.FAST, text2)
+        self.assertIn("~30.0 min", text2)
+        self.assertIn("helm gate window launch --repo %s"
+                      % os.path.realpath(second), text2)
+        self.assertEqual(len(self.measures), 1, "measured a gate it waits on")
+        self.assertEqual(len(self.spawns), 1, self.spawns)
+        # CONTROL, at the same moment: a slow host now measured to finish in
+        # 1,500 s (< 1,800 s) takes the same gate, pinned the same way.
+        self.finished(self.SLOW, 1500, count=4)
+        rc3, text3, _r3 = self.launch(second, "train02", self.T0 + 200, "r2",
+                                      live=("r1",))
+        self.assertEqual(rc3, 0, text3)
+        self.assertEqual(self.placed, [self.FAST, self.SLOW])
+        self.assertEqual(self.exclusions[-2:],
+                         [("measure", self.FAST), ("submit", self.FAST)])
+
+    def test_a_fast_host_excluded_or_down_sends_the_gate_to_the_slow_host(self):
+        self.measured_fast_and_slow()
+        own_env(self, EXCLUDE_ENV, self.FAST)
+        rc, text, _req = self.launch(
+            self.room("train01", self.c), "train01", self.T0,
+            fab=self.placing((self.FAST, self.SLOW)))
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.placed, [self.SLOW])
+        self.assertIn("excluded (%s)" % EXCLUDE_ENV, text)
+        # DOWN: nothing excludes it, but Fab cannot place a gate there. The
+        # door routes again without it rather than refusing the train.
+        own_env(self, EXCLUDE_ENV, "")
+        rc2, text2, _r2 = self.launch(
+            self.moved_room("train02"), "train02", self.T0 + 60, "r2",
+            fab=self.placing((self.FAST, self.SLOW), "r2", down=(self.FAST,)))
+        self.assertEqual(rc2, 0, text2)
+        self.assertEqual(self.placed, [self.SLOW, self.SLOW])
+        self.assertEqual([e for e in self.exclusions if e[0] == "measure"],
+                         [("measure", self.FAST), ("measure", self.SLOW),
+                          ("measure", self.FAST)])
+        self.assertIn("could not take", text2)
+        # CONTROL: the same launch with the fast host up goes to it.
+        rc3, text3, _r3 = self.launch(
+            self.moved_room("train03"), "train03", self.T0 + 120, "r3",
+            fab=self.placing((self.FAST, self.SLOW), "r3"))
+        self.assertEqual(rc3, 0, text3)
+        self.assertEqual(self.placed, [self.SLOW, self.SLOW, self.FAST])
+
+    def test_a_second_gate_is_never_submitted_onto_a_busy_host(self):
+        # 1,500 s on the slow host beats ~800 s left plus 1,000 s on the fast
+        # one, so the door routes the second gate to the free slow host...
+        self.measured_fast_and_slow(fast=1000, slow=1500)
+        rc, text, _req = self.launch(self.room("train01", self.c), "train01",
+                                     self.T0)
+        self.assertEqual(rc, 0, text)
+        second = self.moved_room("train02")
+        # ...and a Fab that ignores the exclusion answers the BUSY fast host.
+        # The door reads the host Fab answered and submits nothing onto it.
+        rc2, text2, _r2 = self.launch(
+            second, "train02", self.T0 + 200, "r2", live=("r1",),
+            fab=self.placing((self.FAST, self.SLOW), "r2", obey=False))
+        self.assertEqual(rc2, 3, text2)
+        self.assertIn("REFUSED", text2)
+        self.assertIn("ALREADY RUNNING on %s" % self.FAST, text2)
+        self.assertEqual(len(self.spawns), 1, self.spawns)
+        # CONTROL: a Fab that honours the exclusion places it on the free host.
+        rc3, text3, _r3 = self.launch(second, "train02", self.T0 + 200, "r2",
+                                      live=("r1",))
+        self.assertEqual(rc3, 0, text3)
+        self.assertEqual(self.placed, [self.FAST, self.FAST, self.SLOW])
+        self.assertEqual(len(self.spawns), 2, self.spawns)
+
+    def test_with_no_host_known_fab_places_it_excluding_every_busy_host(self):
+        rc, text, _req = self.door(self.room("train01", self.c),
+                                   label="train01", observe=self.observe(()))
+        self.assertEqual(rc, 0, text)
+        # CONTROL: nothing busy, nothing known — Fab's environment untouched.
+        self.assertEqual(self.exclusions, [("measure", None),
+                                           ("submit", None)])
+        rc2, text2, _r2 = self.door(self.moved_room("train02"),
+                                    label="train02",
+                                    fab=self.fab("r2", "drowsy"),
+                                    observe=self.observe(("r1",)))
+        self.assertEqual(rc2, 0, text2)
+        self.assertEqual(self.exclusions[2:], [("measure", "snoozy"),
+                                               ("submit", "snoozy")])
+
+    def test_with_no_history_the_config_order_decides(self):
+        own_env(self, HOSTS_ENV, "zeta alpha")
+        prefer = ("alpha", "zeta")
+        rc, text, _req = self.launch(self.room("train01", self.c), "train01",
+                                     self.T0, fab=self.placing(prefer))
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.placed, ["zeta"])
+        # zeta busy: the next free host in config order.
+        rc2, text2, _r2 = self.launch(
+            self.moved_room("train02"), "train02", self.T0 + 60, "r2",
+            live=("r1",), fab=self.placing(prefer, "r2"))
+        self.assertEqual(rc2, 0, text2)
+        self.assertEqual(self.placed, ["zeta", "alpha"])
+        # both busy: nothing is stacked; it waits on the first in config order.
+        rc3, text3, _r3 = self.launch(
+            self.moved_room("train03"), "train03", self.T0 + 120, "r3",
+            live=("r1", "r2"), fab=self.placing(prefer, "r3"))
+        self.assertEqual(rc3, 3, text3)
+        self.assertIn("WAIT", text3)
+        self.assertIn("ALREADY RUNNING on zeta", text3)
+        self.assertEqual(len(self.spawns), 2, self.spawns)
+
+    def test_a_red_or_canceled_gate_is_not_read_as_a_fast_host(self):
+        self.measured_fast_and_slow(fast=1000, slow=3000)
+        self.finished(self.SLOW, 60, count=5, exit_code=1)
+        self.finished(self.SLOW, 30, count=5, exit_code=1, state="CANCELED")
+        rc, text, _req = self.launch(self.room("train01", self.c), "train01",
+                                     self.T0)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.placed, [self.FAST])
+        # CONTROL: the same short runs GREEN are the slow host's real speed.
+        self.finished(self.SLOW, 60, count=5)
+        rc2, text2, _r2 = self.launch(self.moved_room("train02"), "train02",
+                                      self.T0)
+        self.assertEqual(rc2, 0, text2)
+        self.assertEqual(self.placed, [self.FAST, self.SLOW])
+
+    def test_the_default_key_runs_two_rooms_of_one_trunk_head_on_two_hosts(self):
+        """THE DEFAULT IS THE HOST KEY (R1 of the landing refactor): one gate
+        per host, and two rooms of one trunk head (a train and the same train
+        less an ejected car) run at once on two hosts. `trunk` is the escape
+        that keeps the one-gate-per-trunk-head refusal."""
+        own_env(self, KEY_ENV, "")
+        self.measured_fast_and_slow(fast=1000, slow=1500)
+        rc, text, _req = self.launch(self.room("train01", self.c), "train01",
+                                     self.T0)
+        self.assertEqual(rc, 0, text)
+        sibling = self.room("sibling", self.side)   # same trunk head, apart
+        # CONTROL FIRST: under the trunk key, the escape, the sibling is the
+        # same landing window and is refused as one.
+        own_env(self, KEY_ENV, "trunk")
+        rc2, text2, _r2 = self.launch(sibling, "sibling", self.T0 + 200, "r2",
+                                      live=("r1",))
+        self.assertEqual(rc2, 3, text2)
+        self.assertIn("landing window", text2)
+        # THE DEFAULT, with the key unset: admitted, on the other host.
+        own_env(self, KEY_ENV, "")
+        rc3, text3, _r3 = self.launch(sibling, "sibling", self.T0 + 200, "r2",
+                                      live=("r1",))
+        self.assertEqual(rc3, 0, text3)
+        rows = gatewindow.read_runs(self.path)
+        self.assertEqual(sorted(r["host"] for r in rows),
+                         [self.FAST, self.SLOW])
+        self.assertEqual({r["trunk"] for r in rows}, {self.c})
+        # NEVER TWO ON ONE HOST: a third room of the same head, both busy.
+        self.git("checkout", "-q", "-b", "third", self.a)
+        apart = self.commit("third", path="h")
+        self.git("checkout", "-q", self.main)
+        rc4, text4, _r4 = self.launch(self.room("third", apart), "third",
+                                      self.T0 + 200, "r3",
+                                      live=("r1", "r2"))
+        self.assertEqual(rc4, 3, text4)
+        self.assertIn("ALREADY RUNNING on %s" % self.FAST, text4)
+        self.assertEqual(len(self.spawns), 2, self.spawns)
+
+
+class WindowKeyDefault(unittest.TestCase):
+    """HELM_GATE_WINDOW_KEY reads `host` unless it says `trunk`."""
+
+    def test_the_default_key_is_the_host_and_trunk_is_the_escape(self):  # noqa: VACUOUS_ASSERTION — every assertion is an exact key value, trunk and host both
+        from helm import gatehost
+        for environ in ({}, {KEY_ENV: ""}, {KEY_ENV: "host"},
+                        {KEY_ENV: "bogus"}):
+            self.assertEqual(gatehost.window_key(environ), gatehost.KEY_HOST,
+                             environ)
+        for raw in ("trunk", " Trunk "):
+            self.assertEqual(gatehost.window_key({KEY_ENV: raw}),
+                             gatehost.KEY_TRUNK, raw)
+
+
+class RouteByMode(unittest.TestCase):
+    """The median a route reads is the request's MODE's; while no host has a
+    gate of that mode, gates of any mode rank the hosts."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-gatehost-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.planted = 0
+
+    def plant(self, host, seconds, scope, count=3):
+        for _n in range(count):
+            self.planted += 1
+            key = hashlib.sha256(("%s %d" % (host, self.planted))
+                                 .encode()).hexdigest()
+            path = os.path.join(self.tmp, "gate-%s.log" % key)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(finished_event(host, seconds, scope, key))
+                         + "\n")
+            os.utime(path, (1000 + self.planted, 1000 + self.planted))
+
+    def route(self, mode, busy, environ=None):
+        from helm import gatehost
+        return gatehost.plan(mode, busy, self.tmp, environ=environ or {},
+                             now=100.0)
+
+    def test_each_mode_reads_its_own_median(self):
+        whole, sliced = fabgate.whole_scope(), fabgate.slice_scope()
+        self.plant("quick", 1000, whole)
+        self.plant("quick", 200, sliced)
+        self.plant("sluggish", 1500, whole)
+        self.plant("sluggish", 250, sliced)
+        # quick runs a sliced gate launched 100 s ago: ~100 s left of 200.
+        busy = [{"host": "quick", "ts": 0.0, "mode": "sliced"}]
+        # SLICED: 100 + 200 on quick against 250 on sluggish -> go now.
+        route = self.route("sliced", busy)
+        self.assertEqual(route["host"], "sluggish")
+        self.assertEqual(route["exclude"], ["quick"])
+        # SERIAL, same moment: 100 + 1,000 on quick beats 1,500 -> wait.
+        route2 = self.route("serial", busy)
+        self.assertIsNone(route2["host"])
+        self.assertEqual(route2["wait"]["host"], "quick")
+
+    def test_no_gate_of_the_mode_yet_ranks_hosts_by_their_gates_of_any_mode(self):
+        self.plant("quick", 1000, fabgate.whole_scope())
+        self.plant("sluggish", 3000, fabgate.whole_scope())
+        busy = [{"host": "quick", "ts": 0.0, "mode": "sliced"}]
+        # No sliced gate anywhere: the serial medians still say quick is
+        # three times faster, so a sliced gate waits for it.
+        route = self.route("sliced", busy)
+        self.assertIsNone(route["host"])
+        self.assertEqual(route["wait"]["host"], "quick")
+        self.assertIn("no sliced gate measured yet", "\n".join(route["lines"]))
+        # CONTROL on the same observable: with quick excluded, the only
+        # candidate left takes it.
+        route2 = self.route("sliced", busy, {"FAB_EXCLUDE_HOSTS": "quick"})
+        self.assertEqual(route2["host"], "sluggish")
 
 
 if __name__ == "__main__":

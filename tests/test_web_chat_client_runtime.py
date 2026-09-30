@@ -43,7 +43,11 @@ EXTRACT = ["pollChat", "chatDmState", "chatResetLog", "chatHydrateParents", "cha
            "dashChatAgeS", "dashChatExpired", "dashAnswers",
            "dashAnswersClock", "dashFleetClock",
            # the owner's name the poll stamps before it draws a row
-           "chatOwnerStamp", "chatPostAs", "chatTypedName"]
+           "chatOwnerStamp", "chatPostAs", "chatTypedName",
+           # the ack fold the poll and the older page draw acks through
+           # (tests/test_web_chat_ack_fold.py pins what they draw)
+           "dayStamp", "chatAckIds", "chatAckFolds", "chatAckLine",
+           "chatAckRun", "chatAckAppend", "chatPageHtml"]
 
 
 def _extract_fn(src, name):
@@ -257,7 +261,7 @@ class TestChatClientRuntime(unittest.TestCase):
         """THE POSITIVE CONTROL FOR THE ARM ABOVE, over the same transport and
         the same deadline: a read that answers late but in time renders its rows,
         stamps no failure, and draws the answers card off the envelope THIS POLL
-        fetched — with the `helm chat read` provenance line every chat-fed card
+        fetched — with the chat-read provenance line every chat-fed card
         carries. Without this, NOT READ above could be a harness that cannot
         render anything."""
         r = self._result("a_read_that_answers_LATE_still_renders")
@@ -267,7 +271,7 @@ class TestChatClientRuntime(unittest.TestCase):
         self.assertGreater(d["answeredStamp"], 0, json.dumps(d))
         self.assertIn("answers for you", d["card"])
         self.assertIn("the node is back", d["card"])
-        self.assertIn("helm chat read", d["card"])
+        self.assertIn("chat · read", d["card"])
         self.assertTrue(r["pass"], json.dumps(d))
 
     def test_the_owners_name_is_stamped_from_the_reset_open_before_its_rows_draw(self):
@@ -296,6 +300,100 @@ class TestChatClientRuntime(unittest.TestCase):
         self.assertTrue(r["detail"]["p100resolved"])
         self.assertFalse(r["detail"]["p100gone"])
         self.assertEqual(r["detail"]["goneSize"], 0)            # nothing branded gone
+
+
+class ChatSigningOwnerTextTest(unittest.TestCase):
+    """RULE 2 ON THE CHAT VIEW (console walk 4, P1 2). The Chat view's
+    transport strip printed a failure's reason and cause, its hover printed
+    the remediation, and each unsigned row printed "profile/code: reason", so
+    the owner read "Relaunch through `helm launch`" beside every post of a
+    seat run in his own session. The real `chatTransport` and `chatRow` run
+    here over a failure whose agents' text names verbs, beside the owner copy
+    the server sends."""
+
+    STUBS = r"""
+const els = {chattransport: {textContent: "", title: ""}};
+function $(sel) { return els[sel.slice(1)]; }
+function esc(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function chatPostAs() { return "owner"; }
+const CHAT_RSET = [], CHAT_CLAMP_CHARS = 1e9, CHAT_CLAMP_LINES = 1e9;
+function chatIndex() {}
+function chatKey() { return "k"; }
+function chatThreadKey() { return "t"; }
+function chatQuote() { return ""; }
+function dayStamp() { return ""; }
+"""
+    RUN = r"""
+const fault = {profile: "seat-a", code: "identity_conflict",
+  reason: "identity conflict: Relaunch through `helm launch` (which sets both vars to the seat)",
+  cause: "not re-probeable — clears on `helm chat transport ack --profile seat-a`",
+  remediation: "relaunch this seat through `helm launch`; helm chat transport ack --profile <name>",
+  owner_say: "OWNER-SAY seat-a posts unsigned; its lead starts it again",
+  first_failure: "first", last_failure: "last", last_age_s: 12};
+const out = {};
+for (const mode of ["degraded", "unknown"]) {
+  chatTransport({...fault, mode});
+  out[mode] = els.chattransport.textContent + "\n" + els.chattransport.title;
+}
+const row = {from: "seat-a", text: "hello", ts: "t"};
+out.row = chatRow({...row, transport: {...fault, state: "DEGRADED"}});
+out.expected = chatRow({...row, transport: {...fault, state: "DEGRADED",
+                                            expected_unsigned: true}});
+out.signed = chatRow({...row, chain: 7});
+console.log(JSON.stringify(out));
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        node = shutil.which("node")
+        if not node:
+            raise unittest.SkipTest("node not available")
+        src = web_ui_loader.read_text()
+        fns = "\n\n".join(_extract_fn(src, n) for n in ("chatTransport",
+                                                         "chatRow"))
+        cls.tmp = tempfile.mkdtemp(prefix="helm-chat-signing-")
+        path = os.path.join(cls.tmp, "run.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(cls.STUBS + fns + cls.RUN)
+        cls.proc = subprocess.run([node, path], capture_output=True,
+                                  text=True, timeout=60)
+        cls.out = json.loads(cls.proc.stdout or "{}")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
+
+    def test_the_strip_and_an_unsigned_row_draw_the_owners_words(self):
+        from tests._ownerverbs import owner_verbs
+        self.assertTrue(self.out, self.proc.stderr)
+        # POSITIVE CONTROLS: each render is the state named, with the owner copy
+        self.assertIn("DEGRADED", self.out["degraded"])
+        self.assertIn("UNKNOWN", self.out["unknown"])
+        self.assertIn("⚠ DEGRADED", self.out["row"])
+        self.assertIn('class="cdiag"', self.out["row"])
+        self.assertIn("✓", self.out["signed"])
+        for name in ("degraded", "unknown", "row"):
+            self.assertIn("OWNER-SAY seat-a posts unsigned", self.out[name], name)
+            self.assertNotIn("Relaunch", self.out[name], name)
+            self.assertNotIn("re-probeable", self.out[name], name)
+            self.assertEqual(owner_verbs(self.out[name]), [],
+                             "%s: %s" % (name, self.out[name]))
+
+    def test_a_row_from_a_seat_run_outside_the_launcher_is_quietly_unsigned(self):
+        """A seat run outside helm's launcher under a shell's profile posts
+        unsigned by design (the server's `expected_unsigned`): its rows carry a
+        quiet "unsigned" mark whose hover is the owner copy, not the red
+        DEGRADED alarm and its diagnostic line."""
+        from tests._ownerverbs import owner_verbs
+        row = self.out.get("expected", "")
+        self.assertIn(">unsigned<", row)
+        self.assertIn("OWNER-SAY seat-a posts unsigned", row)
+        self.assertNotIn("DEGRADED", row)
+        self.assertNotIn('class="cdiag"', row)
+        self.assertEqual(owner_verbs(row), [], row)
 
 
 if __name__ == "__main__":

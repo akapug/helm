@@ -7,6 +7,8 @@
    next turn surfaces the message through the shipped reflex. Simple DOM
    only — the panel must work from the Orca mobile app's browser. */
 let CHAT_SINCE = 0, CHAT_WIRED = false, CHAT_REACTS = {}, CHAT_NOTIFY_KEY = "";
+// the room's unseen count off the last poll, and the one the owner's hand last acked (`chatSeen`)
+let CHAT_UNSEEN = null, CHAT_ACKED = null;
 const CHAT_RSET = ["👍", "🎉", "🔥", "❤️", "👀"]; // the tiny click-to-react set
 /* WHO THE OWNER POSTS AS. No person's name ships in this page. The name box
    holds only a name the owner TYPED, and only that name is stored. A post,
@@ -84,6 +86,9 @@ let CHAT_ROOMS_OPEN = new Set();
    pre-id reply can require an exact (ts, from, text) match instead of silently
    quoting whichever sibling happened to index first. */
 let CHAT_BY_ID = {}, CHAT_BY_KEY = {}, CHAT_REPLYN = {}, CHAT_KIDS = {}, CHAT_REPLY_TO = null;
+// the receipt line the log ends with, while it does: {from, rows, key}
+// (chatAckAppend). An ack arriving next from the same sender joins it.
+let CHAT_ACK_TAIL = null;
 let CHAT_ROSTER = [], CHAT_PRESENCE = {};   // @mention completion + seat ages
 let CHAT_DIVIDED = false, CHAT_AWAY = 0;    // the unread divider + jump button
 // ── lazy-load window (aligned 1:1 with the predecessor chat: recent-50 initial paint +
@@ -325,14 +330,19 @@ function chatRow(m) {
   const owner = !!me && who === me;
   // Receipt truth on the row itself: signed tick, or a LOUD attempted-signing
   // fallback. Configured-off v1 rows stay quietly unsigned; the transport strip
-  // explains that room-wide fact.
+  // explains that room-wide fact. A seat run outside helm's launcher under a
+  // shell's profile posts unsigned BY DESIGN (the server's
+  // `expected_unsigned`): a quiet mark, not the alarm. The diagnostic is the
+  // server's owner copy (`owner_say`), never `reason`: that is the agents'
+  // text and names helm verbs (console walk 4, P1 2).
   const tr = m.transport || {}, degraded = tr.state === "DEGRADED";
+  const quiet = degraded && tr.expected_unsigned === true;
   const tick = (m.chain != null)
     ? '<span class="ctick" title="signed — chain #' + esc(String(m.chain)) + '">✓</span>'
+    : quiet ? '<span class="ctick" title="' + esc(tr.owner_say || "posted unsigned, as expected") + '">unsigned</span>'
     : degraded ? '<span class="ctick" style="color:var(--bad)" title="unsigned RAM fallback">⚠ DEGRADED</span>' : "";
-  const diag = degraded
-    ? '<div class="cdiag">' + esc(tr.profile || "?") + '/' + esc(tr.code || "signing") +
-      ': ' + esc(tr.reason || "unknown failure") + '</div>' : "";
+  const diag = degraded && !quiet
+    ? '<div class="cdiag">' + esc(tr.owner_say || (tr.profile || "a seat") + "'s post went out unsigned") + '</div>' : "";
   const rbar = '<span class="rbar">' + CHAT_RSET.map(e =>
     '<button class="rbtn" data-e="' + e + '">' + e + "</button>").join("") +
     '<button class="rbtn rbreply" title="reply to this message">↩</button></span>';
@@ -366,15 +376,85 @@ function chatApplyReact(m) {
     .map(([e, n]) => "<span>" + esc(e) + "×" + n + "</span>").join("");
 }
 
+/* AN ACK IS A RECEIPT, NOT CONVERSATION. `helm chat ack` writes a row that
+   names the rows it closes (`ack`, and `acks` for a bulk row: chat.post), and
+   a seat that acks 31 rows one call at a time wrote 31 of them, which this log
+   drew as 31 rows of "handled in-session". Consecutive DONE acks from one
+   sender draw as ONE line that counts the rows they acked, as `helm chat read`
+   prints them (chat.ack_runs): across polls, because they arrive one per poll,
+   and in one response, because a reset open paints them together. A single
+   ack still draws its own line. A blocked ack carries a reason its sender
+   must act on, so it draws as a message (chatRow) and ends the run. */
+function chatAckIds(m) {
+  const one = m && m.ack;
+  if (typeof one !== "string" || !one) return [];
+  const many = m.acks;
+  if (Array.isArray(many) && many.length && many[0] === one
+      && many.every(a => typeof a === "string" && a)) return many;
+  return [one];
+}
+function chatAckFolds(m) {
+  return chatAckIds(m).length > 0 && String(m.ackstate || "done").toLowerCase() === "done";
+}
+function chatAckLine(run) {
+  const rows = run.rows, ids = [].concat(...rows.map(chatAckIds)), n = ids.length;
+  const notes = rows.map(r => String(r.text || "")).filter(Boolean)
+    .filter((t, i, a) => a.indexOf(t) === i);
+  const what = n === 1 ? "acked " + ids[0].slice(0, 8) : "acked " + n + " rows";
+  const said = notes.slice(0, 3).join(" | ") +                  // chat.ACK_NOTES_SHOWN
+    (notes.length > 3 ? " | +" + (notes.length - 3) + " more notes" : "");
+  return '<div class="chatmsg chatack" data-ackrun="' + esc(run.key) + '" data-from="' +
+    esc(run.from) + '" data-ts="' + esc(rows[0].ts || "") + '" data-n="' + n +
+    '" title="' + esc(ids.join(" ")) + '"><span class="cwho">' + esc(run.from) +
+    '</span><span class="cts">' + dayStamp(rows[0].ts) + '</span><span class="cack">✓ ' +
+    esc(what + (said ? ": " + said : "")) + "</span></div>";
+}
+function chatAckRun(m) {
+  return {from: String(m.from || "?"), rows: [m], key: String(m.id || chatThreadKey(m))};
+}
+/* The poll's path: the receipt the log ends with takes the next ack from its
+   sender in place; anything else starts a new one at the end of the log. */
+function chatAckAppend(m) {
+  const log = $("#chatlog"), t = CHAT_ACK_TAIL;
+  if (t && t.from === String(m.from || "?")) {
+    const el = log.querySelector('.chatack[data-ackrun="' + CSS.escape(t.key) + '"]');
+    if (el) { t.rows.push(m); el.outerHTML = chatAckLine(t); return; }
+  }
+  CHAT_ACK_TAIL = chatAckRun(m);
+  log.insertAdjacentHTML("beforeend", chatAckLine(CHAT_ACK_TAIL));
+}
+/* An older page's html, its own runs folded (reactions are applied, not
+   drawn). A run at the page's foot does not join a receipt at the top of the
+   log below it: the page draws its own. */
+function chatPageHtml(lines) {
+  let html = "", run = null;
+  const close = () => { if (run) { html += chatAckLine(run); run = null; } };
+  for (const m of lines) {
+    if (m.react) continue;
+    if (!chatAckFolds(m)) { close(); html += chatRow(m); continue; }
+    if (run && run.from === String(m.from || "?")) run.rows.push(m);
+    else { close(); run = chatAckRun(m); }
+  }
+  close();
+  return html;
+}
+
 function chatTransport(t) {
   if (!t) return;
   const el = $("#chattransport");
-  if (t.mode === "degraded") {
-    el.textContent = "DEGRADED · " + (t.profile || "?") + " · " +
-      (t.reason || "signing failed") + " · first " + (t.first_failure || "?") +
+  // THE OWNER'S COPY ONLY (`owner_say`): `reason`, `cause` and `remediation`
+  // are the agents' text and name helm verbs (console walk 4, P1 2).
+  if (t.mode === "unknown") {
+    el.textContent = "UNKNOWN · " + (t.owner_say || (t.profile || "a seat") + "'s posts went out unsigned") +
       " · last " + (t.last_failure || "?") + " (" + (t.last_age_s || 0) + "s ago)";
-    el.title = "RAM chat still delivers unsigned rows. Remediation: " +
-      (t.remediation || "repair signing, then retry a signed turn");
+    el.title = "A signing failure whose cause could not be checked again from here: not healthy, not proven broken.";
+    return;
+  }
+  if (t.mode === "degraded") {
+    el.textContent = "DEGRADED · " + (t.owner_say || (t.profile || "a seat") + "'s posts went out unsigned") +
+      " · first " + (t.first_failure || "?") +
+      " · last " + (t.last_failure || "?") + " (" + (t.last_age_s || 0) + "s ago)";
+    el.title = "Chat still delivers every post; the posts named here go out unsigned.";
     return;
   }
   el.textContent = t.mode === "signed"
@@ -481,14 +561,19 @@ async function pollChat() {
         const away = !$("#view-chat").classList.contains("on") || document.hidden;
         const cut = d.owner_read | 0;
         let html = "", abs = absBase;
+        // an ack joins the receipt the LOG ends with (chatAckAppend), so the
+        // rows drawn before it reach the log first
+        const flush = () => { if (html) { log.insertAdjacentHTML("beforeend", html); html = ""; } };
         for (const m of d.lines) {
           if (m.react) { abs++; continue; }
           if (!CHAT_DIVIDED && cut > 0 && abs >= cut && (sentSince === 0 || away)) {
-            html += CHAT_DIV_HTML; CHAT_DIVIDED = true;
+            html += CHAT_DIV_HTML; CHAT_DIVIDED = true; CHAT_ACK_TAIL = null;
           }
+          if (chatAckFolds(m)) { flush(); chatAckAppend(m); abs++; continue; }
+          CHAT_ACK_TAIL = null;
           html += chatRow(m); abs++;
         }
-        log.insertAdjacentHTML("beforeend", html);
+        flush();
         msgs.forEach(chatBumpReply); // resolved children bump their parent's ↩N
       }
       d.lines.filter(m => m.react).forEach(chatApplyReact);
@@ -508,6 +593,7 @@ async function pollChat() {
 function chatResetLog() {
   $("#chatlog").innerHTML = "";
   CHAT_REACTS = {}; CHAT_BY_ID = {}; CHAT_BY_KEY = {}; CHAT_REPLYN = {}; CHAT_KIDS = {};
+  CHAT_ACK_TAIL = null;
   CHAT_DIVIDED = false; CHAT_AWAY = 0; CHAT_OLDEST_BASE = 0; // no older page until the next paint stamps base
   CHAT_GEN = null; CHAT_GONE = new Set(); // a reset re-derives the rotation cursor + the gone-set from scratch
 }
@@ -539,9 +625,7 @@ async function chatLoadOlder() {
     if (typeof d.gen === "string" && CHAT_GEN !== null && d.gen !== CHAT_GEN) return;
     if (!d.lines.length) { CHAT_OLDEST_BASE = (typeof d.base === "number") ? d.base : 0; return; }
     const log = $("#chatlog"), oldH = log.scrollHeight;
-    let html = "";
-    for (const m of d.lines) { if (!m.react) html += chatRow(m); } // chatRow indexes each row
-    log.insertAdjacentHTML("afterbegin", html);
+    log.insertAdjacentHTML("afterbegin", chatPageHtml(d.lines)); // chatRow indexes each row
     d.lines.forEach(chatBumpReply);                 // reply/jump resolve across the loaded window
     d.lines.filter(m => m.react).forEach(chatApplyReact);
     CHAT_OLDEST_BASE = (typeof d.base === "number") ? d.base : 0; // walk the cursor further up
@@ -742,7 +826,7 @@ function chatRooms(rooms) {
     ' this during a partial deploy">⚠ dms not reported</div>' :
     '<div class="crsec" style="color:var(--bad)" title="the DM namespace could' +
     ' not be fully read, so this list may be MISSING channels — it is not' +
-    ' evidence that no DM exists. Check the helm chat dir is readable">' +
+    ' evidence that no DM exists. The chat directory may be unreadable">' +
     "⚠ dms incomplete</div>";
   $("#chatroomlist").innerHTML =
     pq.active.map(rowsFor).join("") + qrow("project", "channels", pq.quiet) +
@@ -806,6 +890,7 @@ function chatSnapshot() {
     since: CHAT_SINCE, oldest: CHAT_OLDEST_BASE, divided: CHAT_DIVIDED, away: CHAT_AWAY,
     byId: CHAT_BY_ID, byKey: CHAT_BY_KEY, replyn: CHAT_REPLYN, kids: CHAT_KIDS, reacts: CHAT_REACTS,
     gen: CHAT_GEN, gone: CHAT_GONE,   // cache the rotation cursor so a room that rotated while away is caught on return
+    ackTail: CHAT_ACK_TAIL,           // the receipt the cached log ends with
   };
 }
 
@@ -819,6 +904,7 @@ function chatRestore(room) {
   // restore the cached gen: the very next poll compares it, so a room rotated
   // while we were away resets on return instead of restoring a stale since cursor.
   CHAT_GEN = ("gen" in c) ? c.gen : null; CHAT_GONE = c.gone || new Set();
+  CHAT_ACK_TAIL = c.ackTail || null;
   log.scrollTop = c.scrollTop;   // restore the viewport where the owner left it
   return true;
 }
@@ -858,6 +944,8 @@ function chatSignal(d) {
   }
   NAV_CHAT = mentions || unread;
   NAV_CHAT_MENTION = mentions > 0;
+  CHAT_SIGNAL_READ = true;         // the Home chat tile can say "nothing unread" now
+  if (typeof homeRender === "function") homeRender();
   renderNav();
   document.title = NAV_CHAT ? "(" + NAV_CHAT + ") helm" : "helm";
   faviconDot(NAV_CHAT_MENTION);
@@ -872,11 +960,37 @@ function chatSignal(d) {
   // is what waits for him here, the notification is what reached him there,
   // and both are `_owner_signal`'s one reading of the room.
   dashAnswers(d);
-  // read-ack: chat view open + page visible = the owner has SEEN the room
-  if ((d.total | 0) > (d.owner_read | 0) && $("#view-chat").classList.contains("on") && !document.hidden) {
-    post("/api/chat/read", {room: CHAT_ROOM}).catch(() => {});
-  }
+  // what the owner has not seen in this room: the read-ack waits for his
+  // hand on the Chat view (`chatSeen`), never for this poll
+  CHAT_UNSEEN = {room: CHAT_ROOM, total: d.total | 0, read: d.owner_read | 0};
 }
+
+/* THE READ-ACK WAITS FOR HIS HAND (task/3723; console walk 3, finding 25):
+   a read-only walk opened Chat and the poll above posted the owner's
+   read-ack, so a reader who was not him consumed 97 unread in #main. The
+   room is SEEN only when a real gesture of his own (a click, a key or a
+   scroll: the browser marks it `isTrusted`, a script's click or
+   dispatchEvent never is) lands on the Chat view while the page is
+   focused and visible — never on a poll, the page loading onto Chat, or a
+   programmatic navigation to it. One gesture posts once: `CHAT_ACKED`
+   holds the room and count it acked until a poll shows more. PURE over
+   its arguments: `st` is `CHAT_UNSEEN`, `doc` what the page is. */
+function chatAckDue(ev, st, acked, doc) {
+  return !!(ev && ev.isTrusted === true && st && doc && doc.inChat && doc.chatOn && doc.focused && doc.visible
+    && st.room === doc.room && st.total > st.read && !(acked && acked.room === st.room && acked.total >= st.total));
+}
+function chatSeen(ev) {
+  const view = $("#view-chat");
+  if (!view) return;
+  const st = CHAT_UNSEEN;
+  const doc = {inChat: !!(ev && ev.target && view.contains(ev.target)), chatOn: view.classList.contains("on"),
+               focused: typeof document.hasFocus === "function" && document.hasFocus(),
+               visible: document.visibilityState === "visible", room: CHAT_ROOM};
+  if (!chatAckDue(ev, st, CHAT_ACKED, doc)) return;
+  CHAT_ACKED = {room: st.room, total: st.total};
+  post("/api/chat/read", {room: st.room}).catch(() => { CHAT_ACKED = null; });
+}
+["pointerdown", "keydown", "wheel", "touchmove"].forEach(k => document.addEventListener(k, chatSeen, {capture: true, passive: true}));
 
 const FAVICON = document.querySelector("link[rel=icon]");
 const FAVICON_BASE = FAVICON ? FAVICON.href : "";
@@ -892,7 +1006,7 @@ function notifyOwner(n, preview) {
   try {
     if (!("Notification" in window)) return; // orca webview etc. — the title/badge already carry it
     const fire = () => { try {
-      new Notification("helm chat — @you", {
+      new Notification("helm — @you in chat", {
         body: preview || (n + " unread mention" + (n === 1 ? "" : "s")),
         tag: "helm-chat-mention"});  // tag: replace, never stack
     } catch (e) {} };

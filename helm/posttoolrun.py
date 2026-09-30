@@ -265,7 +265,10 @@ def _run(payload=None):
         if delivery:
             # Existing --room skips cmd_chat's default homing before seats_cli;
             # preparation needs only session/identity, not delivery room state.
-            # The prefix remains chat deliver --hook-json for the SAME CLI scope.
+            # The prefix remains chat deliver --hook-json for the SAME CLI scope,
+            # with one difference: the Orca door admits the delivery phase of a
+            # pane in another project and keeps this whisper phase scoped, since
+            # the whisper steers helm work (hooks.orca_admits reads the phase).
             prep = dict(delivery, name="whisper-prepare",
                         args=delivery["args"] + " --room main")
             event.stage("prepare", prep, payload)

@@ -162,16 +162,25 @@ def _emitted_kinds(sources):
                 and isinstance(node.value.value, str):
             constants[node.targets[0].id] = node.value.value
 
+    # A SATELLITE SPELLS A LEDGER NAME `dispatches.NAME`, so the call-time
+    # lookup reaches a patch on the ledger; that spelling names the same
+    # constant and the same function the bare name does inside the ledger.
+    def ledger_name(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+                and node.value.id == "dispatches":
+            return node.attr
+        return None
+
     def kind_of(value):
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
             return value.value
-        if isinstance(value, ast.Name):
-            return constants.get(value.id)
-        return None
+        return constants.get(ledger_name(value))
 
     def calls(node, name):
-        return any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
-                   and sub.func.id == name for sub in ast.walk(node))
+        return any(isinstance(sub, ast.Call) and ledger_name(sub.func) == name
+                   for sub in ast.walk(node))
 
     ledger, attest = set(), set()
     for fn in ast.walk(tree):
@@ -276,6 +285,7 @@ _SEQ_WRITER_ARMS = {
     "mark_custody": ("custody",),
     "mark_hold": ("hold",),
     "mark_release": ("release",),
+    "record_hold_actor_backfill": ("hold-actor-backfill",),
     "superseded_parent_sweep": ("superseded sweep",),
     "retip": ("retip", "retip race"),
     "_record_discharge_proven": ("discharge",),
@@ -329,6 +339,13 @@ _WRITERS = (
     ("release",
      lambda test, rid: dispatches.mark_hold(rid, "matrix probe predecessor"),
      lambda test, rid: dispatches.mark_release(rid)),
+    # THE RECOVERED HOLDER (task/3131): its own refusals need a held
+    # source-clean row, so the clean twin only has to get PAST this rung.
+    ("hold-actor-backfill", None,
+     lambda test, rid: dispatches.record_hold_actor_backfill(
+         rid, 1, {"transcript": "/matrix/t.jsonl", "line": 1,
+                  "tool_use_id": "tool_matrix", "command_sha256": "0" * 64,
+                  "tool_ts": "2026-01-01T00:00:00.000Z"})),
     ("retip", _prepare_retip,
      lambda test, rid: dispatches.retip(
          rid, test.retip_target, reason="matrix probe", repo=test.repo,

@@ -511,7 +511,7 @@ def _counted(template, reason):
 
 
 NEVER_TRACK_HOOK = _counted("""#!/bin/sh
-# helm work managed hook: pre-commit v7
+# helm work managed hook: pre-commit v8
 # Existing executable hook, when present, runs first with the original args.
 #
 # The staged-set instruments share this timing seam. The vacuous-assertion
@@ -524,6 +524,8 @@ NEVER_TRACK_HOOK = _counted("""#!/bin/sh
 # conflict-marker rung REFUSES staged merge-conflict marker lines. The
 # hardcode rung WARNS on context-identity baked into portable logic. The
 # seat-name rung REFUSES a real seat identity entering public-bound tests/. The
+# private-name rung REFUSES one of the operator's own names added to a
+# public-bound path, and its advisory leg only WARNS. The
 # never-track scanner REFUSES private paths/content. All scanners are SNAPSHOT
 # beside the shared hook at install time, so a lane cannot edit its checked-out
 # detector or disappear and thereby neuter every worktree's guard.
@@ -541,6 +543,7 @@ seatname=%(seatname)s
 conflict=%(conflict)s
 docref=%(docref)s
 world_prose=%(world_prose)s
+private_name=%(private_name)s
 retired_name=%(retired_name)s
 split_budget=%(split_budget)s
 hardcode_rung=%(hardcode_rung)s
@@ -697,6 +700,27 @@ if [ "$HELM_WORLD_PROSE_SKIP" != "1" ]; then
     echo "[helm world-prose] staged source-prose scan SKIPPED; reinstall: helm work install-guard --apply --profile %(profile)s" >&2
   fi
 fi
+# THE PRIVATE-NAME RUNG refuses a line that names one of the operator's own
+# projects, hosts or people when this commit adds it to a public-bound path.
+# Its list and its scanner are the ones tests/test_no_private_names.py reads,
+# so the suite and this door cannot disagree about a name. Its skip guards
+# only this refusing block.
+if [ "$HELM_PRIVATE_NAME_SKIP" != "1" ]; then
+  if [ -f "$private_name" ]; then
+    helm_rung=private-name
+    python3 "$private_name" --staged || exit $?
+  else
+    echo "[helm private-name] WARNING: rung missing at $private_name —" >&2
+    echo "[helm private-name] staged private-name scan SKIPPED; reinstall: helm work install-guard --apply --profile %(profile)s" >&2
+  fi
+fi
+# The same rung's ADVISORY leg asks the local classifier about added comment
+# and document lines inside a small time budget, and only ever WARNS: it is
+# silent when the stream is unreachable and off with
+# HELM_PRIVATE_NAME_ADVISORY=0. It sits outside the refusing block's skip.
+if [ -f "$private_name" ]; then
+  python3 "$private_name" --advise || true
+fi
 # A top-level name this commit retires must not stay spelled anywhere in the
 # tree it produces: the consumer that reaches into the module from another
 # lane is invisible to the author's focused set and red only when the train
@@ -842,7 +866,7 @@ def hook_path(root, name="post-checkout", hooks=None):
 
 
 HOSTPATH_PUSH_HOOK = _counted("""#!/bin/sh
-# helm work managed hook: pre-push v4
+# helm work managed hook: pre-push v5
 # Existing executable hook, when present, runs first with the original args
 # and the same ref lines on stdin.
 #
@@ -876,7 +900,17 @@ HOSTPATH_PUSH_HOOK = _counted("""#!/bin/sh
 # behind, and a full or unwritable TMPDIR cannot refuse a push. The trailing
 # `x` survives the newline stripping of command substitution and is removed
 # after it, so the bytes fed on are the bytes git wrote.
+#
+# v5 — THE SHARED-HISTORY RUNG runs before the host-path scan, from the same
+# snapshot, for every push to every remote. It refuses a push whose commits
+# share no history with the destination's default branch, the shape that
+# published a whole private history to a public repository whose main is a
+# separate release line. It has no skip: HELM_HOSTPATH_SKIP stops only the
+# host-path scan below it, and the one door for such a history is the owner's
+# release publish. A missing snapshot WARNS here and the scan below says the
+# same, so a lost file is named rather than silent.
 scanner=%(scanner)s
+shared_history=$scanner
 user_hook=%(user_hook)s
 @helm-refusal-count@
 
@@ -890,6 +924,13 @@ helm_push_refs() { printf '%%s' "$helm_push_stdin"; }
 
 if [ -x "$user_hook" ]; then
   helm_push_refs | "$user_hook" "$@" || exit $?
+fi
+if [ -f "$shared_history" ]; then
+  helm_rung=shared-history
+  helm_push_refs | python3 "$shared_history" --shared-history "$@" || exit $?
+else
+  echo "[helm shared-history] WARNING: rung missing at $shared_history —" >&2
+  echo "[helm shared-history] shared-history check SKIPPED; reinstall: helm work install-guard --apply --profile %(profile)s" >&2
 fi
 [ "$HELM_HOSTPATH_SKIP" = "1" ] && exit 0
 if [ ! -f "$scanner" ]; then
@@ -964,7 +1005,7 @@ MERGE_COMMIT_HOOK = _counted("""#!/bin/sh
 # THIS DOOR RUNS ONLY THOSE TWO RUNGS. Under the rail profile pre-commit also
 # runs the refusing lane-discipline (which admits a commit carrying
 # MERGE_HEAD), in-flight-gate, seat-name, docref (citation), world-prose,
-# retired-name and split-budget rungs, so a merge git commits itself never meets them while the
+# private-name, retired-name and split-budget rungs, so a merge git commits itself never meets them while the
 # same merge concluded with `git commit` can be refused by one of them. Under
 # the leak profile both doors run the same two rungs.
 #
@@ -1547,6 +1588,14 @@ def _retired_name_rung_path():
     return os.path.abspath(retired_name_rung.__file__)
 
 
+def _private_name_rung_path():
+    """The private-name rung snapshotted beside the hook. It carries the ONE
+    list of the operator's private names, which tests/test_no_private_names
+    imports back, so the suite and the commit door read the same list."""
+    from .. import private_names
+    return os.path.abspath(private_names.__file__)
+
+
 def _seatname_authority_notes():
     """Report live seats missing from the seat-name rung's authority file.
 
@@ -1787,6 +1836,7 @@ def _scanner_assets(root, profile=None, hooks=None):
                 _world_prose_rung_path(),
             os.path.join(d, "retired_name_rung.py"):
                 _retired_name_rung_path(),
+            os.path.join(d, "private_names.py"): _private_name_rung_path(),
             os.path.join(d, "seatname_guard.py"): _seatname_rung_path(),
             os.path.join(d, "trailer_rung.py"): _trailer_rung_path(),
             os.path.join(d, "hostpath_guard.py"): _hostpath_scanner_path()}
@@ -1814,6 +1864,7 @@ def _guard_plan(root, profile=None, hooks=None):
                        if p.endswith("/world_prose_guard.py"))
     retired_name = next(p for p in assets
                         if p.endswith("/retired_name_rung.py"))
+    private_name = next(p for p in assets if p.endswith("/private_names.py"))
     seatname = next(p for p in assets if p.endswith("/seatname_guard.py"))
     trailer = next(p for p in assets if p.endswith("/trailer_rung.py"))
     plan = []
@@ -1831,6 +1882,7 @@ def _guard_plan(root, profile=None, hooks=None):
                 "docref": shlex.quote(docref),
                 "world_prose": shlex.quote(world_prose),
                 "retired_name": shlex.quote(retired_name),
+                "private_name": shlex.quote(private_name),
                 "split_budget": shlex.quote(split_budget),
                 "seatname": shlex.quote(seatname),
                 "vacuous": shlex.quote(vacuous),
@@ -2122,6 +2174,37 @@ def _narrowing_refusal(root, plan, assets, declared, running, profile,
                ", ".join(losses), profile, running))
 
 
+# THE GATE CANARY'S TIMER RIDES THE RAIL. The land door admits a sliced
+# receipt only on the canary record (helm/gatecanary.py `standing`), and a
+# canary nobody scheduled records nothing, so the record never stands. The
+# rail is what every shared checkout of helm's own source installs, so the
+# nightly canary is installed by the same step, never by a seat remembering
+# `helm gate canary --install-timer`. It is outside the hook transaction: the
+# hooks are the rail, and a host with no systemd still gets them, with the
+# timer's failure said in one line.
+def _canary_timer_plan():
+    from .. import gatecanary
+    return ("helm work: DRY — would also install or refresh %s (nightly at %s, "
+            "`helm gate canary run`), whose record the land door reads before "
+            "a sliced receipt may land" % (gatecanary.TIMER_NAME,
+                                           gatecanary.TIMER_AT))
+
+
+def _canary_timer_install():
+    try:
+        from .. import gatecanary
+        ok, detail = gatecanary.ensure_timer()
+    except Exception as exc:        # noqa: BLE001 -- never fails the rail
+        ok, detail = False, "%s: %s" % (type(exc).__name__, exc)
+    if ok:
+        return "helm work: gate canary timer %s" % detail
+    if ok is None:
+        return "helm work: gate canary timer not installed — %s" % detail
+    return ("helm work: WARNING — gate canary timer NOT installed (%s); the "
+            "hooks above are installed. `helm gate canary --install-timer` "
+            "retries it alone" % detail)
+
+
 def install_guard(root, apply=False, profile=None):
     """Print or transactionally install the deterministic shared-tree rail.
 
@@ -2203,7 +2286,7 @@ def install_guard(root, apply=False, profile=None):
             "shared-tree ref rail and the lane-discipline venue rung, "
             "nothing else — every other pre-commit rung names its own "
             "one-commit skip in its refusal)"
-            % len(plan)]
+            % len(plan), _canary_timer_plan()]
 
     # THE BASE-BRANCH PRECONDITION BELONGS TO THE RAIL: its ref hook guards
     # the shared checkout's HEAD, so installing it from any other branch would
@@ -2559,6 +2642,7 @@ def install_guard(root, apply=False, profile=None):
                 "this profile — `--profile rail` is the shared-checkout rail."]
         return 0, notes + _seatname_authority_notes() + [
                            "helm work: guard rail %s in %s" % (state, scope),
+                           _canary_timer_install(),
                            "helm work: shared checkout branch creation/switch now "
                            "FAILS before mutation; occupied worktree branches are "
                            "protected (override: HELM_WORK_INTEGRATOR=1)",
@@ -2580,7 +2664,12 @@ def install_guard(root, apply=False, profile=None):
                            "no-op until seat-names.txt is populated, and says so), "
                            "REFUSES internal chronology added to public-bound "
                            "source prose (one-commit skip: "
-                           "HELM_WORLD_PROSE_SKIP=1), REFUSES a retired "
+                           "HELM_WORLD_PROSE_SKIP=1), REFUSES one of the "
+                           "operator's private names added to a public-bound "
+                           "path and WARNS when the local classifier reads an "
+                           "added comment as naming one (one-commit skip: "
+                           "HELM_PRIVATE_NAME_SKIP=1; advisory off: "
+                           "HELM_PRIVATE_NAME_ADVISORY=0), REFUSES a retired "
                            "top-level name still spelled in the tree the "
                            "commit produces (one-commit skip: "
                            "HELM_RETIRED_NAME_SKIP=1), then enforces the "

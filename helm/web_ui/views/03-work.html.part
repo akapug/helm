@@ -1,0 +1,25 @@
+<div class="view" id="view-flow">
+  <!-- WORK, START TO FINISH (task/3643): ONE page for the backlog and the
+       pipeline, which were two pages counting the same work two ways. Every
+       piece of work is one card in one of five stages, To do › Building › In
+       review › Landing › Landed, read from /api/work alone; the River lens
+       draws the stages as columns and the List lens as the backlog's rows.
+       Backlog and Pipeline are entries into this page (#work/backlog,
+       #work/pipeline), and a project's Work tab is it locked to that
+       project. The section is drawn by `wkPaint` (scripts/52-work.js.part)
+       and boots saying "not read yet". -->
+  <section class="wk" id="wkmain" data-wk="main"><div class="empty">not read yet</div></section>
+  <details class="grp" id="wkseams">
+    <summary>This week at each seam<span class="gmeta">how work crossed from one stage to the next, forward and back</span></summary>
+    <div class="wkfoldbody" id="wkseambody"></div>
+  </details>
+  <details class="grp" id="wkleft">
+    <summary>Leftovers the agents clear<span class="gmeta">records that are not work any more; nothing here waits on you</span></summary>
+    <div class="wkfoldbody" id="wkleftbody"></div>
+  </details>
+  <details class="grp" id="wkelse">
+    <summary>The same numbers elsewhere on the console<span class="gmeta">the nav badge, the Home tile and a project’s row read this page’s own count, so they cannot disagree with it</span></summary>
+    <div class="wkfoldbody" id="wkelsebody"></div>
+  </details>
+</div>
+

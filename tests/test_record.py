@@ -20,6 +20,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -123,20 +124,57 @@ class PassiveAndDirtyTest(RecordBase):
 class SignalTest(RecordBase):
     def test_stuck_gated_to_action_tools_reads_never_arm(self):
         with mock.patch.object(record, "_git_dirty", return_value=False):
+            # A dict resp is rc 0 (success event) — error text in output does
+            # NOT arm the stuck signal (task/1519 cured).
             record.record(self.ev(tool="Bash", tin={"command": "x"},
                                   resp={"stdout": "API Error: rate limit hit"}))
-            self.assertEqual(self.counters()["stuck-signal"], 1)
-            self.assertEqual(self.counters()["stuck-streak"], 1)
+            self.assertEqual(self.counters()["stuck-signal"], 0)
+            self.assertEqual(self.counters()["stuck-streak"], 0)
+            # A PostToolUseFailure event (rc != 0) with matching text DOES arm.
             record.record(self.ev(tool="Bash", tin={"command": "y"},
-                                  resp="permission denied"))  # string resp tolerated
-            self.assertEqual(self.counters()["stuck-streak"], 2)
+                                  resp="permission denied",
+                                  hook_event_name="PostToolUseFailure",
+                                  error="Exit code 1: permission denied"))
+            self.assertEqual(self.counters()["stuck-streak"], 1)
             # a Read whose CONTENT mentions errors is data, not a signal
             record.record(self.ev(tool="Read",
                                   resp={"file": "docs on rate limits: API Error"}))
             self.assertEqual(self.counters()["stuck-signal"], 1)
-            self.assertEqual(self.counters()["stuck-streak"], 2)
+            self.assertEqual(self.counters()["stuck-streak"], 1)
             record.record(self.ev(tool="Bash", tin={"command": "z"},
                                   resp={"stdout": "all good"}))
+        self.assertEqual(self.counters()["stuck-signal"], 0)
+        self.assertEqual(self.counters()["stuck-streak"], 0)
+
+    def test_rc_0_with_stuck_text_does_not_arm(self):  # noqa: VACUOUS_ASSERTION — task/1519, absence is the point
+        """A successful command (dict resp -> rc 0) whose output mentions a
+        failure phrase does NOT advance the stuck-streak (task/1519)."""
+        with mock.patch.object(record, "_git_dirty", return_value=False):
+            record.record(self.ev(tool="Bash", tin={"command": "x"},
+                                  resp={"exitCode": 0,
+                                        "stdout": "API Error: rate limit hit"}))
+        self.assertEqual(self.counters()["stuck-signal"], 0)
+        self.assertEqual(self.counters()["stuck-streak"], 0)
+
+    def test_rc_nonzero_with_stuck_text_does_arm(self):
+        """A failure event (PostToolUseFailure, rc 1) with matching text DOES
+        advance the stuck-streak (task/1519)."""
+        with mock.patch.object(record, "_git_dirty", return_value=False):
+            record.record(self.ev(tool="Bash", tin={"command": "x"},
+                                  resp={"stdout": "rate limit hit"},
+                                  hook_event_name="PostToolUseFailure",
+                                  error="Exit code 1: rate limit"))
+        self.assertEqual(self.counters()["stuck-signal"], 1)
+        self.assertEqual(self.counters()["stuck-streak"], 1)
+
+    def test_rc_nonzero_without_stuck_text_does_not_arm(self):  # noqa: VACUOUS_ASSERTION — task/1519, absence is the point
+        """A failing result (rc 1) whose output does NOT match STUCK_RE does
+        NOT advance the stuck-streak (task/1519)."""
+        with mock.patch.object(record, "_git_dirty", return_value=False):
+            record.record(self.ev(tool="Bash", tin={"command": "x"},
+                                  resp={"stdout": "something went wrong"},
+                                  hook_event_name="PostToolUseFailure",
+                                  error="Exit code 1: failure"))
         self.assertEqual(self.counters()["stuck-signal"], 0)
         self.assertEqual(self.counters()["stuck-streak"], 0)
 
@@ -318,6 +356,7 @@ class CoordinationWriteTest(RecordBase):
         "0123abcd --fix --measured evidence",
         "helm premise fixture-premise | a statement",
         "/opt/fixture/bin/helm task comment 12 a note",
+        "helm task release 12 --note handed back",
         "helm chat dm peer-seat the fix is in",
         "helm reflex retire fixture-reflex",
     )
@@ -710,7 +749,8 @@ class WiringTest(WiringBase):
             "model": "opus",
             "hooks": {
                 "UserPromptSubmit": [{"hooks": [
-                    {"type": "command", "command": hooks.hook_command()}]}],
+                    {"type": "command",
+                     "command": hooks.spec_command(hooks.SPECS[0])}]}],
                 "PostToolUse": [{"matcher": "Bash", "hooks": [
                     {"type": "command", "command": "echo post"}]}]}})
         rc, out, err = self.run_cmd(["install"])
@@ -719,7 +759,7 @@ class WiringTest(WiringBase):
         got = self.read_settings(a)
         self.assertEqual(got["model"], "opus")  # foreign keys survive
         self.assertEqual(got["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
-                         hooks.hook_command())  # inject entry survives
+                         hooks.spec_command(hooks.SPECS[0]))  # inject entry survives
         cmds = record._event_cmds(got)
         self.assertIn("echo post", cmds)        # foreign PostToolUse survives
         self.assertIn(record.hook_command(), cmds)
@@ -935,7 +975,8 @@ class EditPathsCarryTheDirectoryTest(RecordBase):
         fp = os.path.join(record.session_dir(sid), name)
         if not os.path.exists(fp):
             return []
-        return [l for l in open(fp).read().splitlines() if l.strip()]
+        with open(fp) as fh:
+            return [l for l in fh.read().splitlines() if l.strip()]
 
     def test_the_directory_survives_into_edit_paths(self):
         p = os.path.join(self.tmp, "sub", "deep", "lesson.md")
@@ -1171,7 +1212,7 @@ class SwallowBreadcrumbTest(RecordBase):
         four call shapes on another lane the same day. Both numbers are pinned,
         in both directions: a WIDE handler losing its trace reddens, and so
         does someone wiring the eight NARROW ones, whose silence is CORRECT
-        and whose instrumentation would bury the twelve that matter under eight
+        and whose instrumentation would bury the thirteen that matter under eight
         that do not. Ambient Expired propagation makes three handlers wide by
         adding a second control-flow arm, so they leave breadcrumbs like every
         other wide handler.
@@ -1185,9 +1226,13 @@ class SwallowBreadcrumbTest(RecordBase):
         # not about the tree under test.
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         wide_silent = narrow_silent = wired = 0
-        for rel in ("helm/seats_stop_signals.py", "helm/seats_work_offer.py"):
+        # seats_stop_spiral holds the spiral and pair-meld rungs split out
+        # of seats_stop_signals, handlers and all.
+        for rel in ("helm/seats_stop_signals.py", "helm/seats_stop_spiral.py",
+                    "helm/seats_work_offer.py"):
             p = os.path.join(root, rel)
-            tree = ast.parse(open(p, encoding="utf-8").read())
+            with open(p, encoding="utf-8") as f:
+                tree = ast.parse(f.read())
             for tr in ast.walk(tree):
                 if not isinstance(tr, ast.Try):
                     continue
@@ -1208,11 +1253,15 @@ class SwallowBreadcrumbTest(RecordBase):
                         wide_silent += 1
                     else:
                         narrow_silent += 1
-        self.assertEqual(wired, 12, "a WIDE handler stopped leaving a trace")
+        # 13: the pair-meld turn rung's handler speaks like the spiral's.
+        # 14 (task/3338): _wake_is_pane's handler speaks.
+        # 15 (task/3382): _wake_is_local's handler speaks, like its sibling.
+        # 16 (task/1822): the whisper ladder's verb-timeout rung speaks.
+        self.assertEqual(wired, 16, "a WIDE handler stopped leaving a trace")
         self.assertEqual(wide_silent, 0, "a WIDE silent handler is back")
         self.assertEqual(narrow_silent, 8,
                          "the NARROW handlers changed — instrumenting them "
-                         "buries the twelve that can hide a bug")
+                         "buries the thirteen that can hide a bug")
 
 
 class RecordCoverageReadsTheContract(unittest.TestCase):
@@ -1427,3 +1476,368 @@ class RecorderStatusReadsTheWholeContract(WiringBase):
         self.assertEqual(n_after, n_before - 1,
                          "coverage must drop by exactly the home status failed")
         self.assertTrue(self._covered(good))
+
+
+class VerbTimeoutTest(RecordBase):
+    """task/1822: a helm VERB killed by a timeout in a Bash call becomes a P0
+    diagnosis obligation the Stop whisper names (helm/verbtimeout.py). The
+    obligation is a fold over command-log rows: a verb-timeout row opens it, a
+    diagnosis write (task add|comment|update, store add|revise) naming the
+    verb closes it."""
+
+    def fev(self, command, error, sid="sess-1"):
+        return {"session_id": sid, "tool_name": "Bash", "cwd": self.tmp,
+                "hook_event_name": record.FAIL_EVENT, "error": error,
+                "is_interrupt": False, "tool_input": {"command": command}}
+
+    def ok(self, command, sid="sess-1"):
+        return self.ev(tool="Bash", sid=sid, tin={"command": command},
+                       resp={"stdout": "", "stderr": "", "interrupted": False})
+
+    def feed(self, *events):
+        with mock.patch.object(record, "_git_dirty", return_value=False):
+            for e in events:
+                record.record(e)
+
+    def verb_rows(self, sid="sess-1"):
+        return [json.loads(l) for l in
+                self.artifact("command-log.jsonl", sid).splitlines()
+                if '"verb-' in l]
+
+    def test_exit_124_on_a_helm_verb_records_a_row_and_opens_an_obligation(self):
+        from helm import verbtimeout
+        self.feed(self.fev("timeout 30 helm chat post main 'secret body'",
+                           "Exit code 124"))
+        rows = self.verb_rows()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["kind"], "verb-timeout")
+        self.assertEqual(rows[0]["verb"], "chat post")
+        self.assertEqual(rows[0]["how"], "exit 124")
+        self.assertIsInstance(rows[0]["ts"], int)
+        # ids/digests law: never the raw command line
+        self.assertNotIn("secret body", self.artifact("command-log.jsonl"))
+        fp, line = verbtimeout.stop_candidate("sess-1")
+        self.assertTrue(fp.startswith("verbtimeout:chat post:"), fp)
+        self.assertIn("P0", line)
+        self.assertIn("`helm chat post` timed out (exit 124)", line)
+        self.assertIn("m ago", line)                     # the WHEN
+        self.assertIn("helm task add|comment", line)     # the discharge
+        self.assertIn("naming it", line)
+
+    # THE SHAPE CLAUDE CODE PRODUCES (CURE 1822 F1, read off 2.1.284): it
+    # kills the shell with 143 and the failure error is "Exit code 143", then
+    # the timeout line, then stderr and stdout.
+    HARNESS_KILL = "Exit code 143\nCommand timed out after 2m 0s\npartial out"
+
+    def test_the_harness_bash_timeout_counts_and_is_named_apart(self):
+        from helm import verbtimeout
+        self.feed(self.fev("./bin/helm dispatch list --open", self.HARNESS_KILL))
+        rows = self.verb_rows()
+        self.assertEqual([(r["verb"], r["how"]) for r in rows],
+                         [("dispatch list", "harness timeout")])
+        self.assertIn("(harness timeout)", verbtimeout.stop_candidate("sess-1")[1])
+
+    def test_a_plain_143_is_not_a_harness_timeout(self):
+        """NEGATIVE CONTROL: 143 is any SIGTERM; only the harness's own
+        timeout line after it says a clock did it."""
+        self.feed(self.fev("helm dispatch list --open", "Exit code 143\nTerminated"),
+                  self.fev("helm dispatch list --open",
+                           "Exit code 143\nstderr said: Command timed out after 1s"))
+        self.assertEqual(self.verb_rows(), [])
+
+    def test_another_harness_saying_it_on_the_first_line_still_counts(self):
+        self.feed(self.fev("helm doctor", "Command timed out after 10m"))
+        self.assertEqual([r["verb"] for r in self.verb_rows()], ["doctor"])
+
+    def test_rc_0_and_rc_1_raise_nothing_even_when_stderr_says_timed_out(self):
+        from helm import verbtimeout
+        self.feed(self.ok("helm chat post main hi"),
+                  # a nonzero exit puts 'Exit code N' on the FIRST line; a
+                  # verb that printed "timed out" and exited 1 was not killed
+                  self.fev("helm lr fetch", "Exit code 1\nfetch timed out"))
+        self.assertEqual(self.verb_rows(), [])
+        self.assertIsNone(verbtimeout.stop_candidate("sess-1"))
+
+    def test_non_helm_commands_and_bounded_waits_raise_nothing(self):
+        from helm import verbtimeout
+        self.feed(self.fev("timeout 5 sleep 10", "Exit code 124"),
+                  self.fev("echo helm chat post", "Exit code 124"),
+                  self.fev("timeout 60 helm chat wait --seat s", "Exit code 124"),
+                  # THE REAL SPELLINGS (CURE 1822 F4): `helm meld` is no verb
+                  self.fev("timeout 60 helm chat meld recv meld-0-x",
+                           "Exit code 124"),
+                  self.fev("timeout 60 helm chat meld invite seat-b topic "
+                           "--wait", "Exit code 124"),
+                  self.fev("helm chat read --follow", "Command timed out"))
+        self.assertEqual(self.verb_rows(), [])
+        self.assertIsNone(verbtimeout.stop_candidate("sess-1"))
+        # CONTROL: the same shape on a helm verb that is not a wait does arm
+        self.feed(self.fev("timeout 60 helm chat read", "Exit code 124"))
+        self.assertIsNotNone(verbtimeout.stop_candidate("sess-1"))
+
+    def test_the_same_timeout_twice_is_one_obligation_with_a_count(self):
+        from helm import verbtimeout
+        self.feed(self.fev("helm store resolve x", "Exit code 124"),
+                  self.fev("helm store resolve y", "Exit code 124"))
+        opened, err = verbtimeout.open_timeouts("sess-1")
+        self.assertIsNone(err)
+        self.assertEqual([(o["verb"], o["count"]) for o in opened],
+                         [("store resolve", 2)])
+        line = verbtimeout.stop_candidate("sess-1")[1]
+        self.assertEqual(line.count("helm store resolve"), 1, line)
+        self.assertIn(" x2", line)
+
+    def test_a_diagnosis_write_naming_the_verb_discharges_it(self):
+        from helm import verbtimeout
+        self.feed(self.fev("timeout 30 helm chat post main hi", "Exit code 124"))
+        # NEGATIVE CONTROLS: a write that does not name the verb, a read, and
+        # a FAILED write that names it — none discharges
+        self.feed(self.ok("helm task add 'unrelated work'"),
+                  self.ok("helm task list | grep 'chat post'"),
+                  self.fev("helm task comment 1822 'chat post hung'",
+                           "Exit code 1"))
+        self.assertIsNotNone(verbtimeout.stop_candidate("sess-1"))
+        self.feed(self.ok("helm task comment 1822 'helm chat post timed out: "
+                          "the room flock was held by a wedged writer'"))
+        diag = [r for r in self.verb_rows() if r["kind"] == "verb-diagnosis"]
+        self.assertEqual([r["verbs"] for r in diag], [["chat post"]])
+        self.assertIsNone(verbtimeout.stop_candidate("sess-1"))
+        # a timeout AFTER the diagnosis opens it again
+        self.feed(self.fev("helm chat post main hi", "Exit code 124"))
+        self.assertIsNotNone(verbtimeout.stop_candidate("sess-1"))
+
+    def test_a_write_naming_only_its_own_verb_does_not_discharge_that_verb(self):
+        from helm import verbtimeout
+        self.feed(self.fev("helm task comment 7 x", "Exit code 124"))
+        self.feed(self.ok("helm task comment 9 'unrelated'"))
+        self.assertIsNotNone(verbtimeout.stop_candidate("sess-1"))
+        self.feed(self.ok("helm store add 'helm task comment timed out: ...'"))
+        self.assertIsNone(verbtimeout.stop_candidate("sess-1"))
+
+    def test_an_unreadable_command_log_is_one_honest_line_never_a_raise(self):
+        from helm import verbtimeout
+        os.makedirs(os.path.join(record.session_dir("sess-bad"),
+                                 "command-log.jsonl"))
+        # the recorder stays fail-open on it
+        self.feed(self.fev("helm chat post x", "Exit code 124", sid="sess-bad"))
+        fp, line = verbtimeout.stop_candidate("sess-bad")
+        self.assertEqual(fp, "verbtimeout:unreadable")
+        self.assertIn("UNKNOWN, not zero", line)
+        self.assertNotIn("\n", line)
+        # an ABSENT log is an ordinary empty answer, not a finding
+        self.assertIsNone(verbtimeout.stop_candidate("sess-none"))
+
+    def test_the_line_fits_the_whisper_budget_at_the_widest_verb(self):
+        from helm import verbtimeout
+        wide = "a" * 30 + " " + "b" * 30
+        self.feed(self.fev("helm %s x" % wide, "Command timed out after 10m"),
+                  self.fev("helm %s x" % wide, "Command timed out after 10m"),
+                  self.fev("helm other-verb x", "Exit code 124"))
+        opened, _err = verbtimeout.open_timeouts("sess-1")
+        self.assertEqual(len(opened), 2)
+        # a month old: the widest age the line renders ('30d')
+        line = verbtimeout.stop_candidate(
+            "sess-1", now=time.time() + 30 * 86400)[1]
+        whole = ("[helm stop-whisper] " + line +
+                 " This holds once per state — a re-stop passes.")
+        self.assertLessEqual(len(whole.encode("utf-8")),
+                             seats_stop_signals.STOP_WHISPER_CAP, whole)
+
+    def test_the_whisper_ladder_names_it_directly_under_the_owner_ask(self):
+        from helm import seats_work_offer
+        self.feed(self.fev("timeout 9 helm doctor", "Exit code 124"))
+        fps = [c[0] for c in seats_work_offer._whisper_candidates(
+            "sess-1", "wisp", [], False)]
+        self.assertTrue(fps and fps[0].startswith("verbtimeout:doctor:"), fps)
+
+    def test_a_raising_rung_never_silences_the_ladder(self):
+        """CURE 1822 F2: a local `from . import record` later in the ladder
+        made `record` local to the whole function, so this rung's handler
+        raised UnboundLocalError and every rung was lost for the stop."""
+        from helm import seats_work_offer, verbtimeout
+        with mock.patch.object(verbtimeout, "stop_candidate",
+                               side_effect=RuntimeError("probe")), \
+                mock.patch.object(seats_work_offer, "_ask_candidate",
+                                  return_value=("ask:x", "an owner ask")):
+            got = seats_work_offer._whisper_candidates("sess-1", "wisp", [], False)
+        self.assertEqual(got[0][0], "ask:x", got)
+
+    def write_log(self, *lines, sid="sess-1"):
+        d = record.session_dir(sid)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "command-log.jsonl"), "a") as f:
+            for ln in lines:
+                f.write(ln + "\n")
+
+    def test_corrupt_rows_are_skipped_and_the_recorder_still_counts(self):
+        """CURE 1822 F3: an overflowing ts or a non-string verb raised out of
+        the fold, and out of the recorder before its counters ran."""
+        from helm import verbtimeout
+        self.write_log('{"kind":"verb-timeout","verb":"chat post","ts":1e999}',
+                       '{"kind":"verb-diagnosis","verbs":[["a"]],"ts":1}',
+                       '{"kind":"verb-timeout","verb":"doctor","ts":%d}'
+                       % int(time.time()))
+        fp, line = verbtimeout.stop_candidate("sess-1")
+        self.assertIn("helm doctor", line)
+        before = int(record.counters("sess-1").get("turn-calls") or 0)
+        self.feed(self.ok("helm task add 'helm doctor hung on the probe'"))
+        self.assertEqual(int(record.counters("sess-1").get("turn-calls") or 0),
+                         before + 1)
+        self.assertIsNone(verbtimeout.stop_candidate("sess-1"))
+
+    def test_a_124_is_blamed_on_helm_only_when_helm_could_have_made_it(self):
+        """CURE 1822 F5: exit 124 counts a helm argv `timeout` wrapped, or helm
+        as the last simple command; never the first helm on a line whose
+        other command timed out. An `&&` chain proves neither side: when the
+        left side returns 124 the right side never ran."""
+        self.feed(self.fev("timeout 5 sleep 10 && helm doctor", "Exit code 124"),
+                  self.fev("helm chat post main done && timeout 60 python3 -m "
+                           "unittest tests.x", "Exit code 124"),
+                  self.fev("helm chat post main x && timeout 9 helm owed",
+                           "Exit code 124"),
+                  self.fev("cd /tmp && helm doctor", "Exit code 124"))
+        self.assertEqual(self.verb_rows(), [])
+        self.feed(self.fev("cd /tmp; helm doctor", "Exit code 124"))
+        self.assertEqual([r["verb"] for r in self.verb_rows()], ["doctor"])
+
+    def test_a_124_is_blamed_only_on_the_command_whose_status_the_line_returns(self):
+        """CURE 1822 F5 residue: the FIRST wrapped helm on the line was blamed,
+        so `timeout 1 helm doctor; timeout 1 sleep 10`, whose 124 is the
+        sleep's, blamed doctor. The blame goes to the TERMINAL command of a
+        `;`/newline sequence; any other control flow is UNKNOWN, no blame."""
+        # the review's arm: wrapped helm BEFORE a wrapped non-helm command
+        self.feed(self.fev("timeout 1 helm doctor; timeout 1 sleep 10",
+                           "Exit code 124"),
+                  self.fev("timeout 1 helm doctor\ntimeout 1 sleep 10\n",
+                           "Exit code 124"))
+        self.assertEqual(self.verb_rows(), [])
+        # UNPROVABLE SHAPES: which command made the 124 is not on the line
+        for cmd in ("timeout 1 helm doctor && timeout 1 sleep 10",
+                    "timeout 1 helm doctor || timeout 1 sleep 10",
+                    "timeout 1 helm doctor 2>&1 | tail -5",
+                    "(timeout 1 helm doctor)",
+                    "{ timeout 1 helm doctor; }",
+                    "timeout 1 helm doctor &",
+                    "if true; then timeout 1 helm doctor; fi",
+                    # the `exit` hides behind `then`: only the compound
+                    # guard sees that helm may never have run
+                    "if true; then exit 124; fi; timeout 1 helm doctor",
+                    "for i in 1; do timeout 1 helm doctor; done",
+                    "! timeout 1 helm doctor",
+                    # a backtick body record's walker splits as if top level:
+                    # the 124 is the OUTER sleep's
+                    "timeout 1 sleep 9 `true; timeout 1 helm doctor `",
+                    # errexit: sleep's 124 ends the line before helm runs
+                    "set -euo pipefail; timeout 1 sleep 9; timeout 1 helm owed",
+                    "timeout 1 sleep 9; exit; timeout 1 helm owed",
+                    "timeout 1 helm doctor 'unclosed"):
+            self.feed(self.fev(cmd, "Exit code 124"))
+            self.assertEqual(self.verb_rows(), [], cmd)
+        # POSITIVE CONTROLS: helm IS the terminal command
+        self.feed(self.fev("timeout 1 sleep 1; timeout 1 helm doctor",
+                           "Exit code 124"),
+                  self.fev("cd /tmp\ntimeout 9 helm owed 2>&1", "Exit code 124"),
+                  self.fev("echo a; timeout 9 helm chat post main x &>/tmp/x",
+                           "Exit code 124"),
+                  self.fev("timeout 9 helm store resolve 'a; b && c | d'",
+                           "Exit code 124"))
+        self.assertEqual([r["verb"] for r in self.verb_rows()],
+                         ["doctor", "owed", "chat post", "store resolve"])
+
+    def test_a_harness_kill_is_blamed_only_on_a_line_that_is_helm_alone(self):
+        """The harness kills whatever is RUNNING when its clock ends. In
+        `a; b` that is b only when a finished, which the line cannot show, so
+        a harness kill blames helm only when helm is the line's one command."""
+        self.feed(self.fev("helm doctor; sleep 999", self.HARNESS_KILL),
+                  self.fev("sleep 999; helm doctor", self.HARNESS_KILL),
+                  self.fev("helm doctor && sleep 999", self.HARNESS_KILL),
+                  self.fev("helm chat read | head", "Command timed out after 10m"))
+        self.assertEqual(self.verb_rows(), [])
+        self.feed(self.fev("timeout 900 helm doctor 2>&1", self.HARNESS_KILL))
+        self.assertEqual([(r["verb"], r["how"]) for r in self.verb_rows()],
+                         [("doctor", "harness timeout")])
+
+    def test_a_write_that_only_uses_the_words_does_not_clear_it(self):
+        """The discharge must name the helm INVOCATION, `helm <verb>
+        [<subverb>]`, not the verb's words used as ordinary English: a task
+        to post release notes to chat is no diagnosis of `helm chat post`."""
+        from helm import verbtimeout
+
+        def still_open():
+            return "chat post" in [o["verb"] for o in
+                                   verbtimeout.open_timeouts("sess-1")[0]]
+        self.feed(self.fev("timeout 9 helm chat post main hi", "Exit code 124"))
+        self.feed(self.ok("helm task add 'chat post the release notes'"),
+                  self.ok("helm store add - <<'EOF'\nchat post the notes "
+                          "after the land\nEOF"),
+                  self.ok("helm task add 'helm chat poster is a new idea'"))
+        self.assertTrue(still_open())
+        # MUST-HIT: the invocation, by any path to helm
+        self.feed(self.ok("helm task add '`./bin/helm chat post` hung on "
+                          "the room flock'"))
+        self.assertFalse(still_open())
+        self.feed(self.fev("timeout 9 helm chat post main hi", "Exit code 124"))
+        self.feed(self.ok("helm task comment 7 'Helm chat post hung again'"))
+        self.assertFalse(still_open())
+
+    def test_only_a_write_whose_own_status_is_provably_0_clears_it(self):
+        """The review's P2 on 4f21e93a77d: a successful LINE was read as a
+        successful write, so `helm task add '...' || true`, whose add FAILED,
+        cleared the obligation although nothing was filed. The line's status
+        is the write's only when the write is the terminal command of a plain
+        `;`/newline sequence; any other shape clears nothing."""
+        from helm import verbtimeout
+
+        def still_open():
+            return "chat post" in [o["verb"] for o in
+                                   verbtimeout.open_timeouts("sess-1")[0]]
+        self.feed(self.fev("timeout 9 helm chat post main hi", "Exit code 124"))
+        # MUST-MISS: rc 0 on the line, the write's own status unknown
+        for cmd in ("helm task add 'helm chat post hung' || true",
+                    "helm task add 'helm chat post hung'; true",
+                    "helm task add 'helm chat post hung' | tail -1"):
+            self.feed(self.ok(cmd))
+            self.assertTrue(still_open(), cmd)
+        # an explicit nonzero exit on a success event (a codex-shaped
+        # payload) is no success
+        self.feed(self.ev(tool="Bash", tin={"command": "helm task add 'helm "
+                                            "chat post hung'"},
+                          resp={"stdout": "", "exit_code": 1}))
+        self.assertTrue(still_open())
+        # the terminal write is the one whose status the line proves, so an
+        # EARLIER write's heredoc body is not its words
+        self.feed(self.ok("helm store add - <<'EOF'\nhelm chat post hung\nEOF"
+                          "\nhelm store add 'unrelated'"))
+        self.assertTrue(still_open())
+        # MUST-HIT: the write alone, and the write as the terminal command
+        self.feed(self.ok("helm task add 'helm chat post hung'"))
+        self.assertFalse(still_open())
+        self.feed(self.fev("timeout 9 helm chat post main hi", "Exit code 124"))
+        self.assertTrue(still_open())
+        self.feed(self.ok("cd /tmp; helm task add 'helm chat post hung'"))
+        self.assertFalse(still_open())
+
+    def test_only_the_writes_own_words_and_heredoc_clear_it(self):
+        """CURE 1822 F6: the clearing read the whole line, so a retry beside
+        a write, or two own-verb writes, cleared it; and a positional second
+        word made `helm owed wisp` a verb no diagnosis names."""
+        from helm import verbtimeout
+        self.feed(self.fev("timeout 9 helm chat post main hi", "Exit code 124"),
+                  self.fev("timeout 9 helm task comment 7 x", "Exit code 124"))
+        self.feed(self.ok("helm task comment 5 'done' && helm chat post main 'done'"),
+                  self.ok("helm task comment 9 a && helm task comment 10 b"))
+        self.assertEqual(sorted(o["verb"] for o in
+                                verbtimeout.open_timeouts("sess-1")[0]),
+                         ["chat post", "task comment"])
+        # a positional is not a verb word: `owed` has no subverbs
+        self.feed(self.fev("timeout 9 helm owed wisp", "Exit code 124"))
+        self.assertIn("owed", [o["verb"] for o in
+                               verbtimeout.open_timeouts("sess-1")[0]])
+        self.feed(self.ok("helm task add 'helm owed hangs on the ledger fold'"))
+        self.assertNotIn("owed", [o["verb"] for o in
+                                  verbtimeout.open_timeouts("sess-1")[0]])
+        # the write's own heredoc body names it
+        self.feed(self.ok("helm store add - <<'EOF'\nhelm chat post hung: the "
+                          "room flock\nEOF"))
+        self.assertNotIn("chat post", [o["verb"] for o in
+                                       verbtimeout.open_timeouts("sess-1")[0]])

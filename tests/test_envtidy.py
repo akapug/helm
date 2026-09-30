@@ -22,6 +22,8 @@ from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-envtidy-home-", var="HELM_HOME")
 
 from helm import configs, envtidy, hooks as hooks_mod, skillsync, work  # noqa: E402
+from helm.work import _gc  # noqa: E402
+from tests import _roomclock  # noqa: E402
 
 
 def _cmd(tup):
@@ -46,6 +48,13 @@ def _write(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(obj, f, indent=2)
+
+
+# The lean delivery subset seats were reconciled to before task/3089, spelled
+# literally: the module no longer carries it, and a fixture seat wearing it is
+# the shape every live seat had when the owner ruled a seat a full agent.
+OLD_LEAN_ARGS = ("chat deliver --hook-json", "chat join --hook-json",
+                 "chat stop-guard --hook-json")
 
 
 # ---------------------------------------------------------------------------
@@ -96,9 +105,10 @@ class EstateBase(unittest.TestCase):
             envtidy.CANONICAL_HOOKS,
             strays=[("UserPromptSubmit", "bash /home/x/herdr.sh ambient")]))
 
-        # seats: one with the LEAN set already, one bare.
-        lean = tuple(h for h in envtidy.CANONICAL_HOOKS
-                     if h[2] in envtidy._LEAN_ARGS)
+        # seats: one carrying only the OLD lean delivery subset (the shape
+        # every live seat had before task/3089), one bare.
+        lean = tuple(h for h in envtidy.CANONICAL_HOOKS if h[2] in OLD_LEAN_ARGS)
+        self.assertEqual(len(lean), 3)          # the fixture really is the old subset
         _write(j(self.seats, "codex", "claude", "settings.json"),
                _settings_with(lean))
         os.makedirs(j(self.seats, "kimi", "claude"))
@@ -127,7 +137,15 @@ class EstateBase(unittest.TestCase):
         self.assertEqual(len(by["partial-com"]["strays"]), 1)
         self.assertIn("error", by["broken-com"])            # fail-closed, reported
         self.assertEqual(by["seat:codex"]["kind"], "seat")
-        self.assertEqual(by["seat:codex"]["missing"], [])   # lean set complete
+        # a seat is a full agent: the old lean subset is NOT complete — the
+        # recorder legs, inject and both handoff producers read as missing
+        for want in ("PostToolUse record --hook-json",
+                     "PostToolUseFailure record --hook-json",
+                     "UserPromptSubmit inject --hook-json",
+                     "PreCompact handoff check --hook-json"):
+            self.assertIn(want, by["seat:codex"]["missing"])
+        self.assertEqual(len(by["seat:codex"]["missing"]),
+                         len(envtidy.CANONICAL_HOOKS) - len(OLD_LEAN_ARGS))
         # the partial home's gap is surfaced in the variance map
         self.assertTrue(r["hooks_variance"]["missing_by_hook"])
         self.assertIn("partial-com", r["hooks_variance"]["strays_by_home"])
@@ -347,10 +365,14 @@ class EstateBase(unittest.TestCase):
 
     # ---- mcp sync ---------------------------------------------------------
 
-    def _mcp_canon(self, mapping):
-        p = os.path.join(self.tmp, "mcp-canon.json")
+    def _mcp_canon(self, mapping, mode=0o600, name="mcp-canon.json"):
+        """A canonical MCP file. 0600 by default: a file anyone but its
+        owner can reach is REFUSED (task/3089), so every arm that wants its
+        configs read must make the file private — as the operator must."""
+        p = os.path.join(self.tmp, name)
         with open(p, "w") as f:
             json.dump(mapping, f)
+        os.chmod(p, mode)
         return p
 
     def test_mcp_add_with_config_preserves_existing(self):
@@ -372,7 +394,7 @@ class EstateBase(unittest.TestCase):
         finally:
             del os.environ["HELM_MCPS_CANONICAL"]
 
-    def test_mcp_mid_write_failure_restores_original(self):
+    def test_mcp_mid_write_failure_restores_original(self):  # noqa: VACUOUS_ASSERTION — the FAIL verdict and the byte-equal pre-image read are unconditional positives on the same state file
         state = os.path.join(self.whole, ".claude.json")
         _write(state, {"mcpServers": {"pre-existing": {"command": "keep-me"}}})
         with open(state, "rb") as f:
@@ -380,7 +402,7 @@ class EstateBase(unittest.TestCase):
         os.environ["HELM_MCPS_CANONICAL"] = self._mcp_canon(
             {"foo-mcp": {"command": "foo"}})
 
-        def mutate_then_fail(path, _text):
+        def mutate_then_fail(path, _text, **_kw):
             with open(path, "w") as f:
                 f.write('{"mcpServers": {}}\n')
             raise OSError("injected after mutation")
@@ -417,6 +439,678 @@ class EstateBase(unittest.TestCase):
         for p in r["changed"]:
             self.assertEqual(p["adds"], [])                  # nothing auto-added
         self.assertFalse(os.path.exists(self.backup))        # no config -> no write
+
+
+# ---------------------------------------------------------------------------
+# task/3089 — a seat is a full agent: servers, hooks, global instructions
+# ---------------------------------------------------------------------------
+
+SECRET = "FIXTURE-BEARER-SENTINEL-3089"  # gitleaks:allow (a test fixture, not a credential)
+
+
+class SeatFullAgentTest(unittest.TestCase):
+    """Every seat config dir is planned like a home. The fixture estate is the
+    shape the owner measured: a codex-family seat wearing the old lean hook
+    subset whose launch runs the CLAUDE harness (seat:codex — planned), a
+    codex instance with no launch script (unsure — planned), a bare seat with
+    no servers (seat:kimi), and one seat whose launch stamps a NON-claude
+    harness (seat:seat-b — the only exclusion). Every arm plants the violating
+    state and asserts the guard FIRES on it, beside a positive control on the
+    same observable so no arm can pass by observing nothing. Borrows
+    EstateBase's fixture WITHOUT inheriting its arms (they run once, in
+    EstateBase)."""
+
+    _mcp_canon = EstateBase._mcp_canon
+
+    def setUp(self):
+        EstateBase.setUp(self)
+        quiet = mock.patch.object(envtidy, "_worktree_census",
+                                  return_value={"note": "fixture"})
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        j = os.path.join
+        self.kimi = j(self.seats, "kimi", "claude")
+        self.codex = j(self.seats, "codex", "claude")
+        # the measured codex launch shape: the claude harness on a codex model
+        self._launch(self.codex, "claude")
+        # a codex INSTANCE with no launch script yet: UNSURE, so planned
+        self.codex_inst = j(self.seats, "codex", "instances", "seat-a", "claude")
+        os.makedirs(self.codex_inst)
+        # the one seat whose launch runs a harness that is not Claude Code
+        self.other = j(self.seats, "seat-b", "claude")
+        os.makedirs(self.other)
+        self._launch(self.other, "pi")
+        self.dirs = skillsync.config_dirs(
+            claude_root=self.croot, default_claude=self.default,
+            seats_root=self.seats)
+        configs.HOME_ROOTS = [cdir for _label, cdir in self.dirs]
+        self.canon = {"alpha-mcp": {"command": "alpha"},
+                      "beta-mcp": {"type": "http", "url": "https://x.invalid/mcp",
+                                   "headers": {"Authorization": "Bearer " + SECRET}}}
+
+    def _env(self, **kw):
+        """Point the MCP / instructions sources at fixtures for one arm; every
+        other source stays at the suite's planted `off`."""
+        return mock.patch.dict(os.environ, kw)
+
+    @staticmethod
+    def _launch(cdir, *harnesses):
+        """A seat launch script beside `cdir` shaped like the minted one: the
+        harness stamp rides an `env` word list, beside a token export."""
+        stamps = " ".join("HELM_AGENT_HARNESS=%s" % h for h in harnesses)
+        with open(os.path.join(os.path.dirname(cdir), "launch.sh"), "w") as f:
+            f.write("#!/bin/sh\nexport ANTHROPIC_AUTH_TOKEN=\"$(cat token)\"\n"
+                    "exec env HELM_CHAT_NAME=seat-c %s "
+                    "CLAUDE_CONFIG_DIR=%s claude --model m \"$@\"\n"
+                    % (stamps, cdir))
+
+    def _state(self, cdir):
+        with open(os.path.join(cdir, ".claude.json")) as f:
+            return json.load(f)
+
+    # ---- MCP: a seat is planned, not skipped --------------------------------
+
+    def test_a_seat_with_zero_servers_is_planned_not_skipped(self):
+        canon = self._mcp_canon(self.canon)
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            plan = envtidy.plan_mcp_home("seat:kimi", self.kimi)
+            # THE VIOLATION: zero servers. The old planner answered `skip`.
+            self.assertEqual(plan["verdict"], "change")
+            self.assertEqual(sorted(plan["adds"]), ["alpha-mcp", "beta-mcp"])
+            # mutation control: only a non-claude harness stamp makes a seat
+            # skip — plant one on this seat and it is excluded, then remove it
+            self._launch(self.kimi, "pi")
+            self.assertEqual(envtidy.plan_mcp_home(
+                "seat:kimi", self.kimi)["verdict"], "excluded")
+            os.remove(os.path.join(os.path.dirname(self.kimi), "launch.sh"))
+            verdict, detail = envtidy.apply_mcp_home(plan, self.backup)
+            self.assertEqual(verdict, "applied", detail)
+            self.assertEqual(sorted(self._state(self.kimi)["mcpServers"]),
+                             ["alpha-mcp", "beta-mcp"])
+            # the written state holds a credential, so it is born private
+            mode = os.stat(os.path.join(self.kimi, ".claude.json")).st_mode
+            self.assertEqual(mode & 0o777, 0o600)
+            self.assertEqual(envtidy.plan_mcp_home("seat:kimi", self.kimi)["verdict"],
+                             "ok")                                 # now canonical
+
+    def _window(self, cdir, *windows):
+        """A claude-harness launch beside `cdir` stamping each window, in the
+        names launch_line writes (test_the_window_is_read_from_a_REAL_launch
+        pins that the two agree)."""
+        stamps = " ".join("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d "
+                          "CLAUDE_CODE_AUTO_COMPACT_WINDOW=%d" % (w, w)
+                          for w in windows)
+        with open(os.path.join(os.path.dirname(cdir), "launch.sh"), "w") as f:
+            f.write("#!/bin/sh\nexec env HELM_AGENT_HARNESS=claude %s "
+                    "CLAUDE_CONFIG_DIR=%s claude \"$@\"\n" % (stamps, cdir))
+
+    def test_a_SMALL_WINDOW_seat_takes_the_web_search_floor_only(self):
+        canon = self._mcp_canon({"exa": {"command": "exa"},
+                                 "alpha-mcp": {"command": "alpha"},
+                                 "polyana": {"command": "pa"}})
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            # the measured local seat: a 115k window, zero servers
+            self._window(self.kimi, 115072)
+            plan = envtidy.plan_mcp_home("seat:kimi", self.kimi)
+            self.assertEqual(plan["adds"], ["exa"])        # web search, always
+            self.assertEqual(sorted(n for n, _ in plan["withheld"]),
+                             ["alpha-mcp", "polyana"])
+            self.assertIn("115072", dict(plan["withheld"])["polyana"])
+            # control: a 1M window carries the whole set
+            self._window(self.kimi, 1000000)
+            self.assertEqual(sorted(envtidy.plan_mcp_home(
+                "seat:kimi", self.kimi)["adds"]), ["alpha-mcp", "exa", "polyana"])
+            # disagreeing stamps are UNSURE, and an unsure seat is planned whole
+            self._window(self.kimi, 115072, 1000000)
+            self.assertEqual(len(envtidy.plan_mcp_home(
+                "seat:kimi", self.kimi)["adds"]), 3)
+            # a server already present above the floor is surfaced, not removed
+            self._window(self.kimi, 115072)
+            _write(os.path.join(self.kimi, ".claude.json"),
+                   {"mcpServers": {"exa": {"command": "exa"},
+                                   "polyana": {"command": "pa"}}})
+            os.chmod(os.path.join(self.kimi, ".claude.json"), 0o600)
+            plan = envtidy.plan_mcp_home("seat:kimi", self.kimi)
+            self.assertEqual(plan["verdict"], "change")
+            self.assertEqual([n for n, _ in plan["refused"]], ["polyana"])
+            self.assertIn("REMOVE polyana by hand", envtidy._mcp_bits(plan))
+            self.assertEqual(plan["adds"], [])
+            # a home is never budgeted: no launch stamps a window for it
+            self.assertEqual(envtidy.mcp_withheld("home:x", self.kimi, canon), {})
+
+    def test_a_LOCAL_GPU_seat_takes_the_floor_whatever_its_window(self):
+        """A local seat's schemas cost PREFILL on the owner's own GPU, every
+        request, main and subagents alike. MEASURED: qwenlocal's 229,376
+        window cleared the share by about 2k, so it took the whole set (about
+        20k tokens of schemas on a 1.4k tok/s prefill), and the local seats
+        made 3 MCP calls in 1,512."""
+        canon = self._mcp_canon({"exa": {"command": "exa"},
+                                 "alpha-mcp": {"command": "alpha"},
+                                 "polyana": {"command": "pa"}})
+        local = os.path.join(self.seats, "qwenlocal", "claude")
+        os.makedirs(local)
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            # CONTROL: a vendor seat on the same window carries the whole set
+            self._window(self.kimi, 229376)
+            self.assertEqual(sorted(envtidy.plan_mcp_home(
+                "seat:kimi", self.kimi)["adds"]), ["alpha-mcp", "exa", "polyana"])
+            self._window(local, 229376)
+            plan = envtidy.plan_mcp_home("seat:qwenlocal", local)
+            self.assertEqual(plan["adds"], ["exa"])        # web search, always
+            self.assertEqual(sorted(n for n, _ in plan["withheld"]),
+                             ["alpha-mcp", "polyana"])
+            self.assertIn("prefill", dict(plan["withheld"])["polyana"])
+
+    def test_a_LITE_seat_takes_the_floor_wherever_it_is_served(self):  # noqa: VACUOUS_ASSERTION — the plan's adds equality ['exa'] and its withheld equality are unconditional positives on the same plan; assertFalse(own_box) is the arm's precondition, and the control's three-server equality follows
+        """task/3253: the lite profile's `mcp_floor` holds on its own, not
+        only through the own-box arm above. A planted family served from a
+        vendor URL (so not the operator's box) on a window that carries the
+        whole set takes the floor while it declares the lite profile, with
+        the profile's reason; the same family without the profile takes the
+        whole set (the control on the same observable). The live FAMILIES is
+        patched for the arm and restored."""
+        from helm import seat, seat_catalog     # noqa: F401 — seat seeds the impl
+        canon = self._mcp_canon({"exa": {"command": "exa"},
+                                 "alpha-mcp": {"command": "alpha"},
+                                 "polyana": {"command": "pa"}})
+        remote = {"mode": "proxy-key", "pool_default": "vendor",
+                  "pool_providers": {"vendor": {
+                      "base_url": "http://192.0.2.99/v1", "rung": "paid"}}}
+        cdir = os.path.join(self.seats, "fam-lite", "claude")
+        os.makedirs(cdir)
+        self._window(cdir, 1000000)
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            with mock.patch.dict(seat_catalog.FAMILIES,
+                                 {"fam-lite": dict(remote, profile="lite")}):
+                self.assertFalse(seat_catalog.own_box(
+                    seat_catalog.FAMILIES["fam-lite"]))
+                plan = envtidy.plan_mcp_home("seat:fam-lite", cdir)
+                self.assertEqual(plan["adds"], ["exa"])
+                self.assertEqual(sorted(n for n, _ in plan["withheld"]),
+                                 ["alpha-mcp", "polyana"])
+                self.assertIn("lite profile", dict(plan["withheld"])["polyana"])
+            with mock.patch.dict(seat_catalog.FAMILIES, {"fam-lite": remote}):
+                self.assertEqual(sorted(envtidy.plan_mcp_home(
+                    "seat:fam-lite", cdir)["adds"]),
+                    ["alpha-mcp", "exa", "polyana"])
+
+    def test_the_local_floor_follows_the_family_not_the_dir_and_only_surfaces(self):
+        """The own-box arm reads the FAMILY a label parses to: a project
+        instance of a local family is floored like its family, a seat whose
+        family the catalog does not hold is left to its window, and a server
+        the local seat already carries is surfaced for removal, never
+        removed."""
+        canon = self._mcp_canon({"exa": {"command": "exa"},
+                                 "alpha-mcp": {"command": "alpha"},
+                                 "polyana": {"command": "pa"}})
+        inst = os.path.join(self.seats, "qwenlocal", "instances",
+                            "helm-qwenlocal", "claude")
+        stray = os.path.join(self.seats, "nosuchfamily", "claude")
+        local = os.path.join(self.seats, "qwenlocal", "claude")
+        for d in (inst, stray, local):
+            os.makedirs(d)
+            self._window(d, 229376)
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            self.assertEqual(envtidy.plan_mcp_home(
+                "seat:qwenlocal/helm-qwenlocal", inst)["adds"], ["exa"])
+            # CONTROL: no catalog row, so only the window decides
+            self.assertEqual(sorted(envtidy.plan_mcp_home(
+                "seat:nosuchfamily", stray)["adds"]),
+                ["alpha-mcp", "exa", "polyana"])
+            _write(os.path.join(local, ".claude.json"),
+                   {"mcpServers": {"exa": {"command": "exa"},
+                                   "polyana": {"command": "pa"}}})
+            os.chmod(os.path.join(local, ".claude.json"), 0o600)
+            plan = envtidy.plan_mcp_home("seat:qwenlocal", local)
+            self.assertEqual(plan["verdict"], "change")
+            self.assertEqual([n for n, _ in plan["refused"]], ["polyana"])
+            bits = envtidy._mcp_bits(plan)
+            self.assertIn("REMOVE polyana by hand", bits)
+            self.assertIn("prefill", bits)
+            self.assertEqual(envtidy.apply_mcp_home(plan, self.backup)[0], "ok")
+            self.assertIn("polyana", self._state(local)["mcpServers"])
+
+    def test_the_window_is_read_from_a_REAL_launch_line(self):
+        # The stamp comes from the generator, never a hand-typed fixture: a
+        # bare MAX_CONTEXT_TOKENS fixture once passed while every real seat
+        # read UNSURE and took the whole set.
+        from helm import seat  # noqa: F401  (the facade seeds the impl modules)
+        from helm.seat_launch_assets import launch_line
+        launch = os.path.join(os.path.dirname(self.kimi), "launch.sh")
+        with open(launch, "w") as f:
+            f.write("#!/bin/sh\nexec %s\n"
+                    % launch_line("codex", model="gpt-5.3-codex-spark"))
+        self.assertEqual(envtidy.seat_window(self.kimi), 76000)
+        canon = self._mcp_canon({"exa": {"command": "exa"},
+                                 "polyana": {"command": "pa"}})
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            self.assertEqual(envtidy.plan_mcp_home("seat:kimi", self.kimi)["adds"],
+                             ["exa"])
+        # control: a bare name inside another word is not the stamp
+        with open(launch, "w") as f:
+            f.write("#!/bin/sh\nexec env X_MAX_CONTEXT_TOKENS=76000 claude\n")
+        self.assertIsNone(envtidy.seat_window(self.kimi))
+
+    def test_a_settings_env_pin_outranks_the_launch_stamp(self):
+        """The window and output cap a seat RUNS with, not only the ones its
+        launch stamps (task/3184). Claude Code applies the `env` block of the
+        seat's own settings.json over the launch environment (MEASURED on a
+        live local seat whose window was pinned there), so a pin in that file
+        is the effective value.
+
+        Each arm plants the case and reads the same knob, so no arm passes by
+        reading nothing: the launch stamp alone; a settings pin over it; a pin
+        that is not a token count (UNSURE, never a silent fall back to the
+        launch stamp that the pin was meant to replace); a settings file with
+        no such key (the launch stamp again); and a settings file that does
+        not parse (UNSURE, because nobody can say which value Claude Code
+        took)."""
+        name = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+        settings = os.path.join(self.kimi, "settings.json")
+        self._window(self.kimi, 229376)
+        self.assertEqual(envtidy.seat_stamp(self.kimi, name),
+                         (229376, "launch.sh"))
+        _write(settings, {"env": {name: "196608"}})
+        self.assertEqual(envtidy.seat_stamp(self.kimi, name),
+                         (196608, "settings.json"))
+        self.assertEqual(envtidy.seat_window(self.kimi), 196608)
+        _write(settings, {"env": {name: "lots"}})
+        self.assertIsNone(envtidy.seat_stamp(self.kimi, name)[0])
+        self.assertIsNone(envtidy.seat_window(self.kimi))
+        _write(settings, {"env": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16384"}})
+        self.assertEqual(envtidy.seat_stamp(self.kimi, name),
+                         (229376, "launch.sh"))
+        self.assertEqual(
+            envtidy.seat_stamp(self.kimi, "CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+            (16384, "settings.json"))
+        with open(settings, "w") as f:
+            f.write("{not json")
+        self.assertIsNone(envtidy.seat_stamp(self.kimi, name)[0])
+
+    def test_a_backup_shelf_is_private_and_the_copy_keeps_its_mode(self):
+        old = os.umask(0o022)
+        self.addCleanup(os.umask, old)
+        root = os.path.join(self.backup, "fresh-root")
+        os.makedirs(root, mode=0o755)
+        src = os.path.join(self.kimi, ".claude.json")
+        _write(src, {"mcpServers": {"beta-mcp": {"headers": {
+            "Authorization": "Bearer " + SECRET}}}})
+        os.chmod(src, 0o644)                                 # a loose pre-image
+        dst = envtidy._backup(root, "seat:kimi", src)
+        for d in (root, os.path.dirname(dst)):
+            self.assertEqual(os.stat(d).st_mode & 0o777, 0o700, d)
+        self.assertEqual(os.stat(dst).st_mode & 0o777, 0o644)  # rollback exact
+        with open(dst) as f:
+            self.assertIn(SECRET, f.read())                  # the bytes, whole
+
+    def test_a_server_the_family_API_REFUSES_is_never_written(self):
+        canon = self._mcp_canon({"exa": {"command": "exa"},
+                                 "polyana": {"command": "pa"}})
+        gem = os.path.join(self.seats, "gemini", "claude")
+        os.makedirs(gem)
+        self._window(gem, 1000000)
+        refusal = {"gemini": {"polyana": "a fixture refusal: HTTP 400"}}
+        with self._env(HELM_MCPS_CANONICAL=canon), \
+                mock.patch.dict(envtidy.MCP_FAMILY_REFUSES, refusal):
+            plan = envtidy.plan_mcp_home("seat:gemini", gem)
+            self.assertEqual(plan["adds"], ["exa"])
+            self.assertIn("400", dict(plan["withheld"])["polyana"])
+            # control: the same window on another family takes polyana
+            self._window(self.kimi, 1000000)
+            self.assertIn("polyana", envtidy.plan_mcp_home(
+                "seat:kimi", self.kimi)["adds"])
+            # present already -> surfaced for removal, and the sync adds nothing
+            _write(os.path.join(gem, ".claude.json"),
+                   {"mcpServers": {"exa": {"command": "exa"},
+                                   "polyana": {"command": "pa"}}})
+            os.chmod(os.path.join(gem, ".claude.json"), 0o600)
+            plan = envtidy.plan_mcp_home("seat:gemini", gem)
+            self.assertEqual([n for n, _ in plan["refused"]], ["polyana"])
+            self.assertEqual(envtidy.apply_mcp_home(plan, self.backup)[0], "ok")
+            self.assertIn("polyana", self._state(gem)["mcpServers"])
+
+    def test_gemini_takes_polyana_now_the_proxy_fills_array_items(self):
+        # The refusal row is gone: a stale row told the operator to REMOVE a
+        # server gemini had been answering on since the proxy fix.
+        canon = self._mcp_canon({"exa": {"command": "exa"},
+                                 "polyana": {"command": "pa"}})
+        gem = os.path.join(self.seats, "gemini", "claude")
+        os.makedirs(gem)
+        self._window(gem, 1000000)
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            plan = envtidy.plan_mcp_home("seat:gemini", gem)
+            self.assertEqual(sorted(plan["adds"]), ["exa", "polyana"])
+            self.assertEqual(plan["refused"], [])
+
+    def test_a_loose_state_file_holding_servers_is_planned_private(self):
+        state = os.path.join(self.kimi, ".claude.json")
+        _write(state, {"mcpServers": {"alpha-mcp": {"command": "alpha"}}})
+        os.chmod(state, 0o664)
+        canon = self._mcp_canon({"alpha-mcp": {"command": "alpha"}})
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            plan = envtidy.plan_mcp_home("seat:kimi", self.kimi)
+            self.assertEqual((plan["verdict"], plan["adds"]), ("change", []))
+            self.assertEqual(plan["tighten"], "-rw-rw-r--")
+            with open(state, "rb") as f:
+                before = f.read()
+            self.assertEqual(envtidy.apply_mcp_home(plan, self.backup)[0], "applied")
+            self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
+            with open(state, "rb") as f:
+                self.assertEqual(f.read(), before)                  # bytes untouched
+            self.assertEqual(envtidy.plan_mcp_home("seat:kimi", self.kimi)["verdict"],
+                             "ok")
+        # control: a loose file that holds NO servers is not ours to judge
+        other = os.path.join(self.croot, "bare-com", ".claude.json")
+        _write(other, {"numStartups": 1})
+        os.chmod(other, 0o664)
+        with self._env(HELM_MCPS_CANONICAL=self._mcp_canon({}, name="empty.json")):
+            self.assertIsNone(envtidy.plan_mcp_home("bare-com", os.path.dirname(other))["tighten"])
+
+    def test_the_census_never_asks_back_what_the_sync_withholds(self):
+        """THE CENSUS AND THE SYNC ANSWER ONE QUESTION. A server the sync
+        withholds from a seat (over its window, or on the operator's own GPU)
+        is not a gap: listing it as missing asks the operator to add back
+        what the sync said to remove by hand."""
+        canon = self._mcp_canon({"exa": {"command": "exa"},
+                                 "polyana": {"command": "pa"}})
+        local = os.path.join(self.seats, "qwenlocal", "claude")
+        os.makedirs(local)
+        for d in (local, self.kimi):
+            self._window(d, 229376)
+            _write(os.path.join(d, ".claude.json"),
+                   {"mcpServers": {"exa": {"command": "exa"}}})
+            os.chmod(os.path.join(d, ".claude.json"), 0o600)
+        dirs = skillsync.config_dirs(
+            claude_root=self.croot, default_claude=self.default,
+            seats_root=self.seats)
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            m = envtidy.census(dirs=dirs)["mcp_variance"]
+        # CONTROL: the vendor seat on the same window is missing polyana
+        self.assertEqual(m["missing_by_home"].get("seat:kimi"), ["polyana"])
+        self.assertNotIn("seat:qwenlocal", m["missing_by_home"])
+        self.assertEqual(m["withheld_by_home"].get("seat:qwenlocal"),
+                         ["polyana"])
+
+    def test_a_codex_seat_on_the_claude_harness_is_planned(self):
+        """THE RETIRED PREMISE: a codex-family seat was excluded by its family
+        name. Its launch runs the claude harness, so it is Claude Code and is
+        planned — the family instance with no launch script too (unsure)."""
+        self.assertEqual(envtidy.seat_harness(self.codex), "claude")
+        self.assertIsNone(envtidy.seat_harness(self.codex_inst))   # unsure
+        canon = self._mcp_canon(self.canon)
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            for label, cdir in (("seat:codex", self.codex),
+                                ("seat:codex/seat-a", self.codex_inst)):
+                plan = envtidy.plan_mcp_home(label, cdir)
+                self.assertEqual(plan["verdict"], "change", label)
+                self.assertEqual(sorted(plan["adds"]), ["alpha-mcp", "beta-mcp"])
+            c = envtidy.census(dirs=self.dirs)
+        self.assertIn("seat:codex", c["mcp_variance"]["missing_by_home"])
+        self.assertNotIn("seat:codex", c["mcp_variance"]["excluded_by_home"])
+
+    def test_a_non_claude_harness_seat_is_excluded_and_counted(self):  # noqa: VACUOUS_ASSERTION — the exact excluded list, the harness named in its reason and the unsure-seat changes are unconditional positives on the same sync result
+        canon = self._mcp_canon(self.canon)
+        with self._env(HELM_MCPS_CANONICAL=canon):
+            r = envtidy.mcp_sync(dirs=self.dirs, backup_root=self.backup)
+            self.assertEqual([p["label"] for p in r["excluded"]], ["seat:seat-b"])
+            self.assertIn("pi harness", r["excluded"][0]["detail"])   # the reason
+            changed = {p["label"] for p in r["changed"]}
+            self.assertTrue({"seat:codex", "seat:codex/seat-a", "seat:kimi"} <= changed)
+            self.assertNotIn("seat:seat-b", changed)
+            # every dir lands in exactly ONE bucket — none vanishes, none twice
+            self.assertEqual(len(r["changed"]) + len(r["failed"]) + r["steady"]
+                             + len(r["excluded"]), len(self.dirs))
+            c = envtidy.census(dirs=self.dirs)
+            self.assertIn("seat:seat-b", c["mcp_variance"]["excluded_by_home"])
+            self.assertNotIn("seat:seat-b", c["mcp_variance"]["missing_by_home"])
+            # UNSURE IS PLANNED. Each unsure shape of the same seat plans it:
+            # disagreeing stamps, a stamp-free script, an unreadable script.
+            launch = os.path.join(os.path.dirname(self.other), "launch.sh")
+            for shape in ("mixed", "no-stamp", "unreadable", "claude"):
+                with self.subTest(shape=shape):
+                    os.remove(launch) if os.path.isfile(launch) else os.rmdir(launch)
+                    if shape == "mixed":
+                        self._launch(self.other, "pi", "claude")
+                    elif shape == "no-stamp":
+                        self._launch(self.other)
+                    elif shape == "unreadable":
+                        os.makedirs(launch)          # a dir where the script belongs
+                    else:
+                        self._launch(self.other, "claude")
+                    self.assertIsNone(envtidy.mcp_exclusion("seat:seat-b", self.other))
+                    self.assertEqual(envtidy.plan_mcp_home(
+                        "seat:seat-b", self.other)["verdict"], "change")
+            # a HOME is never excluded, whatever sits beside it
+            self._launch(self.whole, "pi")
+            self.assertIsNone(envtidy.mcp_exclusion("whole-com", self.whole))
+
+    def test_the_summary_never_reports_a_skipped_dir_as_canonical(self):  # noqa: VACUOUS_ASSERTION — the exact count line and the per-seat line are unconditional positives on the same output the absence check reads
+        """THE MEASURED FALSE GREEN: `0 homes with gaps, 29 already canonical`
+        while four seats held zero servers. The planted estate is exactly that
+        — excluded and zero-server seats only — and the count must say so."""
+        seats_only = [(l, c) for l, c in self.dirs if l.startswith("seat:")]
+        canon = self._mcp_canon(self.canon)
+        out, err = io.StringIO(), io.StringIO()
+        with self._env(HELM_MCPS_CANONICAL=canon), \
+                mock.patch.object(envtidy.skillsync, "config_dirs",
+                                  return_value=seats_only), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(envtidy.cmd_mcp(["sync"]), 0)
+        text = out.getvalue()
+        self.assertIn("3 dir(s) with gaps, 0 already canonical, 1 excluded, "
+                      "0 failed", text)
+        self.assertIn("seat:seat-b", text)
+        self.assertIn("EXCLUDED", text)
+        self.assertIn("seat:kimi", text)
+        self.assertIn("seat had 0/2 canonical server(s); missing alpha-mcp, "
+                      "beta-mcp", text)
+        self.assertNotIn(SECRET, text + err.getvalue())    # configs never printed
+        # the instructions leg has the same law: no source is not canonical
+        r = envtidy.instructions_sync(dirs=seats_only)
+        self.assertEqual(r["steady"], 0)
+        self.assertEqual(len(r["unsourced"]), len(seats_only))
+
+    # ---- the canonical file's permission rule --------------------------------
+
+    def test_a_world_readable_canonical_file_is_refused(self):  # noqa: VACUOUS_ASSERTION — the 0600 read after the loop is the unconditional positive control on the same resolver
+        body = dict(self.canon)
+        for mode in (0o644, 0o640, 0o604, 0o620, 0o602):
+            with self.subTest(mode=oct(mode)):
+                priv = self._mcp_canon(body, mode=mode, name="priv.json")
+                with self._env(HELM_MCPS_PRIVATE=priv):
+                    with self.assertRaises(envtidy.MCPSourceRefused) as cm:
+                        envtidy.canonical_mcps()
+                msg = str(cm.exception)
+                self.assertIn(priv, msg)                        # named
+                self.assertIn("chmod 600", msg)                 # and the repair
+                self.assertNotIn(SECRET, msg)                   # never the content
+        # the explicit env file obeys the same rule
+        loose = self._mcp_canon(body, mode=0o644, name="env.json")
+        with self._env(HELM_MCPS_CANONICAL=loose):
+            with self.assertRaises(envtidy.MCPSourceRefused):
+                envtidy.canonical_mcps()
+        # positive control: the SAME content at 0600 is read
+        tight = self._mcp_canon(body, mode=0o600, name="priv.json")
+        with self._env(HELM_MCPS_PRIVATE=tight):
+            self.assertEqual(sorted(envtidy.canonical_mcps()), ["alpha-mcp", "beta-mcp"])
+
+    def test_a_refused_file_writes_nothing_anywhere(self):  # noqa: VACUOUS_ASSERTION — rc 2, the named refusal on stderr and tidy's recorded error are unconditional positives before any absence is asserted
+        priv = self._mcp_canon(self.canon, mode=0o644, name="priv.json")
+        out, err = io.StringIO(), io.StringIO()
+        with self._env(HELM_MCPS_PRIVATE=priv), \
+                mock.patch.object(envtidy.skillsync, "config_dirs",
+                                  return_value=self.dirs), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = envtidy.cmd_mcp(["sync", "--apply"])
+            with self.assertRaises(envtidy.MCPSourceRefused):
+                envtidy.mcp_sync(dirs=self.dirs, backup_root=self.backup, apply=True)
+            with mock.patch.object(envtidy, "worktree_gc",
+                                   return_value={"error": "fixture"}):
+                t = envtidy.tidy(dirs=self.dirs, backup_root=self.backup,
+                                 root=self.tmp, apply=False)
+        self.assertEqual(rc, 2)
+        self.assertIn("REFUSED", err.getvalue())
+        self.assertIn(priv, err.getvalue())
+        self.assertNotIn(SECRET, out.getvalue() + err.getvalue())
+        for _label, cdir in self.dirs:
+            self.assertFalse(os.path.exists(os.path.join(cdir, ".claude.json")), cdir)
+        self.assertFalse(os.path.exists(self.backup))
+        # tidy reports the leg as refused instead of aborting or reading clean
+        self.assertIn("REFUSED", t["mcp"]["error"])
+        self.assertIn("REFUSED", t["census"]["mcp_variance"]["canonical_error"])
+        self.assertIn("hooks", t)                        # the other legs still ran
+
+    def test_the_private_file_sits_between_the_env_file_and_the_host_block(self):
+        priv = self._mcp_canon({"from-private": None}, name="priv.json")
+        env = self._mcp_canon({"from-env": None}, name="env.json")
+        host = {"canonical_mcps": {"from-host": None}}
+        with mock.patch.object(envtidy.registry, "authored_host", return_value=host):
+            with self._env(HELM_MCPS_PRIVATE=priv, HELM_MCPS_CANONICAL=env):
+                self.assertEqual(list(envtidy.canonical_mcps()), ["from-env"])
+            with self._env(HELM_MCPS_PRIVATE=priv, HELM_MCPS_CANONICAL=""):
+                self.assertEqual(list(envtidy.canonical_mcps()), ["from-private"])
+            gone = os.path.join(self.tmp, "absent.json")
+            with self._env(HELM_MCPS_PRIVATE=gone, HELM_MCPS_CANONICAL=""):
+                self.assertEqual(list(envtidy.canonical_mcps()), ["from-host"])
+            with self._env(HELM_MCPS_PRIVATE="off", HELM_MCPS_CANONICAL=""):
+                self.assertEqual(list(envtidy.canonical_mcps()), ["from-host"])
+                self.assertIsNone(envtidy.private_mcps_path())
+        with self._env(HELM_MCPS_PRIVATE=""):
+            self.assertEqual(envtidy.private_mcps_path(), envtidy.MCPS_PRIVATE)
+        self.assertTrue(envtidy.MCPS_PRIVATE.endswith(
+            os.path.join(".config", "helm", "mcps-canonical.json")))
+
+    # ---- hooks: the full set, not the lean subset -----------------------------
+
+    def test_seats_are_reconciled_to_the_full_hook_set(self):
+        pre = envtidy.plan_hooks_home("seat:codex", self.codex)
+        self.assertEqual(pre["verdict"], "change")      # the old lean subset is short
+        self.assertEqual(pre["actions"].get("inject --hook-json"), "add")
+        r = envtidy.hooks_sync(dirs=self.dirs, backup_root=self.backup, apply=True)
+        self.assertEqual([p["label"] for p in r["failed"]], ["broken-com"])
+        from helm import record
+        for cdir in (self.codex, self.kimi, self.codex_inst):
+            with open(os.path.join(cdir, "settings.json")) as f:
+                got = json.load(f)
+            for tup in envtidy.CANONICAL_HOOKS:
+                self.assertTrue(hooks_mod._lane_live(got, envtidy._spec(tup)),
+                                (cdir, tup))
+            for ev in record.HOOK_EVENTS:            # both recorder legs, by record's own check
+                self.assertTrue(record._leg_live(got, ev), (cdir, ev))
+        r2 = envtidy.hooks_sync(dirs=self.dirs, backup_root=self.backup, apply=True)
+        self.assertEqual([p["label"] for p in r2["changed"]], [])
+
+    # ---- the global instructions ------------------------------------------------
+
+    def _global_rules(self):
+        src = os.path.join(self.tmp, "owner-home", "CLAUDE.md")
+        os.makedirs(os.path.dirname(src))
+        with open(src, "w") as f:
+            f.write("# the host's global rules\n")
+        return src
+
+    def test_instructions_link_every_seat_and_keep_a_real_file(self):
+        src = self._global_rules()
+        own = os.path.join(self.kimi, "CLAUDE.md")
+        with open(own, "wb") as f:
+            f.write(b"# this seat's own rules\r\nkeep\r\n")
+        st = os.stat(own)
+        # THE VIOLATION: a real file already holds the link's name on one seat
+        squat = os.path.join(self.codex_inst, "rules", "global-instructions.md")
+        os.makedirs(os.path.dirname(squat))
+        with open(squat, "w") as f:
+            f.write("operator's own\n")
+        with self._env(HELM_INSTRUCTIONS_CANONICAL=src):
+            dry = envtidy.instructions_sync(dirs=self.dirs)
+            self.assertFalse(os.path.lexists(os.path.join(
+                self.kimi, "rules", "global-instructions.md")))   # dry wrote nothing
+            self.assertIn("would-link", {p["action"] for p in dry["changed"]})
+            r = envtidy.instructions_sync(dirs=self.dirs, apply=True)
+        linked = {p["label"] for p in r["changed"]}
+        self.assertEqual(linked, {"seat:codex", "seat:kimi", "seat:seat-b"})
+        for cdir in (self.codex, self.kimi, self.other):
+            link = os.path.join(cdir, "rules", "global-instructions.md")
+            self.assertEqual(os.readlink(link), os.path.realpath(src))
+        # the real file is KEPT, byte for byte, and surfaced — never canonical
+        with open(squat) as f:
+            self.assertEqual(f.read(), "operator's own\n")
+        self.assertEqual([(p["label"], p["action"]) for p in r["surfaced"]],
+                         [("seat:codex/seat-a", "real")])
+        # the seat's OWN CLAUDE.md is never touched: same bytes, same inode
+        with open(own, "rb") as f:
+            self.assertEqual(f.read(), b"# this seat's own rules\r\nkeep\r\n")
+        self.assertEqual((os.stat(own).st_ino, os.stat(own).st_mtime_ns),
+                         (st.st_ino, st.st_mtime_ns))
+        # homes are counted as not planned, never as canonical
+        self.assertEqual(len(r["not_planned"]),
+                         len([l for l, _c in self.dirs if not l.startswith("seat:")]))
+        self.assertEqual(r["steady"], 0)
+        with self._env(HELM_INSTRUCTIONS_CANONICAL=src):
+            again = envtidy.instructions_sync(dirs=self.dirs, apply=True)
+        self.assertEqual((again["steady"], again["changed"]), (3, []))
+
+    def test_tidy_reports_each_seats_servers_hooks_and_instructions(self):
+        src = self._global_rules()
+        canon = self._mcp_canon(self.canon)
+        out = io.StringIO()
+        with self._env(HELM_MCPS_CANONICAL=canon, HELM_INSTRUCTIONS_CANONICAL=src):
+            r = envtidy.census(dirs=self.dirs)
+            envtidy._print_census(r, out=out)
+        text = out.getvalue()
+        self.assertIn("seat parity", text)
+        lines = {ln.split()[0]: ln for ln in text.splitlines()
+                 if ln.startswith("  seat:") and "instructions" in ln}
+        self.assertEqual(sorted(lines), ["seat:codex", "seat:codex/seat-a",
+                                         "seat:kimi", "seat:seat-b"])
+        self.assertIn("servers EXCLUDED", lines["seat:seat-b"])
+        self.assertIn("servers 0/2 missing alpha-mcp,beta-mcp", lines["seat:codex"])
+        self.assertIn("servers 0/2 missing alpha-mcp,beta-mcp", lines["seat:kimi"])
+        self.assertIn("hooks 5 missing", lines["seat:codex"])
+        self.assertIn("instructions would-link", lines["seat:kimi"])
+        self.assertIn("own CLAUDE.md: none", lines["seat:kimi"])
+        self.assertNotIn(SECRET, text)
+
+    def test_the_report_flags_a_readable_state_file_holding_servers(self):  # noqa: VACUOUS_ASSERTION — the flagged-label map and the LOOSE lines are unconditional positives on the same census the absence checks read
+        """A `.claude.json` holding MCP servers that group or world can read
+        is a credential they can read: the census flags it on EVERY dir, an
+        excluded seat included (with the manual repair, since the sync does
+        not plan it). A private one, and a loose one with no servers, are
+        not flagged."""
+        servers = {"mcpServers": {"beta-mcp": self.canon["beta-mcp"]}}
+        for cdir, mode in ((self.kimi, 0o664), (self.other, 0o644),
+                           (self.whole, 0o660), (self.codex, 0o600)):
+            _write(os.path.join(cdir, ".claude.json"), servers)
+            os.chmod(os.path.join(cdir, ".claude.json"), mode)
+        bare = os.path.join(self.croot, "bare-com", ".claude.json")
+        _write(bare, {"numStartups": 1})
+        os.chmod(bare, 0o666)
+        out = io.StringIO()
+        with self._env(HELM_MCPS_CANONICAL=self._mcp_canon(self.canon)):
+            r = envtidy.census(dirs=self.dirs)
+            envtidy._print_census(r, out=out)
+        self.assertEqual(r["mcp_variance"]["loose_state_by_home"],
+                         {"seat:kimi": "-rw-rw-r--", "seat:seat-b": "-rw-r--r--",
+                          "whole-com": "-rw-rw----"})
+        text = out.getvalue()
+        self.assertIn("CREDENTIAL EXPOSURE", text)
+        self.assertIn("LOOSE seat:kimi", text)
+        self.assertIn("LOOSE whole-com", text)
+        flagged = [ln for ln in text.splitlines() if "LOOSE seat:seat-b" in ln]
+        self.assertEqual(len(flagged), 1)
+        self.assertIn("excluded from mcp sync: chmod 600", flagged[0])
+        self.assertIn("LOOSE -rw-rw-r--", [ln for ln in text.splitlines()
+                                            if ln.startswith("  seat:kimi")
+                                            and "servers" in ln][0])
+        self.assertNotIn("LOOSE seat:codex", text)          # private: not flagged
+        self.assertNotIn("bare-com", "".join(
+            ln for ln in text.splitlines() if "LOOSE" in ln))  # no servers: not flagged
+        self.assertNotIn(SECRET, text)
+        # and the sync repairs exactly the planned ones, bytes untouched
+        with self._env(HELM_MCPS_CANONICAL=self._mcp_canon(self.canon)):
+            envtidy.mcp_sync(dirs=self.dirs, backup_root=self.backup, apply=True)
+            after = envtidy.census(dirs=self.dirs)
+        self.assertEqual(after["mcp_variance"]["loose_state_by_home"],
+                         {"seat:seat-b": "-rw-r--r--"})       # excluded: by hand
 
 
 # ---------------------------------------------------------------------------
@@ -475,10 +1169,13 @@ class WorktreeGcTest(WorktreeBase):
         _sh(self.root, "git", "checkout", "-q", "-b", "worktree-unmerged")
         self._commit("u.txt", "unlanded work")
         _sh(self.root, "git", "checkout", "-q", "main")
-        # registered worktree, clean, at main tip (merged -> removable)
+        # registered worktree, clean, at main tip, and ABANDONED: nobody has
+        # moved it for longer than the grace a sweep gives a room before its
+        # first commit, so it is removable (a fresh one is kept, task/3428)
         self.wt_rm = os.path.join(self.tmp, "wts", "wf-clean")
         _sh(self.root, "git", "worktree", "add", "-q", "-b", "worktree-wfclean",
             self.wt_rm, "main")
+        _roomclock.age_room(self.wt_rm)
         # registered worktree, AHEAD of main (unmerged -> blocked/keep)
         self.wt_keep = os.path.join(self.tmp, "wts", "wf-ahead")
         _sh(self.root, "git", "worktree", "add", "-q", "-b", "worktree-wfahead",
@@ -622,6 +1319,7 @@ class WorktreeGcTest(WorktreeBase):
         r = _sh(self.root, "git", "worktree", "add", "-q", "-b",
                 "agent-clean", path, "main")
         self.assertEqual(r.returncode, 0, r.stderr)
+        _roomclock.age_room(path)        # abandoned, so work.gc removes it
         self.assertNotIn(path, {row["path"] for row in
                                 envtidy._worktree_rows(self.root, "main")})
         lane = next(row for row in work.gc_scan(self.root) if row["path"] == path)
@@ -762,6 +1460,29 @@ class WorktreeGcTest(WorktreeBase):
         self.assertTrue(any("LOCKED" in line for line in lines))
         self.assertTrue(os.path.isdir(self.wt_rm))
 
+    def test_enact_rereads_what_the_room_holds_after_scan(self):
+        """task/3125. The scan judged the room by the branch it held then. A
+        room that detaches and commits before enact holds a commit only its
+        HEAD reaches, and removing it orphans that commit while the branch
+        the scan judged still reads merged. `gc_enact` re-reads the room's
+        branch before removal; this remover did not."""
+        self._seed()
+        row = next(w for w in envtidy._worktree_rows(self.root, "main")
+                   if w["path"] == self.wt_rm)
+        self.assertEqual(row["verdict"], "remove")
+        _sh(self.wt_rm, "git", "checkout", "-q", "--detach")
+        self._commit("after-scan.txt", "committed after the scan",
+                     where=self.wt_rm)
+        doomed = _sh(self.wt_rm, "git", "rev-parse", "HEAD").stdout.strip()
+        lines = envtidy._enact_worktree(self.root, row, True)
+        self.assertTrue(os.path.isdir(self.wt_rm),
+                        "removed a room that detached under the scan: %s"
+                        % lines)
+        self.assertEqual(
+            _sh(self.wt_rm, "git", "rev-parse", "HEAD").stdout.strip(), doomed)
+        self.assertTrue(any("moved under the scan" in line for line in lines),
+                        lines)
+
     def test_rescue_dirty_first_then_keep(self):
         self._seed()
         envtidy.worktree_gc(root=self.root, apply=True)
@@ -800,6 +1521,314 @@ class WorktreeGcTest(WorktreeBase):
         self.assertFalse(r["apply"])
         # dry umbrella removed nothing
         self.assertIn("worktree-merged", self._branches())
+
+
+class _StrayRooms:
+    """A stray room minted off main, its row in the estate sweep, and the
+    branch set, for the arms that walk a stray room's life."""
+
+    def _add(self, name):
+        path = os.path.join(self.tmp, "wts", name)
+        r = _sh(self.root, "git", "worktree", "add", "-q", "-b",
+                "worktree-" + name, path, "main")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return path
+
+    def _row(self, path):
+        return next(r for r in envtidy._worktree_rows(self.root, "main")
+                    if r["path"] == path)
+
+    def _branches(self):
+        r = _sh(self.root, "git", "for-each-ref", "--format=%(refname:short)",
+                "refs/heads/")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return set(r.stdout.split())
+
+
+class WorktreeGcUnstartedTest(_StrayRooms, WorktreeBase):
+    """THE ESTATE SWEEP ASKS THE SAME QUESTION AS `helm work gc` (task/3428).
+
+    A stray room minted at the trunk a moment ago is clean and its branch is
+    an ancestor of the trunk, which this sweep read as "clean + merged" and
+    removed, branch and all. Nothing of that branch was ever on the trunk; it
+    is EMPTY, not landed, and its builder is about to commit in it."""
+
+    def test_a_fresh_stray_room_at_the_trunk_is_KEPT(self):
+        path = self._add("wf-fresh")
+        row = self._row(path)
+        self.assertEqual(row["verdict"], "keep", row)
+        self.assertFalse(row["remove"])
+        self.assertIn("UNSTARTED", row["why"])
+        envtidy.worktree_gc(root=self.root, apply=True)
+        self.assertTrue(os.path.isdir(path))
+        self.assertIn("worktree-wf-fresh", self._branches())
+
+    def test_control_a_landed_stray_room_is_still_removed(self):  # noqa: VACUOUS_ASSERTION — the absence is the removal under test; the row reads remove and the branch is asserted present before apply
+        path = self._add("wf-landed")
+        self._commit("landed.txt", "landed work", where=path)
+        r = _sh(self.root, "git", "merge", "-q", "--no-ff", "-m", "land",
+                "worktree-wf-landed")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        row = self._row(path)
+        self.assertEqual(row["verdict"], "remove", row)
+        self.assertIn("worktree-wf-landed", self._branches())
+        envtidy.worktree_gc(root=self.root, apply=True)
+        self.assertFalse(os.path.exists(path))
+        self.assertNotIn("worktree-wf-landed", self._branches())
+
+    def test_an_OLD_unstarted_stray_room_is_still_tidied(self):  # noqa: VACUOUS_ASSERTION — the absence is the tidy under test; the row reads remove naming the abandoned-claim rule first
+        self.assertGreater(_roomclock.AGED_S, _gc._UNSTARTED_GRACE_S)
+        path = self._add("wf-old")
+        _roomclock.age_room(path)
+        row = self._row(path)
+        self.assertEqual(row["verdict"], "remove", row)
+        self.assertIn("an abandoned claim", row["why"])
+        envtidy.worktree_gc(root=self.root, apply=True)
+        self.assertFalse(os.path.exists(path))
+        self.assertNotIn("worktree-wf-old", self._branches())
+
+    def test_enact_RE_READS_the_sweep_state_before_removal(self):
+        """The scan judged the room abandoned; its HEAD moved before the
+        enact, on the same branch. The estate sweep had no landedness re-read
+        at the removal at all, so the scan's verdict alone removed rooms."""
+        path = self._add("wf-revived")
+        _roomclock.age_room(path)
+        row = self._row(path)
+        self.assertEqual(row["verdict"], "remove", row)
+        r = _sh(path, "git", "reset", "-q", "--hard", "HEAD")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = envtidy._enact_worktree(self.root, row, True)
+        self.assertTrue(os.path.isdir(path), lines)
+        self.assertIn("worktree-wf-revived", self._branches())
+        self.assertTrue(any(line.startswith("SKIPPED") and "UNSTARTED" in line
+                            for line in lines), lines)
+
+    def test_an_ORPHAN_branch_reset_back_after_committing_is_KEPT(self):  # noqa: VACUOUS_ASSERTION — the never-started branch's absence is the control; the reset branch is asserted PRESENT in the same branch set and its dropped sha read back from its reflog
+        """No room stands on this branch, so no age protects it, and a branch
+        that never committed is still deleted (the control below: it holds no
+        commit). But this one committed and was reset back to the trunk: its
+        tip reads LANDED by ancestry while the commit it wrote is on neither
+        the branch nor the trunk, only in the branch's reflog — which
+        deleting the branch deletes."""
+        self._branch_at_main("lane/never-started")
+        r = _sh(self.root, "git", "checkout", "-q", "-b", "lane/undone")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self._commit("undone.txt", "written, then reset away")
+        dropped = _sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        for cmd in (("git", "reset", "-q", "--hard", "main"),
+                    ("git", "checkout", "-q", "main")):
+            r = _sh(self.root, *cmd)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        verdicts = {o["branch"]: o["verdict"]
+                    for o in envtidy._orphan_branches(self.root, "main")}
+        self.assertEqual(verdicts["lane/never-started"], "delete")
+        self.assertEqual(verdicts["lane/undone"], "keep")
+        envtidy.worktree_gc(root=self.root, apply=True)
+        branches = self._branches()
+        self.assertNotIn("lane/never-started", branches)
+        self.assertIn("lane/undone", branches)
+        log = _sh(self.root, "git", "reflog", "show", "--format=%H",
+                  "lane/undone")
+        self.assertEqual(log.returncode, 0, log.stderr)
+        self.assertIn(dropped, log.stdout.split())
+
+
+class WorktreeGcDroppedWorkTest(_StrayRooms, WorktreeBase):
+    """THE ESTATE SWEEP KEEPS EVERY COMMIT ONLY A REFLOG HOLDS UNTIL IT LANDS
+    (task/3436): the orphan pass (no room, so the branch's reflog is the only
+    record) and the stray-room pass (the room's HEAD reflog too), read by the
+    same `work._sweep_state` as `helm work gc`, and the enact re-proves the
+    room unmoved at the removal itself."""
+
+    def _git(self, cwd, *args):
+        r = _sh(cwd, *(("git",) + args))
+        self.assertEqual(r.returncode, 0, "git %s: %s" % (args, r.stderr))
+        return r.stdout.strip()
+
+    def _head(self, cwd):
+        return self._git(cwd, "rev-parse", "HEAD")
+
+    def _reflog(self, cwd, ref):
+        return self._git(cwd, "reflog", "show", "--format=%H", ref).split()
+
+    def _orphan(self, branch, *steps):
+        """A branch off main in the main checkout, each step a (file, reset)
+        pair: commit `file`, then reset back to main if `reset`. Returns the
+        shas committed, and leaves the checkout on main."""
+        self._git(self.root, "checkout", "-q", "-b", branch)
+        shas = []
+        for name, reset in steps:
+            self._commit(name, "work on " + name)
+            shas.append(self._head(self.root))
+            if reset:
+                self._git(self.root, "reset", "-q", "--hard", "main")
+        self._git(self.root, "checkout", "-q", "main")
+        return shas
+
+    def _detour(self, path, branch, name):
+        self._git(path, "checkout", "-q", "--detach")
+        with open(os.path.join(path, name), "w") as f:
+            f.write("detour\n")
+        self._git(path, "add", name)
+        self._git(path, "commit", "-q", "-m", "detour " + name)
+        sha = self._head(path)
+        self._git(path, "checkout", "-q", branch)
+        return sha
+
+    def _landed_room(self, name):
+        path = self._add(name)
+        self._commit("landed.txt", "landed work", where=path)
+        self._git(self.root, "merge", "-q", "--no-ff", "-m", "land",
+                  "worktree-" + name)
+        return path
+
+    def test_F1_an_ORPHAN_whose_carried_commit_landed_keeps_a_dropped_one(self):
+        dropped, _kept = self._orphan("lane/o1", ("draft.txt", True),
+                                      ("final.txt", False))
+        self._git(self.root, "merge", "-q", "--no-ff", "-m", "land", "lane/o1")
+        verdict = {o["branch"]: o for o in
+                   envtidy._orphan_branches(self.root, "main")}["lane/o1"]
+        self.assertEqual(verdict["verdict"], "keep", verdict)
+        self.assertIn(dropped[:12], verdict["why"])
+        envtidy.worktree_gc(root=self.root, apply=True)
+        self.assertIn("lane/o1", self._branches())
+        self.assertIn(dropped, self._reflog(self.root, "refs/heads/lane/o1"))
+
+    def test_F3_an_ORPHAN_whose_creation_line_expired_keeps_a_dropped_one(self):
+        """No room, so no grace; the reflog has lost its creation line and
+        still names the commit the branch reset away."""
+        (dropped,) = self._orphan("lane/o3", ("dropped.txt", True))
+        said = self._git(self.root, "reflog", "show", "--format=%gs",
+                         "refs/heads/lane/o3").splitlines()
+        at = [i for i, s in enumerate(said) if s.startswith("branch: Created")]
+        self.assertEqual(len(at), 1, said)
+        self._git(self.root, "reflog", "delete",
+                  "refs/heads/lane/o3@{%d}" % at[0])
+        verdict = {o["branch"]: o for o in
+                   envtidy._orphan_branches(self.root, "main")}["lane/o3"]
+        self.assertEqual(verdict["verdict"], "keep", verdict)
+        envtidy.worktree_gc(root=self.root, apply=True)
+        self.assertIn("lane/o3", self._branches())
+        self.assertIn(dropped, self._reflog(self.root, "refs/heads/lane/o3"))
+
+    def test_F5_a_REUSED_stray_room_on_a_NEW_branch_is_KEPT_as_UNSTARTED(self):
+        """The room's old branch committed and landed; the room then checked
+        out a new branch at the trunk. Its HEAD reflog still records the old
+        commit, which is not the new branch's work (task/3436 round 2)."""
+        path = self._landed_room("wf-reuse")
+        old = self._head(path)
+        self._git(path, "checkout", "-q", "-b", "worktree-wf-reuse-next",
+                  "main")
+        self.assertIn(old, self._reflog(path, "HEAD"))
+        row = self._row(path)
+        self.assertEqual(row["branch"], "worktree-wf-reuse-next", row)
+        self.assertEqual(row["verdict"], "keep", row)
+        self.assertIn("UNSTARTED", row["why"])
+        envtidy.worktree_gc(root=self.root, apply=True)
+        self.assertTrue(os.path.isdir(path))
+        self.assertIn("worktree-wf-reuse-next", self._branches())
+
+    def test_F2_a_stray_room_with_a_CONFLICTING_rebase_is_KEPT(self):  # noqa: VACUOUS_ASSERTION — the room's removal is the base under test; the positives are B' rewritten, B' in the room's HEAD reflog, and the room + branch standing after apply
+        """The room committed B on its branch; a ref held B, so the ORIGINAL
+        is not the commit at risk. The trunk then wrote B's own file, and the
+        room rebased onto it: the conflict resolved into a NEW commit B'
+        recorded only as `rebase (continue)`, and the room reset back to the
+        trunk. B' is off the trunk and lives only in the two reflogs that
+        removing the room deletes (task/3436 round 3, ruling 2). The base
+        counted only `_OWN_COMMIT` actions in the reflogs, and
+        `rebase (continue)` is not one, so B' never entered the reflog-only
+        judgment; the room, aged past the unstarted grace, read ANCESTOR as an
+        abandoned claim and was removed, branch and B' with it. The cures keep
+        every reflog line's new sha, whatever its action, so B' is judged,
+        found off the trunk, and the room is kept."""
+        self.addCleanup(os.environ.pop, "GIT_EDITOR")
+        os.environ["GIT_EDITOR"] = "true"
+        path = self._add("wf-rebase")
+        branch = "worktree-wf-rebase"
+        self._commit("f.txt", "B change", where=path)
+        B = self._head(path)
+        self._git(path, "update-ref", "refs/remotes/origin/" + branch, "HEAD")
+        self.assertEqual(self._git(self.root, "rev-parse",
+                                   "refs/remotes/origin/" + branch), B,
+                         "premise: a ref holds B, so it is not at risk")
+        self._commit("f.txt", "trunk change")
+        r = _sh(path, "git", "rebase", "main")
+        self.assertNotEqual(r.returncode, 0,
+                            "fixture: the rebase must conflict (B and the "
+                            "trunk both write f.txt)")
+        with open(os.path.join(path, "f.txt"), "w") as f:
+            f.write("B change (resolved)\n")
+        self._git(path, "add", "f.txt")
+        self._git(path, "rebase", "--continue")
+        Bp = self._head(path)
+        self.assertNotEqual(Bp, B, "the rebase rewrote the commit")
+        self._git(path, "reset", "-q", "--hard", "main")
+        self.assertEqual(self._head(path), self._head(self.root),
+                         "premise: the room is back at the trunk")
+        self.assertIn(Bp, self._reflog(path, "HEAD"),
+                      "premise: B' survives only in the reflog")
+        self.assertGreater(_roomclock.AGED_S, _gc._UNSTARTED_GRACE_S)
+        _roomclock.age_room(path)        # abandoned: only the rule can keep it
+        row = self._row(path)
+        self.assertEqual(row["branch"], branch, row)
+        self.assertEqual(row["verdict"], "keep", row)
+        envtidy.worktree_gc(root=self.root, apply=True)
+        self.assertTrue(os.path.isdir(path))
+        self.assertIn(branch, self._branches())
+        self.assertIn(Bp, self._reflog(path, "HEAD"))
+
+    def test_F2_a_stray_room_with_a_DETACHED_commit_is_KEPT(self):
+        path = self._landed_room("wf-detour")
+        detached = self._detour(path, "worktree-wf-detour", "d.txt")
+        row = self._row(path)
+        self.assertEqual(row["verdict"], "keep", row)
+        self.assertIn(detached[:12], row["why"])
+        envtidy.worktree_gc(root=self.root, apply=True)
+        self.assertTrue(os.path.isdir(path))
+        self.assertIn(detached, self._reflog(path, "HEAD"))
+
+    def test_F4_a_detour_AFTER_the_enact_verdict_is_SKIPPED(self):
+        path = self._landed_room("wf-race")
+        row = self._row(path)
+        self.assertEqual(row["verdict"], "remove", row)
+        real, late = work._sweep_state, []
+
+        def verdict_then_detour(*args, **kw):
+            got = real(*args, **kw)
+            if not late:
+                late.append(self._detour(path, "worktree-wf-race", "l.txt"))
+            return got
+        with mock.patch.object(work, "_sweep_state", verdict_then_detour):
+            lines = envtidy._enact_worktree(self.root, row, True)
+        self.assertEqual(len(late), 1, "the enact never asked the verdict")
+        self.assertTrue(os.path.isdir(path), lines)
+        self.assertIn(late[0], self._reflog(path, "HEAD"))
+        self.assertTrue(any(line.startswith("SKIPPED") and "moved" in line
+                            for line in lines), lines)
+
+    def test_F2_the_RESCUE_path_re_proves_the_room_before_removing_it(self):
+        """A landed, dirty stray room is rescue+remove, and the enact did not
+        re-ask anything about the room after its rescue commit. A detour made
+        after the scan leaves a commit only the room's HEAD reflog holds."""
+        path = self._landed_room("wf-rescue")
+        junk = os.path.join(path, "junk.txt")
+        with open(junk, "w") as f:
+            f.write("uncommitted\n")
+        # ABANDONED, so the rescue itself does not defer (`_RESCUE_ACTIVE_S`)
+        # and the arm reaches the removal it is about.
+        cutoff = time.time() - (_gc._RESCUE_ACTIVE_S + 60)
+        os.utime(junk, (cutoff, cutoff))
+        row = self._row(path)
+        self.assertEqual(row["verdict"], "rescue+remove", row)
+        detached = self._detour(path, "worktree-wf-rescue", "d.txt")
+        with mock.patch.object(work, "_wip_commit",
+                               wraps=work._wip_commit) as rescue:
+            lines = envtidy._enact_worktree(self.root, row, True)
+        self.assertTrue(os.path.isdir(path), lines)
+        self.assertIn(detached, self._reflog(path, "HEAD"))
+        self.assertTrue(any(line.startswith("SKIPPED") and detached[:12] in line
+                            for line in lines), lines)
+        rescue.assert_called_once()
 
 
 class CliSafetyTest(unittest.TestCase):

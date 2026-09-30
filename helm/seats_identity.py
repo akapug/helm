@@ -31,7 +31,7 @@ import sys
 from . import chat, home, pk, vcs
 from .machine_senders import is_machine
 from .seats_address import (_mention_re, mentions, seat_names,  # noqa: F401
-                            seat_scope)                        # re-exported
+                            boundary_scope, seat_scope)  # re-exported
 from .seats_common import (MAX_BYTES, _BROADCAST, _canonical_recipient, _clip,
                            live_alias, names_match, _scrub, _seat_key,
                            canonical_keys, dm_lane, own_name,
@@ -867,7 +867,7 @@ def deliverable(m, seat, room="main", scope=None, ambient=True, beacon=False):
         do NOT wake here (owner steer 2026-07-21: mentions + home-room are
         enough — an owner post reaches a seat via an @mention or its own home
         room, never as a plain main broadcast). NOT fleet-wide: a side room's
-        @all drafts nobody homed elsewhere.
+        @all drafts nobody homed elsewhere. A project_only scope drops main.
       * anything else (foreign-room chatter, incl. non-mention owner posts
         outside home): never (noise law).
     scope=None computes seat_scope here — hot paths pass it precomputed."""
@@ -953,8 +953,8 @@ def deliverable(m, seat, room="main", scope=None, ambient=True, beacon=False):
         # below, so a home-room @all broadcast still wakes. So does a
         # SUBSYSTEM's plain row (machine_senders): it is pulled, not pushed.
         return True
-    if room != "main" and room != home_r:
-        return False
+    if room != home_r and (room != "main" or sc.get("project_only")):
+        return False            # project_only: seats_address.seat_scope
     # @all broadcasts still wake in {home, main}. Owner-rail posts NO LONGER
     # auto-wake (owner steer 2026-07-21: mentions + home-room are enough — an
     # owner post reaches a seat only via an @mention or its own home room, never

@@ -35,7 +35,7 @@ on that recommendation would have destroyed all of it.
 The two states demand OPPOSITE actions, so they are now separate findings:
     quiet + NO live claim anywhere -> STRANDED. Re-check or reassign.
     quiet + HOLDING any live claim -> NOT stranded: a busy or WEDGED owner.
-        RESCUE (preserve the room, recover the seat). Never reassign.
+        Never reassign; a wedge is rescued by the watchdog that owns it.
     claims ledger UNREADABLE       -> UNKNOWN, which is NOT "no claim". Never
         reassign on an unread fact; go read it.
 The claim half is now a DIRECT lookup over every live resource keyed by holder,
@@ -59,6 +59,38 @@ admission, separate latch, separate failure boundary — because a second
 addressee bolted onto filters and latches written for one is how an earlier
 attempt at this collected most of its review.
 
+THE SENDER IS WOKEN ONLY FOR A DECISION IT OWNS (task/3161). Every DM is a
+wake, and the sender's inbox is where a stop-guard counts obligations, so a
+message whose advice is "do nothing" costs the reader a turn and teaches it
+to skip the channel. Leg A therefore DMs three decisions and no others:
+STRANDED (re-check or reassign), CLAIM-UNKNOWN (read the ledger), and a
+WORKING row nothing can wake (tend the pane or reassign, told at first sight
+and again every LATCH_BACKOFF_CAP_S while the row stays open).
+Every other finding is reported (the console line, --json) and never DMd:
+    WORKING  a live pane with no claim. Its act is a wake. When a beacon is
+             armed, leg B sends that wake to the recipient itself and the
+             sender is not DMd. When none is, no DM reaches the pane, so the
+             wake is pane-level tending or a reassign, and only the sender
+             can arrange either. Silence there is a stall nobody sees, and
+             it is the common case: the recipients of WORKING rows are mostly
+             proxy and codex seats with no beacon, which leg B never wakes.
+             So that row DMs the sender at first sight, and again every
+             LATCH_BACKOFF_CAP_S for as long as it stays open and
+             unwakeable: "tend or reassign" is an unanswered act that gets
+             older, and a stuck row never goes silent.
+    HOLDING  a live claim. Never DMd. Some wedges have owners: autocompact
+             for a full context window, the prompt-stall watch for a seat
+             blocked on a prompt, proxywatch for a provider wall. A holder
+             that is live and idle, not at a prompt, not near a full window
+             and not walled, has NO watchdog until its lease expires, and
+             `--ttl` has no upper bound. This rung does not close that gap.
+             When the lease expires the row reads STRANDED, or WORKING on a
+             measured live pane, on the next pass.
+The latch keys on the same decision (see _record_key) and a record lives as
+long as its row is open, so neither a change of label nor a flap between
+states restarts a decision's backoff or cadence. Each record names the
+custodian it told, so a custody transfer tells the new custodian at once.
+
 THE WAKE'S PROOF IS A BEACON, NOT A PANE (see _wake_route). The obvious move
 was to compose resumeturn.wake_alert, which owns waking; measured over the live
 roster it would have refused ten of fourteen seats — every claude-family seat,
@@ -79,7 +111,8 @@ import os
 import sys
 import time
 
-from . import dispatches, home, seats, seats_integrator
+from . import (dispatches, home, remote_session, seat_idle, seats,
+               seats_integrator)
 from .seats_identity import _warn_once
 # ASKED, NEVER SPELLED. The seat that reads a row nobody else can is a ROLE,
 # and seats_integrator is the one door that resolves it against the live
@@ -107,36 +140,78 @@ IDLE_DISPATCH_S = 15 * 60      # soft "should-be-picked-up" window (== QUIET_S);
                                # surfaces BEFORE overdue
 _STATE = "idle_dispatch.json"
 
-_USAGE = """usage: helm seat idle-dispatch [--once] [--dry-run] [--quiet] [--json]
+_USAGE = """usage: helm seat idle-dispatch [--once] [--dry-run] [--apply] [--quiet] [--json]
+       helm seat idle-dispatch --owing [--hours H] [--json]
   One read-only pass: cross every OPEN dispatch against its recipient's
-  presence AND that recipient's directly-looked-up claim state, then DM the
-  dispatch's SENDER one latched alert. Three states, three actions:
+  presence AND that recipient's directly-looked-up claim state. Every row
+  found is REPORTED (one line each; --json carries every fact and the
+  sender's decision as `sender_act`). The dispatch's SENDER is DMd only
+  when it has a decision to make:
     STRANDED      quiet + holds no live claim + NO measured live pane ->
-                  re-check or reassign
-    WORKING       quiet + holds no live claim but the pane is MEASURABLY LIVE
-                  -> wake with an @mention, never reassign. Presence goes
-                  quiet after 2min without a tool boundary while a whole-suite
-                  gate runs ~14min, and reviewing takes no lease, so both
-                  halves of STRANDED are the normal condition of a working
-                  reviewer; a positive pane reading outranks that inference
-    HOLDING       quiet + holds a live claim -> busy or WEDGED owner; RESCUE,
-                  never reassign (their room may hold uncommitted work)
-    CLAIM-UNKNOWN the claims ledger could not be read -> read it; never
-                  reassign on an unread fact
-  A DM, not a broadcast, so it wakes a parked coordinator's beacon. Latched:
-  one alert per dispatch per episode. --dry-run reports without DMing;
-  --quiet skips the DM; --once accepted for stability.
+                  DMs the sender: re-check or reassign
+    CLAIM-UNKNOWN the claims ledger could not be read -> DMs the sender:
+                  read it; never reassign on an unread fact
+    WORKING       quiet + holds no live claim but the pane is MEASURABLY LIVE.
+                  Presence goes quiet after 2min without a tool boundary
+                  while a whole-suite gate runs ~14min, and reviewing takes
+                  no lease, so this is the normal condition of a working
+                  reviewer. Its act is a wake. With an armed beacon the
+                  second leg below wakes the recipient -> reported, NO DM.
+                  With none, nothing can wake it -> DMs the sender at first
+                  sight and again every 4h while the row stays open: the
+                  pane needs tending, or the row a reassign
+    DEAD-TURN     a WORKING row whose pane shows its turn ended on an
+                  upstream error, over a proxy that has read HEALTHY since,
+                  with no beacon listening -> DMs the sender on WORKING's
+                  cadence: wake it with one prompt,
+                  `helm seat resume-turn --nudge --seat <seat>`
+    HOLDING       quiet + holds a live claim -> reported, NO DM. A busy or
+                  WEDGED owner: never reassign (their room may hold
+                  uncommitted work). Autocompact, the prompt-stall watch and
+                  proxywatch own their wedges; a holder that is live and
+                  idle, not at a prompt, not near a full window and not
+                  walled has no watchdog until its lease expires, and --ttl
+                  has no upper bound. An expired lease reads STRANDED, or
+                  WORKING on a measured live pane
+  A DM, not a broadcast, so it wakes a parked coordinator's beacon. Latched
+  per decision for as long as the row is open: STRANDED and CLAIM-UNKNOWN
+  repeat on a doubling backoff, the WORKING DM repeats every 4h (the
+  backoff's cap), and a flap between states keeps every decision's record
+  and backoff count, so a return to a decision already told waits out its
+  backoff. A record names the custodian it told, so a new custodian of the
+  row is told at once. --dry-run reports without DMing; --quiet skips the
+  DM; --once accepted for stability.
 
   SECOND LEG — it also WAKES THE RECIPIENT, the one seat that can discharge
-  the row. Independently admitted (STRANDED only, never a HOLDING owner whose
-  room may hold uncommitted work, never an unread ledger, never a seat its
-  PROVIDER is walling) and independently latched, so a latched sender alert
-  can never swallow a wake. The wake is proved by a MEASURED armed beacon
+  the row. Independently admitted (a row holding no claim, STRANDED or
+  WORKING; never a HOLDING owner whose room may hold uncommitted work, never
+  an unread ledger, never a seat its PROVIDER is walling) and independently
+  latched, so a latched sender alert can never swallow a wake. The wake is proved by a MEASURED armed beacon
   (seats.beacon_procs), not by a resumable pane: a DM reaches a chat lane and
   any armed beacon takes it, so the pane ambiguity that must refuse a RESUME
   is irrelevant here. No beacon = queued bytes, and the leg says so rather
   than claiming a delivery. The claim state is re-read immediately before the
   send, and an unreadable ledger REFUSES the wake without burning its latch.
+
+  IDLE-OWING LEG (task/3118) — a row whose recipient has sat IDLE 10m or more
+  while owing it is admitted whatever its presence (a beacon keeps every
+  beaconed seat `fresh`, which used to drop its rows as busy). IDLE is the
+  seat's own hook record read by helm/seat_idle.py: its turn ended (the
+  stop-guard door's rc 0) and nothing has run in its session since. With a
+  measured armed beacon and no provider wall, the seat is RUNG with one DM
+  naming the row and its triage command, the sender is not DMd (the ring is
+  the act), and leg B does not wake the same row. The ring's record lives
+  as long as the row is open, so it repeats only on the doubling backoff,
+  across idle episodes. A BUSY, RESTING or UNKNOWN reading is never
+  IDLE-OWING. Every sending pass appends one sample per owing seat to the
+  pass ledger (<helm home>/_global/.state/idle-owing.jsonl).
+
+  --owing reads that ledger over the last H hours (default 2): per seat, the
+  minutes it sat IDLE while owing a row, each stretch over 10m, and whether a
+  pass inside the stretch rang it. The two AX bars read this: Seat health
+  (no seat IDLE over 10m on an owed row) and Agent chat (owed rows
+  re-surfaced to an idle seat). Minutes are a lower bound by up to one pass;
+  no pass in the window is UNKNOWN and exits 1.
 
   THIRD LEG — it also reports the rows whose DELIVERY NEVER LANDED, because a
   seat asking "what do I owe" had no answer and a burn-down had no input.
@@ -149,6 +224,22 @@ _USAGE = """usage: helm seat idle-dispatch [--once] [--dry-run] [--quiet] [--jso
   AUTHOR/REVIEWER/LANDER owed, and this leg does not see that transition. The
   obligation seam that answers the wider question does not exist yet, so the
   count is a FLOOR on what is owed, never a total.
+
+  DARK-SEAT MOVER (task/3587) — every pass also judges each seat that owes
+  work: DARK when `helm burn` reads its family RED on MONEY or REACH, when its
+  own last turn ended on a billing or credential refusal, or when its pane is
+  GONE with no armed beacon. A live pane with no beacon is DEAF: it keeps its
+  rows and is told its re-arm route once. A relay-driven seat is never judged.
+  Once a seat has read dark for HELM_DARK_MOVE_GRACE_S (default 600s), each
+  OPEN dispatch row it owes and is not working (no claim on the row or its
+  lane) and each task it owns but never claimed moves to a live seat: a
+  review to the first measured-eligible reader `helm reviewers` names, any
+  other row to a seat measured USABLE, never to a dark seat or family.
+  DRY-RUN unless --apply: it prints what it would move. With --apply each
+  move is a `dispatch rebind` (or the
+  seat-reassign task capability) plus one chat line in #helm. A row with no
+  live seat to take it stays and is reported once. An unreadable roster or
+  ledger moves nothing and says so in one line.
 
   UNREADABLE IS NOT EMPTY, all the way to the exit code. When the ledger
   cannot be read this prints UNKNOWN and exits non-zero, so a caller cannot
@@ -237,12 +328,12 @@ def _live_pane(seat, row=None):
     question over: the rung had the authoritative answer in the same module
     and still composed liveness out of two proxies that cannot see a pane.
 
-    A LIVE pane means WAKE, never reassign — an @mention is the wake path.
-    Like the wall fact this never suppresses the alert and never changes the
-    claim state: the sender still needs to know their obligation is idle,
-    which is this rung's whole purpose. It only stops the alert recommending
-    the one action that would destroy the work. Anything unexpected reads as
-    no fact at all, because a liveness probe must never corrupt a
+    A LIVE pane means WAKE, never reassign, and the wake is leg B's: it DMs
+    the recipient itself when a beacon is armed. So a live pane reads WORKING
+    in the report and --json, and the sender is DMd only when no beacon can
+    take the wake, at first sight and again at the backoff cap (see
+    _sender_act). It never changes the claim state. Anything unexpected
+    reads as no fact at all, because a liveness probe must never corrupt a
     stranded-work alert."""
     row = row if row is not None else _liveness(seat)
     if row is None:
@@ -258,6 +349,118 @@ def _live_pane(seat, row=None):
            "not parked-without-reporting. WAKE it with an @mention; " \
            "reassigning takes work from a seat that still holds it." \
            % (state, str(row.get("evidence") or "no evidence"))
+
+
+# HOW LONG A RELAY MAY LEAVE A LIVE SESSION UNTOUCHED PAST ITS NUDGE WINDOW
+# before idle-dispatch reads that session as unattended: three relay ticks at
+# the relay's default cadence.
+RELAY_GRACE_S = 1800
+
+
+def _relay_reading(recip, rid, now, memo):
+    """None when `recip` is not a relay seat, else (live, why) for row `rid`,
+    read from the relay journal's session for that row.
+
+    A RELAY SEAT'S LIVENESS IS ITS SESSION, NOT A ROSTER ROW. A seat that
+    helm/remote_relay.py drives has no roster row, pane or claim, so the
+    roster reads it quiet for its whole life, and every row sent to it read
+    STRANDED while a cloud session was working it. The relay journal records
+    that session per ROW: each launch, delivery, report and archive names the
+    dispatch row id, and remote_session.sessions folds them into the session
+    the row belongs to, the fold `helm remote status` prints.
+
+    LIVE ONLY ON A POSITIVE READING. The session must be in a state
+    remote_session.LIVE names, and the relay must still be attending it. A
+    ticking relay writes to every live session at least once per nudge
+    window (a nudge, or its one idle check-in), so a session it has not
+    touched for that window plus RELAY_GRACE_S is one no tick is attending;
+    without this bound a stopped relay would hold its rows LAUNCHED,
+    and silent here, forever. No session for the row, a state outside LIVE,
+    and a journal that cannot be read each return (False, why): the row
+    alarms, and the alert says which.
+
+    WHICH SEATS ARE RELAY SEATS IS THE RELAY'S CONFIG, never a name in this
+    source. When that config cannot be read nobody can say, so every seat
+    keeps its roster reading, the alarm this rung always gave, and the sweep
+    says so once. `memo` holds one sweep's reads of the config and journal."""
+    if "cfg" not in memo:
+        try:
+            memo["cfg"], why = remote_session.load_config()
+        except Exception as exc:       # noqa: BLE001 - a read, never a crash
+            memo["cfg"], why = None, "%s: %s" % (type(exc).__name__, exc)
+        if why:
+            _warn_once(
+                "idle-dispatch-relay-config:%s" % why,
+                "the idle-dispatch sweep cannot tell which seats are relay "
+                "seats: the remote-session config could not be read (%s); "
+                "every row is read by roster presence\n" % why)
+    cfg = memo["cfg"]
+    if not cfg or str(recip or "").casefold() not in cfg["seats"]:
+        return None
+    if "journal" not in memo:
+        try:
+            memo["journal"] = remote_session.read_journal(strict=True)
+            memo["sessions"] = remote_session.sessions(memo["journal"])
+            memo["journal_why"] = ""
+        except Exception as exc:       # noqa: BLE001 - a read, never a crash
+            memo["journal"] = None
+            memo["journal_why"] = "%s: %s" % (type(exc).__name__, exc)
+    if memo["journal_why"]:
+        return False, ("the relay journal %s could not be read (%s), so no "
+                       "session can be shown to be working this row"
+                       % (remote_session.journal_path(), memo["journal_why"]))
+    try:
+        return _relay_session(memo["journal"], memo["sessions"], rid, now)
+    except Exception as exc:           # noqa: BLE001 - a read, never a crash
+        return False, ("the relay session for this row could not be read "
+                       "(%s: %s)" % (type(exc).__name__, exc))
+
+
+def _relay_session(journal, folded, rid, now):
+    """(live, why) for row `rid` from the relay journal already folded by
+    remote_session.sessions. See _relay_reading."""
+    from . import pk, remote_relay
+    by_sid, by_row = folded
+    sid = by_row.get(rid)
+    if sid is None:
+        why = "the relay journal holds no session for this row"
+        last = next((e for e in reversed(journal) if e.get("row") == rid
+                     and e.get("event") in ("held", "launch-refused")), None)
+        if last:
+            why += "; the relay's last word on it: %s" % (
+                last.get("reason") or last.get("why") or last.get("event"))
+        return False, why
+    events = by_sid.get(sid) or []
+    state, why = remote_session.infer_state(
+        events, now, flat=remote_relay._flat(journal, events))
+    said = "relay session %s is %s: %s" % (sid, state, why)
+    if state not in remote_session.LIVE:
+        return False, said
+    touched = max([pk.parse_ts_epoch(e.get("ts")) or 0 for e in events]
+                  or [0])
+    window = remote_session.nudge_after_s()
+    if now - touched > window + RELAY_GRACE_S:
+        return False, ("%s, but the relay has written nothing for it in %dm, "
+                       "past its %dm nudge window: no `helm remote tick` is "
+                       "attending it (see `helm remote status`)"
+                       % (said, (now - touched) // 60, window // 60))
+    return True, said
+
+
+def _dead_turn(seat_key, row, route):
+    """"" or the dead-turn reading for a recipient whose pane shows its turn
+    ended on an upstream error, over a proxy that has read HEALTHY since, with
+    NO beacon listening. The sentence and its wake verb are
+    `seat_lifecycle.dead_turn_reading`'s, so this rung and proxywatch print
+    one reading. `route` is `_wake_route`'s measurement: only WAKE_NONE is
+    "nothing listening", and WAKE_UNKNOWN never reads as it. Anything
+    unexpected reads as no fact at all."""
+    try:
+        from . import seat  # noqa: F401 — facade contract: an impl import is accompanied by the facade in its own scope
+        from .seat_lifecycle import dead_turn_reading
+        return dead_turn_reading(row, route == WAKE_NONE, seat=seat_key)
+    except Exception:
+        return ""
 
 
 def _wake_route(seat_key):
@@ -321,8 +524,9 @@ def _provider_wall(seat, row=None):
     second detector would be the drift that let two surfaces disagree elsewhere
     tonight.
 
-    ONE MORE FACT ON AN ALERT THAT ALREADY FIRED, exactly as _context_pressure
-    is. It never suppresses the alert and never changes the claim state: a
+    ONE MORE FACT ON AN ALERT THAT ALREADY FIRED. A wall is not a live pane,
+    so a walled claimless row stays STRANDED and keeps its sender DM. It never
+    suppresses the alert and never changes the claim state: a
     stranded row is still stranded, and the sender still needs to know. It only
     stops the alert from naming the wrong culprit. Anything unexpected reads as
     no fact at all, because a liveness probe must never be able to corrupt a
@@ -334,8 +538,18 @@ def _provider_wall(seat, row=None):
     why = str(row.get("blocked_on") or "").strip()
     action = _seat.remediation_text(row.get("remediation"))
     action += "; this recipient row cannot tell whether reassignment would help"
-    return " Availability: %s%s — %s." % (
-        row["state"], " (%s)" % why if why else "", action)
+    # THE STATE DECIDES, never a word in the detail: the row now carries the
+    # canary's detail, which is vendor prose and can say anything.
+    auth = " — stranded on auth" if why.startswith("upstream AUTH-") else ""
+    return " Availability: %s%s%s — %s." % (
+        row["state"], " (%s)" % why if why else "", auth, action)
+
+
+def _rest(seat):
+    """"" or the sentence that holds this recipient: the owner's rest, or a
+    rest record helm cannot read (helm/seat_rest.py)."""
+    from . import seat_rest
+    return seat_rest.holds(seat)
 
 
 def _context_pressure(seat):
@@ -344,9 +558,9 @@ def _context_pressure(seat):
     still alive, which looks exactly like a quiet holder. Reuses the existing
     autocompact row (the same one `helm seat autocompact --dry-run` prints); it
     is NOT a new watchdog and it never decides anything — it is one more fact on
-    an alert that already fired. Anything unexpected reads as no fact at all,
-    because a context gauge must never be able to suppress or corrupt a
-    stranded-work alert."""
+    a HOLDING finding, read from the report and --json. Anything unexpected
+    reads as no fact at all, because a context gauge must never be able to
+    suppress or corrupt a finding."""
     try:
         from . import autocompact
         row = autocompact.read(seat) or {}
@@ -358,7 +572,7 @@ def _context_pressure(seat):
         return ""
 
 
-def scan():
+def scan(rows=None, idle=None):
     """Read-only: every OPEN dispatch sitting on a quiet recipient, each tagged
     with the recipient's DIRECTLY-LOOKED-UP claim state (see CLAIM_*). A row is
     a finding when its recipient shows no recent tool boundary (presence
@@ -377,12 +591,32 @@ def scan():
     `read_now`, bound once here. They used to make THREE independent
     time.time() reads per row, so a row the FILTER admitted at 59s could be
     REPORTED as 2m old and overdue=True: the scan contradicted itself about
-    one row, and the coordinator read an age that no decision had used."""
+    one row, and the coordinator read an age that no decision had used.
+
+    `rows` IS THE OPEN-ROW READ WHEN THE CALLER ALREADY HOLDS ONE. check()
+    decides which sender records a row still owns from the same read it
+    scans, so the scan and the reap cannot disagree about which rows are
+    open. None reads them here.
+
+    AN IDLE SEAT IS ADMITTED WHATEVER ITS PRESENCE (task/3118). A beacon beats
+    presence on every poll, so every beaconed seat reads `fresh` and the gate
+    below dropped its rows as busy, idle or not. A row whose recipient has
+    sat IDLE at least seat_idle.IDLE_OWING_S while owing it (seat_idle's
+    reading: its turn ended and nothing has run since) is admitted IDLE-OWING,
+    even inside the soft window, and leg I in check() rings the seat. `idle`
+    is the caller's dict of readings by recipient key, filled here with one
+    roster read, so check() reuses them for its pass sample."""
     read_now = time.time()
-    try:
-        rows = dispatches.open_rows()
-    except Exception:
-        return []
+    if rows is None:
+        try:
+            rows = dispatches.open_rows()
+        except Exception:
+            return []
+    idle = {} if idle is None else idle
+    idle.update(seat_idle.readings(
+        {_recipient_key(r.get("recipient")) for r in rows
+         if dispatches._age_s(r, read_now) >= seat_idle.IDLE_OWING_S}
+        - set(idle), now=read_now))
     try:
         claims = seats._live_claims()
     except Exception:
@@ -393,6 +627,7 @@ def scan():
     # than inside the loop so a sweep that meets several self-addressed rows
     # reads the roster once and reports one reason, not one per row.
     integrator, integrator_why = _UNASKED, ""
+    relay_memo = {}               # one read of the relay config and journal
     out = []
     for r in rows:
         rid = str(r.get("id") or "")
@@ -471,11 +706,21 @@ def scan():
             if recip_key == _recipient_key(integrator):
                 continue          # no party left who is neither: nobody to tell
             sender = integrator
-        if dispatches._age_s(r, read_now) < IDLE_DISPATCH_S:
+        owing = seat_idle.owing_s(idle.get(recip_key),
+                                  dispatches._age_s(r, read_now))
+        idle_owing = owing is not None and owing >= seat_idle.IDLE_OWING_S
+        if dispatches._age_s(r, read_now) < IDLE_DISPATCH_S and not idle_owing:
             continue              # too fresh — give the recipient time to pick up
         if ("dispatch:" + rid[:8]) in claimed:
             continue              # claimed the dispatch ITSELF => being worked
-        presence = seats.presence_of(seats.last_seen(recip))
+        # A RELAY SEAT IS READ FROM ITS RELAY SESSION, every other seat from
+        # the roster (see _relay_reading). A live session is working the row;
+        # any other reading keeps the alarm and carries the relay's reason.
+        relay = _relay_reading(recip, rid, read_now, relay_memo)
+        if relay is not None and relay[0]:
+            continue              # a live relay session is working this row
+        presence = ("absent" if relay is not None
+                    else seats.presence_of(seats.last_seen(recip)))
         # FRESHNESS MEASURES WHETHER A PROCESS IS TICKING; THIS RUNG ASKS
         # WHETHER WORK CAN COMPLETE. For a healthy seat those are the same
         # reading, and for a WALLED one they are opposite: a seat its provider
@@ -498,7 +743,7 @@ def scan():
         # wall and pane facts below rather than measured a second time.
         live_early = _liveness(recip) if presence == "fresh" else None
         fresh_walled = bool(presence == "fresh" and _provider_wall(recip, live_early))
-        if presence == "fresh" and not fresh_walled:
+        if presence == "fresh" and not fresh_walled and not idle_owing:
             continue              # recipient crossed a tool boundary recently => busy
         held = by_holder.get(recip_key) or []
         state = (CLAIM_UNKNOWN if unknown
@@ -510,10 +755,16 @@ def scan():
             "lane": str(r.get("lane") or "review"),
             "presence": presence,
             "claim": state,
+            "relay": relay[1] if relay is not None else "",
             "stranded": state == CLAIM_NONE,
             "held": [seats._pub_res(x) for x in sorted(held)],
             "age_min": int(dispatches._age_s(r, read_now) // 60),
             "overdue": dispatches._is_overdue(r, read_now),
+            # THE RECIPIENT'S TURN (helm/seat_idle.py): its reading, and
+            # whether it has sat idle past the bar while owing this row.
+            "idle": idle.get(recip_key),
+            "idle_owing": idle_owing,
+            "idle_owing_min": int(owing // 60) if owing is not None else None,
         }
         # only a HOLDING owner gets the context read: that is the state where
         # "why is a working seat quiet?" is the live question, and the answer
@@ -531,9 +782,10 @@ def scan():
         # extra fact, it is the ADMISSION REASON, and omitting it would print a
         # finding whose only explanation was the thing it declined to read.
         live = (live_early if live_early is not None
-                else _liveness(recip) if state == CLAIM_NONE or fresh_walled
+                else _liveness(recip)
+                if state == CLAIM_NONE or fresh_walled or idle_owing
                 else None)
-        want_facts = state == CLAIM_NONE or fresh_walled
+        want_facts = state == CLAIM_NONE or fresh_walled or idle_owing
         f["wall"] = _provider_wall(recip, live) if want_facts else ""
         f["live_pane"] = _live_pane(recip, live) if want_facts else ""
         f["self_addressed"] = self_addressed
@@ -566,8 +818,24 @@ def scan():
         # structural rather than careless; the wake carries recip_key and the
         # TEXT carries the display form, exactly as the sender alert does.
         f["wake_target"] = recip_key if route == WAKE_ARMED else ""
+        # A RESTING RECIPIENT IS NEVER WOKEN (task/3280), whatever its
+        # beacon: the owner paused it. The sender is told so instead.
+        f["rest"] = _rest(recip_key)
         f["wakeable"] = bool(f["stranded"] and f["wake_target"]
-                             and not f["wall"])
+                             and not f["wall"] and not f["rest"])
+        # A LIVE PANE IS NOT A SEAT THAT CAN TAKE A TURN. The liveness row
+        # carries a turn that died on an upstream error over a proxy that
+        # reads HEALTHY again; with no beacon measured, one prompt into the
+        # pane is the wake. Same liveness row, same measured route.
+        f["dead_turn"] = _dead_turn(recip_key, live, route) \
+            if want_facts else ""
+        # LEG I's ADMISSION (task/3118): an IDLE-OWING row whose seat a DM
+        # can reach -- a measured armed beacon -- and whose provider is not
+        # refusing it. Its claim state does not matter: the reading measured
+        # the seat idle, and a ring reassigns nothing. Leg I owns this row's
+        # wake, so leg B never doubles it (see check).
+        f["idle_ring"] = bool(idle_owing and route == WAKE_ARMED
+                              and not f["wall"] and not f.get("rest"))
         out.append(f)
     return out
 
@@ -580,42 +848,66 @@ def _state_path():
     return os.path.join(home.helm_home(), home.GLOBAL, ".state", _STATE)
 
 
+# THE SENDER'S DECISIONS, the only findings leg A DMs (task/3161). Each is a
+# thing the sender can DO. Every other finding is reported and never DMd, and
+# the reason for each is in the module docstring. They are also the latch
+# key (see _record_key), so a changed label with an unchanged decision is
+# not told twice.
+ACT_STRANDED = "stranded"     # re-check or reassign
+ACT_UNKNOWN = "unknown"       # read the claims ledger before anything else
+ACT_UNWAKEABLE = "unwakeable"  # a live pane no beacon can wake: tend or reassign
+SENDER_ACTS = (ACT_STRANDED, ACT_UNKNOWN, ACT_UNWAKEABLE)
+# THE DECISIONS RE-TOLD ON A FIXED CADENCE, not the doubling backoff. "Tend
+# or reassign" is an unanswered act that gets older exactly as STRANDED's
+# does, so it must never go silent (the capped-backoff law: a stuck row keeps
+# speaking). But its fact, no beacon on a live pane, reads the same on every
+# pass, so the doubling's early repeats would say nothing new. It is told at
+# first sight and again every LATCH_BACKOFF_CAP_S, the cadence the doubling
+# settles into, for as long as its row is open.
+FIXED_CADENCE_S = {ACT_UNWAKEABLE: LATCH_BACKOFF_CAP_S}
+
+
+def _sender_act(f):
+    """The decision one finding hands its SENDER, or "" when it hands none.
+
+    LIVENESS AND CLAIMS ARE DIFFERENT AXES. "Quiet" and "holds no claim" are
+    each true of a working reviewer almost continuously (FRESH_S is 120s while
+    a whole-suite gate runs ~835s, and reviewing takes no worktree lease), so
+    their conjunction is the steady state of that role. A MEASURED live pane
+    is a positive reading and outranks it: that row is WORKING, and its act
+    is a wake. A HOLDING owner is never reassigned, so it leaves the sender
+    no decision.
+
+    A WORKING ROW'S WAKE IS LEG B'S ONLY WHEN LEG B CAN SEND IT. `wakeable`
+    is leg B's own admission, so reading it here keeps the two legs from
+    disagreeing about one row. When it is false no DM reaches the pane, and
+    staying silent would leave the row with no reader at all, which is the
+    common case for proxy and codex recipients, so the sender gets
+    ACT_UNWAKEABLE.
+
+    AN UNRECOGNISED CLAIM STATE READS AS UNKNOWN, the safe decision. Silence
+    would be the dangerous direction for a state nobody has classified, and
+    the reassign text must never be inherited by accident. The claim state
+    itself is never changed here."""
+    claim = f.get("claim")
+    # AN IDLE SEAT LEG I WILL RING HANDS ITS SENDER NO DECISION (task/3118):
+    # its act is that wake, as for a WORKING row leg B can wake. An unread
+    # claims ledger still asks the sender to read it.
+    if f.get("idle_ring") and claim != CLAIM_UNKNOWN:
+        return ""
+    if claim == CLAIM_HOLDING:
+        return ""
+    if claim == CLAIM_NONE and f.get("live_pane") and not f.get("rest"):
+        return "" if f.get("wakeable") else ACT_UNWAKEABLE
+    return ACT_STRANDED if claim == CLAIM_NONE else ACT_UNKNOWN
+
+
 _STRANDED_TEXT = (
     "@%(sender)s IDLE-DISPATCH: your dispatch %(id8)s (%(lane)s) to "
     "@%(recipient)s is STRANDED — the recipient is %(presence)s (%(why)s) "
     "AND holds no live claim on ANY resource (checked by holder "
     "across the whole claims ledger, not just dispatch:%(id8)s), ~%(age_min)dmin "
-    "old%(od)s.%(admit)s%(wall)s%(live_pane)s%(tail)s"
-    "[idle-dispatch watchdog]")
-
-_HOLDING_TEXT = (
-    "@%(sender)s IDLE-DISPATCH: your dispatch %(id8)s (%(lane)s) to "
-    "@%(recipient)s is QUIET BUT HOLDING — NOT stranded. The recipient is "
-    "%(presence)s (%(why)s) but holds %(held)s, ~%(age_min)dmin "
-    "old%(od)s.%(admit)s%(context)s Quiet + holding is a busy or WEDGED owner (out of "
-    "context window with the pane still alive looks exactly like this), not an "
-    "abandoned row — their room may hold uncommitted work that reassignment "
-    "would destroy. RESCUE, do not reassign: `helm seat autocompact --dry-run` "
-    "and `helm seat where %(recipient)s` to tell wedged from busy, preserve the "
-    "room first (`git -C <room> stash create`), then recover the seat. "
-    "[idle-dispatch watchdog]")
-
-# THE SAME TEXT AS STRANDED WITH ONE CLAUSE CHANGED, and the smallness is the
-# point. `_stranded_tail` already replaces the closing RECOMMENDATION when a
-# pane fact is present, so the only thing left contradicting the evidence was
-# the HEADLINE — and the headline is the word a reader acts on. Re-stating the
-# wake advice here would duplicate the tail and the pane fact, so every other
-# field, including %(why)s and %(tail)s, stays exactly as the stranded case
-# has it.
-_WORKING_TEXT = (
-    "@%(sender)s IDLE-DISPATCH: your dispatch %(id8)s (%(lane)s) to "
-    "@%(recipient)s is IDLE BUT ITS RECIPIENT IS LIVE — NOT stranded. The "
-    "recipient is %(presence)s (%(why)s) and holds no live claim, and BOTH "
-    "of those are the ordinary condition of a working reviewer rather than "
-    "evidence of abandonment: presence goes quiet 120s after a tool boundary "
-    "while a whole-suite gate runs ~835s, and reviewing, rebasing, retipping "
-    "and gating take no worktree lease. ~%(age_min)dmin "
-    "old%(od)s.%(admit)s%(wall)s%(live_pane)s%(tail)s"
+    "old%(od)s.%(admit)s%(wall)s%(tail)s"
     "[idle-dispatch watchdog]")
 
 _UNKNOWN_TEXT = (
@@ -627,8 +919,35 @@ _UNKNOWN_TEXT = (
     "read it (`helm chat claims`), then `helm seat where %(recipient)s`. "
     "[idle-dispatch watchdog]")
 
-_TEXTS = {CLAIM_NONE: _STRANDED_TEXT, CLAIM_HOLDING: _HOLDING_TEXT,
-          CLAIM_UNKNOWN: _UNKNOWN_TEXT}
+# main's WORKING TEXT, KEPT FOR THE ONE WORKING ROW THAT STILL DMs: a live pane
+# nothing can wake. The headline says NOT stranded because the pane outranks
+# the two absences, and the tail (_unwakeable_tail) says why an @mention will
+# not do, so the live-pane fact's "WAKE it" is corrected in the same message.
+_UNWAKEABLE_TEXT = (
+    "@%(sender)s IDLE-DISPATCH: your dispatch %(id8)s (%(lane)s) to "
+    "@%(recipient)s is IDLE BUT ITS RECIPIENT IS LIVE — NOT stranded. The "
+    "recipient is %(presence)s (%(why)s) and holds no live claim, and BOTH "
+    "of those are the ordinary condition of a working reviewer rather than "
+    "evidence of abandonment: presence goes quiet 120s after a tool boundary "
+    "while a whole-suite gate runs ~835s, and reviewing, rebasing, retipping "
+    "and gating take no worktree lease. ~%(age_min)dmin "
+    "old%(od)s.%(admit)s%(live_pane)s%(tail)s"
+    "You are told again every %(cadence_h)dh while this row stays open and "
+    "nothing can wake its recipient. [idle-dispatch watchdog]")
+
+# A DEAD TURN IS NOT A WORKING REVIEWER. The WORKING text above argues that
+# quiet and claimless are a reviewer's ordinary condition and forbids a
+# reassign; for a pane whose turn ENDED on an upstream error both halves are
+# wrong. Nothing will start the next turn, and the remedy is one prompt, so
+# this text names that wake and makes no reassign argument either way.
+_DEAD_TURN_TEXT = (
+    "@%(sender)s IDLE-DISPATCH: your dispatch %(id8)s (%(lane)s) to "
+    "@%(recipient)s sits on a DEAD TURN: %(dead_turn)s. The pane is at its "
+    "prompt and no beacon is listening, so an @mention queues unread and no "
+    "turn starts until one prompt reaches the pane. ~%(age_min)dmin "
+    "old%(od)s.%(admit)s You are told again every %(cadence_h)dh while this "
+    "row stays open and nothing can wake its recipient. "
+    "[idle-dispatch watchdog]")
 
 # THE SECOND ADDRESSEE. The sender alert above tells the coordinator their
 # obligation is idle; this tells the ONE SEAT THAT CAN DISCHARGE IT. Every
@@ -653,7 +972,8 @@ _WAKE_RECIPIENT_TEXT = (
     "this scan you held no live claim on any resource and had shown no recent "
     "activity for ~%(age_min)dmin%(od)s. This is not a diagnosis: it cannot "
     "tell an idle-done seat from one that never saw the row, and both happen. "
-    "TWO HONEST EXITS — take it (`helm work claim <lane>`, or reply in the "
+    "TWO HONEST EXITS — take it (start with `helm dispatch triage %(id8)s`, "
+    "which prints the brief; then `helm work claim <lane>`, or reply in the "
     "room that you have it), or say in the room that it is NOT yours so it can "
     "be rerouted. If `helm dispatch list --open` shows you NOTHING that is a "
     "known identity-binding defect and not proof the row is gone: read it by "
@@ -670,14 +990,6 @@ _WAKE_RECIPIENT_TEXT = (
 # every other question.
 
 
-def _held_phrase(held):
-    if not held:
-        return "a live claim"
-    if len(held) == 1:
-        return "a live claim on %s" % held[0]
-    return "%d live claims (%s)" % (len(held), ", ".join(held[:3]))
-
-
 def _why_phrase(f):
     """The parenthetical after `presence`, WHICH IS A CLAIM AND NOT A CONSTANT.
 
@@ -685,7 +997,11 @@ def _why_phrase(f):
     false of one admitted for being WALLED: a walled seat has plenty of recent
     activity, what it lacks is progress. An alert that contradicts, two words
     later, the presence bucket it has just printed has spent its credibility to
-    say nothing, and leaves the reader to pick which half to believe."""
+    say nothing, and leaves the reader to pick which half to believe. A relay
+    seat has no roster activity to speak of, so its parenthetical is the
+    relay session's own reading (see _relay_reading)."""
+    if f.get("relay"):
+        return f["relay"]
     if f.get("fresh_walled"):
         return ("still crossing tool boundaries, so this is NOT quiet — its "
                 "PROVIDER is refusing it, and activity here is not progress")
@@ -717,102 +1033,95 @@ def _admit_phrase(f):
 
 
 def _alert_text(f):
-    """The alert for ONE finding, chosen by its claim state. Three states, three
-    recommendations, because reassigning a quiet HOLDER destroys their work and
-    reassigning on an UNREAD ledger is the same act with less evidence. An
-    unrecognised state falls back to the UNKNOWN text — the safe one — so no
-    future state can inherit the reassign recommendation by accident."""
+    """The sender's DM for ONE finding, chosen by the sender's decision (see
+    _sender_act). Three decisions, three texts, because reassigning on an
+    UNREAD ledger is the destructive act with less evidence, and so is
+    reassigning a seat whose pane is live. A finding with no decision is
+    never sent (see check); asked anyway, it renders the UNKNOWN text, the
+    safe one, so no state can inherit the reassign recommendation by
+    accident."""
     od = " (past its deadline)" if f.get("overdue") else ""
-    # LIVENESS AND CLAIMS ARE DIFFERENT AXES, AND COLLAPSING THEM IS WHAT
-    # PRODUCED A FALSE STRANDED AGAINST A SEAT MID-GATE. "Quiet" and "holds no
-    # claim" are each true of a working reviewer almost continuously —
-    # FRESH_S is 120s while a whole-suite gate on this fleet runs ~835s, and
-    # the review role takes no worktree lease — so their conjunction is the
-    # STEADY STATE of that role, not a signal about it. A MEASURED LIVE PANE
-    # is a POSITIVE reading and outranks an inference drawn from two absences.
-    #
-    # THE ALERT STILL FIRES, and that is deliberate: the sender's obligation
-    # really is idle and they still need to know. Only the WORD the reader
-    # acts on changes, and with it the prescribed disposition — STRANDED says
-    # re-check or reassign, and reassigning a seat that is gating the row is
-    # the one action that destroys work. Nothing is suppressed and the claim
-    # state is untouched.
-    text = _TEXTS.get(f.get("claim"), _UNKNOWN_TEXT)
-    if f.get("claim") == CLAIM_NONE and f.get("live_pane"):
-        text = _WORKING_TEXT
+    act = _sender_act(f)
+    text, tail = {ACT_STRANDED: (_STRANDED_TEXT, _stranded_tail),
+                  ACT_UNWAKEABLE: (_UNWAKEABLE_TEXT, _unwakeable_tail)}.get(
+        act, (_UNKNOWN_TEXT, _stranded_tail))
+    if act == ACT_UNWAKEABLE and f.get("dead_turn"):
+        text, tail = _DEAD_TURN_TEXT, lambda _f: ""
     return text % {
         "sender": f["sender"], "id8": f["id8"], "lane": f["lane"],
         "recipient": f["recipient"], "presence": f["presence"],
         "age_min": f["age_min"], "od": od,
-        "held": _held_phrase(f.get("held")),
-        "context": f.get("context") or "",
-        # .get with a default, like "context" beside it: this dict is built
-        # EXPLICITLY, so a field added to the finding and not here raises
-        # KeyError inside the alert path — which is exactly what happened and
-        # showed up as ZERO alerts rather than an error.
+        # .get with a default: this dict is built EXPLICITLY, so a field added
+        # to the finding and not here raises KeyError inside the alert path —
+        # which is exactly what happened and showed up as ZERO alerts rather
+        # than an error.
         "wall": f.get("wall") or "",
         # every template that names %(live_pane)s needs it here, and the
         # KeyError-means-ZERO-alerts warning above is why this line ships in
         # the same commit as the template that uses it
         "live_pane": f.get("live_pane") or "",
+        "dead_turn": f.get("dead_turn") or "",
+        "cadence_h": FIXED_CADENCE_S[ACT_UNWAKEABLE] // 3600,
         # BOTH DEFAULT THROUGH THEIR COMPOSER, never a bare .get: a template
         # naming a key this dict lacks raises KeyError inside the alert path
         # and surfaces as ZERO alerts — the failure the comment above records
         # happening once already.
         "why": _why_phrase(f),
         "admit": _admit_phrase(f),
-        "tail": _stranded_tail(f)}
+        "tail": tail(f)}
+
+
+def _unwakeable_tail(f):
+    """The closing advice for a live pane that leg B cannot wake.
+
+    A LIVE PANE AND AN ARMED BEACON ARE DIFFERENT FACTS, AND THE REMEDY
+    TRAVELS THE SECOND ONE. `live_pane` says a process is there; an @mention
+    reaches the seat through its beacon, and `wake_route` measures whether
+    one is listening. Telling the sender to use the wake route would send it
+    at a door this finding knows is shut, so the text names the two moves
+    that remain: tend the pane, or reassign a pane that cannot be tended.
+
+    TWO-WAY, BECAUSE `WAKE_UNKNOWN` IS NOT `WAKE_NONE` — the constant says
+    so in its own comment, "the probe could not tell — never none". Every
+    route but NONE gets the unmeasured text. ARMED is wakeable unless a
+    provider wall is read, and scan reads the wall and the live pane from one
+    liveness row whose single state cannot be both, so ARMED arrives here
+    only when that row was unreadable and two later reads disagreed."""
+    if f.get("wake_route") == WAKE_NONE:
+        return (" DO NOT reassign on this alert: the measured live pane "
+                "explains the quiet. But NO BEACON IS LISTENING, so an "
+                "@mention queues rather than wakes — this seat needs "
+                "pane-level tending to get a turn, or a reassign if the pane "
+                "cannot be tended; reassignment is still not automatic. ")
+    return (" DO NOT reassign on this alert: the measured live pane "
+            "explains the quiet. The wake path could NOT be measured, so an "
+            "@mention may queue rather than wake; confirm a beacon before "
+            "relying on it. ")
 
 
 def _stranded_tail(f):
     """The closing recommendation, which must not CONTRADICT the facts above it.
 
-    The STRANDED text ended with a fixed "It may be idle-done or parked
-    WITHOUT reporting … Re-check or reassign". When a contradicting fact is
-    present that reads as a self-negating alert: the wall fact says the seat
-    is not parked and its provider is refusing it, or the pane fact says it
-    is LIVE and between turns — and then the very next sentence says it may
-    be parked and should be reassigned. An alert that asserts both readings
-    has told the reader nothing and leaves them to pick, which is how the
-    destructive one gets picked.
+    The STRANDED text ends with "It may be idle-done or parked WITHOUT
+    reporting … Re-check or reassign". When the wall fact is present that
+    reads as a self-negating alert: the wall says the seat is not parked and
+    its provider is refusing it, and the very next sentence says it may be
+    parked and should be reassigned. An alert that asserts both readings has
+    told the reader nothing and leaves them to pick, which is how the
+    destructive one gets picked. A live pane never reaches this text: it
+    makes the row WORKING, which is either not sent or sent with
+    _unwakeable_tail (see _sender_act).
 
-    This existed before the pane fact and the pane fact made it louder, so it
-    is cured here rather than inherited. The default is UNCHANGED for a row
-    with no contradicting fact — the ordinary stranded case is untouched."""
+    The default is UNCHANGED for a row with no contradicting fact — the
+    ordinary stranded case is untouched. A RESTING recipient is the third
+    fact: it is not parked by accident, and nothing will wake it."""
+    if f.get("rest"):
+        return (" The recipient is %s — the owner paused it, so it is not "
+                "idle-done and nothing will wake it: route the row to "
+                "another seat. " % f["rest"])
     if f.get("wall"):
         return (" This alert cannot tell whether reassignment would help; inspect "
                 "the measured remediation and work ownership before acting. ")
-    if f.get("live_pane"):
-        # A LIVE PANE AND AN ARMED BEACON ARE DIFFERENT FACTS, AND THE REMEDY
-        # TRAVELS THE SECOND ONE. `live_pane` says a process is there; an
-        # @mention reaches the seat through its beacon, and `wake_route`
-        # already measures whether one is listening — this module's own
-        # WAKE_NONE names the consequence, "a DM is queued bytes". Naming the
-        # wake route without consulting it sends the sender at a door this
-        # same finding knows is shut, while the sentence beside it forbids the
-        # only other move. The console line has consulted `wake_route` all
-        # along, so the two surfaces built from ONE finding disagreed: the
-        # operator read "no wake: beacon none" and the sender was told to use
-        # the wake route.
-        #
-        # THREE-WAY, BECAUSE `WAKE_UNKNOWN` IS NOT `WAKE_NONE` — the constant
-        # says so in its own comment, "the probe could not tell — never
-        # none". Collapsing them with `!= WAKE_ARMED` would tell the sender a
-        # beacon is dead on evidence that only says it was not measured, which
-        # is the same unmeasured-as-negative error one refusal further on.
-        if f.get("wake_route") == WAKE_NONE:
-            return (" DO NOT reassign on this alert: the measured live pane "
-                    "explains the quiet. But NO BEACON IS LISTENING, so an "
-                    "@mention queues rather than wakes — this seat needs "
-                    "pane-level tending to get a turn, and reassignment is "
-                    "still not automatic. ")
-        if f.get("wake_route") != WAKE_ARMED:
-            return (" DO NOT reassign on this alert: the measured live pane "
-                    "explains the quiet. The wake path could NOT be measured, "
-                    "so an @mention may queue rather than wake; confirm a "
-                    "beacon before relying on it. ")
-        return (" DO NOT reassign on this alert: the measured live pane explains "
-                "the quiet; use its named WAKE route. ")
     return (" It may be idle-done or parked WITHOUT reporting (the "
             "assume-busy gap). Re-check or reassign — never auto-poached. ")
 
@@ -820,6 +1129,7 @@ def _stranded_tail(f):
 LEG_ALERT = "alert"           # leg A: tell the SENDER their obligation is idle
 LEG_WAKE = "wake"             # leg B: wake the RECIPIENT who owes the row
 LEG_REDELIVER = "redeliver"   # leg C: an obligation whose delivery never landed
+LEG_IDLE = "idle"             # leg I: re-ring an IDLE seat that owes the row
 # THE DOMAIN THIS LEG ACTUALLY MEASURES, named once. Machine consumers get
 # it as a field, humans get it in the line, and both read this constant.
 # THE DOMAIN. The one genuinely hardcoded fact: which delivery marker this leg
@@ -857,7 +1167,7 @@ WAKE_LATCH = "wake:"          # retained: leg B's record key prefix
 INFLIGHT_TTL_S = 120
 
 
-def _record_key(leg, id8):
+def _record_key(leg, id8, act=""):
     """ONE RECORD PER (leg, id8), holding told/retry/inflight as FIELDS.
 
     Three separate key namespaces would be three things the re-arm sweep has to
@@ -865,8 +1175,19 @@ def _record_key(leg, id8):
     namespace it does not enumerate is reaped every single pass, silently
     turning a backoff into no latch at all. That already happened once here.
     One record per leg makes a partial view unrepresentable: the sweep deletes
-    the whole record or none of it."""
-    return "%s:%s" % (leg, id8)
+    the whole record or none of it.
+
+    THE SENDER LEG ALSO KEYS ON ITS DECISION (`act`, one of SENDER_ACTS), as
+    `alert:<act>:<id8>`, because a dedup signature keys on what the reader of
+    the message decides. check() keeps every decision's record for a row as
+    long as that row is OPEN, in any state and whether or not it is a finding
+    this pass, so a flap back to a decision already told waits out that
+    decision's backoff instead of starting a new count, and a
+    FIXED_CADENCE_S decision keeps its cadence. A record keyed without a
+    decision (`alert:<id8>`) matches nothing check() keeps, so the first
+    sending pass reaps it; a row still STRANDED is then told once more rather
+    than guessed at."""
+    return "%s:%s:%s" % (leg, act, id8) if act else "%s:%s" % (leg, id8)
 
 
 def _new_token():
@@ -877,7 +1198,23 @@ def _new_token():
     return secrets.token_hex(8)
 
 
-def _blocked(rec, now):
+def _addressed(part, to):
+    """One TOLD or RETRY record as it stands for addressee `to`: {} when it
+    was written for somebody else.
+
+    A CUSTODY TRANSFER KEEPS THE ROW AND MOVES THE READER. custodian_of moves
+    a row's sender without changing its id, so a record that says only
+    "told" reads the new custodian as told, and the one seat now positioned
+    to act hears nothing for a whole backoff. Each leg-A record therefore
+    names the addressee it was written for, and a different one starts
+    fresh. RETRY is bound the same way because a custody transfer is most
+    often away from a seat whose DMs were failing. `to` None (leg B) keeps
+    the record whole."""
+    part = part or {}
+    return {} if to is not None and part.get("to") != to else part
+
+
+def _blocked(rec, now, every=None, to=None):
     """"" or the EXACT reason this leg may not send right now.
 
     THREE TRUTHFUL STATES, not one latch. TOLD means delivered and drives the
@@ -886,19 +1223,23 @@ def _blocked(rec, now):
     backoff can erase itself, because restoring the prior entry to preserve the
     informational count restores the very count that provides the backoff.
     INFLIGHT means another pass owns an attempt right now; an overlapping pass
-    then observes a TRUE in-flight rather than a fake delivery latch."""
-    told = rec.get("told") or {}
+    then observes a TRUE in-flight rather than a fake delivery latch.
+
+    `every` (a FIXED_CADENCE_S decision) replaces the doubling wait with a
+    fixed one. `to` reads TOLD and RETRY for that addressee (see
+    _addressed); INFLIGHT is a concurrency guard and binds whoever holds it."""
+    told = _addressed(rec.get("told"), to)
     if told.get("at"):
         # THE STORED COUNT IS THE EXPONENT, not the count minus one. After a
         # first delivery n == 1 and the next alert owes 2x LATCH_TTL_S — the
         # doubling IS the fix this backoff exists to be, and an off-by-one
         # here silently halves every wait. A pre-existing arm pins it.
         n = int(told.get("n") or 0)
-        wait = min(LATCH_TTL_S * (2 ** n), LATCH_BACKOFF_CAP_S)
+        wait = every or min(LATCH_TTL_S * (2 ** n), LATCH_BACKOFF_CAP_S)
         if now - told["at"] < wait:
             return "told %dmin ago; next after %dmin" % (
                 (now - told["at"]) // 60, wait // 60)
-    retry = rec.get("retry") or {}
+    retry = _addressed(rec.get("retry"), to)
     if retry.get("next_at") and now < retry["next_at"]:
         return "retry throttled for %ds (%s)" % (
             int(retry["next_at"] - now), retry.get("reason") or "send failed")
@@ -941,6 +1282,102 @@ def _undelivered_obligations():
             continue
         out.append(row)
     return out
+
+
+_IDLE_RING_TEXT = (
+    "@%(recipient)s IDLE-OWING: you owe dispatch %(id8)s (%(lane)s) from "
+    "@%(sender)s%(od)s, and as of this scan your turn ended %(idle_min)d min "
+    "ago with nothing run since (read from your own hooks, helm/seat_idle.py). "
+    "Take it (`helm dispatch triage %(id8)s` prints the brief), or say in the "
+    "room that it is NOT yours so it can be rerouted. This ring repeats only "
+    "on a doubling backoff while the row stays open. [idle-dispatch watchdog]")
+
+
+def _idle_text(f):
+    """Leg I's ring, rendered inside `_deliver`'s failure boundary like every
+    other template here (a KeyError there once surfaced as ZERO alerts)."""
+    reading = f.get("idle") or {}
+    return _IDLE_RING_TEXT % {
+        "recipient": f["recipient"], "id8": f["id8"], "lane": f["lane"],
+        "sender": f["sender"],
+        "od": " (past its deadline)" if f.get("overdue") else "",
+        "idle_min": int((reading.get("idle_s") or 0) // 60)}
+
+
+def _no_ring_why(f):
+    """Why an IDLE-OWING row was not a ring candidate."""
+    if f.get("rest"):
+        return "resting"
+    if f.get("wall"):
+        return "provider wall"
+    if f.get("wake_route") != WAKE_ARMED:
+        return "beacon %s" % (f.get("wake_route") or "unknown")
+    return "not admitted"
+
+
+def _idle_note(f):
+    """Leg I's line-tail: rung, refused, held, or never a candidate."""
+    if not f.get("idle_owing"):
+        return ""
+    head = " | IDLE-OWING %dm" % (f.get("idle_owing_min") or 0)
+    if f.get("idle_sent"):
+        return head + ": RUNG @%s" % f.get("wake_target")
+    if "idle_error" in f:
+        return head + ": RING FAILED @%s: %s" % (
+            f.get("wake_target"), f.get("idle_error") or "send failed")
+    if f.get("idle_skipped"):
+        return head + ": ring held: %s" % f["idle_skipped"]
+    if f.get("idle_ring"):
+        return head + ": would ring @%s" % f.get("wake_target")
+    return head + ": no ring (%s)" % _no_ring_why(f)
+
+
+#: A seat's ring outcome for the pass sample, strongest first.
+_RING_RANK = ("sent", "failed", "held", "no ring")
+
+
+def _ring_rank(word):
+    return next(i for i, w in enumerate(_RING_RANK) if word.startswith(w))
+
+
+def _record_pass(now, rows, idle, findings):
+    """One sample for `helm seat idle-dispatch --owing` (seat_idle.measure):
+    every seat that owes an open row, its reading, the rows it owes with the
+    instant each arrived, and the strongest ring outcome this pass had for it.
+    Never raises; seat_idle.record_pass says on stderr when it cannot write."""
+    try:
+        ring = {}
+        for f in findings:
+            if not f.get("idle_owing"):
+                continue
+            word = ("sent" if f.get("idle_sent")
+                    else "failed: %s" % (f.get("idle_error") or "send failed")
+                    if "idle_error" in f
+                    else "held: %s" % f["idle_skipped"]
+                    if f.get("idle_skipped")
+                    else "no ring: %s" % _no_ring_why(f))
+            key = f.get("recipient_key") or ""
+            if key not in ring or _ring_rank(word) < _ring_rank(ring[key]):
+                ring[key] = word
+        seats_ = {}
+        for r in rows:
+            key = _recipient_key(r.get("recipient"))
+            if not key:
+                continue
+            seats_.setdefault(key, {"owing": []})["owing"].append(
+                [str(r.get("id") or "")[:8], now - dispatches._age_s(r, now)])
+        missing = set(seats_) - set(idle)
+        if missing:
+            idle.update(seat_idle.readings(missing, now=now))
+        for key, e in seats_.items():
+            reading = idle.get(key) or {}
+            e["state"], e["since"] = reading.get("state"), reading.get("since")
+            if key in ring:
+                e["ring"] = ring[key]
+        seat_idle.record_pass(now, seats_)
+    except Exception as exc:                  # noqa: BLE001 — a sample, never a pass
+        print("helm seat idle-dispatch: the idle-owing sample failed (%s: %s)"
+              % (exc.__class__.__name__, exc), file=sys.stderr)
 
 
 def _wake_text(f):
@@ -1128,21 +1565,28 @@ def _finish(key, token, ok, reason=""):
             if (rec.get("inflight") or {}).get("token") != token:
                 return False          # a successor owns it; never overwrite
             rec = dict(rec)
-            rec.pop("inflight", None)
+            # THE ADDRESSEE THE RESERVATION NAMED is the one this result is
+            # about, so both counters are advanced as ITS record: a new
+            # custodian starts at its first tell (see _addressed).
+            to = (rec.pop("inflight", None) or {}).get("to")
             if ok:
-                told = dict(rec.get("told") or {})
+                told = dict(_addressed(rec.get("told"), to))
                 told["at"] = now
                 told["n"] = int(told.get("n") or 0) + 1
+                if to is not None:
+                    told["to"] = to
                 rec["told"] = told
                 rec.pop("retry", None)
             else:
-                retry = dict(rec.get("retry") or {})
+                retry = dict(_addressed(rec.get("retry"), to))
                 n = int(retry.get("n") or 0) + 1
                 retry.update({"n": n, "at": now,
                               "reason": reason or "send failed",
                               "next_at": now + min(
                                   RETRY_TTL_S * (2 ** (n - 1)),
                                   LATCH_BACKOFF_CAP_S)})
+                if to is not None:
+                    retry["to"] = to
                 rec["retry"] = retry
             st[key] = rec
             pk.write_json(path, st)
@@ -1153,6 +1597,30 @@ def _finish(key, token, ok, reason=""):
         return False
 
 
+def _open_rows():
+    """The OPEN dispatch rows, or None when the ledger could not be read.
+
+    `dispatches.open_rows()` CANNOT SAY UNREADABLE. It folds `rows()`, which
+    is `snapshot()[0]`, and an unreadable ledger (a path that is not a private
+    regular file, an open that fails) comes back as {} with its reason in the
+    half `rows()` drops, so the call returns [] and raises nothing. A
+    try/except around it never fires, and [] reads as "no row is open": the
+    re-arm sweep in check() reaped every latch on both legs, and the
+    send-boundary re-read called every finding closed and suppressed its
+    send. So the snapshot is read here with its reason, and an unreadable one
+    is None, said once on stderr."""
+    try:
+        snap, unavailable = dispatches.snapshot()
+        if not unavailable:
+            return dispatches.open_rows(snap)
+        why = unavailable
+    except Exception as e:                    # noqa: BLE001
+        why = "%s: %s" % (type(e).__name__, e)
+    print("helm seat idle-dispatch: the dispatch ledger could not be read, "
+          "so no row is treated as closed: %s" % why, file=sys.stderr)
+    return None
+
+
 def check(post=True, quiet=False):
     """One read-only pass: scan -> per-leg dedup-latch -> DM. Returns
     {"findings": [...], "alerted": [...], "woke": [...]}. The fcntl lock covers
@@ -1161,16 +1629,22 @@ def check(post=True, quiet=False):
     TWO FIRST-CLASS LEGS, INDEPENDENTLY ADMITTED AND INDEPENDENTLY LATCHED.
     Leg A tells the SENDER their obligation is idle; leg B wakes the RECIPIENT,
     the one seat that can discharge it. They are not two views of one alert:
-    they have different addressees, different admission (leg B fires only on a
-    STRANDED row with a measured armed beacon and no provider wall) and
-    different truth conditions, so they get different latch keys. Sharing one
-    key would let whichever leg fired first silently consume the other's alert
-    for the whole backoff window — and since leg A always admits and leg B
-    admits narrowly, the loser would always have been the wake.
+    they have different addressees, different admission (leg A fires only when
+    the sender has a decision: STRANDED, CLAIM-UNKNOWN, or a WORKING row leg B
+    cannot wake; leg B fires only on a claimless row, STRANDED or WORKING,
+    with a measured armed beacon and no provider wall) and different truth
+    conditions, so they get different latch keys. Sharing one key would let
+    whichever leg fired first silently consume the other's alert for the
+    whole backoff window, and the wake is the leg that loses: on a STRANDED
+    row both admit and leg A fires first.
 
-    THE LEGACY KEY IS READ AS SENDER-ONLY. State files written before this
-    carry bare id8 keys, and those are leg A's; the wake takes its own
-    namespace so an existing latch can never suppress a leg that has never run.
+    THE SENDER LEG'S KEY CARRIES ITS DECISION (see _record_key), and its
+    records live as long as their row is OPEN: a flap between states keeps
+    each decision's backoff or cadence, and only a row that closed is
+    reaped. Each record names the custodian it told, so a new custodian of
+    the same row is told at once (see _addressed). The open rows come from
+    the one read this pass scans, and an unreadable read reaps nothing,
+    because unreadable is not empty.
 
     THE RE-ARM SWEEP MUST SEE BOTH SPELLINGS. It drops latches for dispatches
     no longer stranded, keyed on what this pass saw — so a wake key absent from
@@ -1183,7 +1657,14 @@ def check(post=True, quiet=False):
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p + ".lock", "a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        findings = scan()
+        # ONE READ OF THE OPEN ROWS for the scan AND the reap below, so the two
+        # cannot disagree about which rows are open. None is an UNREAD ledger
+        # (see _open_rows): the scan finds nothing, as it always has, and the
+        # reap keeps every record instead of reading "unreadable" as "every
+        # row closed".
+        rows = _open_rows()
+        idle = {}                 # recipient key -> seat_idle reading
+        findings = scan(rows, idle) if rows is not None else []
         # the fresh claim read that leg B's send is owed against — taken here,
         # after scan's probes, so the latch decision and the evidence it rests
         # on are one transaction rather than two
@@ -1192,6 +1673,7 @@ def check(post=True, quiet=False):
         now = time.time()
         alerted = []
         woke = []
+        rung = []
         # latch key -> the entry it REPLACED. The latch is written under this
         # lock so an overlapping pass cannot double-send, and retracted after
         # a delivery that did not happen — restoring the prior entry rather
@@ -1206,9 +1688,10 @@ def check(post=True, quiet=False):
         sending = bool(post and not quiet)
         seen_keys = set()
         for f in findings:
-            key = _record_key(LEG_ALERT, f["id8"])
+            # THE SENDER'S DECISION, published on the finding so the report and
+            # --json say why a row that DMs nobody was not sent.
+            act = f["sender_act"] = _sender_act(f)
             wake_key = _record_key(LEG_WAKE, f["id8"])
-            seen_keys.add(key)
             # THE WAKE KEY IS MARKED SEEN ONLY IF THE ROW IS STILL WAKE-
             # ELIGIBLE, and that is decided below rather than here. Marking it
             # unconditionally kept a completed wake's TOLD record alive through
@@ -1219,7 +1702,11 @@ def check(post=True, quiet=False):
             # SUPPRESSED by a latch earned in an episode that had already
             # ended. The re-arm contract says a picked-up row that re-strands
             # alerts again; this made that false for leg B only.
-            entry = st.get(key)
+            #
+            # THE SENDER'S RECORDS ARE KEPT BY ROW, NOT HERE. They survive
+            # while the row is open (see the reap below), so this loop marks
+            # none of them.
+            key = _record_key(LEG_ALERT, f["id8"], act)
             # BACKOFF, because a flat re-alert on a condition that may never
             # resolve is an unbounded alert source. LATCH_TTL_S alone meant one
             # DM every 15 MINUTES for as long as a dispatch stayed stranded —
@@ -1237,33 +1724,66 @@ def check(post=True, quiet=False):
             # doubles the wait, capped, so a genuinely stuck row still speaks —
             # just at a rate a human or a seat can absorb. ~148 alerts over 37h
             # becomes ~14.
-            rec = st.get(key) or {}
-            why = _blocked(rec, now)
+            # A row with no decision reads no record: nothing about it is held.
+            rec = (st.get(key) or {}) if act else {}
+            why = _blocked(rec, now, every=FIXED_CADENCE_S.get(act),
+                           to=f["sender"])
             f["latched"] = bool(why)
             f["skip_reason"] = why
-            if not why:
+            if act and not why:
                 # DECIDE ALWAYS, RESERVE ONLY WHEN SENDING. `--dry-run` exists
                 # to report what WOULD alert without consuming anything, so
                 # gating the DECISION on sending — rather than only the write
                 # — makes it report nothing at all, which is the opposite of
                 # its contract.
-                f["repeat"] = int((rec.get("told") or {}).get("n") or 0)
+                f["repeat"] = int(
+                    _addressed(rec.get("told"), f["sender"]).get("n") or 0)
                 if sending:
                     token = _new_token()
                     f["token"] = token
                     rec = dict(rec)
                     rec["recipient"] = f["recipient"]
+                    # `to` NAMES WHO THIS RESERVATION TELLS, so _finish writes
+                    # the result as that custodian's record (see _addressed).
                     rec["inflight"] = {"token": token,
-                                       "expires_at": now + INFLIGHT_TTL_S}
+                                       "expires_at": now + INFLIGHT_TTL_S,
+                                       "to": f["sender"]}
                     st[key] = rec
                 alerted.append(f)
+
+            # ---- LEG I: re-ring an IDLE seat that owes the row (task/3118) ---
+            # Admitted in scan (`idle_ring`): IDLE-OWING, an armed beacon, no
+            # wall. ITS RECORD LIVES AS LONG AS THE ROW IS OPEN (see the reap
+            # below), so the doubling backoff runs across idle episodes: a
+            # seat that wakes, idles again and still owes the row waits out
+            # the backoff instead of being rung every ten minutes. It then
+            # skips leg B, which would otherwise wake the same row twice.
+            if f.get("idle_ring"):
+                ikey = _record_key(LEG_IDLE, f["id8"])
+                irec = st.get(ikey) or {}
+                iwhy = _blocked(irec, now)
+                f["idle_latched"] = bool(iwhy)
+                f["idle_skipped"] = iwhy
+                if not iwhy:
+                    f["idle_repeat"] = int(
+                        (irec.get("told") or {}).get("n") or 0)
+                    if sending:
+                        itoken = _new_token()
+                        f["idle_token"] = itoken
+                        irec = dict(irec)
+                        irec["recipient"] = f["recipient"]
+                        irec["inflight"] = {"token": itoken,
+                                            "expires_at": now + INFLIGHT_TTL_S}
+                        st[ikey] = irec
+                    rung.append(f)
+                continue
 
             # ---- LEG B: wake the seat that OWES the row --------------------
             # NO `continue` ABOVE, and that is the whole point. Leg A used to
             # end the iteration when it was latched, so a second leg written
             # underneath it would silently never run for any row whose sender
-            # alert had already fired — which, given leg A admits every finding
-            # and fires first, is every row that matters.
+            # alert had already fired — which, given leg A admits every
+            # STRANDED finding and fires first, is every row that matters.
             f["wake_sent"] = False
             f["wake_latched"] = False
             f["wake_skipped"] = ""
@@ -1343,10 +1863,27 @@ def check(post=True, quiet=False):
                               "delivery": r.get("delivery") or "",
                               "leg": LEG_REDELIVER}
                              for r in owed_rows]
-        # re-arm: drop latches for dispatches no longer stranded (resolved /
-        # picked up), so a later re-strand of the SAME id alerts again
-        for k in [k for k in st if k not in seen_keys]:
-            st.pop(k, None)
+        # re-arm: drop latches whose episode ended, so a later re-strand of
+        # the SAME id alerts again. Leg B's ends when its row stops being
+        # wakeable (resolved / picked up); the sender's ends when its row
+        # closes.
+        #
+        # THE SENDER'S RECORDS OUTLIVE THE FINDING AND END WITH THE ROW.
+        # Reaped per finding, a STRANDED <-> WORKING flap reset the backoff
+        # count and re-told a decision the sender already had, and the
+        # unwakeable DM restarted its cadence every time the recipient crossed
+        # one tool boundary, because a working seat leaves the scan each time
+        # it does. So every decision's record stays while its row is open, and
+        # the reap takes only rows that closed. Leg B keeps its own rule
+        # (marked above while wakeable).
+        if rows is not None:
+            seen_keys.update(
+                _record_key(LEG_ALERT, str(r.get("id") or "")[:8], a)
+                for r in rows for a in SENDER_ACTS)
+            seen_keys.update(_record_key(LEG_IDLE, str(r.get("id") or "")[:8])
+                             for r in rows)
+            for k in [k for k in st if k not in seen_keys]:
+                st.pop(k, None)
         # NON-MUTATING UNLESS WE ACTUALLY SEND. Both --dry-run and --quiet
         # report what WOULD happen, so neither may consume a latch, mint a
         # reservation, or REAP. The reap is the sharp edge: this block drops
@@ -1374,13 +1911,11 @@ def check(post=True, quiet=False):
         # would silence the whole rung on a transient error — the opposite of
         # the failure this cures. Absence of proof of closure is not proof.
         def _live_rows():
-            """The OPEN rows as of RIGHT NOW, by id. None when unreadable."""
-            try:
-                return {str(r.get("id") or ""): r for r in dispatches.open_rows()}
-            except Exception as e:            # noqa: BLE001
-                print("helm seat idle-dispatch: open-row recheck failed: %s" % e,
-                      file=sys.stderr)
-                return None
+            """The OPEN rows as of RIGHT NOW, by id. None when unreadable, which
+            `dispatches.open_rows()` alone cannot say (see _open_rows)."""
+            rows = _open_rows()
+            return (None if rows is None
+                    else {str(r.get("id") or ""): r for r in rows})
 
         def _went_terminal(f):
             """Is this finding still owed, MEASURED AT THIS SEND BOUNDARY.
@@ -1425,17 +1960,18 @@ def check(post=True, quiet=False):
 
         undelivered = []
         for f in alerted:
+            key = _record_key(LEG_ALERT, f["id8"], f["sender_act"])
             if _went_terminal(f):
                 f["sent"] = False
                 f["closed_after_scan"] = True
-                _release(_record_key(LEG_ALERT, f["id8"]), f["token"])
+                _release(key, f["token"])
                 continue
             ok, why = _deliver(f["sender"], _alert_text, f, "alert")
             f["sent"] = ok
             f["send_error"] = why
-            _finish(_record_key(LEG_ALERT, f["id8"]), f["token"], ok, why)
+            _finish(key, f["token"], ok, why)
             if not ok:
-                undelivered.append(_record_key(LEG_ALERT, f["id8"]))
+                undelivered.append(key)
         for f in woke:
             # RE-MEASURE THE BEACON AT SEND TIME, NOT AT SCAN TIME. The route
             # was proved during the scan; since then this pass has finished
@@ -1505,7 +2041,35 @@ def check(post=True, quiet=False):
         # its own reservation above — success advances TOLD, failure advances
         # RETRY on a separate counter — so a failed send never reads as a
         # delivery and never has to be undone.
+        for f in rung:
+            # RE-MEASURED AT THE SEND BOUNDARY, like leg B's beacon and
+            # claims: the row may have closed, the seat may have woken, and
+            # its beacon may have gone. Each is a release, never a failure.
+            ikey = _record_key(LEG_IDLE, f["id8"])
+            skip = ""
+            if _went_terminal(f):
+                f["closed_after_scan"] = True
+                skip = "row closed after the scan"
+            elif (seat_idle.reading(f["recipient_key"]) or {}).get(
+                    "state") != seat_idle.IDLE:
+                skip = "no longer IDLE at send time"
+            elif _wake_route(f["wake_target"])[0] != WAKE_ARMED:
+                skip = "beacon not armed at send time"
+            if skip:
+                f["idle_sent"] = False
+                f["idle_skipped"] = skip
+                _release(ikey, f["idle_token"])
+                continue
+            ok, why = _deliver(f["wake_target"], _idle_text, f, "idle")
+            f["idle_sent"] = ok
+            f["idle_error"] = why
+            _finish(ikey, f["idle_token"], ok, why)
+            if not ok:
+                undelivered.append(ikey)
+    if sending and rows is not None:
+        _record_pass(now, rows, idle, findings)
     return {"findings": findings, "alerted": alerted, "woke": woke,
+            "rung": rung,
             "undelivered": undelivered if sending else [],
             # task/928 slice B. A DISTINCT KEY: `undelivered`
             # already means "latch keys whose send failed" in
@@ -1530,7 +2094,14 @@ def _alert_note(f):
     That is the exact defect class this whole row exists to close, so the
     renderer is not allowed to be the last place it survives: a leg whose
     refusals are invisible is indistinguishable from a leg that never ran.
+
+    AND A ROW THAT HANDS ITS SENDER NO DECISION SAYS SO FIRST (task/3161).
+    HOLDING and a WORKING row leg B can wake are reported here and never DMd;
+    without this line the report would read "would alert" for a row that
+    nothing will send.
     """
+    if not _sender_act(f):
+        return " no DM: @%s has no act on this state" % f["sender"]
     if f.get("rebound_to"):
         return " not sent: rebound to @%s after the scan" % f["rebound_to"]
     if f.get("closed_after_scan"):
@@ -1581,7 +2152,9 @@ def _wake_note(f):
     if f.get("wake_skipped"):
         return " | wake refused: %s" % f["wake_skipped"]
     if f.get("stranded") and f.get("wake_route") != WAKE_ARMED:
-        return " | no wake: beacon %s" % f.get("wake_route")
+        return " | no wake: beacon %s%s" % (
+            f.get("wake_route"),
+            "; %s" % f["dead_turn"] if f.get("dead_turn") else "")
     if f.get("stranded") and f.get("wall"):
         return " | no wake: provider wall"
     return ""
@@ -1592,7 +2165,24 @@ def cmd_idle_dispatch(argv=None):
     if "-h" in args or "--help" in args:
         print(_USAGE)
         return 0
+    if "--owing" in args:
+        return seat_idle.cmd_owing([a for a in args if a != "--owing"])
+    # --apply WRITES (the dark-seat mover), so a junk tail refuses before any
+    # pass runs: `--aply` must never read as a dry run, nor `--bogus --apply`
+    # as an apply.
+    from .cli import guard_tail
+    rc = guard_tail("helm seat idle-dispatch", args,
+                    flags=("--once", "--dry-run", "--apply", "--quiet",
+                           "--json"), usage=_USAGE.splitlines()[0])
+    if rc is not None:
+        return rc
     res = check(post="--dry-run" not in args, quiet="--quiet" in args)
+    # THE DARK-SEAT MOVER RIDES THIS TICK (task/3587): dry-run unless
+    # --apply, and --dry-run wins over --apply.
+    from . import darkmove
+    moved_lines, moves = darkmove.run(
+        apply="--apply" in args and "--dry-run" not in args,
+        post="--quiet" not in args)
     if "--json" in args:
         # THE SCOPE TRAVELS WITH THE DATA, not in the help text. A burn-down
         # consumer reads this dict and nothing else, so an undeclared list is
@@ -1600,23 +2190,26 @@ def cmd_idle_dispatch(argv=None):
         # complete is False unconditionally today and will stay so until the
         # obligation seam exists to widen the domain.
         res = dict(res, redeliverable_scope=REDELIVERABLE_SCOPE,
-                   redeliverable_complete=REDELIVERABLE_COMPLETE)
+                   redeliverable_complete=REDELIVERABLE_COMPLETE,
+                   dark_moves={"lines": moved_lines, "moves": moves})
         print(json.dumps(res))
     else:
         for f in res["findings"]:
             print("%s -> @%s: %s %s%s ~%dmin%s%s"
                   % (f["id8"], f["recipient"], f["presence"],
-                     # THE SAME WORD THE DM USES. Two surfaces answering one
-                     # question differently is how a reader learns to trust
-                     # neither, so the live-pane demotion is applied here too.
-                     ("WORKING" if f.get("live_pane") else "STRANDED")
+                     # THE SAME CLASSIFICATION _sender_act USES. Two surfaces
+                     # answering one question differently is how a reader
+                     # learns to trust neither, so the live-pane demotion is
+                     # applied here too.
+                     ("DEAD-TURN" if f.get("dead_turn")
+                      else "WORKING" if f.get("live_pane") else "STRANDED")
                      if f["claim"] == CLAIM_NONE
                      else "HOLDING" if f["claim"] == CLAIM_HOLDING
                      else "CLAIM-UNKNOWN",
                      " [%s]" % f["held"][0] if f.get("held") else "",
                      f["age_min"], " OVERDUE" if f["overdue"] else "",
                      _alert_note(f))
-                  + _wake_note(f))
+                  + _wake_note(f) + _idle_note(f))
         owed_rows = res.get("redeliverable")
         for r in owed_rows or ():
             print("%s -> @%s: OWED on %s, delivery=%s (%s scope)"
@@ -1639,6 +2232,8 @@ def cmd_idle_dispatch(argv=None):
         elif owed_rows:
             print("owed-undelivered: %d row(s) at %s"
                   % (len(owed_rows), REDELIVERABLE_SCOPE_NOTE))
+        for line in moved_lines:
+            print(line)
     # rc carries the tri-state a burn-down caller has to branch on: 0 means
     # ANSWERED, non-zero means the ledger could not be read.
     return 0 if res.get("redeliverable") is not None else 1

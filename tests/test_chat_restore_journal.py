@@ -114,9 +114,11 @@ class RoundTripTest(RestoreBase):
         chat.log_flush()
         self.wipe_rooms()
         chat.post("post-reboot survivor", room="main", who="carol")
-        raw_before = open(chat.room_path("main"), encoding="utf-8").read()
+        with open(chat.room_path("main"), encoding="utf-8") as fh:
+            raw_before = fh.read()
         chat.restore_journal(apply=True)
-        raw_after = open(chat.room_path("main"), encoding="utf-8").read()
+        with open(chat.room_path("main"), encoding="utf-8") as fh:
+            raw_after = fh.read()
         self.assertTrue(raw_after.endswith(raw_before),
                         "live rows must be the untouched tail of the new file")
         texts = self.texts("main")
@@ -130,11 +132,12 @@ class IdempotenceTest(RestoreBase):
         chat.log_flush()
         self.wipe_rooms()
         chat.restore_journal(apply=True)
-        first = open(chat.room_path("main"), encoding="utf-8").read()
+        with open(chat.room_path("main"), encoding="utf-8") as fh:
+            first = fh.read()
         out = chat.restore_journal(apply=True)
         self.assertEqual(out["rooms"]["main"].get("skipped"), "already restored")
-        self.assertEqual(first,
-                         open(chat.room_path("main"), encoding="utf-8").read())
+        with open(chat.room_path("main"), encoding="utf-8") as fh:
+            self.assertEqual(first, fh.read())
 
     def test_an_UNWIPED_room_restores_nothing(self):
         """The journal always contains what is still live — a restore against
@@ -290,6 +293,71 @@ class FlushInteractionTest(RestoreBase):
                          "a flush right after a restore must append nothing")
 
 
+class RoomLockTest(RestoreBase):
+    """The restore reads, rewrites and renames a room file, so it runs only
+    under the room lock (task/3535)."""
+
+    def test_restore_writes_nothing_when_the_room_lock_is_unavailable(self):  # noqa: VACUOUS_ASSERTION — the planted journal and the skipped reason positively control that no restored row was written
+        chat.post("kept in the journal", room="main", who="alice")
+        self.assertGreater(chat.log_flush(), 0)
+        self.wipe_rooms()
+
+        @contextlib.contextmanager
+        def unavailable(room, timeout_s=None):
+            yield False
+
+        with mock.patch.object(chat, "_room_lock", unavailable):
+            out = chat.restore_journal(apply=True)
+        self.assertEqual(out["state"], "UNKNOWN")
+        self.assertEqual(out["rooms"]["main"]["restored"], 0)
+        self.assertIn("room lock unavailable",
+                      out["rooms"]["main"]["skipped"])
+        self.assertFalse(os.path.exists(chat.room_path("main")))
+        # the refusal is a skip, not damage: a later run restores the room
+        out = chat.restore_journal(apply=True)
+        self.assertEqual(out["rooms"]["main"]["restored"], 1)
+        self.assertEqual(self.texts("main")[0], "kept in the journal")
+
+    def test_an_append_racing_a_restore_waits_and_loses_no_row(self):
+        import threading
+        from tests import _lockwait
+        chat.post("pre-wipe row", room="main", who="alice")
+        chat.log_flush()
+        self.wipe_rooms()
+        lock_path = os.path.realpath(
+            os.path.join(chat.chat_dir(), pk.slug("main") + ".lock"))
+        real_sweep = chat._restore_cursor_sweep
+        seen = {}
+        errors = []
+
+        def poster():
+            try:
+                chat.post("raced the restore", room="main", who="bob")
+            except Exception as e:         # surfaced below, never swallowed
+                errors.append(e)
+
+        def sweep(room, valid):
+            # inside the restore's locked window: the racing append must be
+            # waiting on the room's flock, not writing
+            t = threading.Thread(target=poster)
+            t.start()
+            seen["thread"] = t
+            seen["blocked"] = waits.wait_blocked(t)
+            return real_sweep(room, valid)
+
+        with _lockwait.observed() as waits, \
+                mock.patch.object(chat, "_restore_cursor_sweep", sweep):
+            chat.restore_journal(apply=True)
+            seen["thread"].join(_lockwait.HANG_S)
+        self.assertEqual(seen["blocked"], lock_path)
+        self.assertFalse(seen["thread"].is_alive())
+        self.assertEqual(errors, [])
+        texts = self.texts("main")
+        self.assertEqual(texts[0], "pre-wipe row")
+        self.assertIn("RESTORED from the disk journal", texts[1])
+        self.assertEqual(texts[2], "raced the restore")
+
+
 class ParserEdgeTest(RestoreBase):
     def test_flush_gap_notes_are_not_rows(self):
         chat.post("real row", room="main", who="alice")
@@ -430,8 +498,10 @@ class ParserEdgeTest(RestoreBase):
         j = sorted(n for n in os.listdir(chat.journal_dir())
                    if n.startswith("chat-") and n.endswith(".log"))[0]
         path = os.path.join(chat.journal_dir(), j)
-        body = open(path).read()
-        open(path, "w").write("orphan line with no header\n" + body)
+        with open(path) as fh:
+            body = fh.read()
+        with open(path, "w") as fh:
+            fh.write("orphan line with no header\n" + body)
         self.wipe_rooms()
         out = chat.restore_journal(apply=True)
         self.assertEqual(out["meta"]["orphan_lines"], 1)
@@ -638,7 +708,8 @@ class LogflushTimerTest(RestoreBase):
         self.assertIn("helm-chat-logflush.timer", body)
         self.assertIn("OnUnitActiveSec=180s", body)
         self.assertIn("--apply", body)
-        src = open(chat.__file__, encoding="utf-8").read()
+        with open(chat.__file__, encoding="utf-8") as fh:
+            src = fh.read()
         apply_leg = src.split('if "--apply" not in args:')[1]
         self.assertLess(apply_leg.index("return 0"),
                         apply_leg.index('open(path, "w"'))
@@ -906,6 +977,166 @@ class LifecyclePrefixTest(RestoreBase):
         self.assertIn("meld-probe", str(caught.exception))
 
 
+class TwoNamespacesOneJournalTest(unittest.TestCase):
+    """An isolated chat namespace over the LIVE home's durable journal.
+
+    Measured on the live bus: a reviewer process ran with HELM_CHAT_DIR set and
+    HELM_HOME left at the default. Its first `list` restored its empty chat
+    dir from the shared journal, and the restore appended a
+    `restored-from-journal` marker to 402 live meld journals. The live bus
+    then read those melds UNKNOWN, and a live meld's next transition took the
+    sequence number the marker already held, so the flush quarantined it and
+    its rows stayed in RAM only.
+
+    THE FIXTURE IS PRODUCTION WITH TWO CONSTANTS MOVED. HELM_HOME is unset, so
+    the home is the default one, under a scratch $HOME. A leaves HELM_CHAT_DIR
+    unset and gets the default bus, moved off /dev/shm into scratch. B sets
+    HELM_CHAT_DIR, exactly as the reviewer did. The preconditions below assert
+    that each namespace resolves through the same arm production does.
+    """
+
+    KEYS = ENV_KEYS + ("HOME", "MELD_HOME", "HELM_CHAT_ROOM")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-twons-")
+        self.prior = {k: os.environ.get(k) for k in self.KEYS}
+        for k in self.KEYS:
+            os.environ.pop(k, None)
+        os.environ["HOME"] = os.path.join(self.tmp, "home")
+        os.environ["HELM_CHAT_NODE_URL"] = ""
+        os.environ["HELM_SCRATCH_GC"] = "0"
+        os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
+        os.environ["HELM_CHAT_ROOM"] = "main"
+        self.bus = os.path.join(self.tmp, "shm", "helm-chat")
+        self.isolated = os.path.join(self.tmp, "isolated-chat")
+        patch = mock.patch.object(chat, "DEFAULT_DIR", self.bus)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.cwd_prior = os.getcwd()
+        os.chdir(self.tmp)
+
+    def tearDown(self):
+        os.chdir(self.cwd_prior)
+        for k, v in self.prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def as_a(self):
+        os.environ.pop("HELM_CHAT_DIR", None)
+        from helm import home
+        self.assertEqual(home.surface_origin("CHAT_DIR", "helm-chat",
+                                             chat.DEFAULT_DIR),
+                         (self.bus, home.DEFAULT))
+
+    def as_b(self):
+        os.environ["HELM_CHAT_DIR"] = self.isolated
+        from helm import home
+        self.assertEqual(home.surface_origin("CHAT_DIR", "helm-chat",
+                                             chat.DEFAULT_DIR),
+                         (self.isolated, home.EXPLICIT))
+
+    def journal_bytes(self):
+        out = {}
+        root = chat.journal_dir()
+        for d, _dirs, files in os.walk(root):
+            for n in files:
+                p = os.path.join(d, n)
+                with open(p, "rb") as f:
+                    out[os.path.relpath(p, root)] = f.read()
+        return out
+
+    def a_meld_then_b_reads(self):
+        """A convenes and flushes a live meld; then B does what the reviewer
+        did: its first list, a restore, a meld status and a flush."""
+        self.as_a()
+        room, _ = meld.invite("seat-b", "converge the wire format",
+                              seat="seat-a")
+        meld.join(room, seat="seat-b")
+        self.assertGreater(chat.log_flush(), 0)
+        self.assertEqual(
+            chat.journal_dir(),
+            os.path.join(os.environ["HOME"], ".helm", "helm", "journal"),
+            "precondition: the journal is the DEFAULT home's")
+        before = self.journal_bytes()
+        self.assertIn(os.path.join("meld", meld._room_key(room) + ".jsonl"),
+                      before)
+        self.as_b()
+        chat.list_rooms()
+        chat.restore_journal(apply=True)
+        meld.status(seat="seat-c")
+        chat.log_flush(report={})
+        return room, before
+
+    def test_B_restores_itself_but_never_WRITES_the_durable_journal(self):  # noqa: VACUOUS_ASSERTION — the helper asserts the meld journal is in `before`, and the RAM kinds below are unconditional positives that B really read it
+        room, before = self.a_meld_then_b_reads()
+        after = self.journal_bytes()
+        changed = sorted(k for k in set(before) | set(after)
+                         if before.get(k) != after.get(k))
+        self.assertEqual(changed, [], "B wrote the live journal: %s" % changed)
+        # POSITIVE CONTROL: B did READ the journal and restored its own copy.
+        kinds = [e["transition"] for e in
+                 meld._events(meld.lifecycle_path(room))[0]]
+        self.assertIn("invited", kinds)
+        self.assertIn("restored-from-journal", kinds)
+
+    def test_A_replays_clean_after_B(self):
+        room, _before = self.a_meld_then_b_reads()
+        self.as_a()
+        out = meld.replay_room(room, apply=True)
+        self.assertEqual(out["state"], "ok", out)
+        rows = [x for x in meld.status(seat="seat-a")
+                if x.startswith("  %s " % room)]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertNotIn("UNKNOWN", rows[0])
+
+    def test_A_next_transition_flushes_without_quarantine(self):  # noqa: VACUOUS_ASSERTION — rows appended > 0 and durable == RAM are unconditional positives on the same flush
+        room, _before = self.a_meld_then_b_reads()
+        self.as_a()
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)       # READY
+        meld.say(room, "YIELD", "a live chunk after B ran", seat="seat-a")
+        report = {}
+        appended = chat.log_flush(report=report)
+        self.assertEqual(report["quarantined"], {}, report)
+        self.assertGreater(appended, 0)
+        ram = meld._events(meld.lifecycle_path(room))[0]
+        durable = meld._events(meld.lifecycle_path(room, True))[0]
+        self.assertEqual(durable, ram, "the live meld did not reach disk whole")
+
+    def test_B_flush_is_OFF_and_says_why(self):
+        self.a_meld_then_b_reads()
+        report = {}
+        self.assertEqual(chat.log_flush(report=report), -1)
+        self.assertIn("isolated chat dir", report["isolated"])
+        state, reason = chat.flush_outcome(-1, report)
+        self.assertEqual(state, "off")
+        self.assertIn("never write it", reason)
+        with self.assertRaises(meld.LifecycleError):
+            meld.flush_lifecycle()
+        from helm import chatdebris
+        out, why = chatdebris.retire_room(
+            next(r for r in chat.list_rooms() if r.startswith("meld-")),
+            idle_days=0)
+        self.assertIsNone(out)
+        self.assertIn("isolated chat dir", why)
+
+    def test_the_refusal_names_only_the_one_split_pairing(self):
+        """The four arms of chat.journal_write_refusal. Only an isolated chat
+        dir over the DEFAULT home is refused; a sandbox (both redirected) and
+        an explicit spelling of the production bus both write."""
+        self.as_a()
+        self.assertIsNone(chat.journal_write_refusal())          # the live bus
+        self.as_b()
+        self.assertIn(self.isolated, chat.journal_write_refusal())
+        os.environ["HELM_CHAT_DIR"] = self.bus                   # spelled out
+        self.assertIsNone(chat.journal_write_refusal())
+        os.environ["HELM_CHAT_DIR"] = self.isolated
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "sandbox-home")
+        self.assertIsNone(chat.journal_write_refusal())          # a sandbox
+
+
 class FlushWatchdogTest(RestoreBase):
     """A REPEATEDLY-FAILING DURABILITY TIMER MUST BE LOUD.
 
@@ -1119,9 +1350,12 @@ class FlushWatchdogTest(RestoreBase):
         d = chat.journal_dir()
         if not os.path.isdir(d):
             return ""
-        return "\n".join(
-            open(os.path.join(d, n), encoding="utf-8").read()
-            for n in sorted(os.listdir(d)) if n.startswith("chat-"))
+        texts = []
+        for n in sorted(os.listdir(d)):
+            if n.startswith("chat-"):
+                with open(os.path.join(d, n), encoding="utf-8") as fh:
+                    texts.append(fh.read())
+        return "\n".join(texts)
 
     # -- the cursor age ----------------------------------------------------
     def test_the_cursor_age_is_READABLE_and_a_quiet_fleet_does_not_cry_wolf(self):

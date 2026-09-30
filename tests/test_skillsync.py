@@ -576,3 +576,92 @@ class LinkCanonicalDegradedTest(unittest.TestCase):
         self.assertEqual(res.action, "unavailable")
         self.assertIn("authored layer unreadable", res.detail)
 
+
+
+class LinkInstructionsTest(unittest.TestCase):
+    """task/3089: a seat gets the host's global instructions through
+    `rules/global-instructions.md` -> the default home's CLAUDE.md, the
+    skills-hub shape one file wide. Every refusal plants its violating state
+    and checks the primitive refuses it; the plain link beside it is the
+    positive control that the same call still links."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-instructions-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.src = os.path.join(self.tmp, "owner", "CLAUDE.md")
+        os.makedirs(os.path.dirname(self.src))
+        with open(self.src, "w") as f:
+            f.write("# global rules\n")
+        self.cdir = os.path.join(self.tmp, "seat", "claude")
+        os.makedirs(self.cdir)
+        self.link = os.path.join(self.cdir, "rules", "global-instructions.md")
+        env = mock.patch.dict(os.environ, {"HELM_INSTRUCTIONS_CANONICAL": self.src})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_absent_links_then_is_idempotent(self):
+        dry = skillsync.link_instructions(self.cdir, apply=False)
+        self.assertEqual(dry.action, "would-link")
+        self.assertFalse(os.path.lexists(self.link))          # a plan writes nothing
+        self.assertEqual(skillsync.link_instructions(self.cdir).action, "linked")
+        self.assertEqual(os.readlink(self.link), os.path.realpath(self.src))
+        with open(self.link) as f:
+            self.assertEqual(f.read(), "# global rules\n")    # an edit there is seen here
+        self.assertEqual(skillsync.link_instructions(self.cdir).action, "ok")
+
+    def test_a_link_elsewhere_under_helms_name_is_normalized(self):  # noqa: VACUOUS_ASSERTION — the readlink equality after relink is the unconditional positive on the same link
+        os.makedirs(os.path.dirname(self.link))
+        os.symlink(os.path.join(self.tmp, "stale.md"), self.link)
+        self.assertEqual(skillsync.link_instructions(self.cdir, apply=False).action,
+                         "would-relink")
+        self.assertEqual(skillsync.link_instructions(self.cdir).action, "relinked")
+        self.assertEqual(os.readlink(self.link), os.path.realpath(self.src))
+
+    def test_a_real_file_at_the_links_name_is_kept_and_surfaced(self):
+        os.makedirs(os.path.dirname(self.link))
+        with open(self.link, "w") as f:
+            f.write("mine\n")
+        res = skillsync.link_instructions(self.cdir)
+        self.assertEqual(res.action, "real")
+        self.assertFalse(os.path.islink(self.link))
+        with open(self.link) as f:
+            self.assertEqual(f.read(), "mine\n")
+
+    def test_a_rules_entry_that_is_not_a_real_dir_is_left_alone(self):  # noqa: VACUOUS_ASSERTION — the `blocked` action is the unconditional positive; the empty listing proves nothing was written through the link
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere)
+        os.symlink(elsewhere, os.path.join(self.cdir, "rules"))
+        self.assertEqual(skillsync.link_instructions(self.cdir).action, "blocked")
+        self.assertEqual(os.listdir(elsewhere), [])            # nothing written through it
+
+    def test_the_seats_own_claude_md_is_never_touched(self):
+        own = os.path.join(self.cdir, "CLAUDE.md")
+        with open(own, "wb") as f:
+            f.write(b"# seat rules\r\nkeep\r\n")
+        st = os.stat(own)
+        self.assertEqual(skillsync.claude_md_state(self.cdir), "real")
+        self.assertEqual(skillsync.link_instructions(self.cdir).action, "linked")
+        with open(own, "rb") as f:
+            self.assertEqual(f.read(), b"# seat rules\r\nkeep\r\n")
+        self.assertEqual((os.stat(own).st_ino, os.stat(own).st_mtime_ns),
+                         (st.st_ino, st.st_mtime_ns))
+        self.assertEqual(skillsync.claude_md_state(self.cdir), "real")
+
+    def test_the_sources_quiet_and_loud_answers(self):  # noqa: VACUOUS_ASSERTION — the `unavailable` answer with MISSING and the resolved default path are unconditional positives beside the quiet answers
+        with mock.patch.dict(os.environ, {"HELM_INSTRUCTIONS_CANONICAL": "off"}):
+            self.assertEqual(skillsync.link_instructions(self.cdir).action, "none")
+        gone = os.path.join(self.tmp, "gone.md")
+        with mock.patch.dict(os.environ, {"HELM_INSTRUCTIONS_CANONICAL": gone}):
+            res = skillsync.link_instructions(self.cdir)
+        self.assertEqual(res.action, "unavailable")            # NAMED and missing: loud
+        self.assertIn("MISSING", res.detail)
+        # the DEFAULT source missing is quiet: that home has nothing to share
+        from helm import homes
+        with mock.patch.dict(os.environ, {"HELM_INSTRUCTIONS_CANONICAL": ""}), \
+                mock.patch.dict(homes.DEFAULTS, {"claude": os.path.join(self.tmp, "no-home")}), \
+                mock.patch.object(skillsync.registry, "authored_host", return_value={}):
+            self.assertEqual(skillsync.instructions_canonical(),
+                             (os.path.realpath(os.path.join(self.tmp, "no-home",
+                                                            "CLAUDE.md")), False))
+            self.assertEqual(skillsync.link_instructions(self.cdir).action, "none")
+        self.assertFalse(os.path.lexists(self.link))           # no answer above linked

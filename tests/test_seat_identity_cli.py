@@ -59,8 +59,11 @@ def _source(_name="seats"):
     names = sorted(f for f in os.listdir(d)
                    if f == "seats.py" or f.startswith("seats_"))
     assert len(names) >= 3, "seats package scan found almost nothing: %s" % names
-    return "".join(open(os.path.join(d, f), encoding="utf-8").read()
-                   for f in names)
+    texts = []
+    for f in names:
+        with open(os.path.join(d, f), encoding="utf-8") as fh:
+            texts.append(fh.read())
+    return "".join(texts)
 
 
 class _NoChatName(unittest.TestCase):

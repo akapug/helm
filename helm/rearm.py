@@ -12,17 +12,19 @@ minutes after a land batch (premise land-to-live-compression-owner-directive).
     every `helm chat wait` waiter (owning seat + start, STALE if it started
     before main's current HEAD commit time), the web-service unit (active +
     since, stale iff it predates HEAD), and every OTHER long-lived
-    helm process predating HEAD as an ADVISORY respawn candidate. Mutates
-    nothing.
+    helm process predating HEAD as an ADVISORY respawn candidate, and every
+    installed helm unit its module's current template no longer renders,
+    with the command that re-installs it (task/3405). Mutates nothing.
   * --apply: (1) FIRST post ONE owned ambient ANNOUNCE row to #main (ambient =
     wakes nobody) saying the pass is cycling waiters and why; (2) SIGTERM ONLY
     the stale waiters — each owning agent gets its Monitor-exit notification
     and re-arms on new code at its own turn boundary (the OWNED version of the
     unowned mass-SIGTERM beacon-killer incident class); (3) restart the web
     unit iff it is active AND stale; (4) NEVER touch proxies/daemons/seats —
-    advisory only. Idempotent by convergence: staleness is recomputed from live
-    state each run, so once the signaled waiters exit a second --apply finds
-    nothing stale (a re-signal of a still-dying pid is a harmless no-op).
+    advisory only — and never re-install a drifted unit. Idempotent by
+    convergence: staleness is recomputed from live state each run, so once the
+    signaled waiters exit a second --apply finds nothing stale (a re-signal of
+    a still-dying pid is a harmless no-op).
 
 SAFETY — failed-probe-is-not-absence: only a process whose cmdline argv EXACTLY
 matches the waiter shape (a `helm` executable token immediately followed by
@@ -363,6 +365,28 @@ def scan():
             "web": web, "advisory": advisory}
 
 
+def _unit_drift():
+    """Every installed helm unit its module's current template no longer
+    renders (DRIFTED), or that could not be compared (UNKNOWN), from
+    timerhealth's unit-drift census (task/3405).
+
+    A LAND THAT CHANGES A UNIT TEMPLATE IS A POST-LAND ACTION too: the new
+    text reaches this box only when somebody re-installs the unit, which is
+    the same land-to-live gap the waiters have. READ-ONLY, and --apply never
+    re-installs: a unit is the operator's to re-install, so each row names the
+    command and rearm's writes stay the waiters and the web unit."""
+    from . import timerhealth
+    try:
+        rows = timerhealth.drift()
+    except Exception as exc:              # noqa: BLE001 — reported as a row
+        return [{"module": "?", "unit": "?", "path": None,
+                 "verdict": timerhealth.UNKNOWN,
+                 "detail": "the unit-drift census raised %s"
+                           % type(exc).__name__, "command": ""}]
+    return [r for r in rows
+            if r["verdict"] in (timerhealth.DRIFTED, timerhealth.UNKNOWN)]
+
+
 def _announce_text(head_sha, seats, web_restart):
     bits = []
     if seats:
@@ -658,9 +682,26 @@ def _print_report(plan, actions, applying):
               "whatever owns it (a proxy: `helm seat down <family[-N]> && "
               "helm seat up <family[-N]>`; a daemon: its own restart). "
               "A land never self-propagates to a running proxy")
+    units = plan.get("units")
+    if units:
+        print("  units (installed helm units their module's current template "
+              "no longer renders — re-install each; rearm never rewrites a "
+              "unit):")
+        for u in units:
+            print("    %s %s — %s%s" % (
+                u["verdict"].upper(), u["unit"], u["detail"],
+                " — `%s`" % u["command"] if u["command"] else ""))
+    elif units is not None:
+        print("  units: every installed helm unit matches its module's "
+              "current template")
     n_stale = sum(1 for w in waiters if w["status"] == "STALE")
     tail = "%d waiter%s stale, web %s, %d advisory" % (
         n_stale, "s"[:n_stale != 1], _web_word(web), len(adv))
+    if units is not None:
+        from . import timerhealth
+        n_drift = sum(1 for u in units
+                      if u["verdict"] == timerhealth.DRIFTED)
+        tail += ", %d unit%s drifted" % (n_drift, "s"[:n_drift != 1])
     if applying and actions:
         if actions["announced"]:
             print("  announced to #%s (ambient — woke nobody)" % ANNOUNCE_ROOM)
@@ -685,6 +726,7 @@ def cmd_rearm(args):
         return 2
     applying = "--apply" in args
     plan = scan()
+    plan["units"] = _unit_drift()
     actions = apply(plan) if applying else None
     if "--json" in args:
         out = dict(plan)

@@ -20,6 +20,7 @@ ledger eagerly, and `dispatches` binds these names at the END of its own
 module body, after every name they need exists.
 """
 import json
+import re
 import sys
 import time
 
@@ -27,6 +28,144 @@ from . import dispatches
 
 
 _IMPERFECT_FLAG = "--imperfect"
+
+#: Words a seat types for "show me this row", each answered exactly as
+#: `triage <id>` (task/3382: 78 calls to show/read/get/status/brief on the
+#: local seats, 47 of them `show`, each answered with the whole usage).
+TRIAGE_ALIASES = ("show", "read", "get", "status", "brief")
+
+
+def synopses(usage=None):
+    """{subverb: its ONE usage line}, cut from `dispatches.USAGE` itself so
+    the two cannot drift: the clauses split at a top-level ` | `, and every
+    parenthesised explanation is dropped. The triage aliases each get the
+    line `show` has, under their own name.
+
+    WHY (task/3382): an unknown subverb, and a known one given bad arguments,
+    printed all 8,645 characters of USAGE; 7 of the 11 episodes measured on
+    the local seats never recovered from it."""
+    text = (usage or dispatches.USAGE).split("usage: helm dispatch ", 1)[-1]
+    clauses, buf, depth, i = [], [], 0, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and text.startswith(" | ", i):
+            clauses.append("".join(buf))
+            buf = []
+            i += 3
+            continue
+        elif depth == 0:
+            buf.append(ch)
+        i += 1
+    clauses.append("".join(buf))
+    out = {}
+    for clause in clauses:
+        words = " ".join(clause.split())
+        if words:
+            out.setdefault(words.split()[0], "usage: helm dispatch " + words)
+    base = out.get("show")
+    for alias in TRIAGE_ALIASES if base else ():
+        out[alias] = base.replace("dispatch show ", "dispatch %s " % alias,
+                                  1) + "  (the same as triage <id>)"
+    return out
+
+
+def synopsis(verb):
+    """One subverb's usage line, or the whole USAGE for a name it lacks."""
+    return synopses().get(verb) or dispatches.USAGE
+
+
+def _typed_tips(rid, tip, patch):
+    """(reviewed, patch, rc): the two commit ids a verdict binds, each as the
+    FULL id, or rc when one cannot be.
+
+    A FULL-LENGTH TOKEN PASSES THROUGH UNTOUCHED, so `mark_verdict` sees the
+    same argument it saw before this existed and every check it runs on what
+    is bound (the full-id shape, the stale-tip comparison, the patch
+    ancestry) decides exactly as before. Only a SHORTER token is new: it
+    resolves in the row's repository through `_resolve_tip`, the resolver
+    the send door binds its tip with, which takes exactly one object and
+    peels it to a commit; a ref name is never a prefix. The resolved id is
+    handed on, so the ledger never stores a prefix.
+
+    MEASURED (task/3382): `verdict` demanded 40 hex while every listing
+    prints 12, and the local seats padded the 12 out; odd-length tokens
+    named nothing 51-69 % of the time."""
+    wanted = [t for t in (tip, patch) if t is not None
+              and not dispatches._FULL_TIP.fullmatch(str(t).strip().lower())]
+    if not wanted:
+        return tip, patch, None
+    current, unavailable = dispatches.snapshot()
+    if unavailable:
+        print("helm dispatch verdict: the ledger is unavailable, so a commit "
+              "prefix cannot be resolved (%s); type the full commit id"
+              % unavailable, file=sys.stderr)
+        return None, None, 1
+    # DEFAULT-CLOSED, as the writer's own resolution is: a row the writer
+    # would refuse is refused here in the writer's words, before any git.
+    row, why = dispatches._resolve_row(current, rid)
+    if why:
+        print("helm dispatch: " + why, file=sys.stderr)
+        return None, None, 1
+    repo = row.get("repo_root") or row.get("repo_id")
+    out = []
+    for name, token in (("the reviewed tip", tip), ("--patch-tip", patch)):
+        typed = None if token is None else str(token).strip().lower()
+        if typed is None or dispatches._FULL_TIP.fullmatch(typed):
+            out.append(token)
+            continue
+        full = None
+        if repo and re.fullmatch(r"[0-9a-f]{7,63}", typed):
+            full = dispatches._resolve_tip(repo, typed,
+                                           infer_sha_branch=False)[0]
+        if not full:
+            print("helm dispatch verdict: %s %s is not one commit's id or "
+                  "unique prefix (at least 7 hex) in %s%s" % (
+                      name, token, repo or "a repository this row names",
+                      dispatches._typedids().tip_hint(repo, typed, known=(
+                          (row.get("tip"),) if name == "the reviewed tip"
+                          else ()))),
+                  file=sys.stderr)
+            return None, None, 1
+        out.append(full)
+    return out[0], out[1], None
+
+
+def _unnamed_tip_hint(rid, tip):
+    """The candidate a refused FULL-LENGTH tip could have meant, or ''.
+
+    Asked only after `mark_verdict` refused, and only of a token that is not
+    the row's own tip, so an accepted verdict never pays for it. A padded
+    12-hex prefix is a full-length token that names no object: the refusal
+    stays the writer's, and this adds the commit its first 12 name."""
+    typed = str(tip or "").strip().lower()
+    if not dispatches._FULL_TIP.fullmatch(typed):
+        return ""
+    current, unavailable = dispatches.snapshot()
+    row, why = (None, unavailable) if unavailable else \
+        dispatches._resolve_row(current, rid)
+    if why or typed == row.get("tip"):
+        return ""
+    return dispatches._typedids().tip_hint(
+        row.get("repo_root") or row.get("repo_id"), typed,
+        known=(row.get("tip"),))
+
+
+def _unknown_subverb(verb):
+    """rc 2 and at most two lines: the subverbs, and the closest one's usage.
+    The whole grammar stays on `helm dispatch --help`."""
+    import difflib
+    lines = synopses()
+    print("helm dispatch: unknown subverb %r (subverbs: %s; `helm dispatch "
+          "--help` prints the full usage)" % (verb, ", ".join(lines)),
+          file=sys.stderr)
+    near = difflib.get_close_matches(str(verb), list(lines), n=1)
+    if near:
+        print("closest: " + lines[near[0]], file=sys.stderr)
+    return 2
 
 
 def patch_note(row):
@@ -291,11 +430,12 @@ def _hold_holder_nudge(row):
     it is how a notifier earns the reputation that makes the next one
     ignored.
 
-    IT IS CALLED FROM THE VERB, NOT FROM `mark_hold`, which is the shape
+    IT IS CALLED FROM THE VERBS, NOT FROM `mark_hold`, which is the shape
     `_verdict_land_nudge` already uses and for the reason its own comment
-    gives: `mark_hold` has exactly ONE non-test caller in this tree, so the
-    verb covers every hold helm records, and the ledger writer stays a
-    ledger writer. A delivery inside the write would put a chat transport
+    gives: `mark_hold`'s non-test callers are the hold verb and a
+    fresh-context clean read's verdict (task/3658), both here, so the verbs
+    cover every hold helm records, and the ledger writer stays a ledger
+    writer. A delivery inside the write would put a chat transport
     between a lock and its release — the trap that surface has already
     measured once.
 
@@ -310,12 +450,40 @@ def _hold_holder_nudge(row):
     # that a row is theirs goes to a second tool to find out why; the one
     # thing this hold means is that an approve needs a whole-suite token
     # this reviewer cannot mint, so the sentence says that.
+    #
+    # AND THE NEXT MOVE IS ONE THE HOLDER CAN MAKE (task/3053). "Gate it,
+    # then the approve can bind" names a move nobody is positioned to make:
+    # the reviewer is not woken after the gate, and the integrator is often
+    # the lane's author. The land closes the row instead, on the hold plus
+    # the gate, through the verb named here — and the gate is stated as what
+    # the door checks: a verified whole-suite receipt on a commit containing
+    # the tip, not necessarily the one the land pushed.
+    rid12 = row["id"][:12]
+    from . import landreq                    # DEFERRED — landreq imports us.
+    rehold = landreq.source_clean_rehold(row)
+    if rehold:
+        # A HOLD ITS HOLDER RUNG REFUSES IS THE REVIEWER'S (task/3053: NO
+        # HOLDER in the read's finding f; a stranger's or a lane author's
+        # stamp in the author's ruling 3, round 4). It reaches here only
+        # through an idempotent re-run of a hold written before the door bound
+        # its holder, and no land can close it: the one move is the re-hold,
+        # named in full by the one predicate, and the nudge goes to the seat
+        # that owes it — never a close that refuses.
+        return dispatches._nudge(
+            row.get("recipient") or dispatches._default_lander(),
+            "SOURCE-CLEAN HOLD on %s (%s): no land can close it on your clean "
+            "read — %s." % (rid12, lane, rehold["why"]),
+            "%s: SOURCE-CLEAN at %s — no land can close this hold; re-hold it"
+            % (lane, str(tip)[:12]))
     return dispatches._nudge(
         dispatches._default_lander(),
         "SOURCE-CLEAN HOLD on %s (%s) — @%s read the delta and found nothing, "
         "and cannot mint an approve because one binds a whole-suite token only "
-        "your land gate produces. The next move is YOURS: gate %s, then the "
-        "approve can bind." % (row["id"][:12], lane, reviewer, str(tip)[:12]),
+        "your land gate produces. The next move is YOURS: land %s under a "
+        "whole-suite gate, then `helm lr foldcheck <head> --gate gate:<id> "
+        "--apply`, naming a verified whole-suite receipt on a commit "
+        "containing the tip, closes this row (--reason source-clean-landed) — "
+        "no approve is needed." % (rid12, lane, reviewer, str(tip)[:12]),
         "%s: SOURCE-CLEAN at %s — review complete, awaiting your whole-suite "
         "gate" % (lane, str(tip)[:12]))
 
@@ -381,15 +549,44 @@ def retip_argv_ok(argv):
     return ok, pos, opts, perr
 
 
-def _parse_send(rest, names):
+def send_names(verb):
+    """The valued options `add` and `send` take. ONE SET, read by the door
+    and by the corrected send line (task/3382 F3), so the two can never
+    disagree about which word of an argv is an option."""
+    names = {"--ref", "--note", "--deadline", "--repo", "--kind",
+             "--supersedes"}
+    # THE TASK A NEW CHAIN SERVES (task/3643): recorded on its first row.
+    names.add("--task")
+    names.add("--posture-na")
+    names.add("--read-only-because")
+    names.add("--no-owner-surface-because")
+    # THE REVIEW DOOR'S FLAGS (helm/review_door.py): a recorded reason to
+    # skip the meld, the findings the author disputes, and the design
+    # meld a first irreversible build row cites.
+    names.update(("--async-because", "--disputes", "--meld"))
+    # THE REPAIR WORK `--force` ADMITS past a broken seat (task/3546,
+    # helm/seat_hold.py): recorded beside the seat's hold.
+    names.add("--reason")
+    # THE PATCHES A SUPERSEDING REF DECLINES BY NAME, and the recorded reason
+    # (task/3288, dispatches._undelivered_patch).
+    names.add(dispatches.DECLINE_PATCH_FLAG)
+    if verb == "send":
+        names.add("--key")
+    return names
+
+
+def _parse_send(rest, names=None, lenient=False):
     """Parse send flags without consuming an exact ``--force`` in prose.
 
     Value options keep `_parse`'s historical anywhere-in-argv grammar, and
     unknown options still refuse. Only ``--force`` is ambiguous with message
     prose: it becomes authority when it belongs to the complete trailing option
     block, while an earlier occurrence stays positional text. ``--new-work``
-    keeps its pre-existing bare-flag behaviour.
+    keeps its pre-existing bare-flag behaviour. `lenient` is the corrected
+    line's reading of a refused send (`dispatches._parse`), through this same
+    partition: never a second grammar.
     """
+    names = send_names("send") if names is None else names
     bare = {"--new-work", "--force"}
     cut = len(rest)
     while cut:
@@ -407,7 +604,8 @@ def _parse_send(rest, names):
         flags.add("--force")
     parsed = [a for i, a in enumerate(rest)
               if a != "--new-work" and i not in force_at]
-    pos, opts, err = dispatches._parse(parsed, names, positional_flags=("--force",))
+    pos, opts, err = dispatches._parse(parsed, names, positional_flags=("--force",),
+                                       lenient=lenient)
     return pos, opts, flags, err
 
 
@@ -422,6 +620,197 @@ def _findings_lines(row):
     except Exception as exc:                          # noqa: BLE001
         return ["findings pass: the note could not be rendered (%s)"
                 % type(exc).__name__]
+
+
+def _review_door(verb, kind, target, pos, opts):
+    """The review door's plan for this send/add (helm/review_door.py).
+
+    FAIL-OPEN except where the door itself refuses (T0): an unreadable ledger,
+    an unresolvable tip or an unknown author opens no meld and blocks
+    nothing, because the row is the universal transport."""
+    from . import review_door
+    empty = {"trigger": None, "action": None, "lines": [], "brief": None,
+             "row": {}, "invite": None, "refuse": None,
+             "pair": {"room": None, "topic": None}}
+    try:
+        sender, why = dispatches._acting_author()
+        info = dispatches._repo_info(opts.get("--repo"))
+        if why or not info:
+            return empty
+        tip = (dispatches._resolve_tip(info["repo"], opts["--ref"])
+               or ("", None))[0] or ""
+        disputes = [d.strip() for d in
+                    str(opts.get("--disputes") or "").split(";") if d.strip()]
+        # A FIRST ROW'S PAIR MELD CAN BE NAMED BEFORE THE ROW EXISTS only
+        # when its lane or note names the task: the chain root it would
+        # otherwise be keyed on is this row's own id, minted at the write.
+        hint = None
+        if not opts.get("--supersedes"):
+            room, key = review_door.pair_room(
+                {"lane": pos[1], "note": opts.get("--note"),
+                 "repo_id": info["repo_id"]})
+            hint = room if str(key or "").startswith("task/") else None
+        return review_door.plan(
+            kind, sender, target, pos[1], tip,
+            supersedes=opts.get("--supersedes"),
+            body=" ".join(pos[2:]) if verb == "send" else opts.get("--note"),
+            async_because=opts.get("--async-because"), disputes=disputes,
+            cited_meld=opts.get("--meld"), beacon=review_door.live_beacon,
+            pair_room_hint=hint)
+    except Exception as exc:                          # noqa: BLE001
+        empty["lines"].append("helm dispatch: the review door could not "
+                              "read this chain (%s); no meld was opened"
+                              % type(exc).__name__)
+        return empty
+
+
+def _record_forced(target, row, forced, reason):
+    """Record a `--force` past a broken seat's facts once its row exists
+    (task/3546), and say so. A log that will not take the record is said
+    loudly: the row stands, its admission is unrecorded."""
+    if not forced:
+        return
+    from . import seat_hold
+    _event, err = seat_hold.record_forced(target, row["id"], forced, reason)
+    print("helm dispatch: FORCED past %s on @%s for the repair work: %s — %s"
+          % ("+".join(f["fact"] for f in forced), target, reason,
+             "recorded (`helm seat hold` lists it)" if not err
+             else "NOT RECORDED: " + err), file=sys.stderr)
+
+
+def _door_after(door, row):
+    """After the row exists: say what the door decided, and name the pair
+    meld round the write opened. The row is already written, so nothing here
+    can undo it; a round that could not open leaves the row (which carries
+    the BAR when T2 fired) as the conversation.
+
+    T2 OPENS NO ROOM OF ITS OWN any more: the bar is the topic of the round
+    this send opened in the chain's pair meld (P2), so one chain has one
+    room whatever the door decides."""
+    for line in door["lines"]:
+        print(line)
+    pair = (row or {}).get(dispatches._PAIR_MELD) or {}
+    for line in pair.get("lines") or ():
+        print("helm dispatch: " + line)
+    if not door["invite"]:
+        return
+    peer, _topic = door["invite"]
+    if not pair.get("room"):
+        print("helm dispatch: T2 could not open the meld (%s); row %s carries "
+              "the BAR and is the conversation"
+              % (pair.get("error") or "no pair meld round", row["id"][:12]))
+        return
+    print("helm dispatch: T2 — round %s of chain %s: MELD OPENED %s with @%s "
+          "to agree the BAR, as this round of the task's pair meld (the row "
+          "is the async fallback)."
+          % (door["row"]["meld_door"].get("rounds"),
+             door["row"]["meld_door"].get("chain"), pair["room"], peer))
+
+
+def _cmd_melds(rest):
+    """`helm dispatch melds [--hours N] [--json]` — the review door's two
+    falsifiers, measured read-only (docs/MELD_REVIEW_DOOR.md)."""
+    import json as _json
+    from . import review_door
+    hours = 168
+    flags = set()
+    at = 0
+    while at < len(rest):
+        flag = rest[at]
+        if flag in flags or flag not in ("--hours", "--json"):
+            print("helm dispatch melds: unknown or repeated argument %s" % flag,
+                  file=sys.stderr)
+            return 2
+        flags.add(flag)
+        if flag == "--hours":
+            try:
+                hours = int(rest[at + 1])
+            except (IndexError, ValueError):
+                print("helm dispatch melds: --hours wants a positive whole number",
+                      file=sys.stderr)
+                return 2
+            if hours < 1:
+                print("helm dispatch melds: --hours wants a positive whole number",
+                      file=sys.stderr)
+                return 2
+            at += 1
+        at += 1
+    got = review_door.census(hours=hours)
+    if "--json" in flags:
+        print(_json.dumps(got, indent=2, sort_keys=True))
+        return 0 if "error" not in got else 1
+    if "error" in got:
+        print("helm dispatch melds: " + got["error"], file=sys.stderr)
+        return 1
+    t2, t1, retro = got["t2"], got["t1"], got["retro"]
+    print("review door falsifiers, last %dh:" % got["window_h"])
+    print("  (a) T2 join rate within %ds: %s/%s measured (%d door-opened "
+          "rows, %d rooms unreadable) — %s" % (
+              t2["entry_window_s"], t2["joined_in_window"],
+              t2["rooms_measured"], t2["opened_rows"], t2["unreadable"],
+              t2["reading"]))
+    print("  (b) T1 after an all-mechanical patch FIX: %d of %d firings — %s"
+          % (t1["on_all_mechanical"], t1["fired"], t1["reading"]))
+    prior = got["prior"]
+    print("  prior for (a): %s of %s melds convened in the window had the "
+          "reader join within the entry window (%d unreadable)" % (
+              prior["joined_in_window"], prior["convened"],
+              prior["unreadable"]))
+    print("  replay: %d continuing review sends; T1 silent after %d "
+          "all-mechanical FIX, would offer after %d design-class FIX, %d "
+          "continued no FIX" % (
+              retro["continuing_sends"],
+              retro["after_all_mechanical_fix_t1_silent"],
+              retro["after_design_class_fix_t1_offers"],
+              retro["after_no_fix"]))
+    pair = got["pair"]
+    cost = pair["cost"]
+    print("pair meld, last %dh (docs/MELD_REVIEW_DOOR.md, The pair meld):"
+          % got["window_h"])
+    print("  (a) tasks whose pair meld reached AGREED on a row: %d of %d "
+          "(bar %d%% over %d tasks) — %s; pairings %s" % (
+              pair["agreed"], pair["tasks"], int(pair["floor"] * 100),
+              pair["bar_tasks"], pair["reading"],
+              ", ".join("%s=%d" % kv for kv in sorted(pair["pairings"].items()))
+              or "none"))
+    keys = pair["keys"]
+    print("  keys: %d by task, %d by the chain-root fallback (%d named no "
+          "task, %d named two or more): the fallback count is what the "
+          "task/N parse missed" % (
+              keys["task"], keys["chain_fallback"], keys["no_task"],
+              keys["two_tasks"]))
+    print("  (g) bytes per converged chain: pair meld median %s over %d; rows "
+          "alone median %s over %d" % (
+              cost["pair_median_bytes"], cost["pair_converged"],
+              cost["row_only_median_bytes"], cost["row_only_converged"]))
+    trial = got["mode_ab"]
+    print("review mode A/B, last %dh: %d enrolled chain(s)" % (
+        got["window_h"], len(trial["chains"])))
+    for row in trial["chains"]:
+        elapsed = ("%ds" % row["send_to_hold_s"]
+                   if isinstance(row["send_to_hold_s"], int) else "UNKNOWN")
+        print("  %s %s: enrolled round %s; %s active read round(s); %s cure "
+              "cycle(s); first send->hold %s; reviewer tokens %s; author "
+              "tokens %s" % (
+                  row["chain"][:12], row["mode"], row["enrollment_round"],
+                  row["active_review_rounds"], row["cure_cycles"], elapsed,
+                  row["reviewer_tokens"], row["author_tokens"]))
+    if not trial["chains"]:
+        print("  no PATCH/MELD-DIFF chain enrolled in this window")
+    print("  tokens: " + trial["token_reading"])
+    return 0
+
+
+def _meld_said_back(row):
+    """One line naming the meld a verdict or hold recorded, and whether it
+    switches the spiral rung off (only an AGREED meld both sides spoke in)."""
+    if not row.get("meld_room"):
+        return
+    outcome = str(row.get("meld_outcome") or "?").upper()
+    print("helm dispatch: meld %s — %s%s" % (
+        row["meld_room"], outcome,
+        " (the spiral rung reads this chain as melded)" if outcome == "AGREED"
+        else " (not agreed: the spiral rung still counts this chain)"))
 
 
 def _chain_note(row):
@@ -588,23 +977,67 @@ def _cmd_retract(rest):
     return 0
 
 
+def _uncarried_line(outcome, would=False):
+    """The sentence EVERY cancel prints: what it leaves carried by nothing.
+
+    A ZERO IS PRINTED TOO, because the line is the answer to a question the
+    operator could not otherwise ask, and a silent cancel read the same
+    whether it stranded nothing or seven rounds (task/3357)."""
+    opened = list(outcome.get("uncarried_open") or ())
+    fixes = list(outcome.get("uncarried_fix") or ())
+    chained = bool(outcome.get("chained"))
+
+    def count(ids, noun, tail=""):
+        name = noun if len(ids) == 1 else noun + "s"
+        if not ids:
+            return "0 %s" % name
+        return "%d %s (%s%s)" % (len(ids), name,
+                                 ", ".join(i[:12] for i in ids), tail)
+
+    line = "this cancel %s %s and %s" % (
+        "would un-carry" if would else "un-carries",
+        count(opened, "open round", (" — would be cancelled by --chain"
+                                     if would else " — cancelled by --chain")
+              if chained else ""), count(fixes, "FIX verdict"))
+    if opened and not chained:
+        if would:
+            line += (". Nothing would carry those rounds then, so idle-dispatch "
+                     "would read each STRANDED and nag its sender: re-run with "
+                     "`--chain` and without --dry-run to cancel them too, with "
+                     "this reason")
+        else:
+            line += (". Nothing carries those rounds now, so idle-dispatch "
+                     "reads each STRANDED and nags its sender: `--chain` also "
+                     "cancels them with this reason, and re-running this cancel "
+                     "with it does that now")
+    if fixes:
+        line += ((". `helm owed` would bill each FIX again" if would else
+                  ". `helm owed` bills each FIX again")
+                 + "; a FIX is answered by its landed cure or a successor "
+                 "dispatch (--supersedes), never by a cancel")
+    return line + "."
+
+
 def _cmd_dispatch(args):
     args = list(args or [])
     if not args or args[0] in ("-h", "--help"):
         print(dispatches.USAGE, file=sys.stderr)
         return 2
     verb, rest = args[0], args[1:]
+    if verb in TRIAGE_ALIASES:
+        # A ROW, NAMED: the bulk re-measure behind a bare `triage` is not
+        # what a seat typing `show` asked for, so an alias with no id is a
+        # usage error rather than the whole board.
+        if not [a for a in rest if not a.startswith("--")]:
+            print(synopsis(verb), file=sys.stderr)
+            return 2
+        verb = "triage"
     if verb == "mix":
         return dispatches.cmd_mix(rest)
     if verb == "collisions":
         return _collisions(rest)
     if verb in ("add", "send"):
-        names = {"--ref", "--note", "--deadline", "--repo", "--kind",
-                 "--supersedes"}
-        names.add("--posture-na")
-        names.add("--read-only-because")
-        if verb == "send":
-            names.add("--key")
+        names = send_names(verb)
         # `send` owns a prose tail. An exact `--force` inside that prose must
         # not silently become authority to mint a fork, so only its complete
         # trailing option block is parsed as flags. `add` has no prose and can
@@ -663,14 +1096,30 @@ def _cmd_dispatch(args):
         # byte is ready the producer exists, and a bounded read would truncate
         # a body being written slowly. The window guards ENTRY to the read, not
         # the read itself.
-        if verb == "send" and not err and pos and len(pos) == 2 \
-                and not sys.stdin.isatty() \
-                and dispatches._stdin_has_a_body_fd(sys.stdin):
-            piped = sys.stdin.read().strip()
-            if piped:
-                pos = list(pos) + [piped]
+        if verb == "send" and not err and pos and len(pos) >= 2 \
+                and not sys.stdin.isatty():
+            if len(pos) == 2:
+                if dispatches._stdin_has_a_body_fd(sys.stdin):
+                    piped = sys.stdin.read().strip()
+                    if piped:
+                        pos = list(pos) + [piped]
+            elif dispatches._stdin_has_a_body_fd(sys.stdin, unselectable=False) \
+                    and sys.stdin.read(1):
+                # TWO BODIES, ONE MESSAGE: REFUSE RATHER THAN CHOOSE, the law
+                # chat.resolve_one_body holds (task/3510). A message given AND
+                # a body waiting on stdin means one of them would silently
+                # never leave the caller's shell. One byte is enough to know a
+                # body is there, and only a MEASURED fd is peeked: a stream
+                # with no descriptor is never read, so a message beside it is
+                # sent as before.
+                print("helm dispatch send: REFUSING — both a positional "
+                      "message and piped/heredoc stdin are present, and "
+                      "choosing either silently discards the other. Send ONE "
+                      "body: drop the positional message to use stdin, or "
+                      "close stdin to use the message.", file=sys.stderr)
+                return 2
         if err or len(pos) < (3 if verb == "send" else 2):
-            print("helm dispatch: " + (err or dispatches.USAGE), file=sys.stderr)
+            print("helm dispatch: " + (err or synopsis(verb)), file=sys.stderr)
             return 2
         if not opts.get("--ref"):
             print("helm dispatch: %s requires --ref TIP" % verb, file=sys.stderr)
@@ -742,6 +1191,28 @@ def _cmd_dispatch(args):
         if target_err:
             print("helm dispatch: " + target_err, file=sys.stderr)
             return 1
+        # THE BROKEN-SEAT DOOR'S FORCE LEG (task/3546): the library rung
+        # refuses a held or storming seat; `--force` past it, or past a walled
+        # family, must say which repair work it admits, and is recorded once
+        # the row exists.
+        from . import seat_hold
+        forced, refused = seat_hold.force_leg(target, force, opts.get("--reason"))
+        if refused:
+            print("helm dispatch: " + refused, file=sys.stderr)
+            return 2
+        door = _review_door(verb, kind, target, pos, opts)
+        if door["refuse"]:
+            print(door["refuse"], file=sys.stderr)
+            return 2
+        if door["brief"] and verb == "send":
+            body = " ".join(pos[2:])
+            joined = body + "\n\n" + door["brief"]
+            if len(joined) <= dispatches.MESSAGE_ARG_CAP:
+                pos = list(pos[:2]) + [joined]
+            else:
+                door["lines"].append(
+                    "helm dispatch: the BAR did not fit in this brief; send "
+                    "it to the reader yourself:\n" + door["brief"])
         if verb == "send":
             # THE CANONICAL FROM THE CAPABILITY, never raw argv. The gate
             # proved membership for cap["canonical"]; handing the writer
@@ -757,7 +1228,13 @@ def _cmd_dispatch(args):
                                   force=force,
                                   posture_na=opts.get("--posture-na"),
                                   read_only_because=opts.get(
-                                      "--read-only-because"))
+                                      "--read-only-because"),
+                                  owner_surface_because=opts.get(
+                                      "--no-owner-surface-because"),
+                                  door=door["row"], pair_meld=door["pair"],
+                                  decline_patch=opts.get(
+                                      dispatches.DECLINE_PATCH_FLAG),
+                                  task=opts.get("--task"))
             if row is None:
                 print("helm dispatch: " + why, file=sys.stderr)
                 return _rc(why)
@@ -765,6 +1242,7 @@ def _cmd_dispatch(args):
                 print("helm dispatch: RECIPIENT: " + note, file=sys.stderr)
             for warning in row.get(dispatches._WRITE_WARNINGS, ()):
                 print("helm dispatch: WARNING: " + warning, file=sys.stderr)
+            _record_forced(target, row, forced, opts.get("--reason"))
             if why:
                 print("helm dispatch: " + why, file=sys.stderr)
                 return 1
@@ -842,8 +1320,12 @@ def _cmd_dispatch(args):
             # standing next to and could have cured. One line, always, so the
             # sender reads what they are asking for.
             if kind == "review":
-                print("helm dispatch: REVIEW PROCEDURE: "
-                      + dispatches.REVIEW_READER_FIXES_LINE)
+                procedure = dispatches.REVIEW_MODE_LINES.get(
+                    row.get("review_mode"), dispatches.REVIEW_READER_FIXES_LINE)
+                print("helm dispatch: REVIEW PROCEDURE: " + procedure)
+                if row.get("round_whisper"):
+                    print("helm dispatch: " + row["round_whisper"])
+            _door_after(door, row)
             return 0
         # `kind=kind` — ABSENT HERE UNTIL NOW, and it is the flag's whole point.
         # The parser accepted --kind on `add`, clean_kind VALIDATED it, and this
@@ -858,7 +1340,11 @@ def _cmd_dispatch(args):
             deadline_s=deadline, repo=opts.get("--repo"), kind=kind,
             new_work=new_work, supersedes=opts.get("--supersedes"),
             force=force, _reason=True, posture_na=opts.get("--posture-na"),
-            read_only_because=opts.get("--read-only-because"))
+            read_only_because=opts.get("--read-only-because"),
+            owner_surface_because=opts.get("--no-owner-surface-because"),
+            door=door["row"], pair_meld=door["pair"],
+            decline_patch=opts.get(dispatches.DECLINE_PATCH_FLAG),
+            task=opts.get("--task"))
         if row is None:
             print("helm dispatch: " + (why or "dispatch NOT recorded"),
                   file=sys.stderr)
@@ -867,6 +1353,7 @@ def _cmd_dispatch(args):
             print("helm dispatch: RECIPIENT: " + note, file=sys.stderr)
         for warning in row.get(dispatches._WRITE_WARNINGS, ()):
             print("helm dispatch: WARNING: " + warning, file=sys.stderr)
+        _record_forced(target, row, forced, opts.get("--reason"))
         # SAY THAT NOBODY WAS TOLD. `add` deliberately does not notify — that is
         # its whole difference from `send`, and it is the right primitive for an
         # obligation the recipient already agreed to out of band. But the line
@@ -952,7 +1439,13 @@ def _cmd_dispatch(args):
                          "the roster could not be read"
                          if cap["evidence"] == "read-failed"
                          else "no seat has joined this box yet"))
+        if door["brief"]:
+            door["lines"].append("helm dispatch: `add` carries no brief; "
+                                 "hand the reader the BAR:\n" + door["brief"])
+        _door_after(door, row)
         return 0
+    if verb == "melds":
+        return _cmd_melds(rest)
     if verb == "retract":
         return _cmd_retract(rest)
     if verb == "verdict":
@@ -985,14 +1478,24 @@ def _cmd_dispatch(args):
         # same way. One parse, one cure, because splitting it would leave the
         # older half of the same defect standing.
         flags, tail = dispatches.partition_verdict_flags(rest)
+        # THE TERMINATOR IS HONOURED DOWNSTREAM TOO (task/3382 F4): the
+        # partition consumes a bare `--`, and the free-text tail below then
+        # re-scanned the evidence and refused one starting `-h` or `--x` —
+        # so the escape its refusal teaches could never work, and a corrected
+        # line carrying `-- '-h foo'` refused forever.
+        escaped = rest[2 + len(flags):3 + len(flags)] == ["--"]
         rest = rest[:2] + tail
         # BASIS and POLARITY remain bare flags. The exit question has one
         # deliberately valued arm: a claim that BLOCKS must pay for a named,
         # checkable path rather than one more ceremonial boolean.
         bas, pol, worse, imperfect, unknown = [], [], [], 0, []
         observations = {}
+        declared = set()      # observation fields declared UNKNOWN (lever 6)
+        meld = []             # the meld room this verdict records (A4)
+        design = []           # design findings beside a cure (T1 mixed case)
         patch = []
         no_patch = []
+        diff_handoff = []
         # A MODEL RUN'S READ, recorded by this seat on its behalf (task/2948):
         # one value each, once. mark_verdict owns every rule about them.
         behalf = {}
@@ -1019,20 +1522,24 @@ def _cmd_dispatch(args):
                 imperfect += 1
             elif flag in dispatches._FINDING_FLAGS:
                 key = flag[2:].replace("-", "_")
-                if key in observations or i + 1 >= len(flags) \
+                if key in observations or key in declared \
+                        or i + 1 >= len(flags) \
                         or flags[i + 1].startswith("--"):
                     print("helm dispatch verdict: %s needs one value, once"
                           % flag, file=sys.stderr)
                     return 2
                 value = flags[i + 1]
+                if value.upper() == dispatches.UNKNOWN_OBSERVATION:
+                    declared.add(key)
+                    i += 2
+                    continue
                 if key == "finding_count":
-                    if not value.isascii() or not value.isdecimal() \
-                            or len(value) > 9:
+                    value = dispatches.typed_finding_count(value)
+                    if value is None:
                         print("helm dispatch verdict: finding_count needs a "
                               "non-negative integer (at most 9 digits)",
                               file=sys.stderr)
                         return 2
-                    value = int(value)
                 observations[key] = value
                 i += 1
             elif flag == dispatches._WORSE_THAN_MAIN_FLAG:
@@ -1051,6 +1558,21 @@ def _cmd_dispatch(args):
                     return 2
                 patch.append(flags[i + 1])
                 i += 1
+            elif flag == dispatches._DESIGN_FINDING_FLAG:
+                if i + 1 >= len(flags) or flags[i + 1].startswith("--"):
+                    print("helm dispatch verdict: --design-finding needs the "
+                          "finding, ONE quoted argv token", file=sys.stderr)
+                    return 2
+                design.append(flags[i + 1])
+                i += 1
+            elif flag == dispatches._MELD_FLAG:
+                if i + 1 >= len(flags) or flags[i + 1].startswith("--") \
+                        or meld:
+                    print("helm dispatch verdict: --meld needs the meld ROOM, "
+                          "once", file=sys.stderr)
+                    return 2
+                meld.append(flags[i + 1])
+                i += 1
             elif flag == dispatches._NO_PATCH_BECAUSE_FLAG:
                 if i + 1 >= len(flags) or flags[i + 1].startswith("--") \
                         or no_patch:
@@ -1059,6 +1581,14 @@ def _cmd_dispatch(args):
                           file=sys.stderr)
                     return 2
                 no_patch.append(flags[i + 1])
+                i += 1
+            elif flag == dispatches._DIFF_HANDOFF_FLAG:
+                if i + 1 >= len(flags) or flags[i + 1].startswith("--") \
+                        or diff_handoff:
+                    print("helm dispatch verdict: --diff-handoff needs one "
+                          "exact pair meld ROOM/MSGID, once", file=sys.stderr)
+                    return 2
+                diff_handoff.append(flags[i + 1])
                 i += 1
             else:
                 unknown.append(flag)
@@ -1076,7 +1606,7 @@ def _cmd_dispatch(args):
                   file=sys.stderr)
             return 2
         if len(rest) < 3:
-            print(dispatches.USAGE, file=sys.stderr)
+            print(synopsis("verdict"), file=sys.stderr)
             return 2
         # A NEW verdict must DECLARE its direction. Omitting the flag used to be
         # legal and recorded UNDECLARED — "the honest state, never an implied
@@ -1197,44 +1727,102 @@ def _cmd_dispatch(args):
                   "and the row records which it was."
                   % (str(rest[1])[:12]), file=sys.stderr)
             return 2
-        note, rc = dispatches.freetext.tail("helm dispatch", "verdict", rest[2:],
+        # THE FIFTH TEACHING REFUSAL (lever 6). A FIX hands the work back,
+        # and whether the next read is converging or spiralling is read off
+        # two typed observations: how many findings, and how they relate to
+        # the previous read's. Optional, they were on 36 of 61 FIX verdicts,
+        # and the rung that tells a spiral from a convergence read every
+        # chain as UNKNOWN. UNKNOWN is still an answer; silence is not. A
+        # model run's ADVISORY read records no observations, so it is not
+        # asked for them.
+        if polarity == "fix" and not behalf:
+            missing = [flag for flag, key in zip(dispatches._FINDING_FLAGS,
+                                                 dispatches._FINDING_FIELDS)
+                       if key not in observations and key not in declared]
+            if missing:
+                print("helm dispatch verdict: A FIX COUNTS WHAT IT FOUND — "
+                      "missing %s.\n"
+                      "  --finding-count N = the findings this read raises\n"
+                      "  --prior-relation new|uncured|regression-of-cure = how "
+                      "the newest findings relate to the previous read's cure "
+                      "(new on the first read of a chain)\n"
+                      "  Either may be the literal UNKNOWN, which is recorded "
+                      "as declared; omitting one is refused, because the "
+                      "spiral rung reads a chain with no counts as UNKNOWN."
+                      % " and ".join(missing), file=sys.stderr)
+                return 2
+            if "finding_count" in declared and "prior_relation" in observations:
+                print("helm dispatch verdict: --prior-relation describes "
+                      "COUNTED findings; with --finding-count UNKNOWN it is "
+                      "UNKNOWN too", file=sys.stderr)
+                return 2
+        note, rc = dispatches.freetext.tail("helm dispatch", "verdict",
+                                 ["--"] * escaped + rest[2:],
                                  "the verdict note")
         if rc is not None:
             return rc
-        row, why = dispatches.mark_verdict(rest[0], rest[1], note or "",
+        reviewed, patch_tip, rc = _typed_tips(rest[0], rest[1],
+                                              patch[0] if patch else None)
+        if rc is not None:
+            return rc
+        row, why = dispatches.mark_verdict(rest[0], reviewed, note or "",
                                 polarity=polarity,
                                 basis=bas[0][2:] if bas else None,
                                 bind_author=True,
                                 worse_than_main_paths=worse,
-                                patch_tip=patch[0] if patch else None,
+                                patch_tip=patch_tip,
                                 imperfect=bool(imperfect),
                                 no_patch_because=no_patch[0] if no_patch
                                 else None,
-                                **behalf, **observations)
+                                diff_handoff=diff_handoff[0] if diff_handoff
+                                else None,
+                                **behalf, **observations,
+                                **({"declared_unknown": tuple(sorted(declared))}
+                                   if declared else {}),
+                                **({"meld_room": meld[0]} if meld else {}),
+                                **({"design_findings": design} if design
+                                   else {}))
         if why:
-            print("helm dispatch: " + why, file=sys.stderr)
+            print("helm dispatch: " + why + _unnamed_tip_hint(rest[0], reviewed),
+                  file=sys.stderr)
             return 1
         # A MODEL RUN'S READ IS ADVISORY (task/2948): said back as what it is,
         # and nothing below it runs, because no verdict was written, no row
-        # closed and nobody is owed a nudge for it.
+        # closed and nobody is owed a nudge for it. Said in the SAME lines
+        # `lr show` and `dispatch triage` print for it (task/3081), so the
+        # seat that recorded it sees exactly what a later reader will.
         if behalf:
+            # ONE RUN IN EITHER SPELLING: a retry spelled agent-<id> is the
+            # read the row already carries, and is said back as that read.
+            run = dispatches._advisory_run_key(behalf.get("reviewer_run"))
             read = next((r for r in reversed(row.get("advisory_reads") or ())
-                         if r.get("reviewer_run") == behalf.get("reviewer_run")),
-                        {})
-            print("helm dispatch: %s — ADVISORY read by model %s (run %s, "
-                  "%s: family %s), recorded by @%s; author model %s (%s)."
-                  % (row["id"], read.get("reviewer_model") or "?",
-                     read.get("reviewer_run") or "?",
-                     read.get("independence") or "?",
-                     read.get("reviewer_family") or "?",
-                     read.get("recorded_by") or "?",
-                     read.get("author_model") or "?",
-                     read.get("author_model_source") or "?"))
-            print("helm dispatch: the row stays OWED: a model run's read "
-                  "discharges nothing until helm verifies the run on disk "
-                  "(task/2966); the integrator reads it for itself.")
+                         if dispatches._advisory_run_key(r.get("reviewer_run"))
+                         == run), None)
+            # A FRESH-CONTEXT CLEAN READ COUNTS (task/3658), so this verb also
+            # records the source-clean hold it carries, through the hold's
+            # own door: one verb makes an author's own fresh subagent's read
+            # land-ready, with no third seat. A refusal leaves the read
+            # recorded and says why nothing is held.
+            held = refused = None
+            if read and read.get("independence") == "fresh-context" \
+                    and read.get("polarity") == "concur" \
+                    and row.get("status") == "open":
+                held, refused = dispatches.mark_hold(
+                    row["id"], "SOURCE-CLEAN: fresh-context run %s read %s "
+                    "clean" % (run, reviewed[:12]), source_clean_tip=reviewed)
+                row = held or row
+            said = dispatches.advisory_read_lines(
+                dict(row, advisory_reads=(read,) if read else ()))
+            for n, line in enumerate(said):
+                print("helm dispatch: %s%s" % ("%s — " % row["id"] if n == 0
+                                               else "", line))
             for line in _findings_lines(row):
                 print("helm dispatch: " + line)
+            if refused:
+                print("helm dispatch: the read is recorded and holds nothing: "
+                      + refused, file=sys.stderr)
+            elif held:
+                _hold_holder_nudge(held)
             return 0
         # THE MARKER IS SAID BACK. A basis nothing renders is a basis nobody
         # mints — the 2.34%-adoption lesson in one line.
@@ -1242,9 +1830,13 @@ def _cmd_dispatch(args):
             row["id"], (row.get("polarity") or "UNDECLARED").upper(),
             (row.get("basis") or "UNMARKED").upper(),
             row["tip"][:12]))
-        print("helm dispatch: findings: %s; prior relation: %s" % (
-            row.get("finding_count", "UNKNOWN"),
-            row.get("prior_relation", "UNKNOWN")))
+        if row.get("pin_warning"):
+            print("helm dispatch: warning: " + row["pin_warning"],
+                  file=sys.stderr)
+        said = row.get(dispatches.DECLARED_UNKNOWN) or ()
+        print("helm dispatch: findings: %s; prior relation: %s" % tuple(
+            row.get(key, "UNKNOWN (declared)" if key in said else "UNKNOWN")
+            for key in dispatches._FINDING_FIELDS))
         print("helm dispatch: exit question: %s" % dispatches.verdict_exit_answer(row))
         # SAID BACK, because a co-author record nothing renders is a co-author
         # record nobody mints — the 2.34%-basis-adoption lesson, applied before
@@ -1260,6 +1852,20 @@ def _cmd_dispatch(args):
         if row.get("no_patch_because"):
             print("helm dispatch: no cure committed, because: %s"
                   % row["no_patch_because"])
+        if dispatches._has_diff_handoff(row):
+            receipt = row["diff_handoff"]
+            print("helm dispatch: exact diff handoff: %s/%s at meld round %s "
+                  "(sha256 %s)" % (receipt["room"], receipt["msg_id"],
+                                   receipt["epoch"], receipt["sha256"]))
+        for finding in row.get("design_findings") or ():
+            print("helm dispatch: design finding (meld, not patch): %s"
+                  % finding)
+        _meld_said_back(row)
+        if row.get("polarity") == "fix":
+            from . import dispatches_announce
+            standing = dispatches_announce.standing_room_line(row)
+            if standing:
+                print("helm dispatch: " + standing)
         print("helm dispatch: gate: %s" % dispatches.gate_state(row))
         print("helm dispatch: attestation: %s" % row.get("announce", "n/a"))
         # THE qwen27 FINDINGS NOTE, said back to the reviewer who just
@@ -1347,9 +1953,11 @@ def _cmd_dispatch(args):
             return 1
         # This typed TARGET is the identity the gate proved; rebind must not
         # mistake it for raw argv and resolve it into a different key.
+        # pair_meld={}: the new reader is invited into the chain's pair meld,
+        # the same room its earlier rounds are in.
         out, why = dispatches.rebind(pos[0], target,
                           reason=opts.get("--reason"), force=force,
-                          repo=opts.get("--repo"))
+                          repo=opts.get("--repo"), pair_meld={})
         if why:
             print("helm dispatch: " + why, file=sys.stderr)
             return 1
@@ -1374,6 +1982,9 @@ def _cmd_dispatch(args):
             # data, so this is the stderr half of the same answer.
             for note in out["new"].get(dispatches._ADMISSION_NOTES, ()):
                 print("helm dispatch: RECIPIENT: " + note, file=sys.stderr)
+            for line in (out["new"].get(dispatches._PAIR_MELD) or {}).get(
+                    "lines") or ():
+                print("helm dispatch: " + line)
         # THE ROOM DOES NOT MOVE WITH THE OBLIGATION (#203). stderr in BOTH
         # branches: the JSON receipt already carries room_fence as data, and a
         # warn on stdout would corrupt the automation consumer this verb's own
@@ -1433,28 +2044,58 @@ def _cmd_dispatch(args):
                 row["id"], row.get("delivery_ref") or "none"))
         return 0
     if verb == "cancel":
+        # `--chain` IS A FLAG ONLY BEFORE A `--` ESCAPE, so a reason that
+        # must say the word still can.
+        cut = rest.index("--") if "--" in rest else len(rest)
+        chain = "--chain" in rest[:cut]
+        dry_run = "--dry-run" in rest[:cut]
+        rest = [a for i, a in enumerate(rest)
+                if i >= cut or a not in ("--chain", "--dry-run")]
         if not rest:
-            print("usage: helm dispatch cancel <id-or-unique-prefix> <reason...>  "
+            print("usage: helm dispatch cancel <id-or-unique-prefix> [--chain] "
+                  "[--dry-run] <reason...>  "
                   "(honestly abandon a stranded dispatch — recipient gone / "
                   "work moot; never a substitute for a real verdict. It ALSO "
                   "closes a reviewed row whose verdict declared NO polarity: "
                   "that verdict authorized nothing and demanded nothing, so "
                   "the close is recorded as an ADVISORY CLOSE whose reason "
-                  "names it. A verdict WITH a polarity is still refused)",
+                  "names it. A verdict WITH a polarity is still refused. "
+                  "Every cancel names the open rounds and FIX verdicts it "
+                  "leaves carried by nothing; --chain also cancels those open "
+                  "rounds with the same reason, and never a verdict. "
+                  "--dry-run runs every check and writes nothing)",
                   file=sys.stderr)
             return 2
         reason, rc = dispatches.freetext.tail("helm dispatch", "cancel", rest[1:],
-                                   "a cancel reason")
+                                   "a cancel reason",
+                                   known=("--chain", "--dry-run"))
         if rc is not None:
             return rc
-        row, why = dispatches.mark_cancel(rest[0], reason or "")
+        outcome = {}
+        row, why = dispatches.mark_cancel(rest[0], reason or "", chain=chain,
+                                          outcome=outcome, dry_run=dry_run)
         if why:
             print("helm dispatch: " + why, file=sys.stderr)
             return 1
+        # A DRY RUN LEADS WITH ITS BANNER AND SAYS WOULD: a reader or a
+        # script taking the first status line must never see a cancel that
+        # did not happen.
+        if dry_run:
+            print("helm dispatch: DRY RUN — nothing written; re-run without "
+                  "--dry-run to cancel. What the cancel would record:")
+        if dry_run and row.get("already_cancelled"):
+            state = "ALREADY CANCELLED, nothing left to cancel for this row"
+        elif row.get("cancel_advisory"):
+            state = "WOULD ADVISORY-CLOSE" if dry_run else "ADVISORY-CLOSED"
+        else:
+            state = "WOULD CANCEL" if dry_run else "CANCELLED"
         print("helm dispatch: %s — %s (%s)" % (
-            row["id"],
-            "ADVISORY-CLOSED" if row.get("cancel_advisory") else "CANCELLED",
-            row.get("cancel_reason") or ""))
+            row["id"], state, row.get("cancel_reason") or ""))
+        for pid in outcome.get("chained", ()):
+            print("helm dispatch: %s — %s (%s) by --chain"
+                  % (pid, "WOULD CANCEL" if dry_run else "CANCELLED",
+                     reason or ""))
+        print("helm dispatch: " + _uncarried_line(outcome, would=dry_run))
         return 0
     if verb == "hold":
         owner_gated = "--owner-gated" in rest
@@ -1469,16 +2110,30 @@ def _cmd_dispatch(args):
                 return 2
             source_clean_tip = rest[at + 1]
             del rest[at:at + 2]
+        meld_room = None
+        if dispatches._MELD_FLAG in rest:
+            at = rest.index(dispatches._MELD_FLAG)
+            if at + 1 >= len(rest):
+                print("helm dispatch hold: --meld needs the meld ROOM whose "
+                      "outcome this clean read records", file=sys.stderr)
+                return 2
+            meld_room = rest[at + 1]
+            del rest[at:at + 2]
         if not rest:
             print("usage: helm dispatch hold <id-or-unique-prefix> <reason...> "
-                  "[--owner-gated] [--source-clean TIP]  (acknowledge an "
+                  "[--owner-gated] [--source-clean TIP [--meld ROOM[@EPOCH]]]  "
+                  "(--meld names the meld whose MELD OUTCOME this clean read "
+                  "records; acknowledge an "
                   "obligation gated on an external dependency; --owner-gated "
                   "when that dependency is a DECISION ONLY THE OWNER CAN MAKE, "
                   "which keeps the row out of the machine stall count and names "
                   "him as the holder; --source-clean TIP when your source read "
                   "found nothing and the only thing left is the integrator's "
                   "land gate on the rebased tree, which is what an approve must "
-                  "bind. `helm dispatch list --held --source-clean` is the "
+                  "bind — only the row's recipient may, or its sender on a "
+                  "fresh-context read it recorded at that tip, at a tip "
+                  "descending from the dispatched ref. "
+                  "`helm dispatch list --held --source-clean` is the "
                   "integrator's listing of those rows)",
                   file=sys.stderr)
             return 2
@@ -1488,28 +2143,46 @@ def _cmd_dispatch(args):
             return rc
         row, why = dispatches.mark_hold(rest[0], reason or "",
                              owner_gated=owner_gated,
-                             source_clean_tip=source_clean_tip)
+                             source_clean_tip=source_clean_tip,
+                             meld_room=meld_room)
         if why:
             print("helm dispatch: " + why, file=sys.stderr)
             return 1
         held_on = ""
+        rehold = None
+        if row.get("source_clean_tip") and not row.get("owner_gated"):
+            from . import landreq            # DEFERRED — landreq imports us.
+            rehold = landreq.source_clean_rehold(row)
         if row.get("owner_gated"):
             held_on = " ON THE OWNER"
+        elif rehold:
+            # An idempotent re-run of a hold written before the door bound
+            # its holder returns that hold unchanged; say so, with the move
+            # that clears it (task/3053), rather than hand the row to the
+            # integrator — asked of the one holder predicate.
+            held_on = (" SOURCE-CLEAN at %s — but no land can close this "
+                       "hold: %s" % (row["source_clean_tip"], rehold["why"]))
         elif row.get("source_clean_tip"):
             held_on = (" SOURCE-CLEAN at %s — ON THE INTEGRATOR'S LAND GATE"
                        % row["source_clean_tip"])
         print("helm dispatch: %s — HELD%s (%s)" % (
             row["id"], held_on, row.get("hold_reason") or ""))
+        if row.get("pin_warning"):
+            print("helm dispatch: warning: " + row["pin_warning"],
+                  file=sys.stderr)
+        _meld_said_back(row)
         # THE HOLD THAT MOVES THE PLATE WAKES ITS NEW HOLDER. Only the
         # source-clean one does: the owner reaches his asks through the
         # owner-ask surfaces, and a bare hold moves the row to nobody new.
         _hold_holder_nudge(row)
         if row.get("source_clean_tip") \
                 and row.get("source_clean_tip") != (row.get("tip") or ""):
-            # THE DIVERGENCE IS SHOWN, NEVER REFUSED: a cure round moves the
-            # tip past the dispatched ref and that is the ordinary case. What
-            # would be wrong is letting it pass unseen, because the approve
-            # binds the tip named here and not the one the row was sent at.
+            # A DESCENDANT'S DIVERGENCE IS SHOWN, NEVER REFUSED: a cure round
+            # moves the tip past the dispatched ref and that is the ordinary
+            # case. What would be wrong is letting it pass unseen, because the
+            # land closes on the tip named here and not the one the row was
+            # sent at. A tip OUTSIDE the dispatched ref's history never gets
+            # here: `mark_hold` refuses it (task/3053).
             print("helm dispatch: the row was dispatched at %s; this hold "
                   "declares %s clean" % (row.get("tip") or "an unknown tip",
                                          row["source_clean_tip"]))
@@ -1666,6 +2339,20 @@ def _cmd_dispatch(args):
                 "  [family %s]" % axis if axis else "",
                 "  [%s]" % unread if unread else "")
 
+        def _read_lines(row, claims=False):
+            """The row's advisory reads, then every read on a cancelled row
+            it continues under that row's id (task/3081) — ONE list for the
+            three places a row prints its reads, off this triage's snapshot.
+            `claims` puts the row's hand-back claim lines (task/3540) between
+            the two, where `lr show` prints them, so a claim of THIS row never
+            sits under a FROM header naming another."""
+            own = dispatches.advisory_read_lines(row)
+            if claims:
+                from . import handback_claims
+                own = own + handback_claims.lines(row)
+            return own + dispatches.superseded_read_lines(
+                dispatches.superseded_reads(row, current))
+
         for row in sorted(selected, key=lambda r: str(r.get("ts") or "")):
             print(_triage_line(row))
             # THE BRIEF, AND ONLY ON A NAMED ROW. Storing the body and never
@@ -1711,6 +2398,14 @@ def _cmd_dispatch(args):
             # adjudicate it: named rows only, like the pre-read, and nothing
             # at all on a row that carries none.
             for line in _findings_lines(row):
+                print("  " + line)
+            # EVERY MODEL RUN'S ADVISORY READ (task/3081): named rows only,
+            # and nothing at all on a row that carries none. The row stays
+            # owed, and the lines say so. AND THE HAND-BACK'S CLAIMS, each
+            # CHECKED against a receipt for this row's own tree or UNBOUND
+            # with its reason (task/3540): named review rows only, and
+            # nothing on a brief that claims nothing.
+            for line in _read_lines(row, claims=True):
                 print("  " + line)
             # BY REFERENCE WHEN THE ROW HAS ONE. `body_of` reads the row's
             # BOUNDED copy; `brief_of` reads the file the row names and proves
@@ -1817,6 +2512,19 @@ def _cmd_dispatch(args):
                 note = patch_note(row)
                 if note:
                     print(note)
+                # A SKIPPED ROW'S FINDINGS PASS TOO (task/3382): the pass
+                # stops on a row that can never take its note and says so
+                # here, and a verdicted row is one; a held or carried row
+                # prints the note it took.
+                for line in _findings_lines(row):
+                    print("  " + line)
+                # A SKIPPED ROW'S ADVISORY READS TOO (task/3081): a verdicted
+                # or carried row is where a model run's read was last looked
+                # for and not found — the live case was a CARRIED row.
+                # AND ITS HAND-BACK CLAIMS (task/3540): a verdicted review
+                # row's reader still asks what its brief proved.
+                for line in _read_lines(row, claims=True):
+                    print("  " + line)
         blind = cure_facts["blind_rows"]
         ambiguous = cure_facts["ambiguous"]
         if cure_problems:
@@ -1847,6 +2555,16 @@ def _cmd_dispatch(args):
                 note = patch_note(row)
                 if note:
                     print(note)
+                # A CURED ROW'S ADVISORY READS TOO (task/3081): a FIX-verdicted
+                # row whose author cured on the lane is listed HERE and not in
+                # the skipped loop above, and it is the one verdicted shape
+                # that printed no read while `lr show` printed it.
+                for line in _read_lines(row):
+                    print("  " + line)
+                # AND ITS FINDINGS PASS, under a NAMED row only, as every
+                # other row prints it (task/3382).
+                for line in (_findings_lines(row) if rest else ()):
+                    print("  " + line)
         # rc 2, the same code every verb answers a malformed/unknown argument
         # with — AFTER the loops above, so one typo'd token never suppresses
         # the real rows named beside it.
@@ -1939,12 +2657,14 @@ def _cmd_dispatch(args):
         flags = set(bare)
         unknown = sorted(flags - {"--open", "--overdue", "--held", "--json",
                                   "--mine", "--issued", "--orphaned",
-                                  "--source-clean", "--all-projects"})
+                                  "--source-clean", "--no-holder",
+                                  "--all-projects"})
         if unknown:
             print("helm dispatch list: unknown option%s %s (accepts --open, "
-                  "--overdue, --held, --source-clean, --mine, --issued, "
-                  "--orphaned, --all-projects, --to SEAT, --json)\n%s"
-                  % ("" if len(unknown) == 1 else "s", " ".join(unknown), dispatches.USAGE),
+                  "--overdue, --held, --source-clean, --no-holder, --mine, "
+                  "--issued, --orphaned, --all-projects, --to SEAT, --json)\n%s"
+                  % ("" if len(unknown) == 1 else "s", " ".join(unknown),
+                     synopsis("list")),
                   file=sys.stderr)
             return 2
         if len(flags & {"--open", "--overdue", "--held"}) > 1:
@@ -1958,10 +2678,13 @@ def _cmd_dispatch(args):
         # beside it. Combined with --held it means the same thing, and combined
         # with --open it would name an empty set, which is a question the
         # caller cannot have meant.
-        if "--source-clean" in flags and flags & {"--open", "--overdue"}:
-            print("helm dispatch list: --source-clean selects HELD rows — a "
+        if flags & {"--source-clean", "--no-holder"} \
+                and flags & {"--open", "--overdue"}:
+            print("helm dispatch list: %s selects HELD rows — a "
                   "source-clean row is held by construction, so it cannot be "
-                  "combined with --open or --overdue", file=sys.stderr)
+                  "combined with --open or --overdue"
+                  % ("--no-holder" if "--no-holder" in flags
+                     else "--source-clean"), file=sys.stderr)
             return 2
         # A THIRD DISTINCT REJECTION, for the same reason the two above are
         # kept apart: --mine and --to are both recipient filters, and honouring
@@ -2273,7 +2996,7 @@ def _cmd_dispatch(args):
                 "OVERDUE only — a row that owes nothing cannot be late for it, "
                 "so this is a subset of OPEN and not a second state",
                 lambda r: r.get("id") in owed_ids and dispatches._is_overdue(r, read_now))
-        elif "--source-clean" in flags:
+        elif flags & {"--source-clean", "--no-holder"}:
             # THE INTEGRATOR'S LISTING. These are the rows whose delta reads
             # clean and which cannot carry an approve, because an approve
             # binds a verified whole-suite token that only the land gate on
@@ -2286,6 +3009,23 @@ def _cmd_dispatch(args):
                 "SOURCE-CLEAN HOLDS only — held rows whose reviewer read the "
                 "delta clean and owe nothing but the integrator's land gate",
                 lambda r: query.query_is_held(r) and r.get("source_clean_tip"))
+            if "--no-holder" in flags:
+                # THE BACKLOG `helm train` COUNTS ON ONE LINE (the author's
+                # ruling 6, round 4): the held source-clean rows whose hold
+                # records NO HOLDER, which no land closes and no train takes
+                # until each recipient re-holds. Selected by the holder
+                # rung's own kind, never by a second reading of the stamp.
+                # It is a SUPERSET of the train's count: the train asks the
+                # discharge rung first, so a NO HOLDER row that rung refuses
+                # gets its own EXCLUDED line there and is listed here too.
+                from . import landreq
+                selected = _narrow(
+                    selected,
+                    "NO HOLDER only — source-clean holds that record no "
+                    "holder, each its recipient's to re-hold",
+                    lambda r: getattr(landreq.source_clean_holder_error(r),
+                                      "kind", None)
+                    == landreq.SourceCleanRefusal.NO_HOLDER)
         elif "--held" in flags:
             # THROUGH THE CANONICAL PREDICATE, not the raw status word.
             # Retirement preserves `status` and only adds `retired_admin`, so
@@ -2601,6 +3341,27 @@ def _cmd_dispatch(args):
                     and _still_awaiting(r) and not _ended(r)
                     and not _handed_on(r))
 
+        # THE RECIPIENT'S TURN (task/3118): one idle reading per recipient of
+        # a row still owed (helm/seat_idle.py, one roster read). An owed row
+        # whose seat has sat IDLE ten minutes on it reads IDLE-OWING; a late
+        # row that is not says whether its seat is busy, briefly idle, or
+        # unreadable, so an overdue listing can tell busy from stuck.
+        from . import seat_idle
+        idle = seat_idle.readings(
+            {dispatches._recipient_key(r) for r in rendered
+             if r.get("id") in owed_ids and not _ended(r)}, now=now)
+
+        def _marked(line, r):
+            """`line` with the recipient's idle marker on its FIRST line (a
+            held rung's second line stays where _fmt put it)."""
+            if r.get("id") not in owed_ids or _ended(r):
+                return line
+            mark = seat_idle.list_suffix(
+                idle.get(dispatches._recipient_key(r)),
+                dispatches._age_s(r, now), _late(r))
+            head, sep, tail = line.partition("\n")
+            return head + mark + sep + tail
+
         for row in selected:
             # BOTH PROPERTIES. `_late` (from trunk) is owed-aware, so a row
             # that owes nothing cannot be late; the `now` this lane made
@@ -2608,8 +3369,8 @@ def _cmd_dispatch(args):
             # printed and the marker beside it are measured against the same
             # clock. The marker can now disagree with neither the age nor the
             # debt.
-            print(dispatches._fmt(row, now, _late(row), unverifiable, _chase(row),
-                       reach, _ended(row)))
+            print(_marked(dispatches._fmt(row, now, _late(row), unverifiable,
+                                          _chase(row), reach, _ended(row)), row))
         if unplaceable:
             # ITS OWN HEADING, BELOW THIS PROJECT'S WORK. The rows are printed
             # in the same format because they are the same kind of obligation;
@@ -2618,10 +3379,18 @@ def _cmd_dispatch(args):
             print("\n" + _unplaceable_heading(unplaceable,
                                               scope_project or scope_repo))
             for row in unplaceable:
-                print(dispatches._fmt(row, now, _late(row), unverifiable, _chase(row),
-                           reach, _ended(row)))
+                print(_marked(dispatches._fmt(row, now, _late(row), unverifiable,
+                                              _chase(row), reach, _ended(row)),
+                              row))
         if any(_late(r) for r in rendered):
             print("NEEDS CHECK-IN is advisory only; do not reassign on age alone")
+        if any(seat_idle.is_owing(idle.get(dispatches._recipient_key(r)),
+                                  dispatches._age_s(r, now))
+               for r in rendered if r.get("id") in owed_ids and not _ended(r)):
+            print("IDLE-OWING: the recipient's turn ended and nothing has run "
+                  "since while it owed the row (its own hooks, "
+                  "helm/seat_idle.py); `helm seat idle-dispatch` rings it, on "
+                  "a backoff")
         if any(_chase(r) for r in rendered):
             # The marker is three words on a row addressed to someone else, and
             # the reader is usually a seat that has just lost its context. Say
@@ -2670,8 +3439,7 @@ def _cmd_dispatch(args):
                   "owed; the attest path is at-most-once and never re-signs."
                   % len(unverifiable))
         return 0
-    print(dispatches.USAGE, file=sys.stderr)
-    return 2
+    return _unknown_subverb(verb)
 
 
 # ---------------------------------------------------------------------------

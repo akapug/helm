@@ -829,7 +829,10 @@ class StatusByTest(PresenceBase):
         status line, it only makes overwriting harder than deleting. These
         arms need something to destroy before `--clear` means anything."""
         path = seats.roster_path()
-        rows = json.loads(open(path).read()) if os.path.exists(path) else {}
+        rows = {}
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                rows = json.loads(fh.read())
         row = dict(rows.get(seat) or {})
         row["status"], row["status_ts"], row["status_by"] = line, 1.0, by
         rows[seat] = row

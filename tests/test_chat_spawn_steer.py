@@ -123,11 +123,15 @@ class SpawnSteerTest(unittest.TestCase):
         os.environ.pop("MELD_CHAT_DIR", None)
         # a keyless family's route carries the endpoint its host configures;
         # the catalog holds none, so this case's home configures a
-        # documentation-range one (RFC 5737 TEST-NET-1)
+        # documentation-range one (RFC 5737 TEST-NET-1) for each keyless
+        # family: an unconfigured one has a route with an empty endpoint,
+        # which the proof decoder rightly refuses as malformed
         os.makedirs(os.path.join(self.home, "_global"))
         with open(os.path.join(self.home, "_global", "endpoints.json"),
                   "w") as f:
-            json.dump({"qwen27": "http://192.0.2.10:8083/v1"}, f)  # noqa: SEAT_NAME — the catalog FAMILY key the endpoints file is keyed by, never a seat
+            json.dump({"qwen27": "http://192.0.2.10:8083/v1",  # noqa: SEAT_NAME — the catalog FAMILY keys the endpoints file is keyed by, never seats
+                       "qwenlocal": "http://192.0.2.10:8081/v1",  # noqa: SEAT_NAME — the catalog FAMILY keys the endpoints file is keyed by, never seats
+                       "bonsai": "http://192.0.2.11:8098/v1"}, f)  # noqa: SEAT_NAME — the catalog FAMILY keys the endpoints file is keyed by, never seats
 
         # THE ISOLATION IS ASSERTED, NOT ASSUMED. The surface must resolve
         # through the REDIRECTED arm, under this case's own temp root, and

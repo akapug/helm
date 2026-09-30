@@ -3466,8 +3466,8 @@ class CodexRound1(GateBase):
         # AND THE PREDICATE THAT EXPLAINS MUST BE THE PREDICATE THAT FILTERED.
         # Valid sibling events are consumed separately, not dropped receipts;
         # apply receipt identity only to the rows that reach that predicate.
-        raw = [json.loads(line) for line
-               in open(gate.receipts_path(), encoding="utf-8") if line.strip()]
+        with open(gate.receipts_path(), encoding="utf-8") as fh:
+            raw = [json.loads(line) for line in fh if line.strip()]
         self.assertTrue(any(r.get("event") == gate._TIMING_EVENT for r in raw),
                         "positive control: the ledger contains a timing sibling")
         siblings = (gate._FAILURE_CHUNK_EVENT, gate._TIMING_EVENT)
@@ -4122,6 +4122,7 @@ class Binding(GateBase):
         self.assertEqual(control, "VERIFIED", control_why)
         for sequence_state, phrase in (
                 (vcs.PATCH_SEQUENCE_AMBIGUOUS, "appears more than once"),
+                (vcs.PATCH_SEQUENCE_BACKWARD, "older trunk point"),
                 (vcs.PATCH_SEQUENCE_UNKNOWN, "cannot be derived")):
             backend = mock.Mock()
             backend.text.side_effect = real.text
@@ -4137,6 +4138,52 @@ class Binding(GateBase):
             self.assertIn(phrase, why)
             backend.patch_sequence_containment.assert_called_once_with(
                 self.gitdir(), reviewed, row["head"])
+
+    def test_a_lane_rebased_across_TRAIN_MERGES_is_CARRIED(self):
+        """The live retip shape, at the gate. The reviewed tip sat on a lane
+        commit that then landed on trunk inside a train merge, and the lane
+        was rebased onto the new trunk. The pair's range from that landed car
+        holds every train merge since, none with a patch id, so carriage read
+        UNKNOWN. Each tip's own commits off the remote default branch are one
+        identical patch, so it is CARRIED."""
+        def commit(name):
+            with open(os.path.join(self.repo, name), "w") as fh:
+                fh.write(name + "\n")
+            self._git("add", name)
+            self._git("commit", "-qm", name)
+            return self._git("rev-parse", "HEAD")
+        self._git("checkout", "-q", "-b", "car", "main")
+        car = commit("car.txt")
+        self._git("checkout", "-q", "-b", "other", "main")
+        commit("other.txt")
+        self._git("checkout", "-q", "main")
+        self._git("merge", "-q", "--no-ff", "-m", "train1", "car")
+        self._git("merge", "-q", "--no-ff", "-m", "train2", "other")
+        trunk = self._git("rev-parse", "HEAD")
+        self._git("checkout", "-q", "-b", "reviewed", car)
+        reviewed = commit("lane-work.txt")
+        self._git("checkout", "-q", "-b", "rebased", trunk)
+        rebased = commit("lane-work.txt")
+        self._git("checkout", "-q", "lane/probe")
+        self.assertEqual(self._git("rev-list", "--merges", "--count",
+                                   car + ".." + rebased), "2",
+                         "fixture: the pair's range must carry train merges")
+        # A remote as a fetch leaves it: a tracking ref at trunk and the
+        # default branch recorded (no push, so no hook can run).
+        self._git("remote", "add", "origin", os.path.join(self.tmp, "none"))
+        self._git("update-ref", "refs/remotes/origin/main", trunk)
+        self._git("remote", "set-head", "origin", "main")
+        verdict, relation, sequence = gate.carriage(self.gitdir(), reviewed,
+                                                    rebased)
+        self.assertEqual((verdict, relation, sequence),
+                         (gate.CARRIED, vcs.NOT_ANCESTOR,
+                          (vcs.PATCH_SEQUENCE_EXACT, 0, 1, 1)))
+        # With no recorded default branch the unreadable pair stays UNKNOWN.
+        self._git("remote", "set-head", "origin", "--delete")
+        verdict, _relation, sequence = gate.carriage(self.gitdir(), reviewed,
+                                                     rebased)
+        self.assertEqual((verdict, sequence[0]),
+                         (gate.CARRIAGE_UNKNOWN, vcs.PATCH_SEQUENCE_UNKNOWN))
 
     def test_descendant_binding_uses_the_dispatch_repo_not_receipt_scratch(self):
         """Historical symbol retained; an unplaceable origin is now UNKNOWN.

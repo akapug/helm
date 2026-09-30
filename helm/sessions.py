@@ -404,6 +404,11 @@ def _read_live_sids():
                 argv = f.read().decode("utf-8", "replace").split("\0")
         except OSError:
             continue
+        # ONLY A RESUMING ARGV CAN ADD A ROW, so only its comm is read: asking
+        # every process on the host what it is, to keep the few that name a
+        # session, doubled this walk's reads (task/3556).
+        if "--resume" not in argv and "-r" not in argv:
+            continue
         # argv[0] IS THE WEAKEST OF THE THREE and stays only as a fast accept:
         # a versioned-launch pane's argv[0] is the binary PATH, which does not
         # end in "claude", and `/tmp/bash-claude` does. The kernel's exe link
@@ -487,7 +492,7 @@ def credhome_for(sid, latch=True):
     return found
 
 
-def resume_command(row, home=None):
+def resume_command(row, home=None, launch=None):
     """The harness's own resume invocation. claude resume is cwd-scoped, so the
     command carries the cd; codex resume is global-by-UUID (the cd is comfort).
     A paste-for-human command must be safe in a STAMPED shell: an inherited
@@ -502,7 +507,7 @@ def resume_command(row, home=None):
     carried. A silent re-home is worse than an error, because nothing ever
     reports it."""
     cwd = os.path.expanduser(row.get("cwd") or "") or "."
-    return "cd %r && %s" % (cwd, resume_exec(row, home=home))
+    return "cd %r && %s" % (cwd, resume_exec(row, home=home, launch=launch))
 
 
 def trust_blocked(row, home):
@@ -530,7 +535,7 @@ def trust_blocked(row, home):
     return None
 
 
-def resume_exec(row, home=None, skip_permissions=False):
+def resume_exec(row, home=None, skip_permissions=False, launch=None):
     """The resume invocation WITHOUT the cd prefix — the part that is safe to
     hand to `exec`.
 
@@ -538,7 +543,17 @@ def resume_exec(row, home=None, skip_permissions=False):
     "cd X && claude …" line silently breaks it: exec binds to `cd`, a shell
     builtin, so the exec fails and the && chain never runs. The pane opens,
     dies immediately, and the spawn still returns a handle — a resume that
-    reports success and delivers nothing."""
+    reports success and delivers nothing.
+
+    `launch` is a PROXY seat's own launch script and the model it records
+    (`orcaadopt.proxy_launch`), and it outranks `home`: the resume runs
+    THROUGH that script, because it is what sets the proxy URL, reads the
+    token file and names the family, while the native line below unsets the
+    first two and passes no model."""
+    if launch:
+        return "%s --model %s --resume %s" % (
+            shlex.quote(launch["launch_sh"]), shlex.quote(launch["model"]),
+            shlex.quote(row["i"]))
     from . import seat
     unset = seat.paste_unset_prefix()
     if row["h"] != "claude":
@@ -573,7 +588,8 @@ def is_pinnable(home):
 RESUME_DIR = os.path.expanduser("~/.helm/_global/resumes")
 
 
-def mint_resume_script(row, home=None, skip_permissions=False, env=None):
+def mint_resume_script(row, home=None, skip_permissions=False, env=None,
+                       launch=None):
     """Write the resume as an executable SCRIPT and return its path.
 
     TOKEN LAW (borrowed intact from seat.py's resume): what crosses the
@@ -607,7 +623,8 @@ def mint_resume_script(row, home=None, skip_permissions=False, env=None):
                 "cd %s || { echo \"helm resume: cwd is gone: %s\" >&2; exit 1; }\n"
                 "%sexec %s\n"
                 % (shlex.quote(cwd), cwd, exports,
-                   resume_exec(row, home=home, skip_permissions=skip_permissions)))
+                   resume_exec(row, home=home, skip_permissions=skip_permissions,
+                               launch=launch)))
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
     return path
 
@@ -634,7 +651,8 @@ def resume_identity_env(sid):
              "DREGG_PROFILE": hits[0]} if len(hits) == 1 else None)
 
 
-def spawn_resume(row, title=None, home=None, skip_permissions=False, env=None):
+def spawn_resume(row, title=None, home=None, skip_permissions=False, env=None,
+                 launch=None):
     """Actually resume the session in a pane. (path, handle, adapter) on
     success; raises harness.HarnessError when no metaharness is reachable.
 
@@ -665,7 +683,8 @@ def spawn_resume(row, title=None, home=None, skip_permissions=False, env=None):
                 "both sides)" % (said.getvalue().strip() or "the Orca sync refused "
                                  "the credhome", cred._display_path(home)))
     path = mint_resume_script(row, home=home,
-                              skip_permissions=skip_permissions, env=env)
+                              skip_permissions=skip_permissions, env=env,
+                              launch=launch)
     cwd = os.path.expanduser(row.get("cwd") or "") or os.path.expanduser("~")
     if not os.path.isdir(cwd):
         cwd = os.path.expanduser("~")

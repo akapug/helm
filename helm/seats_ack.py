@@ -24,6 +24,7 @@ moves without deciding anything else first.
 import json
 import os
 import re
+import sys
 import time
 
 from . import chat, home, pk
@@ -35,7 +36,7 @@ from .seats_common import (_BROADCAST, _canonical_recipient, _clip, _Fault,
 from .seats_report import _fmt_age
 from .seats_identity import _warn_disagreement, derive_seat
 from .seats_roster import last_seen, seat_for_session
-from .seats_cursor import _cursor_checked
+from .seats_cursor import _cursor_checked, _sid8
 
 _MENTION_TOKEN = re.compile(r"(?<![A-Za-z0-9._-])@([A-Za-z0-9._-]{1,64})")
 # _Fault and _reason MOVED TO seats_common, the floor every reader already
@@ -324,8 +325,8 @@ def consume_state(m, room, recipient, dev=None, ino=None, end_off=None,
         for x, e in rows:
             if x.get("ack"):
                 sender, _ = _canonical_recipient(x.get("from"))
-                acks[(x["ack"], str(sender or ""))] = \
-                    x.get("ackstate") or "done"
+                for a in chat.ack_ids(x):          # a bulk row names many
+                    acks[(a, str(sender or ""))] = x.get("ackstate") or "done"
             if x.get("id") == tid:
                 end_off = e
     if tid and (tid, rcf) in acks:
@@ -401,34 +402,74 @@ def consume_state(m, room, recipient, dev=None, ino=None, end_off=None,
     if ls is not None and mts is not None and int(ls) > mts:
         return "seen", None       # touch_seen fallback (a later second)
     return "sent", None
-def _locate_row(target_id):
+def _locate_row(target_id, verb="ack"):
     """(row, room, err): the one chat row a bare id names, across every live
-    lane. Exact id wins; an unambiguous >=4-char prefix resolves too (ids are
-    12 hex — nobody types them whole). Ambiguous or unknown => a refusal
-    string, never a guess."""
-    tid = str(target_id or "").strip()
+    lane (`_locate_rows` for one id).
+
+    `verb` names the caller in the sentences that say what to type: `ack`
+    here, and the goal door's `--owner-ref` / `--ref`, which resolves the
+    owner's post through this same reader (helm/goals.py `owner_word`)."""
+    return _locate_rows([target_id], verb)[0]
+def _locate_rows(target_ids, verb="ack"):
+    """[(row, room, err)], one per id in `target_ids`, in order: the one chat
+    row each bare id names, across every live lane, read ONCE for them all
+    (a bulk ack names 31 ids; 31 scans of every lane would be 31 reads of
+    the same bytes). Exact id wins; an unambiguous >=4-char prefix resolves
+    too (ids are 12 hex — nobody types them whole). Ambiguous or unknown =>
+    a refusal string, never a guess.
+
+    A STRING OF DIGITS SHORTER THAN THE ID `helm chat read` PRINTS is the [n]
+    printed beside it, a row NUMBER: only an exact id may match it, never a
+    prefix, so `ack 1243` cannot resolve another seat's row whose id begins
+    with those four digits."""
+    tids = [str(t or "").strip() for t in target_ids]
+    hits = {t: [] for t in tids if t}
+    faults = []
+    if hits:
+        lanes, faults = _all_lanes()
+        # ENUMERATING A LANE IS NOT READING IT. _all_lanes reports lanes it
+        # could not LIST; chat.read then fail-opens per lane, returning [] for
+        # a room that exists and will not open, and silently skipping torn
+        # lines. So a lane could enumerate perfectly, contribute nothing, and
+        # leave `faults` empty — and the absence branch in _resolve_row would
+        # then swear the id matches nothing, over a room it never actually
+        # read. read_checked reports both, and each becomes an ordinary fault
+        # so the existing refusal covers it with no new branch.
+        faults = list(faults)
+        # a prefix is >= 4 characters, so a row can match only the prefixes
+        # that share its first four
+        prefixes = {}
+        for t in hits:
+            if len(t) >= 4 and not (t.isdigit() and len(t) < chat.ID_SHOWN):
+                prefixes.setdefault(t[:4], []).append(t)
+        for room in lanes:
+            rows, _total, unread = chat.read_checked(room)
+            if unread:
+                faults.append(_Fault(unread, room,
+                                     "the lane could not be read"))
+            for m in rows:
+                rid = str(m.get("id") or "")
+                if not rid:
+                    continue
+                if rid in hits:
+                    hits[rid].append((m, room, True))
+                for t in prefixes.get(rid[:4], ()):
+                    if t != rid and rid.startswith(t):
+                        hits[t].append((m, room, False))
+    return [_resolve_row(t, hits.get(t, []), faults, verb) for t in tids]
+def _resolve_row(tid, hits, faults, verb="ack"):
+    """(row, room, err) for one id from its `hits` [(row, room, exact)] and
+    the lane `faults` of the scan that found them (`_locate_rows`)."""
     if not tid:
-        return None, None, "ack needs a message id (helm chat read shows ids)"
-    hits = []
-    lanes, faults = _all_lanes()
-    # ENUMERATING A LANE IS NOT READING IT, and fixing only the first half is
-    # what a reviewer caught here. _all_lanes reports lanes it could not LIST;
-    # chat.read then fail-opens per lane, returning [] for a room that exists
-    # and will not open, and silently skipping torn lines. So a lane could
-    # enumerate perfectly, contribute nothing, and leave `faults` empty — and
-    # the absence branch below would then swear the id matches nothing, over a
-    # room it never actually read. read_checked reports both, and each becomes
-    # an ordinary fault so the existing refusal covers it with no new branch.
-    faults = list(faults)
-    for room in lanes:
-        rows, _total, unread = chat.read_checked(room)
-        if unread:
-            faults.append(_Fault(unread, room, "the lane could not be read"))
-        for m in rows:
-            rid = str(m.get("id") or "")
-            if rid and (rid == tid or (len(tid) >= 4 and rid.startswith(tid))):
-                hits.append((m, room, rid == tid))
+        return None, None, ("%s needs a message id (helm chat read shows ids)"
+                            % verb)
+    number = tid.isdigit() and len(tid) < chat.ID_SHOWN
     exact = [h for h in hits if h[2]]
+    if number and not exact:
+        return None, None, (
+            "%r is a row number, not a message id — %s takes the id `helm "
+            "chat read` prints beside the row's [n] (%d characters)"
+            % (tid, verb, chat.ID_SHOWN))
     # AN EXACT MATCH PROVES ITSELF; A PREFIX MATCH MAKES A CLAIM ABOUT EVERY
     # LANE. "this id exists here" needs only the row in hand, so a fault
     # elsewhere cannot unseat it. "no OTHER row starts with these characters"
@@ -458,12 +499,53 @@ def _locate_row(target_id):
         return None, None, "id %r is ambiguous — use more of it" % tid
     return hits[0][0], hits[0][1], None
 def ack(target_id, state="done", note=None, who=None, session=None):
-    """(result, err). The RECIPIENT marks a row ACTED. One append-only ack row
-    on the SAME lane as the target (the one-writer chat.post path, signed like
-    any row), stamped {ack: <target id>, ackstate: done|blocked}; the note is
-    its text. REFUSED unless the acker is an actual recipient of the row —
-    a foreign or unknown id never writes. Idempotent: a repeat with the same
-    acker + state + note appends nothing (append-only, but no duplicate row)."""
+    """(result, err): `ack_many` for one id. The result names that one row:
+    {target, room, state, row, dup}."""
+    res, err = ack_many([target_id], state, note=note, who=who,
+                        session=session)
+    if err:
+        return None, err
+    r = res[0]
+    return {"target": r["targets"][0], "room": r["room"], "state": r["state"],
+            "row": r["row"], "dup": r["dup"]}, None
+def ack_many(target_ids, state="done", note=None, who=None, session=None):
+    """(results, err). The RECIPIENT marks rows ACTED, in one call. One
+    append-only ack row per room the rows live in, on the SAME lane as its
+    targets (the one-writer chat.post path, signed like any row), stamped
+    {ack: <first id>, acks: [<every id>] when there are more than one,
+    ackstate: done|blocked}; the note is its text. A room holds the acks
+    for its own rows, because the doorbell, the tool-boundary hook and the
+    stop guard look for an ack in its target's room (beacon_doorbell._acks),
+    so ids in one room write one row, and ids in two rooms write two.
+
+    SPLIT REFUSAL. An id that is addressed to someone else, or not found,
+    refuses the whole call and names the first it refused: a seat that acks
+    31 rows and is told 30 were written has to find the one that was not.
+    An id addressed to NO ONE (an @all row, plain chatter) is one an ack
+    cannot clear — a read or a catchup can — so it is skipped, never
+    refused: the call acks the rest and names the skipped rows, and a list
+    whose ids are ALL unaddressed refuses as the foreign case does, naming
+    the first. A roster that cannot be read proves no id unaddressed, so
+    an id that would be skipped refuses the whole call instead. An id
+    named twice (or once whole and once by prefix) is acked once.
+    Idempotent: an id whose latest ack from this acker already carries the
+    same state, session and note is not written again, and a room whose ids
+    are all such writes nothing (its result is `dup`).
+
+    THE ROW RECORDS THE SESSION THAT ACKED (`session`, its seats_cursor
+    `_sid8` key), resolved as a pull resolves it: the tool-boundary hook and
+    the stop guard, whose cursors are per session, honour an ack only from
+    their own session (beacon_doorbell._acks). Inside a delegate's mark it
+    records none, by the pull's own test (helm.pull_delivery): a subagent or
+    a Workflow agent shares its seat's session and name, and its ack, like
+    its read, is not the seat's evidence that it saw the row.
+
+    `results` is one dict per room, in the order its first id was named:
+    {targets: [rows], room, state, row, dup, written: [ids], already: [ids]};
+    `row` is the new ack row, or for a `dup` room the acker's latest ack of
+    its last target. Skipped, unaddressed ids ride a trailing entry of
+    their own ({skipped: [(id, from-label)]}, room None, empty targets and
+    written), so every entry before it is a room the call named."""
     state = str(state or "done").lower()
     if state not in ("done", "blocked"):
         return None, "ack state must be 'done' or 'blocked' (got %r)" % state
@@ -481,42 +563,156 @@ def ack(target_id, state="done", note=None, who=None, session=None):
     seat, _aerr = actors.attributed(who, session, act="acknowledge a row")
     if _aerr:
         return None, _aerr
-    m, room, err = _locate_row(target_id)
-    if err:
-        return None, err
-    tid = m.get("id")
-    recips = _recipients(m)
+    if not target_ids:
+        return None, "ack needs a message id (helm chat read shows ids)"
     scf, _ = _canonical_recipient(seat)
     scf = str(scf or "")
-    if not any(recipient_matches(scf, x) for x in recips):
-        # the refusal reaches a terminal (cmd prints err to stderr): launder
-        # every roster/identity-borne token via _seat_label, the seats.py
-        # publish-owner law — a planted seat name must not reshape the refusal.
-        if not recips:
-            return None, ("%s is not an addressed message — nothing to ack "
-                          "(from %s)" % (str(tid)[:8],
-                                         _seat_label(m.get("from") or "?")))
-        return None, ("%s is addressed to %s, not you (%s) — only its "
-                      "recipient can ack"
-                      % (str(tid)[:8],
-                         "/".join(_seat_label(x) for x in recips),
-                         _seat_label(seat)))
-    prior = [x for x in chat.read(room)[0] if x.get("ack") == tid
-             and recipient_matches(x.get("from"), scf)]
-    prev = prior[-1] if prior else None
-    if prev and prev.get("ackstate") == state \
-            and (prev.get("text") or "") == (note or ""):
-        return {"target": m, "room": room, "state": state, "row": prev,
-                "dup": True}, None
-    # who=seat (the AMBIENT acker, resolved by _seat_actor at the verb) is the
-    # row identity; the signer is whatever the signing gate resolves
-    # (profile=None -> chat._post_identity -> cell.signing_identity) — never
-    # the --seat claim, so a seat cannot forge a signed ACK clearing another
-    # seat's obligation (a cross-family read).
-    row = chat.post(note or "", room=room, who=seat,
-                    ack=tid, ackstate=state)
-    return {"target": m, "room": room, "state": state, "row": row,
-            "dup": False}, None
+    rooms = {}
+    skipped = []
+    located = _locate_rows(target_ids)
+    # ONE ROSTER ACQUISITION FOR THE WHOLE CALL, taken once the ids are
+    # located. Its rows are byte-for-byte the fail-open roster() that
+    # _recipients read per row, so who a row addresses resolves exactly as
+    # before; the verdict beside them is what the skip below needs, because
+    # "addressed to no one" is a claim about the roster, and a roster that
+    # could not be read is where the seat's own @mention would hide.
+    from .seats_roster import roster_acquired
+    known, rfailed = roster_acquired()
+    for m, room, err in located:
+        if err:
+            return None, err
+        tid = m.get("id")
+        recips = _recipients(m, known)
+        if not any(recipient_matches(scf, x) for x in recips):
+            # every refusal and skip-name reaches a terminal (cmd prints
+            # err to stderr; render_ack prints the skip line): launder
+            # every roster/identity-borne token via _seat_label, the
+            # seats.py publish-owner law — a planted seat name must not
+            # reshape either.
+            if recips:
+                return None, ("%s is addressed to %s, not you (%s) — only "
+                              "its recipient can ack"
+                              % (str(tid)[:8],
+                                 "/".join(_seat_label(x) for x in recips),
+                                 _seat_label(seat)))
+            # UNREADABLE IS NOT UNADDRESSED: with the roster unread a row
+            # that mentions this seat resolves to no one, so the call
+            # refuses whole, as it did before the skip, rather than skip
+            # a row the seat may owe (the _resolve_row law: what could not
+            # be read proves no absence).
+            if rfailed:
+                return None, ("cannot prove %s is addressed to no one — the "
+                              "roster could not be read, and a mention of "
+                              "you would hide there; repair that and retry"
+                              % str(tid)[:8])
+            # addressed to no one (an @all row, plain chatter): an ack
+            # cannot clear it — a read or a catchup can — so skip it and
+            # name it below rather than refuse the rows the seat did
+            # handle. Named once however often the call names it, as an
+            # addressed id is acked once.
+            if tid not in {t for t, _who in skipped}:
+                skipped.append((tid, _seat_label(m.get("from") or "?")))
+            continue
+        rooms.setdefault(room, {}).setdefault(tid, m)
+    if not rooms:
+        # every id the call names is unaddressed: refuse as it always has,
+        # naming the first, so a seat that named only rows it cannot ack
+        # learns that nothing was acked.
+        return None, ("%s is not an addressed message — nothing to ack "
+                      "(from %s)" % (str(skipped[0][0])[:8],
+                                     skipped[0][1]))
+    from .pull_delivery import _delegate_marked
+    sid = session or home.session_id()
+    stamp = _sid8(sid) if sid and not _delegate_marked(sid) else None
+    out = []
+    for room, targets in rooms.items():
+        latest = {}
+        for x in chat.read(room)[0]:
+            if recipient_matches(x.get("from"), scf):
+                for a in chat.ack_ids(x):
+                    latest[a] = x
+        already = [t for t, prev in ((t, latest.get(t)) for t in targets)
+                   if prev and prev.get("ackstate") == state
+                   and prev.get("session") == stamp
+                   and (prev.get("text") or "") == (note or "")]
+        fresh = [t for t in targets if t not in already]
+        res = {"targets": list(targets.values()), "room": room,
+               "state": state, "written": fresh, "already": already,
+               "dup": not fresh}
+        # who=seat (the AMBIENT acker, resolved by _seat_actor at the verb)
+        # is the row identity; the signer is whatever the signing gate
+        # resolves (profile=None -> chat._post_identity ->
+        # cell.signing_identity) — never the --seat claim, so a seat cannot
+        # forge a signed ACK clearing another seat's obligation (a
+        # cross-family read).
+        res["row"] = latest[already[-1]] if not fresh else chat.post(
+            note or "", room=room, who=seat,
+            ack=fresh[0] if len(fresh) == 1 else fresh, ackstate=state,
+            ack_session=stamp)
+        out.append(res)
+    if skipped:
+        out.append({"targets": [], "room": None, "state": state,
+                    "written": [], "already": [],
+                    "skipped": skipped, "dup": False})
+    return out, None
+def render_ack(args, seat, note=None, session=None):
+    """`helm chat ack` past its actor and --note (seats_cli): `args` are the
+    ids and at most one state word, in any order -> rc. MANY IDS, ONE CALL:
+    a seat that handled 31 rows says so once, which writes one row per room
+    (`ack_many`), never 31 rows of chat."""
+    usage = ("usage: helm chat ack <id> [<id> ...] [done|blocked] "
+             "[--note ...] [--seat S]")
+    states = [a.lower() for a in args if a.lower() in ("done", "blocked")]
+    tids = [a for a in args if a.lower() not in ("done", "blocked")]
+    if not tids:
+        print(usage, file=sys.stderr)
+        return 2
+    if len(states) > 1 or any(t.startswith("-") for t in tids):
+        print("helm chat: ack takes ids, one state word and --note (got %s)"
+              "\n%s" % (" ".join(args), usage), file=sys.stderr)
+        return 2
+    from .seats_lastread import by_number
+    tids, err = by_number(tids, getattr(seat, "canonical_name", seat))
+    if err:
+        print("helm chat: %s — nothing was acked" % err, file=sys.stderr)
+        return 1
+    res, err = ack_many(tids, states[0] if states else "done", note=note,
+                        who=seat, session=session)
+    if err:
+        print("helm chat: %s — nothing was acked" % err, file=sys.stderr)
+        return 1
+    lbl = res[0]["state"].upper()
+    targets = [m for r in res for m in r["targets"]]
+    written = [t for r in res for t in r["written"]]
+    skipped = [s for r in res for s in r.get("skipped", ())]
+    if skipped:
+        print("helm chat: skipped %d not-addressed row%s: %s — a read or "
+              "catchup clears %s, an ack cannot"
+              % (len(skipped), "" if len(skipped) == 1 else "s",
+                 ", ".join("%s (from %s)" % (str(t)[:8], who)
+                           for t, who in skipped),
+                 "it" if len(skipped) == 1 else "them"))
+    if not written:
+        print("helm chat: %s already acked %s by %s — no new row (idempotent)"
+              % (str(targets[0].get("id") or "")[:8] if len(targets) == 1
+                 else "%d rows" % len(targets), lbl,
+                 # the CLI door hands an AdmittedActor, whose str() is a
+                 # tagged repr by design: its label is `.canonical_name`
+                 _seat_label(getattr(seat, "canonical_name", seat))))
+        return 0
+    rows = sum(1 for r in res if r["written"])
+    senders = sorted({chat._dsan(str(m.get("from") or "?")) for m in targets})
+    print("helm chat: acked %s %s%s%s%s — %s watch%s it leave `helm chat "
+          "pending`"
+          % (written[0][:8] if len(written) == 1 else "%d rows" % len(written),
+             lbl, (': "%s"' % _clip(_scrub(note), 80)) if note else "",
+             " in %d row%s" % (rows, "" if rows == 1 else "s")
+             if len(targets) > 1 else "",
+             " (%d already acked)" % (len(targets) - len(written))
+             if len(targets) > len(written) else "",
+             ", ".join("@" + x for x in senders),
+             "es" if len(senders) == 1 else ""))
+    return 0
 def pending(seat=None, session=None, cap=50):
     """(items, total, lanes): the sender's outbound ADDRESSED rows not yet
     ACTED, one entry per (recipient, row) — SENT-not-SEEN, SEEN-not-ACTED, or
@@ -578,8 +774,8 @@ def pending(seat=None, session=None, cap=50):
         for m, _e in rows:
             if m.get("ack"):
                 sender, _ = _canonical_recipient(m.get("from"))
-                acks[(m["ack"], str(sender or ""))] = \
-                    m.get("ackstate") or "done"
+                for a in chat.ack_ids(m):          # a bulk row names many
+                    acks[(a, str(sender or ""))] = m.get("ackstate") or "done"
         for m, end_off in rows:
             if not recipient_matches(m.get("from"), scf):
                 continue
@@ -755,7 +951,7 @@ def render_pending(seat, session):
     # ack an unresolvable name) and UNKN (nothing was measured). SENT read
     # "recipient dead / away / wedged?" — a guess about a PERSON.
     print("  ○ SENT = written, never reached their cursor — they close it "
-          "with `helm chat ack <id> done|blocked`\n"
+          "with `helm chat ack <id> [<id> ...] done|blocked`\n"
           "  ◐ SEEN = surfaced, not acted — same remedy, theirs to run\n"
           "  ◌ UNRES = no roster row answers that @name — a typo, OR a "
           "live seat that has not joined; it resolves when they run "

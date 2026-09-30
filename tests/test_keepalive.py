@@ -135,8 +135,10 @@ class KeepaliveTest(unittest.TestCase):
             for name in sorted(dirs + files):
                 p = os.path.join(root, name)
                 st = os.lstat(p)
-                digest = hashlib.sha256(open(p, "rb").read()).hexdigest() \
-                    if stat.S_ISREG(st.st_mode) else None
+                digest = None
+                if stat.S_ISREG(st.st_mode):
+                    with open(p, "rb") as fh:
+                        digest = hashlib.sha256(fh.read()).hexdigest()
                 out.append((os.path.relpath(p, self.tmp), stat.S_IMODE(st.st_mode),
                             st.st_size, st.st_mtime_ns, digest))
         return out
@@ -261,14 +263,16 @@ class KeepaliveTest(unittest.TestCase):
 
     def test_preimage_failure_refuses_before_rotating_grant(self):
         d = self._plant_home("due-home", {"refreshToken": "FAKE-R", "expiresAt": 0})
-        before = open(os.path.join(d, ".credentials.json"), "rb").read()
+        with open(os.path.join(d, ".credentials.json"), "rb") as fh:
+            before = fh.read()
         with mock.patch.object(keepalive.cred, "backup", return_value={
                 "ok": False, "reason": "synthetic failure"}), \
                 mock.patch("urllib.request.urlopen") as request:
             res = keepalive.refresh_home(d, apply=True)
         self.assertEqual(res["action"], "error")
         request.assert_not_called()
-        self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(), before)
+        with open(os.path.join(d, ".credentials.json"), "rb") as fh:
+            self.assertEqual(fh.read(), before)
 
     # -- the refresh grant: rotation persisted, owner-only, token-free log --
     def test_refresh_persists_rotation_atomically(self):
@@ -560,12 +564,14 @@ class KeepaliveTest(unittest.TestCase):
                                                      "expiresAt": 0})
         with mock.patch("urllib.request.urlopen", side_effect=RuntimeError(sentinel)):
             res = keepalive.refresh_home(d, apply=True)
-        text = json.dumps(res) + open(keepalive._log_path()).read()
+        with open(keepalive._log_path()) as fh:
+            text = json.dumps(res) + fh.read()
         self.assertNotIn(sentinel, text)
         with open(os.path.join(d, ".credentials.json"), "wb") as f:
             f.write(b"\xff\xfe" + sentinel.encode())
         res = keepalive.refresh_home(d, apply=True)
-        text = json.dumps(res) + open(keepalive._log_path()).read()
+        with open(keepalive._log_path()) as fh:
+            text = json.dumps(res) + fh.read()
         self.assertNotIn(sentinel, text)
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(keepalive, "_predecessor_pids",
@@ -608,7 +614,8 @@ class KeepaliveTest(unittest.TestCase):
         names where it looked."""
         os.environ.pop(keepalive.CLI_ENV)
         d = self._plant_home("due-home", {"refreshToken": "R", "expiresAt": 0})
-        before = open(os.path.join(d, ".credentials.json"), "rb").read()
+        with open(os.path.join(d, ".credentials.json"), "rb") as fh:
+            before = fh.read()
         with mock.patch.object(keepalive.cred, "backup") as backup, \
                 mock.patch("urllib.request.urlopen") as request:
             res = keepalive.refresh_home(d, apply=True)
@@ -617,8 +624,8 @@ class KeepaliveTest(unittest.TestCase):
         self.assertIn(keepalive.CLI_VERSIONS_DIR, res["reason"])
         backup.assert_not_called()
         request.assert_not_called()
-        self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(),
-                         before)
+        with open(os.path.join(d, ".credentials.json"), "rb") as fh:
+            self.assertEqual(fh.read(), before)
         # the positive control on the same home: with a CLI, the grant runs
         os.environ[keepalive.CLI_ENV] = _write_cli(
             os.path.join(self.tmp, "cli", "cli-under-test"))
@@ -786,14 +793,16 @@ class CadenceTest(unittest.TestCase):
             self.assertTrue(os.path.exists(unit))
             self.assertTrue(keepalive.timer_installed())
             stamp = os.stat(unit).st_mtime_ns
-            body = open(unit).read()
+            with open(unit) as fh:
+                body = fh.read()
             ok2, second = keepalive.ensure_timer()
         self.assertIn("enabled", first)
         self.assertTrue(ok2, second)
         self.assertIn("already installed", second)
         self.assertIn("unchanged", second)
-        self.assertEqual(open(unit).read(), body,
-                         "a verify pass rewrote the unit's content")
+        with open(unit) as fh:
+            self.assertEqual(fh.read(), body,
+                             "a verify pass rewrote the unit's content")
         self.assertEqual(os.stat(unit).st_mtime_ns, stamp,
                          "a verify pass re-wrote the unit file")
 

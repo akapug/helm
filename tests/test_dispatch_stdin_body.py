@@ -22,6 +22,7 @@ import contextlib
 import inspect
 import io
 import os
+import socket
 import sys
 import unittest
 from unittest import mock
@@ -44,6 +45,30 @@ class _Stdin(io.StringIO):
 class _Tty(io.StringIO):
     def isatty(self):
         return True
+
+
+def _piped(test, body):
+    """A stdin backed by a REAL fd (a socket pair) carrying `body` and then
+    EOF, so the readiness select measures it the way it measures a pipe."""
+    left, right = socket.socketpair()
+    test.addCleanup(left.close)
+    test.addCleanup(right.close)
+    if body:
+        right.sendall(body)
+    right.shutdown(socket.SHUT_WR)
+    handle = left.makefile("r")
+    test.addCleanup(handle.close)
+
+    class Fd:
+        def isatty(self):
+            return False
+
+        def fileno(self):
+            return left.fileno()
+
+        def read(self, *a):
+            return handle.read(*a)
+    return Fd()
 
 
 class StdinBodyTest(unittest.TestCase):
@@ -70,13 +95,23 @@ class StdinBodyTest(unittest.TestCase):
         for tok in ("`kind`", "$(command substitution)", "$HOME", '"quotes"'):
             self.assertIn(tok, seen["message"], tok)
 
-    def test_an_argv_body_still_works_and_WINS_over_stdin(self):
-        """Backwards compatibility is not optional — every existing caller passes
-        argv. A body on the command line must be used even when something is
-        piped, or a stray pipe would silently replace an intended message."""
-        rc, seen = self._send(["send", "codex-3", "probe", "the argv body",
+    def test_an_argv_body_beside_a_real_piped_body_REFUSES_and_sends_nothing(self):
+        """Backwards compatibility is not optional -- every existing caller passes
+        argv, and an argv body alone is sent exactly as before. But an argv body
+        AND a body waiting on a real pipe is two bodies for one message: keeping
+        either would report "sent" while the other never left the caller's
+        shell, so the door refuses and sends neither (task/3510). The old worry,
+        a stray pipe silently replacing an intended message, is met by refusing
+        rather than by preferring argv."""
+        rc, seen = self._send(["send", "seat-a", "probe", "the argv body",
                                "--ref", "a" * 40, "--kind", "review"],
-                              _Stdin("the piped body\n"))
+                              _piped(self, b"the piped body\n"))
+        self.assertEqual(rc, 2)
+        self.assertEqual(seen, {}, "a refused send must not reach send()")
+        # THE CONTROL on the same door: an EMPTY real pipe is no second body.
+        rc, seen = self._send(["send", "seat-a", "probe", "the argv body",
+                               "--ref", "a" * 40, "--kind", "review"],
+                              _piped(self, b""))
         self.assertEqual(rc, 0)
         self.assertEqual(seen["message"], "the argv body")
 
@@ -85,7 +120,7 @@ class StdinBodyTest(unittest.TestCase):
             ["send", "codex-3", "probe", "please", "use", "--force",
              "carefully", "--ref", "a" * 40, "--kind", "review",
              "--new-work"],
-            _Stdin("ignored pipe\n"))
+            _Stdin(""))
         self.assertEqual(rc, 0)
         self.assertEqual(seen["message"], "please use --force carefully")
         self.assertFalse(seen["kwargs"]["force"])
@@ -93,8 +128,8 @@ class StdinBodyTest(unittest.TestCase):
     def test_a_trailing_force_flag_reaches_an_argv_body_send(self):
         rc, seen = self._send(
             ["send", "codex-3", "probe", "the body", "--ref", "a" * 40,
-             "--kind", "review", "--new-work", "--force"],
-            _Stdin("ignored pipe\n"))
+             "--kind", "review", "--new-work", "--force", "--reason", "fork"],
+            _Stdin(""))
         self.assertEqual(rc, 0)
         self.assertEqual(seen["message"], "the body")
         self.assertTrue(seen["kwargs"]["force"])
@@ -102,7 +137,7 @@ class StdinBodyTest(unittest.TestCase):
     def test_a_trailing_force_flag_reaches_a_stdin_body_send(self):
         rc, seen = self._send(
             ["send", "codex-3", "probe", "--ref", "a" * 40,
-             "--kind", "review", "--new-work", "--force"],
+             "--kind", "review", "--new-work", "--force", "--reason", "fork"],
             _Stdin("the piped body\n"))
         self.assertEqual(rc, 0)
         self.assertEqual(seen["message"], "the piped body")
@@ -218,8 +253,11 @@ class ReadBombTest(unittest.TestCase):
              mock.patch.object(D, "_deadline", return_value=(3600, None)):
             self.assertEqual(D.cmd_dispatch(["add", "c", "l", "--ref", "a" * 40, "--kind", "review"]), 0)
 
-    def test_send_with_an_ARGV_body_never_touches_stdin(self):
-        """argv-wins must not merely PREFER argv — it must not read at all."""
+    def test_send_with_an_ARGV_body_never_touches_stdin(self):  # noqa: VACUOUS_ASSERTION — the bomb raises on any read(), so rc 0 is reachable only if read() was never called
+        """A message given never reads a stdin it cannot MEASURE: this stream has
+        no descriptor to select, so it is not a second body and read() is
+        never called. A real fd is peeked for one byte and a waiting body is
+        refused (test_an_argv_body_beside_a_real_piped_body_REFUSES...)."""
         with mock.patch.object(sys, "stdin", self._Bomb()), \
              mock.patch.object(D, "send",
                                return_value=({"id": "x" * 32, "recipient": "c",
@@ -297,7 +335,8 @@ class VerdictPolarityRequiredTest(unittest.TestCase):
                 # A FIX NAMING NO CURE STATES WHY. This sweep is about the
                 # EXIT ANSWER, so it carries the one recorded reason rather
                 # than meeting a door it is not measuring.
-                argv += ["--no-patch-because", "a design finding for a meld"]
+                argv += ["--no-patch-because", "a design finding for a meld",
+                         "--finding-count", "1", "--prior-relation", "new"]
             rc, called, _err = self._verdict(argv + ["evidence", "here"])
             observed.append((rc, called.get("polarity"), called.get("basis"),
                              called.get("bind_author"),
@@ -335,6 +374,7 @@ class VerdictPolarityRequiredTest(unittest.TestCase):
             observed.append((p, answer[0], rc, called, marker in err))
         rc, called, _err = self._verdict(
             ["verdict", "a" * 32, "b" * 40, "--fix", "--measured",
+             "--finding-count", "1", "--prior-relation", "new",
              "--worse-than-main", self.PATH,
              "--no-patch-because", "a design finding for a meld",
              "evidence", "here"])

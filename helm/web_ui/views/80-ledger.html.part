@@ -35,6 +35,12 @@
       <div class="ltierhead"><b>this machine only · not signed</b><span>helm’s
         fast working notes on this computer — instant, but they prove nothing
         beyond this host. the signed record is the proof copy.</span></div>
+      <!-- THE CHAIN'S OWN CHECK (task/3445): whether this machine's chain
+           re-hashes clean; Home's signing-record tile carries the count. It
+           names no command to check one record (console walk 3, #6): the
+           owner does not use a terminal. -->
+      <section id="chainsum" class="hsum"><div class="drow"><span class="dlab" title="the local attest-chain's verification, re-hashed with the pipeline read (45s)">chain</span>
+        <div class="dval"><span id="dchain" class="dmut">chain not read yet</span></div></div></section>
       <div class="lcard" id="nativecard">
         <h3>local activity <span class="lsub" id="nativesub">what helm did here, newest first</span></h3>
         <div class="llegend"><span><span class="lbadge final">chained</span> tamper-evident local note — not a signed entry</span>

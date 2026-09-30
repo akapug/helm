@@ -1665,6 +1665,59 @@ class EpisodicTest(StoreBase):
         self.assertEqual(store.load_all(include_dormant=False), [])
 
 
+
+class ReadDoorTest(StoreBase):
+    """keywords, gates and gloss READ through the write door (#951), so an id
+    `get` shows is never "not found" there, including `gates episodic:<id>`
+    (the typed ids the injector prints) and `keywords <type>:<id>`."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed_prior("plaw", "S", keywords="alpha")
+        pk.atomic_write(os.path.join(self.adopted, "war-story.md"),
+                        '---\nname: war-story\ndescription: "the glorp incident"\n'
+                        'metadata:\n  node_type: memory\n  type: project\n---\nbody\n')
+
+    def run_store(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_get_sees_both_entries(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a fixed two-item tuple, so both positive asserts always run
+        # CONTROL: both ids are live for the read door every hint names.
+        for eid in ("prior:plaw", "episodic:war-story"):
+            rc, out, _ = self.run_store("get", eid)
+            self.assertEqual(rc, 0, eid)
+            self.assertIn(eid.split(":", 1)[1], out)
+
+    def test_keywords_reads_the_typed_spelling(self):
+        rc, out, err = self.run_store("keywords", "prior:plaw")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("plaw [prior]", out)
+
+    def test_an_out_of_scope_type_is_refused_by_type_not_not_found(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a fixed three-verb tuple, and test_get_sees_both_entries is the control that the entry exists
+        for verb in ("gates", "gloss", "keywords"):
+            rc, _, err = self.run_store(verb, "episodic:war-story")
+            self.assertEqual(rc, 2, verb)
+            self.assertIn("resolves as type episodic", err)
+            self.assertNotIn("not found", err)
+
+    def test_a_typed_id_and_a_disagreeing_type_are_refused_as_such(self):
+        rc, _, err = self.run_store("gates", "prior:plaw", "--type", "lexicon")
+        self.assertEqual(rc, 2)
+        self.assertIn("names type prior, and --type names lexicon", err)
+
+    def test_a_bare_id_with_its_type_still_reads(self):
+        rc, out, err = self.run_store("keywords", "plaw", "--type", "prior")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("plaw [prior]", out)
+
+    def test_an_id_that_resolves_nowhere_is_still_not_found(self):
+        rc, _, err = self.run_store("gates", "no-such-entry")
+        self.assertEqual(rc, 1)
+        self.assertIn("'no-such-entry' not found", err)
+
 class TypedFallbackTest(StoreBase):
     def test_typed_prefix_without_typed_fields_reads_as_episodic(self):
         # the live store carries prem-/lex- named files that are really bulk
@@ -4462,10 +4515,10 @@ class EntryMintGuardTest(AddGateBase):
         # naming it, not by an empty-notes check that any unrelated note breaks
         self.assertEqual(events, [])
         self.assertEqual([n for n in notes if "DUP OVERRIDE" in n], [])
-        # The pre-generalization spelling keeps its three-value unpack contract.
-        _kw, err, notes = store.guard_add_keywords(
+        # a distinct entry with nothing to stem draws no refusal and no note
+        r = store.guard_entry_keywords(
             "prior", "distinct-law", "quota headroom, cred rotation")
-        self.assertEqual((err, notes), (None, []))
+        self.assertEqual((r.refusal, r.notes), (None, []))
 
     def test_writer_failure_emits_no_duplicate_override(self):  # noqa: VACUOUS_ASSERTION — forced duplicate setup and raised writers positively exercise both absence checks
         self.seed_prior("seat-freeze-law", "seats freeze on plan prompts",
@@ -4957,9 +5010,10 @@ class StemCorpusGateTest(StoreBase):
         for i, stmt in enumerate(self._COMMONS):
             self._attested("noise-%d" % i, stmt, "relay-panel-%d" % i)
 
-    def test_corpus_common_measures_this_corpus(self):  # noqa: VACUOUS_ASSERTION — the absence assert has its unconditional positive control two lines up, on the SAME set: built/works/wired must be IN `common`
+    def test_corpus_profile_common_measures_this_corpus(self):  # noqa: VACUOUS_ASSERTION — the absence assert has its unconditional positive control two lines up, on the SAME set: built/works/wired must be IN `common`
         self._seed_commons()
-        common = store.corpus_common(store._jit_candidates(store.load_all()))
+        common = store.corpus_profile(
+            store._jit_candidates(store.load_all())).common
         self.assertLessEqual({"built", "works", "wired"}, common)
         # the ISOLATION control: `worktree` is corpus-common in the LIVE store
         # (statement-df 91 of 1430 on 2026-08-11) and absent here — a gate
@@ -4972,7 +5026,8 @@ class StemCorpusGateTest(StoreBase):
         for i in range(4):
             self._attested("wt-row-%d" % i, "the worktree %d was left dirty" % i,
                            "dirty-worktree-%d" % i)
-        grown = store.corpus_common(store._jit_candidates(store.load_all()))
+        grown = store.corpus_profile(
+            store._jit_candidates(store.load_all())).common
         self.assertIn("worktree", grown)
 
     def test_discipline_following_capture_needs_no_pruning(self):
@@ -5084,8 +5139,8 @@ class StemCorpusGateTest(StoreBase):
 
     # -- the corpus DRIFTS: the documented behaviour, held to the code -------
     #
-    # corpus_common is derived from the store's own statements, so a capture's
-    # verdict is TIME-DEPENDENT. The lane's choice (stated in corpus_common's
+    # corpus_profile is derived from the store's own statements, so a capture's
+    # verdict is TIME-DEPENDENT. The lane's choice (stated in corpus_profile's
     # docstring): the stop-list is MEASURED, never pinned, because a snapshot
     # freezes the measure at one day's corpus AND cannot see the hazard that
     # lives in the store rather than in the write — a stem admitted while its
@@ -5687,6 +5742,7 @@ class StoreDoctorTest(StoreBase):
         CONTROL: the bare rendering of the same line splits the name into
         two tokens, the shape the pre-cure printer produced."""
         import glob
+        import pathlib
         sib_root = self.project_dir("px", "premises")
         self.seed_prior("keyless-px", "a sibling row in px",
                         conf=1.0, root_dir=sib_root)
@@ -5696,7 +5752,7 @@ class StoreDoctorTest(StoreBase):
         sib_files = sorted(glob.glob(os.path.join(sib_root, "**", "*keyless-px*"),
                                      recursive=True))
         self.assertTrue(sib_files, "sibling row file not found (must-hit)")
-        before = [open(f, "rb").read() for f in sib_files]
+        before = [pathlib.Path(f).read_bytes() for f in sib_files]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = store.cmd_store(["doctor", "--project", "px blue"])
@@ -5713,7 +5769,7 @@ class StoreDoctorTest(StoreBase):
             self.assertEqual(store.cmd_store(argv), 0)
         e = store._find("keyless-px", project="px blue", types=("prior",))
         self.assertEqual(store._kw_list(e["keywords"]), ["coil", "jams"])
-        self.assertEqual([open(f, "rb").read() for f in sib_files], before)
+        self.assertEqual([pathlib.Path(f).read_bytes() for f in sib_files], before)
         # CONTROL: the bare rendering splits the name; its last token is a
         # stray positional and its project is `px`, the sibling's
         bare = shlex.split(lines[0].replace("'px blue'", "px blue"))

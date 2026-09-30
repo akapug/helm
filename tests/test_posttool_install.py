@@ -96,7 +96,15 @@ class InstalledPair(unittest.TestCase):
         self.assertEqual(results[0], results[1])
 
     def test_delivery_only_seat_and_record_only_project_do_not_seed_sibling(self):
-        seat, _, _ = envtidy._derive_hooks("seat:example", {})
+        # A seat is reconciled to the FULL canonical set now (task/3089), so a
+        # delivery-only estate is spelled through the override seam
+        # (HELM_HOOKS_CANONICAL's reader) — the property under test is that a
+        # delivery-only derivation never seeds its recorder sibling.
+        only_deliver = tuple(t for t in envtidy.CANONICAL_HOOKS
+                             if t[2] == "chat deliver --hook-json")
+        self.assertEqual(len(only_deliver), 1)
+        with mock.patch.object(envtidy, "canonical_hooks", return_value=only_deliver):
+            seat, _, _ = envtidy._derive_hooks("seat:example", {})
         self.assertEqual(record._event_cmds(seat), [hooks.spec_command(self.deliver)])
         self.assertNotIn(record.FAIL_EVENT, seat["hooks"])
         (self.root / "project" / ".claude").mkdir(parents=True)
@@ -263,8 +271,8 @@ class InstalledPair(unittest.TestCase):
         self.assertEqual(shlex.split(command)[1], "posttool")
         self.assertEqual(shlex.split(hooks.spec_command(self.deliver))[1],
                          "lane")
-        ladder = open(os.path.join(ROOT, "bin", hooks.HOOK_WRAPPER),
-                      encoding="utf-8").read()
+        with open(os.path.join(ROOT, "bin", hooks.HOOK_WRAPPER), encoding="utf-8") as fh:
+            ladder = fh.read()
         self.assertIn("publication UNKNOWN", ladder)
         self.assertIn("hookSpecificOutput", ladder)
 

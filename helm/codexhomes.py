@@ -23,8 +23,9 @@ LAWS:
     copy), never "the account is dead". Pool warns, never refuses, on it.
   - token material NEVER reaches stdout/stderr — email / account_id / plan /
     paths only. Pooled files are 0600 from creation.
-  - plan tiers: chatgpt_plan_type "pro" = ultra (handles multiple concurrent
-    codexes), "team" = team (one codex each). Read from the access_token's
+  - plan tiers: chatgpt_plan_type "pro" = pro (handles multiple concurrent
+    codexes), "team" = team (one codex each). The tier is named as the
+    vendor names the plan. Read from the access_token's
     https://api.openai.com/auth claim, id_token fallback — decode-only
     identity metadata, tokens discarded.
 
@@ -90,7 +91,7 @@ import time
 
 from . import home, pk, seat as _seat
 
-PLAN_TIER = {"pro": "ultra", "team": "team"}
+PLAN_TIER = {"pro": "pro", "team": "team"}
 
 # `helm codex launch` cred-% gate (runbook 2026-07-21 fix #3): the refuse
 # policy lives here, in numbers, so a launch never silently drains a capped
@@ -102,7 +103,7 @@ TAIL_BYTES = 65536       # bytes tailed per rollout (the last rate_limits win)
 
 
 def tier(plan):
-    """chatgpt_plan_type -> the fleet vocabulary (ultra/team); unknowns pass
+    """chatgpt_plan_type -> the fleet vocabulary (pro/team); unknowns pass
     through raw so a new plan name is visible, never masked."""
     return PLAN_TIER.get(plan, plan or "?")
 
@@ -120,26 +121,26 @@ def personal_plan(plan):
     return isinstance(plan, str) and PLAN_TIER.get(plan, "team") != "team"
 
 
-# slice 6 — N-codex-per-credhome: tier IS the seat-count policy. An ultra
-# credhome (plan pro, 20x) drives N concurrent codex seats against the SAME
-# proxy/pool; a team credhome stays 1-each. HELM_CODEX_ULTRA_SEATS moves the
-# ultra count without a state file; unknown tier = 1 (safe).
-def _ultra_seats():
+# slice 6 — N-codex-per-credhome: tier IS the seat-count policy. A pro
+# credhome (20x) drives N concurrent codex seats against the SAME
+# proxy/pool; a team credhome stays 1-each. HELM_CODEX_PRO_SEATS moves the
+# pro count without a state file; unknown tier = 1 (safe).
+def _pro_seats():
     try:
-        return max(1, int(home.env("CODEX_ULTRA_SEATS") or 3))
+        return max(1, int(home.env("CODEX_PRO_SEATS") or 3))
     except ValueError:
         return 3
 
 
 def seat_capacity(t):
-    """Fleet seats a tier supports. ultra -> HELM_CODEX_ULTRA_SEATS (dflt 3);
+    """Fleet seats a tier supports. pro -> HELM_CODEX_PRO_SEATS (dflt 3);
     team/unknown -> 1."""
-    return _ultra_seats() if t == "ultra" else 1
+    return _pro_seats() if t == tier("pro") else 1
 
 
 def capacity():
     """Fleet seat capacity = what the POOL holds, not what exists under
-    ~/.codex-homes (an unpooled ultra contributes 0). {creds: [{email, tier,
+    ~/.codex-homes (an unpooled pro contributes 0). {creds: [{email, tier,
     seats}], total, unknown, error} over every parseable, non-disabled pooled
     codex record. Read by `helm codex capacity` and the `helm seat launch -i`
     guard.
@@ -1278,12 +1279,12 @@ def usage_gate(census=None):
 
 def _suggest_pool(gate):
     """The concrete fix: best unpooled credhome to `helm codex pool` next —
-    prefer an ok-status ultra, then any ok, then the top ultra regardless
+    prefer an ok-status pro, then any ok, then the top pro regardless
     (its reading is the likeliest to improve once the CLI refreshes it)."""
     unpooled = [g for g in gate if not g["pooled"]]
-    for pred in (lambda g: g["status"] == "ok" and g["tier"] == "ultra",
+    for pred in (lambda g: g["status"] == "ok" and g["tier"] == tier("pro"),
                  lambda g: g["status"] == "ok",
-                 lambda g: g["tier"] == "ultra"):
+                 lambda g: g["tier"] == tier("pro")):
         hits = [g for g in unpooled if pred(g)]
         if hits:
             return hits[0]
@@ -2507,8 +2508,8 @@ def _print_capacity():
         print("helm codex: fleet seat capacity UNKNOWN — %s" % cap["error"],
               file=sys.stderr)
         return 1
-    print("helm codex: fleet seat capacity %d (what the POOL holds, ultra=%d/"
-          "cred via HELM_CODEX_ULTRA_SEATS, team=1)" % (cap["total"], _ultra_seats()))
+    print("helm codex: fleet seat capacity %d (what the POOL holds, pro=%d/"
+          "cred via HELM_CODEX_PRO_SEATS, team=1)" % (cap["total"], _pro_seats()))
     for c in cap["creds"]:
         print("  %-32s %-6s %d seat%s" % (
             c["email"] or "-", c["tier"], c["seats"], "s"[:c["seats"] != 1]))
@@ -2523,9 +2524,9 @@ def _print_capacity():
 
 def cmd_codex(args):
     """codex [list] | pool <name> | unpool <name> | pooled | capacity |
-    resets [--dry-run] [--consume <account>] [--json] |
+    resets [--dry-run | --consume <account>] [--json] |
     sync-orca [--watch] [--force-managed] | launch [-i N|--instance N]
-    [--force] [--room R] [--model M] — codexhome roster (ultra/team) + proxy cred
+    [--force] [--room R] [--model M] — codexhome roster (pro/team) + proxy cred
     pooling (auth.json -> 0600 pool file). resets = the earned rate-limit
     reset credits, per pooled account, and the door that spends one. launch = the cred-% gate ahead
     of the seat-launch mint; sync-orca = the one-way orca-selection -> pool

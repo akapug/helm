@@ -1,0 +1,43 @@
+{
+  "seats": {
+    "cloud-opus": {
+      "driver": "claude-cloud",
+      "model": "opus",
+      "effort": "high",
+      "transport": "standing",
+      "review_seat": "cloud-opus-review",
+      "accounts": [
+        {"email": "reviewer-one@example.com", "home": "~/.claude-homes/reviewer-one",
+         "standing_session": "session_01ExampleStandingOne"},
+        {"email": "reviewer-two@example.com", "home": "~/.claude-homes/reviewer-two",
+         "standing_session": "session_01ExampleStandingTwo"}
+      ]
+    },
+    "cloud-opus-review": {
+      "driver": "claude-cloud",
+      "model": "opus",
+      "effort": "high",
+      "accounts": [
+        {"email": "reviewer-one@example.com", "home": "~/.claude-homes/reviewer-one",
+         "standing_session": "session_01ExampleStandingOne"},
+        {"email": "reviewer-two@example.com", "home": "~/.claude-homes/reviewer-two",
+         "standing_session": "session_01ExampleStandingTwo"}
+      ]
+    }
+  },
+  "projects": {
+    "my-project": {
+      "repo": "~/src/my-project",
+      "base": "origin/main",
+      "drop": "owner/private-repo#5",
+      "drop_authors": ["owner"],
+      "brief": "~/src/my-project/review-protocol.txt",
+      "doors": ["src/auth/*", "deploy/*"],
+      "cure_author": "Owner Name <owner@example.com>",
+      "build_author": "Owner Name <owner@example.com>",
+      "transport": "branch",
+      "push_repo": "owner/private-repo",
+      "branch_prefix": "cloudrev/"
+    }
+  }
+}

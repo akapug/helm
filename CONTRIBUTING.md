@@ -43,24 +43,35 @@ whole suite when it lands. In helm's own tree, `helm gate run` enforces that
 split; an adopter project's gate is unchanged.
 
 - **A focused round.** `helm gate run --focus --plan` prints the selection
-  and runs nothing: the test modules whose imports reach a changed module.
-  For a change outside the import graph (a doc, a script), the selection is
-  every tree-wide audit plus each test module that names the file.
-  `helm gate run --focus` runs that selection and mints a focused receipt.
+  and runs nothing. Every whole suite of helm's tree records which files each
+  test module reached, and the plan uses the newest usable record: the test
+  modules whose recorded run reached a file changed since the record's tree,
+  every tree-wide audit, and each test module that names a changed file. The
+  plan names the record and its tree. With no usable record the plan falls
+  back to the test modules whose imports reach a changed module (for a change
+  outside the import graph, every audit plus the tests that name the file),
+  and says why. `helm gate run --focus` runs that selection and mints a
+  focused receipt. A selection of six or more modules runs as parallel
+  slices on the workers the host grants; a smaller one runs in one
+  process. The run says which runner it used and why.
 - **The tree-wide audits, in every round.**
   `helm gate audits -- <your test modules>` prints one command that runs
   every audit plus the modules you name. An audit reads the whole tree
-  instead of importing what it judges, so the focused selection for a Python
-  change does not reliably include it. If you skip this step, a new module,
-  verb or docstring reference meets the audits for the first time at the land
-  gate.
+  instead of importing what it judges. A recorded plan always carries the
+  audits; the import fallback does not reliably carry them for a Python
+  change. If you skip this step on the fallback, a new module, verb or
+  docstring reference meets the audits for the first time at the land gate.
 - **A red round.** Cure it and run the focused round again. A whole suite
   does not run twice on the same tree without a reason: a tree whose last
   whole-suite receipt is red runs again only with `--again` (a suspected
-  flake), and a tree that already has a green one is refused, with that
-  receipt's evidence line printed for you to cite.
-- **The whole suite belongs to the land gate.** The land gate is one serial
-  whole suite, on the exact tree that lands: the integrator's train. In a lane
+  flake), and a tree that already has a green one that can authorize a land
+  of it is refused, with that receipt's evidence line printed for you to
+  cite. A green that cannot land (a sliced receipt, or one only a generic
+  import placed) does not stop the land's own suite; "can land" is
+  foldcheck's own tree-vs-gate rung.
+- **The whole suite belongs to the land gate.** The land gate is one whole
+  suite, on the exact tree that lands (sliced while the gate canary stands,
+  serial otherwise): the integrator's train. In a lane
   room, `helm gate run` refuses a whole suite and prints the focused route
   instead. The escape is `--lane-suite --why TEXT`: the reason goes on the
   receipt label, and every escape is counted.
@@ -70,18 +81,25 @@ What each run can authorize:
 | run | receipt | binds | never binds |
 |---|---|---|---|
 | `helm gate run --focus` | focused (v6) | a cure-round verdict (FIX, SUPERSEDE, CONCUR) at the exact tip | an APPROVE, a land |
-| a whole suite with no mode flag in a lane-level room: a peek, a seat's home, a harness worktree, or a lane room admitted by `--lane-suite` | sliced (v10) | a lane tip, a review's APPROVE | a land |
-| a whole suite anywhere else: the shared checkout, a compose or train room, a `train...` label, a Fab job, or `--serial` | serial | a lane tip, an APPROVE, a land | — |
+| a whole suite with no mode flag in a lane-level room: a peek, a seat's home, a harness worktree, or a lane room admitted by `--lane-suite` | sliced (v10) | a lane tip, a review's APPROVE; a land only while the gate canary stands | a land while the canary does not stand |
+| a whole suite anywhere else: the shared checkout, a compose or train room, a `train...` label, a Fab job, or `--serial` | serial, except the land gate `helm gate window launch`, which runs as slices (v10) while the gate canary stands | a lane tip, an APPROVE, a land | — |
 
-**Sliced is the fast whole suite, and it never lands.** It runs the suite as
-parallel slices of one serial discovery. Every worker must agree on one
+**Sliced is the fast whole suite, and it lands only under the canary.** It
+runs the suite as parallel slices of one serial discovery. Every worker must agree on one
 ordered test inventory, and a leak audit fails any module that leaves process
 state behind. What it cannot see is data that one module leaves in a shared
 module object for a module on a different worker. A serial run sees that
 failure and a sliced run can miss it, so every land door refuses the sliced
-kind by name. A lane-level room that cannot run slices (fewer than four CPUs,
-or a tree whose own `helm/gate.py` predates the kind) runs serial and says
-why. `helm gate equiv` and a standalone `helm/gateshard.py` run are diagnostic
+kind by name unless the gate canary stands: no DISABLE marker, a clean
+one-pass finder run (every module alone in a fresh process), a leak-free
+report-mode sliced suite, three trees on two hosts whose serial and sliced
+runs agreed test for test, a red tree whose real failures the sliced run
+caught too, and evidence under 36 hours old. The
+nightly canary compares a serial and a sliced run of trunk, and its first
+divergence writes the DISABLE marker, which sends every land back to serial.
+A lane-level room that cannot run slices (fewer than four CPUs, or a tree
+whose own `helm/gate.py` predates the kind) runs serial and says why.
+`helm gate equiv` and a standalone `helm/gateshard.py` run are diagnostic
 fresh-worker tools: their results cannot mint or bind landing authority.
 
 **Review and landing.**
@@ -91,13 +109,14 @@ fresh-worker tools: their results cannot mint or bind landing authority.
   APPROVE is refused without a verified `gate:<token>` from a whole suite; it
   is recorded against the token the land gate mints on the tree that lands. A
   CONCUR is not a way around that: it endorses the work and authorizes nothing.
-- The integrator's land gate is one serial whole suite for each landing
-  window (one trunk head). The durable road is `helm gate window launch`,
+- The integrator's land gate is one whole suite for each landing window (one
+  trunk head), run as slices while the canary stands and serial otherwise.
+  The durable road is `helm gate window launch`,
   which `helm train --apply` and `helm gate run` in a compose room both use.
   It records the window before it dispatches a keyed job, refuses a second
   whole suite on the same window, and leaves a detached client that fetches
   and imports the receipt. The classic road is `fab gate` on a train room
-  that stands outside the compose container. It also runs serial, and its
+  that stands outside the compose container. It runs serial, and its
   receipt comes home only through the client that launched it, which imports
   it with `helm gate import`. In a compose room the classic road is refused,
   and the refusal names the durable one. `--sliced` is a usage error in a
@@ -176,6 +195,23 @@ The matrix runs its `unittest` children on the machine that starts it, so on a
 host that refuses local suites (see "Where tests run" above), start it where
 suites may run.
 
+## Choosing what to work on
+
+Friction is a cost, and we count it: the friction tax. Each step repeated by
+hand, each workaround of a hook or guard, each wait, re-read, re-ask or false
+refusal is paid again by every later task that meets it. When you meet
+friction, name it and file it with its size: steps (or minutes) times how
+often it happens per day, counted, never guessed. `helm friction` counts
+guard refusals from the friction ledger; the chat and the transcripts show
+the rest. Count from a bounded sample (a few hundred transcripts at most, or
+a few minutes of work) or run the count through `fab`: a scan of every
+transcript on the machine the agents share can stall every one of them. A fix that removes it is a tax cut, and its payback time is its
+build cost divided by the tax it removes each day. A tax cut that pays back
+within about two days goes ahead of new features. When it lands, say how
+much tax it removed. For example, landing a change by hand once took about 15
+steps, about 20 times a day; automating the land cut about 300 steps a day
+and paid back in about a day.
+
 ## The laws new code obeys
 
 1. **Zero dependencies.** Stdlib only — no pip, no vendored packages, no
@@ -199,7 +235,7 @@ suites may run.
    tombstone; files are kept as the record.
 
 4. **The env2 pattern.** New configuration is a `HELM_*` variable with a
-   working default; if it replaces a predecessor's variable, the legacy
+   working default; if it replaces an older variable, the legacy
    spelling is read as a fallback forever and written never (see
    [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)). Machine-local paths never
    live in code — they arrive by env.
@@ -241,9 +277,15 @@ whole suite, which is the slowest place in the tree to learn anything.
 ## Adding a verb
 
 Add `cmd_<name>` in its own module, register it in `cli.py`'s `VERBS` via
-`_lazy`, add its one-liner to `_VERB_HELP`, document it in
-[docs/VERBS.md](docs/VERBS.md), and test it. The dispatcher help and VERBS.md
-must never disagree — a verb without a doc entry is a bug (this repo learned
+`_lazy`, add its help entry to `_VERB_HELP` in `helm/cli_help.py` (the root
+listing, `helm --help`, prints one line cut from that entry: its usage with
+the bracketed groups taken out but an optional subverb group such as
+`[show|record]`, all of it one optional group when the verb runs bare, then
+its first sentence; a verb that runs bare says so in its entry, by bracketing
+the subverb bare runs, as `codex [list]|pool <name>`, or by a form of flags
+alone, as `ship [--apply] | ship pull`),
+document it in [docs/VERBS.md](docs/VERBS.md), and test it. The dispatcher help
+and VERBS.md must never disagree — a verb without a doc entry is a bug (this repo learned
 that by audit).
 
 ## Verify before you call it done
@@ -267,3 +309,98 @@ scanner's ceiling — never enters history in ANY repo; the pre-commit guard
 (`helm work install-guard --apply`, `helm/nevertrack.py`) refuses it, and
 the devops skill's "Repository Hygiene" section carries the scrub ladder
 for a leak already in history (untracking is not a scrub).
+
+## Releasing
+
+A release is one command. It is a dry run unless you pass `--publish`.
+
+```console
+$ python3 scripts/release/release.py 0.3.2              # dry run: every step except the network writes
+$ python3 scripts/release/release.py 0.3.2 --publish    # stage, push, tag, create the GitHub release
+```
+
+The public repository's `main` is a line of release commits. Each release is
+one commit on top of the previous one. Its tree is the trunk tree minus the
+paths in `scripts/release/omit.txt`, and its author is the public
+repository's owner (the GitHub noreply identity). So a release is a
+fast-forward: it never rewrites history and never force-pushes. The
+development history stays in the private repository.
+
+Before you run it:
+
+- `CHANGELOG.md` has a `## <version>` section. That section is the release
+  notes.
+- `helm/__init__.py` declares that `__version__`.
+- The trunk commit passed the land gate. The command does not run the whole
+  suite again: it proves that the release tree is the trunk tree minus the
+  omit list, byte for byte.
+
+What it does, in order:
+
+1. **Read.** The trunk commit (`--trunk`, default `main`), the public main
+   (`--public`, default the remote `aspublic`) and the public tags. It
+   refuses a version whose tag is already public.
+2. **Back up.** A bare mirror of the public repository in the work directory,
+   `git fsck` clean, its main equal to the public main it read. The work
+   directory is kept, so it must survive a reboot: by default each run gets a
+   new directory under `~/.helm/releases/<version>/`, and a `--work` on a
+   memory filesystem (`tmpfs`, `ramfs`; `/tmp` is one on many hosts), on a
+   filesystem the mount table cannot name, or inside the checkout is refused.
+3. **Build.** The candidate commit and the annotated tag `v<version>`, in a
+   work repository. The same inputs build the same commit, so the sha that a
+   dry run prints is the sha that `--publish` pushes.
+4. **Gate.** The candidate must fast-forward the public main by exactly one
+   commit that changes the tree, and that tree must be the trunk tree minus
+   the omit list. Then the command writes the reports you read before a
+   public release, under `<work>/reports/` and never in the repository:
+   `world_audit.txt` (private tokens, seat names, addresses that are not
+   placeholders, task cites, dates and the owner's voice, counted per class
+   with the files that carry them), `seat_attribution.txt`, `arm_attr.txt`
+   and `content.txt`. They hold private values, so they are readable by you
+   only and the terminal shows counts. The seat-attribution gate refuses a
+   line in `helm/` that names a seat as the one who found or reviewed
+   something unless the KEEP list names it, and a KEEP entry that matches no
+   line. Then the verify battery runs on a fresh clone: no AI
+   authoring line and no private needle in any commit message, the tag
+   message or the notes; no forbidden filename; no private needle in any
+   file; `bin/helm --help`; `bin/helm doctor` in a scratch `HELM_HOME`;
+   `scripts/install.sh`; and `gitleaks`.
+5. **Write, with `--publish` only.** Push the candidate to
+   `release/<version>` on the private repository (`--private`, default
+   `origin`); push it to the public `main` with no force; push the tag; run
+   `gh release create v<version> --verify-tag` with the CHANGELOG section as
+   the notes; then run the battery again on a fresh clone of the public
+   repository. The dry run prints each of these writes and performs none.
+
+Exit status: 0 when the dry run or the publish succeeded; 1 when a read or a
+gate refused, before any network write; 3 when the publish stopped part-way
+(a write failed or timed out, or the public main moved after the stage write;
+the output lists the writes still owed, as commands) or when the published
+repository failed the battery. Any other error is printed as a refusal,
+redacted like every other line and never as a traceback: exit 1 before the
+first network write began, exit 3 after it. What the interpreter prints when
+even that line cannot be printed (stdout closed under it) is redacted the
+same way.
+
+The private needles and the machine-local never-track paths come from
+outside the tree (`HELM_PRIVATE_NEEDLES` and `HELM_NEVER_TRACK_LOCAL`; see
+`helm/nevertrack.py`). `--publish` refuses when no needles are loaded, and
+when `gitleaks` is not installed unless you pass `--without-gitleaks`.
+
+Two more files come from outside the tree, because they name the private
+things the tree must not: the KEEP list (`--keep-file`, default
+`~/.config/helm/release-attr-keep.json`, a JSON list of `{"file", "text",
+"reason"}`) and the private patterns (`--audit-file`, default
+`~/.config/helm/release-audit.json`, a JSON object with the regular
+expressions `seat`, `private_token` and `owner` and a `literals` object of
+labelled strings). Each must be readable by its owner only (`chmod 600`) and
+must not be inside the checkout; one that is absent, loose or malformed is
+not read, and the seat-attribution gate then refuses, in a dry run and in
+`--publish`.
+
+To publish a candidate that was already reviewed, pass `--candidate <rev>`
+(for example the staged `origin/release/<version>`). If the public main moved
+since that candidate was cut, the push would not fast-forward, and the
+command refuses before it writes anything. `--help` lists every option;
+`tests/test_release_tool.py` drives the command against a local bare
+"public" repository and a stub `gh`.

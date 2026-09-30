@@ -24,6 +24,16 @@ THE MATRIX IS THE TASK'S OWN: both rungs x (main seat, subagent) x eight
 states, one subTest per cell, through the shipped entry `cmd_argv_guard`. The
 rig is real: a registered repository with a linked lane, an unregistered one
 with a lane, and a registered one with no lane, all made with git.
+
+THE WRITE RUNG (task/3301, round 2). Edit, Write and NotebookEdit are refused
+when the path resolves inside the shared checkout onto a tracked or
+not-ignored file, and a check-ignore that does not answer fails closed.
+`.git/info/exclude` stays writable, and so does a gitignored `.remember/` and
+a lane room. git init is judged by its directory operand (default the cwd):
+refused at or inside the shared checkout or the lane parent `<checkout>-wt`,
+and allowed for a new project beside them. Text containing
+HELM_WORK_INTEGRATOR=1 is not an exemption; only that variable in the process
+environment is. The refusal names `helm work claim`.
 """
 import contextlib
 import io
@@ -90,6 +100,17 @@ def setUpModule():
     _os.makedirs(RIG["sub"])
     RIG["link"] = _os.path.join(tmp, "shared-link")
     _os.symlink(RIG["shared"], RIG["link"])
+    with open(_os.path.join(RIG["shared"], "helm", "x.py"), "w") as f:
+        f.write("x = 1\n")
+    with open(_os.path.join(RIG["shared"], ".gitignore"), "w") as f:
+        f.write(".remember/\n")
+    remembered = _os.path.join(RIG["shared"], ".remember")
+    _os.makedirs(remembered)
+    with open(_os.path.join(remembered, "x"), "w") as f:
+        f.write("state\n")
+    _git(RIG["shared"], "add", "-A")
+    _git(RIG["shared"], "-c", "core.hooksPath=/dev/null", "commit", "-qm",
+         "tracked")
     RIG["gone"] = _os.path.join(tmp, "no-such-dir", "x")
     path = home.registry_path()
     _os.makedirs(_os.path.dirname(path), exist_ok=True)
@@ -143,6 +164,22 @@ class _Env(unittest.TestCase):
             rc = chat.cmd_argv_guard([])
         return rc, out.getvalue() + err.getvalue()
 
+    def file_hook(self, path, cwd=None, tool="Edit", key="file_path"):
+        """(rc, stdout+stderr) of the shipped entry for a file tool."""
+        payload = {"hook_event_name": "PreToolUse", "tool_name": tool,
+                   "session_id": "sess-sharedtree",
+                   "tool_use_id": "toolu_sharedtree",
+                   "tool_input": {key: path}}
+        if cwd is not None:
+            payload["cwd"] = cwd
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(_sys, "stdin",
+                               io.StringIO(json.dumps(payload))), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = chat.cmd_argv_guard([])
+        return rc, out.getvalue() + err.getvalue()
+
 
 TREE_ACT = "git stash pop"
 LEDGER_ACT = ("helm dispatch verdict d-17 TIP --approve --measured "
@@ -173,7 +210,8 @@ def _states():
 
 
 # rung A refuses in exactly these states, for the seat and a subagent alike
-_TREE_REFUSES = frozenset(("shared checkout cwd", "git -C shared"))
+_TREE_REFUSES = frozenset(("shared checkout cwd", "git -C shared",
+                           "HELM_WORK_INTEGRATOR=1"))
 
 
 class SurfaceByStateMatrixTest(_Env):
@@ -203,9 +241,10 @@ class SurfaceByStateMatrixTest(_Env):
         self.assertEqual(cells, 32)
 
     def test_the_integrator_declared_in_the_environment(self):
-        """The seat's own environment clears rung A, and never rung B: a
-        subagent inherits its seat's environment whole, so a declaration
-        there would open the ledger to every reader it delegates to."""
+        """Only the hook process's environment clears rung A, never command
+        text and never rung B. A subagent inherits its seat's environment
+        whole, so a declaration there would open the ledger to every reader
+        it delegates to."""
         rc, out = self.hook(TREE_ACT, RIG["shared"])
         self.assertEqual(rc, 2, out)
         with mock.patch.dict(_os.environ, {"HELM_WORK_INTEGRATOR": "1"}):
@@ -217,6 +256,13 @@ class SurfaceByStateMatrixTest(_Env):
             self.assertEqual(rc, 2, out)
             rc, out = self.hook(LEDGER_ACT, RIG["shared"])
             self.assertEqual((rc, "BLOCKED" in out), (0, False), out)
+
+    def test_an_integrator_assignment_in_command_text_grants_nothing(self):
+        """A seat can type the integrator variable; that is not role proof."""
+        rc, out = self.hook(
+            "HELM_WORK_INTEGRATOR=1 " + TREE_ACT, RIG["shared"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
 
     def test_monitor_runs_the_same_shell(self):  # noqa: VACUOUS_ASSERTION — every arm of a finite tuple literal executes, and each asserts rc 2 and a refusal
         for rung, command, agent in (("A", TREE_ACT, None),
@@ -417,6 +463,8 @@ class SharedCheckoutRungTest(_Env):
                       out)
         self.assertIn("git stash is one list for every worktree", out)
         self.assertIn("HELM_WORK_INTEGRATOR=1", out)
+        self.assertIn("in the seat's environment; text in the command "
+                      "does not count", out)
 
 
 class EntryImportTest(unittest.TestCase):
@@ -466,6 +514,223 @@ class EntryImportTest(unittest.TestCase):
         self.assertEqual(rc, 0, err[-600:])
         self.assertEqual(sorted(passed - plain), [])
 
+
+class SharedCheckoutWriteRungTest(_Env):
+    """A file tool writing the shared checkout, and git init whose directory
+    operand is the checkout or the lane parent (task/3301). Shell writes are
+    not parsed. The refusal names the lane to claim. A gitignored path, the
+    exclude file, and a lane room stay writable."""
+
+    def tracked(self):
+        return _os.path.join(RIG["shared"], "helm", "x.py")
+
+    def remembered(self):
+        return _os.path.join(RIG["shared"], ".remember", "x")
+
+    def test_edit_on_a_tracked_shared_path_is_refused(self):
+        rc, out = self.file_hook(self.tracked())
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_the_integrator_environment_passes_the_edit(self):
+        rc, out = self.file_hook(self.tracked())
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+        with mock.patch.dict(_os.environ, {"HELM_WORK_INTEGRATOR": "1"}):
+            rc, out = self.file_hook(self.tracked())
+        self.assertEqual(rc, 0, out)
+
+    def test_edit_on_an_ignored_remember_path_passes(self):
+        rc, out = self.file_hook(self.tracked())
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+        rc, out = self.file_hook(self.remembered())
+        self.assertEqual(rc, 0, out)
+
+    def test_edit_on_a_lane_room_path_passes(self):
+        rc, out = self.file_hook(self.tracked())
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+        rc, out = self.file_hook(_os.path.join(RIG["lane"], "a.txt"))
+        self.assertEqual(rc, 0, out)
+
+    def test_write_on_a_tracked_shared_path_is_refused(self):
+        rc, out = self.file_hook(self.tracked(), tool="Write")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_notebook_edit_on_a_tracked_shared_path_is_refused(self):
+        rc, out = self.file_hook(
+            self.tracked(), tool="NotebookEdit", key="notebook_path")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_edit_of_a_new_unignored_file_is_refused(self):
+        rc, out = self.file_hook(
+            _os.path.join(RIG["shared"], "helm", "new.py"))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_a_symlink_into_the_shared_checkout_is_refused(self):
+        rc, out = self.file_hook(_os.path.join(RIG["link"], "helm", "x.py"))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_a_dotdot_path_into_the_shared_checkout_is_refused(self):
+        path = _os.path.join(RIG["lane"], "..", "..", "shared", "helm", "x.py")
+        rc, out = self.file_hook(path)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_git_init_at_the_lane_parent_is_refused(self):
+        rc, out = self.hook("git init", RIG["shared"] + "-wt")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_git_init_in_the_shared_checkout_is_refused(self):
+        rc, out = self.hook("git init", RIG["shared"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_git_init_with_directory_at_the_lane_parent_is_refused(self):
+        rc, out = self.hook(
+            "git -C %s init" % (RIG["shared"] + "-wt"), "/tmp/x")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_git_init_outside_the_lane_parent_passes(self):
+        rc, out = self.hook("git init", RIG["shared"] + "-wt")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+        rc, out = self.hook("git init", "/tmp/x")
+        self.assertEqual(rc, 0, out)
+
+    def test_git_init_inside_a_lane_is_refused(self):
+        """A lane room is inside `<checkout>-wt`. git init there is the same
+        target the lane-parent arm refuses."""
+        rc, out = self.hook("git init", RIG["lane"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_git_init_of_the_checkout_by_operand_is_refused(self):
+        """The directory operand is the target, not the cwd the command was
+        typed in."""
+        rc, out = self.hook("git init %s" % RIG["shared"], "/tmp/x")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_git_init_of_the_lane_parent_by_operand_is_refused(self):
+        rc, out = self.hook(
+            "git init %s" % (RIG["shared"] + "-wt"), "/tmp/x")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+
+    def test_git_init_of_an_outside_directory_from_the_checkout_passes(self):
+        rc, out = self.hook("git init", RIG["shared"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+        rc, out = self.hook("git init /tmp/x", RIG["shared"])
+        self.assertEqual(rc, 0, out)
+
+    def test_git_init_of_a_new_project_beside_the_checkout_passes(self):
+        rc, out = self.hook("git init", RIG["shared"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+        target = _os.path.join(RIG["tmp"], "newproj")
+        rc, out = self.hook("git init %s" % target, RIG["shared"])
+        self.assertEqual(rc, 0, out)
+
+    def test_git_init_fixture_from_an_ancestor_passes(self):
+        """An ancestor of the lane parent is not itself the lane parent. The
+        operand `fixture` is a sibling of the checkout, not a checkout."""
+        rc, out = self.hook("git init", RIG["shared"] + "-wt")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+        rc, out = self.hook("git init fixture", RIG["tmp"])
+        self.assertEqual(rc, 0, out)
+
+    def test_edit_of_git_info_exclude_passes(self):
+        """Private never-track names go in the primary checkout's exclude."""
+        rc, out = self.file_hook(self.tracked())
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+        exclude = _os.path.join(RIG["shared"], ".git", "info", "exclude")
+        rc, out = self.file_hook(exclude)
+        self.assertEqual(rc, 0, out)
+
+    def test_a_check_ignore_that_does_not_answer_fails_closed(self):
+        """A path inside the rail checkout is refused when git does not
+        answer. The probe budget stays under the hook's 2 s."""
+        rc, out = self.file_hook(self.tracked())
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        backend = mock.Mock()
+        # The rail read still answers; only check-ignore goes dark.
+        backend.probe.side_effect = lambda _cwd, *a, **_kw: (
+            chat._RAIL if a[:3] == ("config", "--get", chat._RAIL_KEY) else None)
+        backend.probe_outcome.return_value = (False, None, None)
+        with mock.patch("helm.vcs.backend", return_value=backend):
+            rc, out = self.file_hook(self.tracked())
+        self.assertTrue(backend.probe_outcome.called)
+        _args, kwargs = backend.probe_outcome.call_args
+        self.assertLess(kwargs.get("timeout", 2), 2)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+
+    def test_a_declaration_in_the_command_text_does_not_exempt_git_init(self):
+        """HELM_WORK_INTEGRATOR=1 grants only when it is the process
+        environment, never because the command text contains it."""
+        rc, out = self.hook("git init", RIG["shared"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("claim a lane with `helm work claim <name>`", out)
+        self.assertIn(RIG["shared"], out)
+        rc, out = self.hook(
+            "git init %s  # HELM_WORK_INTEGRATOR=1" % RIG["shared"], "/tmp/x")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("[helm argv-guard] BLOCKED", out)
+        self.assertIn("in the seat's environment; text in the command "
+                      "does not count", out)
 
 if __name__ == "__main__":       # pragma: no cover
     unittest.main()

@@ -51,6 +51,14 @@ class HomesBase(unittest.TestCase):
         for k in ("HELM_SKILL_DECK", "MELD_SKILL_DECK", "HELM_SKILLS_CANONICAL",
                   "MELD_SKILLS_CANONICAL", "MELD_HOME"):
             os.environ.pop(k, None)
+        # no live claude holds a scratch home: the state writer asks helm's
+        # process census first (orcaadopt.claude_processes, task/2698), and a host's
+        # own fleet must not decide these arms
+        from helm import projectmcp
+        census = mock.patch("helm.orcaadopt.claude_processes",
+                            return_value=([], []))
+        census.start()
+        self.addCleanup(census.stop)
 
     def tearDown(self):
         self._envpatch.stop()
@@ -109,6 +117,37 @@ class HomesTest(HomesBase):
         self.assertFalse(os.path.exists(os.path.join(res["home"], ".credentials.json")))
         # idempotent re-prepare
         self.assertTrue(homes.home_create("claude", "new@user.example")["existing"])
+
+    def test_a_prepared_home_carries_no_ai_attribution_before_its_first_session(self):
+        """task/3591: the owner's rule is no AI authoring line anywhere. A
+        credential home is used by `claude /login` and by orca before any
+        `helm hooks install` runs, so prepare writes the estate defaults
+        (hooks.ESTATE_DEFAULTS, attribution included) through the one writer,
+        hooks.install_home; drift names a home that lacks them."""
+        from helm import configs, hooks
+        # the config write gate admits the new home, as it admits any direct
+        # child of ~/.claude-homes on a host (configs._allowed_home); the
+        # fixture's homes root is no such path, so the home is listed, and
+        # backups go to the tmp
+        home = os.path.join(homes.ROOTS["claude"], "attr-user-example")
+        configs.HOME_ROOTS.append(home)
+        self.addCleanup(configs.HOME_ROOTS.remove, home)
+        backups = configs.BACKUP_DIR
+        configs.BACKUP_DIR = os.path.join(self.tmp, "config-backups")
+        self.addCleanup(setattr, configs, "BACKUP_DIR", backups)
+        res = homes.home_create("claude", "attr@user.example")
+        self.assertNotIn("error", res)
+        with open(os.path.join(res["home"], "settings.json")) as f:
+            settings = json.load(f)
+        self.assertEqual(settings.get("attribution"),
+                         {"commit": "", "pr": "", "sessionUrl": False})
+        self.assertTrue(hooks._defaults_live(settings))
+        self.assertIsNone(homes._miss_hook_contract(res["home"]))
+        # MUST-HIT: the same home with the block pulled is named by drift.
+        settings.pop("attribution")
+        with open(os.path.join(res["home"], "settings.json"), "w") as f:
+            json.dump(settings, f)
+        self.assertIn("attribution", homes._miss_hook_contract(res["home"]))
 
     def test_prepare_links_skill_deck_additively(self):
         deck = os.path.join(self.tmp, "deck")
@@ -498,7 +537,21 @@ class HomesTest(HomesBase):
         with open(os.path.join(d, ".claude.json"), "w") as f:
             json.dump({"oauthAccount": {"emailAddress": "squatter@elsewhere.example"}}, f)
         res = homes.home_create("claude", "clash@user.example")
+        self.assertIn(
+            "metadata says squatter@elsewhere.example (lineage UNKNOWN)",
+            res["error"])
+        self.assertNotIn("already holds", res["error"])
+
+    def test_prepare_codex_still_names_the_token_account_as_a_hold(self):
+        """Codex identity is the id_token email, not oauthAccount metadata."""
+        tok = self._jwt({"email": "squatter@elsewhere.example"})
+        d = os.path.join(homes.ROOTS["codex"], "clash-user-example")
+        os.makedirs(d)
+        with open(os.path.join(d, "auth.json"), "w") as f:
+            json.dump({"tokens": {"id_token": tok}}, f)
+        res = homes.home_create("codex", "clash@user.example")
         self.assertIn("already holds squatter@elsewhere.example", res["error"])
+        self.assertNotIn("metadata says", res["error"])
 
     # -- _resolve: name, alias, path; ambiguity demands a provider ----------
     def test_resolve_by_alias_and_path(self):
@@ -674,7 +727,7 @@ class HomeBenefitListTest(HomesBase):
             return None if os.path.exists(os.path.join(home, self.MARK)) \
                 else "no marker file"
         return homes.Benefit(self.MARK, "this test", prov, missing, False,
-                             "`helm homes provision {name}`")
+                             "`helm homes provision {name} --apply`")
 
     def _row(self, rows, path):
         real = os.path.realpath(path)
@@ -709,16 +762,18 @@ class HomeBenefitListTest(HomesBase):
         with the two the hook installer writes."""
         self.assertEqual([b.name for b in homes.BENEFITS],
                          ["shared session store", "skills hub", "skill deck",
-                          "mcp servers", "opus xhigh + ultracode",
+                          "mcp servers", "project mcp approvals",
+                          "global instructions", "opus xhigh + ultracode",
                           "hook contract", "auto-memory base"])
         for b in homes.BENEFITS:
             self.assertTrue(b.source and b.remedy and callable(b.missing), b)
 
     def test_a_new_home_is_told_the_hook_contract_is_not_yet_written(self):
-        """The two benefits this pass does not write are checked instead, so
-        the new home's note names the gap and its command, not silence."""
+        """A hook contract this pass could not write (here the config write
+        gate refuses the fixture's homes root) is named with its command, not
+        silence (task/3591: the pass now writes it through install_home)."""
         res = homes.home_create(self.PROVIDER, "hooks@user.example")
-        self.assertIn("hook contract not written here", res["note"] or "")
+        self.assertIn("hook contract not written", res["note"] or "")
         self.assertIn("`helm hooks install` writes it", res["note"] or "")
 
     def test_the_mcp_source_is_the_default_homes_sibling_state_file(self):
@@ -743,7 +798,7 @@ class HomeBenefitListTest(HomesBase):
         old = self._plant_claude_home("bare-user-example", "bare@user.example")
         row = self._row(homes.benefit_drift(), old)
         self.assertIn(("mcp servers", "servers absent: sib-only",
-                       "`helm homes provision bare-user-example`"), row["missing"])
+                       "`helm homes provision bare-user-example --apply`"), row["missing"])
 
     def test_a_rewritten_home_config_leaves_its_backup_beside_it(self):
         d = homes.DEFAULTS[self.PROVIDER]
@@ -812,10 +867,10 @@ class HomeBenefitListTest(HomesBase):
             json.dump(body, fh)
         before = self._row(homes.benefit_drift(), home)
         self.assertIn(("mcp servers", "servers absent: pa",
-                       "`helm homes provision have-user-example`"), before["missing"])
+                       "`helm homes provision have-user-example --apply`"), before["missing"])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = homes.cmd_homes(["provision", "have-user-example"])
+            rc = homes.cmd_homes(["provision", "have-user-example", "--apply"])
         self.assertEqual(rc, 0, out.getvalue())
         with open(path) as fh:
             got = json.load(fh)
@@ -1003,7 +1058,7 @@ class OpusDefaultsBenefitTest(HomesBase):
             self.NAME,
             "settings.json lacks ultracode, "
             "modelSettings.claude-opus-5-5.effortLevel",
-            "`helm homes provision old-user-example` (the default home: a "
+            "`helm homes provision old-user-example --apply` (the default home: a "
             "`helm launch` with neither --home nor --no-install)")])
         self.assertEqual([m[1] for m in mine(self._row(rows, half))],
                          ["settings.json lacks "
@@ -1021,3 +1076,368 @@ class OpusDefaultsBenefitTest(HomesBase):
         self.assertIn("helm homes provision old-user-example", hit[0])
         self.assertFalse(any("done-user-example" in m and self.NAME in m
                              for m in said), said)
+
+
+class SeatHomeBackfillTest(HomesBase):
+    """ONE RECONCILE, AT LAUNCH AND AS THE BACKFILL (task/2692, task/2670,
+    task/2698, task/3089). A credhome made before approvals existed is
+    missing, in its `.claude.json`, the approval of every trusted project's
+    `.mcp.json` servers and any user-scope server the default home gained
+    since; and, outside its own config dir, the host's global instructions.
+    `helm homes provision <name>` plans all of it (writing nothing),
+    `--apply` writes it, and a second `--apply` is a no-op."""
+
+    PROVIDER = "claude"  # noqa: SEAT_NAME — provider key, not a seat
+
+    def setUp(self):
+        super().setUp()
+        # under the base class's patch.dict, which restores every key at
+        # tearDown — a second patch here would outlive it and re-plant the
+        # tmp HELM_HOME after the dir is gone
+        for k in ("HELM_INSTRUCTIONS_CANONICAL", "MELD_INSTRUCTIONS_CANONICAL"):
+            os.environ.pop(k, None)
+        self.repo = os.path.realpath(os.path.join(self.tmp, "repo"))
+        os.makedirs(os.path.join(self.repo, ".git"))
+        with open(os.path.join(self.repo, ".mcp.json"), "w") as fh:
+            json.dump({"mcpServers": {"chrome-devtools": {"command": "cd"},
+                                      "playwriter": {"command": "pw"}}}, fh)
+        d = homes.DEFAULTS[self.PROVIDER]
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, ".claude.json"), "w") as fh:
+            json.dump({"mcpServers": {"cv": {"command": "cv"},
+                                      "exa": {"command": "exa"}}}, fh)
+        with open(os.path.join(d, "CLAUDE.md"), "w") as fh:
+            fh.write("# the host's global instructions\n")
+        # the repo is a registered helm project, and no live claude holds any
+        # home here (the base stubs the census)
+        from helm import home as helm_home
+        os.makedirs(helm_home.global_dir(), exist_ok=True)
+        with open(helm_home.registry_path(), "w") as fh:
+            json.dump({"version": 1, "projects": {
+                "repo": {"name": "repo", "path": self.repo}}}, fh)
+
+    def _old_home(self, name="old-user-example"):
+        home = self._plant_claude_home(name, "old@user.example")
+        with open(os.path.join(home, ".claude.json"), "w") as fh:
+            fh.write(json.dumps({
+                "oauthAccount": {"emailAddress": "old@user.example"},
+                "mcpServers": {"exa": {"command": "exa-PINNED"},
+                               "extra": {"command": "mine"}},
+                "projects": {self.repo: {"hasTrustDialogAccepted": True}}},
+                indent=2))
+        return home
+
+    def _provision(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = homes.cmd_homes(["provision"] + list(args))
+        return rc, out.getvalue()
+
+    @staticmethod
+    def _state(home):
+        with open(os.path.join(home, ".claude.json")) as fh:
+            return json.load(fh)
+
+    @staticmethod
+    def _bytes(home):
+        with open(os.path.join(home, ".claude.json"), "rb") as fh:
+            return fh.read()
+
+    def _row(self, home):
+        return next(r for r in homes.benefit_drift()
+                    if os.path.realpath(r["path"]) == os.path.realpath(home))
+
+    def test_an_existing_home_is_planned_by_default_backfilled_by_apply_and_then_steady(self):
+        """ARM 3. Dry run names the missing approval and the missing
+        user-scope server and writes nothing; --apply writes both; a second
+        --apply changes no byte and reports nothing added."""
+        home = self._old_home()
+        before = self._bytes(home)
+        rc, out = self._provision("old-user-example")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("project mcp approvals: would provision (unapproved "
+                      "project servers: %s (chrome-devtools, playwriter))"
+                      % self.repo, out)
+        self.assertIn("mcp servers: would provision (servers absent: cv)", out)
+        self.assertIn("dry run", out)
+        self.assertEqual(self._bytes(home), before)
+        self.assertFalse(os.path.lexists(os.path.join(home, "rules")))
+        rc, out = self._provision("old-user-example", "--apply")
+        self.assertEqual(rc, 0, out)
+        got = self._state(home)
+        self.assertEqual(got["projects"][self.repo]["enabledMcpjsonServers"],
+                         ["chrome-devtools", "playwriter"])
+        self.assertIs(got["projects"][self.repo]["hasTrustDialogAccepted"], True)
+        self.assertIn("cv", got["mcpServers"])
+        self.assertIn("provisioned old-user-example", out)
+        steady = self._bytes(home)
+        rc, out = self._provision("old-user-example", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._bytes(home), steady)
+        self.assertNotIn("approved", out)
+        self.assertNotIn("servers added", out)
+        self.assertNotIn("project mcp approvals",
+                         [m[0] for m in self._row(home)["missing"]])
+
+    def test_the_drift_report_names_a_home_missing_its_approvals(self):
+        home = self._old_home()
+        self.assertIn(("project mcp approvals",
+                       "unapproved project servers: %s (chrome-devtools, "
+                       "playwriter)" % self.repo,
+                       "`helm homes provision old-user-example --apply`"),
+                      self._row(home)["missing"])
+
+    def test_a_missing_user_scope_server_is_added_and_the_homes_own_are_kept(self):
+        """ARM 4. The canonical source (the default home's state) has cv and
+        exa; the home pins its own exa and carries an extra server. cv is
+        added; the pinned exa and the extra survive unchanged."""
+        home = self._old_home()
+        self._provision("old-user-example", "--apply")
+        self.assertEqual(self._state(home)["mcpServers"],
+                         {"exa": {"command": "exa-PINNED"},
+                          "extra": {"command": "mine"},
+                          "cv": {"command": "cv"}})
+
+    def test_the_global_instructions_reach_a_credhome_and_a_copy_is_not_loaded_twice(self):
+        """ARM 6 (task/3089). A credhome session reads its own config dir's
+        user memory, never the default home's CLAUDE.md: provision links it
+        into rules/. A home whose own CLAUDE.md already IS those bytes is
+        left alone (the link would load them twice)."""
+        from helm import skillsync
+        home = self._old_home()
+        src = os.path.realpath(os.path.join(homes.DEFAULTS[self.PROVIDER],
+                                            "CLAUDE.md"))
+        self.assertIn("global instructions",
+                      [m[0] for m in self._row(home)["missing"]])
+        rc, out = self._provision("old-user-example", "--apply")
+        self.assertEqual(rc, 0, out)
+        link = os.path.join(home, skillsync.INSTRUCTIONS_LINK)
+        self.assertEqual(os.readlink(link), src)
+        self.assertIn("global instructions linked", out)
+        copy = self._plant_claude_home("copy-user-example", "copy@user.example")
+        shutil.copy(src, os.path.join(copy, "CLAUDE.md"))
+        self._provision("copy-user-example", "--apply")
+        self.assertFalse(os.path.lexists(os.path.join(copy, "rules")))
+
+    def test_the_launch_reconcile_is_the_same_writers_and_quiet_when_steady(self):
+        """homes.reconcile_seat_home — what `helm launch` runs on the home it
+        execs on — writes what --apply writes for the launch cwd, and a
+        second call says nothing."""
+        home = self._plant_claude_home("fresh-user-example", "fresh@user.example")
+        lines = homes.reconcile_seat_home(home, self.repo)
+        got = self._state(home)
+        self.assertEqual(sorted(got["mcpServers"]), ["cv", "exa"])
+        self.assertEqual(got["projects"][self.repo]["enabledMcpjsonServers"],
+                         ["chrome-devtools", "playwriter"])
+        self.assertTrue(any("approved" in l for l in lines), lines)
+        self.assertEqual(homes.reconcile_seat_home(home, self.repo), [])
+
+    def test_a_junk_flag_refuses_before_any_home_is_touched(self):
+        home = self._old_home()
+        before = self._bytes(home)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, _out = self._provision("old-user-example", "--aply")
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown arg '--aply'", err.getvalue())
+        self.assertEqual(self._bytes(home), before)
+
+
+HOMES_CARD_SUPPORT = r"""
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const out = {errors: {}};
+const probe = (k, f) => { try { out[k] = f(); } catch (e) { out.errors[k] = String(e); } };
+"""
+
+
+class HomesCardOwnerWordsTest(HomesBase):
+    """THE CREDENTIAL HOMES CARD ON FLEET › CREDIT TELLS THE OWNER NO COMMAND
+    (task/3735). Creating a home showed a login line to click, copy and run
+    "in YOUR terminal"; verify printed its fixes as `helm homes migrate`,
+    `helm homes archive`, `ln -sfn …` and the login line. The owner: "make
+    them plain sentences". The server keeps its terminal lines for the CLI
+    and carries the owner's words beside them (`owner_next`,
+    `owner_fixes`, as `ready._row` carries `owner_repair`); the card renders
+    only those. Each answer here is the REAL `home_create` / `home_verify`
+    over the scratch estate, rendered by the SHIPPED card functions under
+    node (absent node, the page half SKIPS)."""
+
+    def _estate(self):
+        """Every verify branch that names a step: a home not signed in, a
+        folder named for another account with no sessions link, two named
+        homes on one account, two byte-copied token families, a sessions
+        folder that is a real folder, a codex login naming no email."""
+        self._plant_claude_home("fresh-person-example", "fresh@person.example",
+                                authed=False)
+        self._plant_claude_home("wrong-name", "real@person.example")
+        self._plant_claude_home("dup-one", "same@user.example")
+        self._plant_claude_home("dup-two", "same@user.example")
+        self._plant_claude_home("copy-a", "a@x.example", token="fake-family-1")
+        self._plant_claude_home("copy-b", "b@y.example", token="fake-family-1")
+        d = self._plant_claude_home("real-dir-example", "real@dir.example")
+        os.makedirs(os.path.join(d, "projects"))
+        self._plant_codex_home("cx-noid", "fake-codex-token")
+        return {n: homes.home_verify(n) for n in (
+            "fresh-person-example", "wrong-name", "dup-one", "copy-a",
+            "real-dir-example", "cx-noid")}
+
+    def test_every_verify_fix_has_its_owner_line_with_no_command(self):  # noqa: VACUOUS_ASSERTION — six named branches, each asserted to raise a non-empty fix list and an owner list of the same length before its lines are read
+        from tests._ownerverbs import owner_commands, owner_verbs
+        answers = self._estate()
+        for name, res in answers.items():
+            self.assertNotIn("error", res, name)
+            # POSITIVE CONTROL: each branch raised a fix to say
+            self.assertTrue(res["fixes"], name)
+            owner = res.get("owner_fixes")
+            self.assertIsNotNone(owner, "%s: no owner_fixes" % name)
+            self.assertEqual(len(owner), len(res["fixes"]), (name, owner))
+            for line in owner:
+                self.assertEqual(owner_verbs(line), [], "%s: %s" % (name, line))
+                self.assertEqual(owner_commands(line), [], "%s: %s" % (name, line))
+
+    def test_the_terminal_lines_keep_their_verbs_for_the_cli(self):
+        """THE CONTROL: agent-facing text keeps its verbs. The owner's words
+        are a second field, never an edit of the first."""
+        answers = self._estate()
+        said = lambda n: " ".join(answers[n]["fixes"])
+        self.assertIn("claude /login", said("fresh-person-example"))
+        self.assertIn("helm homes migrate wrong-name", said("wrong-name"))
+        self.assertIn("helm homes archive", said("dup-one"))
+        self.assertIn("ln -sfn", said("real-dir-example"))
+
+    def test_a_home_not_signed_in_says_so_and_that_an_agent_can_start_it(self):
+        owner = " ".join(self._estate()["fresh-person-example"].get("owner_fixes") or [])
+        self.assertIn("not signed in", owner)
+        self.assertIn("an agent can start the login", owner)
+
+    def test_a_new_home_says_it_needs_signing_in_never_the_login_line(self):
+        from tests._ownerverbs import owner_commands, owner_verbs
+        res = homes.home_create("claude", "new@user.example")
+        self.assertNotIn("error", res)
+        # the CLI keeps its lines
+        self.assertIn("claude /login", res["login_cmd"])
+        self.assertIn("helm homes verify", res["next"])
+        said = res.get("owner_next") or ""
+        self.assertIn("new-user-example", said)
+        self.assertIn("needs signing in", said)
+        self.assertIn("an agent can start the login", said)
+        self.assertEqual(owner_verbs(said), [], said)
+        self.assertEqual(owner_commands(said), [], said)
+
+    def test_the_card_renders_only_the_owner_words(self):  # noqa: VACUOUS_ASSERTION — the created line is asserted to name its home and every owner line is asserted present in its verify render, on the same markup the absences read
+        """The page half: the SHIPPED card functions over the real answers
+        show no helm verb and no terminal step, and each owner line."""
+        import subprocess
+        from helm import web_ui_loader
+        from tests._ownerverbs import owner_commands, owner_verbs
+        from tests.test_web_chat_client_runtime import _extract_fn
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        answers = self._estate()
+        created = homes.home_create("codex", "cx@user.example")
+        src = web_ui_loader.read_text()
+        parts = []
+        for name in ("homeCreatedHTML", "homeVerifyHTML"):
+            try:
+                parts.append(_extract_fn(src, name))
+            except AssertionError:
+                pass
+        js = (HOMES_CARD_SUPPORT + "\n\n".join(parts)
+              + "\nconst CREATED = %s, VERIFIED = %s;\n"
+              % (json.dumps(created), json.dumps(answers))
+              + "probe('created', () => homeCreatedHTML(CREATED));\n"
+              "for (const [n, r] of Object.entries(VERIFIED))\n"
+              "  probe('verify:' + n, () => homeVerifyHTML(r));\n"
+              "console.log(JSON.stringify(out));\n")
+        path = os.path.join(self.tmp, "card.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(js)
+        proc = subprocess.run([node, path], capture_output=True, text=True,
+                              timeout=60)
+        out = json.loads(proc.stdout or "{}")
+        self.assertTrue(out, proc.stderr[:1500])
+        self.assertEqual(out["errors"], {}, "the card raised on the shipped page")
+        # POSITIVE CONTROL: the created line names the home, codex's login
+        # line had a command to leak
+        self.assertIn("cx-user-example", out["created"])
+        self.assertIn("codex login", created["login_cmd"])
+        for key, markup in out.items():
+            if key == "errors":
+                continue
+            self.assertEqual(owner_verbs(markup), [], "%s: %s" % (key, markup))
+            self.assertEqual(owner_commands(markup), [], "%s: %s" % (key, markup))
+        import html
+        for name, res in answers.items():
+            shown = html.unescape(out["verify:" + name])
+            for line in res.get("owner_fixes") or ["<no owner line>"]:
+                self.assertIn(line, shown, name)
+
+    def test_a_misnamed_folder_is_never_said_to_name_another_account(self):
+        """A home whose folder is not the canonical name of the account it
+        holds is only that: "wrong-name" names no account at all, so the
+        owner line may not say its folder is named for another one."""
+        owner = " ".join(self._estate()["wrong-name"].get("owner_fixes") or [])
+        # POSITIVE CONTROL: the misnamed-folder line is the one read here
+        self.assertIn("real@person.example", owner)
+        self.assertIn("real-person-example", owner)
+        self.assertIn("the migrate button on this row renames it", owner)
+        self.assertNotIn("named for another account", owner)
+        self.assertIn("not named for the account it holds", owner)
+
+    def _refusals(self):
+        """Every refusal the homes card can show him that names a helm verb
+        in the CLI's line: a new home for an account already seated in a
+        misnamed home, a migrate whose canonical name is taken, and a row
+        that went away under an open card (archived from elsewhere)."""
+        self._plant_claude_home("wrong-name", "real@person.example")
+        os.makedirs(os.path.join(homes.ROOTS["claude"], "real-person-example"))
+        return {"seated": homes.home_create("claude", "real@person.example"),
+                "taken": homes.home_migrate("wrong-name", "claude"),
+                "gone": homes.home_verify("ghost", "claude")}
+
+    def test_a_refusal_carries_the_owner_words_beside_the_cli_line(self):  # noqa: VACUOUS_ASSERTION — three named refusals, each asserted to name a helm verb in its CLI line before its owner line is read
+        from tests._ownerverbs import owner_commands, owner_verbs
+        for name, res in self._refusals().items():
+            # POSITIVE CONTROL: the CLI's refusal names the verb, unchanged
+            self.assertIn("error", res, name)
+            self.assertTrue(owner_verbs(res["error"]), (name, res["error"]))
+            said = res.get("owner_error") or ""
+            self.assertTrue(said, "%s: no owner_error" % name)
+            self.assertEqual(owner_verbs(said), [], "%s: %s" % (name, said))
+            self.assertEqual(owner_commands(said), [], "%s: %s" % (name, said))
+
+    def test_the_card_shows_a_refusal_in_the_owner_words(self):  # noqa: VACUOUS_ASSERTION — each refusal's shown text is asserted to carry its home's name before the absences are read
+        """The page half: the SHIPPED `homePost` door, handed the server's
+        real refusal the way `post` throws it (the parsed body on the
+        error), gives the card his words and never the CLI's verb."""
+        import subprocess
+        from helm import web_ui_loader
+        from tests._ownerverbs import owner_commands, owner_verbs
+        from tests.test_web_accounts import _extract_const
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        answers = self._refusals()
+        door = _extract_const(web_ui_loader.read_text(), "homePost")
+        js = ("const ANS = %s;\n" % json.dumps(answers)
+              + "async function post(url, body) {\n"
+              "  const d = ANS[body.k];\n"
+              "  const err = new Error(url + ' -> 400: ' + d.error);\n"
+              "  err.status = 400; err.body = d; throw err;\n"
+              "}\n" + door + "\n"
+              "(async () => { const out = {};\n"
+              "  for (const k of Object.keys(ANS)) out[k] = (await homePost({k})).error;\n"
+              "  console.log(JSON.stringify(out)); })();\n")
+        path = os.path.join(self.tmp, "door.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(js)
+        proc = subprocess.run([node, path], capture_output=True, text=True,
+                              timeout=60)
+        out = json.loads(proc.stdout or "{}")
+        self.assertEqual(sorted(out), sorted(answers), proc.stderr[:1500])
+        for key, name in (("seated", "wrong-name"), ("taken", "real-person-example"),
+                          ("gone", "ghost")):
+            self.assertIn(name, out[key], key)
+            self.assertEqual(owner_verbs(out[key]), [], "%s: %s" % (key, out[key]))
+            self.assertEqual(owner_commands(out[key]), [], "%s: %s" % (key, out[key]))

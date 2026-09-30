@@ -23,17 +23,35 @@ Only the FIRST read after an invalidation pays. It writes a fresh checkpoint,
 and every reader after it restores.
 
 If a two-minute read happens when the table says a second, that is worth
-looking into. If several seats read at once in the window after a land they all
-pay it, because each started before any of them finished writing.
+looking into. Inside ONE process — `helm web`, its boards and its stop-facts
+resident — a read that arrives while a cold fold of the same checkpoint is
+running waits for that fold and then restores what it wrote, so the process
+pays once. A board's LENSED fold is the exception: it runs on the board's own
+thread, whose git answers the board's projection reads next. Separate
+processes do not share that wait: if several seats read at once in the window
+after a land they all pay it, because each started before any of them
+finished writing.
+
+To check the table against real lands, run `helm lr postland`. Both land
+paths time each land's first read in a new process of the landed checkout's
+own helm, so the code that reads is the code the land put in place. The verb
+prints each land's seconds, WARM or COLD with the miss that said why, and the
+median and max against a 30 s bar. A land whose read could not be timed that
+way is UNMEASURED with its reason, and it is not counted in those figures.
 
 ## Where it lives
 
-`_global/.state/dispatch-fold/` under the helm home — so `HELM_HOME` isolates
-it, which is what keeps it from being a channel between tests. One file per
-code version and per gate-epoch lens, the newest 8 kept. Deleting the directory is safe: the next
-read folds cold and writes a new one. Nothing else reads these files, and
-nothing is lost by removing them — a checkpoint is a cache of an answer the
-ledger can always reproduce.
+`_global/.state/ledger-fold/<ledger key>/` under the helm home — so
+`HELM_HOME` isolates it, which is what keeps it from being a channel between
+tests. One file per code version, gate-epoch lens and repository-config key;
+the directory keeps at most 24 files and 384 MiB, evicting the file used
+least recently first, and a file nobody has used for a day retires. Deleting
+the directory is safe: the next read folds cold and writes a new one.
+Nothing else reads these files, and nothing is lost by removing them — a
+checkpoint is a cache of an answer the ledger can always reproduce. Beside the
+directory sit its save lock, its miss log (`<ledger key>.misses.jsonl`) and
+the post-land record (`<ledger key>.postland.jsonl`), which is the only copy
+of those timings.
 
 ## What makes one stale
 
@@ -97,8 +115,18 @@ This is safe because of what the fold reads git FOR. Only the `carried` close
 replay consults trunk at all; every other close reason is arithmetic over
 immutable ids. Measured: with that one witness stubbed, a cold fold spawns zero
 git processes while 1,177 non-carried closes across nine other reasons replay
-unchanged. And a carried close now stays proven when its own work reaches trunk
-(task/2863), so advancing trunk cannot change the answer.
+unchanged. And a carried close is replayed against the trunk commit it RECORDED
+while that commit is still history of trunk (task/3056) — a descendant keeps
+every commit its ancestor held — and stays proven when its own work reaches
+trunk (task/2863), so advancing trunk cannot change the answer. (Before
+task/3056 the close was replayed against the head, and a trunk edit of a path
+a CONTENT-proven close touched did change it: eight of thirty such closes on
+the live ledger reopened on a cold fold while a restore kept them closed.)
+A trunk rewritten past the recorded commit sends the close back to the head,
+and so does one whose recorded commit a prune then removed from a complete
+repository: an object the repository does not hold cannot be history. Only an
+incomplete repository (shallow, partial clone, promisor remote) refuses that
+close instead, saying the answer is no longer readable.
 
 `tests/test_foldckpt.py` holds one arm per way trunk can move, each saying by
 name whether it restores or replays.

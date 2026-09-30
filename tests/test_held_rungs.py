@@ -41,8 +41,13 @@ def setUpModule():
 
 
 def tearDownModule():
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT, as tests.test_landreq's does
+    # (task/3039): a stopped patcher left here is module data the sliced
+    # gate's leak audit reads as a rebinding, and fails the run.
+    _LIVE_SEATS_PATCH = None
 
 
 def _cli(args):
@@ -75,7 +80,11 @@ class HeldRungBase(_close.CloseBase):
         return tip
 
     def hold(self, rid, reason, **kw):
-        row, why = dispatches.mark_hold(rid, reason, **kw)
+        # BY THE ROW'S RECIPIENT, the one hand a source-clean hold admits
+        # (task/3053); every rung here is sent to seat-a.
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=("seat-a", None)):
+            row, why = dispatches.mark_hold(rid, reason, **kw)
         self.assertIsNone(why, why)
         self.assertEqual(row["status"], "held")
         return row

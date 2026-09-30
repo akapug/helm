@@ -77,6 +77,13 @@ _KEYS_V1 = frozenset(("schema", "observer", "writer", "sequence", "observed_drop
                       "wall_ms", "startup_ms", "outcome"))
 #: v2 adds `blocked_in`: where a span was executing when its budget expired.
 _KEYS_V2 = _KEYS_V1 | {"blocked_in"}
+#: v3 adds `fold_miss`: why a dispatch-fold checkpoint read inside the span
+#: could not be used (`foldckpt`), or None. A slow hook that replayed the whole
+#: ledger then says WHICH key missed instead of only that it was slow.
+_KEYS_V3 = _KEYS_V2 | {"fold_miss"}
+#: How many characters of a miss reason a row carries. The reasons are short
+#: fixed sentences; a repository path inside one is what can run long.
+MAX_FOLD_MISS = 160
 #: THE KEY SET IS EXACT IN BOTH DIRECTIONS, so a new field is a NEW VERSION or
 #: it invalidates the entire retained history. Adding `blocked_in` to one
 #: frozen set would have rejected every row already on disk — and the reader
@@ -84,8 +91,8 @@ _KEYS_V2 = _KEYS_V1 | {"blocked_in"}
 #: nobody reads rather than as an error. The reader accepts BOTH versions and
 #: the writer emits v2; a reader that lands after its writer drops the very
 #: rows the change exists to collect.
-_KEYS_BY_SCHEMA = {1: _KEYS_V1, 2: _KEYS_V2}
-SCHEMA = 2
+_KEYS_BY_SCHEMA = {1: _KEYS_V1, 2: _KEYS_V2, 3: _KEYS_V3}
+SCHEMA = 3
 
 
 def path():
@@ -162,6 +169,31 @@ def _retain(start, end):
         pass
 
 
+def _sample(end):
+    """The raw box readings for an END row the END window stream keeps
+    (task/3259, helm/hookwindow.py), or None for a row it does not keep.
+    `_Event.write` calls this BEFORE it writes the row anywhere, so the
+    readings are never taken after this process's own telemetry writes.
+    Imported here, not at the top: hookwindow imports this module. Never
+    raises."""
+    try:
+        from . import hookwindow
+        return hookwindow.read_box() if hookwindow.keeps(end) else None
+    except Exception:
+        return None
+
+
+def _window(end, box):
+    """Keep one END row, with the readings `_sample` took for it, in the END
+    window stream, which holds hours where this one holds minutes. Best
+    effort like `_retain`."""
+    try:
+        from . import hookwindow
+        hookwindow.note(end, box)
+    except Exception:
+        pass
+
+
 def _append_to(dest, row, max_bytes, generations):
     lock = fd = None
     try:
@@ -224,9 +256,16 @@ class _Event:
                    # None. The outcome says a span ENDED in timeout; this says
                    # where it was at that instant, which is the question a
                    # per-stage tally structurally cannot answer.
-                   blocked_in=None)
+                   blocked_in=None,
+                   # WHY A FOLD CHECKPOINT MISSED inside this span, or None.
+                   fold_miss=None)
         if kind == "END":
+            row["fold_miss"] = span.fold_miss
             row["blocked_in"] = _fit_blocked_in(span.blocked_in, row)
+            # THE BOX IS READ BEFORE ANY WRITE: a reading taken after the
+            # appends below would be the box after this process's own disk
+            # work, not the box at the END it is filed under (task/3259).
+            box = _sample(row)
         try:
             written = append(row)
         except Exception:
@@ -235,8 +274,11 @@ class _Event:
             self.drops += 1
         if kind == "START":
             span.start_row = row
-        elif row["outcome"] in RETAINED:
+            return
+        if row["outcome"] in RETAINED:
             _retain(span.start_row, row)
+        if box is not None:
+            _window(row, box)
 
 
 class _Span:
@@ -246,6 +288,7 @@ class _Span:
         self.outcome = "completed"
         self.blocked_in = None
         self.start_row = None
+        self.fold_miss = None
 
 
 def active():
@@ -329,6 +372,22 @@ def blocked_in(where):
         return
     for span in _CURRENT.get():
         span.blocked_in = where
+
+
+def fold_miss(reason):
+    """Record why a dispatch-fold checkpoint read could not be used.
+
+    Every open span records it, as `blocked_in` does, so the event row and the
+    stage row both say it. The first miss a span saw is the one it keeps: a
+    fold that missed once then saved its own checkpoint has no second miss
+    worth more than the first. Bounded to MAX_FOLD_MISS characters."""
+    if not isinstance(reason, str) or not reason:
+        return
+    reason = reason if len(reason) <= MAX_FOLD_MISS \
+        else reason[:MAX_FOLD_MISS - 3] + "..."
+    for span in _CURRENT.get():
+        if span.fold_miss is None:
+            span.fold_miss = reason
 
 
 def bind(session=None, event=None):
@@ -593,6 +652,10 @@ def _valid_row(row):
     if row.get("blocked_in") is not None \
             and not isinstance(row["blocked_in"], str):
         return False
+    if row.get("fold_miss") is not None and not (
+            isinstance(row["fold_miss"], str)
+            and 0 < len(row["fold_miss"]) <= MAX_FOLD_MISS):
+        return False
     if row["observer"] not in (OBSERVER, "python-runtime-entry-v1"):
         return False
     if any(_identity(row[k]) is None for k in ("writer", "event_id", "span_id")):
@@ -683,6 +746,7 @@ def report(dest=None, since=None, until=None):
                   completed=0, matched=0, starts=0, ends=0)
     spans, writers, groups = {}, {}, {}
     blocked = {}                      # where -> {event_id: {span_id: parent_id}}
+    misses = {}                       # fold-miss reason -> {event_id}
     stamps = []
     sequences = {}
     bad = set()
@@ -803,6 +867,11 @@ def report(dest=None, since=None, until=None):
         # publishes: nothing about it was found contradictory, it is counted
         # as an orphan rather than rejected, and the frame it names is a real
         # observation of where that hook was blocked.
+        # A FOLD MISS IS COUNTED PER EVENT, like a timeout's frame: every
+        # ancestor span carries the reason, and one hook that missed once must
+        # not read as three misses.
+        if end is not None and end.get("fold_miss"):
+            misses.setdefault(end["fold_miss"], set()).add(row["event_id"])
         if where:
             blocked.setdefault(where, {}).setdefault(
                 row["event_id"], {})[row["span_id"]] = row["parent_id"]
@@ -862,7 +931,11 @@ def report(dest=None, since=None, until=None):
                 blocked_in=sorted(
                     ({"where": w, "events": len(e), "timeouts": _leaves(e)}
                      for w, e in blocked.items()),
-                    key=lambda b: (-b["timeouts"], -b["events"], b["where"])))
+                    key=lambda b: (-b["timeouts"], -b["events"], b["where"])),
+                # WHY A FOLD CHECKPOINT MISSED, by reason, counted in events.
+                fold_misses=sorted(
+                    ({"reason": r, "events": len(e)} for r, e in misses.items()),
+                    key=lambda m: (-m["events"], m["reason"])))
 
 
 def _leaves(events):
@@ -886,10 +959,20 @@ def _leaves(events):
 
 
 def cmd(args):
+    """`helm hooks latency [--json] [--since T] [--until T]`, the census of
+    the raw stream; `helm hooks latency --hours H [--json]` hands the END
+    window stream's print to `hookwindow.cmd`."""
     usage = ("usage: helm hooks latency [--json] [--since T] [--until T]\n"
+             "       helm hooks latency --hours H [--json]\n"
              "  T is an ABSOLUTE instant: an ISO-8601 timestamp with a zone "
              "(a trailing Z, or an offset). These rows record absolute "
-             "instants, so an unzoned cut is REFUSED rather than guessed at.")
+             "instants, so an unzoned cut is REFUSED rather than guessed at.\n"
+             "  --hours H reads the END window stream instead: each hook's "
+             "rows and p50/p95/p99 over the last H hours, and every timed-out "
+             "row with the raw box readings taken at its END.")
+    if "--hours" in args:
+        from . import hookwindow
+        return hookwindow.cmd(args)
     argv, want_json, since, until = list(args), False, None, None
     while argv:
         head = argv.pop(0)
@@ -951,6 +1034,12 @@ def cmd(args):
     print("Incidents (timeout and cancelled spans) are kept past rotation in a "
           "second stream; it holds %s. A byte bound, not a clock."
           % ("%.1f h" % held if held is not None else "none yet"))
+    if result.get("fold_misses"):
+        print("Fold checkpoint missed (why the ledger was replayed; counted by "
+              "event):")
+        for m in result["fold_misses"]:
+            print("  %d event%s  %s" % (m["events"], "s"[:m["events"] != 1],
+                                       m["reason"]))
     print("Counts: " + json.dumps(result["counts"], sort_keys=True))
     print("Coverage: " + json.dumps(result["coverage"], sort_keys=True))
     return 0

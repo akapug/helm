@@ -17,29 +17,17 @@ def row():
 
 
 class BoardProjectionTest(Base):
-    def render(self, **cases):
-        from tests.test_web_lr import CardRuntimeBase
-        # A PRIVATE SUBCLASS carries the harness's class fixtures, so
-        # CardRuntimeBase itself -- the base every card class in test_web_lr
-        # inherits -- never keeps this module's tmp dir and node path after
-        # it (task/3039: the slice runner's data audit named them).
-        harness = type("BoardRenderHarness", (CardRuntimeBase,), {})
-        harness.setUpClass()
-        self.addCleanup(harness.tearDownClass)
-        return harness().render(**cases)
-
-    def test_actual_browser_renderer_shows_orphan_standing(self):
+    def test_the_card_carries_the_orphan_standing_it_is_read_by(self):
+        """The land card's ORPHANED mark was drawn by the land board's row
+        renderer, retired with the board (task/3643): the Work page's cards
+        come from /api/work. What stays is the server's card, which carries
+        the owed seat's standing for every reader of /api/lr."""
         self.plant({"alpha": {"session": "s-alpha"}})
         live = landreq.card(row())
         self.plant({"beta": {"session": "s-beta"}})
         orphan = landreq.card(row())
         self.assertIsNone(live["owed_seat_standing"])
         self.assertEqual(orphan["owed_seat_standing"]["state"], "ORPHANED")
-        rendered = self.render(live={"__row": live}, orphan={"__row": orphan},
-                               positive={"__row": dict(live, stalled=True)})
-        self.assertIn("STALLED", rendered["positive"]["html"])
-        self.assertNotIn("ORPHANED", rendered["live"]["html"])
-        self.assertIn("ORPHANED", rendered["orphan"]["html"])
 
     def test_roster_only_change_ages_the_restored_holder(self):
         self.plant({"alpha": {"session": "s-alpha"}})
@@ -138,21 +126,11 @@ class BoardProjectionTest(Base):
         self.assertEqual(current["holder_seat"], "alpha")
         self.assertIsNone(witness)
 
-    def test_browser_known_states_are_visible_and_escaped(self):
-        self.plant({"alpha": {"session": "s-alpha"}})
-        current = landreq.card(row())
-        cases = {state: {"__row": dict(current, owed_seat_standing={
-            "state": state, "why": "<script>review</script>"})}
-            for state in ("RENAMED", "ORPHANED", "UNKNOWN", "FUTURE")}
-        rendered = self.render(**cases)
-        for state in ("RENAMED", "ORPHANED"):
-            html = rendered[state]["html"]
-            self.assertIn(state, html)
-            self.assertIn("&lt;script&gt;review&lt;/script&gt;", html)
-            self.assertNotIn("<script>", html)
-        self.assertIn("NOT expired", rendered["ORPHANED"]["html"])
-        self.assertEqual(rendered["UNKNOWN"]["html"], rendered["FUTURE"]["html"])
-        self.assertNotIn("ORPHANED", rendered["UNKNOWN"]["html"])
+    # RETIRED with the land board (task/3643): the arm that ran its row
+    # renderer over RENAMED, ORPHANED and unknown standings, escaped. The
+    # Work page reads /api/work, which carries no standing yet (named in the
+    # design review's WHERE-IT-WENT.md); the server's standing is pinned by
+    # test_the_card_carries_the_orphan_standing_it_is_read_by above.
 
     def test_pre_lineage_persisted_schema_is_not_restored(self):
         self.plant({"alpha": {"session": "s-alpha"}})

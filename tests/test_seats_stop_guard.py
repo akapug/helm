@@ -1209,7 +1209,8 @@ class GuardrailTextTrim692Test(SeatsBase):
         self.assertIn("seat 'codex'", line)
         self.assertIn("First action", line)
         self.assertIn('Monitor(command: "helm chat wait --seat codex --follow", '
-                      'timeout_ms: 1800000)', line)
+                      'description: "inbox beacon", timeout_ms: 1800000)',
+                      line)
         self.assertIn('ToolSearch(query: "select:Monitor")', line)
         from helm.seats_common import GUIDE_PATH
         self.assertIn(GUIDE_PATH, line)
@@ -1385,6 +1386,51 @@ class StopGuardGatePendingTest(SeatsBase):
         self.assertIn("approved", err)
         self.assertIn("awaiting the land window", err)
         self.assertIn("lease retained", err)
+
+    def hold(self, row, source_clean_tip=None):
+        """Hold the planted row as its RECIPIENT, through the real door."""
+        with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": row["recipient"]}):
+            out, err = dispatches.mark_hold(
+                row["id"], "read the delta, found nothing",
+                source_clean_tip=source_clean_tip)
+        self.assertIsNone(err, "plant hold: %s" % err)
+        return out
+
+    def test_a_SOURCE_CLEAN_hold_at_HEAD_exempts_awaiting_the_train(self):
+        """STAGE 4 (task/3097). A hold the row's recipient records at a named
+        tip is a land path (task/3053): the holder owes nothing, and the only
+        remaining verb is the integrator's train. Read as unfinished work, it
+        tells the holder to finish or hand off work that is done."""
+        seats.claim(self.res, "alice", ttl=60, session=self.sid)
+        self.hold(self.plant(), source_clean_tip=self.head)
+        rc, _o, err = self.guard({"session_id": self.sid})
+        self.assertEqual(rc, 0, err)  # noqa: VACUOUS_ASSERTION — rc 0 is the allow; the assertIns below are the positive controls on err
+        self.assertIn("held source-clean", err)
+        self.assertIn("integrator's train", err)
+        self.assertIn("lease retained", err)
+
+    def test_a_PLAIN_hold_does_NOT_exempt(self):
+        """A hold with no source-clean tip waits on something else, and the
+        holder may owe it; only the named-tip hold is a land path."""
+        seats.claim(self.res, "alice", ttl=60, session=self.sid)
+        self.hold(self.plant())
+        rc, _o, err = self.guard({"session_id": self.sid})
+        self.assertEqual(rc, 2)
+        self.assertIn(self.res, err)
+        self.assertNotIn("held source-clean", err)
+
+    def test_a_source_clean_hold_behind_a_MOVED_HEAD_does_NOT_exempt(self):
+        """The hold names the tip that lands; a commit past it is new work
+        nobody has read."""
+        seats.claim(self.res, "alice", ttl=60, session=self.sid)
+        self.hold(self.plant(), source_clean_tip=self.head)
+        subprocess.run(["git", "-C", self.wt, "-c", "user.email=t@t",
+                        "-c", "user.name=t", "commit", "-q", "--allow-empty",
+                        "-m", "cure past the hold"], check=True,
+                       capture_output=True, timeout=30)
+        rc, _o, err = self.guard({"session_id": self.sid})
+        self.assertEqual(rc, 2)
+        self.assertNotIn("held source-clean", err)
 
     def test_a_FIX_verdict_does_NOT_exempt_rework_is_owed(self):
         seats.claim(self.res, "alice", ttl=60, session=self.sid)
@@ -1654,15 +1700,18 @@ class StopGuardExemptStateIsPrintedTruthTest(SeatsBase):
         self.assertNotIn("EXPIRING", second)
         self.decay(self.GIVEN, 60)                  # THE CROSSING, exempt only
         rc3, _out3, third = self.guard()
-        self.assertEqual(rc3, 2, third)
         self.assertIn("act per line, then stop:", third,
                       "an exempt lease crossed the alarm and the latch "
                       "compressed it away: the fingerprint carried no band")
         line = self.sermon_line(self.GIVEN, third)
         self.assertIn("EXPIRING", line)
         self.assertIn("NO ACTION OWED", line)       # accounting, not a demand
-        # the held lease is steady, so the severity is the exempt lane's alone
-        self.assertNotIn("EXPIRING", self.sermon_line(self.HELD, third))
+        # task/3123: the held lease is steady, so its line is not reprinted
+        # and the stop is not held for it. The one printed line owes nothing,
+        # so the crossing is spoken as a WARN, and the tally counts the rest.
+        self.assertEqual(rc3, 0, third)
+        self.assertNotIn("helm chat release " + self.HELD, third)
+        self.assertIn("1 unchanged lease(s) not reprinted", third)
         rc4, _out4, fourth = self.guard()           # and the tally counts it
         self.assertEqual(rc4, 0, fourth)
         self.assertIn("unchanged. Reprint:", fourth)   # control
@@ -1678,6 +1727,40 @@ class StopGuardExemptStateIsPrintedTruthTest(SeatsBase):
         self.assertEqual(rc, 0, err)
         self.assertIn("not yours to release", err)      # control: the sentence
         self.assertIn("s left, EXPIRING", self.sentence(self.GIVEN, err))
+
+    def test_held_line_labels_age_and_expiry(self):
+        """task/3215. A claim taken 25 minutes ago with an 8h TTL renders
+        "leased 25m ago, expires in 7h35m" — both numbers labelled so the
+        owner reads what they mean. The bare "7h35m" was misread as
+        "a subagent running 7h35m"; it is the time LEFT on an 8h lease.
+        The EXPIRING marker must survive the labelling for the crossing case."""
+        self.claim(self.HELD, ttl=600)
+        with seats._flocked(seats.claims_path() + ".lock"):
+            c = pk.read_json(seats.claims_path(), {}) or {}
+            c[self.HELD]["ts"] = pk.epoch_ts(int(time.time()) - 1500)
+            c[self.HELD]["exp_mono"] = seats._now_mono() + 27300
+            c[self.HELD]["exp_wall"] = time.time() + 27300
+            pk.write_json(seats.claims_path(), c)
+        rc, _out, err = self.guard()
+        line = self.sermon_line(self.HELD, err)
+        self.assertIn("leased 25m ago", line)
+        # left decays ~1s between setup and render; 27300s -> 7h35m, 27299s -> 7h34m
+        import re
+        self.assertTrue(re.search(r"expires in 7h3[45]m", line), line)
+
+    def test_held_line_without_a_mint_time_says_only_when_it_expires(self):
+        """task/3215: a lease whose mint time cannot be read never shows an
+        invented age; the line says when it expires and nothing more."""
+        self.claim(self.HELD, ttl=600)
+        with seats._flocked(seats.claims_path() + ".lock"):
+            c = pk.read_json(seats.claims_path(), {}) or {}
+            c[self.HELD].pop("ts", None)
+            pk.write_json(seats.claims_path(), c)
+        rc, _out, err = self.guard()
+        line = self.sermon_line(self.HELD, err)
+        self.assertIn("expires in ", line)
+        self.assertNotIn("leased", line)
+        self.assertNotIn("unknown", line)
 
 
 class StopGuardRenewingLeaseTest(SeatsBase):
@@ -1979,3 +2062,56 @@ class OneSlowRungCannotDisableTheRestTest(unittest.TestCase):
                          ["claim-evidence", "response"])
         self.assertNotIn("mechanical", order,
                          "the index/scratch tail runs in the resident now")
+
+
+class StopGuardVerbTimeoutTest(SeatsBase):
+    """task/1822 end to end: a helm verb the recorder saw killed by a timeout
+    is named at the next stop, once per state, until a diagnosis write
+    naming it discharges it."""
+
+    SID = "s-vto"
+
+    def guard(self):
+        return self.cmd("stop-guard", ["--hook-json"],
+                        stdin=json.dumps({"session_id": self.SID}).encode())
+
+    def bash(self, command, error=None):
+        event = {"session_id": self.SID, "tool_name": "Bash", "cwd": "/tmp/p",
+                 "tool_input": {"command": command}}
+        if error is None:
+            event.update(hook_event_name="PostToolUse",
+                         tool_response={"stdout": ""})
+        else:
+            event.update(hook_event_name=record.FAIL_EVENT, error=error,
+                         is_interrupt=False)
+        with mock.patch.object(record, "_git_dirty", return_value=False):
+            record.record(event)
+
+    def test_named_once_then_discharged_by_a_diagnosis_note(self):  # noqa: VACUOUS_ASSERTION — the discharge IS an absence: the same fold reads ['dispatch triage'] and the same guard names the timeout earlier in this test
+        seats.join(session=self.SID, seat="vto", cwd="/tmp/p")
+        self.bash("timeout 20 helm dispatch triage abc123", "Exit code 124")
+        rc, _o, err = self.guard()
+        self.assertEqual(rc, 2, err)
+        self.assertIn("`helm dispatch triage` timed out (exit 124)", err)
+        rc, _o, err = self.guard()
+        self.assertEqual(rc, 0, err)                  # latched: same state
+        self.assertNotIn("timed out", err)
+        # a SECOND timeout of the same verb is a new state, not a new row
+        self.bash("timeout 20 helm dispatch triage abc123", "Exit code 124")
+        rc, _o, err = self.guard()
+        self.assertEqual(rc, 2, err)
+        self.assertIn(" x2", err)
+        # THE FOLD, not the latch: the line above is latched, so a quiet
+        # guard alone proves nothing about the discharge. The verb's bare
+        # words are no diagnosis; its invocation is.
+        from helm import verbtimeout
+        self.bash("helm store add 'dispatch triage timed out: it folds the "
+                  "whole ledger per call'")
+        self.assertEqual([o["verb"] for o in
+                          verbtimeout.open_timeouts(self.SID)[0]],
+                         ["dispatch triage"])
+        self.bash("helm store add 'helm dispatch triage timed out: it folds "
+                  "the whole ledger per call'")
+        self.assertEqual(verbtimeout.open_timeouts(self.SID)[0], [])
+        rc, _o, err = self.guard()
+        self.assertNotIn("timed out", err)

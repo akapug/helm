@@ -54,7 +54,7 @@ from ._common import (
 )
 from ._lanes import (
     find_root, lane_branch, lane_path, lane_rows, auto_rows, managed_room_kind,
-    resource,
+    resource, describe_occupants,
     unguarded_inventory, unguarded_rows, worktrees,
     _checkout_issue, _git, _git_bytes, _harness_state,
     _disposable_worktree_occupant, _last_agent_terminal, _live_claude_sessions,
@@ -62,23 +62,23 @@ from ._lanes import (
     _wrote_ago,
 )
 from ._gc import (
-    EnactResult, RETIRABLE, estate_phantom_records, format_gc_summary,
+    EnactResult, RETIRABLE, UNSTARTED, estate_phantom_records,
+    format_gc_summary,
     gc_enact, gc_orphans, was_reclassified,
     LANE_GONE, LANE_LANDED, LANE_UNKNOWN, LANE_UNLANDED, LANE_UNSTARTED,
     landed_leases, lanes_landed, release_command, rooms_dirty,
-    gc_scan, green_receipts, lane_overlaps, list_rows, phantom_records,
+    gc_scan, lane_overlaps, list_rows, phantom_records,
     phantom_scan, seam_candidates,
     post_gc_summary, prune_phantom_records, _base, _delete_lane_branch, _dirty,
-    _has_branch, _live, _merge_state, _merged, _proof_word, _removal_blocker,
-    _wip_commit,
+    _has_branch, _live, _merge_state, _merged, _moved_under_scan,
+    _moved_since, _proof_word, _removal_blocker, _room_fingerprint,
+    _room_state, _sweep_state, _wip_commit,
 )
-from ._claims import claim, release_lane, release_stale_lane, _infer_lane, _positional
+from ._claims import claim, _infer_lane
 from ._common import PEEK_DIRNAME
-from ._peek import peek, peek_area, peek_drop, peek_path, peek_rows, \
-    resolve_commit
+from ._peek import peek, peek_area, peek_drop, peek_path, peek_rows
 from ._guard import (
-    GUARD_HOOK, GUARD_HOOKS, LEGACY_HOOK_MARKERS, MANAGED_HOOK_MARKER,
-    REF_GUARD_HOOK, hook_path, install_guard,
+    GUARD_HOOKS, MANAGED_HOOK_MARKER, hook_path, install_guard,
     _guard_plan, _hook_scope, _owned_hook, _path_snapshot, _put_snapshot,
 )
-from ._cli import USAGE, cmd_work
+from ._cli import cmd_work

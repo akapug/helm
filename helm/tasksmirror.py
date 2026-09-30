@@ -285,7 +285,10 @@ def touches(row):
         out.append("claimed")
     elif tasks.owner_of(row):
         out.append("owner set")
-    if any(c.get("by") != MIRROR_ACTOR for c in row.get("comments") or ()):
+    # AUTHORS THROUGH THE STORE, archived comments included: a row that
+    # outgrew its budget keeps only its newest comments inline, and a human's
+    # comment moved into an archive is still a human's comment.
+    if any(b != MIRROR_ACTOR for b in tasks.comment_authors(row)):
         out.append("commented")
     if row.get("ranked_by"):
         out.append("ranked")
@@ -337,7 +340,7 @@ def settle(pairs, sources, torn, apply=True, path=None, write_cap=WRITE_CAP):
         if status not in FINISHED:
             out["unknown"].append({"row": rid, "ref": key, "status": status})
             continue
-        if any(c.get("by") == MIRROR_ACTOR for c in row.get("comments") or ()):
+        if MIRROR_ACTOR in tasks.comment_authors(row):
             out["already_noted"] += 1
             continue
         where = key[len(REF_HARNESS):] if key.startswith(REF_HARNESS) else key
@@ -567,7 +570,8 @@ WantedBy=timers.target
 """
 
 
-def _timer_units(interval=DEFAULT_INTERVAL_S):
+def _timer_units(interval=DEFAULT_INTERVAL_S, inputs=None):
+    # `inputs` replaces per-install values (timerhealth.unit_values).
     # A persistent unit must never capture a DISPOSABLE WORKTREE's path: the
     # binary comes from the stable install, and the working directory is
     # DERIVED by folding a lane worktree back to the shared checkout. An
@@ -577,11 +581,14 @@ def _timer_units(interval=DEFAULT_INTERVAL_S):
     helm_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "helm")
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cwd = work.find_root(here) or here
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    from . import timerhealth
+    udir = timerhealth.user_unit_dir()
     return (os.path.join(udir, "helm-tasks-mirror.service"),
-            _UNIT_SERVICE % {"helm": helm_bin, "cwd": cwd},
+            _UNIT_SERVICE % timerhealth.unit_values(
+                {"helm": helm_bin, "cwd": cwd}, inputs),
             os.path.join(udir, "helm-tasks-mirror.timer"),
-            _UNIT_TIMER % {"interval": interval})
+            _UNIT_TIMER % timerhealth.unit_values({"interval": interval},
+                                                  inputs))
 
 
 def ensure_timer(interval=DEFAULT_INTERVAL_S):
@@ -591,8 +598,7 @@ def ensure_timer(interval=DEFAULT_INTERVAL_S):
     changed interval or a moved checkout is repaired by re-running rather than
     by an operator noticing."""
     import shutil
-    import subprocess
-    from . import pk
+    from . import timerhealth
     if interval < 1:
         return False, "interval must be at least 1 second"
     systemctl = shutil.which("systemctl")
@@ -600,17 +606,9 @@ def ensure_timer(interval=DEFAULT_INTERVAL_S):
         return False, ("systemctl unavailable; run `helm task mirror --apply` "
                        "from another scheduler")
     spath, service, tpath, timer = _timer_units(interval)
-    try:
-        os.makedirs(os.path.dirname(spath), exist_ok=True)
-        pk.atomic_write(spath, service)
-        pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    for cmd in ([systemctl, "--user", "daemon-reload"],
-                [systemctl, "--user", "enable", "--now",
-                 "helm-tasks-mirror.timer"]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, "%s failed: %s" % (
-                " ".join(cmd), (r.stderr or r.stdout or "").strip()[:200])
+    error, _unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer)), ("helm-tasks-mirror.timer",),
+        systemctl)
+    if error:
+        return False, error
     return True, "mirror cadence enabled every %ds (%s)" % (interval, tpath)

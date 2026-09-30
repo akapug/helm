@@ -122,14 +122,17 @@ class RouteGenerationTest(unittest.TestCase):
         for route in routes:
             row = declared[route["provider"]]
             self.assertEqual(route["upstream_model"], row["upstream_model"])
-        # CONTROL on a family of the OTHER shape: ds4pro is ONE model across
+        # CONTROL on a family of the OTHER shape: a pool is ONE model across
         # several vendors, so every one of its routes still carries the SAME
         # alias. If this ever reads like the block above, the two shapes have
-        # been folded into one and the per-model reading is gone.
-        pool = seat.proxy_routes("ds4pro")  # noqa: SEAT_NAME — the OTHER declaration shape's configured identity is the control
+        # been folded into one and the per-model reading is gone. The pool is
+        # the two-route entry, because no production family declares one.
+        from tests._two_route_catalog import FAMILY as POOL, two_route_entry
+        pool = seat.proxy_routes(POOL, table={
+            POOL: two_route_entry(seat.FAMILIES)})
         self.assertGreater(len(pool), 1)
         self.assertEqual({r["alias"] for r in pool},
-                         {seat.FAMILIES["ds4pro"]["model"]})  # noqa: SEAT_NAME — same control, its declared model
+                         {seat.FAMILIES[POOL]["model"]})
 
     def test_the_generated_config_is_a_fixpoint_of_the_plan(self):  # noqa: VACUOUS_ASSERTION — `assertEqual(plan["text"], text)` is the unconditional positive control: a planner that produced nothing would fail it, so the three absence assertions cannot pass on an empty plan
         """A generator whose own output the planner wants to rewrite would
@@ -522,7 +525,10 @@ class DataTermsGateTest(unittest.TestCase):
         model survives every regeneration and every doctor sweep. Only a
         reading of the config's own bytes can see it."""
         fam = seat.FAMILIES[FAMILY]
-        refused = "openrouter/free"
+        # A model refused for TRAINING ON SUBMITTED DATA. The free-models
+        # router is not the example any more: it is the or-free model class,
+        # admitted as a route (tests/test_or_free_model_class.py).
+        refused = "liquid/lfm-2.5-2.6b:free"
         self.assertIn(refused, fam["disqualified_models"])   # CONTROL
         text = ('openai-compatibility:\n'
                 '  - name: "openrouter-hand"\n'
@@ -538,7 +544,7 @@ class DataTermsGateTest(unittest.TestCase):
         reason = seat_launch_assets.disqualified_route_reason(block, fam)
         self.assertIsNotNone(reason)
         self.assertIn(refused, reason)
-        self.assertIn("RANDOM FREE MODEL", reason)
+        self.assertIn("TRAINS ON SUBMITTED DATA", reason)
 
     def test_the_refused_ids_are_spelled_as_the_vendor_spells_them(self):
         """A table naming ids the vendor does not list blocks NOTHING. The
@@ -654,9 +660,16 @@ class SeatDefaultsTest(unittest.TestCase):
     #: 59 characters of reasoning beside a two-character answer. opus46 is a
     #: `-thinking` route on that same endpoint and did NOT empty at 8 tokens,
     #: so its cap is headroom for a work turn rather than a cure for a
-    #: measured empty completion.
+    #: measured empty completion. qwenlocal's cap is the makers' own
+    #: thinking-on max_tokens (32768). On its endpoint a one-line arithmetic
+    #: prompt spent 293 completion tokens, and the reasoning came back in its
+    #: own field beside a three-character answer. bonsai's is 16384, the cap
+    #: the operator of the local boxes pinned live (task/3184), just above
+    #: the 16000 at which qwen27 measured a fan-out turn cut, so the
+    #: compaction margin comes out of the output inside a 131,072 slot it
+    #: shares with the input.
     CAP_DECLARING = frozenset(("openrouter", "qwen27", SECOND_FREE_LANE,
-                               "opus46", "gptoss"))  # noqa: SEAT_NAME — catalog FAMILY keys, and the set of them IS this arm's subject
+                               "opus46", "gptoss", "qwenlocal", "bonsai"))  # noqa: SEAT_NAME — catalog FAMILY keys, and the set of them IS this arm's subject
 
     #: The cap-declaring families that ALSO map their models per row. Only
     #: these have a `probed_max_completion_tokens` ceiling beside each model,
@@ -691,8 +704,18 @@ class SeatDefaultsTest(unittest.TestCase):
             fam = seat.FAMILIES[family]
             cap = fam["max_output_tokens"]
             self.assertGreater(cap, 4000, family)
+            # A MODEL CLASS ROW HAS NO CEILING OF ITS OWN: the router serves
+            # each request with a model it picks, and the vendor's listing
+            # reports none for it. It records none, so a number there would
+            # be a measurement and never a guess; the ceilings are the
+            # fixed routes'.
             ceilings = [row["probed_max_completion_tokens"]
-                        for row in fam["model_providers"].values()]
+                        for row in fam["model_providers"].values()
+                        if not row.get("model_class")]
+            classes = [row for row in fam["model_providers"].values()
+                       if row.get("model_class")]
+            for row in classes:
+                self.assertNotIn("probed_max_completion_tokens", row, family)
             self.assertTrue(ceilings, family)
             self.assertLess(cap, min(ceilings), family)
 

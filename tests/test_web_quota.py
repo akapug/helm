@@ -176,6 +176,101 @@ class TestWebQuota(unittest.TestCase):
         self.assertEqual(row["windows_left"], 4.0)
         self.assertEqual(row["home_name"], "alice-example-com")
 
+    def test_creds_rows_carry_the_token_lineage_from_the_one_shared_function(self):
+        """task/2636: the quota row shows the same token-lineage verdict
+        `helm cred list` prints, computed by cred.token_lineage and nothing
+        else — no second reader of the lineage or the metadata."""
+        from unittest import mock
+        from helm import cred
+        token = "FAKE-WEB-LINEAGE-REFRESH-not-a-secret"
+        d = os.path.join(homes.ROOTS["claude"], "b-user-example")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {"emailAddress": "b@user.example"}}, f)
+        with open(os.path.join(d, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {"refreshToken": token}}, f)
+        backups = os.path.join(self.tmp, "cred-backups-lineage")
+        prior_home = web._PROVIDER.home
+        web._PROVIDER.home = d
+        try:
+            with mock.patch.dict(os.environ, {"HELM_CRED_BACKUP_ROOT": backups}):
+                cred.cache_clear()
+                cred._lineage_record([(homes._token_family("claude", d),
+                                       "b-user-example", "a@user.example")])
+                real = cred.token_lineage
+                seen = []
+
+                def spy(home, *a, **kw):
+                    seen.append(os.path.realpath(home))
+                    return real(home, *a, **kw)
+                with mock.patch.object(cred, "token_lineage", spy):
+                    self._fresh("creds")
+                    status, rows = self.req("/api/creds")
+                expected = real(d)
+        finally:
+            web._PROVIDER.home = prior_home
+            self._fresh("creds")
+            cred.cache_clear()
+            shutil.rmtree(d, ignore_errors=True)
+        self.assertEqual(status, 200)
+        self.assertIn(os.path.realpath(d), seen)
+        row = rows[0]
+        self.assertEqual(row["token_lineage"], expected)
+        self.assertEqual(row["token_lineage"]["state"], "MISMATCH")
+        self.assertEqual(row["token_lineage"]["accounts"], ["a@user.example"])
+        self.assertEqual(row["identity"], "b@user.example")
+        self.assertEqual(row["token_lineage"]["chrome"], "UNKNOWN")
+        self.assertNotIn(token, json.dumps(rows))
+
+    def test_the_quota_table_labels_the_metadata_and_names_every_lineage_state(self):
+        """task/2636: the row's drift flag names the METADATA account, never
+        "holds", and the lineage flag has words for MISMATCH and AMBIGUOUS."""
+        part = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
+            __file__))), "helm", "web_ui", "scripts", "22-quotatable.js.part")
+        with open(part, encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("drifted: metadata says ${c.identity", src)
+        self.assertNotIn("drifted: holds", src)
+        self.assertIn("lineage MISMATCH", src)
+        self.assertIn("lineage AMBIGUOUS", src)
+
+    def test_creds_rows_carry_the_5h_pace(self):
+        """pace5h: the quota page's account row carries the snapshot's record
+        for its account, and None where nothing measured it."""
+        from helm import accounts, claudepace
+        self._fresh("creds")
+        status, d = self.req("/api/creds")
+        self.assertIsNone(d[0]["pace_5h"])         # CONTROL: nothing written
+        rec = {"state": claudepace.WATCH, "used_pct": 72.0,
+               "pct_per_hour": 26.0, "projected_pct": 104.0,
+               "hit_at": time.time() + 1800, "reset_at": time.time() + 3600,
+               "since": time.time(), "label": accounts.mask_identity(ACCT)}
+        claudepace.write_snapshot({"v": 1, "ts": time.time(), "accounts": {
+            accounts.measured_key(ACCT): rec}})
+        self.addCleanup(os.remove, claudepace.snapshot_path())
+        self._fresh("creds")
+        status, d = self.req("/api/creds")
+        self.assertEqual(status, 200)
+        self.assertEqual(d[0]["pace_5h"]["state"], claudepace.WATCH)
+        self.assertIn("hits 100%", d[0]["pace_5h"]["line"])
+        self._fresh("creds")
+
+    def test_a_bad_5h_pace_record_costs_its_field_never_the_world(self):
+        """pace5h review P3-1: a snapshot record the describer cannot read
+        degrades the pace field to "not measured"; the rows stay."""
+        from helm import accounts, claudepace
+        claudepace.write_snapshot({"v": 1, "ts": time.time(), "accounts": {
+            accounts.measured_key(ACCT): {"state": claudepace.WATCH,
+                                          "used_pct": "lots"}}})
+        self.addCleanup(os.remove, claudepace.snapshot_path())
+        self._fresh("creds")
+        status, d = self.req("/api/creds")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(d, list, d)
+        self.assertEqual([r["name"] for r in d], [ACCT])
+        self.assertIsNone(d[0]["pace_5h"])
+        self._fresh("creds")
+
     def test_creds_degrades_without_provider(self):
         prior = web._PROVIDER
         web._PROVIDER = BrokenProvider()
@@ -277,7 +372,9 @@ class TestWebQuota(unittest.TestCase):
         with urllib.request.urlopen(url, timeout=10) as r:
             self.assertEqual(r.status, 200)
             body = r.read().decode("utf-8")
-        for marker in ('id="nav"', 'class="navarea on" data-a="work"',
+        # the console opens on Home (task/3445 L3): the brand is lit, no area is
+        for marker in ('id="nav"', '<a class="brand on" id="brand" href="#home"',
+                       'class="navarea" data-a="work"',
                        'data-v="quota"', 'data-v="sessions"', 'data-v="configs"',
                        'id="view-work"', 'id="view-quota"', 'id="view-sessions"',
                        'id="view-configs"'):
@@ -291,7 +388,8 @@ class TestWebQuota(unittest.TestCase):
             self.assertIn(marker, body, "quota view markup missing: %s" % marker)
         # the home view survived the restructure intact as the Work page; the
         # board's rows replaced the project card grid (task/2975)
-        for marker in ('id="brows"', 'id="store"', 'id="sessions"', 'id="skillsec"',
+        # (the sessions strip went in task/3445: Fleet › sessions is the list)
+        for marker in ('id="brows"', 'id="store"', 'id="skillsec"',
                        'id="hello"', 'id="foot"'):
             self.assertIn(marker, body, "helm view markup missing: %s" % marker)
         # slice B landed (real sessions view); slice C replaced the placeholder
@@ -383,12 +481,11 @@ let CREDS = [], HIST = [];
 const ROSTER = () => new Set(CREDS.map(c => c.name));
 let DECL = {accounts: []};
 /* DECORATION, AND STUBBED AS SUCH. The cell arm below is about which WORD the
-   state cell carries; the colour of the dot, the truncation of a flag and the
-   spelling of a login command are not its subject. `quotaIdCell` itself is
-   lifted from the assembled page like everything else here. */
+   state cell carries; the colour of the dot and the truncation of a flag are
+   not its subject. `quotaIdCell` itself, and the sentences it says
+   (CRED_SAID), are lifted from the assembled page like everything else here. */
 const short = n => n;
 const acol = () => "#000";
-const LOGIN_CMDS = {codex: h => "LOGIN " + h};
 """
 
 QTABLE_DRIVER = r"""
@@ -457,10 +554,12 @@ const A = (over) => Object.assign({
 const R = (over) => ({cred: A(over), aliases: [], decl: null, spare: [],
                       fam: "codex", name: A(over).name, sub: "s-" + A(over).name});
 HIST = [];
+/* the walls' resets are in the FUTURE: a reset already past is no one's
+   back-in time, and a walled row with none sorts after every known one */
 const ROWS = [
-  R({name: "walled-late", headroom: 0, state: "exhausted", resets_at_ms: 3000}),
+  R({name: "walled-late", headroom: 0, state: "exhausted", resets_at_ms: Date.now() + 3000e3}),
   R({name: "needs-login", headroom: null, state: "expired-token"}),
-  R({name: "walled-soon", headroom: 0, state: "exhausted", resets_at_ms: 2000}),
+  R({name: "walled-soon", headroom: 0, state: "exhausted", resets_at_ms: Date.now() + 2000e3}),
   R({name: "roomy", headroom: 90}),
   R({name: "live-but-due", headroom: null, state: "expired-token", active: true}),
   R({name: "tight", headroom: 5}),
@@ -519,8 +618,12 @@ class QuotaTableRuntimeTest(unittest.TestCase):
                # the composition the owner's ruling is about
                "quotaRows", "quotaAliasOrder", "quotaDeclOrder", "quotaIdCell",
                # …and the screen he EDITS them on, which must show the same set
-               "fillRows", "fillComposed", "fillNeedsDescribe")
-    CONSTS = ("ATIER", "ATIER_SAID")
+               "fillRows", "fillComposed", "fillNeedsDescribe",
+               # the id cell's own parts: each claude home's token lineage,
+               # where a login is the fix, and when a spent account is back
+               "acctHomeLines", "linSaid", "linWhy",
+               "acctNeedsLogin", "acctBackAt", "fmtIn")
+    CONSTS = ("ATIER", "ATIER_SAID", "LIN_SAID", "CRED_SAID")
 
     @classmethod
     def setUpClass(cls):
@@ -697,8 +800,8 @@ class QuotaTableRuntimeTest(unittest.TestCase):
         cell = self.out["unproven_cell"]
         self.assertIn(">member unproven<", cell)
         self.assertIn("no pool file matches this member", cell)
-        self.assertIn("helm codex pool cx-hey", cell)
-        self.assertNotIn("LOGIN ", cell, "a login is not this row's cure")
+        self.assertIn("an agent pools", cell)
+        self.assertNotIn("signing in", cell, "a login is not this row's cure")
         self.assertNotIn(">unknown<", cell)
         # the control on the same renderer: a row with no reading still
         # wears the plain word
@@ -728,22 +831,27 @@ class AttentionStripRuntimeTest(unittest.TestCase):
     Node is optional on non-web hosts: absent, this SKIPS."""
 
     EXTRACT = ("attnPill", "renderAttn")
+    # the sentences a pill says, the id cell's own (task/3735)
+    CONSTS = ("CRED_SAID",)
 
     @classmethod
     def setUpClass(cls):
         import shutil as _sh
         import subprocess
         from helm import web_ui_loader
+        from tests.test_web_accounts import _extract_const
         from tests.test_web_chat_client_runtime import _extract_fn
         cls.node = _sh.which("node")
         if not cls.node:
             raise unittest.SkipTest("node not available")
         src = web_ui_loader.read_text()
         fns = "\n\n".join(_extract_fn(src, n) for n in cls.EXTRACT)
+        consts = "\n".join(_extract_const(src, n) for n in cls.CONSTS)
         cls.tmp = tempfile.mkdtemp(prefix="helm-web-quota-attn-")
         cls.path = os.path.join(cls.tmp, "run.js")
         with open(cls.path, "w", encoding="utf-8") as f:
-            f.write(ATTN_SUPPORT + "\n" + fns + "\n" + ATTN_DRIVER)
+            f.write(ATTN_SUPPORT + "\n" + consts + "\n" + fns + "\n"
+                    + ATTN_DRIVER)
         chk = subprocess.run([cls.node, "--check", cls.path],
                              capture_output=True, text=True)
         assert chk.returncode == 0, "node --check failed:\n" + chk.stderr
@@ -765,7 +873,9 @@ class AttentionStripRuntimeTest(unittest.TestCase):
         due = self.out["due"]
         self.assertIn("1 keepalive due", due)
         self.assertNotIn("need re-login", due)
-        self.assertIn("helm keepalive --apply", due)
+        # the fact and who does it, never the provider's CLI line (task/3735)
+        self.assertIn("no login is needed", due)
+        self.assertNotIn("helm keepalive", due)
         self.assertNotIn("reauth", due)
 
     def test_a_spent_account_still_gets_the_relogin_pill(self):
@@ -814,7 +924,7 @@ class AttentionStripRuntimeTest(unittest.TestCase):
         said = self.out["unproven"]
         self.assertIn("1 member unproven", said)
         self.assertIn("no pool file matches this member", said)
-        self.assertIn("helm codex pool cx-hey", said)
+        self.assertIn("an agent pools", said)
         self.assertNotIn("not reporting", said)
         self.assertNotIn("no auth", said)
         self.assertNotIn("all accounts healthy", said)
@@ -837,10 +947,339 @@ class AttentionStripRuntimeTest(unittest.TestCase):
     def test_a_drifted_home_names_what_it_holds_and_the_repair(self):
         drifted = self.out["drifted"]
         self.assertIn("home issue", drifted)
-        self.assertIn("holds other@x.example", drifted)
+        # task/2636: the account is the METADATA's, never "what it holds"
+        self.assertIn("metadata says other@x.example", drifted)
+        self.assertNotIn("holds other@x.example", drifted)
         self.assertIn("named who", drifted)
-        self.assertIn("helm cred heal", drifted)
+        self.assertIn("an agent repairs the home", drifted)
         self.assertNotIn("need re-login", drifted)
+
+
+
+# ---------------------------------------------------------------------------
+# the Credit page tells the owner no command (task/3735)
+# ---------------------------------------------------------------------------
+
+OWNER_WORDS_SUPPORT = r"""
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const short = (n, l = 26) => String(n).length > l ? String(n).slice(0, l - 1) + "…" : String(n);
+const acol = () => "#000";
+const NOW = Date.now();
+let CREDS = [], HIST = [], ALLOC = {};
+let CREDS_UNREADABLE = null;
+const strandAtReset = () => null;
+const EL = {};
+function el(sel) {
+  if (!EL[sel]) EL[sel] = {sel, innerHTML: "", dataset: {},
+                           classList: {remove: () => {}, add: () => {},
+                                       contains: () => false, toggle: () => {}}};
+  return EL[sel];
+}
+const $ = sel => el(sel);
+"""
+
+OWNER_WORDS_DRIVER = r"""
+const out = {errors: {}};
+const probe = (k, f) => { try { out[k] = f(); } catch (e) { out.errors[k] = String(e); } };
+for (const c of Object.values(BRANCHES)) {
+  if (c.resets_in_h != null) c.resets_at_ms = NOW + c.resets_in_h * 3600e3;
+  delete c.resets_in_h;
+}
+HIST = [{account: BRANCHES.spent.name, provider: "anthropic",
+         probed_at: new Date(NOW - 60e3).toISOString(),
+         gauges: [{label: "7d", utilization: 1.0, reset: (NOW + 20 * 3600e3) / 1000}]}];
+for (const [k, c] of Object.entries(BRANCHES)) {
+  probe("cell:" + k, () => quotaIdCell({cred: c, aliases: []}));
+  probe("pill:" + k, () => {
+    CREDS = [c];
+    CREDS_UNREADABLE = null;
+    renderAttn();
+    return el("#attn").innerHTML;
+  });
+}
+console.log(JSON.stringify(out));
+"""
+
+
+def _owner_branches():
+    """One row per state the Credit page gives a repair or a wall: the
+    shapes /api/creds sends. The due row's status is the provider's OWN
+    sentence, built by the shipped producer with no keepalive log behind it,
+    so the arm reads the text the server really sends (two helm verbs)."""
+    from unittest import mock
+    from helm import providers
+    with mock.patch("helm.keepalive.last_refresh", return_value=None):
+        due = providers._due_refresh_status(3 * 3600, "refresh-live", "/h/due")
+
+    def row(**over):
+        base = {"name": "a@x.example", "provider": "anthropic", "state": "ok",
+                "status": "allowed", "headroom": 80.0, "tier": "Max 20x",
+                "home": "/h/a", "home_name": "a", "identity": None,
+                "name_lies": False, "windows_verdict": "ok",
+                "token_lineage": None, "active": False}
+        base.update(over)
+        return base
+    return {
+        "drifted": row(name="who@x.example", name_lies=True,
+                       identity="other@x.example", home_name="who"),
+        "due": row(name="due@x.example", state="due-refresh", headroom=None,
+                   status=due),
+        "due_orca": row(name="orca@x.example", state="due-refresh",
+                        headroom=None,
+                        status="keepalive due (helm's token expired 3h ago; "
+                               "Orca holds this home's refresh chain, so "
+                               "keepalive skips it) — `helm cred sync-orca "
+                               "--home orca --apply` refreshes it, no login "
+                               "needed; last keepalive pass T by keepalive-cron"),
+        "unproven": row(name="hey-home", provider="codex", state="unknown",
+                        status="pool-member-unknown", headroom=None,
+                        member_unproven=True, home_name="cx-hey"),
+        "login": row(name="dead@x.example", state="expired-token",
+                     headroom=None,
+                     status="reauth-needed (helm's token expired 9d ago and "
+                            "no-home-refresh-token; orca refreshes its own "
+                            "store, not this one)"),
+        "login_codex": row(name="cx-dead", provider="codex", state="api-error",
+                           status="needs_reauth", headroom=None,
+                           home_name="cx-dead"),
+        "spent": row(name="spent@x.example", state="exhausted",
+                     status="blocked", headroom=0.0, resets_in_h=20),
+    }
+
+
+class CreditOwnerWordsRuntimeTest(unittest.TestCase):
+    """THE CREDIT PAGE STATES THE FACT AND WHO FIXES IT, NEVER A COMMAND
+    (task/3735). The owner, asked about Fleet › credit's copy-paste terminal
+    steps (task/3634's "a copied step is a terminal step and says so") against
+    the newer rule that the console never tells him to run a helm command:
+    "make them plain sentences". Every state with a repair — a drifted home, a
+    due token (both kinds), an unproven pool member, a login, and the spent
+    wall that has none — is rendered by the SHIPPED id cell and attention
+    strip, hover text included, and read with the console walk's own check.
+
+    A page function the shipped page does not define is skipped when lifting
+    and its render records the ReferenceError, so each arm fails on its own
+    assertion. Node is optional on non-web hosts: absent, this SKIPS."""
+
+    FNS = ("fmtIn", "latestGauges", "acctBackAt", "acctHomeLines", "linSaid",
+           "linWhy", "quotaIdCell", "attnPill", "renderAttn",
+           # which rows a login is the fix for: the name before the cure,
+           # and the name after it
+           "acctLoginFix", "acctNeedsLogin")
+    CONSTS = ("LIN_SAID", "LOGIN_CMDS", "CRED_SAID")
+    PILL = {"drifted": "1 home issue", "due": "1 keepalive due",
+            "due_orca": "1 keepalive due", "unproven": "1 member unproven",
+            "login": "1 need re-login", "login_codex": "1 need attention",
+            "spent": "1 need attention"}
+    WORD = {"drifted": "metadata says other@x.example", "due": "due-refresh",
+            "due_orca": "due-refresh", "unproven": "member unproven",
+            "login": "expired-token", "login_codex": "api-error",
+            "spent": "spent · back in 20h"}
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil as _sh
+        import subprocess
+        from helm import web_ui_loader
+        from tests.test_web_accounts import _extract_const
+        from tests.test_web_chat_client_runtime import _extract_fn
+        cls.node = _sh.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node not available")
+        cls.page = web_ui_loader.read_text()
+        parts = []
+        for name in cls.FNS:
+            try:
+                parts.append(_extract_fn(cls.page, name))
+            except AssertionError:
+                pass
+        for name in cls.CONSTS:
+            try:
+                parts.append(_extract_const(cls.page, name))
+            except (AssertionError, ValueError):
+                pass
+        cls.branches = _owner_branches()
+        cls.tmp = tempfile.mkdtemp(prefix="helm-web-quota-owner-")
+        path = os.path.join(cls.tmp, "run.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(OWNER_WORDS_SUPPORT
+                    + "const BRANCHES = %s;\n" % json.dumps(cls.branches)
+                    + "\n\n".join(parts) + "\n" + OWNER_WORDS_DRIVER)
+        proc = subprocess.run([cls.node, path], capture_output=True, text=True,
+                              timeout=60)
+        cls.stderr = proc.stderr
+        try:
+            cls.out = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError:
+            cls.out = {}
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
+
+    def got(self, key):
+        self.assertTrue(self.out, "node produced no output: "
+                        + (self.stderr or "")[:1500])
+        self.assertNotIn(key, self.out["errors"],
+                         "%s raised on the shipped page" % key)
+        return self.out[key]
+
+    def test_the_due_rows_status_names_helm_verbs_so_the_arm_can_fail(self):
+        """THE CONTROL on the fixture: what the server sends for a due token
+        DOES name helm verbs, so a clean render below is the page choosing
+        its words, not a fixture with nothing to leak."""
+        from tests._ownerverbs import owner_verbs
+        self.assertIn("keepalive", owner_verbs(self.branches["due"]["status"]))
+        self.assertIn("cred", owner_verbs(self.branches["due_orca"]["status"]))
+
+    def test_no_state_on_the_credit_table_names_a_helm_verb(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a constant non-empty table, and each absence follows an assertIn on the SAME cell naming the branch it drew
+        from tests._ownerverbs import owner_verbs
+        for name, word in self.WORD.items():
+            cell = self.got("cell:" + name)
+            # POSITIVE CONTROL: the cell drew the branch named
+            self.assertIn(word, cell, name)
+            self.assertEqual(owner_verbs(cell), [], "%s: %s" % (name, cell))
+
+    def test_no_state_on_the_credit_table_shows_a_terminal_step(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a constant non-empty table, and each absence follows an assertIn on the SAME cell naming the branch it drew
+        from tests._ownerverbs import owner_commands
+        for name, word in self.WORD.items():
+            cell = self.got("cell:" + name)
+            self.assertIn(word, cell, name)
+            self.assertEqual(owner_commands(cell), [], "%s: %s" % (name, cell))
+            self.assertNotIn("data-fix", cell, name)
+
+    def test_no_attention_pill_names_a_helm_verb_or_a_terminal_step(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a constant non-empty table, and each absence follows an assertIn on the SAME pill naming its label
+        from tests._ownerverbs import owner_commands, owner_verbs
+        for name, label in self.PILL.items():
+            pill = self.got("pill:" + name)
+            self.assertIn(label, pill, name)
+            self.assertEqual(owner_verbs(pill), [], "%s: %s" % (name, pill))
+            self.assertEqual(owner_commands(pill), [], "%s: %s" % (name, pill))
+
+    def test_a_login_says_signing_in_again_and_that_an_agent_can_start_it(self):  # noqa: VACUOUS_ASSERTION — the control absences read cells whose branch words test_no_state_on_the_credit_table_names_a_helm_verb asserts present; the login cells here carry their own assertIn
+        """A login stays a human act, said plainly: the account needs signing
+        in again, and an agent can start the login for him."""
+        for key in ("cell:login", "cell:login_codex", "pill:login"):
+            said = self.got(key)
+            self.assertIn("needs signing in again", said, key)
+            self.assertIn("an agent can start the login", said, key)
+        # THE CONTROL: a login is named only where it is the fix
+        for key in ("cell:due", "cell:unproven", "cell:spent", "pill:due"):
+            self.assertNotIn("needs signing in again", self.got(key), key)
+
+    def test_each_repair_says_who_does_it(self):
+        self.assertIn("an agent renews it", self.got("cell:due"))
+        self.assertIn("no login", self.got("cell:due"))
+        self.assertIn("an agent renews it", self.got("cell:due_orca"))
+        self.assertIn("an agent renews it", self.got("pill:due"))
+        self.assertIn("no pool file matches this member", self.got("cell:unproven"))
+        self.assertIn("an agent pools", self.got("cell:unproven"))
+        self.assertIn("an agent pools", self.got("pill:unproven"))
+        self.assertIn("an agent repairs", self.got("cell:drifted"))
+        self.assertIn("an agent repairs", self.got("pill:drifted"))
+
+    def test_a_spent_allowance_keeps_its_word_its_back_time_and_no_step(self):
+        cell = self.got("cell:spent")
+        self.assertIn("spent · back in 20h", cell)
+        self.assertIn("signing in again does not refill it", cell)
+        self.assertNotIn("an agent", cell)
+
+    def test_the_credit_view_markup_names_no_verb_and_no_terminal_step(self):
+        from tests._ownerverbs import owner_commands, owner_verbs, view_markup
+        view = view_markup(self.page, "quota")
+        # POSITIVE CONTROL: this is the credit view, table hint and homes card
+        self.assertIn('id="qonebody"', view)
+        self.assertIn('id="homescard"', view)
+        self.assertEqual(owner_verbs(view), [], view)
+        self.assertEqual(owner_commands(view), [], view)
+
+    def test_the_credit_scripts_copy_nothing_to_the_clipboard(self):  # noqa: VACUOUS_ASSERTION — the loop runs over two named parts, and each absence follows an assertIn on the SAME source text
+        """The click-to-copy existed only to copy a command; with no command
+        on the page it has nothing to copy."""
+        from helm import web_ui_loader
+        root = os.path.join(os.path.dirname(web_ui_loader.__file__), "web_ui",
+                            "scripts")
+        for part in ("20-quota.js.part", "22-quotatable.js.part"):
+            with open(os.path.join(root, part), encoding="utf-8") as f:
+                src = f.read()
+            # POSITIVE CONTROL: the part is the credit page's
+            self.assertIn("function", src)
+            for said in ("clipboard", "data-fix", "stfix"):
+                self.assertNotIn(said, src, "%s carries %s" % (part, said))
+
+
+DECL_STATES_DRIVER = r"""
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const EL = {"#declrows": {innerHTML: ""}, "#declfill": {innerHTML: "", hidden: true}};
+const $ = s => EL[s] || null;
+let DECL_FILL = true;
+let DECL = {unreadable: "accounts.json is not valid JSON", accounts: []};
+const fillRows = () => [], declFillSort = r => r, declFillHeader = () => "";
+const out = {errors: {}};
+const probe = (k, f) => { try { f(); out[k] = EL[k === "card" ? "#declrows" : "#declfill"].innerHTML; } catch (e) { out.errors[k] = String(e); } };
+probe("card", () => renderDeclared());
+probe("fill", () => renderDeclFill());
+DECL = {unreadable: null, accounts: []};
+probe("fill_empty", () => renderDeclFill());
+console.log(JSON.stringify(out));
+"""
+
+
+class CreditDeclaredStatesOwnerWordsRuntimeTest(unittest.TestCase):
+    """THE DECLARED CARD AND THE FILL SCREEN SAY WHO FIXES IT (task/3735). An
+    unreadable inventory told him "Fix or move that file, then reload", and
+    an empty fill screen told him to "run one seed": a file he cannot reach
+    and a verb he does not type. Each now names the fact and that an agent
+    does it. The SHIPPED renderers draw the unreadable and the empty state.
+    Node is optional on non-web hosts: absent, this SKIPS."""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil as _sh
+        import subprocess
+        from helm import web_ui_loader
+        from tests.test_web_chat_client_runtime import _extract_fn
+        node = _sh.which("node")
+        if not node:
+            raise unittest.SkipTest("node not available")
+        src = web_ui_loader.read_text()
+        fns = "\n\n".join(_extract_fn(src, n) for n in ("renderDeclared", "renderDeclFill"))
+        cls.tmp = tempfile.mkdtemp(prefix="helm-web-quota-decl-")
+        path = os.path.join(cls.tmp, "run.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(fns + "\n" + DECL_STATES_DRIVER)
+        proc = subprocess.run([node, path], capture_output=True, text=True,
+                              timeout=60)
+        cls.stderr = proc.stderr
+        try:
+            cls.out = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError:
+            cls.out = {}
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
+
+    def test_an_unreadable_inventory_says_an_agent_repairs_the_file(self):
+        self.assertTrue(self.out, (self.stderr or "")[:1500])
+        self.assertEqual(self.out["errors"], {})
+        card, fill = self.out["card"], self.out["fill"]
+        # POSITIVE CONTROLS: each unreadable branch drew its reason
+        self.assertIn("accounts.json is not valid JSON", card)
+        self.assertIn("accounts.json is not valid JSON", fill)
+        self.assertIn("An agent repairs or moves that file", card)
+        self.assertIn("An agent repairs or moves that file", fill)
+        self.assertNotIn("Fix or move", card)
+        self.assertNotIn("Fix or move", fill)
+
+    def test_an_empty_fill_screen_names_no_verb_to_run(self):
+        from tests._ownerverbs import owner_commands, owner_verbs
+        said = self.out["fill_empty"]
+        self.assertIn("nothing declared yet", said)
+        self.assertNotIn("run one seed", said)
+        self.assertIn("an agent", said)
+        self.assertEqual(owner_verbs(said), [], said)
+        self.assertEqual(owner_commands(said), [], said)
 
 
 

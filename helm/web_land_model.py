@@ -1781,7 +1781,11 @@ def _lr_recent_lands(lrs=None, all_projects=False, unavailable=None):
     for position, lr in enumerate(lrs.values()):
         if not isinstance(lr, dict):
             continue
-        if lr.get("close_reason") != "landed":
+        # A LANDED SOURCE-CLEAN HOLD IS A LAND TOO (task/3053): the row's own
+        # clean-read tip reached trunk by ancestry under a verified gate, and
+        # leaving it off this card is the owner board saying "landed, no
+        # verdict recorded" by omission instead of in words.
+        if lr.get("close_reason") not in ("landed", "source-clean-landed"):
             continue
         # SAME SCOPE AS EVERY OTHER LIST IN THIS BODY (task/974): a foreign
         # project's land is not this board's land to announce.
@@ -1820,7 +1824,9 @@ def _lr_recent_lands(lrs=None, all_projects=False, unavailable=None):
             # over a verified land — the one sentence this field exists to keep
             # from being wrong. `gate` stays as the fallback because a row
             # closed as landed outside the landing-review ladder carries it.
-            "gate": lr.get("landing_review_gate") or lr.get("gate") or "",
+            # A source-clean land's receipt is the one its close recorded.
+            "gate": lr.get("landing_review_gate") or lr.get("source_clean_gate")
+            or lr.get("gate") or "",
             "ts": ts,
             # WHY THE INSTANT IS MISSING, when it is missing for a reason. An
             # absent stamp and a corrupt one are different facts with different

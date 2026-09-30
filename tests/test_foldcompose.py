@@ -2164,8 +2164,8 @@ class BaseGapTest(ComposeBase):
         SHIPPED functions actually return, out of their own source, rather
         than comparing two lists I wrote."""
         emitted = set()
-        tree = ast.parse(io.open(foldcompose.__file__,
-                                 encoding="utf-8").read())
+        with io.open(foldcompose.__file__, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
         for fn in ast.walk(tree):
             if not isinstance(fn, ast.FunctionDef):
                 continue

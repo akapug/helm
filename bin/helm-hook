@@ -122,6 +122,58 @@ alarm() {
     hd=${HELM_HOOK_ALARM_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/helm-hookalarm-${LOGNAME:-${USER:-helm}}}; mkdir -p "$hd" 2>/dev/null; hw=$(date -u +%Y%m%d%H%M); hp=$hd/$name; hf=$hp.${hw%?}; ha=; if [ -e "$hf" ]; then printf . >> "$hf" 2>/dev/null; else set -- "$hp".*; hc=$(cat "$@" 2>/dev/null); rm -f "$@" 2>/dev/null; if [ -n "$hc" ]; then hs=${1##*.}; hs=${hs#????????}; ha=" (+${#hc} suppressed since ${hs%?}:${hs#??}0Z)"; fi; printf '' > "$hf" 2>/dev/null; say "$m$ha"; fi
 }
 
+# THE FLEET'S STALL RIDES THE TIMEOUT LINE (task/3714). A hook times out
+# because the helm process under it was slow, and one cause is every seat
+# stalled at once inside agents.slice, which a line that says only "TIMED
+# OUT" hides. The line now carries what the kernel counted for the fleet when
+# the budget ran out: the `some avg10` of agents.slice's cpu.pressure and
+# memory.pressure, in the kernel's own digits. BUILTINS ONLY, on the timeout
+# path alone: no fork. The slice is found the way helm/seatceiling.py
+# `fleet_slice` finds it, from this shell's own unified cgroup line, and
+# HELM_FLEET_CGROUP names it outright. With HELM_SEAT_PRESSURE off and no
+# HELM_FLEET_CGROUP nothing is read and nothing is said, as everywhere else
+# that switch reads. `seatceiling.stall_clause` is the Python half and
+# tests/test_pressurewatch.py compares the two renderings.
+stall() {
+    st=
+    sd=${HELM_FLEET_CGROUP:-}
+    if [ -z "$sd" ]; then
+        case ${HELM_SEAT_PRESSURE:-on} in
+        0|[Oo][Ff][Ff]|[Nn][Oo]) return 0 ;;
+        esac
+        cg=
+        if [ -r /proc/self/cgroup ]; then
+            while IFS= read -r ln; do
+                case $ln in 0::/*) cg=${ln#0::} ;; esac
+            done 2>/dev/null </proc/self/cgroup
+        fi
+        case $cg in
+        */agents.slice|*/agents.slice/*)
+            sd=/sys/fs/cgroup${cg%%/agents.slice*}/agents.slice ;;
+        */user@*.service|*/user@*.service/*)
+            up=${cg%%/user@*}
+            ur=${cg#"$up"/}
+            sd=/sys/fs/cgroup$up/${ur%%/*}/agents.slice ;;
+        *)
+            st="; fleet stall UNKNOWN: no agents.slice on this process's cgroup path"
+            return 0 ;;
+        esac
+    fi
+    c1=
+    c2=
+    if read -r k1 c1 _ 2>/dev/null <"$sd/cpu.pressure" && [ "$k1" = some ] \
+            && read -r k2 c2 _ 2>/dev/null <"$sd/memory.pressure" \
+            && [ "$k2" = some ]; then
+        case $c1 in avg10=?*) ;; *) c1= ;; esac
+        case $c2 in avg10=?*) ;; *) c2= ;; esac
+        if [ -n "$c1" ] && [ -n "$c2" ]; then
+            st="; fleet stall (agents.slice PSI some avg10): cpu ${c1#avg10=}%, memory ${c2#avg10=}%"
+            return 0
+        fi
+    fi
+    st="; fleet stall UNKNOWN: agents.slice pressure would not read"
+}
+
 # THE BUDGET STARTS HERE, NOT WHERE THE CHILD'S FIRST LINE RUNS. The outer
 # `timeout` below is armed now, and the interpreter start and imports before a
 # handler's first line spend it. HELM_HOOK_T0 is /proc/uptime at this instant
@@ -263,7 +315,7 @@ if [ "$rc" != 0 ]; then
     # repeats per tool call with nothing new to say; MISSING and an unknown rc
     # each name a broken estate that has to be read every single time.
     case "$rc" in
-    124) alarm "$t" ;;
+    124) stall; alarm "$t$st" ;;
     127) say "$m" ;;
     *)   say "$b" ;;
     esac

@@ -30,13 +30,29 @@ THE CONSTANTS LIVE HERE AND THE SUITE IMPORTS THEM BACK, so there is one
 budget with two readers rather than a copy that drifts -- the shape
 docref_guard established for its citation registry.
 
+THE REFUSAL LEADS WITH THE WAY OUT. A reader that stops after one line must
+still learn the fix, so the REFUSED line itself says "split into a sibling
+module", and numbered steps plus real past splits to copy follow before the
+rule is restated. `way_out` builds that text and the whole-suite backstop
+imports it, so the two readers cannot drift apart (task/3524: a seat that read
+only the rule trimmed comments against it for hours and never split).
+
+A REFUSAL LEAVES ONE RECORD: a JSON line in <git common dir>/helm/refusals.jsonl
+with the guard, the room, its branch and each module's numbers, so a progress
+check can see a seat walled by this rung without reading its transcript. The
+common dir is shared by every worktree of the repository, so one file holds
+every lane's refusals. The record is fail-open: a write that fails is named on
+stderr and the refusal is unchanged.
+
 IMPORTS NOTHING FROM helm. The installer snapshots these bytes beside the
 pre-commit hook, where no helm package exists to import (see
 helm/inflight_gate.py, which states the same law).
 """
+import json
 import os
 import subprocess
 import sys
+import time
 
 #: An EXTRACTED module over this defeats the split.
 FINISH = 1000
@@ -47,6 +63,22 @@ WARN_BAND = 25
 
 SKIP_ENV = "HELM_SPLIT_BUDGET_SKIP"
 _PKG = "helm"
+
+#: Past splits a seat can copy: (the new sibling, the module it moved out of,
+#: the commit that did it). `git show <commit>` shows every moved line, the
+#: import back into the old module, and the tests that followed the code.
+#: tests/test_splitbudget.py refuses a row whose files are gone.
+EXAMPLES = (
+    ("helm/seats_stop_spiral.py", "helm/seats_stop_signals.py", "63c872c6d47"),
+    ("helm/seats_stop_claims.py", "helm/seats_stop_guard.py", "124fb524bc9"),
+    ("helm/seats_gc.py", "helm/seats_report.py", "c162d84e4cc"),
+)
+
+#: The refusal record: its guard token, its path under the git common dir, and
+#: the size at which the live file rolls to `<file>.1` (one generation kept).
+GUARD = "split-budget"
+RECORD = ("helm", "refusals.jsonl")
+RECORD_ROLL_BYTES = 256 * 1024
 
 
 def is_budgeted(rel):
@@ -140,6 +172,83 @@ def _limit(rel):
     return CEILING if rel.endswith("/seats.py") else FINISH
 
 
+def way_out(rel, limit=None):
+    """The fix for `rel` over its budget, as lines a seat can follow with no
+    mentor: what to move, where, how to import it back, and past splits to
+    copy. ONE TEXT, TWO READERS: this rung prints it and the whole-suite
+    backstop imports it."""
+    limit = _limit(rel) if limit is None else limit
+    d, name = os.path.split(rel)
+    stem = name[:-3] if name.endswith(".py") else name
+    new = "%s_<topic>" % stem
+    fanout = ('Add "%s" to _IMPL_MODULES in helm/seats.py, the facade\'s '
+              'patch fan-out.' % new if stem == "seats" else
+              'If _IMPL_MODULES in helm/seats.py lists "%s", add "%s" '
+              'beside it.' % (stem, new))
+    lines = [
+        "THE WAY OUT: split %s. Move whole functions into a new sibling "
+        "module and import them back:" % rel,
+        "  1. Pick whole functions (and the constants only they use) that "
+        "share one topic, enough to leave %s well under %d lines." % (
+            rel, limit),
+        "  2. Move them unchanged into a new file named for that topic: "
+        "%s/%s.py. Give it its own imports for what the moved code uses. It "
+        "must not import %s at the top (an import cycle), so a helper the "
+        "moved code calls moves with it." % (d or ".", new, stem),
+        "  3. Import them back near the top of %s, so every caller keeps "
+        "working:" % rel,
+        "         from .%s import name_a, name_b  # noqa: F401" % new,
+        "  4. %s" % fanout,
+        "  5. Run: git grep -n '%s' tests  (a test that reads the old file by "
+        "path must also read the new one)." % name,
+        "  6. git add both files and commit again.",
+        "COPY A PAST SPLIT (git show <commit> shows every moved line):",
+    ]
+    lines += ["    %s  moved out of %s  in %s" % ex for ex in EXAMPLES]
+    lines.append("The budget is never raised to fit a commit: it is what keeps "
+                 "these files small enough to read.")
+    return lines
+
+
+def record(root, refusals, now=None):
+    """Append ONE JSON line for this refusal to <common dir>/helm/refusals.jsonl.
+
+    None when the line was written, else why it was not. NEVER RAISES: the
+    refusal is decided before this runs and must not depend on it. One
+    `os.write` of one line through O_APPEND, so rooms appending at once do
+    not interleave inside a line."""
+    try:
+        rc, common, err = _git(root, "rev-parse", "--path-format=absolute",
+                               "--git-common-dir")
+        if rc != 0 or not common.strip():
+            return "no git common dir (%s)" % err.decode(
+                "utf-8", "replace").strip()
+        rc, top, _err = _git(root, "rev-parse", "--show-toplevel")
+        brc, branch, _err = _git(root, "symbolic-ref", "-q", "--short", "HEAD")
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+               "guard": GUARD,
+               "worktree": os.fsdecode(top.rstrip(b"\n")) if rc == 0 else None,
+               "branch": (os.fsdecode(branch.rstrip(b"\n")) or None)
+                         if brc == 0 else None,
+               "modules": [{"path": rel, "lines": staged, "was": head,
+                            "budget": limit}
+                           for rel, staged, limit, head in refusals]}
+        path = os.path.join(os.fsdecode(common.rstrip(b"\n")), *RECORD)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.isfile(path) and os.path.getsize(path) > RECORD_ROLL_BYTES:
+            os.replace(path, path + ".1")
+        line = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            wrote = os.write(fd, line)
+        finally:
+            os.close(fd)
+        return None if wrote == len(line) else "short write (%d of %d bytes)" \
+            % (wrote, len(line))
+    except Exception as exc:                                  # noqa: BLE001
+        return "%s: %s" % (type(exc).__name__, exc)
+
+
 def scan(root):
     """(refusals, notes) for what this commit does to the budget."""
     refusals, notes = [], []
@@ -194,14 +303,25 @@ def main(argv=None):
     if not refusals:
         return 0
     print("[helm split-budget] REFUSED: this commit takes %d module(s) past "
-          "the seats-split line budget:" % len(refusals), file=sys.stderr)
+          "the seats-split line budget. The fix is to split: move whole "
+          "functions into a new sibling module and import them back (steps "
+          "below)." % len(refusals), file=sys.stderr)
     for rel, staged, limit, head in refusals:
         print("    %s  %s -> %d  (budget %d)"
               % (rel, "new" if head is None else head, staged, limit),
               file=sys.stderr)
-    print("  The budget is what DRAINS the facade, so it is not raised to fit "
-          "a commit. Move the rationale to the task row or the commit message, "
-          "or extract. One-commit skip: %s=1" % SKIP_ENV, file=sys.stderr)
+    for line in way_out(refusals[0][0], refusals[0][2]):
+        print("  " + line, file=sys.stderr)
+    if len(refusals) > 1:
+        print("  Do the same for every module listed above.", file=sys.stderr)
+    print("  Do not trim old comments to fit: the next commit meets the same "
+          "wall. Only when this commit's own growth is a comment may that text "
+          "move to the commit message instead. Owner override for one commit: "
+          "%s=1" % SKIP_ENV, file=sys.stderr)
+    why = record(root, refusals)
+    if why:
+        print("[helm split-budget] note: this refusal was not recorded (%s); "
+              "the refusal stands." % why, file=sys.stderr)
     return 1
 
 

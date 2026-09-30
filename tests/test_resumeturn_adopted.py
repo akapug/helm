@@ -42,6 +42,9 @@ ADVANCED_PANE = "\n".join(("─" * 40, "❯", "─" * 40,
                            "  ⏵⏵ bypass permissions on"))
 
 
+_settle = None
+
+
 def setUpModule():
     """Zero `submit`'s type->Enter settle for this module.
 
@@ -55,7 +58,11 @@ def setUpModule():
 
 
 def tearDownModule():
-    _settle.stop()
+    global _settle
+    if _settle is not None:
+        _settle.stop()
+    # Back to what import left (see tests/test_module_patch_resets.py).
+    _settle = None
 
 SID = "0fa7c4ed-9a5e-46a0-b2da-f862eb8afad6"
 OTHER = "b4cdb8c0-7371-45b3-a250-e6adfe9ba5a1"

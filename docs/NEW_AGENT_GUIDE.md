@@ -41,7 +41,7 @@ new seats skip and most senior seats drift out of.
 
 **Mandatory first action** (the banner says so; do it before anything else):
 arm your inbox beacon —
-`Monitor(command: "helm chat wait --seat <you> --follow", timeout_ms: 1800000)`.
+`Monitor(command: "helm chat wait --seat <you> --follow", description: "inbox beacon", timeout_ms: 1800000)`.
 Your inbox beacon expires every 30 minutes; that is your check-in. Re-arm it
 in the same turn, and never write its ID anywhere. It is 'the beacon on
 `helm chat wait --seat <you> --follow`'. Every other watcher is named the same
@@ -54,6 +54,34 @@ The beacon wakes you on `@you` mentions, replies to your rows, DMs and
 `@all` — **not** on ambient home-room chatter (each ambient wake burns a full
 turn; the mention culture pierces everything). Catch up on the room when you
 wake; add `--ambient` to the wait command only if your home room is quiet.
+
+The beacon is a **doorbell**, not a stream. However many rows are waiting, it
+rings with ONE line: the WHOLE body of the row you should act on (line breaks
+shown as ` ⏎ `, 1200 characters at most; a longer one ends `(cut, N more
+chars: helm chat read --id ID)`), the unread counts, and ONE pull command.
+The lead is the owner's row, then a DM, then the newest row addressed to you;
+while one of those is unread an `@all`, a reaction or a room row never leads.
+A row addressed to you whose dispatch row or task has closed costs you
+nothing: the ring releases it and says `N already closed` (a dispatch row or
+task it cannot read keeps the row). The pull is
+`helm chat read --id ID,ID,...`, naming exactly the rows you must act on, the
+lead first and then the newest; the rest are only counted, `N not
+addressed: read when idle`, and a ring with nothing to act on names the room
+pulls instead (`helm chat read --room <room> --since <n>`, or
+`helm chat read --dm --seat <you> --since <n>` for your DMs). **After a ring,
+act on the lead, or run the pull it names.** The pull is
+the delivery: the rows it prints in full leave your counts, and your
+tool-boundary hook does not show them again. The beacon then
+stays silent until a new row lands, or rings again every 12 minutes while
+the rows it announced stay unread; rows that land within 60 s of each other
+share one ring, an owner row or a DM rings at once, and at most 12 other
+rings an hour reach you (past that the counts accumulate into the next ring). Arming
+with a backlog rings once, so a pause or a `/clear` costs you one turn, not
+one turn per row. A filter piped after the beacon now sees one line per
+ring, not one per row, so a filter that drops a ring drops every row it
+counts. **Your Monitor filter must not drop ring lines:** a ring can lead
+with a watcher's mention while a person's `@all` is newer. If you must filter by row,
+add `--per-row` to the wait command.
 
 A background shell running `helm chat wait` is **not** a beacon: a background
 process cannot re-invoke your turn loop, so it wakes nobody — never report
@@ -106,6 +134,17 @@ design and must never arm, replace or stop one.
   your work; the metaharness has a separate worktree reaper that helm does not
   coordinate with, so commit anything you would mind losing).
   `helm work list` is the room board.
+- **Coordination verbs always run trunk helm.** `dispatch`, `chat`, `work`,
+  `handoff`, `task`, `lr`, `store` and the other verbs that write a shared
+  ledger run the trunk checkout's code, from any tree, including as
+  `./bin/helm` from your lane. Stale code writes rows that current readers
+  drop, so helm does not let a lane write them. To drive your lane's own
+  version of one of those verbs, set `HELM_LANE_COORDINATION=1`
+  ([ENVIRONMENT](ENVIRONMENT.md#which-helm-runs)). When the trunk checkout
+  cannot be used, those verbs refuse and name the fix, except `chat`, which
+  runs your tree's code and says so in one line. The "you ran helm@X"
+  line still prints for the other verbs, where your lane's own code is the
+  point.
 - **Reviewed SHAs are immutable.** Once a SHA is posted for review, fix on
   top with a new commit — never amend or rebase it away.
 - **Obligations live on the dispatch ledger, and only the ones addressed to
@@ -123,57 +162,106 @@ design and must never arm, replace or stop one.
   named on an open row may be reading it at that moment, which is why the
   rebind door refuses a move off a live reader and records the override when
   a judgement seat makes one anyway.
+- **Work a task in its pair meld.** Every task runs as ONE mixed-family pair
+  in ONE persistent meld room. The task's first dispatch opens the room
+  between the row's sender and its reader, and every later dispatch of the
+  same chain (a FIX, the cure, the re-read, a rebind to a new reader) opens
+  the next ROUND in that same room. The room is named after the task the
+  chain's first row names in its lane (`task-3112` in the lane is enough),
+  else after the chain root: `meld-0-pair-<project>-task-3112`.
+  `helm dispatch send` prints "your pair meld for this task: ROOM" and the
+  `helm chat meld recv ROOM` that waits for your reader; the reader's DM
+  carries the room, and that DM is the only wake. As the reader, join with
+  `helm chat meld join ROOM`, then `helm chat meld recv ROOM`: join prints the
+  earlier rounds as a digest sized to your context window (the smallest
+  digest when your seat carries no window stamp), and
+  `helm chat read --room ROOM` is the whole log. Round one is THE PLAN:
+  agree the problem, its invariants and the acceptance checks; split the
+  genuinely independent work and name who owns the combined result. Either
+  side then implements and the other reviews; a correction gets a focused
+  check of what changed, never a restarted whole review. Close each round
+  with each side's `[DONE]` carrying this one line; an AGREED block that
+  names no `FALSIFIERS` (the closed set of classes the next read may bind)
+  has not converged and is refused with this line as its fix:
+
+  `MELD OUTCOME: AGREED|SPLIT|RESEARCH | BAR: <harms> | FALSIFIERS: <class>; ... | FINDINGS: <id>=<disposition>; ... | TIP: <full sha> | NEXT: <next action>`
+
+  The row stays the ledger: the reader records the outcome with
+  `helm dispatch verdict ... --meld ROOM` (the newest round) or
+  `--meld ROOM@EPOCH` (a named round). A round's outcome closes only the row
+  whose dispatch opened it, and it exempts no later round: exact-round
+  authority. The gate lands it. Joining is never required: a reader who does
+  not join gets the row as before, and the stop guard names a pair meld only
+  when its floor is yours (the peer yielded, joined or closed). A pair round
+  stops the review-spiral block only while both you and the current reader
+  have taken a turn in it inside the spiral's window, and the reader's
+  beacon is live. If both seats are one model family, the room
+  says so rather than calling itself a pair; the gate owes one approval-tier
+  read by a reader that is not the author, of any family. `helm dispatch melds` measures how many tasks'
+  pair melds reach AGREED on a row, and what each converged chain cost.
 - **Reviewing? Patch the mechanical findings yourself.** Every family is an
   equal counterpart, so a reviewer who finds a MECHANICAL defect cures it:
-  commit in your OWN worktree on a branch off the exact tip you reviewed, do
+  commit off the exact tip you reviewed, in your own room or, with none, a
+  `git clone --shared <repo> <scratch>/wt` detached at that tip, then bring
+  the commit into the repo with `git -C <repo> fetch --no-write-fetch-head
+  <scratch>/wt <sha>` (no ref moves; a commit left in the clone is refused as
+  cross-repository proof). Never `git worktree add` or a branch in the shared checkout. Do
   not push, and name the tip on the verdict:
-  `helm dispatch verdict <id> <tip> --fix --measured --patch-tip <your-sha>`
+  `helm dispatch verdict <id> <tip> --fix --measured --finding-count <n>
+  --prior-relation <new|uncured|regression-of-cure> --patch-tip <your-sha>`
   plus the exit answer and evidence. The lane owner or integrator rebases the
   lane onto that tip or cherry-picks it. A DESIGN finding goes to a meld
   instead. The lane then has SEVERAL AUTHORS and the ledger records each;
   family independence is preserved by the composed tip being re-read once by a
   reader who wrote none of it, not by keeping one family read-only.
-- **INDEPENDENCE IS CONTEXT, THEN MODEL, THEN FAMILY — in that order, and
-  only the first two can refuse.** A read is independent of the work when the
-  reader is a different SEAT on a different SESSION (a fresh context window,
-  taken from the proof and never from the alias) answering with a different
-  RESOLVED MODEL. `helm/review_independence.py` is that check, and every
-  refusal names the input it found shared or could not read. A different
-  vendor FAMILY is a PREFERENCE: it is printed on the row, it ranks a
-  candidate (`helm route` admits the author's own family and sorts it last),
-  and it is never the refusal. Confirmed before it shipped, on a seeded
+- **INDEPENDENCE IS THE READER'S CONTEXT; MODEL AND FAMILY RANK.** A read is
+  independent of the work when the reader is a different SEAT on a different
+  SESSION (a fresh context window, taken from the proof and never from the
+  alias) that holds none of the author's working context.
+  `helm/review_independence.py` states the predicate. A different RESOLVED
+  MODEL and a different vendor FAMILY are PREFERENCES: they are printed on
+  the row and rank a candidate (`helm route` admits the author's own family
+  and sorts it last), and neither is required, so a fresh-context Opus read
+  of Opus-authored work counts. Confirmed before it shipped, on a seeded
   three-defect lane read blind: a same-family different-model reader and a
   same-family same-model reader in a fresh window each scored 2 of 3, level
   with the cross-family baseline's 2 of 3 — so the fresh window, not the
   vendor, is doing the work. KNOWN GAP: a NATIVE runtime records no resolved
-  model at all, so for two native seats the model half of the check reads
-  UNKNOWN and refuses rather than guessing. Until the native authority
-  records its model, a native pair's independence rests on the context half
-  and is reported as such.
-- **The landing bar is ONE approval-tier APPROVE**, cross-family (codex /
-  kimi / ds4pro / claude — gemini reviews are valuable input, not a closing
-  leg), where family means the verified resolved runtime model, not the seat
-  label, agent/subagent type, or harness. UNKNOWN runtime grants no authority.
+  model at all, so helm cannot tell which model read a change on a native
+  seat; `helm route` says so beside the seat rather than barring it.
+- **The landing bar is ONE approval-tier APPROVE** by a reader that is not
+  the author (codex / kimi / ds4pro / grok / a fresh-context claude Opus —
+  gemini reviews are valuable input, not a closing leg), where the tier is read from
+  the verified resolved runtime model, not the seat label, agent/subagent
+  type, or harness. UNKNOWN runtime grants no authority.
   The approval is bound WITH a verified `gate:<token>` from a WHOLE suite on a
   tree that carries the reviewed tip, and that suite is the integrator's train:
   a lane runs no whole suite of its own, and `helm gate run` refuses one in a
   lane room. A lane's rounds are focused, and each round is two runs:
-  `helm gate run --focus --plan` prints the selection (the tests the change's
-  imports reach; a change outside the import graph, a `.md` included, selects
-  every tree-wide audit and the tests that name the file instead), and
-  `helm gate audits` prints the tree-wide audits as one command, which a
-  Python change's selection does not reliably carry. A red round is cured and run
+  `helm gate run --focus --plan` prints the selection (the tests whose run,
+  as the newest whole-suite record saw it, reached a changed file, plus every
+  tree-wide audit; with no usable record, the tests the change's imports
+  reach, and a change outside the import graph, a `.md` included, selects
+  every audit and the tests that name the file instead), and
+  `helm gate audits` prints the tree-wide audits as one command, which the
+  import fallback does not reliably carry. A red round is cured and run
   focused again; a whole suite re-runs a red tree only with `--again`, and
-  refuses a tree that already holds a green one. On a host that refuses local
+  refuses a tree that holds a landable green one. On a host that refuses local
   suites (the fleet hub is agents-only), a focused receipt routed through
   `fab gate` cannot come home, so the round is `fab test` over that selection:
   testimony, not a receipt. A reviewer whose source read is clean HOLDS the
-  row: `helm dispatch hold <row> --source-clean <tip> <reason>`, and the approve
-  then binds the token the train's gate mints. An APPROVE without a verified
-  token is refused, and a CONCUR authorizes nothing, so neither stands in for
-  the hold. `helm lr land` only WITNESSES — the integrator performs the merge.
-- **The land gate is ONE SERIAL whole suite per project LANDING WINDOW — one
-  trunk head — on the tree that lands**, because a green receipt on a stacked
+  row: `helm dispatch hold <row> --source-clean <tip> <reason>`. Only the
+  row's recipient, who wrote no round of the lane, can make that hold. Such a
+  row rides `helm train` at its held tip and owes no approve: after the
+  train's gate and land, `helm lr foldcheck <head> --gate gate:<id> --apply`
+  closes it as `source-clean-landed`. A car that rides on an APPROVE still
+  binds that approve to the token the train's gate mints. An APPROVE without a
+  verified token is refused, and a CONCUR authorizes nothing, so neither
+  stands in for the hold. `helm lr land` only WITNESSES — the integrator
+  performs the merge.
+- **The land gate is ONE whole suite per project LANDING WINDOW (sliced while
+  the gate canary stands, serial otherwise) — one trunk head — on the tree
+  that lands**, because a green receipt on a stacked
   train's top car lands every car beneath it. Its durable road is
   `helm gate window launch`, which `helm train --apply` and `helm gate run` in
   a compose room both take. The door records the project, the trunk head and
@@ -186,12 +274,12 @@ design and must never arm, replace or stop one.
   client behind to fetch that receipt — your terminal dying no longer strands a
   green suite. `helm gate window show` names anything the node finished that this
   hub never bound, and `--recover` binds it. The classic road, `fab gate` on a
-  train room standing outside the compose container, also runs serial; its
+  train room standing outside the compose container, runs serial; its
   receipt comes home only through the client that launched it, and it keeps no
   window record. In a compose room the classic road is refused and the refusal
   names the door. A SLICED whole suite (the default with no mode flag in a
-  lane-level room) binds a lane tip and never a land: every land road runs
-  serial.
+  lane-level room) binds a lane tip, and a land only while the gate canary
+  stands.
 - **The train composes itself: `helm train`.** A dry run lists this project's
   approve-ready rows, their reviewed tips and the merge order. `--apply` merges
   each reviewed tip by its exact sha into one detached room under
@@ -228,6 +316,15 @@ longer works. Run the command.
   that misbehaved? Our own bug → open a fix lane, not a rule. Rules are for
   truths we cannot change; a store entry routing around our own bug is
   self-bug-canonization.
+- **Friction is a tax.** When a hook or guard gets in your way, or you repeat
+  a step by hand, do not absorb it in silence. Name it in the same turn and
+  file it, or add it to the lane that owns it, with its size: steps times how
+  often it happens per day, counted, never guessed. `helm friction` counts
+  refusals per guard; the chat and transcripts show the rest, counted from a
+  bounded sample or through `fab`, never a scan of every transcript on the
+  shared machine. A fix that pays
+  back within about two days goes ahead of new features, and its land reports
+  the tax it removed.
 
 ## 5. Orca bearings
 

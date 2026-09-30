@@ -66,7 +66,8 @@ class TwoBodiesRefusalTest(unittest.TestCase):
         path = os.path.join(os.environ["HELM_CHAT_DIR"], "r.jsonl")
         if not os.path.exists(path):
             return []
-        return [json.loads(l)["text"] for l in open(path) if l.strip()]
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(l)["text"] for l in fh if l.strip()]
 
     def test_both_bodies_refuse_and_nothing_posts(self):
         rc, out = self._post(["positional body"], stdin_text="heredoc body\n")
@@ -547,6 +548,138 @@ class RoomTest(ChatBase):
             with chat._room_lock("main", timeout_s=5) as locked:
                 self.assertFalse(locked)
         handle.close.assert_called_once()
+
+    def test_room_lock_nested_acquire_in_same_process_does_not_deadlock(self):
+        """A nested acquire of _room_lock on the same room within one process
+        must be re-entrant and not self-deadlock. Under a real POSIX flock,
+        opening the same lock file on a second descriptor and flocking it
+        blocks indefinitely against the first descriptor in the same process
+        (task/3535)."""
+        import subprocess
+        probe = (
+            "import os, sys\n"
+            "from helm import chat\n"
+            "with chat._room_lock('nested-room-probe'):\n"
+            "    with chat._room_lock('nested-room-probe'):\n"
+            "        print('REENTRANT-OK', flush=True)\n"
+        )
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        p = subprocess.run(
+            [sys.executable, "-u", "-c", probe],
+            capture_output=True, text=True,
+            cwd=repo_dir,
+            timeout=2,
+        )
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("REENTRANT-OK", p.stdout)
+
+    def test_room_lock_bounded_wait_fails_with_holder_pid(self):  # noqa: VACUOUS_ASSERTION — the holder PID on stderr is asserted positively against the spawned holder process
+        """When another process holds the room lock, _room_lock must time out
+        within its bounded wait (not hang indefinitely) and fail loudly
+        identifying the holder PID on stderr (task/3535)."""
+        import io, subprocess, time
+        from helm import pk
+        room = "contended-holder-probe"
+        lock_path = os.path.join(chat.chat_dir(), pk.slug(room) + ".lock")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        holder = subprocess.Popen([
+            sys.executable, "-c",
+            "import fcntl, time\n"
+            f"f = open({repr(lock_path)}, 'a')\n"
+            "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+            "time.sleep(5)\n"
+        ])
+        time.sleep(0.15)
+        try:
+            buf = io.StringIO()
+            with mock.patch("sys.stderr", buf):
+                with chat._room_lock(room, timeout_s=0.2) as locked:
+                    self.assertFalse(locked)
+            err = buf.getvalue()
+            self.assertIn("timed out", err)
+            self.assertIn("pid %d" % holder.pid, err)
+        finally:
+            holder.terminate()
+            holder.wait()
+
+    def test_room_lock_second_thread_waits_on_flock_then_completes(self):
+        """A second THREAD in the same process waits on the room's flock for
+        as long as the first holds it, then takes it — never a bounded
+        in-process wait that gives up and skips the write (task/3535). Only
+        the SAME thread's nested acquire is re-entrant."""
+        import threading
+        from helm import pk
+        from tests import _lockwait
+        room = "thread-contended-probe"
+        lock_path = os.path.realpath(
+            os.path.join(chat.chat_dir(), pk.slug(room) + ".lock"))
+        got = []
+
+        def second():
+            with chat._room_lock(room) as locked:
+                got.append(locked)
+
+        with _lockwait.observed() as waits:
+            with chat._room_lock(room) as outer:
+                self.assertTrue(outer)
+                t = threading.Thread(target=second)
+                t.start()
+                self.assertEqual(waits.wait_blocked(t), lock_path)
+                self.assertEqual(got, [])
+            t.join(_lockwait.HANG_S)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(got, [True])
+
+    def test_room_lock_held_by_another_process_makes_a_post_wait_not_write_unlocked(self):
+        """The default acquire BLOCKS: while another process holds the room
+        lock, a post waits on the flock and writes nothing; once the holder
+        lets go the row lands (task/3535). A default that polls and then
+        carries on unlocked is the defect this arm pins."""
+        import threading
+        from helm import pk
+        from tests import _lockwait
+        room = "main"
+        os.makedirs(chat.chat_dir(), exist_ok=True)
+        lock_path = os.path.join(chat.chat_dir(), pk.slug(room) + ".lock")
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl, sys\n"
+             "f = open(%r, 'a')\n"
+             "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+             "print('HELD', flush=True)\n"
+             "sys.stdin.read()\n" % lock_path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "HELD")
+            errors = []
+
+            def poster():
+                try:
+                    chat.post("waited for the lock", who="a1", sign=False)
+                except Exception as e:     # surfaced below, never swallowed
+                    errors.append(e)
+
+            with _lockwait.observed() as waits:
+                t = threading.Thread(target=poster)
+                t.start()
+                self.assertEqual(waits.wait_blocked(t),
+                                 os.path.realpath(lock_path))
+                self.assertEqual(chat.read(room), ([], 0))
+                holder.stdin.close()
+                holder.wait(_lockwait.HANG_S)
+                t.join(_lockwait.HANG_S)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(errors, [])
+            rows, _ = chat.read(room)
+            self.assertEqual([r.get("text") for r in rows],
+                             ["waited for the lock"])
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+                holder.wait()
+            if holder.stdin and not holder.stdin.closed:
+                holder.stdin.close()
+            holder.stdout.close()
 
     def test_keyed_room_lock_times_out_instead_of_hanging_forever(self):
         # Contend ONLY the keyed room lock: `LOCK_EX|LOCK_NB` is the shape no
@@ -1499,7 +1632,7 @@ class HelpBeforeWorkTest(ChatBase):
             rc, out, err = self._no_dispatch(argv)
             self.assertEqual(rc, 0, argv)
             for token in ("--seat", "--room", "--follow", "--replace",
-                          "--timeout", "--any", "timeout"):
+                          "--timeout", "--any", "--per-row", "timeout"):
                 self.assertIn(token, out, argv)
             self.assertEqual(err, "")
 

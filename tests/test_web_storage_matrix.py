@@ -100,12 +100,23 @@ class WebStorageMatrixHTTPTest(unittest.TestCase):
     def test_missing_and_malformed_artifacts_are_honest_data_states(self):
         missing = self.api()
         self.assertEqual(missing["state"], "missing")
-        self.assertIn("helm storage-matrix --measure", missing["message"])
+        # the page is told in plain words; the terminal keeps its verb
+        self.assertEqual(missing["message"], "not measured yet on this machine")
+        self.assertIn("helm storage-matrix --measure", matrix.view()["message"])
         with open(self.artifact, "w", encoding="utf-8") as handle:
             handle.write("not json")
         malformed = self.api()
         self.assertEqual(malformed["state"], "unavailable")
         self.assertIn("unreadable", malformed["message"])
+
+    def test_the_missing_state_tells_the_owner_no_helm_verb(self):
+        """RULE 2 ON THE BOXES PAGE (console walk 3, open points): the page
+        draws the server's `message`, and a missing snapshot's said "run helm
+        storage-matrix --measure" to a reader who does not use a terminal."""
+        from tests._ownerverbs import owner_verbs
+        missing = self.api()
+        self.assertEqual(missing["state"], "missing")      # control: the branch
+        self.assertEqual(owner_verbs(missing["message"]), [], missing["message"])
 
     def test_nonfinite_optional_metrics_never_reach_browser_json(self):
         def strict(body):
@@ -230,10 +241,14 @@ class StorageMatrixWiringTest(unittest.TestCase):
         boxes tab, and both read paths must go through the one mapper."""
         canon = _extract_fn(self.source, "canonView")
         self.assertIn('storage: "boxes"', canon)
-        self.assertIn('const raw = location.hash.slice(1), v = canonView(raw)',
+        # the hash reads through hashView, whose one mapper is canonView
+        # (task/3445: Work's sections speak #work/<section>)
+        self.assertIn('const r = hashView(location.hash.slice(1)), v = r.v',
                       self.source)
-        self.assertIn('canonView(localStorage.getItem("helm.view"))',
-                      self.source)
+        self.assertIn("canonView(", _extract_fn(self.source, "hashView"))
+        # "/" opens Home (task/3445 L3): a stored view is no longer read at
+        # boot, so an old stored "storage" cannot strand anyone either
+        self.assertNotIn('localStorage.getItem("helm.view")', self.source)
 
     def test_loader_reads_snapshot_endpoint_and_reload_uses_same_path(self):
         load = _extract_fn(self.source, "loadStorage")
@@ -340,6 +355,49 @@ class StorageMatrixClientRuntimeTest(unittest.TestCase):
         self.assertEqual(migrate["other"], "chat")
         self.assertIsNone(migrate["absent"])
 
+    def test_stale_leads_with_archive_sentence_and_dates_per_box(self):
+        """A stale snapshot must lead the page with ONE plain archive sentence
+        and date every per-box state that comes from the old inventory: the
+        'unreachable' error and the missing-tier 'not measured'. Trunk still
+        shows 'STALE · measured ...' and leaves the per-box text undated, so
+        this is RED against the un-fixed UI."""
+        stale = self._result("stale")
+        status = stale["status"]
+        self.assertEqual(
+            status.split()[0], "Archive:",
+            "a stale snapshot must lead with the archive sentence, not the "
+            "old 'STALE · measured ...' line")
+        self.assertIn("this is the", status)
+        self.assertIn("measurement", status)
+        self.assertIn("old", status)
+        self.assertIn("not the fleet today.", status)
+        # The tier count is kept after the sentence, not dropped.
+        self.assertIn("1/3 tiers available", status)
+        # THE DATE SHOWN IN THE SENTENCE MUST DATE THE PER-BOX STATE. It is
+        # extracted from the rendered status (locale-independent) rather than
+        # hardcoded, then checked to appear in each stale per-box line.
+        date_token = status.split("this is the ")[1].split(" measurement")[0]
+        self.assertTrue(date_token, "the archive sentence carries no date")
+        self.assertIn(date_token, stale["offline"],
+                      "per-box 'unreachable' state is not dated as of the "
+                      "measurement")
+        self.assertIn(date_token, stale["ghost"],
+                      "per-box 'not measured' state is not dated as of the "
+                      "measurement")
+
+    def test_fresh_data_renders_unchanged(self):
+        """Fresh data must render exactly as it always did: the old status line
+        and undated per-box state, with no Archive sentence creeping in. This
+        is the regression guard for the 'fresh is unchanged' requirement."""
+        rendered = self._result("rendered")
+        self.assertNotIn("Archive:", rendered["status"])
+        self.assertNotIn("not the fleet today.", rendered["status"])
+        self.assertIn("measured 1m ago", rendered["status"])
+        self.assertIn("2/4 tiers available", rendered["status"])
+        self.assertNotIn(" at the", rendered["offlineState"],
+                         "fresh per-box state must not be dated as of a "
+                         "measurement")
+
 
 _DRIVER = r"""
 class NodeEl {
@@ -425,7 +483,31 @@ const missing = {status: roots.storagestatus.textContent, rowCount: roots.storag
                  rowText: roots.storageRows.children[0].textContent};
 const migrate = {stored: canonView("storage"), kept: canonView("boxes"),
                  other: canonView("chat"), absent: canonView(null)};
-console.log(JSON.stringify({rendered, single, missing, migrate}));
+// STALE, ARCHIVE-ONLY DATA: an old snapshot the server still serves.
+// "Offline" is unreachable on both tiers; "Ghost" has a missing disk tier.
+renderStorage({state:"ok", status:"partial",
+  measured_at:"2026-07-01T12:00:00Z", age_s:80*86400, stale:true,
+  rows:[
+    {id:"offline:local-disk", box:"offline", box_label:"Offline",
+     tier:"local-disk", tier_label:"Local disk", transport:"ssh", order:2,
+     path_label:"host-local scratch storage", status:"unavailable",
+     error:"inventory reports disk unreachable"},
+    {id:"offline:memory", box:"offline", box_label:"Offline",
+     tier:"memory", tier_label:"Memory", transport:"ssh", order:3,
+     path_label:"host-local scratch storage", status:"unavailable",
+     error:"inventory reports memory unreachable"},
+    row("ghost:memory", "Ghost", "Memory", 4, slow),
+  ],
+  method:{sequential_bytes:67108864, sequential_block_bytes:1048576,
+    random_operations:4096, random_block_bytes:4096, fsync_operations:24,
+    notes:"one bounded snapshot, not a device specification"}});
+const staleRows = [...roots.storageRows.children];
+const stale = {
+  status: roots.storagestatus.textContent,
+  offline: staleRows[0].children[0].textContent,
+  ghost: staleRows[1].children[0].textContent,
+};
+console.log(JSON.stringify({rendered, single, missing, migrate, stale}));
 """
 
 

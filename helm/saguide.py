@@ -116,14 +116,26 @@ helm physics (you are a subagent; this is your initial context):
   report. A sweep skipped costs one more build round per sibling, because
   each later finding is the first one's class on another surface. Store:
   curing-a-defect-owes-a-sweep-for-siblings-asking-the-same-question.
-- A REVIEWER PATCHES ITS OWN MECHANICAL FINDINGS. It commits the cure in its
-  own worktree, on a branch off the exact reviewed tip, never pushes, and
-  returns that patch tip beside its verdict; a reader who wrote none of the
-  composed tip re-reads it once. A DESIGN finding goes to a meld, and a brief
-  that names a live system stays read-only. A reviewer briefed "read-only,
-  edit nothing" turns each mechanical finding into a full builder round.
-  Store: xfam-reviewer-fixes-its-own-findings; skill
-  reviewer-implements-own-findings."""
+- A REVIEWER FIXES ITS OWN MECHANICAL FINDINGS IN THE ROW'S REVIEW FIX MODE.
+  PATCH: commit the cure in a scratch clone off the exact reviewed tip, never
+  push, and return that patch tip beside the FIX verdict. A subagent has no
+  room of its own: `git clone --shared <repo> <scratch>/wt`, detach at the
+  reviewed tip, commit there, then
+  `git -C <repo> fetch --no-write-fetch-head <scratch>/wt <sha>` (no refspec,
+  so no ref moves); a commit left in the clone does not resolve in the repo
+  and --patch-tip refuses it. Never `git worktree add` or a branch in the
+  shared checkout. MELD-DIFF: post the exact mechanical diff in the pair meld
+  for the author to apply; use FIX --diff-handoff ROOM/MSGID with a validated
+  pair-message receipt and --no-patch-because, without a reviewer patch tip.
+  A reason or --meld outcome alone proves no cure, even on historical rows:
+  its child remains an ordinary round and T1 design nudge. Only the first
+  advancing direct child of a receipted FIX confirms the author-applied cure.
+  A safety door or non-mechanical composed cure owes a re-read by a non-author;
+  a reversible mechanical cure needs pair agreement.
+  A DESIGN finding goes to a meld, and a brief that names a
+  live system stays read-only. A reviewer briefed "read-only, edit nothing"
+  turns each mechanical finding into a full builder round. Store:
+  xfam-reviewer-fixes-its-own-findings; skill reviewer-implements-own-findings."""
 
 # WHAT THE HOOK ACTUALLY INJECTS. GUIDANCE above is the canonical RECORD and
 # stays whole; this is the delivery, and the two are different jobs.
@@ -155,11 +167,11 @@ helm physics (you are a subagent; this is your initial context):
 # 250 for the first three rules alone; the two above cost what they cost, and
 # the read-only children below, 45% of the 779 measured, now pay nothing.
 BRIEF = """\
-helm physics for this subagent:
-- Tests never run locally. Cure round: `fab test --repo . -- python3 -m unittest <modules>`, touched plus consumers; never land authority.
-- Never arm, replace or stop the seat's chat beacon.
-- A fix or review is done when every other place asking the same question (callers, the predicate elsewhere) is checked and named in your report.
-- A reviewer commits a MECHANICAL cure in its own worktree off the exact reviewed tip, unpushed, and returns that tip with its verdict. DESIGN stays read-only.
+helm physics for subagent:
+- No local tests. Cure: `fab test --repo . -- python3 -m unittest <modules>` touched + consumers; not land authority.
+- Never arm, replace or stop chat beacon.
+- Fix/review: check every other place asking the same question (callers); named in your report.
+- REVIEW FIX MODE: PATCH commits cure off exact tip in scratch clone, unpushed; MELD-DIFF posts exact diff in pair meld for author to apply. Use validated --diff-handoff ROOM/MSGID + --no-patch-because; prose proves no cure. DESIGN stays read-only.
 More: helm saguide --show"""
 
 #: Children that cannot build: the harness's read-only agent types, which are

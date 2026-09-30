@@ -80,7 +80,8 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-stalebot-", var="HELM_HOME")
 
-from helm import dispatches, landreq, seats_integrator, stalebot  # noqa: E402
+from helm import chat, dispatches, landreq, meld, review_door  # noqa: E402
+from helm import seats_integrator, stalebot  # noqa: E402
 
 
 def _integrator():
@@ -795,7 +796,8 @@ class DoctorTest(unittest.TestCase):
         self.addCleanup(__import__("shutil").rmtree, tmp, ignore_errors=True)
         unit = os.path.join(tmp, "helm-stale-bot.timer")
         if timer_exists:
-            open(unit, "w").write("[Timer]\n")
+            with open(unit, "w") as fh:
+                fh.write("[Timer]\n")
         with mock.patch.object(stalebot, "read_state", return_value=state), \
              mock.patch.object(stalebot, "_timer_units",
                                return_value=("s", "", unit, "")):
@@ -1369,6 +1371,9 @@ class RunnableDoorTest(_RepoFixture):
     def test_generated_successor_persists_exact_authority_and_delivery(self):
         import contextlib, io
         parent, cure, roster = self._cured_parent()
+        opened = review_door.open_pair_round(parent)
+        self.assertEqual(opened["round"], 1)
+        room = opened["room"]
         term, _evidence, door, owner = stalebot.classify_cured(
             parent, ("redispatch-cure", cure, 1), roster, live=set(roster))
         self.assertEqual((term, owner), (stalebot.REDISPATCH, "operator"))
@@ -1388,6 +1393,11 @@ class RunnableDoorTest(_RepoFixture):
         self.assertEqual(child["repo_root"], self.repo)
         self.assertEqual(child["recipient"], "seat-c")
         self.assertEqual(child["delivery"], "observed")
+        seeds = meld.seeds(chat.read(room)[0])
+        self.assertEqual(len(seeds), 2)
+        self.assertIn("row %s at %s" % (child["id"][:12], child["tip"][:12]),
+                      seeds[-1][2])
+        self.assertIn(" | round 2 | ", seeds[-1][2])
 
     def test_first_attempt_preserves_cure_diagnostic_before_any_append(self):  # noqa: VACUOUS_ASSERTION — object identity with the exact typed diagnostic is the unconditional positive control before ledger absence
         parent, _cure, _roster = self._cured_parent()
@@ -2160,9 +2170,16 @@ class CliHonestyTest(unittest.TestCase):
             rc = cli.main(["--help"])
         self.assertEqual(rc, 0)
         text = out.getvalue()
+        # the root listing carries each verb's subverbs and their positional
+        # args; the sentence naming redispatch the explicit mutating actuator
+        # sits deep in the stale entry, so the verb's own help carries it
         self.assertIn("stale sweep", text)
         self.assertIn("redispatch <dispatch-id>", text)
-        self.assertIn("explicit mutating actuator", text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli.main(["stale", "--help"])
+        self.assertEqual(rc, 0)
+        self.assertIn("explicit mutating actuator", out.getvalue())
 
     def test_redispatch_help_is_successful_and_names_mutability(self):
         import contextlib, io

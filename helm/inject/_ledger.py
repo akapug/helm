@@ -1105,9 +1105,14 @@ def _seen_load(session):
     # A malformed memo reads as none, which re-renders the current posture
     # once: the fail direction that never hides his word.
     posture = _posture_memo(d.get("posture"))
-    return {"turn": d["turn"], "fired": fired, "pinned": pinned,
-            "nudges": nudges, "lines": lines, "epoch": None, "who": who,
-            "subs": subs, "posture": posture}
+    out = {"turn": d["turn"], "fired": fired, "pinned": pinned,
+           "nudges": nudges, "lines": lines, "epoch": None, "who": who,
+           "subs": subs, "posture": posture}
+    # THE 5H PACE STATE THIS CONTEXT LAST HEARD (claudepace.steer), present
+    # only once one was said: an absent key re-says the current one.
+    if isinstance(d.get("pace5h"), str):
+        out["pace5h"] = d["pace5h"]
+    return out
 
 
 def _posture_memo(raw):
@@ -1195,7 +1200,9 @@ def _seen_save(session, state):
                  "nudges": state.get("nudges", {}), "fired": state["fired"],
                  "lines": lines, "who": state.get("who"),
                  "subs": list(state.get("subs") or ())[-16:],
-                 "posture": state.get("posture")}
+                 "posture": state.get("posture"),
+                 **({"pace5h": state["pace5h"]}
+                    if isinstance(state.get("pace5h"), str) else {})}
         target = _seen_path(session)
         os.makedirs(_seen_dir(), exist_ok=True)
         with open(_seen_lock_path(session), "a+") as lock:

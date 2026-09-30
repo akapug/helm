@@ -3274,7 +3274,7 @@ class CouncilReachTest(InjectBase):
     feature-and-rsh-must-both-be-wired): the recorded predecessor-harness failure was
     SALIENCE — the meld verb existed and agents never reached for it. >= 3
     ping-pong rounds with ONE peer in the home room -> one latched nudge
-    naming the exact council invite command; a new streak re-arms."""
+    naming the exact meld invite command; a new streak re-arms."""
     EXTRA = ("HELM_CHAT_DIR", "MELD_CHAT_DIR", "HELM_CHAT_ROOM",
              "MELD_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE", "HELM_CHAT_NAME",
              "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
@@ -3360,7 +3360,7 @@ class CouncilReachTest(InjectBase):
         got = inject._council_reach(None, None)
         self.assertIsNotNone(got)
         line, wid = got
-        self.assertIn("helm chat council invite seat-b", line)
+        self.assertIn('helm chat meld invite seat-b "<topic>"', line)
         self.assertEqual(wid, inject.COUNCIL_WHISPER_ID)
         self.assertIsNone(inject._council_reach(None, None))   # latched
         self._pingpong(1)                                      # SAME streak
@@ -3429,7 +3429,7 @@ class CouncilReachTest(InjectBase):
         self._pingpong(3)
         sections = inject.gather("carry on", session="sid-r", cwd=None)
         joined = "\n".join(sections["reflex"])
-        self.assertIn("helm chat council invite seat-b", joined)
+        self.assertIn('helm chat meld invite seat-b "<topic>"', joined)
         rows = inject._ledger_rows()
         self.assertIn(inject.COUNCIL_WHISPER_ID, rows[-1]["fired"]["reflex"])
 

@@ -7,11 +7,16 @@ is at the point where a stop stops being a REFUSAL and becomes ADVICE.
 TWO THINGS HERE ACTUALLY BLOCK AN IDLE STOP, and both are deliberate: an
 un-armed beacon (_beacon_block) while the seat owes dispatch work means the
 agent cannot be woken, so stopping makes it unreachable rather than idle; and
-the review spiral (_spiral_gate)
+the review spiral (_spiral_gate, now in seats_stop_spiral with the pair-meld
+turn rung, re-exported here)
 means the same lane has been review-dispatched at three distinct tips, where
-the cure is one live exchange rather than a fourth round. Everything else in
-this file only SUPPLIES SIGNAL to the whisper ladder, which advises and never
-refuses.
+the cure is one live exchange rather than a fourth round. A family that
+catalogues wake as pane is outside the beacon block and the beacon-arm advice:
+its harness cannot arm the waiter, and the pane is the wake. `_wake_is_local`
+and `_beacon_binds` supply the third beacon refusal, the re-arm rung's in
+seats_stop_guard, which refuses only a local-family seat (task/3382).
+Everything else in this file only SUPPLIES SIGNAL to the whisper ladder, which
+advises and never refuses.
 
 PRECISION IS THE WHOLE GAME for the blocking pair. A guard that blocks on a
 bad signal is worse than no guard, because an agent that learns to work
@@ -27,15 +32,17 @@ and their cost is the reason they are cheap: anything expensive here is paid
 on every turn of every seat.
 """
 
+import contextlib
 import hashlib
 import json
 import os
 import re
+import threading
 import time
 
 from . import chat, home, pk, projscope, record, seats_advice, vcs
 from .seats_common import (SEAT_BYTES, STATUS_BYTES, _clip, _scrub, _seat_key,
-                           own_name, recipient_matches, roster)
+                           own_name, recipient_matches, roster, seat_row)
 # Downward edges only: stop_signals -> delivery -> roster -> identity ->
 # common. The stop ladder READS the world these modules maintain and writes
 # none of it, which is why nothing here needs deferring.
@@ -45,9 +52,20 @@ from .seats_cursor import (_occurrence, _sid8, _write_stop_latch,
 from .seats_stop_fp import (_off, _pending_all,  # noqa: F401
                             _pending_rows, _rows_fp, _stop_fp_path)
 from .seats_delivery import _cursor, _room_dirty, _scan_rooms, _tail
+# THE SPIRAL AND PAIR-MELD RUNGS live in seats_stop_spiral (this file reached
+# 986 of its 1000-line budget); every name stays importable from here, and
+# `_OWNER_NAMES` declares the move so the retired-name rung reads it as one.
+from .seats_stop_spiral import (PAIR_LATCH, SPIRAL_LATCH,  # noqa: F401
+                                _SPIRAL_LANE, _meld_open_with, _melded_with,
+                                _my_meld_record, _pair_turn_gate, _spiral_gate,
+                                _spiral_meld, review_door, spiral_block)
+_OWNER_NAMES = (("seats_stop_spiral", (
+    "PAIR_LATCH", "SPIRAL_LATCH", "_SPIRAL_LANE", "_meld_open_with",
+    "_melded_with", "_my_meld_record", "_pair_turn_gate", "_spiral_gate",
+    "_spiral_meld", "review_door", "spiral_block")),)  # moved; bound here
 
 BEACON_LATCH = "stopbeacon"
-def beacon_procs(seat, proc_dir="/proc", strict=False):
+def beacon_procs(seat, proc_dir="/proc", strict=False, session=None):
     """([pids], trouble) — live `helm chat wait` waiters attributable to
     `seat`. Argv shape comes from rearm.py (the same exact-shape gate the
     land-to-live pass signals on): a standalone `helm` token — or `-m helm` —
@@ -56,11 +74,20 @@ def beacon_procs(seat, proc_dir="/proc", strict=False):
     wrapper alone is never mistaken for the beacon; the wrapper execs the real
     process, which IS matched.
 
-    Attribution, in order: the `--seat` flag (casefold), else the process's own
-    HELM_CHAT_NAME/MELD_CHAT_NAME (a beacon armed without --seat resolves its
-    seat from that env), else UNATTRIBUTABLE. The stop guard's default is
+    Attribution, in order: the `--seat` flag, else the name the process's own
+    environ gives it (HELM_CHAT_NAME, else MELD_CHAT_NAME: the order a beacon
+    armed without --seat resolves itself, `beacons.waiter_seat`'s order), else
+    UNATTRIBUTABLE. BOTH LEGS FOLD CASE. The environ leg once compared raw
+    bytes, so a waiter named 'alpha' read as ABSENT for seat 'ALPHA' with no
+    trouble, while the flag leg matched it: a false absence, and under a
+    refusal a false block. The stop guard's default is
     deliberately lenient: unattributable counts as a hit because a wrong BLOCK
     stops a healthy seat.
+
+    `session` (strict only) is the refusal's question: which of the proven
+    LIVE waiters is a beacon for THIS stop (`_beacon_binds`). A waiter that
+    does not bind is no coverage for it; one whose binding cannot be read is
+    trouble, never absence.
 
     `strict=True` IS A POSITIVE CLAIM, AND A SHAPE CANNOT MAKE ONE. An argv
     shape says a `helm chat wait` process EXISTS; it says nothing about whether
@@ -84,15 +111,76 @@ def beacon_procs(seat, proc_dir="/proc", strict=False):
     FAIL-OPEN: trouble is a string and the caller must not block or claim armed
     on it."""
     from . import rearm
-    needles = [("%s=%s" % (v, seat)).encode("utf-8") + b"\0"
-               for v in ("HELM_CHAT_NAME", "MELD_CHAT_NAME")]
     want = str(seat or "").casefold()
+    shapes, trouble = _waiter_shapes(proc_dir)
+    if trouble:
+        return [], trouble
+    hits, opaque = [], []
+    for ipid, pdir, sub in shapes:
+        flag = rearm._flag(sub, "--seat")
+        if flag is not None:
+            if str(flag).casefold() == want:
+                hits.append(ipid)
+            continue
+        try:                             # no --seat: its env names its seat
+            with open(os.path.join(pdir, "environ"), "rb") as f:
+                env = dict(item.partition(b"=")[::2]
+                           for item in f.read(64 * 1024).split(b"\0")
+                           if b"=" in item)
+        except OSError:
+            (opaque if strict else hits).append(ipid)
+            continue
+        named = env.get(b"HELM_CHAT_NAME") or env.get(b"MELD_CHAT_NAME")
+        if not named:
+            (opaque if strict else hits).append(ipid)
+        elif named.decode("utf-8", "replace").casefold() == want:
+            hits.append(ipid)
+    if strict:
+        return _strict_live(seat, hits, opaque, proc_dir, session=session)
+    return hits, None
+
+
+# ONE WALK OF THE PROCESS TABLE PER STOP (task/3556). The beacon rung asks
+# `beacon_procs` twice, the lenient question for its block and the strict one
+# for the re-arm line, and each call walked every process on the host: a stat
+# and a cmdline read for each of about 900 on the fleet host, twice, a few
+# milliseconds apart. Which processes are `helm chat wait` shapes is one fact
+# about the host; ATTRIBUTION (the --seat flag, the waiter's own environ) and
+# the strict probe's liveness proof answer one seat's question, and stay per
+# call. The stop guard opens `one_walk` around its ladder; it is to this walk
+# what `sessions.snapshot` is to the session census, thread-local and
+# re-entrant. A caller outside it walks as it always did, so stalebot's
+# probe-act-probe pair still reads the table twice, and a walk that met
+# trouble is not kept.
+_WALK = threading.local()
+
+
+@contextlib.contextmanager
+def one_walk():
+    """Every `beacon_procs` inside the block reads one walk of the table."""
+    if getattr(_WALK, "box", None) is not None:
+        yield                                  # nested: the outer walk holds
+        return
+    _WALK.box = {}
+    try:
+        yield
+    finally:
+        _WALK.box = None
+
+
+def _waiter_shapes(proc_dir):
+    """([(pid, pid dir, argv after `helm`)] for every same-uid `helm chat
+    wait` shape in `proc_dir`, None), or (None, trouble)."""
+    box = getattr(_WALK, "box", None)
+    if box is not None and proc_dir in box:
+        return box[proc_dir], None
+    from . import rearm
     try:
         me = os.getuid()
         pids = [n for n in os.listdir(proc_dir) if n.isdigit()]
     except OSError as exc:
-        return [], "process table unlistable (%s)" % exc
-    hits, opaque, mypid = [], [], os.getpid()
+        return None, "process table unlistable (%s)" % exc
+    shapes, mypid = [], os.getpid()
     for pid in pids:
         pdir = os.path.join(proc_dir, pid)
         try:
@@ -113,47 +201,97 @@ def beacon_procs(seat, proc_dir="/proc", strict=False):
                           # this as trouble would disable the guard on every
                           # real host — found on the first live run.
         except OSError as exc:
-            return [], ("process %s cmdline unreadable (%s)"
-                        % (pid, exc.__class__.__name__))
+            return None, ("process %s cmdline unreadable (%s)"
+                          % (pid, exc.__class__.__name__))
         argv = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
         sub = rearm._helm_subargv(argv) if argv else None
-        if not sub or sub[:2] != ["chat", "wait"]:
-            continue
-        flag = rearm._flag(sub, "--seat")
-        if flag is not None:
-            if str(flag).casefold() == want:
-                hits.append(ipid)
-            continue
-        try:                             # no --seat: its env names its seat
-            with open(os.path.join(pdir, "environ"), "rb") as f:
-                env = f.read(64 * 1024)
-        except OSError:
-            (opaque if strict else hits).append(ipid)
-            continue
-        named = b"HELM_CHAT_NAME=" in env or b"MELD_CHAT_NAME=" in env
-        if any(n in env for n in needles):
-            hits.append(ipid)
-        elif not named:
-            (opaque if strict else hits).append(ipid)
-    if strict:
-        return _strict_live(seat, hits, opaque, proc_dir)
-    return hits, None
-def _strict_live(seat, hits, opaque, proc_dir):
+        if sub and sub[:2] == ["chat", "wait"]:
+            shapes.append((ipid, pdir, sub))
+    if box is not None:
+        box[proc_dir] = shapes
+    return shapes, None
+def _beacon_binds(pid, session, proc_dir="/proc"):
+    """(True | False | None, why): is live waiter `pid` a beacon for the stop
+    of harness session `session`?
+
+    THE STRICT PROBE PROVES A PROCESS, NOT THIS STOP'S BEACON (codex's
+    planning read of task/3382). It admits a shape without --follow and binds
+    no session or home, so a pre-/clear waiter, another pane's co-named one or
+    a one-shot `helm chat wait` would suppress a refusal the seat needed. Three
+    things bind, all read from the waiter's own argv and environ, the same
+    sources `classify` proved it live from:
+
+      * a FOLLOWED waiter without --any (the join banner's coverage rule: a
+        single wait is a delivery, and --any is a room tap);
+      * THIS helm home, the store its wakes are read from;
+      * THIS session. The session survives a compaction: of 39 re-arms the
+        arm path answered 'already armed' (which compares waiter and arming
+        process by that id), 3 spanned a compaction.
+
+    ANOTHER SESSION ID PROVES NOTHING ON ITS OWN. A /clear keeps the agent
+    process and changes the id, and helm has no measurement of whether a
+    child's environ follows. So a different id is False only when a
+    DIFFERENT agent launched the waiter (both CLAUDE_PIDs read, and unequal);
+    the same agent, or an agent that cannot be named, is None. None is
+    UNKNOWN, and UNKNOWN never refuses a stop."""
+    from . import beacons, rearm
+    argv = beacons.proc_argv(pid, proc_dir)
+    env = beacons.proc_env(pid, proc_dir)
+    if not argv or env is None:
+        return None, "pid %s could not be re-read" % pid
+    sub = rearm._helm_subargv(argv) or []
+    if "--follow" not in sub or "--any" in sub:
+        return False, "pid %s is not a followed beacon" % pid
+    where = beacons.effective_home(env)
+    if where is None:
+        return None, "pid %s names no helm home" % pid
+    if where != beacons._our_home():
+        return False, "pid %s serves another helm home" % pid
+    theirs = beacons.proc_session(pid, proc_dir, env=env)
+    if not theirs or not session:
+        return None, "pid %s has no session to compare" % pid
+    if str(theirs) == str(session):
+        return True, "pid %s is this session's beacon" % pid
+    mine = str(os.environ.get("CLAUDE_PID") or "").strip()
+    agent = str(env.get("CLAUDE_PID") or "").strip()
+    if mine and agent and mine != agent:
+        return False, "pid %s belongs to another agent's session" % pid
+    return None, "pid %s is under another session id of an agent " \
+        "that cannot be told apart from this one" % pid
+def _strict_live(seat, hits, opaque, proc_dir, session=None):
     """The positive half of `beacon_procs`: which of these shapes is a beacon
     somebody is still listening to. Every waiter is asserted, not the first
     match and not the newest — taking the newest arm time is exactly how a seat
     with five waiters, four of them stale, was read as 'current' (#helm 622).
     The session census opens every credential home and NO zero-hit return below
-    reads it, so a seat with no shape at all does not pay to take one."""
+    reads it, so a seat with no shape at all does not pay to take one.
+
+    With `session`, a waiter is asked `_beacon_binds` first: one that does not
+    bind is dropped before the census, and one whose binding is UNKNOWN is
+    still classified, because a proven ghost is absence either way."""
     from . import beacons
+    unbound = {}
+    if session is not None:
+        kept = []
+        for pid in hits:
+            bound, why = _beacon_binds(pid, session, proc_dir)
+            if bound is None:
+                unbound[pid] = why
+            if bound is not False:
+                kept.append(pid)
+        hits = kept
     live = beacons.live_sessions() if hits else None
-    proven, unproven = [], []
+    proven, unproven, unbindable = [], [], []
     for pid in hits:
         row = beacons.classify(pid, seat, None, live, proc_dir)
-        if row["state"] == beacons.LIVE:
+        if row["state"] == beacons.GHOST:
+            continue                    # a PROVEN ghost is a proven absence
+        if pid in unbound:
+            unbindable.append(unbound[pid])
+        elif row["state"] == beacons.LIVE:
             proven.append(pid)
-        elif row["state"] != beacons.GHOST:
-            unproven.append(row)        # a PROVEN ghost is a proven absence
+        else:
+            unproven.append(row)
     if proven:
         return proven, None
     if opaque:
@@ -163,10 +301,15 @@ def _strict_live(seat, hits, opaque, proc_dir):
         return [], ("%d beacon waiter%s for seat %s could not be proven live "
                     "(%s)" % (len(unproven), "" if len(unproven) == 1 else "s",
                               seat, unproven[0]["why"]))
+    if unbindable:
+        return [], ("%d beacon waiter%s for seat %s could not be bound to this "
+                    "session (%s)" % (len(unbindable),
+                                      "" if len(unbindable) == 1 else "s",
+                                      seat, unbindable[0]))
     # Zero proven, zero unprovable: either there is no waiter at all, or every
     # one of them is a proven ghost. Both are the same honest answer — nothing
-    # will wake this seat — and it is the answer this function could not give
-    # before, because a ghost used to satisfy it.
+    # will wake this seat — and a ghost never satisfies it. With a session, a
+    # waiter proven NOT to be this stop's beacon joins them.
     return [], None
 def owes_beacon(seat, session=None):
     """The VALIDATED seat name when this process owes an armed beacon, else
@@ -230,13 +373,107 @@ def _beacon_obligation(seat, dispatch_snapshot=None):
         return None
 
 
+def _wake_is_pane(seat, session=None):
+    """True only when ``seat`` has pane-wake launch identity.
+
+    That harness has no Monitor, so it cannot arm `helm chat wait`; the
+    operator types the wake into the pane. The beacon block then owes
+    nothing: no refusal, no latch, no substitute line.
+
+    A verified exact-session runtime outranks the display name: an ordinary
+    Claude process named ``cursor`` is still beacon-woken. A real bare family
+    name, or a canonical N>=2 ``family-N`` whose proxy mode admits instances,
+    identifies only the catalog candidate; the exact runtime must name that
+    same family. An unknown or nonspawnable spelling, missing evidence, any
+    wake value but ``pane``, or an unreadable catalog stays False, so the block
+    keeps today's behaviour.
+    """
+    try:
+        # seat_catalog is an impl module. The facade has to be imported in
+        # this same scope or the injection census refuses the file. Aliased
+        # so the import does not shadow the seat argument.
+        from helm import seat as _seat_facade  # noqa: F401 — facade beside the impl import
+        from .seat_catalog import FAMILIES
+        from .seats_runtime import runtime_for_session
+        name = str(seat or "")
+        family = name if name in FAMILIES else None
+        entry = FAMILIES.get(family)
+        if entry is None:
+            base, _, tail = name.rpartition("-")
+            candidate = FAMILIES.get(base)
+            # A numbered name is a real family instance only for the OAuth-pool
+            # mode the spawn gate admits, with the same canonical N>=2 suffix.
+            # `cursor-2` is otherwise just an arbitrary stamp wearing the name
+            # of a proxy-key family whose only real seat is bare `cursor`.
+            numbered = isinstance(candidate, dict) \
+                and candidate.get("mode") == "proxy" and tail.isdigit() \
+                and tail == str(int(tail)) and int(tail) >= 2
+            family, entry = (base, candidate) if numbered else (None, None)
+        if not isinstance(entry, dict) or entry.get("wake") != "pane" \
+                or not session:
+            return False
+        runtime, verified = runtime_for_session(seat_row(name)[0], session)
+        return verified and str((runtime or {}).get("family") or "") == family
+    except projscope.Expired:
+        raise
+    except Exception as _swallowed:
+        record.swallow("seats_stop_signals._wake_is_pane", _swallowed)
+        return False
+
+
+def _wake_is_local(seat, session=None):
+    """True only when `seat`'s VERIFIED runtime for this exact session is a
+    family served from the operator's own GPU (`burnflags.local_families`).
+
+    The re-arm rung may REFUSE only such a seat: a continuation there costs
+    nothing, while a paid family would pay for one on every deaf turn-end
+    (task/3382's scope). Resolved the way `_wake_is_pane` resolves a runtime:
+    the roster's exact-session record, never the seat's name, so a native
+    claude seat named like a local family is not one. No session, no record,
+    an unverified or contradictory one, or anything unreadable is False, and
+    False keeps today's advice."""
+    if not session:
+        return False
+    try:
+        from . import burnflags
+        from .seats_runtime import runtime_for_session
+        runtime, verified = runtime_for_session(seat_row(str(seat or ""))[0],
+                                                session)
+        return bool(verified) and isinstance(runtime, dict) and \
+            str(runtime.get("family") or "") in burnflags.local_families()
+    except projscope.Expired:
+        raise
+    except Exception as _swallowed:
+        record.swallow("seats_stop_signals._wake_is_local", _swallowed)
+        return False
+
+
 def _beacon_block(session, room, seat, dispatch_snapshot=None):
     """The armed-beacon gate -> one block line, or None. Latches the OBSERVED
     state (armed|optional|missing-owed|missing-unknown) per (seat, session): a
     measured zero makes the beacon optional and re-arms the gate if work later
-    appears; each missing state blocks once. Probe trouble touches nothing."""
+    appears; each missing state blocks once. Probe trouble touches nothing.
+    A family whose catalog says wake is the pane returns None before the
+    probe and retires any stale latch from an earlier wake policy."""
     name = None if _off("STOP_GUARD_BEACON") else owes_beacon(seat, session)
     if not name:
+        return None
+    if _wake_is_pane(name, session):
+        # A previous build may have latched this SAME session as missing before
+        # its family gained pane wake. Leaving that fingerprint behind makes a
+        # later non-pane policy read the unchanged missing state as already
+        # reported and silently pass. Pane writes no substitute latch; it
+        # retires the obsolete one so any later policy transition re-arms.
+        path = _stop_fp_path(room, seat, session, kind=BEACON_LATCH)
+        with seat_state_lock(seat, session=session) as current:
+            if current:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    record.swallow("seats_stop_signals._beacon_block.pane_unlink",
+                                   exc)
         return None
     pids, trouble = beacon_procs(name)
     if trouble:
@@ -279,312 +516,6 @@ def _beacon_block(session, room, seat, dispatch_snapshot=None):
         "unchanged missing state (a re-stop passes; HELM_STOP_GUARD_BEACON=0 "
         "disables it)." % (name, why, name, seats_advice.beacon_monitor(name),
                            seats_advice.BEACON_EXPIRY_TERSE))
-SPIRAL_LATCH = "stopspiral"
-# The message's whole point is a command the seat can PASTE, which rules out
-# laundering the identities at the sink: mangling a name to make it safe also
-# makes the command wrong. The beacon block above solves this the only honest
-# way — validate at the seam, then interpolate something provably inert — and
-# this rung copies it. `dispatches._TOKEN` is the seat-name shape the ledger
-# already enforces on senders; lanes get the same treatment. A name that does
-# not match is not scrubbed into something plausible, it yields NO FINDING:
-# refusing to speak is always available, and a guard is allowed to be silent.
-_SPIRAL_LANE = re.compile(r"[A-Za-z0-9._/-]{1,160}\Z")
-def _spiral_meld(peer, lane):
-    """The literal cure command, filled in with the real peer and lane."""
-    return ('helm chat meld invite %s "%s: converge every open review finding '
-            'in ONE exchange"' % (peer, lane))
-def _my_meld_record(st, own):
-    """True/False/None: is meld state `st` THIS seat's own record?
-    A meld writes ONE FILE PER PARTY, each carrying `self` for its owner
-    while `peer`/`peers` name only the OTHER side, so ownership is answered
-    by `self` — never by seeking my own name in `peers`, where it never
-    appears. Both callers filtered on `peer` alone while `chat_dir()` holds
-    EVERY seat's files (task/1112, 1145, 1146: one defect, two sites).
-    `own` IS THE SEAT `_spiral_gate` WAS CALLED FOR, threaded from its argument;
-    AMBIENT IDENTITY MUST NOT BE CONSULTED HERE — resolving it inside these
-    matchers is what let seat A's block be suppressed by seat B's meld, and this
-    line said otherwise until a review caught the CONTRACT gone stale while the
-    code was already right. None needs no per-caller branch: both skip not-True."""
-    if not own:
-        return None
-    return str(st.get("self") or "").casefold() == str(own).casefold()
-
-
-def _meld_open_with(peer, span_h, own, now=None):
-    """(True, room, age_s) iff an OPEN, un-converged meld with `peer` exists
-    inside the spiral's window, else (False, reason, None).
-
-    THIS DOES NOT SUPPRESS THE BLOCK, and that distinction is the whole point.
-    `_melded_with` refuses to let a merely-opened meld buy silence — "the gate
-    is disarmed by the cheapest possible gesture" — and that law stands. What
-    was wrong was the PRESCRIPTION: the block told a seat to run
-    `helm chat meld invite <peer> ...` when that seat had already run it and was
-    waiting. Measured twice on lr-build-batches-its-git (room opened
-    07:52Z, guard prescribed the same invite again at 10:43Z) and once on
-    claim-refuses-a-label-whose-row-is-elsewhere.
-
-    So the seat is still walled — it has not converged anything — but it is told
-    the TRUE next action (the peer has not entered; chase or escalate) instead
-    of an action it already took. A gate that prescribes a completed step reads
-    as not having noticed, and a seat that cannot tell "you are ignoring me"
-    from "I have not seen you" learns to discount both.
-
-    FAILS CLOSED TO NO-OPEN-ROOM, same as its sibling: an unreadable meld
-    directory reports nothing rather than inventing a room, because this text
-    goes on screen and a phantom room is worse than a stale prescription.
-
-    Room names are scrubbed and clipped AT THE READ, not at the emit — the
-    contract its sibling establishes, so a future caller cannot undo it by
-    forgetting.
-
-    ELEMENT TWO IS A ROOM ON SUCCESS AND A REASON ON FAILURE, matching the
-    sibling's shape. Only the `if open_room:` guard keeps the two apart, and a
-    mutation that removed it printed "room no open meld with codex inside the
-    window" into live stop-guard text. Never read element two without checking
-    element one — the type is the same and the meaning is not."""
-    import glob as _glob
-    from . import dispatches
-    now = time.time() if now is None else now
-    try:
-        span_s = max(0.0, float(span_h or 0)) * 3600.0
-    except (TypeError, ValueError):
-        return False, "unusable span", None
-    # THE OBSERVED TIP SPAN IS NOT THIS QUESTION'S WINDOW. review_spiral
-    # computes span_h as (newest tip - oldest tip)/3600, so it measures how
-    # tightly a chain's rounds CLUSTERED; at zero -- a batch re-dispatch, every
-    # tip in one second -- the window collapses to the 1.0s tolerance below and
-    # a meld opened seconds ago is invisible, which is the task/981 defect this
-    # function exists to cure. The floor is the spiral's own window, the one
-    # the block's text cites and the one those tips were collected inside, so
-    # span_h can never exceed it. DELIBERATELY NOT APPLIED TO `_melded_with`:
-    # that mirror SUPPRESSES the block, so widening it lets an older
-    # convergence buy silence, while this one only replaces a prescription
-    # with a truer sentence. The asymmetry is about what each AUTHORIZES.
-    # Full reasoning and measurements: task/2256.
-    span_s = max(span_s, float(dispatches.SPIRAL_WINDOW_H) * 3600.0)
-    floor = now - span_s
-    try:
-        paths = _glob.glob(os.path.join(chat.chat_dir(), "*.meld.*.json"))
-    except OSError as e:
-        return False, "meld state unreadable (%s)" % type(e).__name__, None
-    for path in paths:
-        st = pk.read_json(path, None)
-        if not isinstance(st, dict):
-            continue
-        # THE MIRROR OF THE SIBLING'S FILTER: it keeps only converged rooms, this
-        # keeps only UN-converged ones. Neither can fire for the same room, so
-        # the two can never both speak about one meld.
-        if str(st.get("status") or "") in ("done", "done-mutual"):
-            continue
-        who = [st.get("peer")] + list(st.get("peers") or [])
-        if peer not in [str(x) for x in who if x]:
-            continue
-        # AND IT MUST BE MY OWN RECORD — see `_my_meld_record`.
-        if _my_meld_record(st, own) is not True:
-            continue
-        try:
-            when = float(st.get("epoch") or 0)
-        except (TypeError, ValueError):
-            continue
-        if when + 1.0 >= floor:
-            return (True,
-                    _clip(_scrub(str(st.get("room") or "?")), SEAT_BYTES),
-                    max(0.0, now - when))
-    return False, "no open meld with %s inside the window" % peer, None
-
-
-def _melded_with(peer, span_h, own, now=None):
-    """(True, room) iff this seat CONVERGED a meld with `peer` inside the
-    spiral's own window, else (False, reason).
-
-    #70, and it is the guard punishing a seat for taking the guard's own cure.
-    review_spiral counts every distinct reviewed tip and consults NO meld
-    state, and the latch fingerprint includes the round count — so the ONE
-    post-meld round that IS the convergence re-arms the gate against the seat
-    that just did what the block told it to do. The remedy becomes evidence.
-
-    CONVERGED, NOT MERELY OPENED: an `active` meld is a conversation in
-    progress and proves nothing about a cure; only a done/done-mutual state
-    says the exchange closed. Opening a meld must never buy silence, or the
-    gate is disarmed by the cheapest possible gesture.
-
-    INSIDE THE WINDOW, because a meld from last week is not this spiral's cure.
-    The caller passes review_spiral's `since_h` (first tip to now); `span_h`
-    (first to newest tip) ended at the last round and rejected a meld made
-    after it, measured as a whole-suite flake. This asks the question the rule
-    exists to ask — did this seat meld DURING this spiral — and says so
-    plainly rather than implying a precision it does not have.
-
-    FAILS CLOSED TO NOT-MELDED. An unreadable meld directory suppresses
-    nothing: a suppression that fires on absent evidence un-guards the spiral
-    rung fleet-wide, which is the same failure the delegation exemption next
-    door forbids by name."""
-    import glob as _glob
-    now = time.time() if now is None else now
-    try:
-        span_s = max(0.0, float(span_h or 0)) * 3600.0
-    except (TypeError, ValueError):
-        return False, "unusable span"
-    floor = now - span_s
-    try:
-        paths = _glob.glob(os.path.join(chat.chat_dir(), "*.meld.*.json"))
-    except OSError as e:
-        return False, "meld state unreadable (%s)" % type(e).__name__
-    for path in paths:
-        st = pk.read_json(path, None)
-        if not isinstance(st, dict):
-            continue
-        if str(st.get("status") or "") not in ("done", "done-mutual"):
-            continue                      # active != converged
-        who = [st.get("peer")] + list(st.get("peers") or [])
-        if peer not in [str(x) for x in who if x]:
-            continue
-        # AND IT MUST BE MY OWN RECORD — see `_my_meld_record`.
-        if _my_meld_record(st, own) is not True:
-            continue
-        try:
-            when = float(st.get("epoch") or 0)
-        except (TypeError, ValueError):
-            continue
-        # ONE SECOND OF SLACK, and it is a real boundary rather than a fudge.
-        # `epoch` is integer seconds; `floor` is a float. When a spiral's
-        # rounds land inside one second — which is exactly the shape of a fast
-        # ping-pong, and of every test that stages rounds in a loop — span_h is
-        # 0.0 and the window collapses to a POINT that integer truncation puts
-        # the meld just outside. The cure would then be rejected for being
-        # simultaneous with the disease.
-        if when + 1.0 >= floor:
-            # LAUNDERED AT THE READ, never at the emit. This room name comes
-            # out of a meld file ANOTHER seat wrote, and _spiral_gate
-            # interpolates it straight into displayed stop-guard text — so an
-            # unscrubbed value here reshapes the frame it rides in. Scrubbing
-            # at the read makes the contract "element two is always safe to
-            # display", which a future caller cannot undo by forgetting;
-            # laundering at the one emit site would have fixed one caller and
-            # left the next exposed. SEAT_BYTES because a room name is a
-            # glance, exactly like a seat label.
-            return True, _clip(_scrub(str(st.get("room") or "?")), SEAT_BYTES)
-    return False, "no converged meld with %s inside the window" % peer
-def _spiral_gate(session, room, seat, dispatch_snapshot=None, spiral=None):
-    """(block | None, warn | None); `spiral` is review_spiral's own answer."""
-    if _off("STOP_GUARD_SPIRAL") or not seat:
-        return None, None
-    from . import dispatches
-    try:                      # fail-open TOTAL — a Stop rung must never wedge
-        info, err = spiral or dispatches.review_spiral(seat, snap=dispatch_snapshot)
-    except Exception as _swallowed:
-        record.swallow("seats_stop_signals._spiral_gate", _swallowed)
-        return None, None
-    if err:
-        # THE COMMENT WAS ALREADY RIGHT AND THE CODE DID NOT CARRY IT: "UNKNOWN
-        # rounds are not zero rounds". Both returned silence, so a seat the
-        # detector could not KEY ON looked exactly like a seat with nothing to
-        # report — and one seat ran TEN rounds inside that silence. Still
-        # fail-open (a Stop rung may never wedge a turn), now audible.
-        return None, ("[helm stop-guard] review-spiral rung could not measure "
-                      "this seat: %s — rounds are UNKNOWN, not zero."
-                      % _clip(_scrub(str(err)).strip(), STATUS_BYTES))
-    if not info:
-        return None, None     # measured, and genuinely no spiral
-    lane = str(info.get("lane") or "")
-    peer = str(info.get("peer") or "")
-    rounds = int(info.get("rounds") or 0)
-    if not _SPIRAL_LANE.fullmatch(lane) or not dispatches._TOKEN.fullmatch(peer):
-        return None, None     # cannot be quoted inertly -> not said at all
-    if rounds < dispatches.SPIRAL_MELD_ROUNDS:
-        return None, None
-    cure = _spiral_meld(peer, lane)
-    warn = (
-        "[helm stop-guard] two review rounds on lane '%s' (peer %s). At two "
-        "rounds the cure is a meld, never round three — if round two comes "
-        "back with findings, converge them live instead of sending a "
-        "third:\n  %s" % (lane, peer, cure))
-    # THE LATCH KEYS ON THE CHAIN, not the lane string — the same defect this
-    # rung's detector just stopped making. Two unrelated chains reusing one lane
-    # name reach `rounds` independently, and a lane-keyed fingerprint let the
-    # first one's latch swallow the second one's block. `chain` is opaque here
-    # (an id, or "lane:<name>" for a legacy row) and is hashed, never printed,
-    # so nothing needs to quote it.
-    # An advisory is not a served block. Same-tip new evidence can change
-    # FINISH to UNKNOWN/MELD without adding a round; that transition must fire.
-    prescription = info.get("prescription") or "MELD"
-    fp = hashlib.blake2b(("%s|%s|%d|%s" % (
-        info.get("chain") or lane, lane, rounds, prescription))
-        .encode("utf-8"), digest_size=8).hexdigest()
-    path = _stop_fp_path(room, seat, session, kind=SPIRAL_LATCH)
-    try:
-        with open(path) as f:
-            last = f.read().strip()
-    except OSError:
-        last = None
-    if last == fp:
-        return None, None                 # already pointed at this exact state
-    try:
-        latched = _write_stop_latch(path, seat, fp, session=session)
-    except OSError:
-        latched = False
-    if rounds < dispatches.SPIRAL_BLOCK_ROUNDS:
-        return None, warn
-    evidence = str(info.get("finding_evidence") or
-                   "finding trajectory UNKNOWN: no typed verdict observations")
-    if prescription in dispatches.SPIRAL_ADVISORY_PRESCRIPTIONS:
-        return None, ("[helm stop-guard] review tripwire — lane '%s' at "
-                      "%d distinct tips in the last %dh: %s — %s. Not "
-                      "blocking this stop; this is not landing approval."
-                      % (lane, rounds, dispatches.SPIRAL_WINDOW_H,
-                         prescription, evidence))
-    warn += "\n  MELD — " + evidence
-    # #70: THE CURE MUST NOT COUNT AS THE DISEASE. A seat that already
-    # converged a meld with this peer inside this spiral's window has done
-    # exactly what the block prescribes, and the ONE round that carries the
-    # convergence is what re-arms the gate. Suppress the BLOCK, keep the WARN
-    # — the seat still sees the state, it is simply not walled for complying.
-    melded, why = _melded_with(peer, info.get("since_h", info.get("span_h")), seat)
-    if melded:
-        return None, (warn + "\n  Meld already converged with %s (room %s) "
-                      "inside this window — not blocking: this round is the "
-                      "cure, not another spiral." % (peer, why))
-    if not latched:
-        return None, warn    # unlatchable -> degrade, never wall the fleet
-    # THE PRESCRIPTION MUST NOT NAME A STEP THE SEAT ALREADY TOOK. The block
-    # still fires — an opened meld converges nothing and may not buy silence —
-    # but telling a waiting seat to open the room it is waiting in reads as not
-    # having noticed, and a gate that cannot tell "you ignored me" from "I have
-    # not looked" teaches the fleet to discount both. task/981.
-    open_room, open_why, open_age = _meld_open_with(peer, info.get("span_h"), seat)
-    if open_room:
-        cure = ("a meld with %s is ALREADY OPEN (room %s, %dm) and has not "
-                "converged — do NOT open another. Chase the peer in that room, "
-                "or escalate to the integrator that it is not entering:\n"
-                "  helm chat meld say %s --marker YIELD \"<your side>\""
-                % (peer, open_why, int((open_age or 0) // 60), open_why))
-    return spiral_block(lane, rounds, dispatches.SPIRAL_WINDOW_H, peer,
-                        cure, evidence), None
-
-
-def spiral_block(lane, rounds, window_h, peer, cure, evidence):
-    """The review-spiral block's text — a pure renderer at its own door, so a
-    budget arm measures the artifact rather than rebuilding its format string.
-
-    THE QUOTED RULE, THE COST ANECDOTE AND THE COUNTING PROSE ARE NOT HERE, and
-    none of them is lost: the heuristic this rung enforces is named at the end
-    and `helm store get` prints it whole, six-round figure included. What a
-    reader cannot reconstruct stays — which lane, how many tips, which peer,
-    which round, what the evidence says, and the exact command that converges
-    it. The gate's DECISION is decided above; this writes words."""
-    return (
-        "[helm stop-guard] review spiral — lane '%s' is review-dispatched at "
-        "%d distinct tips in the last %dh (latest peer: %s). That is round "
-        "%d, and at two rounds the cure is a meld. Do not idle waiting for "
-        "the next verdict — converge every open finding in one live "
-        "exchange:\n"
-        "  %s\n"
-        "MELD — %s.\n"
-        "Rounds count on the work chain, so renaming the lane does not reset "
-        "them. Blocks once per (chain, round-count, prescription); "
-        "HELM_STOP_GUARD_SPIRAL=0 disables. Why: helm store get "
-        "heuristic:review-begins-with-cat-file"
-        % (lane, rounds, window_h, peer, rounds, cure, evidence))
 STOP_WHISPER_CAP = 240   # one line's byte budget (inject.py WHISPER_CAP kin)
 _WHISPER_FIRED_CAP = 20  # fired-set entries kept per (seat, session) latch
 STUCK_AT = 3    # reflex.py stuck-commonsense threshold (re-fires per bucket)
@@ -632,7 +563,7 @@ def _ask_candidate():
     except Exception as _swallowed:
         record.swallow("seats_stop_signals._ask_candidate", _swallowed)
         return None
-def _dispatch_candidate(dispatch_snapshot=None):
+def _dispatch_candidate(dispatch_snapshot=None, seat=None):
     """The DISPATCH rung — sits directly under the owner-ask rung: work you
     handed to another seat and have not checked on. One cheap local read of
     the dispatch ledger; whispers the OLDEST OVERDUE row, never the list.
@@ -653,8 +584,11 @@ def _dispatch_candidate(dispatch_snapshot=None):
         # row -> derive). Without it the rung offered every seat the same
         # globally-oldest row — the docstring above says "work YOU handed",
         # and the filter that makes that true needs a seat to compare against.
+        # The Stop ladder passes the seat it runs for, the one its owed rung
+        # reads; a hook with no session resolved `acting_seat` to a derived
+        # name that owns nothing (task/3531).
         r, kind, unavailable = dispatches.stop_candidate(
-            seat=acting_seat(cwd=safe_cwd()), snap=dispatch_snapshot)
+            seat=seat or acting_seat(cwd=safe_cwd()), snap=dispatch_snapshot)
         if unavailable:
             return ("dispatch:ledger-unavailable",
                     "dispatch ledger UNAVAILABLE — obligations are UNKNOWN, not "
@@ -683,8 +617,9 @@ def _dispatch_candidate(dispatch_snapshot=None):
                 "PENDING VERDICT — verify at the exact recipient; do NOT "
                 "reassign on age alone. Close the exact reviewed tip with: "
                 "helm dispatch verdict %s %s --approve|--fix|--supersede "
-                "<evidence>   (the polarity flag is REQUIRED — without it "
-                "the verb exits 2)"
+                "<evidence>   (choose one polarity and a basis; a FIX also "
+                "needs --finding-count N --prior-relation RELATION and an "
+                "exit answer; without a polarity the verb exits 2)"
                 % (r.get("id"), r.get("recipient"), lane, r.get("id"),
                    _clip(_scrub(tip), 16)))
     except Exception as _swallowed:

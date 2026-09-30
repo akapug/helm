@@ -36,6 +36,16 @@ REGISTERING MUST NEVER COST A SERVER. `register` and `forget` swallow their own
 failures and answer False. A console that refused to start because it could not
 write its own bookkeeping would trade the thing the owner uses for the thing
 that describes it.
+
+WHAT EACH SERVER COSTS, AND WHOSE IT IS (task/3715). A server started by hand
+from a lane worktree runs under no unit, so under no memory limit: one left
+polling from a single open tab reached 4.5 GB in about 54 minutes. So `live`
+also reads, per server, from /proc: its resident and swapped memory (RSS alone
+hid 1.3-1.9 GB of the console's swap), the systemd unit it runs in (the owner's
+console is the helm-web unit; any other server is ad hoc), its age when no
+record states one, and the TREE it serves, meaning the checkout whose code it
+runs. That is the record's `tree`, else the checkout of the `bin/helm` its
+command line names. Each is None when it cannot be read, never a guess.
 """
 import json
 import os
@@ -66,11 +76,17 @@ def _starttime(pid):
     return beacons.proc_starttime(pid)
 
 
-def register(port, root=None, cwd=None, now=None):
+def _this_tree():
+    """The checkout whose helm package this process imported."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def register(port, root=None, cwd=None, now=None, tree=None):
     """Record that THIS process is serving `port` -> True when a record landed.
 
     False means nothing was written. A caller may not read health into it: the
     file is the record, and a server that could not write one still serves.
+    `tree` is the checkout whose code it serves, this module's own by default.
     """
     now = time.time() if now is None else now
     try:
@@ -88,6 +104,7 @@ def register(port, root=None, cwd=None, now=None):
             "cwd": pk.cut_marked(cwd if cwd is not None else _safe_cwd(),
                                  PATH_CHARS),
             "root": pk.cut_marked(root, PATH_CHARS) if root else None,
+            "tree": pk.cut_marked(tree or _this_tree(), PATH_CHARS),
         }), mode=0o600)
     except Exception:          # noqa: BLE001 — bookkeeping never costs a server
         return False
@@ -183,7 +200,57 @@ def observed(proc_dir=None):
             cwd = os.readlink(os.path.join(root, name, "cwd"))
         except OSError:
             cwd = ""
-        out[pid] = {"pid": pid, "cwd": cwd, "port": _argv_port(argv)}
+        out[pid] = dict(proc_facts(pid, proc_dir), pid=pid, cwd=cwd,
+                        port=_argv_port(argv), tree=_argv_tree(argv, cwd))
+    return out
+
+
+def _argv_tree(argv, cwd):
+    """The checkout a `helm web` command line runs: the tree of the
+    `<tree>/bin/helm` it names (a relative one read from `cwd`, a link
+    followed), or `cwd` for `python -m helm`. None when neither says."""
+    for i, a in enumerate(argv):
+        if os.path.basename(a) == "helm" and argv[i + 1:i + 2] == ["web"]:
+            if os.sep not in a:
+                return None     # found on PATH: which one is not recorded
+            bindir = os.path.dirname(os.path.realpath(
+                os.path.join(cwd or os.sep, a)))
+            tree = os.path.dirname(bindir) \
+                if os.path.basename(bindir) == "bin" else None
+            break
+        if a == "-m" and argv[i + 1:i + 2] == ["helm"]:
+            tree = cwd or None
+            break
+    else:
+        return None
+    # A CHECKOUT CARRIES ITS PACKAGE. A `bin/helm` that is a wrapper script
+    # rather than a link into a checkout names a directory that is not one.
+    return tree if tree and os.path.isfile(
+        os.path.join(tree, "helm", "__init__.py")) else None
+
+
+def proc_facts(pid, proc_dir=None):
+    """What /proc says one process costs and runs under ->
+    {"rss_bytes", "swap_bytes", "unit", "age_s"}, each None when unreadable.
+
+    `unit` is the systemd unit whose cgroup holds it (the `.service` its
+    cgroup path ends in), None for a process in a scope or no unit at all.
+    `age_s` is its start (/proc/<pid>/stat field 22) against /proc/uptime."""
+    from . import beacons, procage
+    out = {"rss_bytes": None, "swap_bytes": None, "unit": None, "age_s": None}
+    raw, err = beacons._read(pid, "status", proc_dir)
+    for line in ([] if err else raw.decode("utf-8", "replace").splitlines()):
+        key, _, value = line.partition(":")
+        field = {"VmRSS": "rss_bytes", "VmSwap": "swap_bytes"}.get(key)
+        words = value.split()
+        if field and words and words[0].isdigit():
+            out[field] = int(words[0]) * 1024
+    raw, err = beacons._read(pid, "cgroup", proc_dir)
+    for line in ([] if err else raw.decode("utf-8", "replace").splitlines()):
+        leaf = line.rsplit(":", 1)[-1].rstrip("/").rsplit("/", 1)[-1]
+        if leaf.endswith(".service"):
+            out["unit"] = leaf
+    out["age_s"] = procage.process_age(pid, proc_dir=proc_dir)
     return out
 
 
@@ -218,6 +285,13 @@ def _argv_port(argv):
     return None
 
 
+def _ui_tree(root):
+    """<tree> for a recorded UI directory <tree>/helm/web_ui, else None."""
+    parts = os.path.normpath(root).split(os.sep)[-2:] if root else []
+    return os.path.dirname(os.path.dirname(os.path.normpath(root))) \
+        if parts == ["helm", "web_ui"] else None
+
+
 def live(now=None, proc_dir=None):
     """What is serving on this host, as a dict.
 
@@ -238,10 +312,11 @@ def live(now=None, proc_dir=None):
     recs, unreadable = _records(proc_dir=proc_dir)
     servers, stale = [], 0
     for rec in recs:
-        alive = beacons.pid_alive(rec["pid"], rec.get("pid_start"))
+        alive = beacons.pid_alive(rec["pid"], rec.get("pid_start"), proc_dir)
         if alive is False:
             stale += 1
             continue
+        facts = proc_facts(rec["pid"], proc_dir)
         servers.append({
             "port": rec["port"],
             "pid": rec["pid"],
@@ -249,6 +324,12 @@ def live(now=None, proc_dir=None):
             "root": rec.get("root") or "",
             "age_s": max(0.0, now - (rec.get("started") or now)),
             "alive": "live" if alive else "unknown",
+            # A RECORD FROM BEFORE `tree` WAS RECORDED still names its UI
+            # directory, which sits at <tree>/helm/web_ui.
+            "tree": rec.get("tree") or _ui_tree(rec.get("root")),
+            "rss_bytes": facts["rss_bytes"],
+            "swap_bytes": facts["swap_bytes"],
+            "unit": facts["unit"],
         })
     # THE PROCESS TABLE IS THE AUTHORITY, the registry is the detail. A server
     # that is running and never registered still counts, or this check would
@@ -262,7 +343,9 @@ def live(now=None, proc_dir=None):
         servers.append({
             "port": proc["port"] if proc["port"] is not None else -1,
             "pid": pid, "cwd": proc["cwd"], "root": "",
-            "age_s": None, "alive": "live", "registered": False,
+            "age_s": proc.get("age_s"), "alive": "live", "registered": False,
+            "tree": proc.get("tree"), "rss_bytes": proc.get("rss_bytes"),
+            "swap_bytes": proc.get("swap_bytes"), "unit": proc.get("unit"),
         })
     for x in servers:
         x.setdefault("registered", True)

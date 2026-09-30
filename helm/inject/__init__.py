@@ -134,6 +134,20 @@ trend. Delivery only: fires are not heeds — whether a fire anchored the agent
 needs per-turn outcome markers, which the ledger does not record. No ledger
 row, no state mutation.
 
+USE-REPORT (the prune instrument): `helm inject --use-report [--hours N]
+[--min-fires N] [--json]` is a READ-ONLY analyzer that answers what
+--lane-report cannot: whether a seat USED what fired. For each fired ledger
+row in the window it finds the fire's own turn in the session's transcript
+(the UserPromptSubmit hook record at or after the row's second, up to the
+next prompt event) and counts a fire as used when that turn's assistant text,
+thinking or tool input names the id, or carries two of the entry's rare store
+keywords — two signals, reported apart, because they differ in trust. A fire
+whose turn could not be read is UNKNOWN, never unused, and is out of every
+rate. Ids with enough readable fires and a use rate under 5% are listed as
+prune candidates with example turns; nothing is retired. Transcripts are
+read in bounded records around each fire under per-turn, per-transcript and
+per-report byte caps, and the report states what it read (_use.py).
+
 COMPARISON BACKEND (the pluggability seam): the local keyword JIT resolver is
 the AUTHORITY; a registered COMPARISON backend (_COMPARE_BACKENDS) runs in
 PARALLEL and its ranked ids are LOGGED/COMPARED to the local lane, NEVER
@@ -159,7 +173,8 @@ FAIL OPEN (docs/HOOKS.md law): a hook that cannot run helm must inject nothing,
 never block — a store or reflex failure yields an empty lane and rc 0.
 
 This is a PACKAGE: inject.py was decomposed into one-way clusters
-(_common <- _entries <- _ledger <- _compare <- _whisper <- _cli) with ZERO
+(_common <- _entries <- _ledger <- _compare <- _whisper <- _cli, and
+_ledger <- _use <- _cli for the use report) with ZERO
 public-surface change — this __init__ re-exports every name the old module
 exposed, so every `from helm import inject; inject.X` caller keeps working
 unchanged. The names the test contract monkeypatches on this package
@@ -200,6 +215,7 @@ from ._ledger import (
     _ledger_append, _seen_dir, _seen_path, _seen_load, _seen_save, _cohort,
     LedgerRows, _read_jsonl, _ledger_rows, lane_report, _pct, _lane_report,
 )
+from ._use import use_report, _use_report
 from ._compare import (
     LocalBackend, CFCompareBackend, LOCAL_BACKEND, _COMPARE_BACKENDS,
     _active_compare, _compare_ledger_path, _compare_diverge, _compare_run,

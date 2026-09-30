@@ -10,7 +10,8 @@ import os
 import unittest
 from unittest import mock
 
-from helm import gate, gateauthority, gatecanary, gateslice
+from helm import (eventledger, gate, gateauthority, gatecanary, gateslice,
+                   landwindow)
 from tests.test_gate_slice_receipt import SliceFixture
 
 RULE = "=" * 70 + "\n"
@@ -125,6 +126,27 @@ class CompareTest(CanaryFixture):
             "test": "<ran count>", "serial": "3", "sliced": "2",
             "kind": "count"}])
 
+    def test_a_count_difference_across_two_hosts_is_a_note_not_a_divergence(self):
+        """A count names no test, and a skip can be the host's: across two
+        hosts the counts are kept as a note, and the failures by id decide."""
+        serial, sliced = self.serial_row(ran=3), self.sliced_row()
+        away = dict(sliced, host=dict(sliced["host"], node="another-node"))
+        result = gatecanary.compare(serial, away, {}, {})
+        self.assertEqual(result["verdict"], gatecanary.AGREE, result)
+        self.assertEqual(result["notes"], [{
+            "test": "<ran count>", "serial": "3", "sliced": "2",
+            "kind": "host-count"}])
+        self.assertIn("counts differ across hosts", result["reason"])
+        # The same hosts: the count still decides.
+        self.assertEqual(gatecanary.compare(serial, sliced, {}, {})["verdict"],
+                         gatecanary.DIVERGED)
+        # Across hosts, a failure by id still decides.
+        failed = {("FAIL", B_FAILS[1]): 1}
+        result = gatecanary.compare(serial, away, failed, {})
+        self.assertEqual(result["verdict"], gatecanary.DIVERGED, result)
+        self.assertEqual([d["kind"] for d in result["divergences"]],
+                         ["serial-only"])
+
     def test_rows_that_are_not_a_serial_and_sliced_pair_are_unknown(self):
         serial, sliced = self.serial_row(), self.sliced_row()
         for pair in ((sliced, sliced), (serial, serial),
@@ -192,6 +214,9 @@ class MarkerTest(CanaryFixture):
         with open(path, "w") as fh:
             fh.write("{half a marker")
         self.assertIn("cannot be read", gate.sliced_land_disabled(self.home))
+        rc, line = gatecanary.clear_marker("read", self.home)
+        self.assertEqual(rc, 1, line)
+        self.assertTrue(os.path.exists(path))
 
     def test_the_verb_reads_the_marker_and_exits_by_it(self):
         with mock.patch.object(gatecanary.home, "global_dir",
@@ -310,6 +335,36 @@ class CanaryDoorTest(CanaryFixture):
         self.assertEqual((verdict, label), (gate.ADMIT, ["canary"]), note)
         self.assertIn("comparison needs one of each", note)
 
+    def test_a_third_run_of_a_kind_the_tree_already_holds_is_refused(self):
+        """The crossing is admitted only while the tree holds NO receipt of
+        the requested kind. Judged by the LAST receipt alone, serial, sliced,
+        serial ... alternated forever: the third run below was the other
+        kind of the one before it, and was admitted."""
+        self.serial_row()
+        self.sliced_row()
+        held, unreadable = gate.tree_suite_receipts(self.repo)
+        self.assertEqual(([gate._suite_kind(r) for r in held], unreadable),
+                         ([gate.SERIAL, gate.SLICED], None))
+        for kind in (gate.SERIAL, gate.SLICED):
+            verdict, note, label = gate.whole_suite_door(self.repo,
+                                                         canary=kind)
+            self.assertEqual((verdict, label), (gate.REFUSE, []), note)
+            self.assertIn("already holds a GREEN whole-suite receipt", note)
+
+    def test_a_tree_whose_only_green_is_sliced_is_gated_again(self):
+        """task/3323: a sliced (v10) green binds lane-level purposes and no
+        land while the canary does not stand for slices, so it does not make
+        the tree "already gated"; a serial green beside it does."""
+        row = self.sliced_row()
+        verdict, note, label = gate.whole_suite_door(self.repo, mode="plan")
+        self.assertEqual((verdict, label), (gate.ADMIT, []), note)
+        self.assertIn(row["id"], note)
+        self.assertIn("cannot authorize a land", note)
+        serial = self.serial_row()
+        verdict, note, _label = gate.whole_suite_door(self.repo, mode="plan")
+        self.assertEqual(verdict, gate.REFUSE, note)
+        self.assertIn("gate:" + serial["id"], note)
+
     def test_the_verb_reads_the_canary_declaration_from_the_environment(self):
         self.serial_row()
         seen = {}
@@ -341,6 +396,114 @@ class TimerTest(unittest.TestCase):
         self.assertIn("Persistent=true", timer)
         self.assertTrue(tpath.endswith(gatecanary.TIMER_NAME))
         self.assertTrue(spath.endswith(gatecanary.SERVICE_NAME))
+
+
+class ARecordedFlakeDoesNotVeto(CanaryFixture):
+    """A sliced-only miss on a test blame recorded as FLAKE for this tree is
+    FLAKE-EXPLAINED: visible in the canary record, and not a DISABLE marker.
+    Anything else, including a store that cannot be read, still vetoes."""
+
+    OTHER = ("FAIL", "tests.test_b.Case.test_c")
+
+    def _flake(self, tree, tests):
+        row, err = landwindow.record_flake(self.repo, {
+            "tree": tree, "gate": "ab" * 8, "train": "train1",
+            "tests": list(tests), "why": "planted flake"})
+        self.assertIsNone(err, err)
+        return row
+
+    def _judge(self, serial, sliced):
+        return gatecanary.judge(serial, sliced, self.home, repo=self.repo)
+
+    def _history(self):
+        rows, unavailable = eventledger.checked_events(
+            gatecanary.history_path(self.home), strict=True)
+        self.assertIsNone(unavailable, unavailable)
+        return rows
+
+    def test_a_sliced_only_flake_is_explained_and_writes_no_marker(self):  # noqa: VACUOUS_ASSERTION — the absent marker and the empty post list are the contract; the sibling arm asserts the DISABLE marker PRESENT and naming the test
+        serial, sliced = self.serial_row(), self.sliced_row([B_FAILS])
+        self._flake(serial["tree"], [B_FAILS[1]])
+        result = self._judge(serial, sliced)
+        self.assertEqual(result["verdict"], gatecanary.FLAKE_EXPLAINED, result)
+        self.assertIsNone(gate.sliced_land_disabled(self.home))
+        self.assertEqual(self.posts, [])
+        row = self._history()[-1]
+        self.assertEqual(row["verdict"], gatecanary.FLAKE_EXPLAINED)
+        self.assertIn(B_FAILS[1], row["explained"])
+
+    def test_the_same_flake_on_a_different_tree_still_diverges(self):
+        serial, sliced = self.serial_row(), self.sliced_row([B_FAILS])
+        self._flake("ab" * 20, [B_FAILS[1]])
+        result = self._judge(serial, sliced)
+        self.assertEqual(result["verdict"], gatecanary.DIVERGED, result)
+        self.assertIn(B_FAILS[1], [d["test"] for d in result["divergences"]])
+        why = gate.sliced_land_disabled(self.home)
+        self.assertIn(serial["tree"][:12], why)
+        self.assertIn("differ", why)
+
+    def test_a_recorded_audit_flake_still_diverges(self):
+        serial, sliced = self.serial_row(), self.sliced_row([AUDIT])
+        self._flake(serial["tree"], [AUDIT[1]])
+        result = self._judge(serial, sliced)
+        self.assertEqual(result["verdict"], gatecanary.DIVERGED, result)
+        self.assertEqual([d["kind"] for d in result["divergences"]], ["audit"])
+        self.assertIsNotNone(gate.sliced_land_disabled(self.home))
+
+    def test_an_unrecorded_divergence_beside_a_flake_still_diverges(self):
+        serial = self.serial_row()
+        sliced = self.sliced_row([B_FAILS, self.OTHER])
+        self._flake(serial["tree"], [B_FAILS[1]])
+        result = self._judge(serial, sliced)
+        self.assertEqual(result["verdict"], gatecanary.DIVERGED, result)
+        tests = {d["test"] for d in result["divergences"]}
+        self.assertIn(self.OTHER[1], tests)
+        self.assertIn(serial["tree"][:12],
+                      gate.sliced_land_disabled(self.home))
+
+    def test_an_unreadable_flake_store_diverges_and_names_it(self):
+        serial, sliced = self.serial_row(), self.sliced_row([B_FAILS])
+        path = landwindow.flakes_path(self.repo)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json\n")
+        result = self._judge(serial, sliced)
+        self.assertEqual(result["verdict"], gatecanary.DIVERGED, result)
+        self.assertIn(path, result["reason"])
+        self.assertIsNotNone(gate.sliced_land_disabled(self.home))
+
+    def test_a_flake_explained_row_between_agrees_neither_resets_nor_adds(self):
+        """Neutral in the standing rule: not a restart, and not an agreeing
+        tree. A DIVERGED in the same record still restarts the count."""
+        def put(verdict, n):
+            tree = "%040x" % n
+            serial = {"id": "serial-%d" % n, "tree": tree, "status": "OK",
+                      "host": {"node": "serial-node"},
+                      "ts": "2026-09-26T00:00:00Z"}
+            sliced = {"id": "sliced-%d" % n, "tree": tree,
+                      "host": {"node": "node-%d" % n},
+                      "slice_authority": {"leak_mode": "fail"},
+                      "ts": "2026-09-26T00:00:00Z"}
+            self.assertTrue(gatecanary.append_verdict(
+                {"verdict": verdict, "reason": "planted",
+                 "shared_failures": 0, "divergences": [],
+                 "explained": [B_FAILS[1]]
+                 if verdict == gatecanary.FLAKE_EXPLAINED else []},
+                serial, sliced, gatecanary.COMPARE, self.home))
+            return tree
+
+        a = put(gatecanary.AGREE, 1)
+        flake = put(gatecanary.FLAKE_EXPLAINED, 2)
+        c = put(gatecanary.AGREE, 3)
+        held = gatecanary.standing(self.home)
+        self.assertIsNone(held["last_diverged"])
+        self.assertEqual(held["agree"], 2, held)
+        self.assertEqual(held["trees"], [a, c])
+        self.assertNotIn(flake, held["trees"])
+        put(gatecanary.DIVERGED, 4)
+        held = gatecanary.standing(self.home)
+        self.assertEqual(held["agree"], 0, held)
+        self.assertIsNotNone(held["last_diverged"])
 
 
 if __name__ == "__main__":

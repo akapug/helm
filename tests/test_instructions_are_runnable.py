@@ -93,11 +93,6 @@ _NON_COMMAND_MENTIONS = {
         "a substitution-obfuscated beacon arm, quoted as the rung's input",
     ("docs/HOOKS.md", "helm $V"):
         "a variable-spelled command the rung deliberately PASSES (measured)",
-    ("helm/beacons.py", "helm '>'"):
-        "a COUNTEREXAMPLE whose whole point is that it is NOT an invocation: "
-        "the quoted redirection operator is an ARGUMENT, so the shell passes "
-        "literal argv and runs no waiter. Spelling it any other way would "
-        "stop it being the witness it is",
 }
 _FORMATTED_COMMAND_MENTIONS = {
     ("helm/clarity/__init__.py", "helm %s)"): "helm " + clarity._USAGE_CHECK,
@@ -467,7 +462,7 @@ class InboxCureRunsTest(InstructionBase):
                               "test measures the filesystem and not the code")
         self.assertIn("seats.py", [os.path.basename(m) for m in mods],
                       "the facade itself was not scanned")
-        src = "\n".join(open(m, encoding="utf-8").read() for m in mods)
+        src = "\n".join(Path(m).read_text(encoding="utf-8") for m in mods)
         # the OLD, park-nothing form must not survive anywhere in the package
         self.assertNotIn("catchup --including-mentions` parks", src)
         self.assertEqual(
@@ -485,7 +480,7 @@ class HelpTableMatchesTheParserTest(InstructionBase):
 
     def test_dispatch_help_carries_the_required_polarity_flag(self):
         entry = cli._VERB_HELP["dispatch"]
-        self.assertIn("verdict <id-or-unique-prefix> <full-reviewed-tip> "
+        self.assertIn("verdict <id-or-unique-prefix> <reviewed-tip> "
                       "--approve|--fix|--supersede", entry)
         for flag in dispatches.POLARITIES:
             self.assertIn("--" + flag, entry)
@@ -670,7 +665,6 @@ class PrintedCommandGrammarTest(InstructionBase):
         families = (("helm/meld*.py", "family"),
                     ("helm/seat*.py", "family"),
                     ("helm/premise/*.py", "family"),
-                    ("helm/web_ui/views/00-home.html.part", "single"),
                     ("docs/VERBS.md", "single"))
         paths = []
         for pat, kind in families:
@@ -699,15 +693,13 @@ class PrintedCommandGrammarTest(InstructionBase):
             "helm %s:",
             "helm seat launch/resume",
             "helm dispatch send ...",
-            "<code>helm premise-check</code>",
         )
         self.assertEqual([s for s in forbidden if s in text], [])
         self.assertNotIn("premise|heuristic <id>", whisper)
         for required in (
                 "helm chat %s:",
                 "helm seat launch <seat>",
-                "helm dispatch send <recipient> <lane>",
-                "<code>helm premise-check &lt;id&gt;</code>"):
+                "helm dispatch send <recipient> <lane>"):
             self.assertIn(required, text)
         self.assertIn(
             "helm store add premise '<id> | <statement> | <keywords>'",

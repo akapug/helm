@@ -49,9 +49,8 @@ scope-sliced, but the store and reflex sets resolve under the cycle's scope.
 
 `helm evolve` **proposes, never mutates**. Every proposal is an explicit verb
 run deliberately by the operator or a supervising agent. Self-modifying
-belief stores that skip the gate don't learn — they drift. This gate is
-inherited from the earliest ancestor design and has survived every
-generation's review.
+belief stores that skip the gate don't learn — they drift. No proposal
+bypasses this gate.
 
 ## Mentorship (the pair extension)
 

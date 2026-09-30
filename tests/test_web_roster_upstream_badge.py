@@ -22,7 +22,8 @@ import subprocess
 import tempfile
 import unittest
 
-from helm import proxywatch, seat, web_ui_loader
+from helm import proxywatch, seat, web_roster, web_ui_loader
+from tests._ownerverbs import owner_verbs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -158,14 +159,20 @@ class RosterWalledBadgeRenderTest(unittest.TestCase):
         lifted = {name: _lift(cls.src, name) for name in LIFT}
         # renderRoster is lifted for the WIRED check only, never executed
         cls.render_roster = lifted.pop("renderRoster")
-        helpful = seat.remediation_text(seat.upstream_remediation({
+        # THE LINE IS THE ONE THE SERVER SENDS: web_roster's own join writes
+        # it onto the row, so the badge is read over what the page is sent.
+        def served(rem):
+            row = {}
+            web_roster._annotate_upstream_remediation(row, rem)
+            return row["upstream_remediation_text"]
+        helpful = served(seat.upstream_remediation({
             "upstream": {"gemini": {
                 "state": proxywatch._PROXY_COOLDOWN, "dark": True,
                 "falsification_bar_s": 1800, "seats": {"gemini": {
                     "state": proxywatch._PROXY_COOLDOWN, "dark": True,
                     "falsification_due": True, "falsification_age_s": 3600,
                     "falsification_seat": "gemini"}}}}}, "gemini", "gemini"))
-        unknown = seat.remediation_text(seat.upstream_remediation(
+        unknown = served(seat.upstream_remediation(
             {"upstream": {"gemini": {"state": "RATE-LIMITED",
                                        "dark": True, "seats": {"gemini": {
                                            "state": "RATE-LIMITED",
@@ -206,14 +213,24 @@ class RosterWalledBadgeRenderTest(unittest.TestCase):
 
     def test_stale_local_cooldown_prescribes_the_derived_proxy_restart(self):
         b = self.out["proxy_cooldown"]
-        self.assertIn("PRESCRIBES: restart this exact proxy", b)
-        self.assertIn("rerun helm proxywatch", b)
+        self.assertIn("the cure is to restart this exact proxy", b)
+        self.assertIn("is now stale", b)            # the measured fact behind it
         self.assertNotIn("local restart does not repair", b)
+
+    def test_the_badge_tells_the_owner_no_helm_verb(self):  # noqa: VACUOUS_ASSERTION — each render's absence of a verb follows an unconditional positive control on the same markup, asserting the branch named was drawn
+        """RULE 2 ON THE SEATS PAGE'S ROSTER (console walk 3, open points): the
+        badge's hover said "PRESCRIBES: restart this exact proxy, then rerun
+        helm proxywatch." Every badge the harness draws is read, hovers
+        included."""
+        # POSITIVE CONTROL on the same render: the restart is still said
+        self.assertIn("restart this exact proxy", self.out["proxy_cooldown"])
+        for name, badge in self.out.items():
+            self.assertEqual(owner_verbs(badge), [], "%s: %s" % (name, badge))
 
     def test_provider_rate_limit_never_gets_the_proxy_restart_advice(self):
         b = self.out["walled"]
         self.assertIn("remediation UNKNOWN", b)
-        self.assertNotIn("PRESCRIBES:", b)
+        self.assertNotIn("restart this exact proxy", b)
         self.assertNotIn("restart/reprobe can help", b)
 
     def test_no_reset_horizon_is_recorded_and_the_badge_says_so(self):

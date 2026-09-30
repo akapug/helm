@@ -571,9 +571,9 @@ class DuplicateSuccessorWarningTest(ChainBase):
         original = dispatches._append_dispatch
         results = []
 
-        def append(row, force=False):
+        def append(row, force=False, **kwargs):
             barrier.wait()
-            return original(row, force=force)
+            return original(row, force=force, **kwargs)
 
         def write(lane, ref):
             results.append(self.child(parent["id"], lane=lane, ref=ref))
@@ -621,7 +621,8 @@ class DuplicateSuccessorWarningTest(ChainBase):
         self.assertIn(first["id"][:12], err)
         self.assertIn("--force", err)
         self.assertEqual(len(dispatches.rows()), 2)
-        rc, out, err = run(dispatches.cmd_dispatch, argv + ["--force"])
+        rc, out, err = run(dispatches.cmd_dispatch,
+                           argv + ["--force", "--reason", "a deliberate fork"])
         self.assertEqual(rc, 0, err)
         self.assertIn("WARNING", err)
         self.assertIn("deliberate fork", err)
@@ -640,7 +641,8 @@ class DuplicateSuccessorWarningTest(ChainBase):
         rc2, out2, err2 = run(
             dispatches.cmd_dispatch,
             ["add", "codex-3", "shared-label", "--ref", self.b,
-             "--kind", "review", "--repo", self.repo, "--new-work", "--force"])
+             "--kind", "review", "--repo", self.repo, "--new-work", "--force",
+             "--reason", "a deliberate same-lane label"])
         self.assertEqual(rc2, 0, err2)
         self.assertIn("born-wrong", err2)
         self.assertIn("NEW WORK", out2)
@@ -813,14 +815,29 @@ class SpiralCountsTheChainTest(ChainBase):
         self.assertIsNone(why)
         return row
 
+    def answer(self, row):
+        """Read a round: a FIX verdict on its own tip. A ROUND IS AN ANSWERED
+        TIP (task/2682) — a dispatch nobody read stops counting once a newer
+        tip replaces it — so a chain these arms count is a chain whose
+        earlier rounds were read."""
+        import time as _time
+        from helm import eventledger
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), {
+            "v": 3, "event": "verdict", "seq": 1, "id": row["id"],
+            "ts": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+            "reviewed_tip": row["tip"], "verdict_ref": "one finding",
+            "polarity": "fix"}))
+
     def test_UNDERCOUNT_a_renamed_continuation_keeps_counting(self):
         """The live incident: `gate-mints-its-own-evidence` landed and
         `gate-epoch-is-append-order` opened immediately to close a hole in it.
         Round 10 of the same work under a new name, and every same-lane rule
         read it as round 1."""
         one = self.review("gate-mints-its-own-evidence", self.a)
+        self.answer(one)
         two = self.review("gate-epoch-is-append-order", self.b,
                           supersedes=one["id"])
+        self.answer(two)
         self.review("gate-receipt-binds-the-tip", self.c, supersedes=two["id"])
         info, err = dispatches.review_spiral("integrator")
         self.assertIsNone(err)
@@ -841,6 +858,7 @@ class SpiralCountsTheChainTest(ChainBase):
 
     def test_one_chain_at_two_rounds_still_fires(self):
         one = self.review("shared-name", self.a)
+        self.answer(one)
         self.review("shared-name", self.b, supersedes=one["id"])
         info, err = dispatches.review_spiral("integrator")
         self.assertIsNone(err)
@@ -850,6 +868,7 @@ class SpiralCountsTheChainTest(ChainBase):
         """History keeps EXACTLY today's behaviour: it has no chain, and
         inventing one would be the lane-name heuristic all over again."""
         one = self.review("legacy-lane", self.a)
+        self.answer(one)
         two = self.review("legacy-lane", self.b, force=True)
         for rid in (one["id"], two["id"]):
             self.rewrite(rid, chain_root=None, supersedes=None)
@@ -887,6 +906,7 @@ class SpiralCountsTheChainTest(ChainBase):
 
     def test_corrupting_a_round_drops_it_from_its_own_chain(self):
         one = self.review("shared-name", self.a)
+        self.answer(one)
         two = self.review("shared-name", self.b, supersedes=one["id"])
         self.assertEqual(dispatches.review_spiral("integrator")[0]["rounds"], 2)
         self.rewrite(two["id"], chain_root="not-a-hex-id")
@@ -1537,3 +1557,318 @@ class SpiralGateKeysOnTheLedgersNameTest(unittest.TestCase):
         with mock.patch.object(dispatches, "snapshot",
                                side_effect=OSError("ledger gone")):
             self.assertEqual(dispatches._sender_strings(), set())
+
+
+class CancelNamesWhatItUncarriesTest(ChainBase):
+    """CANCELLING A CARRIER RE-EXPOSES WHAT IT CARRIED (task/3357 remainder).
+
+    MEASURED 21:25Z: cancelling held row d29247614237 as moot made its
+    carried predecessor b411067d read STRANDED, idle-dispatch nagged its
+    sender, and 7 FIX rounds resurfaced on one seat's owed list. A cancelled
+    row is a PASS-THROUGH to `carrier`, so every round it carried is exposed
+    again unless something below it still carries, and the verb said nothing.
+
+    THE TABLE (task/3357's surface by state), one arm per cell:
+      cancel of a non-carrier            -> names 0, cancels only itself
+      cancel of a carrier, no --chain    -> names the rows, cancels only itself
+      cancel of a carrier, --chain       -> also cancels the OPEN predecessors,
+                                            never a verdict
+      an unreadable ledger               -> refuses as today, writes nothing
+    and four found in the code:
+      --chain climbs: an open round above an open round is un-carried once
+        the lower one is cancelled, so the chain takes both
+      a re-run with --chain repairs a cancel made without it
+      a HELD predecessor is billed by no owed surface, so it is neither
+        named nor cancelled
+      --chain over a round this helm cannot read refuses, writes nothing
+    """
+
+    REASON = ["moot:", "the", "lane", "landed"]
+
+    def cancel(self, rid, *flags):
+        return run(dispatches.cmd_dispatch,
+                   ["cancel", rid] + list(flags) + self.REASON)
+
+    def status(self, rid):
+        return dispatches.rows()[rid]["status"]
+
+    def under(self, parent, lane, hold=False):
+        kid, why = self.child(parent["id"], lane=lane)
+        self.assertIsNone(why)
+        if hold:
+            kid, why = dispatches.mark_hold(kid["id"], "waiting on the land")
+            self.assertIsNone(why)
+        return kid
+
+    def fix_round(self, lane):
+        row = self.root(lane=lane)
+        out, why = dispatches.mark_verdict(row["id"], self.a, "findings",
+                                           polarity="fix")
+        self.assertIsNone(why)
+        return out
+
+    def ladder(self):
+        """FIX <- open <- open <- HELD: the carrier is the held row at the
+        bottom, and each open round is carried by the round below it."""
+        fix = self.fix_round("ladder")
+        upper = self.under(fix, "ladder-upper")
+        lower = self.under(upper, "ladder-lower")
+        held = self.under(lower, "ladder-held", hold=True)
+        return fix, upper, lower, held
+
+    def owed_ids(self):
+        return {r["id"] for r in dispatches.owed(dispatches.snapshot()[0])}
+
+    def billed_fixes(self):
+        from helm import obligation
+        items, _forks, un = obligation.unanswered_fixes(
+            dispatches.snapshot()[0], None)
+        self.assertIsNone(un)
+        return {i["row"] for i in items}
+
+    def test_cancel_of_a_NON_CARRIER_names_zero_and_cancels_only_itself(self):  # noqa: VACUOUS_ASSERTION — the zero is the contract under test, and each cancel is asserted to have happened (rc 0, the CANCELLED line naming the row) through the same CLI result before the zero is read
+        bystander = self.root(lane="bystander")
+        lone = self.root(lane="lone")
+        rc, out, err = self.cancel(lone["id"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("%s — CANCELLED" % lone["id"], out)
+        self.assertIn("un-carries 0 open rounds and 0 FIX verdicts", out)
+        self.assertEqual(self.status(bystander["id"]), "open")
+        # A round a live SIBLING still carries is not un-carried either.
+        parent = self.root(lane="forked")
+        first = self.under(parent, "fork-one")
+        second, why = self.child(parent["id"], lane="fork-two", force=True)
+        self.assertIsNone(why)
+        rc, out, err = self.cancel(first["id"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("un-carries 0 open rounds and 0 FIX verdicts", out)
+        self.assertEqual((self.status(parent["id"]),
+                          self.status(second["id"])), ("open", "open"))
+
+    def test_cancel_of_a_CARRIER_names_what_it_uncarries_and_cancels_only_itself(self):  # noqa: VACUOUS_ASSERTION — the unconditional before-reads on the same owed surfaces prove each named row was carried, and the after-reads prove the cancel exposed it
+        fix, upper, lower, held = self.ladder()
+        self.assertNotIn(lower["id"], self.owed_ids(),
+                         "the open round was never carried, so naming it "
+                         "below proves nothing")
+        rc, out, err = self.cancel(held["id"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("un-carries 1 open round (%s)" % lower["id"][:12], out)
+        self.assertIn("and 0 FIX verdicts", out)
+        self.assertIn("--chain", out, "the remedy was not named")
+        self.assertEqual([self.status(r["id"]) for r in
+                          (fix, upper, lower, held)],
+                         ["verdict", "open", "open", "cancelled"])
+        self.assertIn(lower["id"], self.owed_ids(),
+                      "the round named as exposed is not owed")
+        # A FIX the carrier answered directly (the 7 FIX rounds of 21:25Z).
+        fix2 = self.fix_round("direct")
+        hold2 = self.under(fix2, "direct-hold", hold=True)
+        self.assertNotIn(fix2["id"], self.billed_fixes())
+        rc, out, err = self.cancel(hold2["id"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("un-carries 0 open rounds and 1 FIX verdict (%s)"
+                      % fix2["id"][:12], out)
+        self.assertEqual(self.status(fix2["id"]), "verdict")
+        self.assertIn(fix2["id"], self.billed_fixes(),
+                      "the FIX named as exposed is not billed")
+
+    def test_cancel_CHAIN_also_cancels_the_open_rounds_and_never_a_verdict(self):
+        fix, upper, lower, held = self.ladder()
+        rc, out, err = self.cancel(held["id"], "--chain")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual([self.status(r["id"]) for r in
+                          (fix, upper, lower, held)],
+                         ["verdict", "cancelled", "cancelled", "cancelled"])
+        for r in (upper, lower):
+            self.assertEqual(dispatches.rows()[r["id"]]["cancel_reason"],
+                             " ".join(self.REASON))
+            self.assertIn("%s — CANCELLED" % r["id"], out)
+        self.assertIn("un-carries 2 open rounds (%s, %s — cancelled by "
+                      "--chain)" % (lower["id"][:12], upper["id"][:12]), out)
+        self.assertIn("and 1 FIX verdict (%s)" % fix["id"][:12], out)
+        self.assertNotIn("cancel", [e.get("event") for e in
+                                    dispatches.history(fix["id"])],
+                         "--chain wrote a cancel over a verdict")
+        self.assertEqual(self.owed_ids() & {upper["id"], lower["id"]}, set())
+
+    def test_a_rerun_with_CHAIN_repairs_a_cancel_made_without_it(self):
+        _fix, upper, lower, held = self.ladder()
+        rc, _out, err = self.cancel(held["id"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(self.status(lower["id"]), "open")
+        rc, out, err = self.cancel(held["id"], "--chain")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual((self.status(upper["id"]), self.status(lower["id"])),
+                         ("cancelled", "cancelled"))
+        self.assertIn("cancelled by --chain", out)
+
+    def test_a_HELD_predecessor_is_neither_named_nor_cancelled(self):
+        """No owed surface bills a held row, so un-carrying one exposes
+        nothing; its hold still says who owes the next move."""
+        top = self.root(lane="held-top")
+        middle = self.under(top, "held-middle", hold=True)
+        bottom = self.under(middle, "held-bottom", hold=True)
+        rc, out, err = self.cancel(bottom["id"], "--chain")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("un-carries 0 open rounds and 0 FIX verdicts", out)
+        self.assertEqual((self.status(top["id"]), self.status(middle["id"])),
+                         ("open", "held"))
+
+    def test_an_UNREADABLE_ledger_refuses_as_today_and_writes_nothing(self):  # noqa: VACUOUS_ASSERTION — the refusal is the contract: rc 1 and the stderr naming the unavailable ledger are the positive readings of the same CLI result, and the unchanged event count and held status are the absence the refusal promises
+        from unittest import mock
+        _fix, _upper, _lower, held = self.ladder()
+        before = len(eventledger.events(dispatches.ledger_path()))
+        for flags in ((), ("--chain",)):
+            with self.subTest(flags=flags):
+                with mock.patch.object(dispatches, "snapshot",
+                                       return_value=({}, "ledger locked")):
+                    rc, out, err = self.cancel(held["id"], *flags)
+                self.assertEqual(rc, 1)
+                self.assertIn("unavailable", err)
+                self.assertNotIn("un-carries", out)
+        self.assertEqual(len(eventledger.events(dispatches.ledger_path())),
+                         before)
+        self.assertEqual(self.status(held["id"]), "held")
+
+    def test_CHAIN_over_a_round_this_helm_cannot_read_refuses_and_writes_nothing(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the stderr naming the unreadable round and the vocabulary rung are the positive readings of the same CLI result; the unchanged event count and held status are the absence that refusal promises
+        """Found in the code, not the brief: every writer refuses a row whose
+        fold met an event kind this helm does not know, because its seq would
+        collide with the event it cannot see. `--chain` writes the rounds it
+        un-carries, so it asks the same rung for each of them, and refuses
+        the whole cancel before anything is written."""
+        _fix, _upper, lower, held = self.ladder()
+        path = dispatches.ledger_path()
+        self.assertTrue(eventledger.append(path, {
+            "v": 3, "event": "future-kind", "id": lower["id"],
+            "seq": dispatches.rows()[lower["id"]]["seq"] + 1,
+            "ts": dispatches.pk.now_ts()}))
+        before = len(eventledger.events(path))
+        rc, _out, err = self.cancel(held["id"], "--chain")
+        self.assertEqual(rc, 1)
+        self.assertIn("this helm does not know", err)
+        self.assertIn(lower["id"][:12], err)
+        self.assertEqual(len(eventledger.events(path)), before)
+        self.assertEqual(self.status(held["id"]), "held")
+
+    def test_every_usage_surface_spells_CHAIN(self):
+        from helm import cli_help
+        spelled = "cancel <id-or-unique-prefix> [--chain] [--dry-run] <reason...>"
+        self.assertIn(spelled, dispatches.USAGE)
+        self.assertIn(spelled, cli_help._VERB_HELP["dispatch"])
+        rc, _out, err = run(dispatches.cmd_dispatch, ["cancel"])
+        self.assertEqual(rc, 2)
+        self.assertIn("[--chain]", err)
+        self.assertIn("[--dry-run]", err)
+        doc = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "docs", "VERBS.md")
+        with open(doc, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn(spelled, text)
+        self.assertIn("`--chain`", text)
+
+    def _ledger(self):
+        with open(dispatches.ledger_path(), "rb") as f:
+            return f.read()
+
+    def test_trailing_dry_run_writes_nothing_and_names_the_would_be_cancel(self):
+        """`cancel <id> <reason> --dry-run` is a flag, not more reason text.
+        The row stays open and the ledger is byte-identical (task/2315)."""
+        row = self.root(lane="dry-trailing")
+        before = self._ledger()
+        rc, out, err = run(dispatches.cmd_dispatch,
+                           ["cancel", row["id"]] + self.REASON + ["--dry-run"])
+        self.assertEqual((rc, err), (0, ""))
+        # THE BANNER COMES FIRST and every status says WOULD: a reader or a
+        # script taking the first status line must never read a cancel that
+        # did not happen.
+        self.assertTrue(out.splitlines()[0].startswith(
+            "helm dispatch: DRY RUN — nothing written"), out)
+        self.assertIn("%s — WOULD CANCEL (%s)" % (row["id"],
+                                                 " ".join(self.REASON)), out)
+        self.assertNotIn("— CANCELLED", out)
+        self.assertIn("this cancel would un-carry", out)
+        self.assertNotIn("this cancel un-carries", out)
+        self.assertEqual(self._ledger(), before)
+        self.assertEqual(self.status(row["id"]), "open")
+
+    def test_escape_still_cancels_and_keeps_dry_run_in_the_reason(self):
+        """After `--`, `--dry-run` is reason text and the cancel is real."""
+        row = self.root(lane="dry-escape")
+        rc, out, err = run(dispatches.cmd_dispatch,
+                           ["cancel", row["id"], "--", "some", "reason",
+                            "--dry-run"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertNotIn("nothing written", out)
+        self.assertNotIn("WOULD", out)
+        self.assertIn("%s — CANCELLED (some reason --dry-run)" % row["id"], out)
+        self.assertIn("this cancel un-carries", out)
+        self.assertEqual(self.status(row["id"]), "cancelled")
+        self.assertEqual(dispatches.rows()[row["id"]]["cancel_reason"],
+                         "some reason --dry-run")
+
+    def test_dry_run_with_chain_names_the_rounds_and_writes_nothing(self):
+        fix, upper, lower, held = self.ladder()
+        before = self._ledger()
+        rc, out, err = run(dispatches.cmd_dispatch,
+                           ["cancel", held["id"], "--dry-run", "--chain"]
+                           + self.REASON)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertTrue(out.splitlines()[0].startswith(
+            "helm dispatch: DRY RUN — nothing written"), out)
+        for r in (upper, lower, held):
+            self.assertIn("%s — WOULD CANCEL" % r["id"], out)
+        self.assertNotIn("— CANCELLED", out)
+        self.assertIn("would be cancelled by --chain", out)
+        self.assertIn("would un-carry 2 open rounds", out)
+        self.assertEqual(self._ledger(), before)
+        self.assertEqual([self.status(r["id"]) for r in
+                          (fix, upper, lower, held)],
+                         ["verdict", "open", "open", "held"])
+
+    def test_dry_run_on_an_already_cancelled_row_says_so(self):
+        """An idempotent re-cancel has nothing left to cancel for its row, so
+        its dry run must not report WOULD CANCEL for it."""
+        row = self.root(lane="dry-again")
+        rc, _out, err = run(dispatches.cmd_dispatch,
+                            ["cancel", row["id"]] + self.REASON)
+        self.assertEqual((rc, err), (0, ""))
+        before = self._ledger()
+        rc, out, err = run(dispatches.cmd_dispatch,
+                           ["cancel", row["id"]] + self.REASON + ["--dry-run"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("%s — ALREADY CANCELLED" % row["id"], out)
+        self.assertNotIn("%s — WOULD CANCEL" % row["id"], out)
+        self.assertEqual(self._ledger(), before)
+
+    def test_dry_run_advice_never_claims_the_dry_run_acts(self):
+        """The un-carried advice under a dry run names the real re-run
+        (--chain, without --dry-run), never 'does that now'."""
+        fix, upper, lower, held = self.ladder()
+        rc, out, err = run(dispatches.cmd_dispatch,
+                           ["cancel", held["id"], "--dry-run"] + self.REASON)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("would un-carry 1 open round", out)
+        self.assertNotIn("does that now", out)
+        self.assertIn("without --dry-run", out.split("would un-carry", 1)[1])
+        # A FIX the dry run would expose is billed only by a real cancel.
+        fix2 = self.fix_round("dry-fix")
+        hold2 = self.under(fix2, "dry-fix-hold", hold=True)
+        rc, out, err = run(dispatches.cmd_dispatch,
+                           ["cancel", hold2["id"], "--dry-run"] + self.REASON)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("would un-carry 0 open rounds and 1 FIX verdict", out)
+        self.assertIn("`helm owed` would bill each FIX again", out)
+        self.assertNotIn("bills each FIX again", out)
+        self.assertNotIn(fix2["id"], self.billed_fixes())
+
+    def test_dry_run_refuses_a_polarity_with_the_same_message(self):
+        row = self.fix_round("dry-polar")
+        args = ["cancel", row["id"]] + self.REASON
+        rc, out, err = run(dispatches.cmd_dispatch, args)
+        before = self._ledger()
+        rc2, out2, err2 = run(dispatches.cmd_dispatch, args + ["--dry-run"])
+        self.assertEqual((rc, out, err), (rc2, out2, err2))
+        self.assertEqual(rc2, 1)
+        self.assertIn("already has a verdict", err2)
+        self.assertEqual(self._ledger(), before)
+        self.assertEqual(self.status(row["id"]), "verdict")

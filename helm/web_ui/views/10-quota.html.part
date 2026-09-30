@@ -1,6 +1,19 @@
 <div class="view" id="view-quota">
   <div id="attn"></div>
   <div id="attndetail"></div>
+  <!-- FAMILIES (task/3445): everything measured once for the whole fleet,
+       drawn once, heading this page. One chip per model family in its burn
+       colour; the chosen family's sheet — what lasts, the shares across
+       projects (each opens that project's Team tab), the lane capacity, the
+       reset credits and the declare control — and the vendor whose accounts
+       bill it, the account group below that names this family. A project's
+       Team-tab budget row opens its family here (#quota?family=<name>). -->
+  <section id="flagcard">
+    <div class="qonetop"><b>families</b>
+      <span class="gmeta">how much each model family may run right now — read, not probed</span></div>
+    <div id="flagoverall"></div>
+    <div id="flagrows"></div>
+  </section>
   <div id="chartcard">
     <div class="chead"><b>quota</b>
       <span id="qtabs"><span class="qtab on" data-w="7d">weekly</span><span class="qtab" data-w="5h">session</span></span>
@@ -14,9 +27,13 @@
     <div class="qonetop"><b>what may run right now</b>
       <span id="qoneage" class="gmeta"></span>
       <button class="chip" id="qoneMeasure" title="re-read every account from its provider now">measure now</button>
+      <a class="mlink" href="#models" title="how each model we run does on our own lanes: Fleet › models">how each model does →</a>
     </div>
+    <!-- THE ONE ACCOUNT COUNT (task/3635): these rows, with their scope; the
+         nav and Home print the same number, and the groups below add up to it -->
+    <div id="qonecount" class="qonecount"></div>
     <div class="qonescroll"><table class="qone"><thead><tr id="qonehead"></tr></thead><tbody id="qonebody"></tbody></table></div>
-    <div class="qonehint">click a family to fold it · click a row to select it for resumes · click a state to copy its fix</div>
+    <div class="qonehint">click a family to fold it · click a row to select it for resumes · hover a state for what it means and who fixes it</div>
   </div>
   <details class="grp" id="acctdeclared" open>
     <summary>accounts we pay for<span class="gmeta">declared by YOU — what each is for, what it is not for; agents read this instead of asking</span></summary>
@@ -51,7 +68,7 @@
     <div class="rows" id="burnrows"></div>
   </details>
   <details class="grp" id="homescard">
-    <summary>credential homes<span class="gmeta">one home = one login — helm prepares, YOU run every login</span></summary>
+    <summary>credential homes<span class="gmeta">one home = one login — helm prepares the home, and you approve every login in the browser</span></summary>
     <div id="homeform">
       <input id="hEmail" placeholder="new home: account email (ann@example.com → home ann-example-com)" autocomplete="off">
       <select id="hProv"><option value="claude">claude</option><option value="codex">codex</option></select>

@@ -428,6 +428,9 @@ def _claude_report(home, cwd):
     # ---- memory chain
     memory = {
         "homeClaudeMd": os.path.isfile(os.path.join(home, "CLAUDE.md")),
+        # the home's own rules dir is User memory too — where a seat's link
+        # to the host's global instructions lives (skillsync.link_instructions)
+        "homeRules": len(_list_names(os.path.join(home, "rules"), ".md")),
     }
     if cwd:
         chain = [os.path.join(d, "CLAUDE.md") for d in _ancestors(cwd)

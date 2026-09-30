@@ -11,11 +11,14 @@ Public callers reach these names through the ``seats`` facade. Internal callers
 import this owner directly rather than making ``seats_roster`` grow past the
 project's 1000-line module budget.
 """
+import contextlib
+import functools
 import json
 import os
 import re
+import threading
 
-from . import pk
+from . import landorder, pk
 from .seats_common import _flocked, roster_for_write, roster_path
 
 
@@ -240,6 +243,118 @@ def _runtime_metadata(runtime=None):
         else:
             rejected = True
     return out, rejected
+def _land_order(runtime=None):
+    """THE LAND ORDER for a roster write (task/3265 races R2). The runtime
+    testimony a row carries names the family and model the approval tier and
+    `reviewer_eligibility` read to admit a door car's holder, and `helm train
+    auto` asks that admission in its last word before the push. So a write
+    that carries testimony, or clears it, takes the readiness lock
+    (`landorder.locked`) before the roster's own: it is seen by that last
+    read or ordered after the push. A write with none takes no lock here: a
+    join of it that rebinds or evicts a session of a row carrying testimony
+    runs in the order through `_order_join` (door read B4), and a presence
+    beat or a join touching no testimony never waits on a push."""
+    metadata, rejected = _runtime_metadata(runtime)
+    return landorder.locked() if metadata or rejected \
+        else contextlib.nullcontext()
+
+
+#: THE ROW FIELDS AN ADMISSION READS (`runtime_for_session`, through
+#: `dispatches._approval_identity_family_evidence`). A row with neither
+#: admits nobody, so deleting it, or moving a session id out of it, changes
+#: no land's admission.
+_TESTIMONY_FIELDS = ("runtime", "runtime_sessions")
+
+
+def _carries_testimony(*rows):
+    """Whether any of `rows` carries the runtime testimony a door car's
+    admission reads (task/3265 r4)."""
+    return any(isinstance(row, dict) and any(row.get(k)
+                                             for k in _TESTIMONY_FIELDS)
+               for row in rows)
+
+
+class _Unordered(Exception):
+    """A roster verb found, under the roster's own lock and before it changed
+    anything, testimony it would delete or move outside the land order."""
+
+
+_ORDERED = threading.local()
+
+
+def _order_testimony(*rows):
+    """Raise `_Unordered` when `rows` carry testimony and this verb is not
+    running in the land order (`_in_land_order`)."""
+    if not getattr(_ORDERED, "on", False) and _carries_testimony(*rows):
+        raise _Unordered()
+
+
+def _order_join(rows, seat, session, identity, runtime, cap):
+    """Raise `_Unordered` when a `write_roster` join of `session` into
+    `seat`'s row would change testimony outside the land order (task/3265
+    door read B4). Asked of the locked snapshot `rows` after the row's key is
+    resolved and before the join changes anything; each clause names the
+    write in `write_roster` it foresees. A join carrying runtime is in the
+    order already (`_land_order`). A presence beat of the row's own current
+    session, or a join that touches no row carrying testimony, raises
+    nothing and takes no lock. `cap` is the roster's SESSIONS_KEPT."""
+    metadata, rejected = _runtime_metadata(runtime)
+    if getattr(_ORDERED, "on", False) or not session or metadata or rejected:
+        return
+    sid = str(session)
+    if any(k != seat and isinstance(v, dict) and v.get("session") == sid
+           for k, v in rows.items()):
+        return                  # the bind is refused: another row's current
+    for name, row in rows.items():
+        if not _carries_testimony(row):
+            continue
+        had = [s for s in row.get("sessions") or [] if s != sid]
+        if name != seat:
+            if len(had) != len(row.get("sessions") or []):
+                raise _Unordered()      # `_evict_session` prunes it
+            continue
+        entries = row.get("runtime_sessions")
+        if entries is not None and not isinstance(entries, dict):
+            raise _Unordered()          # rewritten as a dict, then pruned
+        entries = dict(entries or {})
+        if identity and row.get("session") != sid \
+                or len(had) >= cap \
+                or identity and row.get("runtime_verified") is True \
+                and sid not in entries \
+                or _roster_proxywatch_entry(entries, sid)[1] \
+                or set(entries) - set(had) - {sid, row.get("session")}:
+            # the rebind; `_keep_sessions` evicting at the cap; the verified
+            # label carried to the new sid; an invalid measurement poisoned;
+            # `_prune_runtime_sessions` dropping an entry with no session
+            raise _Unordered()
+
+
+def _in_land_order(verb):
+    """THE LAND ORDER for a roster verb that deletes or moves testimony it
+    finds only under the roster's own lock (`disown_session`, task/3265 r4,
+    and a `write_roster` join that rebinds or evicts it, door read B4).
+    The verb runs once unordered; when it meets testimony it raises
+    `_Unordered` before it changes anything, its locks are let go, and it
+    runs again inside `landorder.locked()`, which the lock order takes before
+    the roster's. A verb that meets none runs once and never waits on a
+    push. A land order that cannot be taken is written through, as every
+    veto writer's is (helm/autoland.py, THE THREAT MODEL)."""
+    @functools.wraps(verb)
+    def run(*args, **kw):
+        try:
+            return verb(*args, **kw)
+        except _Unordered:
+            pass
+        was = getattr(_ORDERED, "on", False)
+        with landorder.locked():
+            _ORDERED.on = True
+            try:
+                return verb(*args, **kw)
+            finally:
+                _ORDERED.on = was
+    return run
+
+
 def _runtime_environment(env=None):
     """Translate one joining process's launch environment into runtime facts.
 
@@ -627,7 +742,7 @@ def bind_lifecycle_runtime(seat, session, runtime,
             or metadata.get("agent_harness") != "claude" \
             or not metadata.get("family"):
         return None, "lifecycle runtime stamp is malformed"
-    with _flocked(roster_path() + ".lock"):
+    with _land_order(metadata), _flocked(roster_path() + ".lock"):
         rows = roster_for_write()
         matches = [(name, row) for name, row in rows.items()
                    if str(name).casefold() == str(seat).casefold()
@@ -699,7 +814,7 @@ def stamp_proxy_runtime(session, runtime, proof):
         return None, "measured proxy runtime proof names another session"
     if measured != metadata:
         return None, "measured proxy runtime does not match its proof"
-    with _flocked(roster_path() + ".lock"):
+    with _land_order(metadata), _flocked(roster_path() + ".lock"):
         rows = roster_for_write()
         matches = [(name, row) for name, row in rows.items()
                    if isinstance(row, dict) and row.get("session") == sid]

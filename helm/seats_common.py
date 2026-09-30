@@ -38,9 +38,9 @@ import os
 import re
 import sys
 import time
-import unicodedata
 
 from . import actors, chat, home, pk
+from .seats_common_lock import LockUnavailable, _flocked  # noqa: F401
 
 MAX_BYTES = 200          # the delivery clip — meld's whisper frame budget
 PREVIEW_CHARS = 80       # roster panel preview
@@ -206,9 +206,8 @@ def _roster_read_checked():
 def _scrub(s):
     """Meld's reader-side defense, ported: strip anything that could reshape
     the single-line label the content rides in — C0/C1 controls, format
-    chars, line/paragraph separators. Tab survives."""
-    return "".join(ch for ch in s if ch == "\t"
-                   or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
+    chars, line/paragraph separators. Tab survives. (pk.launder)"""
+    return pk.launder(s)
 def _clip(s, cap=MAX_BYTES):
     """Byte-budget clip on a codepoint boundary (meld's re-clip law)."""
     enc = s.encode("utf-8")
@@ -218,47 +217,6 @@ def _clip(s, cap=MAX_BYTES):
     while end > 0 and (enc[end] & 0xC0) == 0x80:
         end -= 1
     return enc[:end].decode("utf-8", errors="ignore") + "…"
-class _flocked:
-    """flock a STABLE sibling lock file (never an atomic-replaced file).
-
-    Shared-state mutations retain the historical blocking/fail-open behavior.
-    Hot hook evidence passes `blocking=False`: contention is UNKNOWN and must
-    return immediately, never consume the PostToolUse/Stop timeout budget.
-    The CLAIMS lock never blocks here: `_claim_flocked` polls
-    `blocking=False` against CLAIM_LOCK_WAIT_S and its callers refuse."""
-
-    def __init__(self, path, blocking=True):
-        self.path, self.blocking, self.f = path, blocking, None
-
-    def __enter__(self):
-        try:
-            import fcntl
-            self.f = open(self.path, "a")
-            flags = fcntl.LOCK_EX | (0 if self.blocking else fcntl.LOCK_NB)
-            from . import hooklatency
-            hooklatency.flock(self.f.fileno(), flags, "lock-seats", fail_open=True)
-        except OSError:
-            if self.f is not None:
-                self.f.close()
-            self.f = None
-        except BaseException:
-            # A telemetry END may cancel after acquisition, before __enter__
-            # returns. No body owns cleanup yet; close before propagating.
-            if self.f is not None:
-                self.f.close()
-                self.f = None
-            raise
-        return self
-
-    def __exit__(self, *exc):
-        if self.f is not None:
-            try:
-                import fcntl
-                fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-            self.f.close()
-        return False
 def roster_path():
     return os.path.join(chat.chat_dir(), ".roster.json")
 def _seat_key(seat):
@@ -371,12 +329,6 @@ def retire_alias_claims(rows, name):
                          for h in hops[1:]]
         head.setdefault("at", event.get("at"))
         row[RENAME_ALIAS_FIELD] = head
-
-
-def rename_alias(row, now=None):
-    """(old_name, until_epoch) of the LATEST live hop, else (None, None)."""
-    hops = rename_aliases(row, now)
-    return hops[0] if hops else (None, None)
 
 
 def live_alias(name, rows=None, now=None):

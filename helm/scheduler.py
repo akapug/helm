@@ -87,7 +87,10 @@ def collapse_class(card, active=True):
     that predicate and stays listed. So does an OWNER-GATED row: its hold is
     a decision only the owner can make, the landing does not make it, and
     folding it would take an ask off the owner's own queue (`owner_holds`
-    counts listed rows only).
+    counts listed rows only). So does a HELD SOURCE-CLEAN row (task/3053):
+    the predicate itself exempts it, because its close is owed — the
+    integrator's, or its recipient's re-hold — and the row carries the one
+    sentence naming that move (`source_clean_on_main`).
 
     ONE LINE PER ROW, frontier first, because the frontier line names the verb
     that acts on the row. `active` False is the scheduler's own judgement: a
@@ -107,6 +110,24 @@ def collapse_class(card, active=True):
     if landreq.on_main_unverdicted(card) and card.get("owner_gated") is not True:
         return "on_main"
     return None
+
+
+def mark(card, nonbillable=frozenset()):
+    """THE ONE MARK a live land request is counted under (task/3631): contrary
+    outranks stalled, stalled outranks a nonbillable hold (`nonbillable`, the
+    ids `/api/lr` lists as `unmeasurable`), and the rest are moving. One mark
+    per row, so the marks partition the rows.
+
+    `stalled` is read as the card carries it: the board's card carries the
+    display alarm (`landreq.stall_alarm`), and the scheduler is handed the
+    ids that alarm holds for. The land board's tally (`web_board._kanban_
+    tally`) and this module's counts both call this, so the scheduler's
+    "stalled" and "contrary" are the board's: the scheduler counted a row
+    both stalled and contrary under both, and the enforcement stall set
+    rather than the alarm the board and `helm lr list` print."""
+    return "contrary" if card.get("contrary") else "stalled" \
+        if card.get("stalled") else "nonbillable" \
+        if card.get("id") in nonbillable else "moving"
 
 
 def collapsed_lines(members):
@@ -384,6 +405,10 @@ def project(cards, stalled_ids=(), unmeasurable=(), active_ids=None,
                # the on-main predicate's inputs, copied as the card has them
                "trunk_contains_tip": card.get("trunk_contains_tip"),
                "polarity": card.get("polarity"),
+               "source_clean_tip": card.get("source_clean_tip"),
+               # THE ONE SENTENCE for a source-clean hold on trunk (task/3053),
+               # copied as the card has it: the renderers print it verbatim
+               "source_clean_on_main": card.get("source_clean_on_main"),
                "detail": " ".join(str(card.get("hold_reason") or "").split())}
         rows.append(row)
 
@@ -417,11 +442,18 @@ def project(cards, stalled_ids=(), unmeasurable=(), active_ids=None,
     for row in listed:
         key = (row["holder_role"], row["holder_seat"])
         grouped.setdefault(key, []).append(row)
+    def _suc(members):
+        """{stalled, unmeasurable, contrary} over `members`, each counted
+        under its one mark (`mark`), so the counts are the board's."""
+        marks = [mark(row, reasons) for row in members]
+        return {"stalled": marks.count("stalled"),
+                "unmeasurable": marks.count("nonbillable"),
+                "contrary": marks.count("contrary")}
+
     def _group_order(key):
         members = grouped[key]
         active = [row for row in members if row["id"] in active_set]
-        suc_total = sum(row["stalled"] + row["unmeasurable"] + row["contrary"]
-                        for row in active)
+        suc_total = sum(_suc(active).values())
         known = [row["age_s"] for row in members if row["age_s"] is not None]
         oldest = max(known) if known else None
         label = "%s @%s" % key if key[1] else key[0]
@@ -445,9 +477,7 @@ def project(cards, stalled_ids=(), unmeasurable=(), active_ids=None,
         gid = "holder-%d" % index
         active_here = [row for row in full if row["id"] in active_set]
         known_ages = [row["age_s"] for row in full if row["age_s"] is not None]
-        group_suc = {"stalled": sum(row["stalled"] for row in active_here),
-                     "unmeasurable": sum(row["unmeasurable"] for row in active_here),
-                     "contrary": sum(row["contrary"] for row in active_here)}
+        group_suc = _suc(active_here)
         group_suc["total"] = sum(group_suc.values())
         groups.append({"id": gid, "holder_role": role, "holder_seat": seat,
                        "label": "%s @%s" % (role, seat) if seat else role,
@@ -471,9 +501,7 @@ def project(cards, stalled_ids=(), unmeasurable=(), active_ids=None,
     owner_holds = sorted(
         [row for row in live if row["holder_role"] == "owner"],
         key=lambda row: (row["age_s"] is None, -(row["age_s"] or 0), row["id"]))
-    suc = {"stalled": sum(row["id"] in stalled for row in live),
-           "unmeasurable": sum(row["id"] in reasons for row in live),
-           "contrary": sum(row["contrary"] for row in live)}
+    suc = _suc(live)
     suc["total"] = sum(suc.values())
     suc["zero"] = suc["total"] == 0
     return {"unavailable": None, "row_count": len(rows),

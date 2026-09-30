@@ -612,7 +612,8 @@ WantedBy=timers.target
 TIMER_NAME = "helm-keepalive.timer"
 
 
-def _timer_units(interval=DEFAULT_INTERVAL_S):
+def _timer_units(interval=DEFAULT_INTERVAL_S, inputs=None):
+    # `inputs` replaces per-install values (timerhealth.unit_values).
     # Same law as tasksmirror._timer_units, same reason: a persistent unit must
     # never capture a DISPOSABLE WORKTREE's path — the binary is the stable
     # install, the cwd is the lane folded back to the shared checkout.
@@ -620,11 +621,14 @@ def _timer_units(interval=DEFAULT_INTERVAL_S):
     helm_bin = os.path.join(HOME, ".local", "bin", "helm")
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cwd = work.find_root(here) or here
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    from . import timerhealth
+    udir = timerhealth.user_unit_dir()
     return (os.path.join(udir, "helm-keepalive.service"),
-            _UNIT_SERVICE % {"helm": helm_bin, "cwd": cwd},
+            _UNIT_SERVICE % timerhealth.unit_values(
+                {"helm": helm_bin, "cwd": cwd}, inputs),
             os.path.join(udir, TIMER_NAME),
-            _UNIT_TIMER % {"interval": interval})
+            _UNIT_TIMER % timerhealth.unit_values({"interval": interval},
+                                                  inputs))
 
 
 def hand_crontab():
@@ -663,7 +667,7 @@ def ensure_timer(interval=DEFAULT_INTERVAL_S):
     Idempotent: re-running is the refresh path (tasksmirror's shape), so a
     changed interval or a moved checkout is repaired by re-running rather than
     by an operator noticing."""
-    from . import pk
+    from . import timerhealth
     if interval < 1:
         return False, "interval must be at least 1 second"
     systemctl = shutil.which("systemctl")
@@ -671,34 +675,17 @@ def ensure_timer(interval=DEFAULT_INTERVAL_S):
         return False, ("systemctl unavailable; run `helm keepalive --apply` "
                        "from another scheduler")
     spath, service, tpath, timer = _timer_units(interval)
-
-    def current(path):
-        try:
-            with open(path) as fh:
-                return fh.read()
-        except OSError:
-            return None
-
     existed = os.path.exists(tpath)
-    unchanged = current(spath) == service and current(tpath) == timer
-    try:
-        os.makedirs(os.path.dirname(spath), exist_ok=True)
-        # IDEMPOTENT MEANS THE BYTES DO NOT MOVE. Re-writing identical content
-        # still bumps mtime, which is the one thing an operator (or systemd's
-        # own change detection) can look at to tell a verify from an install —
-        # so a pass that reports "unchanged" must leave the files alone to have
-        # said something true.
-        if not unchanged:
-            pk.atomic_write(spath, service)
-            pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    for cmd in ([systemctl, "--user", "daemon-reload"],
-                [systemctl, "--user", "enable", "--now", TIMER_NAME]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, "%s failed: %s" % (
-                " ".join(cmd), (r.stderr or r.stdout or "").strip()[:200])
+    # IDEMPOTENT MEANS THE BYTES DO NOT MOVE. Re-writing identical content
+    # still bumps mtime, which is the one thing an operator (or systemd's own
+    # change detection) can look at to tell a verify from an install — so a
+    # pass that reports "unchanged" must leave the files alone to have said
+    # something true. The reload and enable still run on every pass.
+    error, unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer)), (TIMER_NAME,), systemctl,
+        subprocess, keep_unchanged=True)
+    if error:
+        return False, error
     # WHAT IT FOUND, not only what it did: a second call on an unchanged tree
     # has to be legible as a no-op or an operator cannot tell a verified
     # install from a fresh one, and will keep re-typing it.

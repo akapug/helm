@@ -116,7 +116,8 @@ class RemeasureTest(unittest.TestCase):
             rc = rm.cmd(argv + ["--limit-turns", "5"])
         self.assertEqual(rc, 3)
         self.assertIn("PASS", out.getvalue())
-        rec = json.load(open(relevance.receipt_path()))
+        with open(relevance.receipt_path(), encoding="utf-8") as fh:
+            rec = json.load(fh)
         self.assertEqual((rec["pass"], rec["head"]), (False, "head-x"))
         self.assertFalse(relevance.choice_gate("head-x")[0])
         self.assertTrue(os.path.dirname(relevance.receipt_path()).startswith(home.global_dir()))

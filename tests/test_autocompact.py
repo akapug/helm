@@ -24,6 +24,13 @@ from helm import autocompact, harness, pk, seat, seat_catalog, seats
 # twelve tests red with it, not one of which was about the window's value.
 # Read from the real table, the percentages stay true through the next move.
 CODEX_WINDOW = seat.FAMILIES["codex"]["max_context"]
+# THE MODEL THOSE PLANTS SERVE IS THE FAMILY'S OWN, derived for the same
+# reason. The watchdog divides a reading by the window of the model that
+# served it (seat_catalog.launch_window), so a plant that means "N% of the
+# codex window" must be served by the model that window belongs to. It was
+# gpt-5.6-sol, whose own window is larger, and it read "N%" only while the
+# gauge ignored the model.
+CODEX_MODEL = seat.FAMILIES["codex"]["model"]
 
 SID = "11111111-1111-1111-1111-111111111111"
 _ENV = ("HELM_AUTOCOMPACT_THRESHOLD", "HELM_AUTOCOMPACT_ASSUME_WINDOW",
@@ -57,8 +64,13 @@ def setUpModule():
 
 
 def tearDownModule():
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT, as tests.test_landreq's does
+    # (task/3039): a stopped patcher left here is module data the sliced
+    # gate's leak audit reads as a rebinding, and fails the run.
+    _LIVE_SEATS_PATCH = None
 
 
 class TheLivenessStandInIsInEffectInAutocompactTest(unittest.TestCase):
@@ -158,7 +170,7 @@ class FakeOrcaAdapter(FakeAdapter):
         return {"handle": "new", "pty_id": "pty-1"}
 
 
-def usage_line(ctx, model="gpt-5.6-sol", sidechain=False):
+def usage_line(ctx, model=CODEX_MODEL, sidechain=False):
     d = {"type": "assistant",
          "message": {"role": "assistant", "model": model,
                      "usage": {"input_tokens": ctx - 7000,
@@ -230,7 +242,7 @@ class AutocompactBase(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(rec, f)
 
-    def plant(self, ctx, model="gpt-5.6-sol", sid=SID, age_s=0):
+    def plant(self, ctx, model=CODEX_MODEL, sid=SID, age_s=0):
         p = os.path.join(self.proj, sid + ".jsonl")
         with open(p, "w") as f:
             f.write('{"type":"user","message":{"role":"user"}}\n')
@@ -423,6 +435,43 @@ class AutocompactTest(AutocompactBase):
         self.assertEqual(row["window"], budget)
         self.assertEqual(row["window_src"], "FAMILIES.context_budget")
         self.assertAlmostEqual(row["pct"], 50.0)
+
+    def test_a_cursor_bridge_seat_reads_the_bridges_input_never_its_output(self):
+        """task/3374: helm's percent for the cursor seat is the input the
+        bridge reported over the family's taught window, and the output is
+        never read. The records are shaped as the seat's transcript holds
+        them (the bridge sends no cached count, so input and output only).
+        MEASURED on the seat: the bridge passed Cursor's own count, 911,810,
+        and helm read 474.9% of the 192,000 window it was taught then, the
+        reading the seat compacted on; the first response of a fresh
+        conversation said 16,310 in and 50,900 out. The window is 225,000
+        max_context since task/3616 (405.2% and 7.2% on those records), and
+        the 110,000 context_budget since task/3652 narrows what the seat is
+        taught to (828.9% and 14.8% on the same records). helm carries no
+        defect of its own here: it reads exactly the input, so the cure is the
+        bridge's (its usage-is-the-request patch)."""
+        fam = seat.FAMILIES["cursor"]
+        self.assertEqual(fam["max_context"], 225000)
+        self.assertEqual(fam["context_budget"], 110000)
+        proj = os.path.join(seat.seat_dir("cursor"), "claude", "projects", "-p")  # noqa: SEAT_NAME — the catalog FAMILY key whose window IS the subject of this arm (and "claude" is the config dir name)
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, SID + ".jsonl")
+
+        def reads(inp, out):
+            with open(path, "w") as f:
+                f.write(json.dumps({"type": "assistant", "message": {
+                    "role": "assistant", "model": "grok-4.7-high",
+                    "usage": {"input_tokens": inp, "output_tokens": out}}}) + "\n")
+            return autocompact.read("cursor")  # noqa: SEAT_NAME — the catalog FAMILY key whose window IS the subject of this arm
+
+        row = reads(911810, 299)
+        self.assertEqual(row["window"], 110000)
+        self.assertEqual(row["window_src"], "FAMILIES.context_budget")
+        self.assertEqual(row["ctx_tokens"], 911810)
+        self.assertEqual(row["pct"], 828.9)
+        row = reads(16310, 50900)
+        self.assertEqual(row["ctx_tokens"], 16310)
+        self.assertEqual(row["pct"], 14.8)
 
     # -- the trigger -------------------------------------------------------
 
@@ -2514,8 +2563,8 @@ class Ds4proWindowIsProbeBackedTest(unittest.TestCase):
 
     THE CONTROL THIS CLASS EXISTS TO KEEP is not "ds4pro is unpinned"; it is
     that `_window()` does not answer ONE NUMBER FOR EVERYBODY. That control now
-    runs off grok, the last unpinned family, plus a pinned family that
-    disagrees with it."""
+    runs off ds4flash, the last unpinned family (its route publishes no
+    window), plus pinned families that disagree with it."""
 
     def test_ds4pro_pins_the_window_its_endpoint_publishes(self):
         # UNCONDITIONAL POSITIVE CONTROL on the same observable, kept from the
@@ -2537,12 +2586,18 @@ class Ds4proWindowIsProbeBackedTest(unittest.TestCase):
     def test_window_does_not_answer_one_number_for_everybody(self):
         """THE CONTROL THAT SURVIVED THE RENAME. Three families must resolve
         three different ways or `_window()` has stopped resolving anything:
-        grok falls through _assume_window() to CC's 200k, ds4pro pins its
+        ds4flash falls through _assume_window() to CC's 200k, ds4pro pins its
         published 1M, and codex pins its own smaller ceiling-checked number."""
-        win, why = autocompact._window("grok")
+        win, why = autocompact._window("ds4flash")  # noqa: SEAT_NAME — the catalog FAMILY key whose window IS the subject of this arm
         self.assertEqual(win, autocompact.CC_ASSUMED_WINDOW)
         self.assertEqual(why, "cc-assumed-default")
-        # GROK CARRIES THE UNPINNED POSTURE ALONE NOW. This arm read
+        # GROK CHANGED SIDES: it pinned its xai route's published 256000
+        # (seat_catalog.PUBLISHED_ROUTE_WINDOWS) as a 204000 input ceiling,
+        # so it is no longer the unpinned control and must not read as one
+        self.assertNotEqual(autocompact._window("grok"), (win, why),
+                            "grok's pinned window vanished — if that was "
+                            "deliberate, it is an unpinned control again")
+        # DS4FLASH CARRIES THE UNPINNED POSTURE ALONE NOW. This arm read
         # `for fam in ("gemini", "grok")`, then ds4pro's own assertion, until
         # 2026-08-03 pinned gemini (owner-stated) and ds4pro (probed). Neither
         # was allowed to simply LEAVE — keeping them as same-answer controls
@@ -2921,6 +2976,25 @@ class RefusalLoopEscalatesTest(AutocompactBase):
         self.assertIn("112.", text)               # where the episode started
         self.assertIn("120.", text)               # where it is now
         self.assertIn("[watchdogs-correct-composition-holed]", text)
+
+    def test_the_posted_wedge_line_names_its_window_and_the_windows_source(self):
+        """task/3085: the WATCHDOG line names the seat, the percentages, the
+        window AND where that window came from, on the real post path. A
+        reader who sees "of its 220,000-token window" cannot tell a measured
+        window from an assumed one; the source is what says which."""
+        for pct in (1.12, 1.15):
+            self.refuse(pct)
+        self.plant(int(CODEX_WINDOW * 1.20))
+        with mock.patch("helm.chat.post") as post:
+            res = autocompact.check(seats=["codex"],
+                                    adapter=FakeAdapter(tail=self.RUNNING))
+        src = res["rows"][0]["window_src"]
+        self.assertEqual(src, "FAMILIES.model_context[%s]" % CODEX_MODEL)
+        bodies = [c.args[0] for c in post.call_args_list
+                  if "WATCHDOG:" in c.args[0]]
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("{:,}".format(CODEX_WINDOW), bodies[0])
+        self.assertIn("source: %s" % src, bodies[0])
 
     def test_failed_submission_escalation_names_its_actual_latest_reason(self):
         reason = "DISTINCTIVE SUBMISSION FAILURE"
@@ -3661,6 +3735,29 @@ class Codex3HundredPercentPaneTest(AutocompactBase):
                 self.assertEqual(seat._current_prompt_line(tail), "❯")
                 self.assertEqual(seat._classify_pane_tail(tail)[0], "IDLE")
 
+    def test_a_manual_mode_status_row_is_footer_chrome(self):  # noqa: VACUOUS_ASSERTION — the must-miss prose in the same body is controlled by the exact composer line the measured tail yields
+        """MEASURED on a throwaway pane (task/3209): a Claude Code 2.1.283
+        session NOT in bypass mode draws its permission-mode row with a pause
+        glyph, `⏸ manual mode on`, where a seat draws `⏵⏵ bypass permissions
+        on`. The composer reader knew only the second, so an empty composer
+        above the first read as NO composer and the turn verb refused to type
+        /exit into a perfectly idle pane. The row is chrome; prose that merely
+        uses the glyph is not."""
+        tail = "\n".join(("\u276f /exit", "\u2500" * 40, "\u276f",
+                          "\u2500" * 40,
+                          "  haiku-4-5-20251001 | ~/dev/example/repo",
+                          "  \u23f8 manual mode on \u00b7 1 shell \u00b7 "
+                          "\u2190 for agents"))
+        self.assertEqual(seat._current_prompt_line(tail), "\u276f")
+        for line in ("\u23f8 paused the build while tests ran",
+                     "\u25cf \u23f8 manual mode on",
+                     "the row said \u23f8 manual mode on"):
+            with self.subTest(line=line):
+                self.assertIsNone(seat._PANE_CHROME.match(line))
+                self.assertIsNone(
+                    seat._current_prompt_line("\u276f old submitted\n%s"
+                                              % line))
+
     def test_update_words_in_transcript_prose_are_not_footer_chrome(self):  # noqa: VACUOUS_ASSERTION — exact toast lines above positively control the must-miss prose
         for line in ("Update installed", "Restart to update",
                      "Update installed successfully; restart when convenient",
@@ -3922,6 +4019,41 @@ class ContextBudgetTest(unittest.TestCase):
         self.assertEqual(tw({}, 1000000), 1000000)
         self.assertIsNone(tw({"context_budget": 200000}, None))
 
+    def test_gemini_is_taught_a_budget_under_its_measured_stall(self):
+        """task/3085. The gemini seat stopped working at about 634k tokens: it
+        answered three beacon wakes with "Standing by." and did not take its
+        owed review row until the owner cleared it by hand (GEMINI_STALL
+        carries the date). It was taught a 1,000,000-token window, so the
+        stall read 63.4%, under every trigger, and the watchdog said nothing.
+
+        The budget is the window helm lets the seat hold. Two bounds pin it:
+        100% of it sits UNDER the measured stall, so the watchdog reads that
+        stall as an overage; and its compaction point (80%) sits at or above
+        the family's observed floor, so a seat is never compacted inside the
+        context it was first measured working at. max_context and the owner's
+        statement stay as they are: the model can hold more (two native
+        compactions at 784k succeeded), and the budget does not rewrite that."""
+        m = seat_catalog.GEMINI_STALL
+        fam = seat.FAMILIES["gemini"]
+        self.assertEqual((m["tokens"], m["wakes"], m["taught_window"],
+                          m["measured"]), (633689, 3, 1000000, "2026-09-25"))
+        self.assertEqual(m["native_compact_pre_tokens"], (784417, 784349))
+        self.assertIn("transcript", m["source"])
+        # WHY IT WAS SILENT: the stall was under the trigger of that window.
+        pct = int(seat_catalog.AUTOCOMPACT_PCT_OVERRIDE)
+        self.assertLess(m["tokens"], m["taught_window"] * pct / 100.0)
+        self.assertEqual(fam["max_context"], m["taught_window"])
+        budget = fam["context_budget"]
+        self.assertEqual(budget, 500000)
+        self.assertLess(budget, m["tokens"],
+                        "100% of the budget must sit under the measured stall")
+        self.assertGreaterEqual(budget * pct / 100.0,
+                                fam["observed_context_floor"],
+                                "the budget compacts inside measured health")
+        self.assertLess(budget, min(m["native_compact_pre_tokens"]))
+        self.assertEqual(autocompact._window("gemini"),
+                         (budget, "FAMILIES.context_budget"))
+
     def test_an_incoherent_budget_or_floor_is_refused(self):
         bad = seat_catalog._incoherent_context_budget
         kimi = dict(seat.FAMILIES["kimi"])
@@ -4123,3 +4255,1097 @@ class FreshSessionBetweenRowsTest(AutocompactBase):
         self.assertEqual(self.state(), {})
 
 
+
+
+class SilentOverageTest(AutocompactBase):
+    """task/3085: a proxy seat over its REAL window is visible and recovered,
+    and a live proxy seat the watchdog cannot measure says so.
+
+    THE INCIDENT, measured off a scratch copy of the seat's own transcript
+    (seat_catalog.GEMINI_STALL): the gemini seat held 633,689-634,585 tokens
+    and answered three beacon wakes with "Standing by." while a review row
+    was owed to it, until the owner cleared it by hand. The gauge found and
+    read that transcript correctly. It divided by the 1,000,000-token window
+    the family was taught, read 63.4%, stayed under the 80% trigger, and said
+    nothing. The silence was right against the window and wrong about the
+    seat.
+
+    Every arm runs one real pass (`check`, post on, chat captured) in a
+    scratch HELM_HOME, with the live census planted and a fake pane."""
+
+    PANE = "hg"
+
+    def seat_up(self, family, seat_name=None):
+        """Register `seat_name` (default: the family seat) on pane PANE and
+        return its transcript project dir. No transcript is planted."""
+        seat_name = seat_name or family
+        d = seat._instance_dir(family, seat_name)
+        proj = os.path.join(d, "claude", "projects", "-p")
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(d, "spawn.json"), "w") as f:
+            json.dump({"v": 1, "seat": seat_name, "harness": "fake",
+                       "handle": self.PANE, "session": SID,
+                       "worktree": self.tmp,
+                       "launch_sh": os.path.join(d, "launch.sh")}, f)
+        return proj
+
+    def plant_at(self, proj, ctx, model, sid=SID, age_s=0):
+        path = os.path.join(proj, sid + ".jsonl")
+        with open(path, "w") as f:
+            f.write(usage_line(ctx, model=model) + "\n")
+        if age_s:
+            t = time.time() - age_s
+            os.utime(path, (t, t))
+        return path
+
+    def run_pass(self, seats, live, tail="❯ ", grace=0):
+        """One real pass with chat captured. Returns (result, bodies, pane)."""
+        pane = FakeAdapter(panes=({"handle": self.PANE, "title": "t",
+                                   "status": "connected"},), tail=tail)
+        with mock.patch.object(autocompact, "_live_seat_names",
+                               return_value=live), \
+                mock.patch.object(autocompact, "UNKNOWN_GRACE_S", grace,
+                                  create=True), \
+                mock.patch("helm.chat.post") as post:
+            res = autocompact.check(seats=seats, adapter=pane)
+        return res, [c.args[0] for c in post.call_args_list], pane
+
+    NOWIN = {"port": 8399, "model": "nowin-m", "mode": "proxy-key"}
+
+    # -- the incident ------------------------------------------------------
+
+    def test_the_measured_stall_is_an_overage_that_speaks_and_compacts(self):
+        """RED on trunk: the stall read 63.4% of 1M and nothing was said.
+        GREEN: the family is taught its budget, the same reading is an
+        overage, the line names the seat, the %, the window and its source,
+        and /compact goes into the idle pane with no owner involved."""
+        stall = 634585                          # the third "Standing by."
+        proj = self.seat_up("gemini")
+        self.plant_at(proj, stall, "gemini-3.6-flash")
+        res, bodies, pane = self.run_pass(["gemini"], {"gemini"})
+        row = res["rows"][0]
+        self.assertGreaterEqual(
+            row["pct"], autocompact.threshold_pct(),
+            "the stall reads %.1f%% of a %s window from %s — under the "
+            "trigger, so the watchdog stays silent"
+            % (row["pct"], row["window"], row["window_src"]))
+        self.assertEqual(len(bodies), 1, bodies)
+        for fact in ("gemini", "%.1f%%" % row["pct"],
+                     "{:,}".format(row["window"]),
+                     "source: %s" % row["window_src"]):
+            self.assertIn(fact, bodies[0])
+        self.assertEqual(pane.sent, [(self.PANE, "/compact", True)],
+                         "the seat was not recovered without the owner")
+
+    def test_a_refused_compaction_still_names_the_window_and_its_source(self):
+        """The pane holds an open turn, so /compact is refused (correctly);
+        the refusal line must still carry the window and where it came from."""
+        proj = self.seat_up("gemini")
+        self.plant_at(proj, 634585, "gemini-3.6-flash")
+        res, bodies, pane = self.run_pass(
+            ["gemini"], {"gemini"}, tail="work\nesc to interrupt")
+        row = res["rows"][0]
+        self.assertEqual(row.get("actuation_state"), "RUNNING")
+        self.assertEqual(pane.sent, [])
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("REFUSED on gemini", bodies[0])
+        self.assertIn("{:,}".format(row["window"]), bodies[0])
+        self.assertIn("source: %s" % row["window_src"], bodies[0])
+
+    # -- a family with no pinned window --------------------------------------
+
+    def test_an_unpinned_family_is_gauged_against_a_named_window(self):
+        """No max_context: the window is Claude Code's own default for a
+        non-claude model (what the launch line leaves the seat taught), and
+        the line says that is where the number came from.
+
+        REPORT-ONLY (task/3534). An ASSUMED window is input helm has not
+        proven, and the owner's ruling on that task is that nothing
+        auto-fires on it: "really bad practice to make auto-firing things
+        that we dont fully understand the input data about". So the reading
+        is still shown against it and the seat is still named, and nothing is
+        typed into the pane."""
+        with mock.patch.dict(seat.FAMILIES, {"nowin": dict(self.NOWIN)}):
+            proj = self.seat_up("nowin")
+            self.plant_at(proj, 170000, "nowin-m")
+            res, bodies, pane = self.run_pass(["nowin"], {"nowin"})
+        row = res["rows"][0]
+        self.assertEqual((row["window"], row["window_src"]),
+                         (autocompact.CC_ASSUMED_WINDOW, "cc-assumed-default"))
+        self.assertAlmostEqual(row["pct"], 85.0)
+        self.assertEqual(row["status"], "window-unproven")
+        self.assertEqual(pane.sent, [], "a /compact fired on an assumed window")
+        self.assertIn("window unproven, no fire", autocompact._row_line(row))
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("window unproven", bodies[0])
+        self.assertIn("{:,}".format(autocompact.CC_ASSUMED_WINDOW), bodies[0])
+        self.assertIn("source: cc-assumed-default", bodies[0])
+
+    def test_an_explicit_assume_window_is_a_declaration_and_fires(self):
+        """task/3534: HELM_AUTOCOMPACT_ASSUME_WINDOW stays, as an explicit
+        opt-in only. Set, it is the operator's own declaration of the window
+        for this host, it names itself as the source, and the seat fires as a
+        catalog-declared one does."""
+        os.environ["HELM_AUTOCOMPACT_ASSUME_WINDOW"] = "200000"
+        with mock.patch.dict(seat.FAMILIES, {"nowin": dict(self.NOWIN)}):
+            proj = self.seat_up("nowin")
+            self.plant_at(proj, 170000, "nowin-m")
+            res, bodies, pane = self.run_pass(["nowin"], {"nowin"})
+        row = res["rows"][0]
+        self.assertEqual((row["window"], row["window_src"]),
+                         (200000, "HELM_AUTOCOMPACT_ASSUME_WINDOW"))
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(pane.sent, [(self.PANE, "/compact", True)])
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("source: HELM_AUTOCOMPACT_ASSUME_WINDOW", bodies[0])
+
+    def test_a_declared_window_fires_where_an_assumed_one_does_not(self):
+        """task/3534 CONTROL on one observable: the same reading, the same
+        pane, the same trigger. A family whose window the catalog declares
+        (gemini's context_budget) is compacted; the unpinned family is not."""
+        proj = self.seat_up("gemini")
+        win, src = autocompact._window("gemini")
+        self.assertEqual(src, "FAMILIES.context_budget")
+        self.plant_at(proj, int(win * 0.85), "gemini-3.8-flash-high")
+        res, _bodies, pane = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(res["rows"][0]["status"], "ok")
+        self.assertEqual(pane.sent, [(self.PANE, "/compact", True)])
+        with mock.patch.dict(seat.FAMILIES, {"nowin": dict(self.NOWIN)}):
+            proj = self.seat_up("nowin")
+            self.plant_at(proj, int(autocompact.CC_ASSUMED_WINDOW * 0.85),
+                          "nowin-m")
+            res, _bodies, pane = self.run_pass(["nowin"], {"nowin"})
+        self.assertEqual(res["rows"][0]["status"], "window-unproven")
+        self.assertEqual(pane.sent, [])
+
+    def test_a_live_seat_with_no_window_says_UNKNOWN_window(self):
+        """With the assumed window switched off there is no window at all. A
+        live seat in that state is announced, never dropped."""
+        os.environ["HELM_AUTOCOMPACT_ASSUME_WINDOW"] = "0"
+        with mock.patch.dict(seat.FAMILIES, {"nowin": dict(self.NOWIN)}):
+            proj = self.seat_up("nowin")
+            self.plant_at(proj, 170000, "nowin-m")
+            res, bodies, pane = self.run_pass(["nowin"], {"nowin"})
+        self.assertEqual(res["rows"][0]["status"], "window-unset")
+        self.assertEqual(pane.sent, [])
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("UNKNOWN window for seat nowin", bodies[0])
+        self.assertIn("assume-window off", bodies[0])
+
+    # -- a transcript the gauge cannot find ----------------------------------
+
+    def test_a_live_seat_with_no_transcript_says_UNKNOWN_and_why(self):
+        proj = self.seat_up("gemini")
+        res, bodies, _ = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(res["rows"][0]["status"], "no-context-data")
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("UNKNOWN context for seat gemini", bodies[0])
+        self.assertIn("no session transcript under", bodies[0])
+        self.assertIn(os.path.dirname(proj), bodies[0])
+
+    def test_a_seat_with_no_transcript_and_no_process_says_nothing(self):
+        """CONTROL for the arm above: the same unmeasurable seat with no live
+        process is a seat nobody launched, and it is not announced."""
+        self.seat_up("gemini")
+        res, bodies, _ = self.run_pass(["gemini"], set())
+        self.assertEqual(res["rows"][0]["status"], "no-context-data")
+        self.assertEqual(bodies, [])
+        # the SAME pass, with the census saying it is live, does speak
+        res, bodies, _ = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(len(bodies), 1, bodies)
+
+    def test_a_transcript_with_no_usage_says_UNKNOWN_and_names_it(self):
+        proj = self.seat_up("gemini")
+        path = os.path.join(proj, SID + ".jsonl")
+        with open(path, "w") as f:
+            f.write('{"type":"user","message":{"role":"user"}}\n')
+        res, bodies, _ = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn(SID + ".jsonl", bodies[0])
+        self.assertIn("no non-zero usage record", bodies[0])
+
+    def test_a_registered_session_whose_transcript_is_elsewhere_says_UNKNOWN(self):
+        """The newest transcript the gauge finds is old and belongs to ANOTHER
+        session than the one the seat registered: the live transcript is not
+        where the gauge reads."""
+        other = "22222222-2222-2222-2222-222222222222"
+        proj = self.seat_up("gemini")
+        self.plant_at(proj, 100000, "gemini-3.6-flash", sid=other,
+                      age_s=autocompact.FRESH_S + 600)
+        res, bodies, _ = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(res["rows"][0]["status"], "stale")
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("UNKNOWN context for seat gemini", bodies[0])
+        self.assertIn(SID, bodies[0])
+        self.assertIn(other, bodies[0])
+
+    def test_an_idle_seat_on_its_own_old_transcript_says_nothing(self):
+        """CONTROL for the arm above: the old transcript IS the registered
+        session, so the seat has simply taken no turn. Its context is that
+        reading, and it is under the trigger."""
+        proj = self.seat_up("gemini")
+        self.plant_at(proj, 100000, "gemini-3.6-flash",
+                      age_s=autocompact.FRESH_S + 600)
+        res, bodies, _ = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(res["rows"][0]["status"], "stale")
+        self.assertEqual(bodies, [])
+        # the same fixture with another session registered does speak
+        other = "22222222-2222-2222-2222-222222222222"
+        self.plant_at(proj, 100000, "gemini-3.6-flash", sid=other,
+                      age_s=autocompact.FRESH_S + 600)
+        os.remove(os.path.join(proj, SID + ".jsonl"))
+        res, bodies, _ = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(len(bodies), 1, bodies)
+
+    def test_UNKNOWN_waits_out_a_starting_session_and_speaks_once(self):
+        """A fresh session has no usage record until its first answer, so the
+        line waits UNKNOWN_GRACE_S; once said, it is not repeated every pass;
+        a measured pass re-arms it."""
+        proj = self.seat_up("gemini")
+        young, bodies, _ = self.run_pass(["gemini"], {"gemini"}, grace=3600)
+        self.assertTrue(young["rows"][0].get("unmeasured"))
+        said = [len(bodies)]                          # still starting: quiet
+        said.append(len(self.run_pass(["gemini"], {"gemini"})[1]))   # speaks
+        said.append(len(self.run_pass(["gemini"], {"gemini"})[1]))   # once
+        path = self.plant_at(proj, 100000, "gemini-3.6-flash")
+        said.append(len(self.run_pass(["gemini"], {"gemini"})[1]))   # measured
+        os.remove(path)
+        said.append(len(self.run_pass(["gemini"], {"gemini"})[1]))   # re-armed
+        self.assertEqual(said, [0, 1, 0, 0, 1])
+
+    def test_a_dry_run_marks_UNKNOWN_and_neither_posts_nor_latches(self):
+        self.seat_up("gemini")
+        with mock.patch.object(autocompact, "_live_seat_names",
+                               return_value={"gemini"}), \
+                mock.patch.object(autocompact, "UNKNOWN_GRACE_S", 0,
+                                  create=True), \
+                mock.patch("helm.chat.post") as post:
+            res = autocompact.check(seats=["gemini"], fire=False, post=False,
+                                    adapter=FakeAdapter())
+        self.assertTrue(res["rows"][0].get("unmeasured"))
+        self.assertIn("no session transcript under",
+                      autocompact._row_line(res["rows"][0]))
+        post.assert_not_called()  # noqa: VACUOUS_ASSERTION — the real pass below, on this same fixture, posts exactly one line; a dry run that had posted would have latched it silent
+        self.assertNotIn("_unknown", pk.read_json(autocompact._state_path(),  # noqa: VACUOUS_ASSERTION — the same real pass below writes the latch this dry run must not
+                                                  {}) or {})
+        # and the real pass after it still speaks: the dry run consumed nothing
+        _, bodies, _ = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(len(bodies), 1, bodies)
+
+    # -- controls --------------------------------------------------------------
+
+    def test_a_claude_model_seat_is_unchanged(self):
+        """With the claude gate closed a claude-model seat is left to Claude
+        Code's own compaction, at any percentage: no fire, no line, and it is
+        not UNKNOWN either — it was measured."""
+        os.environ["HELM_AUTOCOMPACT_CLAUDE"] = "0"
+        proj = self.seat_up("gemini")
+        win = autocompact._window("gemini")[0]
+        self.plant_at(proj, int(win * 0.95), "claude-opus-4-6")
+        res, bodies, pane = self.run_pass(["gemini"], {"gemini"})
+        row = res["rows"][0]
+        self.assertEqual(row["status"], "claude-model")
+        self.assertFalse(row.get("unmeasured"))
+        self.assertEqual((bodies, pane.sent), ([], []))
+        # POSITIVE CONTROL on the same observables: the gate open, the same
+        # seat fires and speaks.
+        os.environ["HELM_AUTOCOMPACT_CLAUDE"] = "1"
+        res, bodies, pane = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(pane.sent, [(self.PANE, "/compact", True)])
+        self.assertEqual(len(bodies), 1, bodies)
+
+    def test_a_measured_seat_under_the_trigger_says_nothing(self):
+        proj = self.seat_up("gemini")
+        win = autocompact._window("gemini")[0]
+        self.plant_at(proj, int(win * 0.50), "gemini-3.6-flash")
+        res, bodies, pane = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(res["rows"][0]["status"], "ok")
+        self.assertFalse(res["rows"][0].get("unmeasured"))
+        self.assertEqual((bodies, pane.sent), ([], []))
+        # POSITIVE CONTROL on the same observables: over the trigger it speaks
+        self.plant_at(proj, int(win * 0.90), "gemini-3.6-flash")
+        res, bodies, pane = self.run_pass(["gemini"], {"gemini"})
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertEqual(pane.sent, [(self.PANE, "/compact", True)])
+
+
+    def test_a_stale_row_of_an_assumed_window_is_not_a_percentage(self):
+        """task/3534, non-author read: an idle seat of an unpinned family goes
+        STALE after HELM_AUTOCOMPACT_FRESH_S (6h), and read() tests staleness
+        before window-unproven, so the row says `stale` while its percentage
+        is of the ASSUMED window. The consumers must key on where the window
+        came from, not on the status word: context UNKNOWN, never 85.0."""
+        from helm import proxywatch, reviewer_eligibility
+        with mock.patch.dict(seat.FAMILIES, {"nowin": dict(self.NOWIN)}):
+            proj = self.seat_up("nowin")
+            self.plant_at(proj, 170000, "nowin-m", age_s=7 * 3600)
+            row = autocompact.read("nowin")
+            self.assertEqual(row["window_src"], autocompact.ASSUMED_WINDOW_SRC)
+            self.assertEqual(row["status"], "stale")
+            self.assertIsNotNone(row["pct"])        # the percentage is there
+            answers = (proxywatch._ctx_pct("nowin"),
+                       reviewer_eligibility.read_context("nowin"))
+        self.assertEqual(answers, (proxywatch.CTX_WINDOW_UNPROVEN,
+                                   reviewer_eligibility.CONTEXT_WINDOW_UNPROVEN),
+                         "an assumed window answered as a percentage")
+
+class ClearedSeatGaugeTest(AutocompactBase):
+    """task/3208's sibling in the gauge: `read()` names the seat's context from
+    the NEWEST transcript, and right after a /clear on a claude that writes the
+    new session's transcript lazily (MEASURED on a fleet host, row b07de796),
+    the newest is the PRE-clear session's. Its usage then reads as this seat's
+    context against a register SessionStart already moved to the new session:
+    `session-mismatch`, which is actionable, so a /compact goes into the pane
+    that was just cleared. The seat's live process names its current session
+    in its own presence record, and the gauge reads THAT session's transcript.
+    """
+
+    NEW = "22222222-2222-4222-8222-222222222222"
+    PID = 7300002
+
+    def setUp(self):
+        super().setUp()
+        # SessionStart's /clear rebind already moved the register to NEW.
+        path = os.path.join(self.d, "spawn.json")
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+        rec["session"] = self.NEW
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+        self.old_ctx = int(CODEX_WINDOW * 0.85)
+        self.plant(self.old_ctx, sid=SID)            # the OLD session, fresh
+
+    def _live(self):
+        root = os.path.join(self.d, "claude", "sessions")
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "%d.json" % self.PID), "w") as f:
+            json.dump({"pid": self.PID, "sessionId": self.NEW,
+                       "procStart": "4242", "kind": "interactive",
+                       "entrypoint": "cli", "status": "idle"}, f)
+        from helm import sessions
+        real = sessions._pid_is_claude
+        return mock.patch.object(
+            sessions, "_pid_is_claude",
+            side_effect=lambda pid, start=None:
+                int(pid) == self.PID or real(pid, start))
+
+    def test_a_cleared_seat_never_reads_the_OLD_sessions_context(self):
+        with self._live():
+            row = autocompact.read("codex")
+        self.assertNotEqual(row["session"], SID,
+                            "the gauge read the pre-/clear session as this "
+                            "seat's context")
+        self.assertIsNone(row["ctx_tokens"])
+        self.assertEqual(row["status"], "no-context-data")
+        self.assertIn(self.NEW, row["unmeasured_why"])
+
+    def test_with_no_live_process_the_newest_transcript_still_decides(self):
+        """THE CONTROL: the same seat with no live process holding a record
+        keeps today's reading — the newest transcript's session and usage."""
+        row = autocompact.read("codex")
+        self.assertEqual(row["session"], SID)
+        self.assertEqual(row["ctx_tokens"], self.old_ctx)
+        self.assertEqual(row["status"], "session-mismatch")
+
+    def test_a_proxy_row_of_the_OLD_session_never_reads_as_the_cleared_seat(self):
+        """The same cleared seat, read through the proxy.log fallback: the
+        proxy's last usage row is the PRE-clear session's 85%, and the live
+        session has no transcript. That row is that session's usage, never
+        this seat's context now — read as this seat's it is a
+        `session-mismatch` against NEW, which is actionable, and the /compact
+        this class exists to prevent. Nothing else pins the session filter on
+        the proxy rung."""
+        with open(os.path.join(seat.seat_dir("codex"), "proxy.log"), "w") as f:
+            f.write('{"session_id":"%s","usage":{"input_tokens":%d}}\n'
+                    % (SID, self.old_ctx))
+        with self._live():
+            row = autocompact.read("codex")
+        self.assertIsNone(row["ctx_tokens"], row)
+        self.assertEqual(row["status"], "no-context-data")
+        self.assertIn(self.NEW, row["unmeasured_why"])
+
+
+class LiveSessionCopiesGaugeTest(AutocompactBase):
+    """A live session whose transcript exists as TWO files carrying one id,
+    under two project slugs — the shape `cv port <sid> --to-dir X` leaves
+    (it re-emits the session under the new cwd's slug with `new_id: None`,
+    and the original is untouched), and the seat then resumes and writes on
+    in the new slug. The gauge read the NEWEST transcript before task/3208,
+    which is the live copy. `_seat_session_path_by_id` refuses two distinct
+    files for one id, so the live-session gauge must still read one of them
+    rather than calling the seat's context unmeasurable."""
+
+    PID = 7300003
+
+    def test_the_live_sessions_newest_copy_is_its_context(self):
+        stale = self.plant(int(CODEX_WINDOW * 0.40), sid=SID, age_s=3 * 3600)
+        live_proj = os.path.join(self.d, "claude", "projects", "-tmp-ported")
+        os.makedirs(live_proj, exist_ok=True)
+        live = os.path.join(live_proj, SID + ".jsonl")
+        with open(live, "w") as f:
+            f.write('{"type":"user","message":{"role":"user"}}\n')
+            f.write(usage_line(int(CODEX_WINDOW * 0.91)) + "\n")
+        self.assertNotEqual(os.path.realpath(stale), os.path.realpath(live))
+        root = os.path.join(self.d, "claude", "sessions")
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "%d.json" % self.PID), "w") as f:
+            json.dump({"pid": self.PID, "sessionId": SID, "procStart": "4242",
+                       "kind": "interactive", "entrypoint": "cli",
+                       "status": "idle"}, f)
+        from helm import sessions
+        real = sessions._pid_is_claude
+        with mock.patch.object(sessions, "_pid_is_claude",
+                               side_effect=lambda pid, start=None:
+                               int(pid) == self.PID or real(pid, start)):
+            row = autocompact.read("codex")
+        self.assertEqual(row["ctx_tokens"], int(CODEX_WINDOW * 0.91), row)
+        self.assertEqual(row["session"], SID)
+        self.assertEqual(row["status"], "ok")
+
+
+class UnregisteredSeatHelperGaugeTest(AutocompactBase):
+    """The gauge's side of a review's F1 (row 7744dc85daa8): a register that
+    holds no session let EVERY live presence record speak for the seat, so an
+    orphaned `claude -p` helper's session was read as the seat's context.
+    Only the seat's interactive claude (entrypoint "cli") speaks there."""
+
+    HELPER = "33333333-3333-4333-8333-333333333333"
+    PID = 7300004
+
+    def _live_record(self, entrypoint):
+        root = os.path.join(self.d, "claude", "sessions")
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "%d.json" % self.PID), "w") as f:
+            json.dump({"pid": self.PID, "sessionId": self.HELPER,
+                       "procStart": "4242", "kind": "interactive",
+                       "entrypoint": entrypoint, "status": "busy"}, f)
+        from helm import sessions
+        real = sessions._pid_is_claude
+        return mock.patch.object(
+            sessions, "_pid_is_claude",
+            side_effect=lambda pid, start=None:
+                int(pid) == self.PID or real(pid, start))
+
+    def setUp(self):
+        super().setUp()
+        self.unbind_session()
+        self.helper_ctx = int(CODEX_WINDOW * 0.30)
+        self.seat_ctx = int(CODEX_WINDOW * 0.60)
+        self.plant(self.helper_ctx, sid=self.HELPER, age_s=60)
+        self.plant(self.seat_ctx, sid=SID)           # newest
+
+    def test_a_helpers_session_is_never_the_unregistered_seats_context(self):
+        with self._live_record("sdk-cli"):
+            row = autocompact.read("codex")
+        self.assertEqual((row["session"], row["ctx_tokens"]),
+                         (SID, self.seat_ctx), row)
+
+    def test_the_seats_interactive_claude_names_its_context(self):
+        """THE CONTROL: the same record written by an interactive claude is
+        the seat's own, and the gauge reads its session."""
+        with self._live_record("cli"):
+            row = autocompact.read("codex")
+        self.assertEqual((row["session"], row["ctx_tokens"]),
+                         (self.HELPER, self.helper_ctx), row)
+
+
+class TheWindowIsTheServedModelsTest(AutocompactBase):
+    """The watchdog divides the context an upstream RECEIVED by the window of
+    the model that RECEIVED it: `seat_catalog.launch_window` for the model the
+    reading's own usage record names, the one number the launch line teaches
+    Claude Code for that model. Never the family's default when the seat runs
+    another model.
+
+    MEASURED on the helm-codex seat (launched `--model gpt-5.6-sol`,
+    its launch line CLAUDE_CODE_MAX_CONTEXT_TOKENS=320000, every main-chain
+    usage record's message.model gpt-5.6-sol): the newest record held 231,746
+    tokens (input 322 + cache_read 231,424 on one request, the proxy's split of
+    the upstream's own input_tokens, not a double count). The watchdog divided
+    that by 220,000, FAMILIES.max_context, which is gpt-6-astra's input ceiling,
+    and posted "context CLIMBING from 81.8% to 104.4%". Against sol's own
+    320,000 the same reading is 72.4%. Claude Code had compacted that session
+    natively 59 times, each at about 240k: 80% of (320k less its 20k
+    reserve). The seat was never near its window; the gauge was.
+
+    The same false reading fed every consumer of `autocompact.read`: the
+    rebind wall (100%), reviewer eligibility and the idle-dispatch note."""
+
+    SOL = "gpt-5.6-sol"
+    SPARK = "gpt-5.3-codex-spark"
+
+    def model_window(self, model):
+        return seat.FAMILIES["codex"]["model_context"][model]
+
+    def register_model(self, model, seat_name="codex"):
+        path = os.path.join(seat._instance_dir("codex", seat_name),
+                            "spawn.json")
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+        rec["model"] = model
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+
+    def proxy_row(self, ctx, seat_name="codex"):
+        """One session-attributed usage row in the seat's proxy.log: a reading
+        that carries NO served model, so the window must come from the seat."""
+        d = seat._instance_dir("codex", seat_name)
+        with open(os.path.join(d, "proxy.log"), "w") as f:
+            f.write('{"session_id":"%s","usage":{"input_tokens":%d}}\n'
+                    % (SID, ctx))
+
+    # -- the defect --------------------------------------------------------
+
+    def test_the_measured_sol_reading_is_72_percent_not_105(self):
+        """RED on trunk: 231,746 / 220,000 = 105.3%, over the trigger, and an
+        idle pane is sent /compact. GREEN: 72.4% of sol's own window, no fire."""
+        win = self.model_window(self.SOL)
+        self.assertGreater(win, CODEX_WINDOW,
+                           "the defect needs a served model whose window is "
+                           "wider than the family default")
+        self.plant(231746, model=self.SOL)
+        ad = FakeAdapter()
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        row = res["rows"][0]
+        self.assertEqual((row["window"], row["window_src"]),
+                         (win, "FAMILIES.model_context[%s]" % self.SOL))
+        self.assertEqual(row["pct"], round(100.0 * 231746 / win, 1))
+        self.assertLess(row["pct"], autocompact.threshold_pct())
+        self.assertEqual((res["fired"], ad.sent), ([], []))
+        # POSITIVE CONTROL on the same observables: over sol's own trigger the
+        # same seat and pane are sent /compact, so the silence is a reading.
+        self.plant(int(win * 0.90), model=self.SOL)
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(res["fired"][0]["mode"], "injected")
+        self.assertEqual(ad.sent, [("h1", "/compact", True)])
+
+    def test_the_measured_sol_reading_posts_no_refusal_line(self):
+        """RED on trunk: the pane holds an open turn, so the watchdog posts
+        "REFUSED ... of its 220,000-token window (source:
+        FAMILIES.max_context)", the line the owner read as a measurement
+        fault. GREEN: the seat is under its trigger and nothing is said."""
+        self.plant(231746, model=self.SOL)
+        with mock.patch.object(autocompact, "_live_seat_names",
+                               return_value={"codex"}), \
+                mock.patch.object(autocompact, "UNKNOWN_GRACE_S", 0,
+                                  create=True), \
+                mock.patch("helm.chat.post") as post:
+            res = autocompact.check(
+                seats=["codex"],
+                adapter=FakeAdapter(tail="work\nesc to interrupt"))
+        self.assertLess(res["rows"][0]["pct"], autocompact.threshold_pct())
+        self.assertEqual([c.args[0] for c in post.call_args_list], [])
+        # POSITIVE CONTROL on the same observables: over sol's own trigger the
+        # same open turn is refused out loud, so silence above is a reading.
+        self.plant(int(self.model_window(self.SOL) * 0.90), model=self.SOL)
+        with mock.patch.object(autocompact, "_live_seat_names",
+                               return_value={"codex"}), \
+                mock.patch.object(autocompact, "UNKNOWN_GRACE_S", 0,
+                                  create=True), \
+                mock.patch("helm.chat.post") as post:
+            autocompact.check(
+                seats=["codex"],
+                adapter=FakeAdapter(tail="work\nesc to interrupt"))
+        bodies = [c.args[0] for c in post.call_args_list]
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("REFUSED on codex", bodies[0])
+
+    def test_a_small_window_model_is_read_against_its_own_window(self):
+        """The unsafe direction of the same defect. A spark reading at 70,000
+        is 92% of spark's 76,000, and trunk read it as 32% of 220,000, so the
+        seat would reach its 400 with the watchdog silent."""
+        win = self.model_window(self.SPARK)
+        self.assertLess(win, CODEX_WINDOW)
+        self.plant(70000, model=self.SPARK)
+        ad = FakeAdapter()
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        row = res["rows"][0]
+        self.assertEqual((row["window"], row["window_src"]),
+                         (win, "FAMILIES.model_context[%s]" % self.SPARK))
+        self.assertEqual(res["fired"][0]["mode"], "injected")
+        self.assertEqual(ad.sent, [("h1", "/compact", True)])
+
+    def test_a_reading_with_no_served_model_uses_the_registered_model(self):
+        """A proxy.log row names no model. The seat's registered --model
+        (spawn.json, the door every launch.sh writer re-derives through)
+        then decides, as it does on the launch line."""
+        win = self.model_window(self.SOL)
+        self.register_model(self.SOL)
+        self.proxy_row(250000)
+        row = autocompact.read("codex")
+        self.assertEqual(row["source"], "proxy.log")
+        self.assertEqual((row["window"], row["window_src"]),
+                         (win, "FAMILIES.model_context[%s]" % self.SOL))
+        self.assertEqual(row["pct"], round(100.0 * 250000 / win, 1))
+
+    def test_a_reading_with_no_served_model_uses_the_declared_instance_model(self):
+        """With nothing registered, the instance's `instance_models` entry is
+        the model its launch line starts, so it is the window's model too.
+        No shipped family declares that table (every codex runs gpt-6.1-sol,
+        seat_catalog.CODEX_MODEL_RULING), so the arm plants one naming a
+        model codex still catalogues with a window of its own."""
+        fam = seat.FAMILIES["codex"]
+        name, model = "codex-4", self.SOL  # noqa: SEAT_NAME — a numbered codex instance the planted table declares
+        self.assertNotEqual(fam["model_context"][model], CODEX_WINDOW)
+        planted = mock.patch.dict(fam, {"instance_models": {name: model}})
+        planted.start()
+        self.addCleanup(planted.stop)
+        self.spawn("h2", seat_name=name)
+        self.proxy_row(250000, seat_name=name)
+        row = autocompact.read(name)
+        self.assertEqual((row["window"], row["window_src"]),
+                         (fam["model_context"][model],
+                          "FAMILIES.model_context[%s]" % model))
+
+    def test_window_resolves_per_model(self):
+        self.assertEqual(autocompact._window("codex", self.SOL),
+                         (self.model_window(self.SOL),
+                          "FAMILIES.model_context[%s]" % self.SOL))
+
+    # -- controls ----------------------------------------------------------
+
+    def test_the_family_default_model_keeps_its_window_and_trigger(self):
+        """CONTROL, green before and after: the default model's window is the
+        family window, and 85% of it still fires."""
+        self.plant(int(CODEX_WINDOW * 0.85), model=CODEX_MODEL)
+        ad = FakeAdapter()
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        row = res["rows"][0]
+        self.assertEqual(row["window"], CODEX_WINDOW)
+        self.assertAlmostEqual(row["pct"], 85.0, places=1)
+        self.assertEqual(ad.sent, [("h1", "/compact", True)])
+
+    def test_a_served_model_over_its_own_trigger_still_fires(self):
+        """CONTROL, green before and after: a wider window is not an exemption.
+        85% of sol's window fires exactly as 85% of the default does."""
+        self.plant(int(self.model_window(self.SOL) * 0.85), model=self.SOL)
+        ad = FakeAdapter()
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(res["fired"][0]["mode"], "injected")
+        self.assertEqual(ad.sent, [("h1", "/compact", True)])
+
+    def test_a_claude_model_reading_is_unchanged(self):
+        """CONTROL, green before and after: no family catalogues a claude id,
+        so a claude-model reading keeps the family window, and fires at 95%."""
+        self.plant(int(CODEX_WINDOW * 0.95), model="claude-opus-4")
+        ad = FakeAdapter()
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        row = res["rows"][0]
+        self.assertEqual((row["window"], row["window_src"]),
+                         (CODEX_WINDOW, "FAMILIES.max_context"))
+        self.assertEqual(ad.sent, [("h1", "/compact", True)])
+
+    def test_an_uncatalogued_served_model_reads_the_family_default(self):
+        """CONTROL, green before and after: a served id the family does not
+        catalogue has no window of its own. The family default decides, the
+        lower number here, even when the seat REGISTERED a wider model: what
+        served the request outranks what was asked for, and when the window
+        is unknown the gauge goes LOWER (the recoverable direction)."""
+        self.register_model(self.SOL)
+        self.plant(int(CODEX_WINDOW * 0.50), model="zz-uncatalogued-model")
+        row = autocompact.read("codex")
+        self.assertEqual((row["window"], row["window_src"]),
+                         (CODEX_WINDOW, "FAMILIES.max_context"))
+        self.assertAlmostEqual(row["pct"], 50.0, places=1)
+
+    def test_a_budget_still_narrows_the_served_models_window(self):
+        """CONTROL, green before and after: a family `context_budget` narrows
+        whatever window the model has, and the source names the budget."""
+        fam = {"port": 8398, "model": "zz-m", "mode": "proxy-key",
+               "max_context": 300000, "context_budget": 250000,
+               "model_context": {"zz-m": 300000, "zz-wide": 500000}}
+        with mock.patch.dict(seat.FAMILIES, {"zzbud": fam}):
+            self.assertEqual(autocompact._window("zzbud"),
+                             (250000, "FAMILIES.context_budget"))
+            proj = os.path.join(seat.seat_dir("zzbud"), "claude",
+                                "projects", "-p")
+            os.makedirs(proj, exist_ok=True)
+            with open(os.path.join(proj, SID + ".jsonl"), "w") as f:
+                f.write(usage_line(125000, model="zz-wide") + "\n")
+            row = autocompact.read("zzbud")
+        self.assertEqual((row["window"], row["window_src"]),
+                         (250000, "FAMILIES.context_budget"))
+        self.assertAlmostEqual(row["pct"], 50.0, places=1)
+
+
+# ---------------------------------------------------------------------------
+# task/3534 — autocompact fires only on input it has proven
+# ---------------------------------------------------------------------------
+# THE MEASURED FAILURE: the timer typed /compact into a compacted gemini pane
+# every minute and each was answered "Not enough messages to compact". The
+# gauge read 707k (141.5% of a 500k window) from a usage record that sat
+# before a NEWER compact_boundary whose postTokens was 5325, and the pane's
+# refusal never stopped the next send. The owner's ruling on this task:
+# "really bad practice to make auto-firing things that we dont fully
+# understand the input data about."
+
+RULE = "─" * 40
+# The pane after Claude Code answers a /compact it will not run: the /compact
+# command returns this text as its output (read out of the 2.1.284 binary),
+# drawn as a result row under the submitted command, then the idle composer.
+REFUSED_TAIL = "\n".join((
+    "❯\xa0/compact",
+    "  ⎿\xa0 Not enough messages to compact.",
+    RULE, "❯\xa0", RULE, "  ⏵⏵ bypass permissions on"))
+
+
+def _iso(epoch):
+    """A transcript record's own `timestamp`, as Claude Code writes it."""
+    return "%s.%03dZ" % (time.strftime("%Y-%m-%dT%H:%M:%S",
+                                       time.gmtime(epoch)),
+                         int((epoch % 1) * 1000))
+
+
+def stamped_usage(ctx, at, model=CODEX_MODEL):
+    d = json.loads(usage_line(ctx, model=model))
+    d["timestamp"] = _iso(at)
+    return json.dumps(d)
+
+
+def boundary_line(at, post=None, pre=None, trigger="manual", sidechain=False):
+    meta = {"trigger": trigger}
+    if pre is not None:
+        meta["preTokens"] = pre
+    if post is not None:
+        meta["postTokens"] = post
+    d = {"type": "system", "subtype": "compact_boundary",
+         "timestamp": _iso(at), "compactMetadata": meta}
+    if sidechain:
+        d["isSidechain"] = True
+    return json.dumps(d)
+
+
+class CompactBoundaryGaugeTest(AutocompactBase):
+    """task/3534 item 1: the gauge honors the newest compact_boundary.
+
+    Walking back, a main-chain compact_boundary NEWER than the newest usage
+    record is the reading: its compactMetadata.postTokens when that is a
+    positive int, else UNKNOWN. The usage from before it is what the seat
+    held BEFORE the compaction and is never read as its context now."""
+
+    PANE = "hg"
+
+    def write(self, *lines, proj=None, sid=SID):
+        path = os.path.join(proj or self.proj, sid + ".jsonl")
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        return path
+
+    def test_a_newer_boundary_reads_its_postTokens_and_keeps_the_model(self):
+        now = time.time()
+        self.write(stamped_usage(int(CODEX_WINDOW * 0.95), now - 300),
+                   boundary_line(now - 120, pre=5603, post=5325))
+        row = autocompact.read("codex")
+        self.assertEqual(row["ctx_tokens"], 5325,
+                         "the pre-compaction usage was read as the context")
+        self.assertEqual(row["model"], CODEX_MODEL)
+        # the model it kept decides the window, exactly as a usage reading's
+        self.assertEqual((row["window"], row["window_src"]),
+                         autocompact._window("codex", CODEX_MODEL))
+        self.assertEqual(row["status"], "ok")
+
+    def test_a_boundary_without_postTokens_is_UNKNOWN_never_the_old_usage(self):
+        now = time.time()
+        for post in (None, 0, -1, True, "5325"):
+            with self.subTest(post=post):
+                self.write(stamped_usage(int(CODEX_WINDOW * 0.95), now - 300),
+                           boundary_line(now - 120, pre=5603, post=post))
+                row = autocompact.read("codex")
+                self.assertIsNone(row["ctx_tokens"])
+                self.assertIsNone(row["pct"])
+                self.assertEqual(row["status"], "no-context-data")
+                self.assertIn("compact_boundary", row["unmeasured_why"])
+        # CONTROL on the same observable: a positive postTokens is a reading
+        self.write(stamped_usage(int(CODEX_WINDOW * 0.95), now - 300),
+                   boundary_line(now - 120, pre=5603, post=5325))
+        self.assertEqual(autocompact.read("codex")["ctx_tokens"], 5325)
+
+    def test_a_usage_record_newer_than_the_boundary_still_wins(self):
+        now = time.time()
+        after = int(CODEX_WINDOW * 0.60)
+        self.write(stamped_usage(int(CODEX_WINDOW * 0.95), now - 600),
+                   boundary_line(now - 400, pre=5603, post=5325),
+                   stamped_usage(0, now - 300),
+                   stamped_usage(after, now - 60))
+        row = autocompact.read("codex")
+        self.assertEqual(row["ctx_tokens"], after)
+        self.assertEqual(row["status"], "ok")
+
+    def test_a_sidechain_boundary_is_not_the_seats_compaction(self):  # noqa: VACUOUS_ASSERTION — the one assertion pins ctx_tokens to the planted non-zero usage, a positive value
+        now = time.time()
+        high = int(CODEX_WINDOW * 0.95)
+        self.write(stamped_usage(high, now - 300),
+                   boundary_line(now - 120, post=5325, sidechain=True))
+        self.assertEqual(autocompact.read("codex")["ctx_tokens"], high)
+
+    def test_the_measured_gemini_shape_reads_its_compaction_and_never_fires(self):  # noqa: VACUOUS_ASSERTION — the same pass's row is the positive control: measured 5325 tokens, declared window, status ok
+        """The live transcript's tail, in its measured order and spacing: the
+        707.5k usage record, 163 s later the manual compact_boundary (preTokens
+        5603, postTokens 5325), the isCompactSummary user record, then only
+        the local /compact command records the timer's own sends left. No
+        assistant reply after the compaction: the seat's quota is spent."""
+        d = seat._instance_dir("gemini", "gemini")
+        proj = os.path.join(d, "claude", "projects", "-p")
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(d, "spawn.json"), "w") as f:
+            json.dump({"v": 1, "seat": "gemini", "harness": "fake",
+                       "handle": self.PANE, "session": SID,
+                       "worktree": self.tmp,
+                       "launch_sh": os.path.join(d, "launch.sh")}, f)
+        t0 = time.time() - 600
+        model = seat.FAMILIES["gemini"]["model"]
+        lines = [json.dumps({
+            "type": "assistant", "timestamp": _iso(t0),
+            "message": {"role": "assistant", "model": model,
+                        "usage": {"input_tokens": 700500,
+                                  "cache_read_input_tokens": 7000,
+                                  "cache_creation_input_tokens": 0,
+                                  "output_tokens": 311}}}),
+            json.dumps({"type": "system", "subtype": "compact_boundary",
+                        "timestamp": _iso(t0 + 163),
+                        "compactMetadata": {"trigger": "manual",
+                                            "preTokens": 5603,
+                                            "postTokens": 5325}}),
+            json.dumps({"type": "user", "isCompactSummary": True,
+                        "timestamp": _iso(t0 + 164),
+                        "message": {"role": "user", "content":
+                                    "This session is being continued from "
+                                    "a previous conversation."}})]
+        for i in range(3):
+            at = t0 + 240 + 60 * i
+            lines.append(json.dumps({
+                "type": "user", "timestamp": _iso(at),
+                "message": {"role": "user", "content":
+                            "<command-name>/compact</command-name>\n"
+                            "<command-message>compact</command-message>\n"
+                            "<command-args></command-args>"}}))
+            lines.append(json.dumps({
+                "type": "system", "subtype": "local_command",
+                "timestamp": _iso(at + 1),
+                "content": "<local-command-stdout>Not enough messages to "
+                           "compact.</local-command-stdout>"}))
+        self.write(*lines, proj=proj)
+        pane = FakeAdapter(panes=({"handle": self.PANE, "title": "t",
+                                   "status": "connected"},), tail="❯ ")
+        res = autocompact.check(seats=["gemini"], post=False, adapter=pane)
+        row = res["rows"][0]
+        self.assertEqual(pane.sent, [],
+                         "/compact was typed into a seat that had compacted")
+        self.assertEqual(res["fired"], [])
+        # POSITIVE CONTROL on the same row: measured, declared, actionable,
+        # and simply far under the trigger.
+        self.assertEqual(row["ctx_tokens"], 5325)
+        self.assertEqual(row["model"], model)
+        self.assertEqual((row["window"], row["window_src"]),
+                         (500000, "FAMILIES.context_budget"))
+        self.assertEqual(row["pct"], 1.1)
+        self.assertEqual(row["status"], "ok")
+
+
+class CompactRefusalLatchTest(AutocompactBase):
+    """task/3534 item 2: a target's refusal stops the actuator.
+
+    Once the pane answers a /compact with a refusal, that seat gets NO
+    further /compact until a usage reading NEWER than the refusal exists.
+    Before this, a refusal the TUI drew at once never showed the command in
+    the composer and never opened a turn, so the send was "unproven", wrote
+    no latch, and the next pass sent again; the refusal series and its alarm
+    only ever posted to chat."""
+
+    def stamp(self, ctx, at, sid=SID):
+        path = os.path.join(self.proj, sid + ".jsonl")
+        with open(path, "w") as f:
+            f.write(stamped_usage(ctx, at) + "\n")
+        return path
+
+    def test_a_refused_compact_is_not_sent_again_without_a_newer_reading(self):  # noqa: VACUOUS_ASSERTION — ad.sent is asserted equal to the ONE first send, and the first pass's COMPACT_REFUSED row is asserted outside the loop
+        self.plant(int(CODEX_WINDOW * 0.96))
+        ad = FakeAdapter(tail="❯ ", post_send_tails=(REFUSED_TAIL,))
+        first = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        passes = []
+        # Four more cadences: the pane redrawn clean or still showing the
+        # answer, and the status flipping to session-mismatch and back as it
+        # did live. None of them is a newer reading.
+        other = "22222222-2222-2222-2222-222222222222"
+        for tail, flip in (("❯ ", False), (REFUSED_TAIL, True),
+                           ("❯ ", True), ("❯ ", False)):
+            ad.tail, ad.post_send_tails = tail, None
+            flipped = os.path.join(self.proj, other + ".jsonl")
+            if flip:
+                shutil.copy(os.path.join(self.proj, SID + ".jsonl"), flipped)
+            elif os.path.exists(flipped):
+                os.unlink(flipped)
+            passes.append(autocompact.check(
+                seats=["codex"], post=False, adapter=ad))
+        self.assertEqual(ad.sent, [("h1", "/compact", True)],
+                         "a /compact the pane refused was sent again")
+        row = first["rows"][0]
+        self.assertEqual(row["actuation_state"], "COMPACT_REFUSED")
+        self.assertIn("Not enough messages to compact", row["actuation_reason"])
+        self.assertEqual(
+            [r["rows"][0]["status"] for r in passes],
+            ["ok", "session-mismatch", "session-mismatch", "ok"])
+        for res in passes:
+            self.assertTrue(res["rows"][0].get("latched"))
+            self.assertEqual(res["fired"], [])
+        self.assertIn("newer reading", autocompact._row_line(passes[-1]["rows"][0]))
+
+    def test_a_reading_newer_than_the_refusal_rearms_the_seat(self):  # noqa: VACUOUS_ASSERTION — the final pass positively fires `injected` and ad.sent holds two sends
+        self.stamp(int(CODEX_WINDOW * 0.96), time.time() - 60)
+        ad = FakeAdapter(tail="❯ ", post_send_tails=(REFUSED_TAIL,))
+        autocompact.check(seats=["codex"], post=False, adapter=ad)
+        ad.tail, ad.post_send_tails = "❯ ", None
+        again = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertTrue(again["rows"][0].get("latched"))
+        # the seat took a turn after the refusal
+        self.stamp(int(CODEX_WINDOW * 0.97), time.time() + 1)
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(res["fired"][0]["mode"], "injected")
+        self.assertEqual(ad.sent, [("h1", "/compact", True)] * 2)
+
+    def test_a_refusal_already_on_screen_stops_the_send(self):  # noqa: VACUOUS_ASSERTION — the same pass positively classifies COMPACT_REFUSED and the next one positively latches; no send is the contract
+        """The pane's newest answer is a refused /compact and helm holds no
+        latch for it (a /compact typed by hand, or a lost state file): the
+        pass reads the refusal off the pane BEFORE it types anything."""
+        self.plant(int(CODEX_WINDOW * 0.96))
+        ad = FakeAdapter(tail=REFUSED_TAIL)
+        first = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        second = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(ad.sent, [],
+                         "the pane's refusal was on screen and /compact "
+                         "was typed")
+        self.assertEqual(first["rows"][0]["actuation_state"],
+                         "COMPACT_REFUSED")
+        self.assertTrue(second["rows"][0].get("latched"))
+
+    def test_an_unproven_send_blocks_the_seat_until_a_newer_reading(self):
+        """FAIL CLOSED ON AN UNPROVEN SEND. The bytes went in and nothing
+        visible followed: no drain, no turn, no refusal. Helm cannot tell a
+        consumed /compact from a refused one it did not see, so the seat gets
+        no second /compact until it has a reading newer than the send."""
+        self.stamp(int(CODEX_WINDOW * 0.96), time.time() - 60)
+        ad = FakeAdapter(tail="❯ ", consume_compact=False)
+        first = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        later = [autocompact.check(seats=["codex"], post=False, adapter=ad)
+                 for _ in range(3)]
+        self.assertEqual(ad.sent, [("h1", "/compact", True)],
+                         "an unproven /compact was sent again")
+        self.assertEqual(first["rows"][0]["actuation_state"], "UNKNOWN")
+        self.assertIn("unproven", first["rows"][0]["actuation_reason"])
+        for res in later:
+            self.assertTrue(res["rows"][0].get("latched"))
+        self.assertIn("unproven", autocompact._row_line(later[-1]["rows"][0]))
+        # the seat took a turn after the send: a newer reading re-arms it
+        self.stamp(int(CODEX_WINDOW * 0.97), time.time() + 1)
+        ad.consume_compact = True
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(res["fired"][0]["mode"], "injected")
+        self.assertEqual(ad.sent, [("h1", "/compact", True)] * 2)
+
+    def test_an_unproven_send_speaks_once_not_every_pass(self):
+        self.stamp(int(CODEX_WINDOW * 0.96), time.time() - 60)
+        ad = FakeAdapter(tail="❯ ", consume_compact=False)
+        with mock.patch.object(autocompact, "_live_seat_names",
+                               return_value={"codex"}), \
+                mock.patch("helm.chat.post") as post:
+            for _ in range(5):
+                autocompact.check(seats=["codex"], adapter=ad)
+        bodies = [c.args[0] for c in post.call_args_list]
+        self.assertEqual(len(ad.sent), 1, ad.sent)
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("UNPROVEN", bodies[0])
+        self.assertIn("newer reading", bodies[0])
+
+    def test_a_refusal_that_is_history_does_not_block_a_fire(self):
+        """POSITION DECIDES. A refusal with a newer turn below it is history:
+        the seat took a turn after it."""
+        self.plant(int(CODEX_WINDOW * 0.96))
+        tail = "\n".join((REFUSED_TAIL.split(RULE)[0].rstrip(),
+                          "❯\xa0please carry on", "● Done.",
+                          RULE, "❯\xa0", RULE,
+                          "  ⏵⏵ bypass permissions on"))
+        self.assertIsNone(autocompact._compact_refusal(tail))
+        # A submitted prompt is drawn with a plain space after the glyph and
+        # the composer with a no-break space; the pairing takes either.
+        for glyph in ("❯\xa0/compact", "❯ /compact"):
+            self.assertEqual(autocompact._compact_refusal(
+                REFUSED_TAIL.replace("❯\xa0/compact", glyph)),
+                "Not enough messages to compact")
+        ad = FakeAdapter(tail=tail)
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(res["fired"][0]["mode"], "injected")
+
+    def test_a_refusal_speaks_once_not_every_pass(self):
+        """One line for the refusal, never one per minute."""
+        self.plant(int(CODEX_WINDOW * 0.96))
+        ad = FakeAdapter(tail="❯ ", post_send_tails=(REFUSED_TAIL,))
+        with mock.patch.object(autocompact, "_live_seat_names",
+                               return_value={"codex"}), \
+                mock.patch("helm.chat.post") as post:
+            for _ in range(5):
+                autocompact.check(seats=["codex"], adapter=ad)
+                ad.tail, ad.post_send_tails = "❯ ", None
+        bodies = [c.args[0] for c in post.call_args_list]
+        self.assertEqual(len(ad.sent), 1, ad.sent)
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("Not enough messages to compact", bodies[0])
+        self.assertIn("newer reading", bodies[0])
+
+
+class StaleRefusalAlarmDischargesTest(AutocompactBase):
+    """task/3534: a refusal alarm keyed to an episode the seat can no longer
+    be read as never met the same-episode discharge, and stayed ACTIVE for
+    good (the live gemini entry). It is discharged, with a trace, once the
+    seat's newest reading is below the alarm's threshold and was taken after
+    the alarm's run began."""
+
+    RUNNING = "work\nesc to interrupt"
+    OTHER = "22222222-2222-2222-2222-222222222222"
+
+    def alarm(self):
+        for pct in (1.12, 1.15, 1.20):
+            self.plant(int(CODEX_WINDOW * pct))
+            res = autocompact.check(seats=["codex"], post=False,
+                                    adapter=FakeAdapter(tail=self.RUNNING))
+        self.assertEqual([r["seat"] for r in res["alarms"]], ["codex"])
+        os.unlink(os.path.join(self.proj, SID + ".jsonl"))
+        with open(os.path.join(self.d, "spawn.json")) as f:
+            rec = json.load(f)
+        rec["session"] = self.OTHER
+        with open(os.path.join(self.d, "spawn.json"), "w") as f:
+            json.dump(rec, f)
+
+    def low(self, at):
+        with open(os.path.join(self.proj, self.OTHER + ".jsonl"), "w") as f:
+            f.write(stamped_usage(int(CODEX_WINDOW * 0.01), at) + "\n")
+
+    def test_a_newer_low_reading_discharges_the_stale_alarm_with_a_trace(self):
+        self.alarm()
+        self.low(time.time() + 1)
+        with mock.patch("helm.chat.post") as post:
+            res = autocompact.check(seats=["codex"], post=True,
+                                    adapter=FakeAdapter())
+        row = res["rows"][0]
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual([r["seat"] for r in res["discharged"]], ["codex"])
+        self.assertEqual(res["alarms"], [])
+        self.assertNotIn("codex", pk.read_json(autocompact._state_path(), {})[
+            autocompact._REFUSAL_ALARM_KEY])
+        texts = [c.args[0] for c in post.call_args_list]
+        self.assertEqual(len(texts), 1, texts)
+        self.assertIn("WATCHDOG DISCHARGED", texts[0])
+        self.assertIn("session:" + SID, texts[0])
+        self.assertIn("session:" + self.OTHER, texts[0])
+
+    def test_an_older_reading_leaves_the_stale_alarm_active(self):
+        self.alarm()
+        self.low(time.time() - 3600)
+        res = autocompact.check(seats=["codex"], post=False,
+                                adapter=FakeAdapter())
+        self.assertEqual(res["discharged"], [])
+        self.assertEqual(res["alarms"][0]["refusal_alarm"]["observation"],
+                         "identity-mismatch")
+        # CONTROL on the same fixture: the newer reading does discharge
+        self.low(time.time() + 1)
+        res = autocompact.check(seats=["codex"], post=False,
+                                adapter=FakeAdapter())
+        self.assertEqual([r["seat"] for r in res["discharged"]], ["codex"])

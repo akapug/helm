@@ -33,12 +33,16 @@ OWNER_SPECIMENS = (
     "helm/nevertrack.py", "helm/vacuous_assertion.py", "helm/hostpath_guard.py",
     "helm/inflight_gate.py", "helm/hardcode.py", "helm/docref_guard.py",
     "helm/conflict_marker.py", "helm/world_prose_guard.py", "helm/seatname_guard.py",
+    "helm/private_names.py",
     "helm/trailer_rung.py", "helm/lane_discipline.py", "helm/hooks.py",
     "helm/cred/_common.py", "helm/cred/cli.py", "helm/record.py",
     "helm/hookrun.py", "helm/foldcompose.py", "helm/foldcheck.py",
     "helm/injection_schema.py", "helm/inject/_ledger.py", "helm/seat_ledger.py",
     "helm/eventledger.py", "helm/dispatches.py", "helm/dispatches_close.py",
-    "helm/dispatches_cli.py", "helm/landreq.py", "helm/landreq_close.py",
+    "helm/dispatches_cli.py", "helm/dispatches_spiral.py",
+    "helm/dispatches_tier.py", "helm/dispatches_carriage.py",
+    "helm/dispatches_announce.py", "helm/dispatches_rebind.py",
+    "helm/dispatches_retract.py", "helm/landreq.py", "helm/landreq_close.py",
     "helm/landreq_cli.py",
     "helm/verdicts.py", "helm/verdict_tier.py", "helm/store/policy_history.py",
     "helm/store/load.py", "helm/seats_roster.py", "helm/seats_common.py",
@@ -110,6 +114,92 @@ class ParserAndEffectTest(HermeticCase):
         self.assertLessEqual(len(row["verdict_ref"]), 256)
         clean = contract._diff_records(b"M\0docs/example.txt\0")
         self.assertEqual(contract.effects(got["effects"], clean), ("REVERSIBLE", None))
+
+    def test_generated_review_guidance_binds_full_brief_without_changing_legacy_identity(self):  # noqa: VACUOUS_ASSERTION — the full-brief digest is asserted on successful parse before the damaged reference is refused
+        row, rows = specimen()
+        original = row["message_hash"]
+        full = row["message_body"] + "\n\n" + dispatches.REVIEW_MODE_LINES["PATCH"]
+        ref, size, why = dispatches.write_brief_file(full)
+        self.assertIsNone(why)
+        row.update(brief_ref=ref, brief_bytes=size, message_body=full,
+                   review_mode="PATCH", verdict_ref=evidence(full))
+        self.assertEqual(row["message_hash"], original)
+        got, why = contract.parse(row, dict(rows, **{row["id"]: row}))
+        self.assertIsNone(why)
+        self.assertEqual(got["brief"], ref)
+        for change in ({"brief_ref": "0" * 32},
+                       {"message_hash": "0" * 32},
+                       {"review_mode": "MELD-DIFF"}):
+            damaged = dict(row, **change)
+            got, why = contract.parse(damaged, dict(rows, **{row["id"]: damaged}))
+            self.assertIsNone(got)
+            self.assertIn("UNKNOWN", why)
+
+    def test_rebound_review_parses_with_its_preserved_authored_hash(self):
+        row, rows = specimen()
+        original_hash = row["message_hash"]
+        original = row["message_body"]
+        initial = original + "\n\n" + dispatches.REVIEW_MODE_LINES["PATCH"]
+        first_ref, first_size, why = dispatches.write_brief_file(initial)
+        self.assertIsNone(why)
+        row.update(brief_ref=first_ref, brief_bytes=first_size,
+                   message_body=initial, review_mode="PATCH",
+                   verdict_ref=evidence(initial))
+        rows[row["id"]] = row
+
+        # A move to a different Codex reader keeps the authored hash while
+        # binding a different generated suffix and a new full-brief reference.
+        moved_text = original + "\n\n" + dispatches.REVIEW_MODE_LINES["MELD-DIFF"]
+        moved_ref, moved_size, why = dispatches.write_brief_file(moved_text)
+        self.assertIsNone(why)
+        moved = dict(row, id="3" * 32, supersedes=row["id"],
+                     message_body=moved_text, brief_ref=moved_ref,
+                     brief_bytes=moved_size, review_mode="MELD-DIFF",
+                     message_hash=original_hash, verdict_ref=evidence(moved_text))
+        rows[moved["id"]] = moved
+        got, why = contract.parse(moved, rows)
+        self.assertIsNone(why, why)
+        self.assertEqual(got["brief"], moved_ref)
+        self.assertEqual(moved["message_hash"], original_hash)
+        lost_hash = dict(moved, message_hash=None)
+        got, why = contract.parse(lost_hash, dict(rows, **{moved["id"]: lost_hash}))
+        self.assertIsNone(got)
+        self.assertIn("authored review brief hash", why)
+
+    def test_generated_suffix_cannot_replace_the_authored_scope(self):
+        row, rows = specimen()
+        suffix = "\n\n" + dispatches.REVIEW_MODE_LINES["MELD-DIFF"]
+        authored = row["message_body"]
+        for full, marker in ((authored + suffix, "mode"),
+                             (authored + "\n\nextra scope" + suffix,
+                              "changed scope"),
+                             (authored + suffix + "\n\nextra", "changed suffix")):
+            with self.subTest(marker=marker):
+                ref, size, why = dispatches.write_brief_file(full)
+                self.assertIsNone(why)
+                changed = dict(row, brief_ref=ref, brief_bytes=size,
+                               message_body=full, review_mode="MELD-DIFF",
+                               verdict_ref=evidence(full))
+                got, why = contract.parse(
+                    changed, dict(rows, **{row["id"]: changed}))
+                if marker == "mode":
+                    self.assertIsNone(why)
+                    self.assertEqual(got["brief"], ref)
+                else:
+                    self.assertIsNone(got)
+                    self.assertIn("UNKNOWN", why)
+
+    def test_round_whisper_only_binds_the_authored_prefix(self):
+        row, rows = specimen()
+        whisper = "round three: continue the review"
+        full = row["message_body"] + "\n\n" + whisper
+        ref, size, why = dispatches.write_brief_file(full)
+        self.assertIsNone(why)
+        row.update(brief_ref=ref, brief_bytes=size, message_body=full,
+                   round_whisper=whisper, verdict_ref=evidence(full))
+        got, why = contract.parse(row, dict(rows, **{row["id"]: row}))
+        self.assertIsNone(why)
+        self.assertEqual(got["brief"], ref)
 
     def test_absence_ambiguity_truncation_and_positive_zero_are_not_authority(self):
         row, rows = specimen()
@@ -209,7 +299,8 @@ class ParserAndEffectTest(HermeticCase):
             if not os.path.exists(path):
                 continue
             try:
-                tree = ast.parse(io.open(path, encoding="utf-8").read())
+                with io.open(path, encoding="utf-8") as fh:
+                    tree = ast.parse(fh.read())
             except (SyntaxError, ValueError):
                 continue
             for node in tree.body:
@@ -350,7 +441,8 @@ class LifecycleTest(HermeticCase):
         self.assertIsNotNone(row)
         with native_author(self), mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "review-fixture"}):
             verdict, err = dispatches.mark_verdict(
-                row["id"], tip, statement or evidence(body), polarity=polarity,
+                row["id"], tip, statement or evidence(dispatches.brief_of(row)[0]),
+                polarity=polarity,
                 basis=basis, bind_author=True)
         self.assertIsNone(err, err)
         self.assertEqual(verdict["verdict_version"], 4)
@@ -1123,6 +1215,107 @@ class LifecycleTest(HermeticCase):
         self.assertEqual(event["close_proof_version"], 1)
         self.assertNotIn("compose_land_proof", event)
         self.assertNotIn("compose_land_proof", plain)
+
+    def test_a_compose_close_over_an_unbounded_concur_refuses_at_writer_and_replay(self):
+        """A CONCUR endorses and authorizes nothing, and only the prospective
+        bounded contract `compose --bounded-concur` admits lets one close as
+        landed. So over a concur-only row that never opted in, the v3 compose
+        close refuses BY NAME at the ladder, at the locked writer and at
+        replay — the same composition, gate and trunk that land its bounded
+        peer — and the bounded row and an ordinary APPROVE still close."""
+        bounded, ordinary, manifest, receipt = self.mixed_multicommit()
+        unbounded = self.review(body="Review the same change, no bound declared.",
+                                statement="read the patch, looks right")
+        self.assertEqual(unbounded["reviewed_tip"], bounded["reviewed_tip"])
+        # Without --bounded-concur a concur is never a car; with it, an
+        # unbounded one is excluded by name.
+        rc, text, _err = self.command("compose", unbounded["id"], "--json")
+        self.assertEqual(rc, 1)
+        self.assertIn("REVIEWED", text)
+        rc, text, _err = self.command("compose", unbounded["id"], "--bounded-concur", "--json")
+        self.assertEqual(rc, 1)
+        self.assertIn(unbounded["id"], text)
+        self.assertIn("prospective opt-in", text)
+        self.git("merge", "--ff-only", manifest["composed_tip"])
+        history = self.events()
+        for preview in (True, False):
+            out, why = self.close(unbounded, manifest, receipt, dry_run=preview, fan_out=False)
+            self.assertIsNone(out)
+            self.assertIn(unbounded["id"], why)
+            self.assertIn("authorizes nothing", why)
+            self.assertIn("prospective opt-in", why)
+            out, why = landreq.close(unbounded["id"], "landed", trunk="main", live=True,
+                                     dry_run=preview, fan_out=False)
+            self.assertIsNone(out)
+            self.assertIn(unbounded["id"], why)
+            self.assertIn("authorizes nothing", why)
+            self.assertEqual(self.events(), history)
+        # POSITIVE CONTROL on the same composition: the bounded row closes v3
+        # and its event records the bound it was admitted under.
+        rows, err = dispatches.snapshot()
+        self.assertIsNone(err, err)
+        before_bounded = copy.deepcopy(rows[bounded["id"]])
+        closed, err = self.close(bounded, manifest, receipt, fan_out=False)
+        self.assertIsNone(err, err)
+        self.assertEqual(closed["close_reason"], "landed")
+        event = [e for e in self.events() if e.get("event") == "close"
+                 and e["id"] == bounded["id"]][-1]
+        self.assertEqual(event["close_proof_version"], 3)
+        body = brief(self.base, bounded["reviewed_tip"])
+        self.assertEqual(event["compose_land_proof"]["contract"], {
+            "base": self.base, "tip": bounded["reviewed_tip"],
+            "brief": hashlib.blake2b(body.encode("utf-8"), digest_size=16).hexdigest(),
+            "effects": ["reversible"]})
+        self.assertIsNone(dispatches._close_event_error(event, before_bounded, rows))
+        # THE LOCKED WRITER, bypassing the ladder, refuses the same close.
+        history = self.events()
+        for version, extra in ((3, {"compose_manifest": manifest, "compose_gate": receipt}),
+                               (1, {})):
+            out, why = dispatches._record_close_proven(
+                unbounded["id"], "landed", unbounded["reviewed_tip"],
+                close_proof_version=version, closing_repo_id=event["closing_repo_id"],
+                closing_trunk_ref=event["closing_trunk_ref"],
+                closing_trunk_sha=event["closing_trunk_sha"],
+                proof_mode=event["close_proof_mode"],
+                translated_tip=event.get("translated_tip"),
+                delivery_class=event["close_delivery_class"], **extra)
+            with self.subTest(version=version):
+                self.assertIsNone(out)
+                self.assertIn("prospective opt-in" if version == 3 else "polarity", why)
+            self.assertEqual(self.events(), history)
+        # AND REPLAY: the bounded row's own proof, hand-appended as a close of
+        # the unbounded row, is refused, as is a plain v1 landed close of it.
+        rows, err = dispatches.snapshot()
+        self.assertIsNone(err, err)
+        before = copy.deepcopy(rows[unbounded["id"]])
+        grafted = dict(event, id=unbounded["id"], seq=int(before["seq"]) + 1)
+        plain = {k: v for k, v in grafted.items()
+                 if k not in ("compose_land_proof", "compose_land_anchor")}
+        plain["close_proof_version"] = 1
+        for hostile, words in ((grafted, "prospective opt-in"), (plain, "polarity")):
+            with self.subTest(version=hostile["close_proof_version"]):
+                why = dispatches._close_event_error(hostile, before, rows)
+                self.assertTrue(why)
+                self.assertIn(words, why)
+                self.assertEqual(dispatches._apply(copy.deepcopy(before), hostile, rows), before)
+        self.assertFalse(rows[unbounded["id"]].get("close_reason"))
+        # Compose evidence on the APPROVE is refused by its own id: the
+        # exception belongs only to a CONCUR, and nothing is written.
+        history = self.events()
+        out, why = self.close(ordinary, manifest, receipt, dry_run=True, fan_out=False)
+        self.assertIsNone(out)
+        self.assertIn(ordinary["id"], why)
+        self.assertIn("not a CONCUR", why)
+        self.assertEqual(self.events(), history)
+        # CONTROL: an APPROVE on the same composition closes as it always has.
+        plain_close, err = landreq.close(ordinary["id"], "landed", trunk="main",
+                                         live=True, fan_out=False)
+        self.assertIsNone(err, err)
+        self.assertEqual(plain_close["close_reason"], "landed")
+        approved = [e for e in self.events() if e.get("event") == "close"
+                    and e["id"] == ordinary["id"]][-1]
+        self.assertEqual(approved["close_proof_version"], 1)
+        self.assertNotIn("compose_land_proof", approved)
 
     def test_hostile_reanchored_actual_close_events_stay_inert(self):
         row = self.review()

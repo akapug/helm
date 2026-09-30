@@ -8,10 +8,29 @@ badge and they cost very different amounts, so they are two functions.
 THE REMOTES ARE LOCAL AND CHEAP. `remotes(path)` asks the checkout's own git
 config for every `remote.<name>.url`, once per change of that config file (a
 stat fingerprint, the shape `web_board._trunk_tip` uses for refs). A remote
-on GitHub yields its `owner/name`; anything else yields no name at all, and
-the page says "unknown" rather than guessing where it points. A fork carries
-two remotes — the fork and the repository it came from — and both are
-returned, fork first.
+whose URL is a PLAIN GitHub repository URL yields its `owner/name`; anything
+else yields no name at all, and the page says "unknown" rather than guessing
+where it points. A fork carries two remotes — the fork and the repository it
+came from — and both are returned, fork first.
+
+PLAIN IS THE HOST-PATH GUARD'S RULE (`hostpath_guard._plain_slug`, task/3410):
+https, ssh or scp form, owner/name and nothing more. A URL that only READS as
+GitHub's names no repository here, because git takes it elsewhere, and the
+name is what gh is asked about, what the or-free privacy door pairs with the
+refs that remote's fetch wrote, and what the board links to. MEASURED
+(task/3413, git 2.53, libcurl 8.18): a `#` or a `?` before the `@` sent git
+to the host before it, a `..` segment to another repository on github.com,
+and a file:// URL on the host github.com to a local path, while the old
+reading named the github.com repository in the URL.
+
+THE READ SEES THE CHECKOUT, NOT THE PROCESS. It runs under
+`vcs._authority_env()`, so an ambient GIT_DIR cannot answer for another
+repository and GIT_CONFIG_COUNT or GIT_CONFIG_PARAMETERS cannot add a URL.
+What that scrub keeps, HOME's and the system's config, git still reads, so
+each row says which config named it (`scope`), and a reader that must not be
+fooled by them (`dispatches._commit_public`) credits only the checkout's
+own. The memo below is keyed on the checkout's config file, which an ambient
+plant never touches, so a read that saw one would have outlived it.
 
 A REMOTE URL CAN CARRY A CREDENTIAL (`https://user:token@host.example/owner/name`), so
 the raw URL never leaves this module. What leaves is the parsed `owner/name`
@@ -21,24 +40,25 @@ VISIBILITY IS ONE NETWORK CALL PER REPOSITORY, SO IT IS ASKED ONCE A DAY.
 `visibility(slugs)` answers from a small on-disk cache under the helm home
 and never waits on the network: a repository with no answer yet reads
 `pending` and is queued for ONE background worker, which asks
-`gh repo view <owner/name> --json visibility` and writes the answer back. An
-answer is kept for a day; a failed ask (gh missing, not logged in, no such
-repository) is recorded as `unknown` WITH the reason and asked again after an
-hour, so a transient failure neither sticks for a day nor hammers gh. A
-visibility is never inferred from anything else: no answer from gh is
-`unknown`, never `public` and never `private`.
+`gh repo view github.com/<owner/name> --json visibility` and writes the
+answer back. The host is spelled out because a bare `owner/name` goes to
+whatever host GH_HOST names, and every slug here came from a plain
+github.com URL. An answer is kept for a day; a failed ask (gh missing, not
+logged in, no such repository) is recorded as `unknown` WITH the reason and
+asked again after an hour, so a transient failure neither sticks for a day
+nor hammers gh. A visibility is never inferred from anything else: no answer
+from gh is `unknown`, never `public` and never `private`.
 
 `ask=False` answers from the cache alone and queues nothing — the board uses
 it for projects it folds as quiet, which the owner is not looking at.
 """
 import json
 import os
-import re
 import subprocess
 import threading
 import time
 
-from . import gitfacts, home, pk
+from . import gitfacts, home, hostpath_guard, pk
 
 CACHE_NAME = "repo-visibility.json"
 #: how long a visibility gh answered stays the answer
@@ -48,17 +68,13 @@ FAILURE_TTL_S = 3600
 GH_TIMEOUT_S = 20
 _KNOWN = ("public", "private", "internal")
 
-# owner/name out of the three spellings a GitHub remote takes: scp-style
-# `git@github.com:o/n.git`, `https://[cred@]github.com/o/n[.git]` and
-# `ssh://git@github.com/o/n.git`.
-_GITHUB = re.compile(r"^(?:[a-z+]+://)?(?:[^@/]+@)?github\.com[:/]"
-                     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/*$")
-
 
 def slug_of(url):
-    """`owner/name` for a GitHub remote URL, else None."""
-    m = _GITHUB.match(str(url or "").strip())
-    return "%s/%s" % (m.group(1), m.group(2)) if m else None
+    """`owner/name` for a PLAIN GitHub repository URL, else None: the scp
+    `git@github.com:o/n.git`, `https://[cred@]github.com/o/n[.git]` and
+    `ssh://git@github.com/o/n.git` spellings, and nothing else
+    (`hostpath_guard._plain_slug`, the one rule; module docstring)."""
+    return hostpath_guard._plain_slug(url) if isinstance(url, str) else None
 
 
 def cache_path():
@@ -90,12 +106,16 @@ def _config_stamp(common):
 
 
 def remotes(path):
-    """([{remote, slug, url}], None) for a checkout, or (None, why).
+    """([{remote, slug, url, scope}], None) for a checkout, or (None, why).
 
-    `origin` first, then the rest by name. ONE git spawn when the checkout's
+    `origin` first, then the rest by name; a remote named with two URLs is
+    two rows. `scope` is the config git read the URL from (`local`,
+    `worktree`, `global`, `system`). ONE git spawn when the checkout's
     config changed, NONE when it did not. A path that is not itself a
     checkout root is refused rather than handed to git, which would walk up
-    and answer for whatever repository encloses it."""
+    and answer for whatever repository encloses it. The records are read
+    NUL-separated, because a config value may hold a newline and a
+    line-split read would take the rest of it for another row."""
     if not path or not os.path.exists(os.path.join(path, ".git")):
         return None, "no git checkout at the registered path"
     common = gitfacts._common_dir(path)
@@ -108,20 +128,28 @@ def remotes(path):
         return [dict(r) for r in hit[1]], None
     from . import vcs
     rc, out, _err = vcs.backend(path).text(
-        path, "config", "--get-regexp", r"^remote\..*\.url$", timeout=10)
+        path, "config", "-z", "--show-scope", "--get-regexp",
+        r"^remote\..*\.url$", timeout=10, env=vcs._authority_env())
     # `--get-regexp` exits 1 when nothing matched: a checkout with no remote
     if rc not in (0, 1) or (rc == 1 and out.strip()):
         return None, "git could not read the remotes (rc %d)" % rc
+    # scope NUL key NEWLINE value NUL, per entry
+    fields = out.split("\0")
+    if fields[-1] == "":
+        fields.pop()
+    if len(fields) % 2:
+        return None, "git answered something that is not the remotes"
     rows = []
-    for line in out.splitlines():
-        key, _sp, url = line.partition(" ")
+    for scope, entry in zip(fields[0::2], fields[1::2]):
+        key, _nl, url = entry.partition("\n")
         name = key[len("remote."):-len(".url")] if key.startswith(
             "remote.") and key.endswith(".url") else ""
         if not name:
             continue
         slug = slug_of(url)
         rows.append({"remote": name, "slug": slug,
-                     "url": "https://github.com/" + slug if slug else None})
+                     "url": "https://github.com/" + slug if slug else None,
+                     "scope": scope})
     rows.sort(key=lambda r: (r["remote"] != "origin", r["remote"]))
     if stamp is not None:
         with _REMOTES_LOCK:
@@ -143,8 +171,9 @@ _IDLE = threading.Condition(_LOCK)
 def _gh_visibility(slug):
     """(VISIBILITY, None) from gh, or (None, why). The one network call."""
     try:
-        p = subprocess.run(("gh", "repo", "view", slug, "--json",
-                            "visibility"), capture_output=True, text=True,
+        p = subprocess.run(("gh", "repo", "view", "github.com/" + slug,
+                            "--json", "visibility"),
+                           capture_output=True, text=True,
                            timeout=GH_TIMEOUT_S, stdin=subprocess.DEVNULL)
     except FileNotFoundError:
         return None, "gh is not installed"

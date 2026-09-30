@@ -1027,7 +1027,7 @@ class SidDelegationTest(FleetRowsBase):
                               "who_failed": False,
                               "census_partial": False}) as prc:
             self.assertEqual(fleet._census(),
-                             ({7: rows[0]}, False, False, False))
+                             ({7: rows[0]}, False, False, False, {}))
         prc.assert_called_once_with()
 
     def test_fleet_source_rederives_no_sid_or_config_parsing(self):

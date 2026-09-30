@@ -1,0 +1,20 @@
+<div class="view" id="view-models">
+  <!-- FLEET › MODELS (task/3448): the model scorecard's one home. The owner:
+       "maybe helm needs our own internal version on a page of the webui that
+       ranks the models we use as well". It is the page of `helm eval board`,
+       reading the same board (/api/models): each model's score is a public
+       benchmark PRIOR, measured under its maker's harness, blended with how
+       its lanes landed here, with n and a band; a model opens its detail in
+       place. Under it, the apprenticeship rungs as evidence — only the owner
+       admits. Supply (what may run, the accounts) is Fleet › credit, one link
+       away both ways; each project's Team tab links a seat here. -->
+  <section id="modelscard">
+    <div class="qonetop"><b>models</b>
+      <span class="gmeta">how each model we run does on our own lanes, beside its public benchmark</span>
+      <span id="modelswin"><button type="button" class="chip on" data-mwin="30d">30 days</button><button type="button" class="chip" data-mwin="7d">7 days</button></span>
+      <a class="mlink" href="#quota" title="supply: what may run right now, and the accounts that pay for it">supply: credit →</a>
+    </div>
+    <div id="modelsbody"><div class="mempty">not read yet</div></div>
+  </section>
+  <section id="modelsrungs"></section>
+</div>

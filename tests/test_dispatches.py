@@ -1090,6 +1090,7 @@ class LifecycleTest(DispatchBase):
                 dispatches, "mark_verdict", side_effect=capture):
             rc, out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], self.a, "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--no-patch-because", "a design finding for a meld", "safe"])
         self.assertEqual((rc, err), (0, ""))
@@ -1113,6 +1114,7 @@ class LifecycleTest(DispatchBase):
                 dispatches, "mark_verdict", side_effect=capture):
             rc, out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], self.a, "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--no-patch-because", "a design finding for a meld", "safe"])
         self.assertEqual((rc, err), (0, ""))
@@ -1124,6 +1126,7 @@ class LifecycleTest(DispatchBase):
 
         rc, _out, err = run(dispatches.cmd_dispatch, [
             "verdict", row["id"], self.a, "--fix", "--unverified",
+            "--finding-count", "1", "--prior-relation", "new",
             "--worse-than-main", "helm/dispatches.py",
             "--no-patch-because", "a design finding for a meld", "safe"])
         self.assertEqual(rc, 1)
@@ -3715,6 +3718,64 @@ class AtomicSendTest(DispatchBase):
         self.assertNotEqual(one["recipient"], two["recipient"])
         self.assertNotEqual(one["delivery_ref"], two["delivery_ref"])
 
+    def _capped_send(self, recipient, family, cap, message="build this",
+                     lane="build"):
+        """Send to `recipient` while the verified-family resolver answers
+        `family` and that family's catalog entry carries `cap`."""
+        from helm import seat_catalog
+        patched = dict(seat_catalog.FAMILIES)
+        patched["bonsai"] = dict(seat_catalog.FAMILIES["bonsai"], max_subagents=cap)
+        with mock.patch.object(seat_catalog, "FAMILIES", patched), \
+                mock.patch.object(dispatches, "_verified_family",
+                                  return_value=family):
+            row, why, posted = dispatches.send(
+                recipient, lane, message, self.a, repo=self.repo,
+                sign=False, new_work=True)
+        self.assertIsNone(why)
+        self.assertTrue(posted)
+        return dispatches.brief_of(row)[0]
+
+    def test_send_appends_seat_limit_to_cap_zero_family(self):
+        """task/3641 — send() appends a SEAT LIMIT line when the
+        recipient's family has max_subagents set (0 means no subagents)."""
+        whole = self._capped_send("bonsai", "bonsai", 0)
+        self.assertIn("SEAT LIMIT: run with no subagents", whole)
+
+    def test_send_appends_seat_limit_to_cap_one_family(self):
+        """task/3641 — send() appends 'at most 1 subagent(s)' for a family
+        whose max_subagents is 1."""
+        whole = self._capped_send("bonsai", "bonsai", 1)
+        self.assertIn("SEAT LIMIT: at most 1 subagent(s) at a time", whole)
+
+    def test_the_cap_follows_the_verified_family_not_the_seat_name(self):  # noqa: VACUOUS_ASSERTION — the first half is the positive control on the same brief
+        """task/3641 — the cap is keyed by the family send() resolves for its
+        other per-family checks, never by the seat's name: a seat named
+        otherwise on a capped family gets the line, and a seat that merely
+        shares a capped family's name but runs another family does not."""
+        whole = self._capped_send("worker-7", "bonsai", 0)  # noqa: SEAT_NAME — a seat named unlike its family
+        self.assertIn("SEAT LIMIT: run with no subagents", whole)
+        whole = self._capped_send("bonsai", None, 0, lane="build-other")
+        self.assertNotIn("SEAT LIMIT", whole)
+
+    def test_send_omits_seat_limit_for_uncapped_family(self):
+        """task/3641 — send() does NOT append a SEAT LIMIT line when the
+        family has no max_subagents field."""
+        row, why, posted = dispatches.send(
+            "seat-a", "build", "build this", self.a, repo=self.repo,
+            sign=False, new_work=True)  # noqa: SEAT_NAME — generic fixture seat
+        self.assertIsNone(why)
+        self.assertTrue(posted)
+        whole, _, _ = dispatches.brief_of(row)
+        self.assertNotIn("SEAT LIMIT", whole)
+
+    def test_send_uses_exactly_one_seat_limit_line_on_supersede(self):
+        """task/3641 — a successor brief that carries its predecessor's text,
+        SEAT LIMIT line included, keeps exactly one line."""
+        first = self._capped_send("bonsai", "bonsai", 0)
+        again = self._capped_send("bonsai", "bonsai", 0, message=first,
+                                  lane="build-successor")
+        self.assertEqual(again.count("SEAT LIMIT"), 1)
+
 
 OLD_TS = "2026-07-01T00:00:00Z"     # before LEGACY_COMPAT_BOUNDARY
 
@@ -3959,7 +4020,11 @@ class HistoricalCompatTest(DispatchBase):
         self.assertTrue(eventledger.append(dispatches.ledger_path(), row))
         got = dispatches.rows()[row["id"]]
         self.assertEqual(got["migration"], "needs-redispatch")
-        fp, text = seats._dispatch_candidate()
+        # NO SENDER, so the net is cast to the row's RECIPIENT, and a seat
+        # that is neither party is never shown it (task/3531).
+        self.assertIsNone(seats._dispatch_candidate())
+        with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "codex-3"}):
+            fp, text = seats._dispatch_candidate()
         self.assertIn("needs-redispatch", fp)
         self.assertIn("NEEDS REDISPATCH", text)
         rc, _out, _err = run(dispatches.cmd_dispatch,
@@ -4722,9 +4787,11 @@ class StorageSafetyTest(DispatchBase):
                        "reviewed_tip": None, "delivery_ref": "post-%d" % i,
                        "delivery_error": None, "last_updated": now}
                 f.write(json.dumps(row) + "\n")
-        started = time.monotonic()
+        # task/3465: the bound is CPU time — under a loaded gate the wall
+        # clock grades the box, not the replay.
+        started = time.process_time()
         self.assertIsNone(seats._dispatch_candidate())
-        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertLess(time.process_time() - started, 1.5)
 
 
 class CmdTest(DispatchBase):
@@ -4779,6 +4846,7 @@ class CmdTest(DispatchBase):
         with self.verdict_author():
             rc, _out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--imperfect", "the finding is real but not a regression"])
         self.assertEqual(rc, 2, err)
         self.assertIn("APPROVE", err)
@@ -4792,6 +4860,7 @@ class CmdTest(DispatchBase):
         with self.verdict_author():
             rc, out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", paths[0], "--worse-than-main", paths[1],
                 "--no-patch-because", "a design finding for a meld",
                 "these paths regress relative to main"])
@@ -7359,6 +7428,14 @@ class HoldReleaseTest(DispatchBase):
         self.assertEqual(rc, 2)
         self.assertIn("usage:", err)
 
+    def test_the_top_level_usage_names_the_hold_meld_citation(self):
+        """The verb's own usage names `--meld` beside `--source-clean`, and a
+        reviewer reads the top-level usage first: missing there, a reviewer
+        concluded the parser refused the flag and held without the citation."""
+        start = dispatches.USAGE.index("hold <id-or-unique-prefix>")
+        hold = dispatches.USAGE[start:dispatches.USAGE.index("(", start)]
+        self.assertIn("--source-clean TIP [--meld ROOM[@EPOCH]]", hold)
+
     def test_cli_release_usage_on_no_args(self):
         rc, _out, err = run(dispatches.cmd_dispatch, ["release"])
         self.assertEqual(rc, 2)
@@ -8836,6 +8913,7 @@ class VerdictAuthorNudgeTest(DispatchBase):
         with self.verdict_author():
             rc, _out, err = run(dispatches.cmd_dispatch, [
                 "verdict", erow["id"], erow["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--no-patch-because", "a design finding for a meld",
                 "cli-door evidence"])
@@ -9688,7 +9766,7 @@ class UnroutableRecipientTest(DispatchBase):
 
             rc, out, err = run(dispatches.cmd_dispatch,
                                self.argv("send", "claude", "prejoin-lane",
-                                         "--force"))
+                                         "--force", "--reason", "pre-join"))
             self.assertEqual(rc, 0, err)                # the send is PERMITTED
             self.assertNotIn("delivery observed", out)  # the CLAIM is not
             # "NO RECIPIENT", never "NOT DELIVERED": a forced pre-join send
@@ -9841,7 +9919,8 @@ class UnroutableRecipientTest(DispatchBase):
         queued. The promise was false AND reassuring."""
         self.seatrow("helm-claude")
         rc, out, err = run(dispatches.cmd_dispatch,
-                           self.argv("add", "ghost", "prejoin-add", "--force"))
+                           self.argv("add", "ghost", "prejoin-add", "--force",
+                                     "--reason", "pre-join"))
         self.assertEqual(rc, 0, err)
         # ASSERTS CODEX'S CONTRACT, not my earlier wording: ABSENT names the
         # state at assignment and says a public mention is not a durable
@@ -11436,9 +11515,11 @@ class CuredFixAwaitsAReviewerTest(DispatchBase):
         self.assertEqual(where[2]["id"], kid["id"])
 
     def test_a_CONCUR_successor_did_not_review_the_cure(self):
-        """A `concur` on the cure authorizes nothing, so it is not a review:
-        the identical withdrawn chain with a concur verdict leaves the cure
-        awaiting review at its tip. The FIX arm above is the control on the
+        """A WITHDRAWN `concur` on the cure left the board, so it is not a
+        review: the identical withdrawn chain with a concur verdict leaves the
+        cure awaiting review at its tip. A STANDING one is a review, and the
+        arms beside `test_a_commit_after_a_standing_concur_is_awaiting_review`
+        pin that. The FIX arm above is the control on the
         same producers. MUTATION: counting any recorded verdict as a review in
         `dispatches._verdict_is_a_review` hides this parent."""
         parent, kid, snap = self.reviewed_chain(polarity="concur")
@@ -11448,6 +11529,66 @@ class CuredFixAwaitsAReviewerTest(DispatchBase):
         self.assertIsNone(err)
         self.assertEqual([(r["id"], w[1]) for r, w in got],
                          [(parent["id"], self.cure)])
+
+    def test_a_STANDING_concur_on_the_cure_answers_the_fix(self):  # noqa: VACUOUS_ASSERTION — the RETRACTED concur runs first in the same loop and must report r1 and a True candidate through the same two assertions, so the empty answer for the standing CONCUR is measured against a census proven able to report
+        """The census asks the owed pass's question of the same rows: a FIX
+        whose continuation still stands on a CONCUR was answered, and telling
+        its author to re-dispatch sends the reviewed cure to a reviewer again.
+        Measured on 7f9fdca3c22a, which triage called CURED and told to
+        re-dispatch while c8036f39eabe held a CONCUR on its patch tip. The
+        RETRACTED concur beside it is the control: it answered nothing, so
+        the cure is awaiting review again. `cure_candidate` is asked too,
+        because the web console counts unplaceable rows with it and its
+        docstring promises the census's population.
+
+        `cure_candidate` STAYS TRUE FOR BOTH. It is the index-free half of
+        the census, and whether a concur reviewed the CURRENT cure is a tip
+        question only the index can answer (see the arm below, where the
+        author commits again after the concur). A candidate the census then
+        classifies as reviewed is honest; a row dropped before the tip is
+        read is the defect."""
+        parent = self.row("r1", self.reviewed)
+        concur = self.row("r2", self.cure, polarity="concur", supersedes="r1")
+        retracted = dict(concur, polarity="retracted", verdict_retracted=True,
+                         retracted_polarity="concur")
+        expired = dict(concur, close_reason="expired")
+        for kid, want in ((retracted, ["r1"]), (expired, ["r1"]),
+                          (concur, [])):
+            with self.subTest(kid=(kid["polarity"], kid.get("close_reason"))):
+                snap = self.snap_of(parent, kid)
+                got, err = self.rows(snap)
+                self.assertIsNone(err)
+                self.assertEqual([r["id"] for r, _w in got], want)
+                self.assertTrue(dispatches.cure_candidate(parent, snap))
+
+    def test_a_commit_after_a_standing_concur_is_awaiting_review(self):
+        """A CONCUR REVIEWS THE COMMIT IT NAMES, NOT THE BRANCH. The concur
+        stands on the cure the branch held then; the author commits again
+        above it. The census must report the NEWER tip as awaiting review,
+        and the triage, the stalebot sweep and the redispatch door all read
+        this census. Before the newer commit, the same chain is CURE_REVIEWED
+        and names the concur, which is the positive control on the same
+        classifier. MUTATION: answering the FIX from the concur's presence
+        alone, before the tip is read, drops the parent."""
+        parent = self.row("r1", self.reviewed)
+        concur = self.row("r2", self.cure, polarity="concur", supersedes="r1")
+        snap = self.snap_of(parent, concur)
+        index, ierr = dispatches._cure_index(root=self.repo, trunk=self.main)
+        self.assertIsNone(ierr)
+        state, where = dispatches.cure_state(
+            parent, index,
+            reviewed=dispatches.chain_reviewed_tips(parent, snap))
+        with self.subTest("the concur reviewed the cure the branch held"):
+            self.assertEqual(state, dispatches.CURE_REVIEWED)
+            self.assertEqual(where[2]["id"], "r2")
+        self.git("checkout", "-q", "side")
+        newer = self.commit("cured-after-the-concur")
+        self.git("checkout", "-q", self.main)
+        got, err = self.rows(snap)
+        self.assertIsNone(err)
+        self.assertEqual([(r["id"], w[1]) for r, w in got], [("r1", newer)],
+                         "a commit made after the concur was hidden from "
+                         "the cure census")
 
     def test_a_cure_committed_after_the_successors_review_is_awaiting(self):
         """The control for the arm above: the identical reviewed chain, then
@@ -12482,7 +12623,14 @@ class RegisteredProjectWriteDoorTest(DispatchBase):
         toplevel BESIDE the gitdir it reports, which is the working tree by
         definition wherever this suite runs — and the equality below binds the
         two, so a resolver that answered about some other repository cannot
-        pass this arm."""
+        pass this arm.
+
+        WHY kind="build": this arm tests registry admission, not review routing.
+        A REVIEW row at the checkout's own HEAD would also be judged by the
+        owner-surface guard (task/3444: the checkout's diff from origin/main)
+        and the review-lane guard (task/3511: lane/helms-own-work does not
+        hold that ref), both properties of wherever the suite runs, so a
+        build row keeps the arm about the one door it names (task/3513)."""
         home = self._real_home()
         self._register()                       # no projects whatsoever
         info = dispatches._repo_info(
@@ -12502,9 +12650,9 @@ class RegisteredProjectWriteDoorTest(DispatchBase):
         self.assertEqual(registry.load().get("projects"), {},
                          "the registry is not actually empty, so this arm "
                          "would pass for the wrong reason")
-        row, why = dispatches.add("seat-under-test", "lane/helms-own-work",
-                                  ref=tip, repo=here, new_work=True,
-                                  kind="review", notify=False, _reason=True)
+        row, why = dispatches.add(
+            "seat-under-test", "lane/helms-own-work", ref=tip, repo=here,
+            new_work=True, kind="build", notify=False, _reason=True)
         self.assertIsNotNone(row, "an empty registry locked helm out of its "
                              "own ledger: %s" % (why,))
         self.assertEqual(dispatches.rows()[row["id"]]["repo_id"], home)
@@ -15206,7 +15354,9 @@ class TheLedgerRungStaysWithinItsBudgetTest(DispatchBase):
         laptop, python 3.14, warm page cache. The events are the WRITER'S own
         rows re-keyed, never invented shapes — a fold over rows `_new_state`
         rejects would be fast and would prove nothing, which is why the row
-        count below is asserted."""
+        count below is asserted. The bound is CPU time (`time.process_time`),
+        because under a loaded whole-suite gate a wall-clock reading measures
+        the box, not the fold (task/3465)."""
         self.add(recipient="grok", kind="build")
         events = eventledger.events(dispatches.ledger_path())
         seed = [e for e in events if e.get("event") == "dispatch"]
@@ -15217,9 +15367,9 @@ class TheLedgerRungStaysWithinItsBudgetTest(DispatchBase):
             row["id"] = "%016x" % index
             row["lane"] = "planted-%d" % index
             planted.append(row)
-        started = time.monotonic()
+        started = time.process_time()
         out, _verdicts, _taken = dispatches._fold(planted)
-        elapsed = time.monotonic() - started
+        elapsed = time.process_time() - started
         self.assertEqual(len(out), 20000,
                          "the fold rejected the planted rows, so the timing "
                          "below measures an empty loop")
@@ -15272,8 +15422,8 @@ class CodexPoolBudgetGateTest(DispatchBase):
         # AND NOT AN ACCOUNT IDENTITY: the fold carries no email, by the arm
         # that widened it — a refusal a reader pastes into a room must not
         # publish a credential's owner.
-        self.assertNotIn("@", why.split("force=True")[0])
-        self.assertIn("force=True", why)
+        self.assertNotIn("@", why.split("--force")[0])
+        self.assertIn("--force", why)
         # --force FILES IT. A guard with no door is a guard people route around.
         forced, fwhy, _ = dispatches.send(
             "codex", "capped-lane", "work", self.a, repo=self.repo,
@@ -15512,7 +15662,30 @@ class ASourceCleanHoldNamesTheIntegrator(DispatchBase):
     verified whole-suite token that only the land gate on the rebased tree
     produces. The verdict door has always sent reviewers here in PROSE, so
     the claim existed and no surface could find it.
+
+    EVERY HOLD HERE IS MADE BY THE ROW'S RECIPIENT, the one hand the
+    source-clean door admits (task/3053): every row is sent to RECIPIENT and
+    only the hold's identity read answers as that seat. The fixture still
+    AUTHORS every row as `integrator`, so no row here becomes a self-review.
     """
+
+    RECIPIENT = "seat-b"
+
+    def add(self, **kwargs):
+        kwargs.setdefault("recipient", self.RECIPIENT)
+        return super().add(**kwargs)
+
+    def setUp(self):
+        super().setUp()
+        real = dispatches._acting_author
+
+        def acting(action="author this dispatch"):
+            if action == "hold this row":
+                return self.RECIPIENT, None
+            return real(action)
+        patch = mock.patch.object(dispatches, "_acting_author", acting)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def held(self, tip=None, **kw):
         row = self.add()
@@ -15915,6 +16088,7 @@ class ReviewerPatchTipIsCoAuthorWorkTest(DispatchBase):
         with self.verdict_author():
             return run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
+                "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py", *flags,
                 *(() if any(f == "--patch-tip" for f in flags)
                   else ("--no-patch-because", "a design finding for a meld")),
@@ -15947,6 +16121,60 @@ class ReviewerPatchTipIsCoAuthorWorkTest(DispatchBase):
         self.assertIn("does not descend from the reviewed tip", err)
         self.assertEqual(dispatches.snapshot()[0][row["id"]]["status"], "open",
                          "a refused patch tip must not bind a verdict")
+
+    def reviewer_cure(self, name):
+        """A reviewer's cure: one commit on its own branch `name`, off the
+        reviewed tip `b`."""
+        self.git("checkout", "-q", "-b", name, self.b)
+        cure = self.commit("the reviewer's cure on " + name)
+        self.git("checkout", "-q", self.main)
+        return cure
+
+    def test_a_patch_tip_on_the_lanes_own_branch_refuses(self):  # noqa: VACUOUS_ASSERTION — the absent patch_tip is asserted beside an unconditional rc==1, the exact refusal words and status==open on the same replayed row, and the control arm records the cure by value
+        """THE AUTHOR'S SUCCESSOR IS NOT A REVIEWER'S PATCH. `c` is the
+        author's next commit on lane/<lane> after the reviewed tip `b`. It
+        descends from `b` exactly as a reviewer's cure does, and every commit
+        carries the same git identity, so ancestry alone records the author's
+        own work as a second author's: the pair agreement then lets that
+        author hold, and land, commits nobody else read. The control is the
+        same lane, moved to the same `c`, with a cure on review/<x> off `b`:
+        it passes, so this refusal is about WHERE the tip lives."""
+        row = self.add(ref=self.b, recipient="seat-b")
+        lane = "lane/" + row["lane"]
+        self.git("branch", lane, self.c)
+        self.assertEqual(self.git("merge-base", "--is-ancestor", self.b,
+                                  self.c), "",
+                         "fixture premise: c descends from the reviewed tip")
+        rc, _out, err = self._fix(row, "--patch-tip", self.c)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("that tip is on the lane's own branch", err)
+        self.assertIn(lane, err)
+        current = dispatches.snapshot()[0][row["id"]]
+        self.assertEqual(current["status"], "open",
+                         "a refused patch tip must not bind a verdict")
+        self.assertNotIn("patch_tip", current)
+        # THE CONTROL: the same lane state, a cure on the reviewer's branch.
+        other = self.add(ref=self.b, recipient="seat-b")
+        self.git("branch", "lane/" + other["lane"], self.c)
+        cure = self.reviewer_cure("review/seat-b")
+        rc, _out, err = self._fix(other, "--patch-tip", cure)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(dispatches.snapshot()[0][other["id"]]["patch_tip"],
+                         cure)
+
+    def test_a_patch_on_the_reviewers_branch_off_the_reviewed_tip_passes(self):
+        """The lane's own branch exists and sits at the reviewed tip; the
+        cure is on review/x off it. A lane with NO local branch passes too:
+        the descendant arm above names `c` for a lane that never had one."""
+        row = self.add(ref=self.b, recipient="seat-b")
+        self.git("branch", "lane/" + row["lane"], self.b)
+        cure = self.reviewer_cure("review/x")
+        rc, out, err = self._fix(row, "--patch-tip", cure)
+        self.assertEqual(rc, 0, err)
+        current = dispatches.snapshot()[0][row["id"]]
+        self.assertEqual((current["patch_tip"], current["patch_author"]),
+                         (cure, "seat-b"))
+        self.assertIn(cure[:12], out)
 
     def test_a_FIX_without_the_flag_is_unchanged(self):  # noqa: VACUOUS_ASSERTION — this arm IS the control: the absent fields are the claim, asserted beside an unconditional rc==0 and polarity==fix on the same replayed row
         row = self.add(ref=self.b)
@@ -16135,13 +16363,272 @@ class ReadVerbsRunInsideOneMemoScopeTest(DispatchBase):
         # POSITIVE CONTROL ON THE SAME OBSERVABLE, unconditional: the set is
         # populated and holds exactly the projections. An empty frozenset would
         # satisfy the refusal below while granting the cure to nothing.
+        # show/read/get/status/brief are triage under another name (task/3382):
+        # each routes to the triage arm before any read runs.
         self.assertEqual(sorted(dispatches.DISPATCH_READ_VERBS),
-                         ["briefs", "collisions", "list", "mix", "triage"])
+                         ["brief", "briefs", "collisions", "get", "list", "mix",
+                          "read", "show", "status", "triage"])
         writers = ["add", "cancel", "hold", "mark-delivered", "rebind",
                    "release", "retip", "send", "verdict"]
         self.assertEqual(
             [v for v in writers if v in dispatches.DISPATCH_READ_VERBS], [],
             "a verb that APPENDS is inside the memo scope")
+
+
+class RowHeaderSiteTest(DispatchBase):
+    """task/3300: a delivered dispatch brief must carry its OWN row id.
+
+    The id cannot be written INTO the brief: it is derived from the brief's
+    hash (`message_hash`, `_op_id`), so naming it in the message is circular.
+    The cure is at DELIVERY — the one place the recipient sees the row and the
+    id both exist. Every site that DMs a dispatch row to its recipient must
+    therefore open the DM with a line naming the row's full 32-hex id and its
+    lane, so a verdict or a hand-back answers THIS row, not a sibling that
+    looks the same (measured: bonsai sent a new row instead of a verdict; a
+    seat concurred on the parent review row instead of the agreement row).
+
+    THE SCOPE IS FOUR NAMED SITES, and only ONE of them DMs. `send()` is the
+    brief's delivery — it calls `seats.dm` and the recipient reads the brief
+    verbatim. `add()` and `rebind()` do NOT DM: they wake the recipient with a
+    room MENTION, and that mention already names the row id (12-hex), so a DM
+    header would be owed to nothing. `_nudge_undelivered()` DMs nobody at all —
+    it is a one-line stderr report of a delivery that already failed. The
+    control arms below pin each of those three delivery forms so a future hand
+    that turns one of them into a bare DM (or strips the id from a mention)
+    shows up here. Only the send() arm is RED: it is the one site the recipient
+    reads a brief through, and today that first line is the brief itself."""
+
+    def test_a_sent_briefs_DMs_a_first_line_naming_ITS_OWN_full_id_and_lane(self):
+        """THE RED ARM. A bare send (no pair meld) DMs the brief verbatim today,
+        so the recipient's first line is the brief's — with no idea which row
+        it belongs to. The cure opens the DM with one line naming the row's
+        full 32-hex id and its lane; the brief still follows, unchanged."""
+        row, why, posted = dispatches.send(
+            "seat-a", "dm-brief-site", "Do this exact thing", self.a,
+            repo=self.repo, key="dm-brief-1", kind="review", sign=False,
+            new_work=True)
+        self.assertIsNone(why)
+        self.assertTrue(posted)
+        self.assertEqual(len(row["id"]), 32,
+                         "the row id is a 32-hex blake2b-128 digest")
+        (dm,) = seats.chat.read(seats.dm_lane("seat-a"))[0]
+        first = dm["text"].split("\n", 1)[0]
+        self.assertIn(row["id"], first,
+                      "the DM's first line must carry the row's FULL id, "
+                      "not a prefix a reader cannot act on")
+        self.assertIn("dm-brief-site", first,
+                      "the DM's first line must carry the lane, so the "
+                      "recipient knows which obligation this is")
+        # the header is its OWN line, and the brief follows after a blank
+        # line unchanged — the recipient's existing reading of the brief is
+        # not disturbed, only preceded.
+        self.assertTrue(dm["text"].startswith(first + "\n\n"),
+                        "the header must be a first line, not a splice into the brief")
+        self.assertIn("Do this exact thing", dm["text"])
+
+    def test_an_added_row_delivers_by_mention_naming_ITS_OWN_id_not_a_dm(self):
+        """A GREEN CONTROL on the second named site. add() wakes its recipient
+        with a room MENTION, not a DM: `_notify_public` posts
+        `@<label> <id[:12]>: <context>` to the project room and marks the row
+        delivered on THAT mention's id. The mention already names the row, so
+        a DM header would be owed to nothing — and if a future hand routes
+        add() through a DM instead, this arm (the id already in the mention) is
+        what a reviewer checks the new text against."""
+        with mock.patch("helm.chat.post",
+                        return_value={"id": "mention-add-1"}) as post:
+            row = dispatches.add(recipient="seat-b", lane="dm-add-site",
+                                 ref=self.a, repo=self.repo, new_work=True,
+                                 notify=True)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["delivery_ref"], "mention-add-1",
+                         "add()'s delivery IS the mention, not a private DM")
+        notice = post.call_args_list[-1].args[0]
+        self.assertTrue(notice.startswith("@"),
+                        "add() notifies the room by @-mention, never a DM")
+        self.assertIn(row["id"][:12], notice,
+                      "the mention already names the row, so no DM header is "
+                      "owed to add()")
+
+    def test_a_rebind_announces_its_NEW_row_by_id_in_the_room_mention(self):
+        """A GREEN CONTROL on the third named site. rebind() mints a NEW row
+        (the old one is cancelled) and wakes the NEW recipient through that
+        new row's add() mention — a room post naming the NEW id, not a DM. The
+        recipient's action is to take up the new obligation, and the mention
+        already says which one; a DM header here would be owed to nothing. This
+        pins that the mention names the NEW row's id, not the cancelled old one
+        a naive reader might still be looking at."""
+        row = self.add(recipient="grok", kind="review")
+        with mock.patch("helm.chat.post",
+                        return_value={"id": "mention-rebind-1"}) as post:
+            out, err = dispatches.rebind(row["id"], "ds4pro", force=True,
+                                         reason="move the obligation",
+                                         repo=self.repo)
+        self.assertIsNone(err)
+        old, new = out["old"], out["new"]
+        self.assertEqual(old["status"], "cancelled")
+        self.assertEqual(new["recipient"], "ds4pro")
+        self.assertNotEqual(new["id"], old["id"], "rebind mints a fresh row")
+        mentioned = [c.args[0] for c in post.call_args_list if c.args]
+        self.assertTrue(any(new["id"][:12] in t for t in mentioned),
+                        "the rebind's new-row mention must name the NEW id")
+        self.assertTrue(any(old["id"][:12] not in t for t in mentioned),
+                        "the mention wakes the new recipient on the new row, "
+                        "not a re-post of the cancelled old one")
+
+    def test_nudge_undelivered_reports_on_stderr_and_posts_nowhere(self):
+        """A GREEN CONTROL on the fourth named site. _nudge_undelivered is the
+        tail of a nudge whose DM FAILED — it cannot DM the recipient (that
+        already did not deliver), and it must not launder a failed delivery
+        into a room post that reaches nobody. It says so once, on stderr, and
+        touches no chat surface at all — so it owes no DM header either."""
+        from helm import seats_identity
+        with mock.patch.object(seats_identity, "_warn_once") as warn, \
+                mock.patch.object(chat, "post") as post:
+            dispatches._nudge_undelivered("seat-a", "transport down")
+        warn.assert_called_once()
+        self.assertTrue(str(warn.call_args[0][1]).startswith(
+            "a verdict nudge to 'seat-a' did not deliver"),
+            "the stderr report must name the recipient and the failure")
+        post.assert_not_called()
+
+
+class ReviewLaneRefusalTest(DispatchBase):
+    """task/3511: `helm dispatch send|add --kind review` must refuse when the
+    named lane branch does not hold the tip.
+
+    The incident (task/3511): rows b336dfb43845 and 04a7cfe64327 named lane
+    "claude" but sat on the real lane's branch. The ledger accepted them, so
+    the lane field was wrong for anything keyed by lane.
+
+    This class tests `_review_lane_refusal` through dispatches.add with
+    kind="review" on a temp repository. Because `_review_lane_refusal` judges
+    repository identity via `git-common-dir` (worktrees share the helm tree's
+    common dir; a bare temp clone does not), we patch `_this_helm_tree` so the
+    guard's `helm_common` resolves to the temp repo, and the common-dir
+    comparison passes during these tests.
+    """
+
+    def _make_lane(self, name, sha):
+        """Create a lane branch at `sha` in self.repo."""
+        subprocess.run(
+            ["git", "-C", self.repo, "branch", name, sha], check=True)
+
+    def _add_review(self, lane, ref, repo):
+        """Call dispatches.add with kind="review" and return (row, why)."""
+        return dispatches.add(
+            "seat-a", lane, ref=ref, repo=repo,
+            kind="review", new_work=True, notify=False, _reason=True)
+
+    def _with_helm_mock(self, test_fn):
+        """Patch `_this_helm_tree` to return self.repo so the guard fires."""
+        with unittest.mock.patch("helm.dispatches._this_helm_tree",
+                                 return_value=self.repo):
+            test_fn()
+
+    def test_a_tip_on_laneful_lane_names_it_correctly(self):
+        """Arm a: tip on lane/right, lane "right" -> row is not None."""
+        sha = self.commit("a")
+        self._make_lane("lane/right", sha)
+        def fn():
+            row, why = self._add_review("right", sha, self.repo)
+            self.assertIsNotNone(row,
+                                 "a correctly named lane must not be refused")
+        self._with_helm_mock(fn)
+
+    def test_b_tip_on_lane_right_but_lane_claude_is_refused(self):
+        """Arm b: tip on lane/right, lane "claude" (no such branch) -> row
+        is None, why names "lane/right" and "claude"."""
+        sha = self.commit("a")
+        self._make_lane("lane/right", sha)
+        def fn():
+            row, why = self._add_review("claude", sha, self.repo)
+            self.assertIsNone(row, "wrong lane must be refused")
+            self.assertIn("lane/right", why,
+                          "refusal must name the correct lane")
+            self.assertIn("claude", why,
+                          "refusal must name the wrongly-named lane")
+        self._with_helm_mock(fn)
+
+    def test_c_tip_on_newer_commit_than_lane_other(self):
+        """Arm c: lane/other exists at an older commit that lacks the tip,
+        lane "other" -> row is None, why names "lane/right"."""
+        old_sha = self.commit("a")
+        new_sha = self.commit("b")
+        self._make_lane("lane/right", new_sha)
+        self._make_lane("lane/other", old_sha)
+        def fn():
+            row, why = self._add_review("other", new_sha, self.repo)
+            self.assertIsNone(row,
+                              "tip not contained in named lane must be refused")
+            self.assertIn("lane/right", why,
+                          "refusal must name the lane that actually holds the tip")
+        self._with_helm_mock(fn)
+
+    def test_d_no_lane_branch_holds_the_tip(self):
+        """Arm d: no lane/* branch holds the tip, lane "anything" -> row is
+        not None (today's behaviour, the check never blocks on git hiccup)."""
+        sha = self.commit("a")
+        # No lane branches exist at all.
+        def fn():
+            row, why = self._add_review("anything", sha, self.repo)
+            self.assertIsNotNone(row,
+                                 "no lane branch holding the tip: must NOT block")
+        self._with_helm_mock(fn)
+
+    def test_e_lane_with_prefix_lanes_correctly(self):
+        """Arm e: tip on lane/right, lane "lane/right" -> row is not None."""
+        sha = self.commit("a")
+        self._make_lane("lane/right", sha)
+        def fn():
+            row, why = self._add_review("lane/right", sha, self.repo)
+            self.assertIsNotNone(row,
+                                 "lane with prefix must be resolved correctly")
+        self._with_helm_mock(fn)
+
+    def test_g_send_from_a_lane_worktree_is_judged(self):
+        """Arm g (F2): the guard fires from a lane worktree, not just when
+        _this_helm_tree is patched to the main repo.  A lane worktree and the
+        shared checkout share the same git-common-dir, so the comparison must
+        pass even though the working-tree paths differ.  Patch _this_helm_tree
+        to the main repo (so the guard has a helm_common to compare against),
+        then send from the worktree path naming a wrong lane: must be refused.
+        Check it FAILS on the pre-F1 code (relative common-dir strings never
+        match) and passes after F1 (--path-format=absolute + realpath)."""
+        import subprocess
+        import tempfile
+        sha = self.commit("a")
+        self._make_lane("lane/right", sha)
+        # Create a worktree of the main repo.
+        with tempfile.TemporaryDirectory() as wt:
+            subprocess.run(
+                ["git", "-C", self.repo, "worktree", "add", wt, "HEAD"],
+                check=True, capture_output=True,
+            )
+            def fn():
+                with unittest.mock.patch(
+                        "helm.dispatches._this_helm_tree",
+                        return_value=self.repo):
+                    row, why = self._add_review("claude", sha, wt)
+                    self.assertIsNone(row,
+                                      "wrong-lane send from a worktree must be refused")
+                    self.assertIn("lane/right", why,
+                                  "refusal must name the correct lane")
+                    self.assertIn("claude", why,
+                                  "refusal must name the wrong lane")
+            fn()
+
+    def test_f_kind_build_is_not_judged(self):
+        """Arm f: kind="build" with lane "claude" and the tip on lane/right
+        -> row is not None (builds are not judged)."""
+        sha = self.commit("a")
+        self._make_lane("lane/right", sha)
+        def fn():
+            row, why = dispatches.add(
+                "seat-a", "claude", ref=sha, repo=self.repo,
+                kind="build", new_work=True, notify=False, _reason=True)
+            self.assertIsNotNone(row,
+                                 "build rows must not be subject to the lane guard")
+        self._with_helm_mock(fn)
 
 
 def setUpModule():

@@ -126,6 +126,27 @@ _ROSTER_CONSUMERS = {
         "name, the role) is LEDGER-sourced, not roster-sourced. The refusal "
         "string reaches an operator's terminal, so this module is an emission "
         "site and is allowlisted as one, not as a membership reader."),
+    "seat_hold.py": (
+        "LAUNDERED at `_label`, AND IT IS AN EMISSION SITE (task/3546). ONE "
+        "read, in `usability_rows`: the broken-seat refusal (`instead`) walks the "
+        "usability join over the whole roster to name ONE seat to use "
+        "instead, and that roster key is rendered into the dispatch refusal "
+        "an operator reads, so it passes `_label` (pk.launder, clipped) where "
+        "it is formatted. The dark-seat mover (darkmove.py, task/3587) takes "
+        "its targets from the same list and renders each through `_label`. "
+        "Every other seat name this module prints (a hold's seat, a storm's "
+        "seat, a forced admission's seat) comes from its own hold log or the "
+        "silent-drop latch, not the roster, and passes the same `_label`. "
+        "Driven by the runtime sweep's planted hostile seats."),
+    "seat_idle.py": (
+        "RESOLUTION-ONLY, AND IT RENDERS NOTHING THE ROSTER SUPPLIED. ONE "
+        "read, `roster_checked()` in `roster_rows`, shared by every reading "
+        "in a sweep, to find the CURRENT session of a seat the CALLER names "
+        "(task/3118). A reading carries the caller's own spelling, never the "
+        "canonical roster key; the session id leaves only after it passes a "
+        "token check (`_SID`), and a reason prints eight characters of it or "
+        "`(unprintable)`; every other reason is fixed prose. The measurement "
+        "report prints seat names from dispatch rows through `_seat_label`."),
     "turnstamp.py": (
         "RESOLUTION-ONLY, AND IT RENDERS NOTHING THE ROSTER SUPPLIED. ONE "
         "read, `seats.roster_checked()` inside `reconcile`, which exists to "
@@ -256,6 +277,12 @@ _ROSTER_CONSUMERS = {
         "seat_incarnation matches a keyed writer to one durable roster "
         "generation. Both return only state/counts; no roster key reaches a "
         "display sink."),
+    "seats_rotation.py": (
+        "INTERNAL-MATCHING-ONLY: rotation_hold_offset reads the roster only to "
+        "list each seat's cursor paths for the room being compacted; the seats "
+        "and sessions it reads are compared and turned into paths, never "
+        "emitted. What leaves is one offset. Relocated verbatim from "
+        "seats_delivery by the split (task/3519)."),
     "seats_delivery.py": (
         "INTERNAL-MATCHING-ONLY: the delivery path reads the roster to decide "
         "WHO A ROW REACHES — resolve_recipient, recipient_capability, "
@@ -350,12 +377,20 @@ _ROSTER_CONSUMERS = {
         "tests/test_chat_tree_steer.py "
         "test_a_name_that_cannot_be_named_inertly_is_not_named."),
     "dispatches.py": (
-        "INTERNAL-MATCHING-ONLY: two sites, both via roster_checked(). "
+        "INTERNAL-MATCHING-ONLY: three sites, all via roster_checked(). "
         "_open_for's sweep passes the roster to _mine_or_unprovable as a "
         "MEMBERSHIP predicate to decide which rows are visible; no key is "
-        "returned or printed. The recipient-runtime read does `roster.get("
-        "recipient)` and any name in its refusals is the CALLER'S recipient "
-        "argument, never a roster key."),
+        "returned or printed. _declared_pair_family casefold-matches "
+        "one canonical row and emits only its validated family token, never "
+        "the bound roster key. The DEAD recipient door names live seats in "
+        "its refusal, each through seats._seat_label."),
+    # THE LEDGER'S FOURTH SITE, moved whole with the approval tier
+    # (task/3407); its reason moved with it, unchanged.
+    "dispatches_tier.py": (
+        "INTERNAL-MATCHING-ONLY: one site, via roster_checked(). The "
+        "recipient-runtime read does `roster.get(recipient)` and any name in "
+        "its refusals is the CALLER'S recipient argument, never a roster "
+        "key."),
     "fleet.py": (
         "LAUNDERED via seats._seat_label in _seat_for — the ONE boundary "
         "where a censused pid gains a seat name, covering BOTH sources "
@@ -364,6 +399,18 @@ _ROSTER_CONSUMERS = {
         "of the census. It was RAW until 2026-08-04: fleet.py held zero "
         "scrub/label calls, and the regex tripwire could not see it because "
         "fleet obtains the roster through roster_checked()."),
+    "meld.py": (
+        "ONE IDENTITY-ONLY READER. `_reach` looks up the attendance row of "
+        "each invitee the convener already named (validated by "
+        "home.validate_seat_arg before it gets here) with an exact-key "
+        "`.get`; it iterates nothing, and the only seat it emits is the "
+        "caller's own invitee name, laundered through chat._dsan. An "
+        "unreadable roster names no seat, so the invite says nothing. "
+        "(b) MEMBERSHIP-ONLY: `_outside_member_mentions` (task/3247) reads "
+        "roster_acquired to ask whether each @token in the message names a "
+        "roster key or a live alias of one; it iterates keys only to "
+        "casefold them for that test and returns the message's OWN tokens, "
+        "never a roster key, and an unreadable roster fails closed."),
     "orcaadopt.py": (
         "TWO SITES, DIFFERENT REASONS. (a) INTERNAL-MATCHING-ONLY: "
         "`roster.get(seat)` reads the row's session and sessions SIDS for pane "
@@ -556,6 +603,19 @@ _ROSTER_CONSUMERS = {
         "{key: (runtime, verified)} and every consumer reaches it as "
         "`runtimes.get(name)` on a name it already holds; what leaves is a "
         "family token from a fixed catalogue, never a roster key."),
+    "burnflags.py": (
+        "INTERNAL-MATCHING-ONLY, through the CHECKED read: "
+        "`_session_bindings` asks roster_checked which seat each local "
+        "certification's session key binds to now, resolving every roster "
+        "session whose sid8 is that key the way `seat_for_session` does, and "
+        "the answer is only ever COMPARED with the family's operator seat, "
+        "which comes from this host's local names and never from the roster. "
+        "What leaves is a colour and a cause that names the operator (a "
+        "local-names value) and the record's own `by` (a file value, "
+        "repeated only when it is a well-formed seat name); the bound seat "
+        "itself is deliberately NOT printed, so no roster key reaches the "
+        "snapshot, the board, `helm burn` or the verb's refusal. A failed "
+        "read is its own GREY cause, never an empty roster."),
     "actors.py": (
         "INTERNAL-MATCHING-ONLY, and the read is the CHECKED one on purpose: "
         "_own_roster_key asks roster_checked whether a name that is a RETIRED "
@@ -641,6 +701,25 @@ _ROSTER_CONSUMERS = {
         "runtime before family_for. No arbitrary roster key is interpolated: "
         "selected keys travel only through token-bound address fields, while "
         "unavailable/ambiguous facts render fixed prose."),
+    "teams.py": (
+        "VALIDATED AT THE SEAM, AND IT IS AN EMISSION SITE. One site, "
+        "`roster_checked()` in `_roster`, read by two consumers. "
+        "`live_families` looks rows up BY an authored member's seat name, "
+        "which `validate` admitted, iterates no roster key and emits only "
+        "a family word. `placements` places every seat seen "
+        "in the last three days on a project so `derive` can propose a team "
+        "and `drift` can name what the lead does next. Seat names leave this "
+        "module as proposed members, drift lines, the `helm team` listing "
+        "and the board's add-seat picker, and every one of them is a key "
+        "`placements` admitted: a key that is not a seat name "
+        "(`_seat_ok`, [A-Za-z0-9._-]{1,64}) is never placed, so no ESC or "
+        "bidi can reach a sink, and a legitimate seat is unchanged. The home "
+        "room a drift line prints passes the same check or reads as none. "
+        "The raw roster is kept only for membership (`seat in roster`). An "
+        "authored member is a seat name already, because `validate` refuses "
+        "any other. NOT WIRED INTO THE SECTION-B SWEEP: the arm standing in "
+        "for it is tests/test_teams.py DeriveTest, which plants a hostile "
+        "key and room beside a legitimate seat."),
 }
 
 # COUNT-PIN per module: module-granularity alone let a NEW roster() call site
@@ -650,6 +729,13 @@ _ROSTER_CONSUMERS = {
 # new site launders. Regenerate deliberately with _roster_call_sites() below.
 _ROSTER_CALL_COUNTS = {
     "ownership_census.py": 1,
+    "seat_hold.py": 1,  # ONE read, in `usability_rows`: the fleet the broken-
+                        # seat refusal and the dark-seat mover name a seat
+                        # to use instead from.
+    "seat_idle.py": 1,  # ONE read, in `roster_rows`: every reading of a
+                        # sweep shares it (`readings`), so a second site
+                        # would mean a reading resolved against another
+                        # instant's roster than its neighbours'.
     "turnstamp.py": 1,  # ONE read, in `reconcile`, and the count is the
                         # point: a SECOND site here would mean something
                         # other than the binding check is consulting the
@@ -711,7 +797,21 @@ _ROSTER_CALL_COUNTS = {
                            # the owner's profile would stand — which rows bind
                            # this process's session; the one key it can return
                            # goes through seats_common._seat_label first
-    "chat.py": 3,          # THREE SITES, AND TWO OF THEM CAN EMIT.
+    "chat.py": 5,          # FIVE SITES, AND TWO OF THEM CAN EMIT.
+                           # (5) _inherited_profile (task/3723, console walk
+                           # 4) — INTERNAL-MATCHING-ONLY: asked only on an
+                           # identity refusal, it reads the keys as a
+                           # casefolded membership test (and live_alias over
+                           # the same rows) for the ONE name it already
+                           # holds, the ambient profile; it returns that name
+                           # or None, never a roster key, and the name is
+                           # laundered by _failure_public/_public_transport
+                           # before any status, row or console sink.
+                           # (4) _rostered_seat_keys (task/3519), the cursor
+                           # reaper's read — INTERNAL-MATCHING-ONLY: the keys
+                           # become a hashed seat-key SET for a membership
+                           # test on cursor filenames; only paths leave
+                           # (victims gc unlinks), never a roster key.
                            # (3) _tree_roster, the tree rung's read — its
                            # consumer tree_steers EMITS a key and that row's
                            # home room inside a pasteable command, each
@@ -737,9 +837,20 @@ _ROSTER_CALL_COUNTS = {
                            # that reaches any sink is the caller's own
                            # argument, which did not come from the roster.
     "codexhomes.py": 1,
-    "dispatches.py": 2,   # BOTH via roster_checked(), invisible to the old
-                          # regex: _open_for's visibility filter and the
-                          # recipient-runtime read. INTERNAL-MATCHING-ONLY.
+    "dispatches.py": 3,   # All via roster_checked(), invisible to the old
+                          # regex: _open_for's visibility filter and pair-family
+                          # declaration lookup. INTERNAL-MATCHING-ONLY; the
+                          # family site emits only a validated family token,
+                          # never a roster key. (4 -> 3: the
+                          # recipient-runtime read moved whole to
+                          # dispatches_tier.py, task/3407.) (3 -> 4: the DEAD
+                          # recipient door, task/3531, names live seats in its
+                          # refusal; every key it emits goes through
+                          # seats._seat_label.) (4 -> 3: _author_sessions, the
+                          # fresh-context door's old bound (c), is gone: that
+                          # door judges the reading instance, task/3658.)
+    "dispatches_tier.py": 1,  # the recipient-runtime read, moved whole from
+                              # dispatches.py with the approval tier.
     "fleet.py": 2,        # 1 -> 2. The first is via roster_checked() and is
                           # LAUNDERED at _seat_for; the raw key reaching the
                           # census's first column is the failure this pin
@@ -761,6 +872,11 @@ _ROSTER_CALL_COUNTS = {
     "injection_config.py": 1,  # one fail-closed roster acquisition; raw keys
                                # drive matching only, and the selected key is
                                # laundered through _seat_label before JSON emit
+    "meld.py": 2,          # `_reach`: one exact-key attendance read per
+                           # invitee the caller named (task/3088); emits no
+                           # roster key. +1 (task/3247): _outside_member_
+                           # mentions, a membership-only read that emits the
+                           # message's own @tokens, never a roster key.
     "orcaadopt.py": 3,    # +2 (was 1). roster_current_sids(), the ADDRESSING
                           # half of the roster read once per pane listing: it
                           # EMITS (see its reason above) and is laundered at
@@ -844,6 +960,10 @@ _ROSTER_CALL_COUNTS = {
                              # lookup. Keyed reads only (`runtimes.get(name)`
                              # on a name the caller supplied) and it emits a
                              # catalogued family token, never a roster key.
+    "burnflags.py": 1,      # ONE CHECKED READ, `_session_bindings`: the
+                            # seat each certification's session key binds to,
+                            # compared with the local-names operator and never
+                            # printed. INTERNAL-MATCHING-ONLY.
     "actors.py": 2,         # TWO CHECKED READS, one per identity question.
                             # THE FIRST: _own_roster_key, roster_checked ->
                             # exact-key membership for a retired-alias record;
@@ -942,7 +1062,14 @@ _ROSTER_CALL_COUNTS = {
     # third wave: three sites to seats_delivery. 17 -> 14, 0 -> 3, 52 -> 52.
     "seats_cursor.py": 2,  # restore sweep + identity-generation matching
                             # paths; only pair counts are rendered
-    "seats_delivery.py": 3,
+    "seats_delivery.py": 3,  # +1 (task/3519): _born_after_join reads the
+                              # seat's own `joined` stamp, matched by hashed
+                              # seat key; it returns a bool, never a key;
+                              # -1 (task/3519): rotation_hold_offset's read
+                              # moved to seats_rotation, verbatim
+    "seats_rotation.py": 1,  # RELOCATED, not new: rotation_hold_offset's
+                              # census of each seat's cursors left
+                              # seats_delivery with the split
     # task/2069: one tri-state claims snapshot, INTERNAL-MATCHING-ONLY.
     # RELOCATED, not new: the claims rung left seats_stop_guard for
     # seats_stop_claims and its single roster read went with it. The census
@@ -952,7 +1079,12 @@ _ROSTER_CALL_COUNTS = {
     # fourth wave: one site to seats_stop_signals. 14 -> 13, 0 -> 1, 52 -> 52.
     "seats_stop_signals.py": 1,
     # fifth wave: four sites to seats_ack. 13 -> 9, 0 -> 4, 52 -> 52.
-    "seats_ack.py": 4,
+    "seats_ack.py": 5,    # +1 (task/3224): ack_many's ONE roster_acquired
+                          # per call, INTERNAL-MATCHING-ONLY. Its rows feed
+                          # _recipients (recipient comparisons, every emitted
+                          # name through _seat_label) and its verdict makes
+                          # the skip of an unaddressed id fail closed; no
+                          # roster key reaches a sink from it. (was 4)
     "seats_claims.py": 1,  # claim_holder_listedness — ONE membership read
                            # over roster KEYS via recipient_matches, answering
                            # listed/unlisted/unknown. It binds no key: the
@@ -1076,6 +1208,11 @@ _ROSTER_CALL_COUNTS = {
                           # summary listing roster keys would be an emission
                           # site, and this rung exists to keep seat identities
                           # out of places they do not belong.
+    "teams.py": 1,        # task/3156: ONE read, in `_roster`, which
+                          # `placements` and `live_families` share; `derive`,
+                          # `drift`, the verb and the board take its world as
+                          # an argument, so a second site here would be a
+                          # reader that skipped the seat-name check.
 }
 
 # EVERY accessor that hands a caller the roster mapping. `roster()` is the
@@ -1990,6 +2127,23 @@ class RosterSinkSweepTest(unittest.TestCase):
         self.assertIn("pane", text)              # the laundered name survives
         self.assertIn("h1", text)                # and the row really rendered
 
+    # -- seat_hold.py: the broken-seat refusal's seat to use instead ----------
+    def test_the_broken_seat_alternative_is_inert(self):
+        """`seat_hold.instead` reads the roster and names ONE of its keys in
+        the dispatch door's refusal (task/3546). MUTATION: render the key raw
+        in `instead` — the planted key's ESC/bidi reach the refusal."""
+        from helm import seat_hold, seat_usability
+
+        def join(seats=None, **_kw):
+            return {n: {"seat": n, "family": "kimi",
+                        "verdict": seat_usability.USABLE}
+                    for n in (seats or ())}
+        with unittest.mock.patch.object(seat_usability, "join", join):
+            text = seat_hold.instead("somebody-else")
+        self._assert_inert("the broken-seat refusal", text)
+        self.assertIn("pwn", text)               # a planted key was named
+        self.assertIn("Use @", text)
+
     # -- seat_resume_all.py: the post-reboot sweep's table ---------------------
     def test_seat_resume_all_table_is_inert(self):
         """The sweep enumerates orca-ADOPTED seats from roster KEYS and prints
@@ -2302,6 +2456,18 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
         with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
             rv = fn()
         return o.getvalue() + e.getvalue(), rv
+
+    # -- 0. goals.owner_word(): the refusal naming who posted a cited row ------
+    def test_goal_owner_ref_refusal_is_inert(self):
+        """A goal's owner-ref that resolves to a row somebody else posted is
+        refused NAMING that author, and the name reaches the seat's terminal:
+        a planted hostile from-field must arrive laundered, and still arrive."""
+        from helm import goals
+        self._plant("main", "bb" * 6, "the owner said drop it")
+        said, err = goals.owner_word("bb" * 6, {}, "--owner-ref", "task/1")
+        self.assertIsNone(said)
+        self._assert_inert("goals.owner_word", err)
+        self.assertIn("posted by lane", err)
 
     # -- 1. seats.deliver(): the tool-boundary nudge ---------------------------
     def test_deliver_boundary_nudge_is_inert(self):
@@ -2667,11 +2833,24 @@ def _from_field_read_sites(pkg=PKG):
 # The allowlist IS the law (mirrors _ROSTER_CONSUMERS): every module that reads
 # a chat-row identity field must appear here with a reason. Keyed by basename.
 _FROM_FIELD_CONSUMERS = {
-    "seats_cli.py": (
-        "LAUNDERED: the ack verbs read a chat row's from/tfrom to decide "
-        "which rows are ADDRESSED to the acting seat. Identity that reaches "
-        "the operator goes through _seat_label; the rest are comparisons. "
-        "Moved verbatim from seats.py by the split."),
+    "dispatches.py": (
+        "INTERNAL-MATCHING-ONLY: reissue notification reconciliation reads a "
+        "main-room row's from field only to require the exact seat that wrote "
+        "the successor; it returns the opaque chat id as delivery evidence and "
+        "never emits the raw sender. The MELD-DIFF handoff checks a post's "
+        "from field against the recipient and compares the nearest seed's "
+        "convener with the pair; neither identity is emitted, and the refusal "
+        "names no participant."),
+    "review_door.py": (
+        "LAUNDERED: room_outcome reads a meld room's seed from-field and each "
+        "floor chunk's from to decide which PARTY closed with which MELD "
+        "OUTCOME — set membership and matching. The party names that reach "
+        "text (the per-party why, the --meld citation refusal) route "
+        "chat._dsan at the emit."),
+    # seats_cli.py IS GONE FROM THIS ALLOWLIST: its last from-field read, the
+    # ack verb's confirmation naming the senders who watch the acked rows
+    # leave `helm chat pending`, moved to seats_ack.render_ack with the bulk
+    # ack (it launders through chat._dsan there, as it did here).
     "seats_catchup.py": (
         "LAUNDERED / INTERNAL-MATCHING-ONLY: catchup reads from/rfrom/dm to "
         "classify direct asks and tally their senders. Rendered senders pass "
@@ -2695,11 +2874,14 @@ _FROM_FIELD_CONSUMERS = {
         "reader sees that an alias was resolved. Seat NAMES in that verb do "
         "reach the operator, and every one of them goes through the roster "
         "verb's own label door."),
-    "seats_stop_signals.py": (
-        "INTERNAL-MATCHING-ONLY: the pending/ask probes read a chat row's "
-        "from/tfrom to decide whether a row is ADDRESSED TO this seat and "
-        "therefore owed an answer before it may idle. A comparison against "
-        "the seat's own identity, never a render. Moved by the split."),
+    "seats_stop_spiral.py": (
+        "INTERNAL-MATCHING-ONLY: _meld_open_with reads a meld state's "
+        "peer/peers ONLY to test membership against the caller's peer and "
+        "never emits them; the one value that reaches a sink is `room`, "
+        "laundered at the read via _clip(_scrub(...)). _spiral_gate prints "
+        "the spiral's peer only after it matches the seat-name shape "
+        "(dispatches._TOKEN). Moved verbatim from seats_stop_signals by its "
+        "split, which took every chat-row identity read that file had."),
     "seats_delivery.py": (
         "LAUNDERED: the delivery path reads a chat row's from/tfrom to decide "
         "whether the row is FOR this seat — a comparison against the "
@@ -2714,6 +2896,35 @@ _FROM_FIELD_CONSUMERS = {
         "these reads carried under the old filename they carry under the "
         "new one; registered rather than exempted because a split must not "
         "become a way to leave an allowlist."),
+    "chatshort.py": (
+        "INTERNAL-MATCHING-ONLY: owed_to reads a row's dm ONCE, as a bool, "
+        "to keep a DM row whole in the short read (task/3382). No identity "
+        "is emitted from it: every line renders through chat.run_line or "
+        "chat._fmt, which launder the sender and the DM display through "
+        "chat._dsan as the full read does."),
+    "beacon_doorbell.py": (
+        "INTERNAL-MATCHING-ONLY: _acked reads an ack row's from ONCE, to test "
+        "whether the doorbell's own seat wrote the ack, and keeps only the "
+        "acked row id. No name is emitted: the ring's lead is the wake line "
+        "delivery already rendered through chat._dsan."),
+    "goals.py": (
+        "LAUNDERED / INTERNAL-MATCHING-ONLY: _chat_word resolves the chat row "
+        "a goal's owner-ref names (goal-ledger D1: a goal closes or reopens "
+        "only on the owner's word) and reads the row's from twice: once to "
+        "test it against the owner's names (ownerasks.is_owner, a bool), and "
+        "once as the author the refusal names, laundered through "
+        "seats_ack._seat_label (the _clip(_scrub(...)) door the ack refusal "
+        "uses) before any sink. The record written on the row carries the "
+        "row id, ts and room, never the author. Verified by "
+        "ChatRowFromFieldSinkSweep's goal owner-ref test."),
+    "ownerasks.py": (
+        "NOT-A-CHAT-ROW: both reads are a decision card's custody record "
+        "{from, to, goal, ts} (move_asker, goal-ledger item A), whose keys "
+        "happen to be spelled from/to. `from` is the card's PREVIOUS ASKER, "
+        "a seat token validated as a deliverable address when the card was "
+        "filed (file_decision's _canonical_recipient) and again by move_asker "
+        "before it became the asker; the custody journal event and `helm "
+        "decide show` print it. It never came from a chat row."),
     "machine_senders.py": (
         "INTERNAL-MATCHING-ONLY: owner_rail reads a chat row's from ONCE, to "
         "test it against the owner's names beside the row's owner-rail "
@@ -2742,12 +2953,19 @@ _FROM_FIELD_CONSUMERS = {
         "aborted_by. The reveal/abort/tally CALLERS in seats._cmd_council "
         "launder each signer as they print. This module has no other sink — "
         "it returns data; seats.py owns the printing."),
+    "meld_standing.py": (
+        "LAUNDERED / INTERNAL-MATCHING-ONLY: the standing meld (task/3560). "
+        "fold reads each row's from only to test it against the room's "
+        "participants at that point; recv emits the sender through "
+        "chat._dsan, and every member list and @mention it posts or prints "
+        "routes chat._dsan too."),
     "meld.py": (
         "LAUNDERED: every meld identity EMIT routes chat._dsan — invite (@peers "
         "posted text + MELD-INVITED display, d_peers), join (READY posted text + "
         "MELD-JOINED display, d_convener), recv (READY/ABORT/DONE lines + the "
         "pending-countersign list, chat._dsan(frm/member)), say (DONE/ABORT @peer "
-        "mention), status (peer column). standup's 2+ pinned SET keeps the RAW "
+        "mention, the MELD-PEER-CLOSED refusal's closed members), status (peer "
+        "column). standup's 2+ pinned SET keeps the RAW "
         "members ONLY in state[peers]/[done_peers] for recv's frm MATCHING (frm "
         "is accept-filtered before it can enter done_peers) — never emitted raw. "
         "Verified by ChatRowFromFieldSinkSweep's join/invite/say/status/recv-all-"
@@ -2806,7 +3024,11 @@ _FROM_FIELD_CONSUMERS = {
 # trips until a human re-counts AND confirms the new site launders (or is
 # internal). Regenerate deliberately from _from_field_read_sites().
 _FROM_FIELD_READ_COUNTS = {
-    "chat.py": 36,         # +1: _append tests dm only to decide whether the
+    "chat.py": 37,         # +1: ack_runs compares two ack rows' from to fold
+                           # a run; MATCHING-ONLY — the folded line names the
+                           # sender through _fmt_acks, which launders via _dsan
+                           # (the one it replaced in _fmt did the same).
+                           # +1: _append tests dm only to decide whether the
                             # roster census applies; MATCHING-ONLY, never emitted.
                             # +1: append-time broadcast census passes the row
                             # internally; its from-key is never emitted here and
@@ -2822,7 +3044,15 @@ _FROM_FIELD_READ_COUNTS = {
     "council.py": 2,       # convene's `convener` param + its registry write —
                            # the actor-gate KEY is stored raw (like meld's
                            # state[peers]); every emit launders via _dsan
+    "dispatches.py": 6,    # reissue notice recovery matches the raw author;
+                           # +5: MELD-DIFF post from and nearest-seed convener
+                           # match only the recipient and pair; no identity
+                           # reaches a refusal or display
     "homes.py": 1,
+    "chatshort.py": 1,     # owed_to: a row's dm as a bool (never cut a
+                           # DM); every line renders through chat._fmt
+    "beacon_doorbell.py": 1,  # _acks: an ack row's from, compared with the
+                              # seat it asks for and never emitted
     "route.py": 2,        # the routing verb's header: the family the caller
                           # asked FROM, compared against the alias they typed
                           # so the resolution is visible. A family name, not a
@@ -2842,7 +3072,26 @@ _FROM_FIELD_READ_COUNTS = {
                               # MATCHING-ONLY (it counts which SIDES used review
                               # vocabulary and emits no name; the whisper line
                               # itself launders the peer via chat._dsan)
-    "meld.py": 17,    # +1: say's pinned-role preflight reads the legacy `peer`
+    "meld_standing.py": 2,  # the standing meld (task/3560): fold's
+                            # membership read (MATCHING-ONLY) and recv's
+                            # sender, emitted through chat._dsan.
+    "meld.py": 22,    # +1: partial-opening repair matches an invite row's
+                      # `from` against the exact convener; MATCHING-ONLY, while
+                      # every emitted identity still routes chat._dsan.
+                      # +1 net, the pair meld: `seeds` reads each row's
+                      # `from` only to match it against the seed's own
+                      # convener= field, and `latest_seed` returns the raw
+                      # convener as a KEY that join launders before any emit
+                      # (d_convener) and history_digest launders per party;
+                      # the loop join carried moved into latest_seed. (was 20)
+                      # +3, all MATCHING-ONLY and each verified before this
+                      # re-pin: converged_with's peer membership test (RELOCATED
+                      # from seats_stop_signals._melded_with, which drops by 1);
+                      # _peers_closed's row `from`, matched against the pinned
+                      # set to find a member's unread DONE (the refusal's names
+                      # route chat._dsan); _member's projection `peer`, a
+                      # casefold comparison that returns a bool. (was 17)
+                      # +1: say's pinned-role preflight reads the legacy `peer`
                       # fallback into an INTERNAL membership set; every identity
                       # in the refusal is laundered by _membership_mismatch_lines.
                       # +4: lifecycle replay validates peer, matches it against
@@ -2867,22 +3116,66 @@ _FROM_FIELD_READ_COUNTS = {
     "seats_identity.py": 8,
     "machine_senders.py": 1,   # owner_rail's owner-name test: MATCHING-ONLY,
                                # a bool, never an emitted name.
+    "goals.py": 2,        # _chat_word (goal-ledger D1): the is_owner test,
+                          # MATCHING-ONLY, and the refusal's author, laundered
+                          # through seats_ack._seat_label before any sink.
+    "ownerasks.py": 2,    # NOT-A-CHAT-ROW: move_asker's custody record and
+                          # `helm decide show`'s custody line read the card's
+                          # previous asker, a validated seat token.
     # third wave: one site to seats_delivery. 22 -> 21, 0 -> 1, 96 -> 96.
     "seats_delivery.py": 1,
     # fourth wave: two sites to seats_stop_signals. 21 -> 19, 0 -> 2, 96 -> 96.
-    "seats_stop_signals.py": 3,   # +1: _meld_open_with, the spiral block's
-                                  # open-room detector (task/981). VERIFIED
-                                  # BEFORE RE-PINNING, which is the whole point
-                                  # of this arm: it reads peer/peers ONLY to
-                                  # test membership and never emits them; the
-                                  # one value that reaches a sink is `room`,
-                                  # laundered AT THE READ via
-                                  # _clip(_scrub(...)) exactly like its sibling
-                                  # _melded_with. The reason strings interpolate
-                                  # the CALLER's peer argument, not the file's.
+    "review_door.py": 17,  # +3, the closing check (done_refusal): the
+                           # round's convener, from the named round's seed
+                           # or meld.latest_seed, only joins the invited set
+                           # to test which ledger rows the block's tip
+                           # claims. MATCHING-ONLY: its refusal emits the
+                           # room, a row id and the ledger row's lane and
+                           # seat, never a chat-row name. (was 14)
+                           # +3, the pair meld's spiral ruling:
+                           # pair_exchange reads each row's `from` only to
+                           # test it against the author and the current
+                           # reader and collect who spoke; its two new
+                           # convener reads restrict those turns to one exact
+                           # eligible round. It returns a room name and never
+                           # a seat. (was 11)
+                           # +2, the pair meld: room_outcome's convener now
+                           # comes from meld.latest_seed or the named round's
+                           # seed (a KEY: every party name it emits routes
+                           # chat._dsan), and pair_turns_owed matches each
+                           # row's `from` against the round's members, its
+                           # one emitted peer laundered in pair_turn_line.
+                           # (was 9)
+                           # +3: the falsifier census (meld_seed's seed
+                           # test, joined_within's invited set and each row's
+                           # sender) — MATCHING-ONLY, it emits counts, never a
+                           # name.
+                           # room_outcome: the seed's convener (3 sites),
+                           # the invited set, and each chunk's sender — all
+                           # MATCHING; emitted names route chat._dsan.
+    # RELOCATED, not new: the spiral rung left seats_stop_signals for
+    # seats_stop_spiral and both of that file's reads went with it, so the
+    # census TOTAL is unchanged and seats_stop_signals leaves the table.
+    "seats_stop_spiral.py": 2,    # _meld_open_with, the spiral block's
+                                  # open-room detector (task/981): it reads
+                                  # peer/peers ONLY to test membership and
+                                  # never emits them; the one value that
+                                  # reaches a sink is `room`, laundered AT THE
+                                  # READ via _clip(_scrub(...)) exactly like
+                                  # _melded_with. And _spiral_gate's
+                                  # `info["peer"]`, the review spiral's own
+                                  # peer, printed only after it matches
+                                  # dispatches._TOKEN (the seat-name shape):
+                                  # a name that does not match yields no
+                                  # finding at all. (was seats_stop_signals: 2)
     # fifth wave: ten sites to seats_ack — it is the ack ladder, so the
     # from-field IS its subject. 19 -> 9, 0 -> 10, 96 -> 96.
-    "seats_ack.py": 11,   # +1 RELOCATED, not new: render_pending moved here
+    "seats_ack.py": 12,   # +1 RELOCATED, not new: render_ack moved here from
+                          # seats_cli's `cmd` dispatcher with the bulk ack, and
+                          # its `chat._dsan(m.get("from"))` naming the senders
+                          # who watch the acked rows leave pending went with
+                          # it; seats_cli drops by the same 1, to none.
+                          # +1 RELOCATED, not new: render_pending moved here
                           # from seats_cli's `cmd` dispatcher so it sits beside
                           # pending()/fault_lines(), which produce the states it
                           # renders. Its `it["to"]` read went with it. The census
@@ -2893,12 +3186,8 @@ _FROM_FIELD_READ_COUNTS = {
     # five reads moved again from seats_cli to seats_catchup; the split changes
     # ownership, never the conserved total. A pin entry for a module that no
     # longer reads would vouch for call sites that do not exist.
-    "seats_cli.py": 1,    # -1 AGAIN, same shape as render_pending above:
-                          # render_catchup left for seats_catchup, and the
-                          # `chat._dsan(m.get("from"))` that names each parked
-                          # row's author went with it. The legend that says
-                          # what parked/held/retry MEAN now sits beside the
-                          # catchup() that decides them.
+    # seats_cli.py IS GONE FROM THIS PIN: its one read left with render_ack
+    # (above), as render_pending's and render_catchup's did before it.
     "seats_catchup.py": 6,   # +1 RELOCATED, not new — the read above. The
                              # census TOTAL is unchanged and seats_cli drops
                              # by the same 1; the split moves ownership, never
@@ -3131,6 +3420,11 @@ _TRANSPORT_PROJECTION_CONSUMERS = {
     ("chat.py", "_transport_tag"): "CLI, follow, and journal row renderer launders legacy/pre-fix nested fields at the sink",
     ("chat.py", "transport_failure_summary"): "CLI/node/doctor summary launders both nested fields at the sink",
     ("chat.py", "transport_status"): "status owner consumes already-public incidents and routes signer reason through _transient_failure",
+    ("chat.py", "_classify_failures"): "reads already-public incident rows (sign_failures -> _failure_public) and adds its cause and liveness sentences through _safe_reason before any row leaves it",
+    ("chat.py", "_resolution_public"): "resolution publish owner launders profile via _dsan and reason, reader and probe via _safe_reason",
+    ("chat.py", "transport_scoped_lines"): "each dark-seat row passes _public_transport before its line is composed",
+    ("chat.py", "_signing_alert_text"): "the signing page composes only from rows passed through _public_transport, and strips @ so quoted failure text addresses nobody",
+    ("chat.py", "signing_watchdog"): "the watchdog's reason line reads its head row only after _public_transport",
     ("doctor.py", "check_chat_node"): "doctor routes direct signer reason through chat._safe_reason and transport summaries through their public owner",
     ("human.py", "status_line"): "TUI renderer launders both nested fields at the sink",
     ("chatnode.py", "_status"): "signer freshness/core rungs launder through chat._safe_reason at the sink — the staleness reason embeds a git COMMIT SUBJECT and a repo path, the core reason embeds names printed by the signer binary, and none of the three is helm-authored text",

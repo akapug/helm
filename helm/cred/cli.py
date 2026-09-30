@@ -27,9 +27,11 @@ def doctor_rows():
     for r in rs:
         if r["verdict"] == "DRIFT":
             out.append(("WARN",
-                        "credhome %s HOLDS %s (drift — that account's home is %s); "
+                        "credhome %s %s (drift — that account's home is %s); "
                         "%s, `helm cred list` shows the whole estate"
-                        % (_display_path(r["name"]), r["account"], r["wants_home"],
+                        % (_display_path(r["name"]),
+                           _cred.metadata_says(r["account"], r["real"]),
+                           r["wants_home"],
                            "`helm cred heal` restores %s from its %d snapshot%s"
                            % (_display_path(r["name"]), r["named_backups"],
                               "s"[:r["named_backups"] != 1]) if r["named_backups"]
@@ -45,9 +47,15 @@ def doctor_rows():
         out.append(("WARN", "no cred backup for %s — `helm cred backup --all` is "
                             "what makes the next /login reversible" % a))
     if not out:
+        tally = {}
+        for r in rs:
+            state = _cred.token_lineage(r["real"])["state"]
+            tally[state] = tally.get(state, 0) + 1
+        states = ", ".join("%d %s" % (n, s) for s, n in sorted(tally.items()))
         out.append(("OK", "cred homes: %d claude home%s, every dir name matches the "
-                          "account it holds; %d account%s backed up"
-                    % (len(rs), "s"[:len(rs) != 1],
+                          "account its metadata names (lineage %s); %d account%s "
+                          "backed up"
+                    % (len(rs), "s"[:len(rs) != 1], states,
                        len(accounts), "s"[:len(accounts) != 1])))
     return out
 
@@ -95,22 +103,28 @@ def _resolve_home(name):
 def _print_list(args):
     as_json = "--json" in args
     rs = _cred.rows()
+    # ONE lineage read for the whole list (task/2636): N homes cost N small
+    # credential reads and this one file, never a subprocess or a request.
+    families, _why = _cred._lineage_doc()
     for r in rs:
         # AGREE says the identity is right, never that the token is alive: a
         # home copied from Orca weeks ago agrees and cannot log in. FRESHNESS
         # is the second question, asked of Orca's copy of the same account.
         r["orca"] = _orca_column(r)
+        r["token_lineage"] = _cred.token_lineage(r["real"], families=families)
+        # the display carries the short tag, never the lineage key itself
+        r["family"] = r["token_lineage"]["tag"]
     if as_json:
         print(json.dumps(_public_paths(rs), indent=2))
         return 0
     if not rs:
         print("helm cred: no claude credential homes found")
         return 0
-    print("helm cred — identity read from CONTENT (%s oauthAccount), never from "
-          "the dir name; FRESHNESS is the token against Orca's copy of that account:"
-          % ACCOUNT_JSON)
+    print("helm cred — the METADATA account (%s oauthAccount, which Orca rewrites "
+          "on a switch), never the dir name; FRESHNESS is the token against "
+          "Orca's copy of that account:" % ACCOUNT_JSON)
     print("  %-30s %-32s %-8s %-14s %-8s %s"
-          % ("DIR NAME", "ACTUAL ACCOUNT", "VERDICT", "FRESHNESS", "BACKUPS", "NOTE"))
+          % ("DIR NAME", "METADATA ACCOUNT", "VERDICT", "FRESHNESS", "BACKUPS", "NOTE"))
     for r in sorted(rs, key=lambda r: (r["default"], r["name"])):
         note = []
         orca = r["orca"]
@@ -158,6 +172,10 @@ def _print_list(args):
         print("  %-30s %-32s %-8s %-14s %-8s %s"
               % (_display_path(r["name"])[:30], (r["account"] or "-")[:32], r["verdict"],
                  orca["verdict"], r["backups"], "; ".join(note)))
+        print("    " + _lineage_line(r["token_lineage"]))
+    print("  token lineage is %s; `claude auth status` prints the .claude.json "
+          "metadata, not the token; chrome extension account: UNKNOWN (no local "
+          "source)" % _cred.LINEAGE_BASIS)
     drift = [r for r in rs if r["verdict"] == "DRIFT"]
     stale = [r for r in rs if r["orca"]["verdict"] == _cred.STALE]
     print("helm cred: %d home%s, %d drift%s, %d stale against Orca%s"
@@ -165,6 +183,22 @@ def _print_list(args):
              len(stale),
              " — `helm cred heal` (dry-run) shows the repair" if drift else ""))
     return 0
+
+
+def _lineage_line(lin):
+    """One line per home: the token family's recorded accounts against the
+    metadata. MISMATCH names both; UNKNOWN says why and names no account."""
+    fam = "family %s" % lin["tag"] if lin["tag"] else "family ?"
+    if lin["state"] == _cred.LINEAGE_UNKNOWN:
+        return "lineage UNKNOWN: %s (%s)" % (fam, lin["reason"])
+    seen = ", ".join(lin["accounts"])
+    if lin["state"] == _cred.LINEAGE_AMBIGUOUS:
+        return ("lineage AMBIGUOUS: token %s was recorded under %s (more than "
+                "one account); metadata says %s" % (fam, seen, lin["metadata"]))
+    if lin["state"] == _cred.LINEAGE_MISMATCH:
+        return ("lineage MISMATCH: token %s was recorded under %s; metadata "
+                "says %s" % (fam, seen, lin["metadata"]))
+    return "lineage MATCH: token %s recorded under %s" % (fam, seen)
 
 
 def _orca_column(row):
@@ -203,9 +237,9 @@ def _print_sync_orca(args):
         return 1
     res = _cred.sync(path, apply=apply, replace_own_chain=replace)
     shown = _display_path(name)
-    print("helm cred sync-orca (%s): home %s holds %s — %s"
+    print("helm cred sync-orca (%s): home %s %s — %s"
           % ("APPLIED" if apply else "dry-run — add --apply", shown,
-             res["account"] or "-", res["verdict"]))
+             _cred.metadata_says(res["account"], path), res["verdict"]))
     if res["reason"]:
         print("  " + res["reason"])
     if res["action"] == "would-sync":
@@ -461,8 +495,10 @@ def _print_switch_guard(args):
         print("  now safe to run:  %s" % homes.LOGIN_CMDS["claude"](shown))
     else:
         print("  home path redacted; select it by name before running /login")
-    print("  after the login: `helm cred list` shows what this home now holds; "
-          "`helm cred heal` puts %s back when no session holds it." % res["account"])
+    print("  after the login: `helm cred list` shows what this home's metadata "
+          "now says; `helm cred heal` puts back the login whose %s when no "
+          "session holds it."
+          % _cred.metadata_says(res["account"], path))
     return 0
 
 

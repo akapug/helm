@@ -152,6 +152,8 @@ class DriftTest(unittest.TestCase):
 
 class DoctorLinesTest(unittest.TestCase):
     def setUp(self):
+        from tests._two_route_catalog import pin_off_peak
+        pin_off_peak(self)            # the gate's clock is not these arms' subject
         self.d = tempfile.mkdtemp(prefix="helm-test-dl-")
 
     def tearDown(self):
@@ -346,7 +348,7 @@ class SidecarMeterKnobTest(unittest.TestCase):
 
     KIMI_BEFORE = 'host: "127.0.0.1"\nport: 8318\napi-keys:\n  - "tok"\ndebug: false\nusage-statistics-enabled: false\nremote-management:\n  allow-remote: false\n  secret-key: ""\n  disable-control-panel: true\nopenai-compatibility:\n  - name: "moonshot"\n    base-url: "https://api.moonshot.ai/v1"\n    api-key-entries:\n      - api-key: "key"\n    models:\n      - name: "kimi-k3"\n        alias: "kimi-k3"\n      - name: "kimi-k3"\n        alias: "claude-opus-5"\n      - name: "kimi-k3"\n        alias: "claude-sonnet-5"\n      - name: "kimi-k3"\n        alias: "claude-haiku-4-5-20251001"\n      - name: "kimi-k3"\n        alias: "claude-fable-5-1"\n      - name: "kimi-k3"\n        alias: "claude-haiku-4-5"\n      - name: "kimi-k3"\n        alias: "claude-opus-5-5"\nnonstream-keepalive-interval: 15\ntransient-error-cooldown-seconds: 5\nstreaming:\n  keepalive-seconds: 15\n  bootstrap-retries: 2\n'
 
-    CODEX_BEFORE = 'host: "127.0.0.1"\nport: 8317\nauth-dir: "/auth"\napi-keys:\n  - "tok"\ndebug: false\nusage-statistics-enabled: false\nremote-management:\n  allow-remote: false\n  secret-key: ""\n  disable-control-panel: true\nnonstream-keepalive-interval: 15\ntransient-error-cooldown-seconds: 5\nstreaming:\n  keepalive-seconds: 15\n  bootstrap-retries: 2\n# built-in subagent frontmatter ids -> this family\'s model (task/1948)\n# (per id where the family declares subagent_tiers: one pane, two models)\noauth-model-alias:\n  codex:\n    - name: "gpt-6-astra"\n      alias: "claude-opus-5"\n      fork: true\n    - name: "gpt-5.6-sol"\n      alias: "claude-sonnet-5"\n      fork: true\n    - name: "gpt-5.6-sol"\n      alias: "claude-haiku-4-5-20251001"\n      fork: true\n    - name: "gpt-6-astra"\n      alias: "claude-fable-5-1"\n      fork: true\n    - name: "gpt-5.6-sol"\n      alias: "claude-haiku-4-5"\n      fork: true\n    - name: "gpt-6-astra"\n      alias: "claude-opus-5-5"\n      fork: true\n'
+    CODEX_BEFORE = 'host: "127.0.0.1"\nport: 8317\nauth-dir: "/auth"\napi-keys:\n  - "tok"\ndebug: false\nusage-statistics-enabled: false\nremote-management:\n  allow-remote: false\n  secret-key: ""\n  disable-control-panel: true\nnonstream-keepalive-interval: 15\ntransient-error-cooldown-seconds: 5\nstreaming:\n  keepalive-seconds: 15\n  bootstrap-retries: 2\n# built-in subagent frontmatter ids -> this family\'s model (task/1948)\n# (per id where the family declares subagent_tiers: one pane, two models)\noauth-model-alias:\n  codex:\n    - name: "gpt-6.1-sol"\n      alias: "claude-opus-5"\n      fork: true\n    - name: "gpt-6.1-sol"\n      alias: "claude-sonnet-5"\n      fork: true\n    - name: "gpt-6.1-sol"\n      alias: "claude-haiku-4-5-20251001"\n      fork: true\n    - name: "gpt-6.1-sol"\n      alias: "claude-fable-5-1"\n      fork: true\n    - name: "gpt-6.1-sol"\n      alias: "claude-haiku-4-5"\n      fork: true\n    - name: "gpt-6.1-sol"\n      alias: "claude-opus-5-5"\n      fork: true\n'
 
     METER = ("usage-statistics-enabled: true\n"
              "redis-usage-queue-retention-seconds: 3600\n")
@@ -360,7 +362,7 @@ class SidecarMeterKnobTest(unittest.TestCase):
         is gone from both, so a reconcile cannot find it canonical."""
         with self._clean():
             oauth = seat._config_yaml(8317, "/auth", "tok", channel="codex",
-                                      model="gpt-6-astra", family="codex")
+                                      model="gpt-6.1-sol", family="codex")
             keyed = seat._config_yaml_key(
                 8318, "tok", "moonshot", "https://api.moonshot.ai/v1",
                 "kimi-k3", "key")
@@ -383,10 +385,12 @@ class SidecarMeterKnobTest(unittest.TestCase):
 
     def test_the_oauth_output_is_otherwise_byte_identical_to_its_pin(self):
         """The codex control, same shape: the tier-table alias block and every
-        keepalive line survive unchanged."""
+        keepalive line survive unchanged. The pin is a gpt-6.1-sol pane, the
+        model every codex seat runs (seat_catalog.CODEX_MODEL_RULING), so
+        every row, the tiered workers included, names gpt-6.1-sol."""
         with self._clean():
             oauth = seat._config_yaml(8317, "/auth", "tok", channel="codex",
-                                      model="gpt-6-astra", family="codex")
+                                      model="gpt-6.1-sol", family="codex")
         self.assertEqual(oauth.replace(self.METER, "usage-statistics-enabled: false\n"),
                          self.CODEX_BEFORE)
         self.assertNotEqual(oauth, self.CODEX_BEFORE)

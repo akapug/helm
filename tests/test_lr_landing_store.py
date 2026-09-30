@@ -63,8 +63,13 @@ def setUpModule():
 
 
 def tearDownModule():
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT, as tests.test_landreq's does
+    # (task/3039): a stopped patcher left here is module data the sliced
+    # gate's leak audit reads as a rebinding, and fails the run.
+    _LIVE_SEATS_PATCH = None
 
 
 class LandingStoreBackfillTest(unittest.TestCase):

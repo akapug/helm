@@ -91,6 +91,7 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/configs/resolve": _api_configs_resolve,
     "/api/configs/file": _api_configs_file,
     "/api/creds": _api_creds,
+    "/api/models": _api_models,
     "/api/history": _api_history,
     "/api/burn": _api_burn,
     "/api/physics": _api_physics,
@@ -110,6 +111,8 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/ledger/turn": _api_ledger_turn,
     "/api/ledger/native": _api_ledger_native,
     "/api/multiplayer/state": _api_mp_state,
+    "/api/backlog": _api_backlog,
+    "/api/work": _api_work,
 }
 
 POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
@@ -120,6 +123,8 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
     "/api/decisions/comment": _api_decisions_comment,
     "/api/tasks/comment": _api_tasks_comment,
     "/api/projects/state": _api_projects_state,
+    "/api/projects/team": _api_projects_team,
+    "/api/burn/declare": _api_burn_declare,
     "/api/friction/dial": _api_friction_dial,
     "/api/owner/posture": _api_posture_post,
     "/api/skills/toggle": _api_skills_toggle,

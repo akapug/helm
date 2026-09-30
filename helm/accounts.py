@@ -750,7 +750,7 @@ def _bad_entry(key, why):
             "why": why}
 
 
-def read(accounts_path=None):
+def read(accounts_path=None, measured=None):
     """The inventory as the owner's surfaces see it.
 
     {"accounts": [...projected, sorted...], "bad": [...], "unreadable": str|None,
@@ -779,33 +779,71 @@ def read(accounts_path=None):
     rows.sort(key=lambda r: (r.get("vendor") or "", r.get("id") or ""))
     bad.sort(key=lambda b: b["id"])
     return {"accounts": rows, "bad": bad, "unreadable": unreadable,
-            "revision": revision(raw), "totals": totals(rows), "path": p}
+            "revision": revision(raw), "totals": totals(rows, measured),
+            "path": p}
 
 
-def read_strict(accounts_path=None):
+def read_strict(accounts_path=None, measured=None):
     """The authority read: REFUSES an unreadable file instead of answering an
     empty inventory. `helm accounts` uses this, because telling an agent we have
     zero accounts when the file is garbled is worse than telling it nothing."""
-    view = read(accounts_path)
+    view = read(accounts_path, measured)
     if view["unreadable"]:
         raise AccountsUnreadable(view["unreadable"])
     return view
 
 
-def totals(rows):
+def billed_free(group):
+    """Whether one subscription's records say it is FREE: every billing they
+    state is `free`, and at least one states it. THE ONE RULE for a free
+    bill (task/3635): `totals` counts by it, and `decorate_duplicates`
+    carries its answer on every record so the page counts the same one
+    whichever record it speaks for."""
+    return {r.get("billing") for r in group if r.get("billing")} == {"free"}
+
+
+def totals(rows, measured=None):
     """accounts N · monthly spend $X — so nobody has to recount.
 
     UNPRICED ROWS ARE COUNTED, NOT ASSUMED FREE. A sum that silently treats
-    'unknown' as zero understates the bill and reads authoritative doing it."""
-    units = sum(int(r.get("count") or 0) for r in rows)
-    spend, unpriced = 0.0, 0
-    for r in rows:
-        value = r.get("price_value")
-        if value is None:
+    'unknown' as zero understates the bill and reads authoritative doing it.
+
+    ONE SUBSCRIPTION COUNTS ONCE (task/3635). Rows naming one login are one
+    bill written down more than once: two homes of a login and the default
+    pointer at it are three rows and one subscription. They count once, at
+    the largest count and price any of them states, and are unpriced only
+    when none is priced. `accounts` stays the number of ROWS; a row that
+    names no login is its own bill.
+
+    THIS IS THE ONE PLACE THE RULE LIVES, keyed exactly as the card's
+    `subscription` is (declared_identity against `measured`), and `read` is
+    its one caller: the web card, `helm accounts` and `helm accounts --json`
+    all print the totals of the view `read` built with the measured rows in
+    hand, so the three cannot disagree. Without measured rows a default
+    pointer, which only the measured side resolves, stays its own bill.
+
+    A BILL DECLARED FREE IS AN ACCOUNT, NEVER A PAID ONE (task/3635). `free`
+    counts the units whose rows all say `billing: free`; they cost $0, so
+    they are never "unpriced", and every surface says "N accounts (M paid,
+    K free)" rather than calling them paid."""
+    groups = {}
+    for i, r in enumerate(rows):
+        key = subscription_key(declared_identity(r, measured))
+        groups.setdefault(key or ("row", i), []).append(r)
+    units, spend, unpriced, free = 0, 0.0, 0, 0
+    for group in groups.values():
+        count = max(int(r.get("count") or 0) for r in group)
+        units += count
+        if billed_free(group):
+            free += count
+            continue
+        prices = [r["price_value"] for r in group
+                  if r.get("price_value") is not None]
+        if not prices:
             unpriced += 1
             continue
-        spend += value * int(r.get("count") or 0)
-    return {"accounts": len(rows), "units": units,
+        spend += max(prices) * count
+    return {"accounts": len(rows), "units": units, "free": free,
             "monthly_spend": round(spend, 2), "unpriced": unpriced}
 
 
@@ -937,8 +975,35 @@ def _merge_over_stored(payload, stored):
     return merged
 
 
+class Saved(tuple):
+    """What `save` answers: (row, error, code), the three every caller
+    unpacks, and `.revision`, the revision of the inventory THIS save wrote.
+
+    It is computed under the lock from the map the write put on disk, never
+    from a read afterwards. A read after the lock is released can already
+    hold a third writer's save, and a page that adopted THAT revision would
+    hold one covering a write it never drew: its next save would pass the
+    compare-and-set and merge over a change nobody on that page saw. None
+    when the save wrote nothing.
+
+    A tuple of three with an attribute, rather than a fourth element, because
+    every caller of `save` unpacks three and only the web door needs this."""
+
+    def __new__(cls, row, error, code, revision=None):
+        self = super().__new__(cls, (row, error, code))
+        self.revision = revision
+        return self
+
+    def __getnewargs__(self):
+        """What copy, deepcopy and pickle hand `__new__`. tuple's own answer
+        is the ONE tuple of items, which this `__new__` cannot take, so every
+        copy of an answer raised TypeError."""
+        return (*self, self.revision)
+
+
 def save(payload, expected_revision=None, accounts_path=None, original_id=None):
-    """Add or MERGE one declared account -> (row, error, code).
+    """Add or MERGE one declared account -> Saved: (row, error, code), and
+    `.revision`, the revision this save wrote (None when it wrote nothing).
 
     A field the payload does not carry keeps the value already on disk; an
     explicit empty or null clears it (`_merge_over_stored`). The merge happens
@@ -962,11 +1027,11 @@ def save(payload, expected_revision=None, accounts_path=None, original_id=None):
     with a duplicate, so that is the contract. An ADD passes None and is
     unaffected: this is about an editor that already has a row open."""
     if not isinstance(payload, dict):
-        return None, "an account must be a set of fields, not a bare value.", \
-            "refused"
+        return Saved(None, "an account must be a set of fields, not a bare "
+                           "value.", "refused")
     unknown = _unknown_error(payload)
     if unknown:
-        return None, unknown, "refused"
+        return Saved(None, unknown, "refused")
     try:
         # THE ID IS CLEANED FIRST, which is validate's own order: an
         # address-shaped id is an ID problem with a slug to suggest, and the
@@ -974,25 +1039,25 @@ def save(payload, expected_revision=None, accounts_path=None, original_id=None):
         # that tells him what to type instead.
         account_id = _clean_declared_id(payload.get("id"))
     except ValueError as e:
-        return None, str(e), "refused"
+        return Saved(None, str(e), "refused")
     if original_id is not None:
         try:
             original = _clean_id(original_id)
         except ValueError as e:
-            return None, str(e), "refused"
+            return Saved(None, str(e), "refused")
         if original != account_id:
             # BEFORE THE LOCK because it needs nothing from disk, and it is a
             # refusal rather than a rename so the failure mode cannot be the
             # duplicate this check exists to stop. Both ids are cleaned, so
             # the sentence carries no payload a hostile one could smuggle.
-            return None, (
+            return Saved(None, (
                 "the id is the row's key, so an edit cannot change it: '%s' "
                 "cannot become '%s'. Remove that row and add it again under "
                 "the new id — nothing was changed." % (original, account_id)
-            ), "refused"
+            ), "refused")
     secret = _secret_error(payload)
     if secret:
-        return None, secret, "refused"
+        return Saved(None, secret, "refused")
 
     def _mutate(raw, removed):
         if expected_revision is not None and revision(raw) != expected_revision:
@@ -1037,23 +1102,28 @@ def save(payload, expected_revision=None, accounts_path=None, original_id=None):
         # standing ban on the name.
         while row["id"] in removed:
             removed.remove(row["id"])
-        return dict(row)
+        # THE REVISION THIS WRITE PUTS ON DISK, taken here because `raw` is
+        # the map `_update_doc` writes, under the lock, as it stands now. A
+        # read after the lock is released can already hold a third writer's
+        # save.
+        return dict(row), revision(raw)
 
     try:
-        out, err = _update_doc(_mutate, accounts_path)
+        done, err = _update_doc(_mutate, accounts_path)
     except _Conflict as e:
-        return None, str(e), "conflict"
+        return Saved(None, str(e), "conflict")
     except _Vanished as e:
         # its own code, because the card has to RELOAD on it exactly as it
         # does on a conflict: he is editing a row that is not there.
-        return None, str(e), "gone"
+        return Saved(None, str(e), "gone")
     except ValueError as e:
-        return None, str(e), "refused"
+        return Saved(None, str(e), "refused")
     if err:
-        return None, err, "refused"
+        return Saved(None, err, "refused")
+    out, wrote = done
     pk.event("accounts", out["id"], "declared %s %s x%d"
              % (out["vendor"], out["plan"], out["count"]))
-    return project(out), None, None
+    return Saved(project(out), None, None, wrote)
 
 
 def remove(account_id, expected_revision=None, accounts_path=None):
@@ -1371,7 +1441,10 @@ def client_rows(accounts_path=None, measured=None):
     where a page could otherwise POST a key of its choosing and bind a record to
     a subscription it picked, and the stored-row validator, where persisting it
     would hand every older row a structure a later keying did not mint."""
-    view = read(accounts_path)
+    if measured is None:
+        measured = _measured()
+    # the totals are keyed against the same measured rows as `subscription`
+    view = read(accounts_path, measured)
     return dict(view, accounts=decorate_duplicates(view["accounts"], measured))
 
 
@@ -1413,6 +1486,12 @@ def decorate_duplicates(rows, measured=None):
     if measured is None:
         measured = _measured()
     dups = duplicate_groups(rows, measured)
+    keyed = [(row, subscription_key(declared_identity(row, measured)))
+             for row in rows or []]
+    same_bill = {}
+    for row, key in keyed:
+        if key:
+            same_bill.setdefault(key, []).append(row)
     by_vendor = {}
     for row in rows or []:
         by_vendor.setdefault((row.get("vendor") or "").strip().lower(),
@@ -1432,6 +1511,10 @@ def decorate_duplicates(rows, measured=None):
             # Keyed here, every home under a login lands on the row it belongs
             # to.
             subscription=subscription_key(declared_identity(row, measured)),
+            # the whole subscription's answer, by `totals`' own rule, so the
+            # page's count of free accounts is the declared total's
+            billed_free=billed_free(same_bill.get(
+                subscription_key(declared_identity(row, measured))) or [row]),
             duplicate_of=dups.get(account_id, []),
             points_at_default=bool(DEFAULT_HANDLE_RE.match(target.lower())),
             vendor_siblings=([s.get("id") for s in siblings
@@ -1952,8 +2035,10 @@ def _print_rows(view, measured=None):
                                         "" if row["measured_as"] in linked["matched"]
                                         else " (declared, not measured)")))
     t = view["totals"]
-    print("  totals: %d account(s), %d unit(s), $%s/month%s"
-          % (t["accounts"], t["units"], t["monthly_spend"],
+    print("  totals: %d account(s), %d unit(s)%s, $%s/month%s"
+          % (t["accounts"], t["units"],
+             " (%d free)" % t["free"] if t.get("free") else "",
+             t["monthly_spend"],
              " (%d unpriced)" % t["unpriced"] if t["unpriced"] else ""))
     if linked["measured_only"]:
         print("  measured but NOT declared (%d): %s"
@@ -2021,13 +2106,16 @@ def cmd_accounts(args):
                         usage="accounts [--json]")
         if rc is not None:
             return rc
+        # ONE MEASURED READ for the join and the totals, the one the web
+        # card keys against too (task/3635)
+        measured = _measured()
         try:
-            view = read_strict()
+            view = read_strict(measured=measured)
         except AccountsUnreadable as e:
             print("helm accounts: " + str(e), file=sys.stderr)
             return 1
         if verb == "--json":
-            print(json.dumps(dict(view, join=join(view["accounts"], _measured())),
+            print(json.dumps(dict(view, join=join(view["accounts"], measured)),
                              indent=2, ensure_ascii=False))
             return 0
         if not view["accounts"] and not view["bad"]:
@@ -2035,7 +2123,7 @@ def cmd_accounts(args):
                   "on the cockpit's quota tab, or `helm accounts seed --apply` "
                   "adds a row for every account helm already knows about.")
             return 0
-        _print_rows(view, _measured())
+        _print_rows(view, measured)
         return 0
     if verb == "show":
         rc = guard_tail("helm accounts show", flagged, flags=("--json",),

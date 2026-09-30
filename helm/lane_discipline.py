@@ -12,8 +12,9 @@ its private worktree -> verify it with focused runs (`helm gate run --focus`,
 the tests the change reaches, beside the tree-wide audits that
 `helm gate audits` prints) -> a cross-family
 reviewer reads it and, on a clean read, HOLDS it source-clean (`helm dispatch
-hold --source-clean`), or, on a MECHANICAL finding, commits the cure in their
-OWN worktree on a branch off the exact reviewed tip and records that tip on a
+hold --source-clean`), or, on a MECHANICAL finding, commits the cure off the
+exact reviewed tip in their own room, or in a `git clone --shared` clone whose
+commit they fetch into the repo, and records that tip on a
 FIX verdict (`--patch-tip`) for the lane owner or integrator to rebase onto ->
 the integrator composes the train, runs its ONE serial whole suite (the
 land gate) on the tree that lands, the approve binds that suite's token, and
@@ -25,8 +26,8 @@ none of it, not a rule that one family may only look. A DESIGN finding is
 never patched under review — it goes to a meld.
 
 NOTE WHAT DID NOT CHANGE: every one of those authors writes INSIDE A LANE. A
-reviewer's cure is a commit on a branch off the reviewed tip in the reviewer's
-own worktree; it is never a commit on the shared checkout's base branch, which
+reviewer's cure is a commit off the reviewed tip in the reviewer's own room or
+shared clone; it is never a commit on the shared checkout's base branch, which
 is the exact act this rung refuses.
 
 THE COST WAS NOT THE COMMIT, IT WAS THE INHERITANCE. Two OTHER seats then cut
@@ -285,21 +286,24 @@ def _refusal(root, detail):
     base = base_branch(root)
     return [
         "REFUSED: %s" % detail,
+        "move the change into a lane: claim one, copy your edited files into "
+        "the room it prints, and commit there:",
+        "    helm work claim <lane-name> --seat <your-seat-name>",
+        "    cp <each edited file> <the room it prints>/<same path>   (then, "
+        "back here: git checkout -- <each file>)",
+        "    cd <the room it prints> && git add <files> && git commit",
         "no lane holds this change, so no gate ran on it and no cross-family "
         "verdict covers it — a reviewer's own cure is welcome, but it belongs "
-        "on a branch off the tip they reviewed, in their own worktree, named "
-        "on the verdict; this is the shared checkout's base branch. And that "
+        "off the tip they reviewed, in their own room or in a `git clone "
+        "--shared` clone fetched back with `git -C <repo> fetch "
+        "--no-write-fetch-head <clone> <sha>`, named on the verdict; this is the shared checkout's base "
+        "branch. And that "
         "is not the worst of it: every lane cut "
         "from '%s' afterwards INHERITS the commit silently. Their diff against "
         "origin/%s shows YOUR change as THEIRS, and because a verdict is a "
         "statement about a TREE, an APPROVE on their lane covers your commit "
         "whether the reviewer noticed it or not. Measured 2026-08-03, twice."
         % (base, base),
-        "move it into a lane — the change is not lost, `git stash -u` carries "
-        "it whole:",
-        "    git stash -u",
-        "    helm work claim <lane-name> --seat <your-seat-name>",
-        "    cd <the room it prints> && git stash pop",
         "A FOLD IS NOT AFFECTED BY THIS RUNG, and that is deliberate — folds "
         "are the one correct path onto '%s'. `git merge` builds its commit "
         "through pre-merge-commit and never reaches a pre-commit rung, and a "

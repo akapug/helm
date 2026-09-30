@@ -34,11 +34,13 @@ from unittest import mock
 
 from tests.test_web_chat_client_runtime import _extract_fn  # noqa: E402
 from tests.test_work import LandedWorld  # noqa: E402
+from tests._ownerverbs import owner_verbs, view_markup  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import (burnflags, home, pk, registry, repofacts,  # noqa: E402
-                  scheduler, tasks, web, web_board, web_cache, web_ui_loader)
+from helm import (burnflags, gatewindow, home, landreq, pk,  # noqa: E402
+                  registry, repofacts, scheduler, tasks, vcs, web, web_board,
+                  web_cache, web_ui_loader)
 from helm import seat as seat_mod  # noqa: E402
 
 
@@ -113,13 +115,21 @@ def _placed(roster, paths):
     return out
 
 
+# WHAT A CARD CARRIES FOR THE ONE LAND BOARD (task/3585) off a pipeline row
+# that names no task, holder, tip, gate or mark
+_BARE = {"task": None, "holder": "unknown", "tip": None, "gate": "",
+         "contrary": False, "stalled": False}
+
+
 def _lr_body(read_age_s=4):
     """The land pipeline's body for a board scoped to alpha. Two loops, one of
-    them HONORED (closed through succession, so not in flight)."""
+    them HONORED (closed through succession, so not in flight). `read_at` is
+    the instant its reading was taken, which `read_age_s` counts from."""
     return {
         "withheld": {"scope": "alpha", "scope_repo": "/x/.git",
                      "foreign": 0, "unresolved": 0, "by_project": {}},
         "read_age_s": read_age_s, "projected_age_s": read_age_s,
+        "read_at": time.time() - read_age_s,
         "unavailable": None,
         "loops": [{"id": "r1", "lane": "lane-a", "honored": False},
                   {"id": "r2", "lane": "lane-b", "honored": True}],
@@ -147,6 +157,7 @@ def _lr_all_body(read_age_s=6):
         "withheld": {"scope": "alpha", "scope_repo": "/x/.git",
                      "foreign": 3, "unresolved": 1, "by_project": {"beta": 2}},
         "read_age_s": read_age_s, "projected_age_s": read_age_s,
+        "read_at": time.time() - read_age_s,
         "unavailable": None,
         "loops": [{"id": "r1", "lane": "lane-a", "state": "AWAITING_REVIEW",
                    "honored": False},
@@ -251,8 +262,7 @@ class BoardJoinTest(unittest.TestCase):
         # EVERY LEG GETS A BUDGET NO TEST BOX CAN MISS. The arms about a slow
         # leg shorten that one leg's own; the rest must never time out here.
         budgets = mock.patch.object(
-            web_board, "_LEG_BUDGET_S", dict.fromkeys(
-                ("flags", "tasks", "seats", "lands", "trunk"), 60),
+            web_board, "_LEG_BUDGET_S", dict.fromkeys(web_board._LEGS, 60),
             create=True)
         budgets.start()
         self.addCleanup(budgets.stop)
@@ -299,6 +309,14 @@ class BoardJoinTest(unittest.TestCase):
                          ["a1", "a2", "a3"])
         self.assertEqual(got["beta"]["tasks"]["open"], 1)
 
+    def test_a_projects_line_counts_its_open_p0_and_p1(self):
+        """The project's line says "3 open · 3 P1" (task/3445): the join
+        counts each open row's rank, and a closed P1 is not one of them."""
+        got = self.board()["projects"]
+        self.assertEqual((got["alpha"]["tasks"]["p0"],
+                          got["alpha"]["tasks"]["p1"]), (0, 3))
+        self.assertEqual(got["beta"]["tasks"]["p1"], 1)
+
     def test_a_project_with_no_seats_carries_empty_seats_not_a_guess(self):
         """delta has open work and nobody seated on it. Its join says so in
         two empty lists; it must not borrow another project's seats."""
@@ -317,6 +335,22 @@ class BoardJoinTest(unittest.TestCase):
         # the seats behind each chip ride with it
         self.assertEqual(fams["anthropic"]["seats"], ["alpha-claude"])
         self.assertEqual(fams["codex"]["seats"], ["seat-a"])
+
+    def test_each_family_names_the_account_groups_that_bill_it(self):
+        """The Families card on Fleet › credit speaks model families, the
+        accounts table vendors; the flags section carries the join: the seat
+        catalog's one reading of the groups that bill each family, in route
+        order — the reading the seeder mints its rows from (task/3461)."""
+        from helm import seat
+        fams = self.board()["sections"]["flags"]["families"]
+        self.assertIn("anthropic", fams)
+        self.assertIn("codex", fams)
+        for fam in fams:
+            self.assertEqual(fams[fam]["bills"], seat.billing_groups(fam), fam)
+            self.assertNotIn("vendor", fams[fam], fam)
+            self.assertIn("money_provenance", fams[fam], fam)
+        self.assertEqual(fams["anthropic"]["bills"], ["anthropic"])
+        self.assertEqual(fams["codex"]["bills"], ["codex"])
 
     def test_a_family_with_no_flag_is_carried_and_says_so(self):
         body = self.board()
@@ -504,8 +538,10 @@ class BoardJoinTest(unittest.TestCase):
 
     def test_gh_itself_is_asked_for_the_visibility_field(self):
         """The one real spawn, with `gh` replaced by a script on PATH: the
-        argv is what the brief names, and an answer gh does not recognise is
-        unknown rather than a guess."""
+        argv is what the brief names, with the host spelled out so GH_HOST
+        cannot send the ask elsewhere (tests/test_or_free_model_class.py),
+        and an answer gh does not recognise is unknown rather than a
+        guess."""
         bindir = tempfile.mkdtemp(prefix="helm-fake-gh-")
         self.addCleanup(shutil.rmtree, bindir, True)
         log = os.path.join(bindir, "argv")
@@ -519,8 +555,8 @@ class BoardJoinTest(unittest.TestCase):
         self.assertEqual(got, ("PUBLIC", None))
         with open(log) as handle:
             self.assertEqual(handle.read().split(),
-                             ["repo", "view", "akapug/alpha", "--json",
-                              "visibility"])
+                             ["repo", "view", "github.com/akapug/alpha",
+                              "--json", "visibility"])
 
     def test_a_quiet_projects_repos_are_never_sent_to_gh(self):
         run = self._repo(self.paths["gamma"], int(self.now) - 50 * 86400)
@@ -563,18 +599,27 @@ class BoardJoinTest(unittest.TestCase):
         alpha = self.board()["projects"]["alpha"]
         # `trunk_contains_tip` rides every card, None where the pipeline
         # never answered it — "not asked", which the page draws as before —
-        # and beside it the one predicate's answer, False over a None
+        # and beside it the one predicate's answer, False over a None, and
+        # the source-clean sentence, None on a row that owes no on-main move
         self.assertEqual(alpha["lanes"]["loops"],
                          [{"id": "r1", "lane": "lane-a",
                            "state": "AWAITING_REVIEW",
                            "trunk_contains_tip": None,
-                           "on_main_unverdicted": False},
+                           "on_main_unverdicted": False,
+                           "source_clean_on_main": None,
+                           "owes_rehold": False, "age_s": None,
+                           "mark": "moving", **_BARE},
                           {"id": "r3", "lane": "lane-g", "state": "READY",
+                           **_BARE,
                            "trunk_contains_tip": None,
-                           "on_main_unverdicted": False}])
+                           "on_main_unverdicted": False,
+                           "source_clean_on_main": None,
+                           "owes_rehold": False, "age_s": None,
+                           "mark": "moving"}])
         self.assertEqual(alpha["lanes"]["building_lanes"], ["lane-c"])
         self.assertEqual(alpha["landed"],
-                         [{"lane": "lane-z", "task": "task/9", "age_s": 3600}])
+                         [{"lane": "lane-z", "task": "task/9", "age_s": 3600,
+                           "tip": None, "gate": ""}])
 
     def test_an_unread_lands_list_is_unknown_not_empty(self):
         self.lr["recent_lands"] = {"rows": [], "total": None,
@@ -615,7 +660,13 @@ class BoardJoinTest(unittest.TestCase):
         # absent — and has no count line to draw, which is None, not a zero
         self.assertEqual(got["projects"]["gamma"]["pipeline"],
                          {"loops": [], "landed": [], "on_main": None,
-                          "collapsed": []})
+                          "collapsed": [], "loops_more": {}, "rehold": None,
+                          "tally": {"live": 0, "marks": {"contrary": 0,
+                                                         "stalled": 0,
+                                                         "nonbillable": 0,
+                                                         "moving": 0},
+                                    "holders": {}},
+                          "landed_more": 0})
         # the scope project keeps its own scoped read
         self.assertNotIn("pipeline", got["projects"]["alpha"])
         # rows no registered project owns are counted, never placed
@@ -650,6 +701,125 @@ class BoardJoinTest(unittest.TestCase):
         fleet = self.board()["sections"]["fleet"]
         self.assertIs(fleet["loading"], True)
         self.assertIsNone(fleet["unavailable"])
+
+    # -- a warm read keeps its stamps (task/3657) ------------------------------
+
+    def test_an_unmoved_all_projects_reading_keeps_its_read_stamp(self):
+        """EVERY board response asks the all-projects read again, and while
+        nothing moved the pipeline answers each ask with the SAME reading.
+        The fleet section's clock is that reading's own instant, so it is one
+        stamp on every response. Derived from each ask's completion less a
+        whole-second age, it moved on every response, and every Work poll
+        read a new revision and rebuilt its snapshot (task/3657)."""
+        first = self.board()["sections"]["fleet"]["measured_at"]
+        self.assertTrue(web_board._fleet_wait(5))
+        time.sleep(0.3)                 # a later ask of the same reading
+        self.board()
+        self.assertTrue(web_board._fleet_wait(5))
+        again = self.board()["sections"]["fleet"]["measured_at"]
+        self.assertGreaterEqual(self.calls["lr_all"], 2)  # asked again
+        self.assertIsNotNone(first)
+        self.assertEqual(again, first)
+        self.assertEqual(first, self.lr_all["read_at"])
+
+    def test_a_reread_of_an_unmoved_land_pipeline_keeps_its_read_stamp(self):
+        """The lands leg reads the pipeline again behind its served reading;
+        an unmoved pipeline answers with the same reading, and the section
+        keeps that reading's stamp rather than the re-read's clock less a
+        whole-second age (task/3657)."""
+        first = self.board()["sections"]["lands"]["measured_at"]
+        web_board._forget()             # the leg is read again
+        time.sleep(0.3)
+        again = self.board()["sections"]["lands"]["measured_at"]
+        self.assertEqual(self.calls["lr"], 2)
+        self.assertEqual(again, first)
+        self.assertEqual(first, self.lr["read_at"])
+
+    def test_a_leg_read_past_its_budget_does_not_hold_the_next_board(self):
+        """A board waits for each leg until THAT READ's budget runs out. A read
+        an earlier board already waited its budget out on is still being
+        read, and the next board says so at once: waiting a second budget on
+        it cost every warm poll three seconds on the owner's console while
+        the land projection rebuilt (task/3657). What each board waited is
+        read off the join it made, never off the clock."""
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        waits, real = [], web_board._read_behind
+
+        def slow(qs):
+            if not qs.get("all_projects"):
+                gate.wait(10)
+            return self._api_lr(qs)
+
+        class Joined:
+            """The lands read's thread, recording each board's wait on it."""
+            def __init__(self, thread):
+                self.thread = thread
+
+            def join(self, timeout=None):
+                waits.append(timeout)
+                self.thread.join(timeout)
+
+            def is_alive(self):
+                return self.thread.is_alive()
+
+        def spied(key, *args, **kw):
+            thread, box = real(key, *args, **kw)
+            if thread is None or key != "board:lands":
+                return thread, box
+            return Joined(thread), box
+        with mock.patch.dict(web_board._LEG_BUDGET_S, {"lands": 0.3}), \
+                mock.patch.object(web_board, "_read_behind", spied), \
+                mock.patch.object(web, "_roster_cached", self._roster), \
+                mock.patch.object(web, "_api_lr", slow):
+            first = web._api_board()
+            second = web._api_board()
+            gate.set()
+            self.assertTrue(self._settle("lands"))
+            third = web._api_board()
+        self.assertEqual(len(waits), 2, waits)
+        self.assertGreater(waits[0], 0.2, "the first board did not wait for "
+                           "the leg read it started")
+        self.assertEqual(waits[1], 0.0, "the next board waited a second "
+                         "budget on a read already past its own")
+        self.assertIs(first["sections"]["lands"]["loading"], True)
+        self.assertIs(second["sections"]["lands"]["loading"], True)
+        self.assertIsNone(second["sections"]["lands"]["unavailable"])
+        self.assertEqual(self.calls["lr"], 1, "a second lands read started")
+        # the read it left behind lands, and is what the board then serves
+        self.assertFalse(third["sections"]["lands"].get("loading"))
+        self.assertEqual(third["projects"]["alpha"]["lanes"]["in_flight"], 1)
+
+    def test_the_marks_are_the_boards_own_four_sections(self):
+        """THE WORK READER'S REVISION MARKS FOUR SECTIONS (lands, fleet,
+        seats, tasks: each one's clock, scope and state). `_board_marks`
+        answers them off the board's OWN legs and fleet read, without the
+        joins, so a Work poll with nothing moved costs no board build; and
+        they are the sections `/api/board` carries, so the revision they make
+        is the whole board's (task/3657)."""
+        from helm import work_model
+        with mock.patch.object(web, "_roster_cached", self._roster), \
+                mock.patch.object(web, "_api_lr", self._api_lr):
+            web._api_board()
+            self.assertTrue(web_board._fleet_wait(5))
+            board = web._api_board()
+            self.assertTrue(web_board._fleet_wait(5))
+            with mock.patch.object(web_board, "_seats_join",
+                                   side_effect=AssertionError("joined")):
+                marks, projects = web_board._board_marks()
+        self.assertEqual(sorted(marks["sections"]),
+                         ["fleet", "lands", "seats", "tasks"])
+        for name in ("fleet", "lands", "seats", "tasks"):
+            for key in ("measured_at", "scope", "unavailable", "loading",
+                        "stale"):
+                with self.subTest(section=name, field=key):
+                    self.assertEqual(marks["sections"][name].get(key),
+                                     board["sections"][name].get(key))
+        self.assertIsNotNone(marks["sections"]["fleet"]["measured_at"])
+        self.assertEqual(projects, web_board._projects())
+        self.assertEqual(
+            work_model.revision(marks, projects, "fp", NOW),
+            work_model.revision(board, web_board._projects(), "fp", NOW))
 
     # -- the last land, off each project's own trunk ---------------------------
 
@@ -714,13 +884,36 @@ class BoardJoinTest(unittest.TestCase):
         self.assertEqual(self.board()["sections"]["trunk"]["source"],
                          "git for-each-ref")
 
+    def test_the_gate_window_is_read_and_unreadable_is_never_no_gate(self):
+        """task/3129: the board reads the store `helm gate window show`
+        reads. None launched here: every project with a checkout carries an
+        empty list, which is an answer. A store nobody can read is the gate
+        section UNAVAILABLE with its reason, and no project carries a list."""
+        self._repo(self.paths["alpha"], int(self.now) - 60)
+        body = self.board()
+        self.assertIsNone(body["sections"]["gate"]["unavailable"])
+        self.assertEqual(body["sections"]["gate"]["source"],
+                         "helm gate window show")
+        self.assertEqual(body["projects"]["alpha"]["gate"], [])
+        self.assertNotIn("gate", body["projects"]["beta"])   # no checkout
+        path = gatewindow.runs_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("{not json")
+        web_board._forget()
+        body = self.board()
+        self.assertIn("could not be read",
+                      body["sections"]["gate"]["unavailable"])
+        self.assertNotIn("gate", body["projects"]["alpha"],
+                         "an unreadable gate window was sent as no gate")
+
     # -- the clocks --------------------------------------------------------
 
     def test_every_section_carries_its_own_clock(self):
         sections = self.board()["sections"]
         self.assertEqual(sorted(sections),
-                         ["flags", "fleet", "lands", "lights", "seats",
-                          "tasks", "trunk"])
+                         ["flags", "fleet", "gate", "lands", "lights",
+                          "seats", "tasks", "teams", "trunk"])
         for name, sec in sections.items():
             for key in ("source", "measured_at", "age_s", "limit_s", "stale",
                         "unavailable"):
@@ -738,7 +931,9 @@ class BoardJoinTest(unittest.TestCase):
         self.lr = _lr_body(read_age_s=10 ** 6)
         stale = self.board()["sections"]
         self.assertIs(stale["lands"]["stale"], True)
-        self.assertEqual(stale["lands"]["limit_s"], web_board.SECTION_LIMIT_S)
+        # the land pipeline's section is bounded by the two bounds its age
+        # adds up from, the leg's and the pipeline body's own (task/3632)
+        self.assertEqual(stale["lands"]["limit_s"], web_board.PIPELINE_LIMIT_S)
         self.assertGreater(stale["lands"]["age_s"], stale["lands"]["limit_s"])
         for name in ("flags", "tasks", "seats", "lights", "trunk"):
             self.assertIs(stale[name]["stale"], False, name)
@@ -832,6 +1027,9 @@ class BoardJoinTest(unittest.TestCase):
             first = web._api_board()
             gate.set()
             self.assertTrue(done.wait(10))
+            # the read LANDS once it has kept its answer: its budget was
+            # waited out by the first read, so the next one is not held on it
+            self.assertTrue(self._settle("seats"))
             second = web._api_board()
         self.assertIs(first["sections"]["seats"].get("loading"), True)
         self.assertFalse(second["sections"]["seats"].get("loading"))
@@ -985,6 +1183,10 @@ class BoardJoinTest(unittest.TestCase):
         for r in [alpha] + beta:
             self.assertIn("dirty", r)
             self.assertIsNone(r.pop("dirty"))
+        # NO GATE RUNS HERE (task/3130): every claim carries `on_gate`, null
+        for r in [alpha] + beta:
+            self.assertIn("on_gate", r)
+            self.assertIsNone(r.pop("on_gate"))
         self.assertEqual(body["headline"]["lanes"]["landed"], 0)
         self.assertEqual(alpha,
                          {"lane": "lane-a", "kind": "claim",
@@ -1119,8 +1321,125 @@ class BoardJoinTest(unittest.TestCase):
         self.assertEqual(joins(), {"roster": 1, "lr": 1},
                          "the expensive joins were rebuilt inside the TTL")
 
+    # -- the teams leg and its write door (task/3156) --------------------
+
+    def team(self, *members, **shares):
+        return {"members": [{"seat": s, "family": f, "role": r}
+                            for s, f, r in members], "shares": shares}
+
+    def test_the_teams_leg_joins_an_authored_team_with_its_own_clock(self):  # noqa: VACUOUS_ASSERTION — the absent team before the write is the control for the equalities on the team after it
+        from helm import teams
+        before = self.board()
+        self.assertNotIn("team", before["projects"]["alpha"])   # the control
+        self.assertIs(before["sections"]["teams"]["stale"], False)
+        row, problem, _code = teams.write(
+            "alpha", self.team(("alpha-codex", "codex", "builder"), codex=30),
+            0, by="owner", reason="alpha leads codex", apply=True,
+            post=lambda body, room: None)
+        self.assertIsNone(problem)
+        web_board._forget()
+        got = self.board()
+        team = got["projects"]["alpha"]["team"]
+        self.assertEqual((team["v"], team["authored"], team["binding"]),
+                         (1, True, True))
+        self.assertEqual(team["shares"], {"codex": 30})
+        self.assertEqual(team["members"][0]["state"], "wanted")
+        self.assertEqual(team["history"][-1]["reason"], "alpha leads codex")
+        sec = got["sections"]["teams"]
+        self.assertEqual(sec["source"], "helm team")
+        self.assertIsInstance(sec["measured_at"], float)
+        self.assertIn("RED", sec["say"])
+        self.assertEqual(sorted(sec["roles"]),
+                         ["builder", "checker", "lead", "reviewer"])
+        # THE LANES AND THE TIER RIDE THE SECTION: the card folds a slot share
+        # and drops at E3 what route drops only when both reach it
+        self.assertIn("qwen27", sec["slots"]["families"])
+        self.assertIn("codex", sec["tier"]["families"])
+        self.assertEqual(sec["tier"]["kinds"], ["review", "verify"])
+
+    def test_the_team_door_answers_200_400_and_409(self):
+        with mock.patch("helm.chat.post") as posted:
+            body, status = web._api_projects_team({
+                "name": "alpha", "expected": 0, "reason": "first team",
+                "team": self.team(("alpha-codex", "codex", "builder"),
+                                  codex=30)})
+            self.assertEqual(status, 200, body)
+            self.assertEqual((body["ok"], body["v"]), (True, 1))
+            self.assertEqual(posted.call_count, 1)
+            self.assertEqual(posted.call_args.kwargs["room"], "alpha")
+            # the version moved: the same save again is STALE and writes nothing
+            body, status = web._api_projects_team({
+                "name": "alpha", "expected": 0, "reason": "again",
+                "team": self.team(codex=60)})
+            self.assertEqual((status, body["code"]), (409, "stale"), body)
+            self.assertIn("v1 now", body["error"])
+            # an invalid team, a missing version, an unknown project
+            body, status = web._api_projects_team({
+                "name": "alpha", "expected": 1, "reason": "x",
+                "team": self.team(("alpha-codex", "codex", "boss"))})
+            self.assertEqual((status, body["code"]), (400, "invalid"), body)
+            body, status = web._api_projects_team({
+                "name": "alpha", "reason": "x", "team": self.team()})
+            self.assertEqual(status, 400, body)
+            body, status = web._api_projects_team({
+                "name": "nowhere", "expected": 0, "reason": "x",
+                "team": self.team()})
+            self.assertEqual(status, 400, body)
+            # A ROSTER THAT DID NOT READ (round 3, ruling c): the family door
+            # cannot check the members, so the save is refused, 503, and
+            # names the class
+            from helm import seats_roster
+            with mock.patch.object(seats_roster, "roster_checked",
+                                   return_value=({}, True)):
+                body, status = web._api_projects_team({
+                    "name": "alpha", "expected": 1, "reason": "roster torn",
+                    "team": self.team(("alpha-codex", "codex", "builder"),
+                                      codex=60)})
+            self.assertEqual((status, body.get("code")), (503, "unread"),
+                             body)
+            self.assertIn("RosterUnread", body["error"])
+        from helm import teams
+        self.assertEqual(teams.authored_only("alpha")["shares"],
+                         {"codex": 30}, "a refused save wrote something")
+
+    def test_a_saved_team_shows_on_the_next_board_read(self):
+        """The door drops the kept teams reading: the owner's save must not
+        wait out the leg's cache, or his next save meets a 409 against the
+        version the page is still showing."""
+        self.assertNotIn("team", self.board()["projects"]["alpha"])
+        with mock.patch("helm.chat.post"):
+            body, status = web._api_projects_team({
+                "name": "alpha", "expected": 0, "reason": "first team",
+                "team": self.team(("alpha-codex", "codex", "builder"))})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.board()["projects"]["alpha"]["team"]["v"], 1)
+
+    def test_the_declare_door_is_worse_only(self):  # noqa: ORPHANED_MOCK — the door reads burnflags.family_flag through its module attribute, and the 400 not-worse answer is the double firing
+        flag = {"colour": "ORANGE", "axes": {"money": "ORANGE"},
+                "expires_at": time.time() + 3600}
+        with mock.patch.object(burnflags, "family_flag", return_value=flag):
+            body, status = web._api_burn_declare({
+                "family": "codex", "colour": "YELLOW", "until": "24h",
+                "reason": "an improvement"})
+            self.assertEqual((status, body["code"]), (400, "not-worse"), body)
+            self.assertIn("raise its share", body["error"])
+            body, status = web._api_burn_declare({
+                "family": "codex", "colour": "RED", "until": "reset",
+                "reason": "hold codex for the release"})
+        self.assertEqual(status, 200, body)
+        said = burnflags.read_declarations()["families"]["codex"]
+        self.assertEqual((said["colour"], said["until"]),
+                         ("RED", flag["expires_at"]))
+        body, status = web._api_burn_declare({
+            "family": "codex", "colour": "RED", "until": "24h", "reason": ""})
+        self.assertEqual(status, 400, body)
+
     def test_the_endpoint_is_registered_and_served(self):
         self.assertIs(web.API["/api/board"], web._api_board)
+        self.assertIs(web.POST_API["/api/projects/team"],
+                      web._api_projects_team)
+        self.assertIs(web.POST_API["/api/burn/declare"],
+                      web._api_burn_declare)
         self.assertIn("/api/projects/state", web.POST_API)   # the write door
         self.assertNotIn("/api/board", web.POST_API)
         srv = web.make_server(0)
@@ -1145,6 +1464,27 @@ class BoardJoinTest(unittest.TestCase):
 # the browser half
 
 _DECL = r"^(?:const|let) %s = .*;$"
+
+# THE TEAM CARD'S FUNCTIONS AND STATE (task/3156): the board's open row and
+# its burn card now draw through them, so every node run of the board lifts
+# them with it.
+TEAM_FNS = ("teamTokens", "teamRatio", "teamEff", "teamShort", "teamMode",
+            "teamLane",
+            "teamSlots", "teamWord", "teamPct", "teamBurning",
+            "teamFailedText",
+            "teamCurrent", "teamDraft", "teamLightRed", "teamAlloc",
+            "teamLine", "teamTabHref", "famHref", "shareBar", "slotBar",
+            "teamCredits", "famBilled", "famSheet",
+            "teamMini",
+            "teamFamRow", "teamMemberRow", "teamAddRow", "teamDiff",
+            "teamDriftLines", "teamRoute", "teamHistory", "teamParts",
+            "teamSplit", "teamFold",
+            "teamSection")
+TEAM_DECLS = ("TEAM_DRAFT", "TEAM_MSG", "TEAM_KIND", "FAM_SEL", "FAM_MSG",
+              "TEAM_KINDS", "TEAM_RANK", "TEAM_PALETTE", "TEAM_FOLDS")
+# the accounts table's groups, which the family sheet links into (the credit
+# page's own read; null until it has answered)
+TEAM_DECLS += ("QUOTA_GROUPS",)
 
 
 def _flag(colour, cause):
@@ -1185,7 +1525,9 @@ def _board(running=3, possible=5, green=1, **over):
         "seats": _sec(unplaced=0),
         "lands": _sec(scope="alpha"),
         "trunk": _sec(),
+        "teams": _sec(seats=[], pace={}, burn=None, say={}, roles={}),
         "fleet": _sec(unplaced=0),
+        "gate": _sec(unplaced=0, unknown_hosts=[]),
     }
     for name, patch in over.items():
         sections[name] = dict(sections[name], **patch)
@@ -1317,14 +1659,12 @@ class BoardRendererRuntimeTest(unittest.TestCase):
            "cardBoundS", "cardStale",
            "flagWhen", "flagsHTML", "boardRank", "boardSort", "boardSec",
            "boardSecState", "boardSecWord", "boardQuiet", "boardLayout",
-           "boardCapacity", "boardChip", "boardChips", "boardCount",
+           "boardCapacity", "boardTeam", "boardCount",
            "boardLanes", "boardLaneWord", "boardProgress", "boardRepoBadge",
-           "boardRepos",
-           "boardKanban", "boardKanbanHTML", "boardKanbanCount",
-           "boardFoldLine", "fleetKanbanHTML", "boardWide", "boardWaits",
-           "boardDetail", "boardRowHTML", "onYouRead")
-    CONSTS = ("LIGHTS", "FLAGCOL", "LIGHT_RANK", "KANBAN_OF")
-    DECLS = ("DETAIL_HAVE", "DETAIL_ROUTE", "BOARD_DIRTY")
+           "boardRepos", "boardLand", "boardWide", "boardDetail", "projTab",
+           "boardRowHTML", "onYouRead", "lrStale") + TEAM_FNS
+    CONSTS = ("LIGHTS", "FLAGCOL", "LIGHT_RANK", "PROJ_TABS")
+    DECLS = ("DETAIL_HAVE", "DETAIL_ROUTE", "BOARD_DIRTY") + TEAM_DECLS
 
     SUPPORT = r"""
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -1334,6 +1674,16 @@ async function post(url, body) { POSTED.push({url, body}); return {ok: true}; }
 async function boardReload() { RELOADS++; }
 const _rowjs = name => ({name, path: "/fake/dev/" + name, status: "active",
   last_seen: 1900000000, sessions: {}, light: {colour: "active", authored: false}});
+// THE WORK PAGE (scripts/52-work.js.part, run in tests/test_web_work_page.py)
+// stands in by name: a row's count is its share of the one work read, and a
+// project's Work tab is that page locked to the project. `WORK` is the read.
+let WORK = null;
+const WK = {proj: {lock: null, view: {}}};
+function wkProjectCount(d, key) {
+  return '<span class="bcount">work of ' + key + (d ? " read" : " unread") + "</span>";
+}
+function wkProjFor(key) { WK.proj.lock = key; }
+function wkHTML(inst) { return '<section class="wk" data-wk="proj" data-lock="' + inst.lock + '"></section>'; }
 function fakeBox(key, reason) {
   const msg = {textContent: ""};
   const why = {value: reason, focused: false, focus() { this.focused = true; }};
@@ -1370,18 +1720,25 @@ out.c_nolights = boardCapacity(BOARD_NOLIGHTS);
 out.c_reading = boardCapacity(BOARD_READING, 12);
 out.row_reading = boardRowHTML(ALPHA, BOARD_READING, false);
 out.open_reading = boardRowHTML(ALPHA, BOARD_READING, true);
+out.open_reading_work = boardRowHTML(ALPHA, BOARD_READING, true, "work");
+out.open_reading_about = boardRowHTML(ALPHA, BOARD_READING, true, "about");
 out.flags_reading = flagsHTML(BOARD_READING.sections.flags);
 out.sorted = boardSort(ROWS).map(p => p.name);
-out.chips = boardChips(BOARD.projects.alpha, BOARD);
-out.chips_stale = boardChips(BOARD_FLAGS_STALE.projects.alpha, BOARD_FLAGS_STALE);
-out.chips_none = boardChips(BOARD.projects.beta, BOARD);
+out.team_none = boardTeam(ALPHA, BOARD.projects.alpha, BOARD);
+out.team_reading = boardTeam(ALPHA, BOARD.projects.alpha, BOARD_READING);
 out.collapsed = boardRowHTML(ALPHA, BOARD, false);
 out.expanded = boardRowHTML(ALPHA, BOARD, true);
-out.expanded_beta = boardRowHTML(BETA, BOARD, true);
-out.gamma = boardRowHTML(GAMMA, BOARD, false);
-out.gamma_notasks = boardRowHTML(GAMMA, BOARD_TASKS_DOWN, false);
+out.expanded_work = boardRowHTML(ALPHA, BOARD, true, "work");
+out.expanded_about = boardRowHTML(ALPHA, BOARD, true, "about");
+out.expanded_beta = boardRowHTML(BETA, BOARD, true, "work");
+out.tab_bogus = boardRowHTML(ALPHA, BOARD, true, "nonsense");
+// AN OLD TAB NAME (tab=lanes, tab=tasks) is no tab any more: `projRoute`
+// maps those addresses to the Work tab, and a name the strip lacks is Team
+out.tab_lanes = boardRowHTML(ALPHA, BOARD, true, "lanes");
+WORK = {d: {cards: []}, at: 0};
+out.collapsed_read = boardRowHTML(ALPHA, BOARD, false);
+WORK = null;
 out.seats_stale = boardRowHTML(ALPHA, BOARD_SEATS_STALE, false);
-out.tasks_stale = boardRowHTML(ALPHA, BOARD_TASKS_STALE, false);
 out.flags_ok = flagsHTML(BOARD.sections.flags);
 out.flags_unmeasured = flagsHTML(BOARD_UNMEASURED.sections.flags);
 out.flags_stale = flagsHTML(BOARD_FLAGS_STALE.sections.flags);
@@ -1395,6 +1752,8 @@ out.p_even = boardProgress({progress: {lands7: 0, opened7: 2, closed7: 2}}, BOAR
 out.p_beta = boardProgress(BOARD.projects.beta, BOARD);
 out.p_tasks_stale = boardProgress(BOARD_TASKS_STALE.projects.alpha, BOARD_TASKS_STALE);
 out.p_trunk_stale = boardProgress(BOARD_TRUNK_STALE.projects.alpha, BOARD_TRUNK_STALE);
+out.p_master = boardProgress({progress: {lands7: 3, opened7: 1, closed7: 1},
+  last_land: {at: 1, age_s: 60, how: "push", sha: "4611958e44a2", ref: "master"}}, BOARD);
 out.r_fork = boardRepos(BOARD.projects.alpha);
 out.r_unread = boardRepos(BOARD.projects.beta);
 out.r_none = boardRepos({repos: []});
@@ -1417,27 +1776,8 @@ out.b_unasked = boardRepoBadge({remote: "origin", slug: "akapug/x",
   url: "https://github.com/akapug/x", visibility: "unasked"});
 out.b_public = boardRepoBadge({remote: "origin", slug: "akapug/x",
   url: "https://github.com/akapug/x", visibility: "public", stale: true});
-out.kb_alpha = boardKanban(ALPHA, BOARD.projects.alpha, BOARD);
-out.kb_beta = boardKanban(BETA, BOARD.projects.beta, BOARD);
-out.kb_beta_loading = boardKanban(BETA, BOARD_FLEET_LOADING.projects.beta, BOARD_FLEET_LOADING);
-out.kb_beta_down = boardKanban(BETA, BOARD_FLEET_DOWN.projects.beta, BOARD_FLEET_DOWN);
-out.kb_html_loading = boardKanbanHTML(out.kb_beta_loading);
-out.kb_html_down = boardKanbanHTML(out.kb_beta_down);
-const PARTIAL = JSON.parse(JSON.stringify(BOARD));
-PARTIAL.sections.fleet.landed_partial = {shown: 6, total: 700};
-PARTIAL.projects.beta.pipeline.landed = [];
-out.kb_partial = boardKanban(BETA, PARTIAL.projects.beta, PARTIAL);
-out.kb_html_partial = boardKanbanHTML(out.kb_partial);
 out.lanes_seats_only = boardLanes({running: [{lane: null, kind: "seat", seats: ["g-1"]},
   {lane: null, kind: "seat", seats: ["g-2"]}]}, BOARD);
-const FLEET_ROWS = [ALPHA, BETA, GAMMA];
-out.fk_ok = fleetKanbanHTML(FLEET_ROWS, BOARD);
-out.fk_loading = fleetKanbanHTML(FLEET_ROWS, BOARD_FLEET_LOADING);
-out.fk_down = fleetKanbanHTML(FLEET_ROWS, BOARD_FLEET_DOWN);
-out.fk_pending = fleetKanbanHTML(FLEET_ROWS, null);
-out.kb_stale = boardKanban(ALPHA, BOARD_LANDS_STALE.projects.alpha, BOARD_LANDS_STALE);
-out.kb_html = boardKanbanHTML(out.kb_alpha);
-out.kb_html_beta = boardKanbanHTML(out.kb_beta);
 out.y_quiet = onYouRead(ODQ_NONE, LR_NONE);
 out.y_decisions = onYouRead(ODQ_TWO, LR_NONE);
 out.y_asks = onYouRead(ODQ_NONE, LR_ASKS);
@@ -1448,6 +1788,9 @@ out.y_lr_down = onYouRead(ODQ_NONE, {unavailable: "pipeline UNKNOWN"});
 out.y_lr_stale = onYouRead(ODQ_NONE, Object.assign({}, LR_NONE, {read_age_s: 9999}));
 out.y_odq_down = onYouRead({unavailable: true, why: "ledger gone"}, LR_NONE);
 const lay = boardLayout(QROWS, BOARD, "", false);
+const lit = boardLayout(ROWS, BOARD, "", false, "green");
+out.lit_green = [lit.lead.map(p => p.name), lit.quiet.length];
+out.lit_unset = boardLayout(ROWS, BOARD, "", false, "unset").shown.map(p => p.name);
 out.q_lead = lay.lead.map(p => p.name);
 out.q_fold = lay.quiet.map(p => p.name);
 out.q_shown = lay.shown.length;
@@ -1459,6 +1802,20 @@ out.land_ok = boardWide(ALPHA, BOARD.projects.alpha, BOARD);
 out.land_none = boardWide(BETA, BOARD.projects.beta, BOARD);
 out.land_nojoin = boardWide(GAMMA, undefined, BOARD);
 out.land_stale = boardWide(ALPHA, BOARD_TRUNK_STALE.projects.alpha, BOARD_TRUNK_STALE);
+// THE PROJECT THE TRAIN LANDS: its newest train's push, off the work read
+WORK = {d: {trains: {project: "alpha", recent: [{name: "train9", land: 40,
+  at: Date.now() / 1000 - 7200}]}}, at: Date.now()};
+out.land_train = boardWide(ALPHA, BOARD.projects.alpha, BOARD);
+out.land_train_other = boardWide(BETA, BOARD.projects.beta, BOARD);
+// A QUIET DAY: no train in the day's window; the last one landed three days
+// ago, or the last one was vetoed and none landed in the window
+WORK = {d: {trains: {project: "alpha", recent: [], last: {name: "train8", state: "DONE",
+  land: 39, at: Date.now() / 1000 - 3 * 86400}}}, at: Date.now()};
+out.land_train_quiet = boardWide(ALPHA, BOARD.projects.alpha, BOARD);
+WORK = {d: {trains: {project: "alpha", recent: [], last: {name: "train10", state: "VETOED",
+  land: null, at: Date.now() / 1000 - 600}}}, at: Date.now()};
+out.land_train_none = boardWide(ALPHA, BOARD.projects.alpha, BOARD);
+WORK = null;
 out.active_join = boardWide(ALPHA_OLD, {active_at: Date.now() / 1000 - 60}, BOARD);
 out.active_old = boardWide(ALPHA_OLD, undefined, BOARD);
 out.active_none = boardWide(NEVER, undefined, BOARD);
@@ -1505,23 +1862,18 @@ console.log(JSON.stringify(out));
             "BOARD_FLAGS_STALE": _board(flags={"stale": True, "age_s": 9000}),
             "BOARD_NOLIGHTS": _board(green=None, lights={
                 "unavailable": "registry unreadable"}),
-            "BOARD_LANDS_STALE": _board(lands={"stale": True,
-                                               "age_s": 99999}),
             "BOARD_TASKS_STALE": _board(tasks={"stale": True,
                                                "age_s": 99999}),
             "BOARD_TASKS_DOWN": _board(tasks={
                 "unavailable": "ledger unreadable"}),
             "BOARD_NOREGISTRY": _board(running=None, possible=5),
-            "BOARD_FLEET_LOADING": _board(fleet={
-                "loading": True, "measured_at": None, "age_s": None}),
-            "BOARD_FLEET_DOWN": _board(fleet={
-                "unavailable": "the all-projects read raised (OSError)"}),
             "BOARD_TRUNK_STALE": _board(trunk={"stale": True,
                                                "age_s": 99999}),
             # THE FIRST READ AFTER A RESTART: every leg past its budget
             "BOARD_READING": _board(running=None, possible=None, **{
                 name: dict(_READING, **extra) for name, extra in (
                     ("seats", {}), ("tasks", {}), ("trunk", {}),
+                    ("teams", {}),
                     ("lands", {"scope": None}),
                     ("flags", {"families": {}, "overall": None}),
                     ("fleet", {"loading": False, "retry": False,
@@ -1591,10 +1943,13 @@ console.log(JSON.stringify(out));
             self.assertNotIn("landed", re.sub(r"<[^>]*>", "", self.out[key]),
                              key)
 
-    def test_the_capacity_line_says_where_the_lanes_are(self):
-        # alpha runs three lanes, beta one; busiest first
-        self.assertIn("alpha 3 · beta 1", self.out["c_ok"])
-        self.assertNotIn("alpha 3", self.out["c_noroster"])  # unread: no shares
+    def test_the_capacity_line_lists_no_project(self):  # noqa: VACUOUS_ASSERTION — "lanes running" is asserted on the same text first, the unconditional positive control
+        """EACH PROJECT IS LISTED ONCE (task/3445): its lanes are on its own
+        line, so the capacity line no longer names projects."""
+        text = re.sub(r"<[^>]*>", "", self.out["c_ok"])
+        self.assertIn("lanes running", text)
+        self.assertNotIn("alpha 3", text)
+        self.assertNotIn("beta 1", text)
 
     def test_the_active_count_rides_beside_green(self):
         """The overview's "N active" (the scan's own word) was lost with the
@@ -1602,10 +1957,11 @@ console.log(JSON.stringify(out));
         self.assertIn("1 green · 12 active", self.out["c_ok"])
         self.assertNotIn("active", self.out["c_noactive"].split("green")[1][:40])
 
-    def test_an_off_board_share_makes_the_shares_add_up(self):
-        self.assertIn("alpha 3 · beta 1 · other 1", self.out["c_other"])
-        # no off-board claim, no "other" share (read the text, not the markup)
-        self.assertNotIn("other", re.sub(r"<[^>]*>", "", self.out["c_ok"]))
+    def test_lanes_on_no_projects_line_are_said_so_the_lines_add_up(self):
+        self.assertIn("1 on no project's line", self.out["c_other"])
+        # no off-board claim, nothing said (read the text, not the markup)
+        self.assertNotIn("no project's line",
+                         re.sub(r"<[^>]*>", "", self.out["c_ok"]))
 
     def test_an_unreadable_registry_is_blamed_not_the_roster(self):
         # what he READS: the text, not the markup (the tap link is #roster)
@@ -1629,18 +1985,17 @@ console.log(JSON.stringify(out));
         for unknown in ("? open", "lanes ?", "land ?", "seats ?", "0 open",
                         "no lanes", "STALE"):
             self.assertNotIn(unknown, row, unknown)
-        opened = text(self.out["open_reading"])
-        for part in ("seats still being read", "tasks still being read",
-                     "lanes still being read",
-                     "land pipeline still being read",
-                     "last land still being read"):
-            self.assertIn(part, opened, part)
-        self.assertNotIn("UNKNOWN", opened)
+        # EACH TAB, still being read, says so in its own words (task/3445);
+        # the Work tab is the Work page's, which says what IT has read
+        # (tests/test_web_work_page.py OneCountEverywhereTest)
+        opened = text(self.out["open_reading"])          # the Team tab
+        about = text(self.out["open_reading_about"])
+        self.assertIn("team still being read", opened)
+        self.assertIn("newest on main still being read", about)
+        for got in (opened, about):
+            self.assertNotIn("UNKNOWN", got)
         self.assertNotIn("nobody is seated", opened)     # never an answer
-        # the scoped pipeline has not named its project yet; the fleet read
-        # has, so this row's kanban is still being read, not "not read here"
-        self.assertIn("still being read", opened.split("open tasks")[0])
-        self.assertNotIn("not read here", opened.split("open tasks")[0])
+        self.assertIn('data-wk="proj" data-lock="alpha"', self.out["open_reading_work"])
         flags = text(self.out["flags_reading"]["head"])
         self.assertIn("still being read", flags)
         self.assertNotIn("not measured", flags)
@@ -1662,12 +2017,17 @@ console.log(JSON.stringify(out));
         self.assertNotIn("at once", self.out["flags_ok"]["head"])
         self.assertIn("lanes running", self.out["c_ok"])  # the control
 
-    def test_the_capacity_line_carries_one_chip_per_family_in_its_colour(self):
+    def test_the_capacity_line_keeps_its_counts_and_no_family_chip(self):
+        """Supply is Fleet › credit's (task/3445 L4): the line under Work ›
+        projects counts lanes, seats and lights, and draws no family."""
         c = self.out["c_ok"]
-        self.assertEqual(c.count('class="fchip'), 2)
-        self.assertIn("anthropic", c)
-        self.assertIn("#c9772e", c)                     # ORANGE
-        self.assertIn("#b58a2e", c)                     # YELLOW, codex
+        self.assertIn("lanes running", c)               # the counts stay
+        self.assertIn("1 green · 12 active", c)
+        for key in ("c_ok", "c_flags_stale", "c_unmeasured", "c_reading"):
+            self.assertNotIn("fchip", self.out[key], key)
+            self.assertNotIn("bfams", self.out[key], key)
+            self.assertNotIn("credit not measured", self.out[key], key)
+            self.assertNotIn("credit: still being read", self.out[key], key)
 
     def test_the_capacity_line_never_draws_a_number_it_did_not_read(self):
         self.assertIn("not read yet", self.out["c_pending"])
@@ -1685,12 +2045,6 @@ console.log(JSON.stringify(out));
         self.assertIn("STALE", self.out["c_seats_stale"])
         self.assertNotIn("3 lanes running", self.out["c_seats_stale"])
 
-    def test_stale_or_unmeasured_flags_draw_uncoloured_family_chips(self):
-        for key in ("c_flags_stale", "c_unmeasured"):
-            self.assertNotIn("#c9772e", self.out[key], key)
-        self.assertIn("fstale", self.out["c_flags_stale"])
-        self.assertIn("not measured", self.out["c_unmeasured"])
-
     # -- the rows ----------------------------------------------------------
 
     def test_rows_sort_green_yellow_orange_red_then_unset(self):
@@ -1698,35 +2052,35 @@ console.log(JSON.stringify(out));
                          ["g-new", "g-old", "yel", "org", "red1", "zeta",
                           "quiet"])
 
-    def test_each_chip_carries_its_family_colour_and_its_reason(self):
-        chips = self.out["chips"]
-        self.assertIn("anthropic", chips)
-        self.assertIn("one account left", chips)       # the hover reason
-        self.assertIn("#c9772e", chips)                # ORANGE, from FLAGCOL
-        self.assertEqual(chips.count('class="fchip'), 2)
+    def test_a_line_says_its_team_state_and_never_guesses_one(self):
+        """The line's team cell (task/3445): "no team" only when the teams
+        leg was read; still being read, it says so."""
+        self.assertIn("no team", self.out["team_none"])
+        self.assertIn("team reading", self.out["team_reading"])
+        self.assertNotIn("no team", self.out["team_reading"])
 
-    def test_a_family_with_no_flag_says_no_flag(self):
-        chips = self.out["chips"]
-        at = chips.index("localllm")
-        self.assertIn("no flag", chips[at - 400:at + 400])
-        self.assertIn("fnone", chips)
-
-    def test_a_project_with_no_seats_draws_no_chips(self):
-        self.assertIn('class="bchips"', self.out["chips_none"])   # drawn at all
-        self.assertNotIn("fchip", self.out["chips_none"])
-
-    def test_a_collapsed_row_carries_light_name_chips_and_one_count(self):
+    def test_a_collapsed_row_carries_light_name_team_and_one_count(self):
+        """ONE LINE PER PROJECT (task/3445): light · name · team state ·
+        its work, then on a desktop its lanes, last land, activity and repos.
+        No family chips (supply) and no week's progress (the About tab).
+        ONE COUNT EVERYWHERE (task/3643 slice 3): the count is the project's
+        share of the Work page's one read, not the board's task tally; what
+        that share says is run in tests/test_web_work_page.py."""
         row = self.out["collapsed"]
         self.assertIn('class="dot green authored"', row)
         self.assertIn(">alpha<", row)
-        self.assertIn("fchip", row)
+        self.assertIn('class="bteam', row)
+        self.assertNotIn("fchip", row)
         self.assertEqual(row.count('class="bcount'), 1)
-        self.assertIn("3 open", row)
+        self.assertIn("work of alpha unread", row)
+        self.assertIn("work of alpha read", self.out["collapsed_read"])
+        self.assertNotIn("3 open", row)
         self.assertNotIn("bdetail", row, "a collapsed row drew its detail")
         # everything beyond those four is desktop-only, by class
         wide = row[row.index('class="bwide'):]
-        for word in ("3 lanes", "12 lands", "landed", "active", "private"):
+        for word in ("3 lanes", "merged", "active", "private"):
             self.assertIn(word, wide, word)
+        self.assertNotIn("12 lands", wide)
 
     def test_the_phone_rule_hides_the_desktop_cells(self):
         css = self.src
@@ -1734,43 +2088,55 @@ console.log(JSON.stringify(out));
                       r"\{display:none\}[^@]*)\}", css)
         self.assertIsNotNone(m, "no phone rule hides the desktop-only cells")
 
-    def test_an_expanded_row_carries_kanban_lanes_progress_repos_and_more(self):
+    def test_an_open_project_is_three_tabs_one_at_a_time(self):  # noqa: VACUOUS_ASSERTION — every tab row's strip is asserted EQUAL to the three tab names, and the Work tab's locked mount is asserted present on the same render the absences read
+        """TEAM · WORK · ABOUT (task/3445, task/3643 slice 6); the Team tab by
+        default, and each tab draws only its own part. The Lanes and Tasks
+        tabs were this project's share of the land board and of the backlog;
+        they are one tab now, the Work page locked to this project."""
+        team, work = self.out["expanded"], self.out["expanded_work"]
+        for row in (team, work, self.out["expanded_about"]):
+            self.assertEqual(re.findall(r'data-ptab="([a-z]+)"', row),
+                             ["team", "work", "about"])
+            self.assertEqual(row.count('class="ptab on"'), 1)
+        self.assertIn('class="ptab on" aria-selected="true" data-ptab="team"', team)
+        for key in ("tab_bogus", "tab_lanes"):
+            self.assertIn('class="ptab on" aria-selected="true" data-ptab="team"',
+                          self.out[key], key)
+        # TEAM: the light setter, then the team
+        self.assertIn("lightset", team)
+        self.assertIn("dteam", team)
+        self.assertNotIn('data-wk="proj"', team)
+        # WORK: the Work page, locked to this project and to no other
+        self.assertIn('data-wk="proj" data-lock="alpha"', work)
+        self.assertIn('data-wk="proj" data-lock="beta"', self.out["expanded_beta"])
+        self.assertNotIn("lightset", work)
+        for gone in ('class="bkb"', "owed rows", "tasks not read yet"):
+            self.assertNotIn(gone, work, gone)
+        # ABOUT: its week, its repositories, what is on file
+        about = self.out["expanded_about"]
+        self.assertIn("4 opened", about)                # its progress
+        self.assertIn("emberian/alpha", about)          # both halves of a fork
+        self.assertIn("akapug/alpha", about)
+        self.assertIn("dwrap", about)
+
+    def test_an_open_projects_line_and_tabs_are_one_sticky_head(self):
+        """The helm project's Team tab is 4,443 px tall at 1440 px, and its
+        name and tab strip scrolled away with it (task/3475). The open row
+        draws its line and its tabs together in `.bstick`, which the
+        stylesheet sticks below the nav, and only the tab's body after it."""
         row = self.out["expanded"]
-        self.assertIn("bdetail", row)
-        self.assertIn("lightset", row)
-        self.assertIn("wire the board", row)            # its tasks
-        self.assertIn("alpha-claude", row)              # its seats
-        self.assertIn("integrator", row)                # its waits
-        self.assertIn("one account left", row)          # the burn reason
-        self.assertIn("no burn flag", row)              # the family without one
-        self.assertIn('class="bkb"', row)               # its kanban
-        self.assertIn("lane-b (seat-a)", row)           # a lane and its seat
-        self.assertIn("local-1 at work, no lane claimed", row)
-        self.assertIn("4 opened", row)                  # its progress
-        self.assertIn("emberian/alpha", row)            # both halves of a fork
-        self.assertIn("akapug/alpha", row)
+        stick = row.index('<div class="bstick">')
+        body = row.index('<div class="bdetail">')
+        self.assertLess(stick, row.index('<div class="bline">'))
+        self.assertLess(row.index('<div class="bline">'), row.index('class="ptabs"'))
+        self.assertLess(row.index('class="ptabs"'), body)
+        self.assertLess(body, row.index('class="ptabbody"'))
+        self.assertEqual(row.count('class="ptabs"'), 1)
+        self.assertNotIn("bstick", self.out["collapsed"])
 
-    def test_a_project_the_pipeline_does_not_project_says_so(self):
-        row = self.out["expanded_beta"]
-        self.assertIn("lane-q", row)                    # its running lane
-        self.assertIn("not read here", row)
-        self.assertNotIn("integrator", row)
-
-    def test_a_project_the_joins_never_reached_reads_zero_only_when_read(self):
-        self.assertIn("0 open", self.out["gamma"])
-        self.assertNotIn("0 open", self.out["gamma_notasks"])
-        self.assertIn("?", self.out["gamma_notasks"])
-
-    def test_a_stale_tasks_section_does_not_draw_its_count(self):
-        row = self.out["tasks_stale"]
-        count = row[row.index('class="bcount'):]
-        self.assertNotIn("3 open", count[:200])
-        self.assertIn("STALE", count[:300])
-
-    def test_stale_flags_draw_no_colour_on_the_chips(self):
-        chips = self.out["chips_stale"]
-        self.assertIn("fstale", chips)
-        self.assertNotIn("#c9772e", chips)
+    def test_the_light_filter_shows_one_colour_or_the_unset(self):
+        self.assertEqual(self.out["lit_green"], [["g-new", "g-old"], 0])
+        self.assertEqual(self.out["lit_unset"], ["zeta", "quiet"])
 
     def test_last_activity_is_the_newer_of_the_sync_and_the_seat_beat(self):
         self.assertIn("active today", self.out["active_join"])
@@ -1802,24 +2168,41 @@ console.log(JSON.stringify(out));
 
     # -- progress -----------------------------------------------------------
 
-    def test_progress_is_lands_then_the_backlogs_net_arrow(self):
+    def test_progress_is_commits_then_the_backlogs_net_arrow(self):
+        """ONE WORD PER NOUN (console walk 4, P1 3): the week counts the
+        first-parent commits on the project's main, which a project that
+        merges by hand makes too; "land" is what helm records, and its Work
+        tab says that is not measured. So About says "commits on main",
+        never "lands"."""
         cell, line = self.out["p_alpha"]["cell"], self.out["p_alpha"]["line"]
-        self.assertIn("12 lands", cell)
+        self.assertIn("12 commits", cell)
+        self.assertIn("this week: 12 commits on main", line)
         self.assertIn("↓5", cell)                       # 9 closed, 4 opened
         self.assertIn("4 opened", line)
         self.assertIn("9 closed", line)
         self.assertIn("↑3", self.out["p_grow"]["cell"])  # 5 opened, 2 closed
+        self.assertIn("1 commit on main", self.out["p_grow"]["line"])
         self.assertIn("→0", self.out["p_even"]["cell"])
-        self.assertIn("0 lands", self.out["p_even"]["cell"])
+        self.assertIn("0 commits", self.out["p_even"]["cell"])
+        # a project trunked on master counts master's commits, and says so,
+        # as its About's newest commit does ("newest commit on master")
+        self.assertIn("this week: 3 commits on master",
+                      self.out["p_master"]["line"])
+        self.assertNotIn("main", self.out["p_master"]["line"])
+        for key in ("p_alpha", "p_grow", "p_even", "p_beta", "p_tasks_stale",
+                    "p_trunk_stale", "p_master"):
+            for half in ("cell", "line"):
+                with self.subTest(progress=key, half=half):
+                    self.assertNotIn("land", self.out[key][half].lower())
 
     def test_progress_never_draws_a_count_it_did_not_read(self):
-        self.assertIn("lands ?", self.out["p_beta"]["cell"])
-        self.assertNotIn("0 lands", self.out["p_beta"]["cell"])
+        self.assertIn("commits ?", self.out["p_beta"]["cell"])
+        self.assertNotIn("0 commits", self.out["p_beta"]["cell"])
         stale = self.out["p_tasks_stale"]["cell"]
-        self.assertIn("12 lands", stale)                 # the lands still read
+        self.assertIn("12 commits", stale)               # the trunk still read
         self.assertNotIn("↓", stale)
         self.assertIn("STALE", self.out["p_trunk_stale"]["cell"])
-        self.assertNotIn("12 lands", self.out["p_trunk_stale"]["cell"])
+        self.assertNotIn("12 commits", self.out["p_trunk_stale"]["cell"])
 
     # -- repos --------------------------------------------------------------
 
@@ -1866,83 +2249,6 @@ console.log(JSON.stringify(out));
         self.assertIn("no git checkout", self.out["r_unread"])
         self.assertIn("not read yet", self.out["r_nojoin"])
 
-    # -- the kanban ---------------------------------------------------------
-
-    def test_the_kanban_splits_the_pipeline_into_four_columns(self):
-        kb = self.out["kb_alpha"]
-        lanes = {col: [c["lane"] for c in kb[col]] for col in kb}
-        # lane-a holds a claim AND a review: it is drawn where it got to; a
-        # seat at work with no claim is its own card, marked as a seat
-        self.assertEqual(lanes["building"],
-                         ["lane-b", "@local-1", "lane-c", "lane-f"])
-        self.assertEqual(lanes["review"], ["lane-a", "lane-o"])
-        self.assertEqual(lanes["gate"], ["lane-g", "lane-m"])
-        self.assertEqual(lanes["landed"], ["lane-z"])
-
-    def test_another_projects_columns_come_from_the_all_projects_read(self):
-        kb = self.out["kb_beta"]
-        lanes = {col: [c["lane"] for c in kb[col]] for col in kb}
-        self.assertEqual(lanes, {"building": ["lane-q", "b-fix"],
-                                 "review": ["b-review"], "gate": [],
-                                 "landed": ["b-landed"]})
-        self.assertNotIn("not read here", self.out["kb_html_beta"])
-
-    def test_while_that_read_warms_the_columns_say_loading(self):
-        kb = self.out["kb_beta_loading"]
-        self.assertEqual([c["lane"] for c in kb["building"]], ["lane-q"])
-        for col in ("review", "gate", "landed"):
-            self.assertEqual(kb[col], "loading", col)
-        self.assertEqual(self.out["kb_html_loading"].count("still being read"), 3)
-
-    def test_a_failed_read_draws_unknown_columns_never_empty_ones(self):
-        kb = self.out["kb_beta_down"]
-        for col in ("review", "gate", "landed"):
-            self.assertEqual(kb[col], "unknown", col)
-        html = self.out["kb_html_down"]
-        self.assertEqual(html.count(">UNKNOWN<"), 3)
-        self.assertNotIn(">none<", html)
-        self.assertIn(">none<", self.out["kb_html_beta"])  # the control: gate 0
-
-    def test_a_capped_lands_list_never_reads_as_none_landed(self):
-        self.assertEqual(self.out["kb_partial"]["landed"], "partial")
-        self.assertIn("none among the newest lands read",
-                      self.out["kb_html_partial"])
-        # the control: the same project with its land in the list draws it
-        self.assertEqual([c["lane"] for c in self.out["kb_beta"]["landed"]],
-                         ["b-landed"])
-
-    def test_a_stale_pipeline_draws_no_pipeline_column(self):
-        kb = self.out["kb_stale"]
-        self.assertEqual([c["lane"] for c in kb["building"]],
-                         ["lane-a", "lane-b", "@local-1"])  # the roster read
-        for col in ("review", "gate", "landed"):
-            self.assertEqual(kb[col], "stale", col)
-
-    # -- the fleet kanban, grouped by project -----------------------------------
-
-    def test_the_fleet_kanban_is_grouped_by_project_with_nothing_withheld(self):
-        html = self.out["fk_ok"]
-        self.assertLess(html.index(">alpha<"), html.index(">beta<"))
-        self.assertEqual(html.count('class="bkb"'), 2)   # gamma has nothing
-        self.assertNotIn(">gamma<", html)
-        self.assertIn("b-review", html)
-        for word in ("withheld", "--all-projects"):
-            self.assertNotIn(word, html)
-
-    def test_the_fleet_kanban_says_loading_then_unknown_never_empty(self):
-        self.assertIn("still being read", self.out["fk_loading"])
-        self.assertIn(">beta<", self.out["fk_loading"])   # its lanes still read
-        self.assertIn("UNKNOWN", self.out["fk_down"])
-        self.assertIn("OSError", self.out["fk_down"])
-        self.assertIn("not read yet", self.out["fk_pending"])
-
-    def test_the_kanban_draws_four_named_columns_with_counts(self):
-        html = self.out["kb_html"]
-        for word in ("building", "review", "gate", "landed"):
-            self.assertIn(">" + word, html, word)
-        self.assertEqual(html.count('class="bkcol'), 4)
-        self.assertIn("task/9", html)
-
     # -- on you -------------------------------------------------------------
 
     def test_nothing_on_you_is_one_quiet_line(self):
@@ -1976,24 +2282,72 @@ console.log(JSON.stringify(out));
         self.assertIn("decisions UNKNOWN", self.out["y_odq_down"]["line"])
         self.assertIs(self.out["y_odq_down"]["queue"], True)
 
+    def test_homes_strip_says_one_muted_word_where_work_says_why(self):
+        """Home's on-you strip is a headline: a read past its bound is the
+        word "stale", one not read or failed "not read" — the tiles' words,
+        never the age or the reason, which are Work's On-you block's."""
+        word = lambda w: '<span class="hstale">%s</span>' % w
+        stale, down = self.out["y_lr_stale"]["home"], self.out["y_lr_down"]["home"]
+        self.assertEqual(stale, "owner asks " + word("stale"))
+        self.assertEqual(down, "owner asks " + word("not read"))
+        self.assertEqual(self.out["y_unread"]["home"], word("not read"))
+        self.assertEqual(self.out["y_half"]["home"], "owner asks " + word("not read"))
+        self.assertEqual(self.out["y_odq_down"]["home"], "decisions " + word("not read"))
+        self.assertEqual(self.out["y_asks"]["home"], self.out["y_asks"]["line"])
+        for key in ("y_unread", "y_half", "y_lr_down", "y_lr_stale", "y_odq_down"):
+            self.assertNotIn("not read yet", self.out[key]["home"], key)
+
     # -- the last land cell --------------------------------------------------
 
-    def test_the_land_cell_reads_the_trunk(self):
+    def test_the_land_cell_reads_the_trunk_and_says_merged(self):
+        """ONE LANDED TIME (walk 2, finding 17): a project with no train
+        record merges by hand, so its trunk's newest commit is "merged", and
+        "landed" is only ever a train's push."""
         land = self.out["land_ok"][self.out["land_ok"].index("bland"):]
-        self.assertIn("landed 1h ago", land)
+        self.assertIn("merged 1h ago", land)
+        self.assertNotIn("landed", land.split("bact")[0])
         self.assertIn("4611958e44a2", land)             # the sha, on hover
 
-    def test_an_unreadable_trunk_reads_not_read_here(self):
+    def test_the_train_projects_land_cell_is_the_trains_push_time(self):  # noqa: VACUOUS_ASSERTION — the same land cell is asserted to read 'landed 2h ago' and to name train9 before its 'merged' absence is read
+        """...and the project the train lands says "landed" at its newest
+        train's push, the time the Work page's Landed column prints."""
+        land = self.out["land_train"][self.out["land_train"].index("bland"):]
+        self.assertIn("landed 2h ago", land)
+        self.assertIn("train9", land)
+        self.assertNotIn("merged", land.split("bact")[0])
+        other = self.out["land_train_other"]
+        self.assertNotIn("landed", other[other.index("bland"):].split("bact")[0])
+        # the work read lands after the board's: the cell is redrawn in place
+        # when it does, or the train's project read "merged" for a minute
+        self.assertIn("boardLand(", _extract_fn(self.src, "boardCountsPaint"))
+
+    def test_a_quiet_day_never_calls_the_train_project_merged_by_hand(self):
+        """The day's window holds only DONE trains of the last 24 h. After a
+        quiet day the train's project fell through to its trunk's newest
+        commit, "merged 3h ago · merged by hand, so helm records no land",
+        false for the one project that lands by train. Its last DONE train
+        is its land; with none, the cell says no train landed in the day."""
+        quiet = self.out["land_train_quiet"]
+        quiet = quiet[quiet.index("bland"):].split("bact")[0]
+        self.assertIn("landed 3d ago", quiet)
+        self.assertIn("train8", quiet)
+        self.assertNotIn("merged", quiet)
+        none = self.out["land_train_none"]
+        none = none[none.index("bland"):].split("bact")[0]
+        self.assertIn("no land in 24 h", none)
+        self.assertNotIn("merged", none)
+
+    def test_an_unreadable_trunk_reads_not_read_here(self):  # noqa: VACUOUS_ASSERTION — land_ok is asserted to carry 'merged' unconditionally after the loop, the positive control on the same cell
         for key in ("land_none", "land_nojoin"):
             land = self.out[key][self.out[key].index("bland"):]
             self.assertIn("not read here", land, key)
-            self.assertNotIn("landed", land.split("bact")[0], key)
-        self.assertIn("landed", self.out["land_ok"])     # the control
+            self.assertNotIn("merged", land.split("bact")[0], key)
+        self.assertIn("merged", self.out["land_ok"])     # the control
 
     def test_a_stale_trunk_reads_stale_not_a_time(self):
         land = self.out["land_stale"][self.out["land_stale"].index("bland"):]
         self.assertIn("STALE", land.split("bact")[0])
-        self.assertNotIn("landed", land.split("bact")[0])
+        self.assertNotIn("merged", land.split("bact")[0])
 
     # -- the quiet fold --------------------------------------------------------
 
@@ -2058,6 +2412,612 @@ console.log(JSON.stringify(out));
         self.assertTrue(self.out["bare_focused"])
         self.assertEqual(len(self.out["posted"]), 1,
                          "a colour with no reason reached the door")
+
+
+def _team_board():
+    """A board carrying the teams leg: the spec's worked example on codex
+    (46.4M/h lasts; alpha 30%, beta 35%), a proposed team on gamma, and the
+    flag card's codex reading with its reset credits."""
+    say = {"GREEN": "open more lanes", "YELLOW": "normal work, no extra lanes",
+           "ORANGE": "critical path only", "RED": "start nothing new on this family",
+           "GREY": "not measured"}
+    roles = {"lead": ["review", "build", "verify", "delegate", "research",
+                      "council"],
+             "builder": ["build", "delegate", "review"],
+             "reviewer": ["review", "verify", "council"],
+             "checker": ["verify", "research"]}
+
+    def member(seat, fam, role, state="live"):
+        return {"seat": seat, "family": fam, "role": role, "state": state,
+                "shared": []}
+    alpha_alloc = {"codex": {"mode": "rate", "share": 30, "colour": "RED",
+                             "family_colour": "ORANGE", "rationed": True}}
+    return {
+        "headline": {"lanes": {}, "green": 1, "colour": "ORANGE"},
+        "sections": {
+            "flags": _sec(families={
+                "codex": {"colour": "ORANGE", "axis": "money",
+                          "cause": "runway 54h is under the 85h horizon",
+                          "provenance": "measured", "expires_at": None,
+                          "credits": {"usable": 1, "unread": 3,
+                                      "why": "3 accounts not asked for a "
+                                             "balance this pass"}},
+                "anthropic": {"colour": "YELLOW", "axis": "money",
+                              "cause": "4 of 6 accounts past half",
+                              "provenance": "measured", "expires_at": None},
+                "kimi": {"colour": "GREY", "axis": None,
+                         "cause": "no money reader exists for this family",
+                         "provenance": "unmeasured", "expires_at": None},
+                "qwen27": {"colour": "GREY", "axis": None,
+                           "cause": "local on the operator's own GPUs, free",
+                           "provenance": "unmeasured", "expires_at": None}},
+                overall={"colour": "ORANGE", "family": "codex"}),
+            "teams": _sec(seats=[{"seat": "qwen27", "family": "qwen27",
+                                  "presence": "live", "project": "alpha"}],
+                          pace={"codex": {"sustainable_per_h": 54 * 73e6 / 85,
+                                          "tokens_per_hour": 73e6}},
+                          burn={"codex": {"per_hour": 73e6, "seats": {
+                              "alpha-codex": 32.85e6, "beta-codex": 22.63e6,
+                              "gamma-codex": 10.95e6}}},
+                          # THE LANES: qwen27 measured at 4, and four rows on
+                          # it — two on delta, one on alpha (no share), one
+                          # on no project
+                          slots={"families": ["qwen27", "qwenlocal"],
+                                 "capacity": {"qwen27": {
+                                     "lanes": 4, "by": "seat-m",
+                                     "ts": 1900000000,
+                                     "reason": "4 concurrent at 32k"}},
+                                 "capacity_problem": None, "why": None,
+                                 "in_use": {
+                                     "qwen27": {"by_project": {"delta": 2,
+                                                               "alpha": 1},
+                                                "unplaced": 1, "total": 4},
+                                     "qwenlocal": {"by_project": {},
+                                                   "unplaced": 0,
+                                                   "total": 0}}},
+                          tier={"kinds": ["review", "verify"],
+                                "families": ["anthropic", "codex", "ds4pro",
+                                             "kimi", "grok"]},
+                          say=say, roles=roles,
+                          # THE AXES WHOSE ORANGE A SHARE RATIONS, read from
+                          # `teams.RATION_AXES` by the server, never copied
+                          ration_axes=["money", "declared"])},
+        "projects": {
+            "alpha": {"team": {
+                "v": 2, "authored": True, "binding": True, "by": "owner",
+                "ts": 1900000000, "reason": "alpha leads codex",
+                "members": [member("alpha-claude", "anthropic", "lead"),
+                            member("alpha-codex", "codex", "builder")],
+                "shares": {"codex": 30}, "allocation": alpha_alloc,
+                "drift": [], "history": [
+                    {"kind": "team", "v": 2, "by": "owner", "ts": 1900000000,
+                     "reason": "alpha leads codex",
+                     "diff": ["codex share 25% → 30%"]}]}},
+            "beta": {"team": {
+                "v": 1, "authored": True, "binding": True, "by": "owner",
+                "ts": 1900000000, "reason": "beta",
+                "members": [member("beta-codex", "codex", "builder")],
+                "shares": {"codex": 35},
+                "allocation": {"codex": {"mode": "rate", "share": 35}},
+                "drift": [], "history": []}},
+            "delta": {"team": {
+                "v": 1, "authored": True, "binding": True, "by": "owner",
+                "ts": 1900000000, "reason": "delta reads on the local lane",
+                "members": [member("delta-claude", "anthropic", "lead"),
+                            member("qwen27", "qwen27", "reviewer")],
+                "shares": {"qwen27": 30}, "allocation": {},
+                "drift": [], "history": []}},
+            "gamma": {"team": {
+                "v": 0, "authored": False, "binding": False, "by": "",
+                "ts": None, "reason": "",
+                "members": [member("gamma-claude", "anthropic", "lead"),
+                            member("gamma-codex", "codex", "builder")],
+                "shares": {"codex": 15}, "allocation": {}, "drift": [
+                    {"kind": "unlisted", "seat": "stray-seat",
+                     "text": "stray-seat works here and is not on the team"}],
+                "history": []}}}}
+
+
+class TeamCardRuntimeTest(unittest.TestCase):
+    """task/3156: the team card and the family sheet, lifted out of the
+    SHIPPED page and run under node over a board carrying the teams leg."""
+
+    DRIVER = r"""
+const out = {};
+const A = BOARD.projects.alpha;
+out.alloc = teamAlloc("alpha", teamCurrent("alpha", A), BOARD, false);
+out.line = teamLine("alpha", "codex", out.alloc.codex);
+// D1: an ORANGE that the reach axis set rations nobody
+BOARD.sections.flags.families.codex.axis = "reach";
+out.reach = teamAlloc("alpha", teamCurrent("alpha", A), BOARD, false).codex;
+BOARD.sections.flags.families.codex.axis = "money";
+// D2: a family with no share is unrationed on the card, never 0%
+const BARE = {members: A.team.members, shares: {}};
+out.unset = teamAlloc("alpha", BARE, BOARD, false).codex;
+out.unset_line = teamLine("alpha", "codex", out.unset);
+out.unset_diff = teamDiff(BARE, {members: A.team.members, shares: {codex: 30}});
+// D3: a member is billed to the family it SPENDS, which the server sends
+out.spends = Object.keys(teamAlloc("alpha", {members: [{seat: "alpha-native",
+  family: "codex", spends: "anthropic", role: "reviewer"}], shares: {}}, BOARD, false));
+// D6: a burn reader that RAISED reads FAILED on the card, never unmeasured
+const TSEC = BOARD.sections.teams, TBURN = TSEC.burn;
+TSEC.burn = null;
+TSEC.failed = {burn: "ValueError"};
+out.failed = teamAlloc("alpha", teamCurrent("alpha", A), BOARD, false).codex;
+out.failed_line = teamLine("alpha", "codex", out.failed);
+out.failed_section = teamSection(ALPHA, A, BOARD);
+TSEC.failed = {};
+out.unread_line = teamLine("alpha", "codex", teamAlloc("alpha", teamCurrent("alpha", A), BOARD, false).codex);
+TSEC.burn = TBURN;
+delete TSEC.failed;
+out.section = teamSection(ALPHA, A, BOARD);
+out.mini = teamMini(ALPHA, A, BOARD);
+out.flags = flagsHTML(BOARD.sections.flags, BOARD);
+out.bar = shareBar("codex", BOARD);
+out.gamma = teamSection(GAMMA, BOARD.projects.gamma, BOARD);
+out.gamma_mini = teamMini(GAMMA, BOARD.projects.gamma, BOARD);
+out.red_light = teamAlloc("alpha", teamCurrent("alpha", A), BOARD, true).codex;
+// THE OWNER PRESSES + EIGHT TIMES: a draft, the budget moves at once
+const dr = teamDraft("alpha", A);
+dr.shares.codex = 70;
+out.after = teamAlloc("alpha", dr, BOARD, false).codex;
+out.section_after = teamSection(ALPHA, A, BOARD);
+out.bar_after = shareBar("codex", BOARD);
+out.diff = teamDiff(A.team, dr);
+dr.members.push({seat: "qwen27", family: "qwen27", role: "reviewer", state: "live", added: true});
+dr.members[1].gone = true;
+out.diff2 = teamDiff(A.team, dr);
+out.route_build = teamRoute("alpha", dr, teamAlloc("alpha", dr, BOARD, false), "build", false,
+  BOARD.sections.flags.families, BOARD.sections.teams.roles, BOARD.sections.teams.say);
+out.route_red = teamRoute("alpha", dr, {}, "build", true, {}, BOARD.sections.teams.roles, {});
+out.drift = teamDriftLines("alpha", A.team, dr);
+// THE LANES: delta holds 2 of its 1.2 slots on qwen27 (30% of 4 lanes)
+const D = BOARD.projects.delta;
+out.lane = teamAlloc("delta", teamCurrent("delta", D), BOARD, false).qwen27;
+out.lane_line = teamLine("delta", "qwen27", out.lane);
+out.lane_section = teamSection(DELTA, D, BOARD);
+out.lane_mini = teamMini(DELTA, D, BOARD);
+out.lane_bar = slotBar("qwen27", BOARD);
+out.lane_route = teamRoute("delta", teamCurrent("delta", D), {qwen27: out.lane}, "council", false,
+  BOARD.sections.flags.families, BOARD.sections.teams.roles, BOARD.sections.teams.say, BOARD.sections.teams.tier);
+out.lane_review = teamRoute("delta", teamCurrent("delta", D), {qwen27: out.lane}, "review", false,
+  BOARD.sections.flags.families, BOARD.sections.teams.roles, BOARD.sections.teams.say, BOARD.sections.teams.tier);
+FAM_SEL = "qwen27";
+out.lane_sheet = flagsHTML(BOARD.sections.flags, BOARD).rows;
+const dd = teamDraft("delta", D);
+dd.shares.qwen27 = 80;
+out.lane_after = teamAlloc("delta", dd, BOARD, false).qwen27;
+TEAM_DRAFT.delete("delta");
+// NOT MEASURED: the same world with no capacity recorded
+BOARD.sections.teams.slots.capacity = {};
+out.unmeasured = teamAlloc("delta", teamCurrent("delta", D), BOARD, false).qwen27;
+out.unmeasured_line = teamLine("delta", "qwen27", out.unmeasured);
+out.unmeasured_section = teamSection(DELTA, D, BOARD);
+out.unmeasured_bar = slotBar("qwen27", BOARD);
+FAM_SEL = null;
+// the sheet names the accounts that bill its family (task/3445 L4): a link
+// only where an account group on credit can answer it
+BOARD.sections.flags.families.codex.bills = ["codex"];
+FAM_SEL = "codex";
+out.billed_unread = flagsHTML(BOARD.sections.flags, BOARD).rows;   // no table yet
+QUOTA_GROUPS = new Set(["codex"]);
+out.billed = flagsHTML(BOARD.sections.flags, BOARD).rows;
+QUOTA_GROUPS = new Set(["anthropic"]);
+out.billed_nogroup = flagsHTML(BOARD.sections.flags, BOARD).rows;
+BOARD.sections.flags.families.qwen27.bills = [];                  // local: no bill
+FAM_SEL = "qwen27";
+out.billed_lane = flagsHTML(BOARD.sections.flags, BOARD).rows;
+QUOTA_GROUPS = null;
+FAM_SEL = null;
+out.eff = [teamEff("ORANGE", 1.0), teamEff("ORANGE", 2.0), teamEff("ORANGE", 2.0001),
+           teamEff("RED", 0.1), teamEff("YELLOW", 9), teamEff("ORANGE", null)];
+out.tokens = [teamTokens(10.95e6), teamTokens(13.914e6), teamTokens(640e3)];
+console.log(JSON.stringify(out));
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        from tests.test_web_accounts import _extract_const
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node not available")
+        src = web_ui_loader.read_text()
+
+        def decl(name):
+            m = re.search(_DECL % re.escape(name), src, re.M)
+            assert m, "no declaration of %s in the assembled page" % name
+            return m.group(0)
+        fns = "\n\n".join(_extract_fn(src, n) for n in (
+            "age", "ago", "pkey", "lrDur", "lrAgo", "flagWhen", "flagsHTML",
+            "boardSec", "boardSecState", "boardSecWord") + TEAM_FNS)
+        support = ('const esc = s => String(s ?? "").replace(/[&<>"\']/g, c => '
+                   '({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;","\'":"&#39;"}[c]));\n')
+        worlds = {"BOARD": _team_board(), "ALPHA": _row("alpha", "green"),
+                  "GAMMA": _row("gamma"), "DELTA": _row("delta", "green")}
+        cls.BOARD = worlds["BOARD"]
+        payload = "".join("const %s = %s;\n" % (k, json.dumps(v))
+                          for k, v in worlds.items())
+        cls.tmp = tempfile.mkdtemp(prefix="helm-web-teams-runtime-")
+        path = os.path.join(cls.tmp, "run.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(support + _extract_const(src, "FLAGCOL") + "\n"
+                    + "\n".join(decl(n) for n in TEAM_DECLS) + "\n"
+                    + payload + fns + cls.DRIVER)
+        chk = subprocess.run([cls.node, "--check", path],
+                             capture_output=True, text=True)
+        assert chk.returncode == 0, "node --check failed:\n" + chk.stderr
+        cls.proc = subprocess.run([cls.node, path], capture_output=True,
+                                  text=True, timeout=60)
+        try:
+            cls.out = json.loads(cls.proc.stdout or "{}")
+        except json.JSONDecodeError:
+            cls.out = {}
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
+
+    def setUp(self):
+        self.assertTrue(self.out, "node produced no output: "
+                        + (self.proc.stderr or "")[:1200])
+
+    def _run_driver(self, expr, extra=""):
+        """Run a one-line driver under node, returning the JSON string output."""
+        from tests.test_web_accounts import _extract_const
+        src = web_ui_loader.read_text()
+        support = ('const esc = s => String(s ?? "").replace(/[&<>"\']/g, c => '
+                   '({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;","\'":"&#39;"}[c]));\n')
+        fns = "\n\n".join(_extract_fn(src, n) for n in (
+            "age", "ago", "pkey", "lrDur", "lrAgo", "flagWhen", "flagsHTML",
+            "boardSec", "boardSecState", "boardSecWord") + TEAM_FNS)
+        decls = "\n".join(re.search(_DECL % re.escape(n), src, re.M).group(0)
+                          for n in TEAM_DECLS)
+        header = support + _extract_const(src, "FLAGCOL") + "\n" + decls
+        path = os.path.join(self.tmp, "run2.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(header + fns + extra + expr + "\nconsole.log(JSON.stringify(out));\n")
+        p = subprocess.run([self.node, path], capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, "node failed: " + p.stderr[:600]
+        self.out2 = json.loads(p.stdout or "{}")
+        return self.out2
+
+    def test_shareBar_with_raised_teams_section(self):
+        """When the teams leg raised, shareBar says UNKNOWN, not 'No project'."""
+        teams = dict(self.BOARD["sections"]["teams"],
+                     loading=None, retry=None,
+                     unavailable="the team read raised (ValueError)",
+                     measured_at=None, age_s=None)
+        board = json.loads(json.dumps(self.BOARD))
+        board["sections"]["teams"] = teams
+        # clear project shares so shareBar hits the empty-keys path
+        for p in board["projects"].values():
+            p.setdefault("team", {})["shares"] = {}
+        out = self._run_driver("out = shareBar('codex', board);",
+                               "const board = " + json.dumps(board) + ";\n")
+        self.assertIn("UNKNOWN", out)
+        self.assertNotIn("No project has a", out)
+        self.assertIn("ValueError", out)
+
+    def test_shareBar_with_loading_teams_section(self):
+        """When the teams leg is still being read, shareBar says not read yet."""
+        teams = dict(self.BOARD["sections"]["teams"],
+                     loading=True, retry=True,
+                     measured_at=None, age_s=None,
+                     unavailable=None)
+        board = json.loads(json.dumps(self.BOARD))
+        board["sections"]["teams"] = teams
+        for p in board["projects"].values():
+            p.setdefault("team", {})["shares"] = {}
+        out = self._run_driver("out = shareBar('codex', board);",
+                               "const board = " + json.dumps(board) + ";\n")
+        self.assertIn("not read yet", out)
+        self.assertNotIn("No project has a", out)
+        self.assertNotIn("UNKNOWN", out)
+
+    def test_shareBar_with_zero_shares_still_says_no_project(self):
+        """A read teams section with zero codex shares: keep 'No project'."""
+        teams = dict(self.BOARD["sections"]["teams"], unavailable=None)
+        board = json.loads(json.dumps(self.BOARD))
+        board["projects"] = {"alpha": {"team": {"binding": True,
+                                                 "members": [], "shares": {}}}}
+        board["sections"]["teams"] = teams
+        out = self._run_driver("out = shareBar('codex', board);",
+                               "const board = " + json.dumps(board) + ";\n")
+        self.assertIn("No project has a codex share yet", out)
+
+    def test_shareBar_no_three_space_runs_in_output(self):
+        """shareBar output never has three consecutive spaces."""
+        bar = self.out["bar"]
+        self.assertNotIn("   ", bar)
+        bar_after = self.out["bar_after"]
+        self.assertNotIn("   ", bar_after)
+
+    def test_the_card_folds_the_worked_example_as_the_server_does(self):
+        a = self.out["alloc"]["codex"]
+        self.assertEqual((a["mode"], a["share"], a["total"]), ("rate", 30, 65))
+        self.assertEqual(a["colour"], "RED")
+        self.assertTrue(a["rationed"])
+        self.assertEqual(self.out["line"], "share codex 30% → 13.9M/h budget, "
+                         "burning 32.9M/h (2.4×) → RED for alpha")
+        self.assertEqual(self.out["tokens"], ["11.0M", "13.9M", "640k"])
+        self.assertEqual(self.out["eff"], ["YELLOW", "ORANGE", "RED", "RED",
+                                           "YELLOW", "ORANGE"])
+
+    def test_an_orange_that_reach_set_rations_nobody_on_the_card(self):  # noqa: VACUOUS_ASSERTION — two unconditional tuple equalities, the reach fold and its money control
+        """D1: the card folds a draft as `teams.allocation` folds a saved
+        team, so an ORANGE the reach axis set is the family's own colour
+        here too, never a budget colour."""
+        got = self.out["reach"]
+        self.assertEqual((got["colour"], got["rationed"]), ("ORANGE", False))
+        # CONTROL: the money axis behind the same ORANGE rations it
+        a = self.out["alloc"]["codex"]
+        self.assertEqual((a["colour"], a["rationed"]), ("RED", True))
+
+    def test_a_family_with_no_share_is_unrationed_on_the_card(self):  # noqa: VACUOUS_ASSERTION — the unset share's absence sits beside the saved 30% share asserted by equality on the same fold
+        """D2: the card folds an unset share as the server does, so the
+        family's own ORANGE stands and nothing reads 0%."""
+        got = self.out["unset"]
+        self.assertIsNone(got["share"])
+        self.assertEqual((got["colour"], got["rationed"]), ("ORANGE", False))
+        self.assertIn("no share", self.out["unset_line"])
+        self.assertNotIn("0%", self.out["unset_line"])
+        self.assertEqual(self.out["unset_diff"], ["codex share unset → 30%"])
+        # CONTROL: the saved 30% share on the same family rations it
+        self.assertEqual(self.out["alloc"]["codex"]["share"], 30)
+
+    def test_a_member_is_billed_to_the_family_it_spends(self):
+        """D3: the server sends each member's `spends` (the family door's
+        answer) beside the authored family, and the card folds a draft on
+        it, as `teams.allocation` does."""
+        self.assertEqual(self.out["spends"], ["anthropic"])
+        # CONTROL: a member the door names nothing for folds on its family
+        self.assertIn("codex", self.out["alloc"])
+
+    def test_a_reader_that_raised_reads_failed_on_the_card(self):
+        """D6: the server names each reader that RAISED in the section's
+        `failed`, and the card says FAILED where it would say unmeasured."""
+        self.assertIn("burning FAILED (ValueError)", self.out["failed_line"])
+        self.assertNotIn("unmeasured", self.out["failed_line"])
+        self.assertEqual(self.out["failed"].get("burnFailed"), "ValueError")
+        self.assertIn("readings FAILED", self.out["failed_section"])
+        # CONTROL: no burn reading at all is unmeasured, never FAILED
+        self.assertIn("burning unmeasured", self.out["unread_line"])
+
+    def test_the_team_section_draws_every_part_of_the_mockup(self):
+        sec = self.out["section"]
+        for needle in ("team v2", "budgets", "data-team-step", "30%",
+                       "13.9M/h", "alpha-codex", "data-team-role",
+                       "data-team-rm", "data-team-addseat", "qwen27",
+                       "new seat alpha-", "what the lead will do",
+                       "what agents hear", "history",
+                       "codex share 25% → 30%", "save team v2 → v3",
+                       "No changes.", "reset credits: 1 usable"):
+            self.assertIn(needle, sec, needle)
+        self.assertIn(" disabled>save team", sec)       # nothing to save
+        self.assertIn("codex RED 2.4×", self.out["mini"])
+
+    def test_a_press_moves_the_budget_the_bar_and_the_save_bar_at_once(self):
+        after = self.out["after"]
+        self.assertEqual((after["share"], after["total"]), (70, 105))
+        self.assertTrue(after["over"])
+        self.assertEqual(after["colour"], "ORANGE")      # 32.9 vs 30.9M/h
+        sec = self.out["section_after"]
+        self.assertIn("Not saved: codex share 30% → 70%", sec)
+        self.assertNotIn(" disabled>save team", sec)
+        self.assertIn("alpha 70%", self.out["bar_after"])
+        self.assertIn("(unsaved)", self.out["bar_after"])
+        self.assertIn("over-promised: shares add to 105%",
+                      self.out["bar_after"])
+        self.assertEqual(self.out["diff"], ["codex share 30% → 70%"])
+        self.assertEqual(self.out["diff2"], ["− alpha-codex",
+                                             "+ qwen27 (reviewer, qwen27)",
+                                             "codex share 30% → 70%"])
+
+    def test_the_route_preview_and_the_drift_follow_the_draft(self):
+        self.assertIn("not @qwen27: role reviewer does not take build",
+                      self.out["route_build"])
+        self.assertIn("E9", self.out["route_build"])
+        self.assertIn("is RED — start nothing new here", self.out["route_red"])
+        self.assertIn("alpha-codex leaves: it keeps its lanes until it "
+                      "releases them, and gets no new work here.",
+                      self.out["drift"])
+
+    def test_a_red_light_releases_the_share(self):
+        red = self.out["red_light"]
+        self.assertEqual((red["share"], red["budget"]), (0, 0))
+        self.assertEqual(red["colour"], "RED")
+
+    def test_the_family_sheet_links_each_share_to_its_projects_team_tab(self):
+        """Fleet › credit holds the shares across projects; each project's
+        share opens that project's Team tab (task/3445 L4)."""
+        self.assertIn('href="#work/projects?open=alpha&amp;tab=team"', self.out["bar"])
+        self.assertIn("alpha 30%", self.out["bar"])      # the legend still reads
+        self.assertIn('href="#work/projects?open=delta&amp;tab=team"', self.out["lane_bar"])
+
+    def test_a_budget_row_links_its_family_on_fleet_credit(self):
+        self.assertIn('href="#quota?family=codex"', self.out["section"])
+
+    def test_the_family_sheet_links_its_accounts_only_where_a_group_answers(self):
+        """A link exists only where an account group on credit can answer it:
+        before the accounts table is read the sheet says so; a vendor no group
+        carries is named, not linked; a family served from the operator's own
+        GPUs has no bill at all (task/3445 L4 cure)."""
+        self.assertIn('data-qfam="codex"', self.out["billed"])
+        for key in ("billed_unread", "billed_nogroup", "billed_lane"):
+            self.assertNotIn("data-qfam", self.out[key], key)
+        self.assertIn("accounts not read yet", self.out["billed_unread"])
+        self.assertIn("no account on this page", self.out["billed_nogroup"])
+        self.assertIn("local GPU, no bill", self.out["billed_lane"])
+        self.assertIn("own GPUs", self.out["billed_lane"])  # the lane sheet drew
+
+    def test_the_family_sheet_carries_shares_credits_and_the_declare(self):
+        rows = self.out["flags"]["rows"]
+        for needle in ('data-fam-sel="codex"', "fchip fpick on",
+                       "Lasts to the reset only at <b>46.4M/h</b>",
+                       "the fleet burns <b>73.0M/h</b>", "alpha 30%",
+                       "beta 35%", "unallocated 35% (held back)",
+                       "Reset credits:", "3 accounts not asked",
+                       "declare a colour for codex", "data-declare="):
+            self.assertIn(needle, rows, needle)
+        self.assertIn("runway 54h is under the 85h horizon", rows)
+        self.assertEqual(self.out["bar"].count("<i style"), 2)
+
+    def test_a_local_lane_folds_into_slots_as_the_server_does(self):  # noqa: VACUOUS_ASSERTION — the saved fold asserts queued True and the draft asserts it False, each an unconditional equality on the same field
+        """The owner's slots direction on the card: 30% of 4 lanes is 1.2
+        slots, delta holds 2 — ORANGE, and the next row QUEUES."""
+        a = self.out["lane"]
+        self.assertEqual((a["mode"], a["lane"], a["capacity"], a["inUse"],
+                          a["fleet"]), ("slots", True, 4, 2, 4))
+        self.assertAlmostEqual(a["slots"], 1.2)
+        self.assertEqual((a["colour"], a["queued"]), ("ORANGE", True))
+        # the same sentence `teams.line` prints (tests/test_teams.py)
+        self.assertEqual(self.out["lane_line"],
+                         "slots qwen27 30% of 4 lanes → 1.2 slots, 2 in use "
+                         "(fleet 4 of 4) → ORANGE for delta; QUEUED — new "
+                         "work waits for a lane, it is not refused")
+        # a press to 80% is 3.2 slots: inside them, and the next row fits
+        after = self.out["lane_after"]
+        self.assertAlmostEqual(after["slots"], 3.2)
+        self.assertEqual((after["colour"], after["queued"]),
+                         ("YELLOW", False))
+
+    def test_the_card_steps_a_slot_share_and_says_queued(self):
+        sec = self.out["lane_section"]
+        for needle in ('data-fam="qwen27"', "of <b>4 lanes</b>",
+                       "<b>1.2 slots</b>", "<b>2</b> in use here",
+                       "fleet 4 of 4", "▲ slots 1.2",
+                       "QUEUED: one more row here waits for a lane",
+                       "data-team-kind='council'"):
+            self.assertIn(needle, sec, needle)
+        self.assertIn("qwen27 ORANGE 2 of 1.2 slots, queued",
+                      self.out["lane_mini"])
+
+    def test_the_route_preview_queues_the_lane_and_keeps_the_tier(self):
+        self.assertIn("TAKE @qwen27", self.out["lane_route"])
+        self.assertIn("QUEUED</b> — slots qwen27 30% of 4 lanes",
+                      self.out["lane_route"])
+        # a review CLOSES a row: the owner's approval tier decides (E3)
+        self.assertIn("not @qwen27: qwen27 is not in the owner&#39;s "
+                      "approval tier", self.out["lane_review"])
+        self.assertIn("(E3)", self.out["lane_review"])
+
+    def test_the_family_sheet_draws_the_lanes_bar(self):
+        sheet = self.out["lane_sheet"]
+        for needle in ("fchip fpick on", "Capacity 4 lanes, measured by "
+                       "seat-m", "4 concurrent at 32k", "tstack tslots",
+                       "<b>4 lanes</b> in all · <b>4</b> in use · 0 free"):
+            self.assertIn(needle, sheet, needle)
+        bar = self.out["lane_bar"]
+        for needle in ("delta 30% = 1.2 slots · 2 in use", ">over<",
+                       "alpha: 1 in use, no share", "on no project: 1 in use",
+                       "unallocated 70% = 2.8 slots", 'class="over"'):
+            self.assertIn(needle, bar, needle)
+        self.assertEqual(bar.count("<i style"), 1)      # delta alone
+
+    def test_with_no_capacity_recorded_it_says_so_and_no_number(self):
+        u = self.out["unmeasured"]
+        self.assertEqual((u["capacity"], u["slots"], u["queued"]),
+                         (None, None, False))
+        self.assertEqual(u["colour"], "GREY")
+        self.assertEqual(self.out["unmeasured_line"],
+                         "slots qwen27 30%: capacity not measured, 2 in use "
+                         "here → GREY for delta")
+        self.assertIn("<b>capacity not measured</b>",
+                      self.out["unmeasured_section"])
+        self.assertNotIn("slots</b>", self.out["unmeasured_section"])
+        bar = self.out["unmeasured_bar"]
+        self.assertIn("<b>capacity not measured</b> · <b>4</b> in use", bar)
+        self.assertIn("delta 30% · 2 in use", bar)
+        self.assertNotIn("= ", bar)
+
+    def test_a_proposed_team_offers_accept_and_binds_nothing(self):
+        self.assertIn("proposed team", self.out["gamma"])
+        self.assertIn("data-team-accept", self.out["gamma"])
+        self.assertIn("stray-seat works here", self.out["gamma"])
+        self.assertIn("team proposed", self.out["gamma_mini"])
+        self.assertNotIn("gamma", self.out["bar"])        # not binding
+
+    def test_work_and_the_families_card_tell_the_owner_no_helm_verb(self):  # noqa: VACUOUS_ASSERTION — each render's absence of a verb follows an unconditional positive control on the same markup, asserting the branch named was drawn
+        """RULE 2 ON WORK › PROJECTS AND THE FAMILIES CARD (console walk 3,
+        open points). With no projects the list said "run `helm sync`, then
+        refresh"; the families card, past its bound, said "`helm burn` reads
+        them fresh". The card's stale branch runs; the list is markup."""
+        board = json.loads(json.dumps(self.BOARD))
+        board["sections"]["flags"].update(stale=True, age_s=900, limit_s=600)
+        out = self._run_driver(
+            "const out = {stale: flagsHTML(board.sections.flags, board).head};",
+            "const board = " + json.dumps(board) + ";\n")
+        work = view_markup(web_ui_loader.read_text(), "work")
+        # POSITIVE CONTROLS: the stale branch, and the list's empty state
+        self.assertIn("STALE", out["stale"])
+        self.assertIn('id="brows"', work)
+        for name, markup in (("stale", out["stale"]), ("work", work)):
+            self.assertEqual(owner_verbs(markup), [], "%s: %s" % (name, markup))
+
+    def test_the_team_tab_tells_the_owner_no_helm_verb(self):
+        """RULE 2 ON WORK › PROJECTS › <PROJECT> › TEAM (console walk 3, #7).
+        The tab said "the lead starts or resumes it (`helm seat spawn
+        <project>-codex` for a new codex seat on this project)" and headed its
+        route box `helm route review --project <project>`; its other states named
+        `helm team set` and `helm team capacity`. The owner does not use a
+        terminal.
+
+        The lead's lines come from the REAL `teams.drift` over a world that
+        raises every kind of drift it can name, so the tab is read over the
+        text the server actually sends."""
+        from helm import teams
+        team = {"members": [
+            {"seat": "alpha-claude", "family": "anthropic", "role": "lead"},
+            {"seat": "alpha-kimi", "family": "kimi", "role": "reviewer"},
+            {"seat": "beta-codex", "family": "codex", "role": "builder"},
+            {"seat": "alpha-grok", "family": "grok", "role": "reviewer"}],
+            "shares": {}}
+
+        def placed(fam, project, home=None, source="home room"):
+            return {"family": fam, "presence": "live", "project": project,
+                    "home_room": home, "source": source}
+        seats = {"alpha-claude": placed("anthropic", "alpha", "alpha"),
+                 "beta-codex": placed("codex", "beta", "beta"),
+                 "alpha-grok": placed("kimi", "alpha", "alpha"),
+                 "stray-codex": placed("codex", "alpha", source="its cwd"),
+                 "odd-seat": placed("unmeasured-fam", "alpha", source="its cwd")}
+        drift = teams.drift("alpha", team, {"seats": seats,
+                                            "roster": dict.fromkeys(seats)},
+                            flags={"codex": {"colour": burnflags.RED}})
+        # POSITIVE CONTROL: the world raised every kind the lead is told about
+        self.assertEqual({d["kind"] for d in drift},
+                         {"wanted", "family-differs", "homed-elsewhere",
+                          "family-red", "no-share", "unlisted"})
+        board = json.loads(json.dumps(self.BOARD))
+        board["projects"]["alpha"]["team"].update(
+            members=[dict(m, state="wanted" if m["seat"] == "alpha-kimi"
+                          else "live", shared=[]) for m in team["members"]],
+            shares={}, drift=drift)
+        board["sections"]["teams"]["slots"]["capacity"] = {}  # lanes unmeasured
+        extra = "".join("const %s = %s;\n" % (k, json.dumps(v)) for k, v in (
+            ("board", board), ("ALPHA", _row("alpha", "green")),
+            ("DELTA", _row("delta", "green"))))
+        out = self._run_driver("""const out = {};
+out.saved = teamSection(ALPHA, board.projects.alpha, board);
+const dr = teamDraft("alpha", board.projects.alpha);
+dr.members.push({seat: "alpha-qwen", family: "qwen27", role: "reviewer",
+                 state: "wanted", added: true, shared: []});
+out.draft = teamSection(ALPHA, board.projects.alpha, board);
+TEAM_DRAFT.delete("alpha");
+out.lanes = teamSection(DELTA, board.projects.delta, board);
+out.none = teamSection(ALPHA, {team: null}, board);
+FAM_SEL = "qwen27";
+out.sheet = flagsHTML(board.sections.flags, board).rows;""", extra)
+        # POSITIVE CONTROLS on the same renders: each is the state named
+        self.assertIn("alpha-kimi is not running", out["saved"])
+        self.assertIn("what agents hear", out["saved"])
+        self.assertIn("Start alpha-qwen", out["draft"])
+        self.assertIn("capacity not measured", out["lanes"])
+        self.assertIn("no team", out["none"])
+        self.assertIn("Capacity not measured", out["sheet"])
+        for name in ("saved", "draft", "lanes", "none", "sheet"):
+            self.assertEqual(owner_verbs(out[name]), [],
+                             "%s: %s" % (name, out[name]))
 
 
 class BoardReadAgainRuntimeTest(unittest.TestCase):
@@ -2245,191 +3205,88 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class LandedOnTheKanbanTest(unittest.TestCase):
+def _work_placed(running, loops=(), **pipe):
+    """WHERE THE WORK PAGE PUTS EACH HELD LANE: `running` (a project's
+    `/api/board` rooms) and `loops` (its live land requests, as
+    `web_board._kanban_card` sends them) read by `work_model.build`, the one
+    reader `/api/work` serves and the Work page draws (task/3643 slice 6
+    retired the land board's kanban that drew them before). -> {lane: sorted
+    places}, a place being the stage of the move the lane is on, or "record"
+    for a room on landed work whose lease release is all that is owed
+    (Leftovers the agents clear). `pipe` extends the project's pipeline
+    record (its `on_main` and `collapsed` lines)."""
+    from helm import work_model
+    now = time.time()
+    sec = {"source": "x", "measured_at": now - 5, "age_s": 5,
+           "limit_s": 1200, "unavailable": None, "stale": False}
+    live = list(loops)
+    board = {"generated_at": now,
+             "sections": {"lands": dict(sec, scope="proj"),
+                          "fleet": dict(sec, scope="proj"),
+                          "seats": dict(sec), "tasks": dict(sec)},
+             "projects": {"proj": {"lanes": dict({
+                 "loops": live, "loops_cut": [], "loops_more": {},
+                 "rehold": None, "tally": web_board._kanban_tally(live),
+                 "on_main": None, "collapsed": []}, **pipe),
+                 "running": list(running)}}}
+    snap = work_model.build({
+        "now": now, "board": board, "projects": {"proj": {"name": "proj"}},
+        "tasks": {"rows": {}, "history": {}, "unavailable": None},
+        "dispatch": {"rows": {}, "events": {}, "chains": {},
+                     "unavailable": None},
+        "trains": {"trains": [], "lands": {}, "ejections": [],
+                   "unavailable": None},
+        "train_project": "proj", "zone": "America/Los_Angeles"})
+    got = {}
+    for card in snap["cards"].values():
+        for act in card["actions"]:
+            got.setdefault(act["lane"], []).append(act["stage"])
+    for rec in snap["records"]:
+        got.setdefault(rec["lane"], []).append("record")
+    return {lane: sorted(places) for lane, places in got.items()}
+
+
+def _claim_room(lane, state, proof="LANDED by ancestry (the tip itself is "
+                "on the trunk)", dirty=None):
+    """One held room as `web_board._seats_join` sends it in `running`."""
+    return {"lane": lane, "kind": "claim", "seats": ["s1"],
+            "landed": {"state": state, "proof": proof, "tip": "ab" * 6},
+            "dirty": dirty}
+
+
+class LandedOnTheWorkPageTest(unittest.TestCase):
     """WHAT THE OWNER READ: "about half the listed lanes already landed ...
-    why werent they listed as landed in helm?" A kanban that reads the
-    paperwork draws a lane BUILDING for as long as its lease is held and a
-    request under REVIEW for as long as no verdict is recorded, and a land
-    does neither. These arms run the SHIPPED `boardKanban` under node over the wire
-    shapes the server's producers emit (`running[].landed` from
-    `work.lanes_landed`, `web_board._kanban_card`)."""
+    why werent they listed as landed in helm?" The land board's kanban drew
+    a lane BUILDING for as long as its lease was held; it is retired
+    (task/3643 slice 6), and these arms read the same wire shapes through
+    the Work page's one reader. What the page does with each card it is
+    sent is run in tests/test_web_work_page.py; how each row is typed is
+    tests/test_work_model.py."""
 
-    FNS = ("pkey", "lrDur", "lrAgo", "boardSec", "boardSecState",
-           "boardKanban", "boardKanbanHTML", "boardKanbanCount",
-           "boardFoldLine", "boardLaneWord")
-
-    @classmethod
-    def kanban(cls, cases):
-        """{name: (running, loops, landed)} -> {name: columns}, one node run.
-        `landed` None is a pipeline whose lands list could not be read."""
-        from tests.test_web_accounts import _extract_const
-        node = shutil.which("node")
-        if not node:
-            raise unittest.SkipTest("node not available")
-        src = web_ui_loader.read_text()
-        fns = "\n\n".join(_extract_fn(src, n) for n in cls.FNS)
-        board = {"sections": {"seats": _sec(), "lands": _sec(scope="proj"),
-                              "fleet": _sec(scope="proj")}}
-        worlds = {name: {"running": run,
-                         "lanes": dict({"loops": loops, "building_lanes": []},
-                                       **(extra[0] if extra else {})),
-                         "landed": landed}
-                  for name, (run, loops, landed, *extra) in cases.items()}
-        dirty = re.search(_DECL % "BOARD_DIRTY", src, re.M).group(0)
-        script = ("const esc = s => String(s);\n"
-                  + _extract_const(src, "KANBAN_OF") + "\n" + dirty + "\n"
-                  + fns + "\n"
-                  + "const BOARD = %s;\nconst W = %s;\nconst out = {};\n"
-                  % (json.dumps(board), json.dumps(worlds))
-                  + "for (const k in W) { out[k] = boardKanban({name: "
-                    "'proj'}, W[k], BOARD); out[k].html = "
-                    "boardKanbanHTML(out[k]); }\n"
-                  + "out.words = (W.parity || W[Object.keys(W)[0]]).running"
-                    ".map(boardLaneWord);\n"
-                  + "console.log(JSON.stringify(out));\n")
-        tmp = tempfile.mkdtemp(prefix="helm-web-board-landed-")
-        try:
-            path = os.path.join(tmp, "run.js")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(script)
-            proc = subprocess.run([node, path], capture_output=True,
-                                  text=True, timeout=60)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-        assert proc.returncode == 0, proc.stderr[:2000]
-        return json.loads(proc.stdout)
-
-    @staticmethod
-    def lanes(col):
-        return [r["lane"] for r in col] if isinstance(col, list) else col
-
-    @staticmethod
-    def served(cards):
-        """(loops, lanes extras) as the SERVER sends them for these cards:
-        `web_board._kanban_split`, the call `_lands_join` makes, so the page
-        is fed exactly the live cards and count lines it would receive."""
-        live, on_main, folded = web_board._kanban_split(cards, 0)
-        return live, {"on_main": on_main, "collapsed": folded}
-
-    @staticmethod
-    def claim(lane, state, proof="LANDED by ancestry (the tip itself is on "
-              "the trunk)", dirty=None):
-        return {"lane": lane, "kind": "claim", "seats": ["s1"],
-                "landed": {"state": state, "proof": proof, "tip": "ab" * 6},
-                "dirty": dirty}
-
-    def test_a_landed_lane_under_a_DIRTY_room_is_landed_AND_still_building(self):
-        """THE CLI KEEPS IT, SO THE BOARD DOES. `helm work list` prints a
-        landed row whose room is dirty as DIRTY (commit or --park first) and
-        `helm lr foldcheck` keeps it rather than offering its release; a
-        kanban that drew it landed alone would hide uncommitted work. It is
-        drawn in both columns and each card says why."""
-        run = [self.claim("dirty-landed", "landed", dirty=True),
-               self.claim("clean-landed", "landed", dirty=False)]
-        both = self.kanban({"parity": (run, [], [])})
-        got = dict(both["parity"], words=both["words"])
-        landed = {r["lane"]: r["note"] for r in got["landed"]}
-        building = {r["lane"]: r["note"] for r in got["building"]}
-        self.assertEqual(sorted(landed), ["clean-landed", "dirty-landed"])
-        self.assertIn("room DIRTY (commit or park first)",
-                      landed["dirty-landed"])
-        self.assertEqual(sorted(building), ["dirty-landed"])
-        self.assertIn("landed on main", building["dirty-landed"])
-        self.assertIn("room DIRTY (commit or park first)",
-                      building["dirty-landed"])
-        # THE CONTROL on the same columns: a clean landed room says nothing
-        # of dirt and is not building
-        self.assertNotIn("DIRTY", landed["clean-landed"])
-        self.assertIn("room DIRTY", got["words"][0])
-        self.assertNotIn("DIRTY", got["words"][1])
-
-    def test_a_DIRTY_landed_lane_is_one_building_card_when_landed_is_unread(self):
-        got = self.kanban({"unread": ([self.claim("dirty-landed", "landed",
-                                                  dirty=True)],
-                                      [], None)})["unread"]
-        self.assertEqual(got["landed"], "unknown")
-        self.assertEqual(self.lanes(got["building"]), ["dirty-landed"])
-        note = got["building"][0]["note"]
-        self.assertIn("LANDED", note)
-        self.assertIn("room DIRTY (commit or park first)", note)
-
-    def test_a_lane_its_land_request_drew_landed_still_says_its_room_is_DIRTY(self):
-        landed = [{"lane": "lane/dirty-landed", "task": "task/9",
-                   "age_s": 60}]
-        got = self.kanban({"filed": ([self.claim("dirty-landed", "landed",
-                                                 dirty=True)],
-                                     [], landed)})["filed"]
-        self.assertEqual(self.lanes(got["landed"]), ["lane/dirty-landed"])
-        self.assertIn("task/9", got["landed"][0]["note"])
-        self.assertIn("room DIRTY", got["landed"][0]["note"])
-        self.assertEqual(self.lanes(got["building"]), ["dirty-landed"])
-
-    def test_a_landed_lease_and_an_on_main_request_draw_as_LANDED(self):
-        on_main = web_board._kanban_card({"id": "r1", "lane": "reviewed-in-chat",
-                                          "state": "AWAITING_REVIEW",
-                                          "trunk_contains_tip": True})
-        waiting = web_board._kanban_card({"id": "r2", "lane": "waiting",
-                                          "state": "AWAITING_REVIEW",
-                                          "trunk_contains_tip": False})
-        run = [self.claim("landed-lane", "landed"),
-               self.claim("building-lane", "unlanded"),
-               self.claim("just-claimed", "unstarted"),
-               self.claim("reviewed-in-chat", "gone")]
-        loops, extra = self.served([on_main, waiting])
-        got = self.kanban({"parity": (run, loops, [], extra)})["parity"]
-        # THE ON-MAIN REQUEST IS COUNTED ON ONE LINE, not drawn as a card: it
-        # is ledger debris nobody moves, and the line names the listing
-        self.assertEqual(self.lanes(got["landed"]), ["landed-lane", None])
-        summary = got["landed"][1]
-        self.assertEqual(summary["summary"], 1)
-        self.assertIn("no verdict recorded", summary["note"])
-        self.assertIn("helm lr list", summary["note"])
-        notes = {r["lane"]: r["note"] for r in got["landed"]}
-        self.assertIn("lease still held", notes["landed-lane"])
-        self.assertIn("LANDED by ancestry", notes["landed-lane"])
-        # the CONTROLS on the same columns: unlanded and never-started work is
-        # still building, and a request NOT on main is still under review
-        self.assertEqual(self.lanes(got["building"]),
-                         ["building-lane", "just-claimed"])
-        self.assertEqual(self.lanes(got["review"]), ["waiting"])
-
-    def test_an_unread_landed_column_keeps_the_card_where_it_was_and_says_so(self):
-        on_main = web_board._kanban_card({"id": "r1", "lane": "on-main",
-                                          "state": "AWAITING_REVIEW",
-                                          "trunk_contains_tip": True})
-        loops, extra = self.served([on_main])
-        got = self.kanban({"unread": ([self.claim("landed-lane", "landed")],
-                                      loops, None, extra)})["unread"]
-        self.assertEqual(got["landed"], "unknown")
-        building = {r["lane"]: r["note"] for r in got["building"]}
-        self.assertIn("LANDED", building["landed-lane"])
-        # the count line stays where its cards came from, and says so
-        summary = [r for r in got["review"] if r.get("summary")]
-        self.assertEqual([r["summary"] for r in summary], [1])
-        self.assertIn("ON MAIN", summary[0]["note"])
-        self.assertNotIn("on-main", self.lanes(got["building"]))
-
-    def test_a_lane_already_landed_is_not_ALSO_building_unless_it_moved_on(self):
-        landed = [{"lane": "lane/done", "task": None, "age_s": 60},
-                  {"lane": "lane/next-round", "task": None, "age_s": 60},
-                  {"lane": "lane/branch-gone", "task": None, "age_s": 60}]
-        run = [self.claim("done", "unstarted"),
-               self.claim("next-round", "unlanded"),
-               self.claim("branch-gone", "gone"),
-               self.claim("never-landed", "gone")]
-        got = self.kanban({"relanded": (run, [], landed)})["relanded"]
-        self.assertEqual(self.lanes(got["building"]),
-                         ["next-round", "never-landed"])
-        notes = {r["lane"]: r["note"] for r in got["building"]}
-        self.assertIn("lease only — no room or branch", notes["never-landed"])
-        self.assertNotIn("lease only", notes["next-round"])
+    def test_a_room_on_landed_work_is_a_leftover_never_building(self):
+        """A landed lease is a record whose lease release its seat owes
+        (Leftovers the agents clear); unlanded and never-started rooms are
+        their seat's Building move. THE GAP, named: a landed room whose room
+        holds uncommitted work was drawn "room DIRTY (commit or park first)"
+        on the kanban; `/api/work`'s rooms carry no `dirty`, so the page
+        cannot say it, and `helm work list` still does."""
+        got = _work_placed([_claim_room("landed-lane", "landed"),
+                            _claim_room("dirty-landed", "landed", dirty=True),
+                            _claim_room("building-lane", "unlanded"),
+                            _claim_room("just-claimed", "unstarted"),
+                            _claim_room("never-landed", "gone")])
+        self.assertEqual(got, {"landed-lane": ["record"],
+                               "dirty-landed": ["record"],
+                               "building-lane": ["building"],
+                               "just-claimed": ["building"],
+                               "never-landed": ["building"]})
 
     def test_a_BUILD_row_sent_against_trunk_is_building_not_landed(self):
         """fold-checkpoint-key-3048 and seat-signs-as-itself-3049 read as
-        LANDED the moment they were sent. The projection now answers a build
+        LANDED the moment they were sent. The projection answers a build
         row's containment off its LANE, so a build with nothing authored is
-        not contained, and the kanban draws AWAITING_BUILD where it is: in
-        building."""
+        not contained, and the Work page draws AWAITING_BUILD in Building,
+        beside a request under review in In review."""
         build = web_board._kanban_card({"id": "b", "state": "AWAITING_BUILD",
                                         "lane": "seat-signs-as-itself-3049",
                                         "kind": "build",
@@ -2437,48 +3294,14 @@ class LandedOnTheKanbanTest(unittest.TestCase):
         review = web_board._kanban_card({"id": "r", "lane": "under-review",
                                          "state": "AWAITING_REVIEW",
                                          "trunk_contains_tip": False})
-        got = self.kanban({"sent": ([], [build, review], [])})["sent"]
-        self.assertEqual(self.lanes(got["building"]),
-                         ["seat-signs-as-itself-3049"])
-        self.assertEqual(got["building"][0]["note"], "AWAITING_BUILD")
-        self.assertEqual(self.lanes(got["review"]), ["under-review"])
-        self.assertEqual(got["landed"], [])
+        self.assertEqual(_work_placed([], [build, review]),
+                         {"seat-signs-as-itself-3049": ["building"],
+                          "under-review": ["review"]})
 
-    def test_on_main_rows_are_ONE_count_line_naming_the_listing(self):
-        """The server counts them (`lanes.on_main`); the page draws one line
-        with the count, the oldest age and the command — and the lanes it
-        counts are placed, so a claim on one of them is not drawn building."""
-        on_main = {"label": "on main with no verdict recorded", "count": 7,
-                   "oldest_age_s": 3 * 86400,
-                   "lanes": ["m%d" % i for i in range(7)],
-                   "command": "helm lr list"}
-        verdicted = [{"lane": "lane/verdicted", "task": "task/9",
-                      "age_s": 60}]
-        got = self.kanban({"line": (
-            [self.claim("m3", "unlanded"), self.claim("fresh", "unlanded"),
-             # a landed lease on a lane the line already counts is not a
-             # second entry beside it — one entry per lane
-             self.claim("m4", "landed")],
-            [], verdicted, {"on_main": on_main})})["line"]
-        self.assertEqual(self.lanes(got["landed"]), ["lane/verdicted", None])
-        line = got["landed"][1]
-        self.assertEqual(line["summary"], 7)
-        for part in ("on main with no verdict recorded", "oldest 3d",
-                     "helm lr list"):
-            self.assertIn(part, line["note"])
-        # the review WITH a verdict that landed is still its own card
-        self.assertIn("task/9", got["landed"][0]["note"])
-        self.assertEqual(self.lanes(got["building"]), ["fresh"])
-        # the column head counts what the line counts, not one card
-        self.assertIn('landed <span class="bmut">8</span>', got["html"])
-
-    def test_the_page_never_refolds_a_card_the_server_sent(self):  # noqa: VACUOUS_ASSERTION — the two cards are asserted PRESENT in their columns by exact lane lists and the server's line by its exact count, on the same render
-        """THE SERVER DECIDES, ONCE. A page that folds a card marked
-        `trunk_contains_tip` into the on-main line itself is a second copy of
-        the rule, reading containment alone — and it counts a FIX-verdicted
-        row whose tip is on main (which the server keeps LISTED) as "no
-        verdict recorded". Every card the server sends is drawn as a card;
-        the count is the server's line and nothing else."""
+    def test_the_server_marks_what_is_on_main_with_no_verdict(self):  # noqa: VACUOUS_ASSERTION — the owner-gated card's flag is asserted True and both cards are asserted placed by an exact lane list
+        """THE SERVER DECIDES, ONCE: the card carries whether its work is
+        on main with no verdict recorded, and a FIX-verdicted row whose tip
+        is on main is not that (it stays listed, a fix owed)."""
         fix = web_board._kanban_card({"id": "f", "lane": "fix-on-main",
                                       "state": "CHANGES_REQUESTED",
                                       "polarity": "fix",
@@ -2486,46 +3309,12 @@ class LandedOnTheKanbanTest(unittest.TestCase):
         gated = web_board._kanban_card({"id": "g", "lane": "owner-gated",
                                         "state": "AWAITING_REVIEW",
                                         "trunk_contains_tip": True})
-        on_main = web_board._kanban_card({"id": "m", "lane": "in-history",
-                                          "state": "AWAITING_REVIEW",
-                                          "trunk_contains_tip": True})
         self.assertIs(fix["on_main_unverdicted"], False)
-        self.assertIs(on_main["on_main_unverdicted"], True)
-        # the owner-gated hold the server kept listed is sent as a card
-        # although its work is on main with no verdict
         self.assertIs(gated["on_main_unverdicted"], True)
-        got = self.kanban({"sent": ([], [fix, gated], [],
-                                    {"on_main": {"count": 1, "lanes":
-                                                 ["in-history"],
-                                                 "label": "on main with no "
-                                                 "verdict recorded",
-                                                 "command": "helm lr list",
-                                                 "oldest_age_s": None}})})
-        got = got["sent"]
-        self.assertEqual(self.lanes(got["building"]), ["fix-on-main"])
-        self.assertEqual(self.lanes(got["review"]), ["owner-gated"])
-        self.assertEqual([r.get("summary") for r in got["landed"]], [1],
-                         "the page counted a card the server kept listed")
-
-    def test_collapsed_lines_are_drawn_under_the_columns_with_their_command(self):  # noqa: VACUOUS_ASSERTION — the drawn line and its command are asserted PRESENT in the same kanban HTML first; the plain run's missing fold is the paired absence
-        lines = [{"class": "off_frontier", "count": 4, "command":
-                  "helm lr retire --off-frontier", "oldest_age_s": 50 * 86400,
-                  "label": "left over after landing or abandonment (off the "
-                  "live frontier)", "by_reason": {}}]
-        got = self.kanban({"fold": ([], [], [], {"collapsed": lines})})["fold"]
-        self.assertEqual(got["collapsed"], lines)
-        self.assertIn("<b>4</b> left over after landing", got["html"])
-        self.assertIn("oldest 50d", got["html"])
-        self.assertIn("helm lr retire --off-frontier", got["html"])
-        plain = self.kanban({"none": ([], [], [])})["none"]
-        self.assertNotIn("bkfold", plain["html"])
-
-    def test_the_lanes_hover_says_a_landed_lane_is_landed(self):
-        got = self.kanban({"parity": ([self.claim("landed-lane", "landed"),
-                                       self.claim("open", "unlanded")],
-                                      [], [])})
-        self.assertIn("landed on main, lease still held", got["words"][0])
-        self.assertNotIn("landed", got["words"][1])
+        # THE PAGE NEVER REFOLDS a card it was sent: both are placed, as
+        # moves on work that is on trunk
+        got = _work_placed([], [fix, gated])
+        self.assertEqual(sorted(got), ["fix-on-main", "owner-gated"])
 
 
 def _loop(rid, lane, state="AWAITING_REVIEW", dwell_s=3600, **kw):
@@ -2541,78 +3330,6 @@ def _loop(rid, lane, state="AWAITING_REVIEW", dwell_s=3600, **kw):
            "frontier_rung": None}
     row.update(kw)
     return row
-
-
-class BoardWaitsRuntimeTest(unittest.TestCase):
-    """THE WAITS SECTION, drawn by the SHIPPED `boardWaits`: the live groups
-    as before, then one line per collapsed class with its count, its oldest
-    age and the command that lists it."""
-
-    FNS = ("pkey", "lrDur", "lrAgo", "boardSec", "boardSecState",
-           "boardSecWord", "boardFoldLine", "boardWaits")
-
-    def render(self, j, scope="proj"):
-        node = shutil.which("node")
-        if not node:
-            raise unittest.SkipTest("node not available")
-        src = web_ui_loader.read_text()
-        fns = "\n\n".join(_extract_fn(src, n) for n in self.FNS)
-        board = {"sections": {"lands": _sec(scope=scope)}}
-        script = ('const esc = s => String(s ?? "").replace(/[&<>"\']/g, '
-                  'c => ({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;",'
-                  '"\'":"&#39;"}[c]));\n' + fns + "\n"
-                  + "console.log(JSON.stringify(boardWaits({name: 'proj'}, "
-                  "%s, %s)));\n" % (json.dumps(j), json.dumps(board)))
-        tmp = tempfile.mkdtemp(prefix="helm-web-board-waits-")
-        try:
-            path = os.path.join(tmp, "run.js")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(script)
-            proc = subprocess.run([node, path], capture_output=True,
-                                  text=True, timeout=60)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-        assert proc.returncode == 0, proc.stderr[:2000]
-        return json.loads(proc.stdout)
-
-    def test_live_groups_then_one_line_per_collapsed_class(self):
-        html = self.render({
-            "waits": [{"label": "lander", "count": 1, "oldest_age_s": 600,
-                       "rows": [{"plain_title": "a live ready", "age_s": 600,
-                                 "stage_class": "ready"}]}],
-            "waits_collapsed": [
-                {"class": "off_frontier", "count": 249,
-                 "oldest_age_s": 60 * 86400, "command":
-                 "helm lr retire --off-frontier",
-                 "label": "left over after landing or abandonment (off the "
-                 "live frontier)"},
-                {"class": "superseded", "count": 290, "oldest_age_s": None,
-                 "command": "helm lr list --all",
-                 "label": "absorbed or settled by a later round (nobody owes "
-                 "a move)"}]})
-        self.assertIn("<b>lander</b> · 1 waiting", html)
-        self.assertIn("a live ready", html)
-        self.assertIn("<b>249</b> left over after landing", html)
-        self.assertIn("oldest 60d", html)
-        self.assertIn("<code>helm lr retire --off-frontier</code>", html)
-        self.assertIn("<b>290</b> absorbed or settled", html)
-        self.assertIn("<code>helm lr list --all</code>", html)
-        self.assertNotIn("nothing is waiting", html)
-
-    def test_only_collapsed_rows_says_no_live_obligation_and_keeps_the_lines(self):
-        html = self.render({"waits": [], "waits_collapsed": [
-            {"class": "unclassified", "count": 2, "oldest_age_s": 86400,
-             "command": "helm lr retire --off-frontier",
-             "label": "unclassified (the lane is gone and helm cannot place "
-             "the work)"}]})
-        self.assertIn("no live obligation is waiting", html)
-        self.assertIn("<b>2</b> unclassified", html)
-        self.assertNotIn("nothing is waiting", html)
-
-    def test_an_older_body_without_lines_draws_as_before(self):
-        self.assertIn("nothing is waiting", self.render({"waits": []}))
-        self.assertIn("not read here", self.render({"waits": []},
-                                                   scope="other"))
 
 
 class LiveObligationsJoinTest(unittest.TestCase):
@@ -2757,6 +3474,25 @@ class LiveObligationsJoinTest(unittest.TestCase):
                          + sum(c["count"] for c in rec["lanes"]["collapsed"]),
                          len(cards))
 
+    def test_the_waits_past_the_listed_groups_are_counted(self):
+        """task/3130: the waits list TOP_WAITS groups; the rest are counted
+        in `waits_more`, never dropped silently. THE CONTROL: a model with
+        fewer groups counts none."""
+        groups = [{"label": "g%d" % i, "count": 1, "oldest_age_s": 60,
+                   "rows": []} for i in range(web_board.TOP_WAITS + 2)]
+        body = {"withheld": {"scope": "proj"}, "read_age_s": 5,
+                "unavailable": None, "loops": [],
+                "scheduler": {"unavailable": None, "groups": groups},
+                "recent_lands": {"rows": [], "total": 0, "unavailable": None}}
+        _sec, rec = web_board._lands_join(lambda _qs: (body, 200))
+        self.assertEqual(len(rec["proj"]["waits"]), web_board.TOP_WAITS)
+        self.assertEqual(rec["proj"]["waits_more"], 2)
+        body["scheduler"]["groups"] = groups[:3]
+        _sec, rec = web_board._lands_join(lambda _qs: (body, 200))
+        self.assertEqual([g["label"] for g in rec["proj"]["waits"]],
+                         ["g0", "g1", "g2"])
+        self.assertEqual(rec["proj"]["waits_more"], 0)
+
     def test_nothing_on_main_is_no_line_not_a_zero_claim(self):
         rec = self.join([_loop("r", "lane-r")], active=["r"])
         # THE POSITIVE CONTROL on the same join: the live row IS drawn
@@ -2794,10 +3530,10 @@ class LandedLaneParityTest(LandedWorld):
 
     "that's not *my* board that's our board, just the webui (UX not AX)
     version" (the owner): agents read `helm work list`, the owner
-    reads the kanban, and both must say the same thing about the same lane.
-    One real tree, three lanes — merged, open, claimed at the trunk — read
-    through the CLI render and through `/api/board`'s seats join, then drawn
-    by the shipped kanban."""
+    reads the Work page, and both must say the same thing about the same
+    lane. One real tree, three lanes — merged, open, claimed at the trunk —
+    read through the CLI render and through `/api/board`'s seats join, then
+    placed by the Work page's one reader (`_work_placed`)."""
 
     def board(self):
         from helm import seats
@@ -2830,12 +3566,12 @@ class LandedLaneParityTest(LandedWorld):
         landed_lines = [l for l in out.splitlines() if "LANDED —" in l]
         self.assertEqual(len(landed_lines), 1, out)
         self.assertIn("helm work release merged", landed_lines[0])
-        # ... and the owner's kanban column, drawn from the SAME board rows
-        kb = LandedOnTheKanbanTest.kanban(
-            {"parity": (self.board(), [], [])})["parity"]
-        self.assertEqual(LandedOnTheKanbanTest.lanes(kb["landed"]), ["merged"])
-        self.assertEqual(LandedOnTheKanbanTest.lanes(kb["building"]),
-                         ["fresh", "open"])
+        # ... and the owner's Work page, placed from the SAME board rows: the
+        # landed room is a leftover whose lease release is owed (the CLI's
+        # "helm work release merged"), the others are Building
+        self.assertEqual(_work_placed(self.board()),
+                         {"merged": ["record"], "fresh": ["building"],
+                          "open": ["building"]})
 
     def test_a_second_board_read_asks_git_only_the_landed_rooms_dirt(self):  # noqa: VACUOUS_ASSERTION — the second read's calls are asserted EQUAL to ["status", "worktree"], a positive non-empty list, and the first read's assertGreater(asked, 0) is its unconditional control
         """LANDEDNESS IS ANSWERED FROM ITS STAMP; DIRT IS NOT STAMPABLE. Over
@@ -2869,8 +3605,8 @@ class LandedSurfaceMatrixTest(LandedWorld):
 
     Surfaces: `helm work list` (the LANDED line and its DIRTY clause),
     `helm lr foldcheck`'s advice (`_print_landed_leases`), `landed_leases`
-    (release / kept), the web kanban (columns, drawn by the SHIPPED
-    `boardKanban`) and the web headline (`headline.lanes.landed`, drawn by
+    (release / kept), the Work page (where its one reader places each
+    lane, `_work_placed`) and the web headline (`headline.lanes.landed`, drawn by
     the SHIPPED `boardCapacity`). States: landed clean, landed under a dirty
     room, reset back to the trunk after committing, an idle lane that
     fast-forwarded the trunk in, claimed at the trunk, an idle lane that
@@ -2880,15 +3616,19 @@ class LandedSurfaceMatrixTest(LandedWorld):
     one surface for every state, so a failure names the surface and the lane.
     """
 
-    # lane: (verdict, CLI line, landed_leases, kanban columns)
+    # lane: (verdict, CLI line, landed_leases, Work page places). A landed
+    # room is a record (Leftovers the agents clear); the dirty one too —
+    # `/api/work`'s rooms carry no `dirty`, so the page cannot keep it in
+    # Building the way the retired kanban did, and the CLI's DIRTY line and
+    # `landed_leases` keeping it are where that is read.
     MATRIX = {
-        "clean":     ("landed", "LANDED", "release", ("landed",)),
-        "dirty":     ("landed", "LANDED DIRTY", "kept", ("building", "landed")),
+        "clean":     ("landed", "LANDED", "release", ("record",)),
+        "dirty":     ("landed", "LANDED DIRTY", "kept", ("record",)),
         "reset":     ("unlanded", None, None, ("building",)),
         "ffidle":    ("unstarted", None, None, ("building",)),
         "fresh":     ("unstarted", None, None, ("building",)),
         "mergeidle": ("unknown", None, None, ("building",)),
-        "picked":    ("landed", "LANDED", "release", ("landed",)),
+        "picked":    ("landed", "LANDED", "release", ("record",)),
     }
 
     def world(self):
@@ -2941,7 +3681,7 @@ class LandedSurfaceMatrixTest(LandedWorld):
             raise unittest.SkipTest("node not available")
         src = web_ui_loader.read_text()
         fns = "\n\n".join(_extract_fn(src, n) for n in (
-            "lrDur", "lrAgo", "boardSec", "boardSecState", "boardChip",
+            "lrDur", "lrAgo", "boardSec", "boardSecState",
             "boardCapacity"))
         board = {"headline": {"lanes": fleet},
                  "sections": {"seats": _sec(), "flags": _sec(families={})},
@@ -3024,23 +3764,12 @@ class LandedSurfaceMatrixTest(LandedWorld):
                     else "kept" if "  %s (" % lane in kept else None)
             self.assertEqual(said, want, (lane, out))
 
-    def test_the_kanban_draws_each_lane_where_the_matrix_says(self):  # noqa: VACUOUS_ASSERTION — every lane's column tuple is asserted by equality to a non-empty MATRIX cell, and the dirty lane's two notes are counted (== 2) before their text is read
+    def test_the_work_page_places_each_lane_where_the_matrix_says(self):  # noqa: VACUOUS_ASSERTION — the placed lanes are asserted EQUAL to the matrix's seven before the per-lane equalities run
         running, _fleet = self.board()
-        kb = LandedOnTheKanbanTest.kanban(
-            {"matrix": (running, [], [])})["matrix"]
-        cols = {}
-        for col in ("building", "review", "gate", "landed"):
-            for r in kb[col]:
-                cols.setdefault(r["lane"], []).append(col)
+        got = _work_placed(running)
+        self.assertEqual(sorted(got), sorted(self.MATRIX))
         for lane, (_v, _cli, _rel, want) in self.MATRIX.items():
-            self.assertEqual(tuple(sorted(cols.get(lane, ()))), want, lane)
-        notes = [r["note"] for col in ("building", "landed")
-                 for r in kb[col] if r["lane"] == "dirty"]
-        self.assertEqual(len(notes), 2)
-        for note in notes:
-            self.assertIn("room DIRTY (commit or park first)", note)
-        self.assertFalse([r for col in ("building", "landed") for r in kb[col]
-                          if r["lane"] != "dirty" and "DIRTY" in r["note"]])
+            self.assertEqual(tuple(got[lane]), want, lane)
 
     def test_the_headline_counts_the_landed_held_lanes_in_R_and_names_them(self):
         running, fleet = self.board()
@@ -3054,3 +3783,267 @@ class LandedSurfaceMatrixTest(LandedWorld):
         self.assertIn("%d lanes running, %d of them landed (lease still held)"
                       % (fleet["running"], len(landed)),
                       self.capacity(fleet))
+
+
+class BoardPipelineFeedTest(unittest.TestCase):
+    """WHAT THE SERVER SENDS OF ONE PROJECT'S PIPELINE, and that it cuts
+    nothing silently (task/3129, task/3130). The land board's kanban that
+    drew these is retired (task/3643 slice 6); the Work page reads them
+    through `/api/work`, whose reader counts every row the pipeline sent
+    (tests/test_work_model.py), so what is pinned here is the feed."""
+
+    def served(self, cards):
+        live, on_main, folded = web_board._kanban_split(cards, 0)
+        feed = web_board._kanban_feed(live)
+        return feed["loops"], {"on_main": on_main, "collapsed": folded,
+                               "loops_more": feed["loops_more"],
+                               "rehold": feed["rehold"]}
+
+    def test_every_state_the_cap_cut_is_counted(self):
+        cards = ([_loop("r%d" % i, "rev-%d" % i) for i in range(4)]
+                 + [_loop("g%d" % i, "gate-%d" % i, state="READY")
+                    for i in range(2)]
+                 + [_loop("b0", "build-0", state="AWAITING_BUILD",
+                          kind="build")])
+        with mock.patch.object(web_board, "KANBAN_ROWS", 3):
+            loops, extra = self.served(cards)
+            under, under_extra = self.served(cards[:2])
+        self.assertEqual(extra["loops_more"],
+                         {"AWAITING_REVIEW": 1, "READY": 2,
+                          "AWAITING_BUILD": 1})
+        self.assertEqual(len(loops) + sum(extra["loops_more"].values()),
+                         len(cards))
+        # UNDER THE CAP, the control: every card sent, nothing more
+        self.assertEqual([c["lane"] for c in under], ["rev-0", "rev-1"])
+        self.assertFalse(under_extra["loops_more"])
+
+    def test_landed_re_holds_are_one_line_not_cards(self):
+        door = "helm dispatch release x; helm dispatch hold x <reason>"
+        held = [_loop("h%d" % i, "held-%d" % i, trunk_contains_tip=True,
+                      source_clean_tip="c" * 40, reviewer="kimi",
+                      source_clean_rehold={"kind": "NO HOLDER", "door": door,
+                                           "why": "NO HOLDER; " + door},
+                      dwell_s=(i + 1) * 86400)
+                for i in range(2)]
+        for row in held:
+            row["source_clean_on_main"] = landreq.source_clean_on_main(row)
+            self.assertIn("RE-HOLD owed by @kimi", row["source_clean_on_main"])
+        live = _loop("r1", "can-move")
+        only_loops, only = self.served(held)
+        loops, extra = self.served([held[0], live, held[1]])
+        self.assertEqual(only_loops, [])
+        self.assertEqual(only["rehold"]["count"], 2)
+        # MIXED: the card that can move is sent, the re-holds on the line
+        self.assertEqual([c["lane"] for c in loops], ["can-move"])
+        self.assertEqual(extra["rehold"]["count"], 2)
+
+    def test_the_server_sends_actionable_rows_first_and_counts_every_cut(self):
+        door = "helm dispatch release x; helm dispatch hold x <reason>"
+        rehold = _loop("h1", "held-1", trunk_contains_tip=True,
+                       source_clean_tip="c" * 40, reviewer="kimi",
+                       source_clean_rehold={"kind": "NO HOLDER", "door": door,
+                                            "why": door})
+        rehold["source_clean_on_main"] = landreq.source_clean_on_main(rehold)
+        cards = [_loop("o1", "opened", state="OPEN"),
+                 _loop("y1", "ready", state="READY"),
+                 _loop("v1", "reviewed-on-main", state="REVIEWED",
+                       polarity="approve", trunk_contains_tip=True),
+                 _loop("a1", "awaiting"),
+                 rehold,
+                 _loop("f1", "sent-back", state="CHANGES_REQUESTED",
+                       polarity="fix", trunk_contains_tip=False)]
+        body = {"withheld": {"scope": "proj"}, "read_age_s": 5,
+                "unavailable": None, "loops": cards,
+                "building": {"rows": [], "total": 0, "unavailable": None},
+                "recent_lands": {"rows": [], "total": 0,
+                                 "unavailable": None}}
+        with mock.patch.object(web_board, "KANBAN_ROWS", 3):
+            _sec_, rec = web_board._lands_join(lambda _qs: (body, 200))
+        lanes = rec["proj"]["lanes"]
+        # actionable and NOT on main first, each group in the pipeline's order
+        self.assertEqual([c["lane"] for c in lanes["loops"]],
+                         ["awaiting", "sent-back", "opened"])
+        self.assertEqual(lanes["loops_more"], {"READY": 1, "REVIEWED": 1})
+        self.assertEqual((lanes["rehold"]["count"], lanes["rehold"]["lanes"]),
+                         (1, ["held-1"]))
+        self.assertEqual(lanes["rehold"]["command"], "helm lr list")
+        self.assertIn("RE-HOLD owed by @kimi",
+                      lanes["rehold"]["rows"][0]["owed"])
+        # NOTHING IS CUT SILENTLY: cards + cuts + the line = every live card
+        self.assertEqual(len(lanes["loops"]) + sum(lanes["loops_more"].values())
+                         + lanes["rehold"]["count"], lanes["in_flight"])
+        self.assertEqual(lanes["in_flight"], len(cards))
+
+    def test_the_landed_and_building_lists_say_what_their_caps_cut(self):
+        rows = [{"lane": "l%d" % i, "task": None, "age_s": 60 * i}
+                for i in range(6)]
+        ahead = [{"lane": "a%d" % i, "ahead": 1} for i in range(10)]
+        body = {"withheld": {"scope": "proj"}, "read_age_s": 5,
+                "unavailable": None, "loops": [],
+                "building": {"rows": ahead, "total": 12, "unavailable": None},
+                "recent_lands": {"rows": rows, "total": 40,
+                                 "unavailable": None}}
+        _sec_, rec = web_board._lands_join(lambda _qs: (body, 200))
+        proj = rec["proj"]
+        self.assertEqual(proj["landed_more"], 34)
+        self.assertEqual(proj["lanes"]["building_more"],
+                         12 - web_board.TOP_LANES)
+        self.assertEqual([r["lane"] for r in proj["landed"]],
+                         ["l%d" % i for i in range(6)])
+        # UNDER THE CAP, the control: no more counted
+        body["recent_lands"]["total"] = 6
+        body["building"]["total"] = 8
+        _sec_, rec = web_board._lands_join(lambda _qs: (body, 200))
+        self.assertEqual((rec["proj"]["landed_more"],
+                          rec["proj"]["lanes"]["building_more"]), (0, 0))
+
+
+class GateOnTheBoardTest(LandedWorld):
+    """THE GATE THE BOARD DRAWS IS THE RUN `helm gate window show` READS, AND
+    A LEASE ITS TRAIN CARRIES IS ON IT — in one real tree: a compose room
+    that merged `trained` the way `helm train` does, a record in the window
+    store naming it, and four leases (in the train, open, landed, claimed at
+    the trunk). The node is the only seam, and it is the door's own."""
+
+    def setUp(self):
+        super().setUp()
+        self.lane("trained", commits=1)
+        self.lane("open", commits=1)
+        self.lane("merged", commits=1)
+        self.land("merged")
+        self.lane("fresh")
+        self.trunk = self.git(self.root, "rev-parse", "origin/main")
+        self.room = os.path.join(self.tmp, "rooms", "train901")
+        self.git(self.root, "worktree", "add", "-q", "--detach", self.room,
+                 self.trunk)
+        self.git(self.room, "merge", "--no-ff", "-q", "-m",
+                 "train901: merge lane trained", "lane/trained")
+        self.head = self.git(self.room, "rev-parse", "HEAD")
+        self.tip = self.git(self.root, "rev-parse", "lane/trained")
+        self.now = float(int(time.time()))
+        self.store = os.path.join(self.tmp, "gate-window", "runs.json")
+        gatewindow.write_runs(self.store, [{
+            "project": gatewindow.project_id(self.room), "room": self.room,
+            "head": self.head, "trunk": self.trunk, "label": "train901",
+            "pid": None, "ts": self.now - 2760, "token": "t1",
+            "host": "node-a", "run_id": "r1"}])
+        self.projects = {"proj": {"path": self.root}}
+
+    def gate(self, node=("r1",), path=None):
+        live = None if node is None else {rid: "RUNNING" for rid in node}
+        return web_board._gate_join(self.projects, path=path or self.store,
+                                    inflight=lambda host: live,
+                                    now=lambda: self.now)
+
+    def test_a_running_gate_is_its_label_node_age_head_and_train(self):  # noqa: VACUOUS_ASSERTION — the retired run's empty list is the same project key whose one card the first read asserts by exact fields, lanes and liveness
+        sec, out = self.gate()
+        self.assertIsNone(sec["unavailable"])
+        (card,) = out["proj"]
+        self.assertEqual((card["label"], card["train"], card["host"],
+                          card["age_s"], card["head"], card["running"]),
+                         ("train901", "train901", "node-a", 2760, self.head,
+                          "running"))
+        self.assertEqual(card["lanes"], [{"lane": "trained",
+                                          "tip": self.tip[:12]}])
+        # a node that could not be read keeps the run, and says UNKNOWN
+        _sec, out = self.gate(node=None)
+        self.assertEqual(out["proj"][0]["running"], "unknown")
+        self.assertIn("node-a", out["proj"][0]["running_why"])
+        # a node that says the run is over: no gate, and the list says so
+        sec, out = self.gate(node=())
+        self.assertEqual(out["proj"], [])
+        self.assertIsNone(sec["unavailable"])
+
+    def test_no_store_is_no_gate_and_an_unreadable_one_is_UNKNOWN(self):
+        sec, out = self.gate(path=os.path.join(self.tmp, "none", "runs.json"))
+        self.assertIsNone(sec["unavailable"])
+        self.assertEqual(out, {"proj": []})
+        with open(self.store, "w") as fh:
+            fh.write("{not json")
+        sec, out = self.gate()
+        self.assertIn("could not be read", sec["unavailable"])
+        self.assertIn(self.store, sec["unavailable"])
+        self.assertEqual(out, {}, "an unreadable window was drawn as no gate")
+
+    def rep(self):
+        from helm import seats
+        return {"seats": [], "claims": seats.claims_list(gc=False),
+                "roster_failed": False}
+
+    def test_one_ancestry_question_per_leased_lane_per_board_build(self):  # noqa: VACUOUS_ASSERTION — the None on_gate lanes sit beside `trained` asserted on the gate by exact head and label on the same running rows, and the asked list is asserted equal to two named tips
+        _sec, out = self.gate()
+        gates = web_board._gate_heads(out)
+        self.assertEqual(gates, {"proj": {"head": self.head,
+                                          "label": "train901"}})
+        asked, real = [], vcs.GitVcs.ancestry
+
+        def ancestry(this, root, tip, ref):
+            if ref == self.head:
+                asked.append(tip)
+            return real(this, root, tip, ref)
+        memo = {}
+        with mock.patch.object(vcs.GitVcs, "ancestry", ancestry):
+            _s, first, _f = web_board._seats_join(
+                self.projects, {"families": {}}, time.time(), self.rep(),
+                gates=gates, memo=memo)
+            once = list(asked)
+            web_board._seats_join(self.projects, {"families": {}},
+                                  time.time(), self.rep(), gates=gates,
+                                  memo=memo)
+        running = {r["lane"]: r for r in first["proj"]["running"]}
+        self.assertEqual(running["trained"]["on_gate"],
+                         {"head": self.head[:12], "label": "train901"})
+        # the controls: work not in the train, work already on the trunk and
+        # a lease at the trunk (an ancestor of every head) are not on it
+        for lane in ("open", "merged", "fresh"):
+            self.assertIsNone(running[lane]["on_gate"], lane)
+        # the two lanes with work off the trunk were asked, once each, and
+        # the same build's cache answered the second read
+        self.assertEqual(sorted(once), sorted(
+            [self.tip, self.git(self.root, "rev-parse", "lane/open")]))
+        self.assertEqual(asked, once)
+        # THE WORK PAGE over the same rows: the landed room is a leftover and
+        # the rest are Building. THE GAP, named: the retired kanban drew
+        # `trained` on the running gate; `/api/work` carries no room's
+        # `on_gate` and no running gate, so the page cannot place it there.
+        self.assertEqual(_work_placed(first["proj"]["running"]),
+                         {"merged": ["record"], "trained": ["building"],
+                          "open": ["building"], "fresh": ["building"]})
+
+    def test_the_board_read_carries_the_gate_and_the_lane_on_it(self):  # noqa: ORPHANED_MOCK — node_inflight is reached through /api/board's gate leg: web_board._gate_join calls gatewindow.live_runs, whose default node reader it is; the card asserted by label proves it answered
+        """End to end through `/api/board`: the registry, the roster's real
+        claims and the window store the door writes, in this helm home."""
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "proj": {"name": "proj", "path": self.root}}})
+        gatewindow.write_runs(gatewindow.runs_path(),
+                              gatewindow.read_runs(self.store))
+        rep = self.rep()
+        body = {"withheld": {"scope": "proj"}, "read_age_s": 1,
+                "unavailable": None, "loops": [],
+                "building": {"rows": [], "total": 0, "unavailable": None},
+                "recent_lands": {"rows": [], "total": 0, "unavailable": None}}
+        web_board._forget()
+        web._qstate.pop("flags", None)
+        self.addCleanup(web_board._forget)
+        self.addCleanup(web_board._fleet_reset)
+        self.addCleanup(web._qstate.pop, "flags", None)
+        with mock.patch.dict(web_board._LEG_BUDGET_S,
+                             dict.fromkeys(web_board._LEGS, 60)), \
+                mock.patch.object(web, "_roster_cached", lambda room: rep), \
+                mock.patch.object(web, "_api_lr", lambda qs: (
+                    {"warming": True} if qs.get("all_projects") else body,
+                    200)), \
+                mock.patch.object(gatewindow, "node_inflight",
+                                  lambda host, runner=None: {"r1": "RUNNING"}), \
+                mock.patch.object(repofacts, "_gh_visibility",
+                                  lambda slug: (None, "stubbed")):
+            got = web._api_board()
+            self.assertTrue(web_board._fleet_wait(10))
+        self.assertIsNone(got["sections"]["gate"]["unavailable"])
+        self.assertEqual(got["sections"]["gate"]["source"],
+                         "helm gate window show")
+        proj = got["projects"]["proj"]
+        self.assertEqual([g["label"] for g in proj["gate"]], ["train901"])
+        on_gate = {r["lane"]: r.get("on_gate") for r in proj["running"]}
+        self.assertEqual(on_gate["trained"]["head"], self.head[:12])
+        self.assertIsNone(on_gate["open"])

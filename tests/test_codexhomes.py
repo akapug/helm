@@ -144,11 +144,11 @@ class CodexHomesTest(CodexHomesBase):
     class that only needs the fixture subclasses CodexHomesBase."""
 
     # -- list: tier classification, aliases, pooled column ------------------
-    def test_list_classifies_ultra_and_team(self):
+    def test_list_classifies_pro_and_team(self):
         self._plant("admin-example", email="admin@example.test", plan="pro", plan_in="access")
         self._plant("member-example", email="member@example.test", plan="team", plan_in="id")
         rows = {r["name"]: r for r in codexhomes.codex_list()}
-        self.assertEqual(rows["admin-example"]["tier"], "ultra")
+        self.assertEqual(rows["admin-example"]["tier"], "pro")
         self.assertEqual(rows["admin-example"]["plan"], "pro")
         self.assertEqual(rows["member-example"]["tier"], "team")
         self.assertEqual(rows["member-example"]["email"], "member@example.test")
@@ -177,7 +177,8 @@ class CodexHomesTest(CodexHomesBase):
         self.assertEqual(rc, 0, err)
         self.assertIn("admin-example", out)
         self.assertIn("admin@example.test", out)
-        self.assertIn("ultra", out)
+        self.assertRegex(out, r"admin@example\.test\s+pro\b")
+        self.assertNotIn("ultra", out, "the tier is named as the vendor names the plan")
         self._assert_no_secrets(out + err)
 
     # -- pool: flat 0600 record, right fields, source untouched -------------
@@ -361,7 +362,7 @@ class CodexHomesTest(CodexHomesBase):
         self.assertEqual(len(rows), 2)
         r = rows["codex-admin-example.json"]
         self.assertEqual((r["email"], r["tier"], r["disabled"]),
-                         ("admin@example.test", "ultra", False))
+                         ("admin@example.test", "pro", False))
         self.assertEqual(rows["codex-member-example.json"]["tier"], "team")
         # list now shows the pooled linkage
         by_name = {x["name"]: x for x in codexhomes.codex_list()}

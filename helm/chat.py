@@ -105,6 +105,7 @@ The owner's orca pane sidecar is exactly: helm chat read --follow
 import bisect
 import contextlib
 import hashlib
+import io
 import itertools
 import tempfile
 import json
@@ -146,6 +147,16 @@ _GATESLICE_MUTABLE = {
     "_SIGN_FAILURE_FALLBACK": (
         "keyed by owner path, and every chat dir a test plants is its own "
         "key"),
+    "_AUTHORITY_PATTERNS": (
+        "the refused-verb table compiled once, on first use, from the "
+        "constant delegate_grant.REFUSED"),
+    "_SEAT_DARK_MEMO": (
+        "keyed by the failure dir's absolute path and the profile, so every "
+        "chat dir a test plants is its own key, and a verdict older than "
+        "SEAT_DARK_MEMO_S is read again"),
+    "_ROOM_LOCKS_HELD": (
+        "keyed by (lock path, thread); an entry lives only while that "
+        "thread is inside _room_lock and is popped on its way out"),
 }
 _SIGN_FAILURE_FALLBACK_LOCK = threading.RLock()
 _QUOTED_VALUE = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
@@ -190,6 +201,56 @@ _REMEDIATION = {
     "incident_state_unreadable": "repair incident-state ownership/permissions/space, then retry; transport ack cannot retire an unreadable owner",
 }
 
+# THE SAME FAILURES IN THE OWNER'S WORDS: (what happened, who repairs it).
+# `reason`, `cause` and `remediation` are the agents' text and name helm verbs;
+# the console draws `owner_say`, composed from these, because the owner does
+# not use a terminal (console walk 4, P1 2). Keyed like `_REMEDIATION`.
+_OWNER_SAY = {
+    "node_unreachable": ("the chat node did not answer %s, so its posts went "
+                         "out unsigned", "a lead restarts the node"),
+    "node_probe_failed": ("the chat node could not be checked for %s, so its "
+                          "posts went out unsigned", "a lead restores the node"),
+    "signer_unavailable": ("the signing program %s is set to use cannot run, "
+                           "so its posts go out unsigned",
+                           "its lead points it at a working signing program"),
+    "signer_launch_failed": ("the signing program failed to start for %s, so "
+                             "its posts went out unsigned",
+                             "its lead repairs that program"),
+    "signing_timeout": ("a signed post from %s timed out and may have reached "
+                        "the record anyway", "its lead checks the node's "
+                        "record before it posts again"),
+    "send_outcome_unknown": ("whether %s's last signed post reached the "
+                             "record is not known", "its lead checks the "
+                             "node's record before it posts again"),
+    "faucet_source_dry": ("the chat node refused %s's post for its fee, and "
+                          "the account that pays those fees is empty",
+                          "a lead refills that account"),
+    "join_failed": ("%s could not join the chat node's room, so its posts go "
+                    "out unsigned", "its lead repairs the join"),
+    "send_failed": ("the chat node refused %s's signed post",
+                    "its lead checks the node and the seat's balance"),
+    "signing_exception": ("signing failed with an error for %s",
+                          "its lead reads the error where the seat runs"),
+    "identity_conflict": ("%s's posts go out unsigned because it runs under "
+                          "a profile that is not its own",
+                          "its lead starts it again through helm's launcher "
+                          "so it signs as itself"),
+    "identity_unreadable": ("the seat list could not be read, so %s cannot "
+                            "prove its profile is its own and its posts go "
+                            "out unsigned", "a lead repairs the seat list"),
+    "incident_state_unreadable": ("the record of signing failures on this "
+                                  "computer cannot be read, so %s's signing "
+                                  "state is unknown",
+                                  "a lead repairs that record's file"),
+}
+_OWNER_SAY_DEFAULT = ("signing failed for %s", "its lead repairs it")
+_OWNER_EXPECTED = (
+    "%s posts unsigned: it runs outside helm's launcher, in a session that "
+    "carries the profile '%s' and none of its own, and helm never signs a "
+    "post under another name. That is the expected state for a seat run in "
+    "your own session, such as a lead: nobody needs to act, and a seat "
+    "started through helm's launcher signs as itself.")
+
 
 _ID_FIELDS = ("from", "tfrom", "rfrom", "dm")   # the NAME-carrying row fields
 
@@ -203,11 +264,15 @@ def _dsan(s):
     HELM_CHAT_NAME at the source) — a legit name is unchanged; this catches any
     row whose name was planted OUTSIDE the seam (a foreign/pre-fix jsonl row).
     Message TEXT is deliberately NOT touched — it legitimately carries unicode
-    (voice pastes, emoji, U+2028); only names are laundered."""
-    if not isinstance(s, str):
-        return s
-    return "".join(ch for ch in s if ch == "\t"
-                   or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
+    (voice pastes, emoji, U+2028); only names are laundered. A non-string
+    passes through unchanged."""
+    return pk.launder(s) if isinstance(s, str) else s
+
+
+# The lists of failure rows a transport status carries: the live ones, those
+# scoped to a dark seat, and those scoped as the expected state of a seat run
+# outside helm launch under a shell's profile (`_expected_unsigned`).
+_FAILURE_LISTS = ("failed_profiles", "dark_failures", "expected_failures")
 
 
 def _public_transport(value):
@@ -219,19 +284,83 @@ def _public_transport(value):
     out = dict(value)
     if isinstance(out.get("profile"), str):
         out["profile"] = _dsan(out["profile"])
+    if isinstance(out.get("inherited_profile"), str):
+        out["inherited_profile"] = _dsan(out["inherited_profile"])
     if isinstance(out.get("reason"), str):
         out["reason"] = _safe_reason(out["reason"])
-    if isinstance(out.get("failed_profiles"), list):
-        out["failed_profiles"] = [_public_transport(v)
-                                  for v in out["failed_profiles"]]
+    for key in ("cause", "liveness_why"):
+        if isinstance(out.get(key), str):
+            out[key] = _safe_reason(out[key])
+    for key in _FAILURE_LISTS:
+        if isinstance(out.get(key), list):
+            out[key] = [_public_transport(v) for v in out[key]]
+    if isinstance(out.get("resolved"), list):
+        out["resolved"] = [_resolution_public(v) for v in out["resolved"]]
     return out
+
+
+def _expected_unsigned(f):
+    """True for a failure that is the EXPECTED state, not a fault: a seat
+    refused its signature because the profile it runs under is a shell's, one
+    no seat carries and not one of the owner's names (`_inherited_profile`).
+    That is a seat started outside helm launch, as a lead in the owner's own
+    session is. A seat under ANOTHER seat's profile, or a refused swap under
+    the owner's, never records one, and stays loud."""
+    return f.get("code") == "identity_conflict" \
+        and bool(f.get("inherited_profile"))
+
+
+def _owner_say(f):
+    """One published failure in the OWNER'S words: what happened, who repairs
+    it, and, when known, what clears it — never a command, because he does not
+    use a terminal (console walk 4, P1 2). Composed only from the failure's
+    structured fields, never its `reason`, `cause` or `remediation`, which are
+    the agents' and keep their verbs. `f` is already public (laundered)."""
+    who = f.get("profile") if f.get("profile") not in (None, "", "?") \
+        else "a seat"
+    if _expected_unsigned(f):
+        return _OWNER_EXPECTED % (who, f["inherited_profile"])
+    fact, fixer = _OWNER_SAY.get(f.get("code"), _OWNER_SAY_DEFAULT)
+    tail = ("%s is not running now, so this waits until it comes back" % who
+            if f.get("liveness") == "dark"
+            else "it clears on %s's next signed post" % who
+            if f.get("cause_state") == CAUSE_UNPROBED
+            else "whether its cause is gone could not be checked from here"
+            if f.get("cause_state") == CAUSE_UNKNOWN else "")
+    return "; ".join(p for p in (fact % who, fixer, tail) if p) + "."
+
+
+def _owner_words(value):
+    """`value`, a published transport dict, with the owner's copy added in
+    place beside the agents' text: `owner_say` on it and on each failure row it
+    carries, `expected_unsigned` where the failure is the expected state, and
+    `owner_scoped`, one owner line per scoped row. A dict with no failure gains
+    no key. The console draws only these (console walk 4, P1 2)."""
+    if not isinstance(value, dict):
+        return value
+    if isinstance(value.get("code"), str):
+        value["owner_say"] = _owner_say(value)
+        if _expected_unsigned(value):
+            value["expected_unsigned"] = True
+    for key in _FAILURE_LISTS:
+        for f in value.get(key) or ():
+            if isinstance(f, dict) and isinstance(f.get("code"), str):
+                _owner_words(f)
+    lines = [f["owner_say"] for key in ("dark_failures", "expected_failures")
+             for f in value.get(key) or ()
+             if isinstance(f, dict) and f.get("owner_say")]
+    if lines:
+        value["owner_scoped"] = lines
+    return value
 
 
 def public_rows(rows):
     """Copies of `rows` with every identity display-laundered — the shape the
     web /api/chat wire and any JSON sink emits. The stored rows keep raw NAME
     fields for reaction/reply matching; transport.profile is an emitted signer
-    identity and is laundered too."""
+    identity and is laundered too, and an unsigned row's transport carries the
+    owner's copy of its failure (`_owner_words`), computed here so a row stored
+    before it existed gains it too."""
     out = []
     for m in rows:
         c = dict(m)
@@ -239,7 +368,7 @@ def public_rows(rows):
             if isinstance(c.get(k), str):
                 c[k] = _dsan(c[k])
         if "transport" in c:
-            c["transport"] = _public_transport(c["transport"])
+            c["transport"] = _owner_words(_public_transport(c["transport"]))
         out.append(c)
     return out
 
@@ -255,7 +384,7 @@ def chat_dir():
 
 
 STATE_SUBDIR = "state"
-STATE_FAMILIES = ("deleg",)
+STATE_FAMILIES = ("deleg", "lastread")
 
 
 def state_path(family, name):
@@ -326,10 +455,72 @@ def room_path(room="main"):
     lanes live in the dm/ subdir, invisible to list_rooms (no room fanout, no
     web channel row, no default log-flush) while every reader/cursor/rotation
     mechanic composes unchanged."""
-    r = pk.slug(room)
-    if r.startswith(DM_PREFIX):
-        return os.path.join(chat_dir(), "dm", r[len(DM_PREFIX):] + ".jsonl")
-    return os.path.join(chat_dir(), r + ".jsonl")
+    return room_key_path(pk.slug(room))
+
+
+def room_key_path(key):
+    """An ALREADY-SLUGGED room key -> its log, never slugged again: pk.slug
+    strips before it truncates, so a 60-char key cut at a "-" slugs to a
+    different name, and a cursor's room key read through `room_path` named
+    a log that is not its room's (task/3519)."""
+    if key.startswith(DM_PREFIX):
+        return os.path.join(chat_dir(), "dm", key[len(DM_PREFIX):] + ".jsonl")
+    return os.path.join(chat_dir(), key + ".jsonl")
+
+
+ROOMS_GENERATION = ".rooms-generation"
+
+
+def rooms_generation():
+    """The room-set token: bytes that change when a room log is CREATED.
+    -> bytes, b"" when the file is absent; a fresh token on every read when
+    it is unreadable, so a reader re-lists rather than trusting a cache.
+
+    THE DIRECTORY'S mtime CANNOT ANSWER "IS THERE A NEW ROOM". Room logs
+    share the flat chat dir with per-session cursors, locks and stop state,
+    which are created and replaced several times a second, so the dir moves
+    on nearly every read. `web_sse._chat_fingerprint` keyed its room-name
+    cache on it and listed the whole directory four times a second: measured
+    task/3519, 34,058 entries for 305 logs, about 35% of a core while a
+    console was open. This token moves only when a writer creates a log, so
+    a reader re-lists once per new room and never for the state beside it.
+
+    A writer running older code does not bump it, so a reader keeps an age
+    bound as the backstop for the log such a writer creates."""
+    try:
+        with open(os.path.join(chat_dir(), ROOMS_GENERATION), "rb") as f:
+            return f.read(64)
+    except FileNotFoundError:
+        return b""
+    except OSError:
+        return os.urandom(8)
+
+
+def bump_rooms_generation():
+    """Move the room-set token. Call AFTER the new log exists: a reader that
+    sees the new token lists after it, and one that read the old token lists
+    again on its next pass. A fresh random token per bump needs no lock,
+    because two writers bumping at once still leave a token no reader holds.
+    Best-effort: a failed bump costs the reader its age bound, never a post.
+
+    REPLACED WHOLE, never truncated in place: a truncate-then-write shows a
+    reader b"" between the two, and leaves it there when the write fails.
+    The token goes to a private temporary that `os.replace` swaps in, so a
+    reader sees the old token or the new one."""
+    path = os.path.join(chat_dir(), ROOMS_GENERATION)
+    tmp = None
+    try:
+        token = os.urandom(8).hex()
+        tmp = "%s.%d.%s.tmp" % (path, os.getpid(), token)
+        with open(tmp, "x", encoding="ascii") as f:
+            f.write(token)
+        os.replace(tmp, path)
+    except OSError:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def empty_room_line(room, label):
@@ -704,6 +895,87 @@ def _waiter_cursor_sessions(live):
     return keep
 
 
+ROOMLESS_CURSOR_S = 3600   # a cursor on a missing room, untouched this long
+
+
+def _live_prefixes(live, waiters):
+    """The 8-char session prefixes that hold cursors. Raises when liveness
+    cannot be proven; `dead_cursors` turns that into its refusal."""
+    if live is None:
+        from . import sessions
+        held = sessions.live_sids()
+        live = set(held)
+        waiters = _waiter_cursor_sessions(
+            held if isinstance(held, dict) else dict.fromkeys(live))
+    live = set(live)
+    live.update(waiters or ())
+    # NORMALISE BOTH SIDES TO THE SAME 8 CHARS, then compare exactly. Filenames
+    # do not agree on a sid length — measured on the live dir: 7,480 cursors
+    # carry an 8-char sid, 3,613 carry 23, with a tail out to 34 — and
+    # `live_sids` returns full uuids. An earlier version truncated only the LIVE
+    # side and then tried `p.startswith(sid)`, which can never be true for a
+    # 23-char sid against an 8-char prefix: a live session holding a long-form
+    # cursor would have been read as DEAD and reaped. It happened to be safe
+    # today only because no live session had one, which is luck, not a design.
+    return frozenset(str(s)[:8] for s in live if s)
+
+
+def _rostered_seat_keys():
+    """{seat_key} the roster holds, or None when that is not provable: an
+    unreadable roster, or a seat rename moving cursor ownership right now."""
+    from .seats_common import _seat_key
+    from .seats_rename import rename_journal_path
+    from .seats_roster import roster_checked
+    try:
+        if os.path.exists(rename_journal_path()):
+            return None
+        rows, failed = roster_checked()
+    except Exception:
+        return None
+    if failed or not isinstance(rows, dict):
+        return None
+    return {_seat_key(seat) for seat in rows}
+
+
+def _cursor_judge(live_pfx):
+    """One cursor's verdict -> True when it is dead. A judge asks the roster
+    and each room log at most once, so a whole-directory scan shares one and
+    a per-victim re-proof takes a fresh one."""
+    seats, gone, now = [], {}, time.time()
+
+    def over(seat_key):
+        if not seats:
+            seats.append(_rostered_seat_keys())
+        return seats[0] is not None and seat_key not in seats[0]
+
+    def roomless(room, path):
+        """The room's log is PROVABLY absent and the cursor has sat untouched
+        past the grace. Only FileNotFoundError is absence: an unstatable log
+        is unknown, and unknown keeps. The key is the cursor's own, already
+        slugged, so it is never slugged again (`room_key_path`)."""
+        if room not in gone:
+            try:
+                os.stat(room_key_path(room))
+                gone[room] = False
+            except FileNotFoundError:
+                gone[room] = True
+            except OSError:
+                gone[room] = False
+        if not gone[room]:
+            return False
+        try:
+            return now - os.stat(path).st_mtime >= ROOMLESS_CURSOR_S
+        except OSError:
+            return False
+
+    def judge(cur):
+        sid = cur["session_key"]
+        if sid is not None:
+            return sid[:8] not in live_pfx
+        return roomless(cur["room"], cur["path"]) and over(cur["seat_key"])
+    return judge
+
+
 def dead_cursors(live=None, waiters=None):
     """Per-session read cursors whose SESSION is dead. (victim_paths, kept, err)
 
@@ -735,36 +1007,39 @@ def dead_cursors(live=None, waiters=None):
     liveness cannot be established at all we keep EVERYTHING and report the
     error: an unknown session is not a dead one.
 
+    A CURSOR ON A MISSING ROOM, OF A SEAT THAT IS OVER (task/3519). Measured
+    on the live bus: 1,324 cursors pointed at rooms with no log, and 16,142
+    cursors are seat-level, which the session rule never judges. But a
+    missing room is not by itself a dead cursor. A seat that joins while its
+    home room has no log holds pre-log baselines there (dev/ino null, off 0),
+    and those ARE the delivery line for the room's first post: reaping them
+    left that post to the EOF self-heal. So a live session keeps its cursor,
+    room or no room, and a seat-level cursor on a missing room goes only when
+    the roster no longer holds its seat -- nothing runs it and nothing will
+    inherit it. An unreadable roster, or a rename in flight, keeps every one.
+    The one age bound in this function is here and nowhere else:
+    `ROOMLESS_CURSOR_S`, because a join baselines its rooms before it writes
+    the roster row. Only a log that is provably ABSENT counts; an unstatable
+    one keeps. No `.lock` sibling is ever a victim here (task/2520):
+    gc's chat-cursor-locks row probes an unheld one before it takes it.
+
     Dry-run by default, like every other helm gc.
     """
     d = chat_dir()
     if not os.path.isdir(d):
         return [], 0, None
-    if live is None:
-        try:
-            from . import sessions
-            held = sessions.live_sids()
-            live = set(held)
-            waiters = _waiter_cursor_sessions(
-                held if isinstance(held, dict) else dict.fromkeys(live))
-        except Exception as e:            # cannot prove liveness -> touch nothing
-            return [], 0, "liveness unavailable (%s) — kept everything" % e
-    live = set(live)
-    live.update(waiters or ())
-    # NORMALISE BOTH SIDES TO THE SAME 8 CHARS, then compare exactly. Filenames
-    # do not agree on a sid length — measured on the live dir: 7,480 cursors
-    # carry an 8-char sid, 3,613 carry 23, with a tail out to 34 — and
-    # `live_sids` returns full uuids. An earlier version truncated only the LIVE
-    # side and then tried `p.startswith(sid)`, which can never be true for a
-    # 23-char sid against an 8-char prefix: a live session holding a long-form
-    # cursor would have been read as DEAD and reaped. It happened to be safe
-    # today only because no live session had one, which is luck, not a design.
-    live_pfx = frozenset(str(s)[:8] for s in live if s)
+    try:
+        live_pfx = _live_prefixes(live, waiters)
+    except Exception as e:                # cannot prove liveness -> touch nothing
+        return [], 0, "liveness unavailable (%s) — kept everything" % e
     victims, kept = [], 0
     try:
         names = os.listdir(d)
     except OSError as e:
         return [], 0, str(e)
+    # Function-local: a module-level import would cycle (seats_cursor imports chat).
+    from .seats_cursor import parse_cursor_path
+    judge = _cursor_judge(live_pfx)
     for n in names:
         if ".cursor." not in n:
             continue
@@ -773,30 +1048,78 @@ def dead_cursors(live=None, waiters=None):
         # it removes the only baseline a replacement waiter can inherit.
         if n.endswith((".lock", ".tmp")):
             continue
-        tail = n.rsplit(".cursor.", 1)[1]
-        if "." not in tail:
-            kept += 1
+        # The session key is what the CANONICAL parser says it is: everything
+        # after the FIRST dot after the seat key, dots included — legacy
+        # session keys may carry dots, and the old last-fragment read reaped a
+        # LIVE session whose key had one (the seat then re-read its whole
+        # room). A file the parser returns None for is not a cursor: skipped,
+        # never counted kept, never a victim.
+        cur = parse_cursor_path(os.path.join(d, n))
+        if cur is None:
             continue
-        sid = tail.rsplit(".", 1)[-1]
-        if not sid or sid[:8] in live_pfx:
+        if not judge(cur):
             kept += 1
             continue
         victims.append(os.path.join(d, n))
-        lk = os.path.join(d, n + ".lock")
-        if os.path.exists(lk):
-            victims.append(lk)          # the lock is half the directory entries
+        # THE REAPER NEVER UNLINKS A LOCK FILE (task/2520), for any cursor:
+        # a lock is an flock handle, and unlinking one a writer still holds
+        # detaches the name, so the next writer takes a fresh inode the first
+        # cannot see. gc's chat-cursor-locks row probes an unheld lock before
+        # it takes one.
     return victims, kept, None
+
+
+def cursor_reap_lock(_victim=None):
+    """The lock a cursor reap holds from its re-proof through the unlink:
+    the cursor topology lock, which every cursor initializer and rename
+    holds while it creates or moves a cursor. `helm gc` takes it
+    non-blocking per victim, so a writer mid-mint makes the reap SKIP."""
+    from .seats_cursor import _cursor_topology_path
+    return _cursor_topology_path()
+
+
+def still_dead_cursor(live=None, waiters=None):
+    """-> still(path): the per-victim re-proof of what `dead_cursors` named.
+
+    The scan and the unlink are two moments. Under `cursor_reap_lock` this
+    asks again, for the one path: its session still dead (liveness is read
+    ONCE, at the first re-proof, which is after the scan), or, for a
+    seat-level cursor, its room still absent, the grace still passed, and
+    its seat still not in the roster, read afresh for every path. A `.lock`
+    path answers False for every cursor, the finder's own law (task/2520):
+    only gc's chat-cursor-locks row, which probes a lock unheld before it
+    takes it, unlinks one. Anything unprovable answers False, and False
+    keeps."""
+    from .seats_cursor import parse_cursor_path
+    snap = []
+
+    def still(path):
+        if path.endswith((".lock", ".tmp")):
+            return False
+        cur = parse_cursor_path(path)
+        if cur is None:
+            return False
+        if not snap:
+            snap.append(_live_prefixes(live, waiters))
+        return _cursor_judge(snap[0])(cur)
+    return still
 
 
 def _reap_for_test(live=None, waiters=None):
     """Test-only actuator. Production deletion belongs to `helm gc` — this
-    exists so the reap LOGIC can be pinned without importing the gc plane."""
+    exists so the reap LOGIC can be pinned without importing the gc plane.
+    It holds the lock and asks the re-proof gc's chat-cursors row does."""
+    import fcntl
     victims, kept, err = dead_cursors(live=live, waiters=waiters)
     if err:
         return [], kept, err
+    still = still_dead_cursor(live=live, waiters=waiters)
     for v in victims:
         try:
-            os.remove(v)
+            with open(cursor_reap_lock(v), "a") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                if still(v):
+                    os.remove(v)
         except OSError:
             pass
     return victims, kept, None
@@ -1047,10 +1370,13 @@ def _safe_reason(reason):
     return s[:head] + (_REASON_ELISION % (len(s) - head - tail)) + s[-tail:]
 
 
-def _diag(code, reason, remediation=None, event_epoch=None, event_ts=None):
+def _diag(code, reason, remediation=None, event_epoch=None, event_ts=None,
+          inherited=None):
     """Structured, secret-safe failure captured at the failure boundary. The
     private event clock is sampled FIRST, so scheduling during redaction or
-    before the RAM lock cannot reorder it behind a newer success."""
+    before the RAM lock cannot reorder it behind a newer success.
+    `inherited` is the shell's profile an identity refusal ran under
+    (`_inherited_profile`); it rides the record as `inherited_profile`."""
     event_epoch = _epoch(event_epoch, time.time())
     event_ts = event_ts if isinstance(event_ts, str) and event_ts else pk.now_ts()
     # A NODE REFUSAL WITH ONE KNOWN CURE NAMES THE CURE, not the code's generic
@@ -1063,16 +1389,19 @@ def _diag(code, reason, remediation=None, event_epoch=None, event_ts=None):
         code, "repair the named signing failure, then retry")
     if "transport ack" not in fix:
         fix += "; " + _ACK_REMEDIATION
-    return {"code": str(code or "signing_exception"),
-            "reason": _safe_reason(reason), "remediation": fix,
-            "_event_epoch": event_epoch, "_event_ts": event_ts}
+    out = {"code": str(code or "signing_exception"),
+           "reason": _safe_reason(reason), "remediation": fix,
+           "_event_epoch": event_epoch, "_event_ts": event_ts}
+    if isinstance(inherited, str) and inherited:
+        out["inherited_profile"] = inherited
+    return out
 
 
 def _normal_diag(value, code="signing_exception"):
     if isinstance(value, dict):
         return _diag(value.get("code") or code, value.get("reason"),
                      value.get("remediation"), value.get("_event_epoch"),
-                     value.get("_event_ts"))
+                     value.get("_event_ts"), value.get("inherited_profile"))
     return _diag(code, value)
 
 
@@ -1159,6 +1488,8 @@ def _next_sign_failure(old, profile, diag):
                  "last_failure": stamp, "failure_count": 1,
                  "remediation": diag["remediation"],
                  "_first_epoch": now, "_last_epoch": now}
+    if diag.get("inherited_profile"):
+        candidate["inherited_profile"] = diag["inherited_profile"]
     old = old if isinstance(old, dict) else {}
     success = _epoch(old.get("_success_epoch"))
     last = _epoch(old.get("_last_epoch"))
@@ -1180,7 +1511,42 @@ def _next_sign_failure(old, profile, diag):
         failure_count=(_count(old.get("failure_count")) if active else 0) + 1,
         _first_epoch=_epoch(old.get("_first_epoch"), now) if active else now,
         _success_epoch=success)
+    candidate.update(_kept_history(old))
     return candidate, candidate, True
+
+
+#: How many resolution events one profile keeps. Enough to read a flapping
+#: node's recent history on one screen; bounded so a RAM record stays small.
+RESOLUTIONS_KEPT = 8
+
+
+def _kept_history(old):
+    """The fields a profile's record carries across every rewrite: the
+    resolution history, and — while its last watermark is a resolution or an
+    ack rather than a signed turn — the marker that says so and, for a
+    resolution, the receipt it kept.
+
+    A resolution records "the cause was measured gone" and an ack records "an
+    operator retired this", never "this profile signed", so the next failure
+    must not launder either watermark into a receipt, and must not erase the
+    events that explain it. THE ACK MARKER RIDES WITH ITS WATERMARK: a failure
+    that follows an ack keeps the ack's `_success_epoch` (it drops delayed
+    pre-ack failures), and without `acknowledged_at` beside it that epoch read
+    as a receipt the moment a resolution or a dark-seat scoping retired the
+    failure — the profile read SIGNED and led the fleet as its newest signer,
+    having never signed."""
+    old = old if isinstance(old, dict) else {}
+    kept = {}
+    events = old.get("resolutions")
+    if isinstance(events, list) and events:
+        kept["resolutions"] = [e for e in events
+                               if isinstance(e, dict)][-RESOLUTIONS_KEPT:]
+    if old.get("resolved_at"):
+        kept["resolved_at"] = old["resolved_at"]
+        kept["_receipt_epoch"] = _epoch(old.get("_receipt_epoch"))
+    if old.get("acknowledged_at"):
+        kept["acknowledged_at"] = old["acknowledged_at"]
+    return kept
 
 
 def _failure_public(rec, now=None):
@@ -1191,20 +1557,24 @@ def _failure_public(rec, now=None):
     now = _epoch(now, time.time())
     first = _epoch(rec.get("_first_epoch"), now)
     last = _epoch(rec.get("_last_epoch"), first)
-    return {"profile": _dsan(rec.get("profile"))
-            if isinstance(rec.get("profile"), str) else "?",
-            "code": rec.get("code") if isinstance(rec.get("code"), str)
-            else "incident_state_corrupt",
-            "reason": _safe_reason(rec["reason"]),
-            "first_failure": rec.get("first_failure")
-            if isinstance(rec.get("first_failure"), str) else "?",
-            "last_failure": rec.get("last_failure")
-            if isinstance(rec.get("last_failure"), str) else "?",
-            "failure_count": max(1, _count(rec.get("failure_count"), 1)),
-            "remediation": rec.get("remediation")
-            if isinstance(rec.get("remediation"), str) else _ACK_REMEDIATION,
-            "age_s": max(0, int(now - first)),
-            "last_age_s": max(0, int(now - last))}
+    out = {"profile": _dsan(rec.get("profile"))
+           if isinstance(rec.get("profile"), str) else "?",
+           "code": rec.get("code") if isinstance(rec.get("code"), str)
+           else "incident_state_corrupt",
+           "reason": _safe_reason(rec["reason"]),
+           "first_failure": rec.get("first_failure")
+           if isinstance(rec.get("first_failure"), str) else "?",
+           "last_failure": rec.get("last_failure")
+           if isinstance(rec.get("last_failure"), str) else "?",
+           "failure_count": max(1, _count(rec.get("failure_count"), 1)),
+           "remediation": rec.get("remediation")
+           if isinstance(rec.get("remediation"), str) else _ACK_REMEDIATION,
+           "age_s": max(0, int(now - first)),
+           "last_age_s": max(0, int(now - last))}
+    if isinstance(rec.get("inherited_profile"), str) \
+            and rec["inherited_profile"]:
+        out["inherited_profile"] = _dsan(rec["inherited_profile"])
+    return out
 
 
 def _sign_failure_rows(state, now=None):
@@ -1299,7 +1669,10 @@ def _record_sign_failure(profile, failure):
 
 
 def _clear_sign_failure(profile, succeeded_at=None):
-    """Record a per-profile committed-signing watermark in both owner views.
+    """Record a per-profile committed-signing watermark in both owner views
+    -> (cleared, err). `cleared` says an active incident was retired; `err`
+    is None when the state was read and written, else the exception class
+    that stopped it, so a failed write never reads as "nothing to clear".
     The real receipt-confirmed signing path is the sole production caller; the
     fallback changes only after the shared watermark write succeeds."""
     p = _profile(profile)
@@ -1316,15 +1689,20 @@ def _clear_sign_failure(profile, succeeded_at=None):
                 prior = _epoch(old.get("_success_epoch"))
                 active = _active_failure(old)
                 if last > succeeded_at:
-                    return False
+                    return False, None
                 cleared = {"profile": p,
                            "_success_epoch": max(prior, succeeded_at)}
+                # A SIGNED TURN IS A RECEIPT, so the resolution marker ends
+                # here; the events that explain the record's past stay.
+                history = _kept_history(old).get("resolutions")
+                if history:
+                    cleared["resolutions"] = history
                 state[p] = cleared
                 pk.write_json(sign_failures_path(), state)
                 fallback[p] = cleared
-                return active
-    except Exception:
-        return False
+                return active, None
+    except Exception as exc:
+        return False, exc.__class__.__name__
 
 
 def _signed_success_epoch(profile):
@@ -1346,13 +1724,20 @@ def _signed_success_epoch(profile):
         state.get(p) if isinstance(state, dict) else None, fallback)
     if rec.get("acknowledged_at"):
         return 0.0
+    # A RESOLUTION IS NOT A RECEIPT EITHER: its watermark retires the incident
+    # and the receipt this profile held before it is what still proves signing.
+    if rec.get("resolved_at"):
+        return _epoch(rec.get("_receipt_epoch"))
     return _epoch(rec.get("_success_epoch"))
 
 
 def acknowledge_sign_failures(profile=None):
     """Operator retirement for dead/renamed profiles. This is an explicit ACK,
     not a recovery claim; its watermark prevents delayed pre-ack failures from
-    resurrecting the incident. Returns acknowledged exact profile names."""
+    resurrecting the incident. Returns (acknowledged exact profile names,
+    err): `err` is None when the state was read and written, else the
+    exception class that stopped the ACK, so a failed ACK never reads as
+    "no matching active incident"."""
     now, stamp = time.time(), pk.now_ts()
     try:
         with _SIGN_FAILURE_FALLBACK_LOCK:
@@ -1372,14 +1757,17 @@ def acknowledge_sign_failures(profile=None):
                         continue
                     cleared[p] = {"profile": p, "_success_epoch": now,
                                   "acknowledged_at": stamp}
+                    history = _kept_history(rec).get("resolutions")
+                    if history:
+                        cleared[p]["resolutions"] = history
                     state[p] = cleared[p]
                     done.append(p)
                 if done:
                     pk.write_json(sign_failures_path(), state)
                     fallback.update(cleared)
-                return done
-    except Exception:
-        return []
+                return done, None
+    except Exception as exc:
+        return [], exc.__class__.__name__
 
 
 def _stamp_sign_failure(row, profile, failure):
@@ -1399,6 +1787,8 @@ def _stamp_sign_failure(row, profile, failure):
                       "first_failure": stamp, "last_failure": stamp,
                       "failure_count": 1, "age_s": 0, "last_age_s": 0,
                       "remediation": d["remediation"]}
+        if d.get("inherited_profile"):
+            rec.setdefault("inherited_profile", d["inherited_profile"])
         rec["remediation"] = "%s; shared incident retention failed: %s; process-local fallback active" % (
             rec["remediation"], _safe_reason(
                 "%s: %s" % (exc.__class__.__name__, exc)))
@@ -1430,10 +1820,287 @@ def _transient_failure(profile, code, reason):
     return _failure_public(rec, d["_event_epoch"])
 
 
-def transport_status(fleet=False):
+# ---------------------------------------------------------------------------
+# SELF-RESOLUTION AND SCOPE — a failure whose cause is measurably gone retires
+# itself, and a dark seat's failure is that seat's line, not the fleet's
+# ---------------------------------------------------------------------------
+# The measured case: the web board read "signing DEGRADED · <seat> · chat node
+# unreachable at http://127.0.0.1:8898 ... (19h ago)" while the node answered,
+# and the scorecard counted 531 DEGRADED marks in a day. The record could be
+# retired only by a signed turn from that same profile or a hand-typed
+# `transport ack`, and the profile's seat had gone dark, so nothing would ever
+# retire it and the owner found it on his own panel.
+#
+# A CAUSE IS RE-MEASURED, NEVER ASSUMED. Only two causes have a probe this
+# process already pays for: the node (`node_head`, run by every status read)
+# and the signer (`cell.bin_status`). Each record gets one of four verdicts:
+#
+#   GONE      the probe measured the cause absent -> the record RESOLVES, with
+#             an event naming who probed, what the probe saw, and when. The
+#             record is rewritten, never deleted: the failure it retired rides
+#             the event, and the events ride every later rewrite.
+#   PRESENT   the probe measured the cause still there -> DEGRADED.
+#   UNKNOWN   the probe could not answer for THIS record (it raised, the
+#             record names another node, the process has no signer or no
+#             node to ask) -> UNKNOWN, which is never healthy.
+#   UNPROBED  no probe exists for this cause (a refused send, a failed join,
+#             an identity refusal) -> DEGRADED as before, and named: it clears
+#             on that profile's next signed turn or an ack.
+RESOLVE_GONE, CAUSE_PRESENT, CAUSE_UNKNOWN, CAUSE_UNPROBED = (
+    "GONE", "PRESENT", "UNKNOWN", "UNPROBED")
+_NODE_CAUSES = ("node_unreachable", "node_probe_failed")
+_SIGNER_CAUSES = ("signer_unavailable",)
+# The node a failure names: "chat node unreachable at <url>" is the post
+# path's wording and the status path's, so the URL follows " at ".
+_NAMED_NODE = re.compile(r"\bat (https?://[^\s,;)]+)")
+
+
+def _iso(epoch):
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(epoch)))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def _cause_now(code, reason, probe, profile=None):
+    """(verdict, sentence) for ONE failure's cause, re-measured by `probe`
+    ({epoch, url, head, head_error, signer}, taken once per status read)."""
+    at = _iso(probe.get("epoch"))
+    if code in _NODE_CAUSES:
+        u = probe.get("url")
+        if not u:
+            return CAUSE_UNKNOWN, (
+                "the chat node cannot be re-probed here: the signed transport "
+                "is disabled in this process (HELM_CHAT_NODE_URL is empty)")
+        m = _NAMED_NODE.search(reason if isinstance(reason, str) else "")
+        named = m.group(1).rstrip("/.") if m else None
+        if named and named != u.rstrip("/"):
+            return CAUSE_UNKNOWN, (
+                "the failure names node %s and this process probes %s, so "
+                "its cause cannot be re-measured here" % (named, u))
+        if probe.get("head_error"):
+            return CAUSE_UNKNOWN, (
+                "the node probe itself failed at %s (%s), so whether %s "
+                "answers is unknown" % (at, probe["head_error"], u))
+        head = probe.get("head")
+        if head is None:
+            return CAUSE_PRESENT, ("the chat node still does not answer at %s "
+                                   "(probed %s)" % (u, at))
+        return RESOLVE_GONE, (
+            "the chat node answered GET %s/api/receipts at %s (%s)" % (
+                u, at, "chain head #%s" % head.get("chain_index")
+                if isinstance(head, dict) and head else "no receipts yet"))
+    if code in _SIGNER_CAUSES:
+        signer = probe.get("signer") or {}
+        if not signer.get("configured"):
+            return CAUSE_UNKNOWN, (
+                "the signer cannot be re-probed here: this process has no "
+                "signer configured (HELM_CELL_BIN is unset)")
+        if not signer.get("usable"):
+            return CAUSE_PRESENT, ("the configured signer is still unusable "
+                                   "(%s)" % _safe_reason(signer.get("reason")))
+        return RESOLVE_GONE, (
+            "the configured signer answered usable at %s (cell.bin_status: "
+            "%s)" % (at, signer.get("state") or "ready"))
+    who = profile or "this profile"
+    return CAUSE_UNPROBED, (
+        "not re-probeable — clears when %s next commits a signed turn, or on "
+        "`helm chat transport ack --profile %s`" % (who, who))
+
+
+def _resolution_public(event):
+    """One resolution event as every surface may emit it: only its named
+    fields, with identity and every diagnostic laundered."""
+    e = dict(event) if isinstance(event, dict) else {}
+    return {"profile": _dsan(e.get("profile")) if isinstance(
+                e.get("profile"), str) else "?",
+            "code": e.get("code") if isinstance(e.get("code"), str) else "?",
+            "reason": _safe_reason(e.get("reason")),
+            "first_failure": e.get("first_failure") or "?",
+            "last_failure": e.get("last_failure") or "?",
+            "failure_count": max(1, _count(e.get("failure_count"), 1)),
+            "resolved_at": e.get("resolved_at") or "?",
+            "resolved_epoch": _epoch(e.get("resolved_epoch")),
+            "by": _safe_reason(e.get("by")),
+            "probe": _safe_reason(e.get("probe"))}
+
+
+def _resolve_sign_failures(probe, by):
+    """Retire every active incident whose cause `probe` measured GONE, and
+    return the public resolution events recorded (newest first).
+
+    UNDER THE SAME LOCK AND ORDERING AS EVERY OTHER WRITER. The watermark is
+    the PROBE's time, so a failure measured after the probe began stays
+    active, and a delayed failure measured before it cannot resurrect the
+    record (`_next_sign_failure` drops anything at or below the watermark).
+    The receipt the profile held before is kept apart from the watermark, so
+    a resolution never reads as a signing receipt. NEVER RAISES: a resolution
+    that cannot be recorded leaves the incident standing."""
+    now, done, changed = _epoch(probe.get("epoch"), time.time()), [], {}
+    stamp = _iso(now)
+    try:
+        with _SIGN_FAILURE_FALLBACK_LOCK:
+            fallback = _fallback_sign_failure_state()
+            _validate_sign_failure_owner()
+            with _sign_failure_lock():
+                state = _read_sign_failure_state()
+                if not isinstance(state, dict):
+                    state = {}
+                for p in list(state) + [p for p in fallback if p not in state]:
+                    if not isinstance(p, str):
+                        continue
+                    rec = _combined_sign_failure_state(state.get(p),
+                                                       fallback.get(p))
+                    if not _active_failure(rec) \
+                            or _epoch(rec.get("_last_epoch")) > now:
+                        continue
+                    verdict, evidence = _cause_now(rec.get("code"),
+                                                   rec.get("reason"), probe, p)
+                    if verdict != RESOLVE_GONE:
+                        continue
+                    event = {"profile": p, "code": rec.get("code"),
+                             "reason": rec.get("reason"),
+                             "first_failure": rec.get("first_failure"),
+                             "last_failure": rec.get("last_failure"),
+                             "failure_count": rec.get("failure_count"),
+                             "resolved_at": stamp, "resolved_epoch": now,
+                             "by": by, "probe": evidence}
+                    receipt = (_epoch(rec.get("_receipt_epoch"))
+                               if rec.get("resolved_at") else 0.0
+                               if rec.get("acknowledged_at")
+                               else _epoch(rec.get("_success_epoch")))
+                    history = (_kept_history(rec).get("resolutions") or []) \
+                        + [event]
+                    changed[p] = {"profile": p,
+                                  "_success_epoch": max(
+                                      _epoch(rec.get("_success_epoch")), now),
+                                  "resolved_at": stamp,
+                                  "_receipt_epoch": receipt,
+                                  "resolutions": history[-RESOLUTIONS_KEPT:]}
+                    done.append(event)
+                if changed:
+                    state.update(changed)
+                    pk.write_json(sign_failures_path(), state)
+                    fallback.update(changed)
+    except Exception:                     # noqa: BLE001 — the incident stands
+        return []
+    return [_resolution_public(e) for e in reversed(done)]
+
+
+def sign_resolutions():
+    """Every recorded resolution event, newest first — the history a
+    self-resolved incident leaves behind (who probed, what the probe saw,
+    when, and the failure it retired). An unreadable owner answers the
+    process-local view only."""
+    with _SIGN_FAILURE_FALLBACK_LOCK:
+        fallback = {p: dict(r) for p, r in
+                    _fallback_sign_failure_state().items()
+                    if isinstance(r, dict)}
+        try:
+            _validate_sign_failure_owner()
+            state = {}
+            if os.path.exists(sign_failures_path()):
+                with _sign_failure_lock():
+                    state = _read_sign_failure_state()
+        except Exception:                 # noqa: BLE001 — local view only
+            state = {}
+    if not isinstance(state, dict):
+        state = {}
+    events = []
+    for p in list(state) + [p for p in fallback if p not in state]:
+        if isinstance(p, str):
+            rec = _combined_sign_failure_state(state.get(p), fallback.get(p))
+            events.extend(_kept_history(rec).get("resolutions") or [])
+    return sorted((_resolution_public(e) for e in events),
+                  key=lambda e: e["resolved_epoch"], reverse=True)
+
+
+#: How long one seat-liveness verdict is reused by the status reads. The web
+#: console recomputes the transport on every poll, and a dark seat's verdict
+#: re-proves its DEAF register with a process walk; thirty seconds bounds that
+#: to two walks a minute while a seat that comes back reads live within one.
+SEAT_DARK_MEMO_S = 30.0
+_SEAT_DARK_MEMO = {}   # (incident owner path, profile) -> (epoch, verdict)
+
+
+def _seat_darkness(profile, now=None):
+    """seat_usability.signing_dark for one failing profile, memoised briefly.
+    A read that raises answers None (unproven), which keeps the failure loud."""
+    now = time.time() if now is None else now
+    key = (os.path.abspath(sign_failures_path()), str(profile))
+    hit = _SEAT_DARK_MEMO.get(key)
+    if hit is not None and 0 <= now - hit[0] < SEAT_DARK_MEMO_S:
+        return hit[1]
+    try:
+        from . import seat_usability
+        got = seat_usability.signing_dark(profile, now=now)
+    except Exception as exc:              # noqa: BLE001 — unproven, not dark
+        got = {"dark": None, "since": None, "seat": None,
+               "why": "the seat liveness read raised (%s)"
+                      % exc.__class__.__name__}
+    _SEAT_DARK_MEMO[key] = (now, got)
+    return got
+
+
+def _classify_failures(failures, probe, own, now):
+    """(live, dark, expected) public rows, each carrying its cause verdict and
+    whose failure it is. `own` is the reader's own label on a per-process
+    read: a seat asking about itself is never scoped away, because being told
+    the fleet is fine when YOU cannot sign is the failure this status exists
+    to prevent. Only a PROVEN dark seat is scoped; an unproven one stays loud.
+
+    AN EXPECTED STATE IS NOT A FAULT. A seat refused because the profile it
+    runs under names no seat was started outside helm launch under a shell's
+    profile, and a lead in the owner's own session runs that way by design:
+    History led with "signing DEGRADED" for it (console walk 4, P1 2). Its
+    failure is scoped as that seat's line (`_expected_unsigned`), is never
+    asked the liveness question, and still leads the seat's OWN read."""
+    live, dark, expected = [], [], []
+    for f in failures:
+        who = f.get("profile")
+        verdict, cause = _cause_now(f.get("code"), f.get("reason"), probe, who)
+        if verdict == RESOLVE_GONE:
+            # Measured gone but not recorded (the write failed, or the record
+            # moved under the probe): the record stands, and says why.
+            verdict, cause = CAUSE_UNKNOWN, (
+                "%s, but the resolution could not be recorded, so the "
+                "record stands" % cause)
+        row = dict(f, cause_state=verdict, cause=_safe_reason(cause))
+        if own is not None and who == _dsan(own):
+            live.append(dict(row, liveness="live",
+                             liveness_why="this is the reader's own profile"))
+            continue
+        if _expected_unsigned(row):
+            expected.append(row)
+            continue
+        seen = _seat_darkness(who, now=now)
+        why = _safe_reason((seen or {}).get("why") or "no liveness verdict")
+        if (seen or {}).get("dark") is True:
+            since = seen.get("since")
+            dark.append(dict(row, liveness="dark", liveness_why=why,
+                             dark_since=_iso(since) if since else "?"))
+        else:
+            live.append(dict(row, liveness="live" if (seen or {}).get(
+                "dark") is False else "unknown", liveness_why=why))
+    return live, dark, expected
+
+
+def _resolver_label(fleet, me, reader):
+    return "%s pid %d" % (reader or ("fleet status reader" if fleet else
+                                     "transport status for %s" % me if me
+                                     else "transport status reader"),
+                          os.getpid())
+
+
+def transport_status(fleet=False, reader=None):
     """The ONE transport truth for CLI/TUI/web/doctor. A reachable node plus an
     executable signer is only *ready*; any profile whose attempted signed turn
-    fell back remains DEGRADED until that SAME profile completes a signed turn.
+    fell back remains DEGRADED until that SAME profile completes a signed turn,
+    its cause is measured gone (the record RESOLVES, see above), or an
+    operator acks it. A failure whose cause could not be re-probed reads
+    UNKNOWN, never healthy. A failure from a seat PROVEN dark is reported as
+    that seat's scoped line (`dark_failures`, `scoped`) and does not make the
+    fleet DEGRADED. `reader` names who is asking, for the resolution event.
     An unset signer is configured-off; a set-but-unusable signer is unavailable.
     The persistent incident fields come from RAM, never disk coordination.
 
@@ -1445,7 +2112,13 @@ def transport_status(fleet=False):
     its incident, while its next post was refused. A refusal is live, not
     retained, so no ack can hide it: it leads `failed_profiles` until the seat
     can sign as itself. A `fleet` reader describes the system, not the process
-    rendering it, so it reports retained incidents and skips its own identity."""
+    rendering it, so it reports retained incidents and skips its own identity.
+
+    A failure that is the EXPECTED state (`_expected_unsigned`: a seat started
+    outside helm launch under a shell's profile) is scoped like a dark seat's,
+    as `expected_failures`, and does not make the fleet DEGRADED. Every read
+    that carries a failure also carries the OWNER'S copy of it
+    (`_owner_words`), for the console, beside the agents' text."""
     from . import cell
     u = node_url()
     signer = cell.bin_status()
@@ -1463,41 +2136,73 @@ def transport_status(fleet=False):
         current = next((f for f in failures
                         if f.get("profile") == _dsan(me)
                         and f.get("code") == refused["code"]), None)
-        current = current or _transient_failure(
-            me, refused["code"], refused["reason"])
-        rows = [current] + [f for f in failures if f is not current]
+        current = dict(current or _transient_failure(
+            me, refused["code"], refused["reason"]),
+            cause_state=CAUSE_PRESENT, liveness="live",
+            cause="this process's own posts are refused by the identity "
+                  "gate now")
+        rows = [current] + [f for f in failures
+                            if f.get("profile") != current.get("profile")
+                            or f.get("code") != current.get("code")]
         out.update(current, mode="degraded", state="DEGRADED",
                    failed_profiles=rows)
-        return out
+        return _owner_words(out)
     if signer["configured"] and not signer["usable"]:
         current = next((f for f in failures
                         if f.get("profile") == _dsan(me)
                         and f.get("code") == "signer_unavailable"), None)
-        current = current or _transient_failure(
-            me, "signer_unavailable", signer["reason"])
-        rows = [current] + [f for f in failures if f is not current]
+        current = dict(current or _transient_failure(
+            me, "signer_unavailable", signer["reason"]),
+            cause_state=CAUSE_PRESENT, liveness="live",
+            cause="this process's configured signer is unusable now (%s)"
+                  % _safe_reason(signer["reason"]))
+        rows = [current] + [f for f in failures
+                            if f.get("profile") != current.get("profile")
+                            or f.get("code") != current.get("code")]
         out.update(current, mode="degraded", state="DEGRADED",
                    failed_profiles=rows)
-        return out
+        return _owner_words(out)
     probe_error = None
+    probe_at = time.time()
     try:
         h = node_head(u) if u else None
     except Exception as exc:
         h = None
         probe_error = "%s: %s" % (exc.__class__.__name__, exc)
     out["head"] = h.get("chain_index") if isinstance(h, dict) and h else None
+    probe = {"epoch": probe_at, "url": u, "head": h,
+             "head_error": probe_error, "signer": signer}
     if failures:
-        out.update(failures[0], mode="degraded", state="DEGRADED",
-                   failed_profiles=failures)
-        return out
-    if u and signer["usable"] and h is None:
+        resolved = _resolve_sign_failures(
+            probe, _resolver_label(fleet, me, reader))
+        if resolved:
+            out["resolved"] = resolved
+            failures = sign_failures()
+    live, dark, expected = _classify_failures(failures, probe,
+                                              None if fleet else me, probe_at)
+    if dark:
+        out["dark_failures"] = dark
+    if expected:
+        out["expected_failures"] = expected
+    if dark or expected:
+        out["scoped"] = transport_scoped_lines(out)
+    degraded = [f for f in live if f["cause_state"] != CAUSE_UNKNOWN]
+    unknown = [f for f in live if f["cause_state"] == CAUSE_UNKNOWN]
+    if not degraded and u and signer["usable"] and h is None:
         reason = "configured chat node unreachable at %s" % u
         if probe_error:
             reason += " (%s)" % probe_error
-        f = _transient_failure(me, "node_unreachable", reason)
-        out.update(f, mode="degraded", state="DEGRADED",
-                   failed_profiles=[f])
-        return out
+        degraded = [dict(_transient_failure(me, "node_unreachable", reason),
+                         cause_state=CAUSE_PRESENT, liveness="live",
+                         cause="the chat node does not answer at %s now" % u)]
+    if degraded:
+        out.update(degraded[0], mode="degraded", state="DEGRADED",
+                   failed_profiles=degraded + unknown)
+        return _owner_words(out)
+    if unknown:
+        out.update(unknown[0], mode="unknown", state="UNKNOWN",
+                   label="unknown", failed_profiles=unknown)
+        return _owner_words(out)
     if h is not None:
         if not signer["usable"]:
             out["mode"] = "unsigned (no signer)"
@@ -1531,7 +2236,7 @@ def transport_status(fleet=False):
                                fleet_signer=who, fleet_signed_epoch=when,
                                detail="this reader has no receipt of its own; "
                                       "newest fleet receipt is %s" % who)
-    return out
+    return _owner_words(out)
 
 
 def fleet_signed():
@@ -1555,8 +2260,10 @@ def fleet_signed():
         # skips it; the fleet question must agree with the per-profile one.
         if not isinstance(rec, dict) or rec.get("acknowledged_at"):
             continue
+        # NOR IS A RESOLUTION: the receipt it kept is the signing evidence.
+        key = "_receipt_epoch" if rec.get("resolved_at") else "_success_epoch"
         try:
-            epoch = float(rec.get("_success_epoch") or 0)
+            epoch = float(rec.get(key) or 0)
         except (TypeError, ValueError):
             continue
         if epoch > 0 and (best is None or epoch > best[1]):
@@ -1572,29 +2279,72 @@ def transport_label(st):
 
 
 def transport_failure_summary(st):
-    """One loud, bounded operator line from transport_status()."""
-    if not isinstance(st, dict) or st.get("mode") != "degraded":
+    """One loud, bounded operator line from transport_status(): DEGRADED, or
+    UNKNOWN when the failure's cause could not be re-probed. The cause verdict
+    rides the line when the status carries one."""
+    if not isinstance(st, dict) or st.get("mode") not in ("degraded",
+                                                          "unknown"):
         return ""
     st = _public_transport(st)
-    return ("DEGRADED profile '%s': %s — first %s, last %s (%ss ago), "
-            "%d failure%s; remediation: %s" % (
+    cause = st.get("cause")
+    return ("%s profile '%s': %s — first %s, last %s (%ss ago), "
+            "%d failure%s; %sremediation: %s" % (
+                "UNKNOWN" if st.get("mode") == "unknown" else "DEGRADED",
                 st.get("profile") or "?", st.get("reason") or "unknown",
                 st.get("first_failure") or "?", st.get("last_failure") or "?",
                 st.get("last_age_s") or 0, st.get("failure_count") or 1,
                 "s"[:(st.get("failure_count") or 1) != 1],
+                ("cause: %s; " % cause) if cause else "",
                 st.get("remediation") or "retry a signed turn"))
+
+
+def transport_scoped_lines(st):
+    """One line per failure scoped to a DARK seat: whose it is, since when the
+    seat is dark, how old its last attempt is, and what the liveness read
+    measured. A scoped line is information, not an alarm: nothing will sign
+    from that seat until it comes back, and it clears when the seat signs
+    again or its cause is measured gone. Then one line per failure scoped as
+    the EXPECTED state (`_expected_unsigned`): whose it is, the shell's
+    profile it runs under, and the remedy for an agent that wants it signed."""
+    lines = []
+    for f in (st or {}).get("dark_failures") or ():
+        f = _public_transport(f)
+        lines.append("%s (dark since %s): last signing attempt failed %s ago "
+                     "(%s: %s) — %s" % (
+                         f.get("profile") or "?", f.get("dark_since") or "?",
+                         _dur(f.get("last_age_s") or 0), f.get("code") or "?",
+                         f.get("reason") or "unknown",
+                         f.get("liveness_why") or "dark"))
+    for f in (st or {}).get("expected_failures") or ():
+        f = _public_transport(f)
+        lines.append("%s (started outside helm launch, under the shell's "
+                     "profile %r that names no seat): its posts go out "
+                     "unsigned, last %s ago (%s) — the expected state for a "
+                     "seat run in the owner's session; %s" % (
+                         f.get("profile") or "?",
+                         f.get("inherited_profile") or "?",
+                         _dur(f.get("last_age_s") or 0), f.get("code") or "?",
+                         f.get("remediation") or "relaunch it through "
+                         "`helm launch` to sign as itself"))
+    return lines
 
 
 def _cmd_transport(args):
     verb = args[0] if args else "status"
     if verb == "status" and len(args) == 1 or not args:
         st = transport_status()
+        # UNKNOWN IS NEVER HEALTHY: it exits 1 beside DEGRADED. A failure
+        # scoped to a dark seat, or as a seat's expected state, is printed and
+        # exits 0 — it is that seat's.
+        bad = st.get("mode") in ("degraded", "unknown")
         print("helm chat transport: " + (
-            transport_failure_summary(st) if st.get("mode") == "degraded"
+            transport_failure_summary(st) if bad
             else "%s%s" % (transport_label(st).upper(),
                             " — chain #%s" % st["head"]
                             if st.get("head") is not None else "")))
-        return 1 if st.get("mode") == "degraded" else 0
+        for line in st.get("scoped") or ():
+            print("helm chat transport: scoped: " + line)
+        return 1 if bad else 0
     if verb != "ack":
         print(HELP["transport"], file=sys.stderr)
         return 2
@@ -1605,7 +2355,12 @@ def _cmd_transport(args):
     if (profile is None) == (not all_profiles) or len(args) != 1:
         print(HELP["transport"], file=sys.stderr)
         return 2
-    done = acknowledge_sign_failures(None if all_profiles else profile)
+    done, err = acknowledge_sign_failures(None if all_profiles else profile)
+    if err:
+        print("helm chat transport: ack FAILED: %s — the incident state could "
+              "not be read or written; nothing was acknowledged" % err,
+              file=sys.stderr)
+        return 3
     if not done:
         print("helm chat transport: no matching active incident", file=sys.stderr)
         return 1
@@ -1741,6 +2496,8 @@ def payload_for(row, text=None):
 
 
 def _node_token():
+    """The room node's bearer: the RAM token, else the state's. The RAM one
+    wins, so every writer of a fresh token writes it (store_node_token)."""
     try:
         with open(_token_path()) as f:
             t = f.read().strip()
@@ -1750,6 +2507,68 @@ def _node_token():
         pass
     from . import chatnode
     return chatnode.state().get("token") or ""
+
+
+def store_node_token(token):
+    """THE ONE WRITER of the RAM token, 0600 from its creation. `_revive` and
+    chatnode.provision both write through it, so a token the node just issued
+    is always the one `_node_token` answers next."""
+    _ensure_dir()
+    pk.atomic_write(_token_path(), token or "", mode=0o600)
+    os.chmod(_token_path(), 0o600)
+
+
+def _unlock_backoff_path():
+    return os.path.join(chat_dir(), ".node-unlock-backoff")
+
+
+def note_unlock_refused(word):
+    """Start the unlock backoff after a revive whose unlock the node refused
+    (`word`: chatnode.UNLOCK_REFUSALS or UNLOCK_REJECTED). The marker sits
+    beside the RAM token, 0600, and holds only when and why, never the
+    passphrase or a token."""
+    _ensure_dir()
+    pk.atomic_write(_unlock_backoff_path(),
+                    json.dumps({"at": time.time(), "reason": word}), mode=0o600)
+    os.chmod(_unlock_backoff_path(), 0o600)
+
+
+def clear_unlock_backoff():
+    """End the backoff: an unlock the node accepted proves its cause gone."""
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(_unlock_backoff_path())
+
+
+_BACKOFF_WORD = re.compile(r"[a-z_]{1,32}")
+
+
+def unlock_backoff():
+    """The unlock backoff in force, or None: {reason, ago, left}.
+
+    WHY IT EXISTS. dregg admits chatnode.UNLOCK_ATTEMPTS_PER_MINUTE unlocks
+    per client IP, and every seat here is one client. `_revive` unlocks for
+    every send the node refused at its door, so with a stored passphrase the
+    node rejects, the seats' sends spent that budget and the operator's
+    `helm chat node up` met 429. After one refused revive, every seat skips
+    its revive for UNLOCK_BACKOFF_S and says why; `up` never reads this.
+
+    BOUNDED BOTH WAYS. The marker keeps wall time, because the seats are
+    separate processes. An `at` in the future (a clock set back) or older than
+    the backoff is not in force, so no marker holds revives longer than
+    UNLOCK_BACKOFF_S. A marker that cannot be read is not in force either:
+    that costs one unlock attempt, which a refusal answers with a new marker."""
+    from . import chatnode
+    try:
+        with open(_unlock_backoff_path()) as f:
+            mark = json.load(f)
+        ago = time.time() - float(mark["at"])
+        word = mark["reason"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    if not (isinstance(word, str) and _BACKOFF_WORD.fullmatch(word)
+            and 0 <= ago < chatnode.UNLOCK_BACKOFF_S):
+        return None
+    return {"reason": word, "ago": ago, "left": chatnode.UNLOCK_BACKOFF_S - ago}
 
 
 def _env_extra(token):
@@ -1778,7 +2597,16 @@ def _env_extra(token):
 
 def _revive():
     """Re-unlock + re-bootstrap a wiped/stale room node. Returns (token, None)
-    or (None, precise reason); unlock/faucet health failures never disappear."""
+    or (None, precise reason); unlock/faucet health failures never disappear.
+
+    Runs when a join fails, and when /turns/submit refuses a send at its door
+    (401/403, `_door_refusal`). The unlock uses the STORED passphrase, and the
+    token it returns replaces the RAM one — the refresh a stale RAM token
+    needs, since `_node_token` prefers it over the state's.
+
+    A REFUSED UNLOCK BACKS EVERY SEAT OFF (`unlock_backoff`). Inside the
+    backoff no unlock is sent, and the reason names the backoff and the
+    refusal that started it; an accepted unlock ends it."""
     from . import chatnode
     u = node_url()
     st = chatnode.state()
@@ -1786,15 +2614,24 @@ def _revive():
         return None, "node revive unavailable: no chat node URL"
     if not st.get("passphrase"):
         return None, "node revive unavailable: no stored chat-node passphrase"
-    token, err = chatnode.unlock(u, st["passphrase"])
+    held = unlock_backoff()
+    if held:
+        # Short: it rides in a 401 door reason with the signer's line, and
+        # the whole must fit chat.REASON_CAP unelided.
+        return None, ("unlock backoff after a refused unlock (%s) %ds ago: no "
+                      "seat unlocks for %ds; `helm chat node up` ignores it"
+                      % (held["reason"], held["ago"], math.ceil(held["left"])))
+    said = {}
+    token, err = chatnode.unlock(u, st["passphrase"], diag=said)
     if err:
+        if said.get("refused"):
+            note_unlock_refused(said["refused"])
         return None, err
+    clear_unlock_backoff()
     healthy, err = chatnode.ensure_healthy_result(u)
     if not healthy:
         return None, err
-    _ensure_dir()
-    pk.atomic_write(_token_path(), token or "")
-    os.chmod(_token_path(), 0o600)
+    store_node_token(token)
     return token, None
 
 
@@ -1938,7 +2775,8 @@ def _node_refusal(rc, out, err):
 def _signer_last_word(rc, out, err):
     """The signer's last stderr line, `[client-sign] error: ` stripped, when
     it exited nonzero, printed nothing on stdout and never said a turn was
-    accepted — else None. The one door both refusal shapes are read through."""
+    accepted — else None. The one door every refusal shape is read through
+    (`_node_refusal`, `_funding_refusal`, `_door_refusal`)."""
     if not isinstance(rc, int) or rc <= 0 or (out or "").strip():
         return None
     lines = [line.strip() for line in (err or "").splitlines() if line.strip()]
@@ -1993,6 +2831,78 @@ def _funding_diag(rc, said, cell_hex):
     return _diag("send_failed", "%s: %s" % (never, classified))
 
 
+_DOOR_REFUSAL = re.compile(r"/turns/submit returned (401|403)(?: [A-Za-z ]+)?")
+_DOOR_CAUSE = {401: "the node refused the token helm sent",
+               403: "the node is LOCKED"}
+DOOR_REMEDY = ("`helm chat node up` completes provision (it unlocks with the "
+               "stored passphrase and stores the token); `helm chat node "
+               "status` says LOCKED until it does")
+
+
+def _door_refusal(rc, out, err):
+    """401 or 403 when the node refused the send AT ITS DOOR, else None.
+
+    A DOOR REFUSAL IS DEFINITE, AND A REVIVE CURES IT. dregg-client-sign
+    prints `/turns/submit returned <status>` as its last word for any non-2xx
+    answer. The node answers 401 from its bearer check (require_auth) and 403
+    when its cipherclerk is locked (submit_signed_turn: `if !s.unlocked`), and
+    both come before the turn is staged or executed, so nothing can have
+    committed (dregg node/src/api.rs, the rebased build). A node left locked
+    by an interrupted `up` still reads /status healthy:true, so reading this
+    as `send_outcome_unknown` sends the operator to inspect receipts for turns
+    the node never looked at, and drops the one line that names the cause.
+    Every other status, and every shape `_signer_last_word` refuses, stays
+    UNKNOWN."""
+    m = _DOOR_REFUSAL.fullmatch(_signer_last_word(rc, out, err) or "")
+    return int(m.group(1)) if m else None
+
+
+def _door_diag(rc, status, err, token, revive_err=None):
+    """send_failed for a door refusal helm could not cure: the revive failed
+    (`revive_err`), or the one retry after it was refused at the door too
+    (the retry's note, which `_send_attempts` appends, says so)."""
+    reason = ("cell send rc %s: /turns/submit refused the turn (HTTP %d) "
+              "before executing it, so it did not commit — %s"
+              % (rc, status, _DOOR_CAUSE[status]))
+    if revive_err:
+        reason += "; the revive failed: %s" % revive_err
+    return _diag("send_failed", _with_signer_line(reason, err, token),
+                 remediation=DOOR_REMEDY)
+
+
+SIGNER_LINE_CAP = 160
+# A BEARER TOKEN'S SHAPE: 32+ url-safe characters in one run (dregg's are 64
+# hex, blake3 derive_key). The shape also takes a 64-hex turn hash with it;
+# a hash is on the node for anyone to read again, and a leaked bearer is not
+# something a redaction can take back.
+_TOKEN_SHAPED = re.compile(
+    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{32,}={0,2}(?![A-Za-z0-9_=-])")
+
+
+def _with_signer_line(reason, err, token=None):
+    """`reason` plus the signer's own last stderr line: without it a
+    DEGRADED reason names no cause. Bounded to SIGNER_LINE_CAP, with the
+    token in use and anything shaped like a bearer token removed before the
+    key-based scrub (`_safe_reason`) runs. A line the reason already carries
+    (a node refusal's text) is not repeated."""
+    lines = [ln.strip() for ln in (err or "").splitlines() if ln.strip()]
+    if not lines:
+        return reason
+    line = lines[-1]
+    core = line[len(_SIGNER_ERROR_PREFIX):] if line.startswith(
+        _SIGNER_ERROR_PREFIX) else line
+    core = core[len(NODE_REFUSAL_MARK):] if core.startswith(
+        NODE_REFUSAL_MARK) else core
+    if core.strip() and core.strip() in reason:
+        return reason
+    if token and len(token) >= 6:
+        line = line.replace(token, "[token redacted]")
+    line = _safe_reason(_TOKEN_SHAPED.sub("[token-shaped value redacted]", line))
+    if len(line) > SIGNER_LINE_CAP:
+        line = line[:SIGNER_LINE_CAP - 1] + "…"
+    return "%s; the signer said: %s" % (reason, line)
+
+
 def _short_of_fee(refused, cell_hex):
     """(need, have) when the node refused the send because the SENDING cell
     could not pay its fee, else None.
@@ -2020,8 +2930,15 @@ def _sign_send(payload, profile, topic=CHAT_TOPIC):
     join can recover once. The signer loses the distinction between explicit
     rejection and a malformed submit response, so even a nonzero exit may
     follow a committed turn: every unsuccessful send is `send_outcome_unknown`
-    except an explicit node refusal (`_node_refusal`), which is `send_failed`
-    and carries the node's text.
+    except an explicit node refusal (`_node_refusal`) and a refusal at the
+    node's door (`_door_refusal`), which are `send_failed`. Both kinds of row
+    carry the signer's last line (`_with_signer_line`).
+
+    A DOOR REFUSAL REVIVES ONCE. A 401 or 403 from /turns/submit comes before
+    the node executes anything, so helm revives (unlock with the stored
+    passphrase, refresh the RAM token) and sends once more. A warm join cache
+    never runs a join, so a revive that ran only on a failed join would never
+    run for a node that locked after the cache was written.
 
     THE TOP-UP IS REACTIVE. The send goes first. Only when the node refuses it
     because this cell cannot pay its fee (`_short_of_fee`) does helm ask the
@@ -2059,7 +2976,8 @@ def _sign_send(payload, profile, topic=CHAT_TOPIC):
 
 
 def _send_attempts(payload, profile, topic, hexid, token, notes):
-    """The send and its one fee retry, run while `_sign_send` holds the node's
+    """The send and its one retry — after a door refusal and a revive, or
+    after a fee refusal and a top-up — run while `_sign_send` holds the node's
     send lock (`_node_send_lock`). `notes` follow the reason of EVERY send that
     does not commit, including a signer timeout, which is where a send that
     went out unlocked behind a hung holder lands."""
@@ -2085,6 +3003,17 @@ def _send_attempts(payload, profile, topic, hexid, token, notes):
         funding = _funding_refusal(rc, out, err)
         if funding is not None:
             return None, noted(_funding_diag(rc, funding, hexid))
+        door = _door_refusal(rc, out, err)
+        if door is not None:
+            if attempt == 2:
+                return None, noted(_door_diag(rc, door, err, token))
+            revived, revive_err = _revive()
+            if revive_err is not None:
+                return None, noted(_door_diag(rc, door, err, token, revive_err))
+            token = revived or token
+            notes.append("helm revived the node after a first HTTP %d at its "
+                         "door, and this is the one retry" % door)
+            continue
         refused = _node_refusal(rc, out, err)
         if attempt == 2 or not (refused and _short_of_fee(refused, hexid)):
             break
@@ -2114,7 +3043,8 @@ def _send_attempts(payload, profile, topic, hexid, token, notes):
     # replay") as faucet_source_dry and sent the fleet to refuel a faucet
     # those sends never needed. Only a fee refusal whose top-up failed, above,
     # names the faucet.
-    return None, _diag(code, "; ".join([reason] + notes))
+    return None, _diag(code, "; ".join([_with_signer_line(reason, err, token)]
+                                       + notes))
 
 
 def _refusal_reason(rc, refused):
@@ -2150,7 +3080,8 @@ def emit_coordination_turn(topic, payload, profile=None):
     reading = ("", "") if profile else cell.seat_reading()
     p, refusal = cell.signing_identity(profile, reading=reading)
     if refusal:
-        return None, _identity_refusal(refusal, reading[1])
+        return None, _identity_refusal(refusal, reading[1],
+                                       cell.signer_profile()[0])
     try:
         return _sign_send(payload, p, topic=topic)
     except Exception as exc:
@@ -2226,7 +3157,10 @@ def _post_identity(profile, admitted=None, admit=True):
         return p, None
     if not ambient:
         return _profile(None), None
-    return label, _identity_refusal(refusal, unreadable)
+    # A label-only reader consults nothing more, so it pays no roster read
+    # for whether the refused profile is a shell's.
+    return label, _identity_refusal(refusal, unreadable,
+                                    ambient if admit else None)
 
 
 def _own_admission(who):
@@ -2239,16 +3173,63 @@ def _own_admission(who):
     return who if isinstance(who, actors.AdmittedActor) else None
 
 
-def _identity_refusal(refusal, roster_unreadable):
+def _identity_refusal(refusal, roster_unreadable, ambient=None):
     """The ONE classification of a gate refusal, for the post and the emit
     path alike: `identity_unreadable` when the roster could not say who this
     seat is (a relaunch does not repair a roster), else `identity_conflict`.
+    A conflict under `ambient`, the profile the environment names, records
+    that profile as `inherited_profile` when no seat carries it
+    (`_inherited_profile`): the seat runs outside helm launch under a
+    shell's profile, the expected state (`_expected_unsigned`).
 
     The parameter is not named `unreadable` on purpose: that name marks a
     PROCESS-census consumer to tests/test_orcaadopt.py's census, and this is
     the roster's reason, not a /proc census."""
-    return _diag("identity_unreadable" if roster_unreadable
-                 else "identity_conflict", refusal)
+    if roster_unreadable:
+        return _diag("identity_unreadable", refusal)
+    return _diag("identity_conflict", refusal,
+                 inherited=_inherited_profile(ambient))
+
+
+def _inherited_profile(ambient):
+    """`ambient` when a clean roster read proves that no seat carries it, by
+    key or by a live rename alias, else None. A seat is a fleet actor, a row
+    with a home room, as `cell.seat_reading` counts one; an observed session's
+    row is not. Such a profile is a shell's, the one a process started
+    outside helm launch inherits (on the owner's box his rc exports his own),
+    and not another pane's settings. A profile that names a seat is the
+    pane-contagion shape, and a roster this read cannot trust proves nothing:
+    both answer None, so the failure stays loud. Asked only on a refusal, so
+    a signed post pays no roster read.
+
+    NOR IS ONE OF THE OWNER'S NAMES A SHELL'S PROFILE HERE. Under a
+    recognised owner name the gate has a lawful way to sign the seat as
+    itself (task/3049, the admitted swap), so its refusal there is that swap
+    failing: the identity layer refused or raised, or the session is bound to
+    another seat under a stale chat name. Each is a fault, and scoped as the
+    expected state it would silence the watchdog, doctor and every fleet read
+    for every owner-export seat at once. An owner set that cannot be read
+    proves nothing either, and answers None."""
+    if not ambient:
+        return None
+    try:
+        from . import seats
+        from .seats_common import live_alias
+        from .seats_identity import owner_names
+        if str(ambient).strip().casefold() in {
+                str(n).strip().casefold() for n in owner_names() or ()}:
+            return None
+        rows, failed = seats.roster_checked()
+        if failed or not isinstance(rows, dict):
+            return None
+        want = str(ambient).casefold()
+        if any(str(k).casefold() == want and isinstance(r, dict)
+               and r.get("home_room") for k, r in rows.items()) \
+                or live_alias(ambient, rows)[0]:
+            return None
+    except Exception:                    # noqa: BLE001 — unproven stays loud
+        return None
+    return ambient
 
 
 def _signed_row(row, payload_text, profile, sign, admitted=None):
@@ -2303,7 +3284,12 @@ def _signed_row(row, payload_text, profile, sign, admitted=None):
             return _stamp_sign_failure(row, p, _diag(
                 "send_failed", "signer returned no committed signing receipt"))
         signed_at = info.pop("_helm_signed_at", time.time())
-        _clear_sign_failure(p, signed_at)
+        _cleared, err = _clear_sign_failure(p, signed_at)
+        if err:
+            # The row is signed; only the watermark that retires the profile's
+            # incident failed, so status keeps reading its last failure.
+            pk.event("chat", "sign-clear", "profile %s signed, but its "
+                     "incident watermark FAILED: %s" % (_dsan(p), err))
         row.update(turn=info.get("turn_hash"), receipt=info.get("receipt_hash"),
                    chain=info.get("chain_index"), payload=payload)
     except Exception as exc:
@@ -2311,6 +3297,29 @@ def _signed_row(row, payload_text, profile, sign, admitted=None):
             row, p or "helm-agent", _diag(
                 "signing_exception", "%s: %s" % (exc.__class__.__name__, exc)))
     return row
+
+
+# (lock path, thread ident) -> [open lock file, depth] for every room lock a
+# thread holds now. flock belongs to the open file, so a second open of the
+# same lock file in the same process blocks against the first forever
+# (task/3535); only the SAME thread's nested acquire reuses the held file.
+# Other threads and processes still open their own and wait on the flock.
+_ROOM_LOCKS_HELD = {}
+
+
+def _room_lock_path(room):
+    return os.path.abspath(os.path.join(chat_dir(), pk.slug(room) + ".lock"))
+
+
+if hasattr(os, "register_at_fork"):
+    # a forked child inherits the table but holds no lock of its own: its
+    # first acquire must open and flock afresh, as it did before the table
+    os.register_at_fork(after_in_child=_ROOM_LOCKS_HELD.clear)
+
+
+def is_room_locked(room):
+    """True if THIS thread currently holds the room write lock."""
+    return (_room_lock_path(room), threading.get_ident()) in _ROOM_LOCKS_HELD
 
 
 @contextlib.contextmanager
@@ -2321,8 +3330,22 @@ def _room_lock(room, timeout_s=None):
     rotation replaces that inode, which would let a fresh opener bypass a
     lock held on the old one (codex C4). Fail-open: a lock that cannot be
     taken degrades to the unlocked v1 behavior rather than dropping the
-    message — the fallback law is drop the GUARANTEE, never the row."""
+    message — the fallback law is drop the GUARANTEE, never the row.
+
+    timeout_s=None waits for as long as the lock is held; a bounded wait is
+    the caller's opt-in, and it answers False with the holder named on
+    stderr. Re-entrant within ONE thread: a nested acquire of a room this
+    thread already holds reuses that file and only counts depth (task/3535)."""
     import fcntl                  # POSIX advisory lock (Linux fleet)
+    key = (_room_lock_path(room), threading.get_ident())
+    held = _ROOM_LOCKS_HELD.get(key)
+    if held is not None:
+        held[1] += 1
+        try:
+            yield True
+        finally:
+            held[1] -= 1
+        return
     lf = None
     try:
         try:
@@ -2340,7 +3363,8 @@ def _room_lock(room, timeout_s=None):
                     if timeout_s is None:
                         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
                     else:
-                        deadline = time.monotonic() + max(0.0, float(timeout_s))
+                        wait_s = max(0.0, float(timeout_s))
+                        deadline = time.monotonic() + wait_s
                         while True:
                             try:
                                 fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2349,6 +3373,7 @@ def _room_lock(room, timeout_s=None):
                                 if time.monotonic() >= deadline:
                                     if timing is not None:
                                         timing.outcome = "timeout"
+                                    _room_lock_timed_out(room, wait_s)
                                     raise OSError("chat room lock timed out")
                                 time.sleep(0.05)
                     if timing is not None:
@@ -2361,14 +3386,35 @@ def _room_lock(room, timeout_s=None):
             if lf is not None:
                 lf.close()
             lf = None
+        if lf is not None:
+            _ROOM_LOCKS_HELD[key] = [lf, 1]
         yield lf is not None
     finally:
         if lf is not None:
+            _ROOM_LOCKS_HELD.pop(key, None)
             try:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
             except OSError:
                 pass
             lf.close()
+
+
+def _room_lock_timed_out(room, wait_s):
+    """One honest stderr line for a bounded wait that ran out: which room,
+    how long, and the process holding it when /proc/locks can say."""
+    held = None
+    try:
+        from . import seats_claims
+        held = seats_claims._flock_holder(_room_lock_path(room))
+    except Exception:
+        held = None
+    who = ("pid %d (state %s)" % (held[0], held[1]) if held and held[1]
+           else "pid %d" % held[0] if held else "an unknown holder")
+    try:
+        sys.stderr.write("helm chat: room lock on %s timed out after %gs — "
+                         "held by %s\n" % (room, wait_s, who))
+    except Exception:
+        pass
 
 
 def _room_destination(room):
@@ -2595,6 +3641,8 @@ def _append_once(row, room, event_id=None, event_room=None):
             start = f.tell()
             f.write(encoded)
             f.flush()
+        if not start:
+            bump_rooms_generation()     # a new log: readers re-list once
         if receipts is not None:
             receipts[row["id"]] = row
             # Append precedes the receipt and rotation follows it. A process
@@ -2659,8 +3707,40 @@ def _append(row, room, event_id=None):
             target = redirect
     if result is None:
         raise OSError(redirect_error)
-    _rotate(room_path(target), room=target)
+    pending = getattr(_ROTATIONS, "pending", None)
+    if pending is None:
+        _rotate(room_path(target), room=target)
+    else:
+        pending.append((room_path(target), target))
     return result
+
+
+# Rotations an append asked for while a caller held a room lock across its
+# post (meld.say): kept per thread, run by rotation_deferred when its block
+# ends, after that lock is released.
+_ROTATIONS = threading.local()
+
+
+@contextlib.contextmanager
+def rotation_deferred():
+    """Hold every room rotation this thread's appends ask for until the block
+    ends, then run them. THE LOCK ORDER is the delivery-state guard, then the
+    room lock (`_rotate` takes them so); a caller that posts while it holds
+    the room lock would take the guard inside it, and a plain post rotating
+    the same room, holding the guard and waiting for the room, would wait on
+    it for ever. Enter this OUTSIDE the room lock so the rotations run after
+    the lock is released. A nested use joins the outer one."""
+    if getattr(_ROTATIONS, "pending", None) is not None:
+        yield
+        return
+    _ROTATIONS.pending = []
+    try:
+        yield
+    finally:
+        pending = _ROTATIONS.pending
+        del _ROTATIONS.pending
+        for path, room in dict.fromkeys(pending):
+            _rotate(path, room=room)
 
 
 def resolve_ref(rows, ref):
@@ -2733,9 +3813,27 @@ def _default_post_room():
         return "main"              # homing must never break a post
 
 
+_PADDED_SHA_REFUSAL = ("helm chat: refusing to post a padded short sha — "
+                       "resolve it ($(git rev-parse <prefix>)) or set %s=1 to "
+                       "quote it deliberately")
+
+
+def post_refusal(text):
+    """The refusal `post` would raise for this body before it builds a row,
+    or None. A pure check for a caller that must know before its own write
+    (meld's say appends a lifecycle transition in the same lock span): it
+    prints nothing, records no friction and writes nothing. The rule is not a
+    second copy: it asks the same shaguard.refuse, on the text post reads."""
+    from . import emoji, shaguard
+    if shaguard.refuse(emoji.expand(text), stream=io.StringIO()):
+        return _PADDED_SHA_REFUSAL % shaguard.SKIP_ENV
+    return None
+
+
 def post(text, room=None, who=None, profile=None, sign=None, origin=None,
          dm=None, dm_display=None, ambient=False, reply_to=None, ack=None,
-         ackstate=None, verdict=None, event_id=None):
+         ackstate=None, verdict=None, event_id=None, ack_session=None,
+         meld_marker=None):
     """Append one message; returns it. v2: shortcodes expand, and when the
     room node answers the digest rides a signed self-write turn FIRST — the
     row carries {turn, receipt, chain}. Node down -> plain v1 row (rendered
@@ -2828,10 +3926,7 @@ def post(text, room=None, who=None, profile=None, sign=None, origin=None,
         # loudly, which is the entire point.
         from . import friction
         friction.record("shaguard", reason="padded-sha")
-        raise ValueError(
-            "helm chat: refusing to post a padded short sha — resolve it "
-            "($(git rev-parse <prefix>)) or set %s=1 to quote it deliberately"
-            % shaguard.SKIP_ENV)
+        raise ValueError(_PADDED_SHA_REFUSAL % shaguard.SKIP_ENV)
     shaguard.warn(text)
     # `who` may be an ADMITTED ACTOR (what every CLI/act door hands down now)
     # or an explicit on-behalf-of name (a bot, the web surface naming itself).
@@ -2848,6 +3943,11 @@ def post(text, room=None, who=None, profile=None, sign=None, origin=None,
     # the first honest word of every fresh seat impossible.
     row = {"ts": pk.now_ts(),
            "from": _actor_label(who) or whoname(), "text": text}
+    if meld_marker is not None:
+        if meld_marker not in ("YIELD", "HOLD", "DONE", "ABORT") \
+                or not text.endswith(" [%s]" % meld_marker):
+            raise ValueError("chat meld marker does not frame this text")
+        row["meld_marker"] = meld_marker
     if not dm:
         capabilities = _post_addressee_capabilities(text)
         if capabilities:
@@ -2873,8 +3973,22 @@ def post(text, room=None, who=None, profile=None, sign=None, origin=None,
         # names the target row it closes — seats.deliverable drops it like a
         # reaction, and the SENDER reads it off `helm chat pending`. The note
         # (if any) is the text; a blocked ack carries its reason there.
-        row["ack"] = ack
+        # ONE ID OR MANY (seats_ack.ack_many): a bulk row names every id in
+        # `acks` and keeps the first in `ack`. Every reader before `acks`
+        # read `ack` as one string, and one still running that code (a
+        # lane's own checkout, a long-lived web server) reads the bulk row as
+        # an ack of its first row rather than a list it cannot hash. Readers
+        # take the ids from `ack_ids`.
+        ids = [ack] if isinstance(ack, str) else list(ack)
+        row["ack"] = ids[0]
+        if len(ids) > 1:
+            row["acks"] = ids
         row["ackstate"] = ackstate or "done"
+        if ack_session:
+            # WHICH SESSION ACKED (seats_ack stamps its seats_cursor._sid8
+            # key, none for a delegate): the tool-boundary hook and the stop
+            # guard honour an ack only from their own session.
+            row["session"] = ack_session
     if reply_to:
         row.update(_dm_parent_fields(room, reply_to) if dm else
                    _parent_fields(room, reply_to))
@@ -2988,6 +4102,30 @@ def react_prefix(rows):
     return tag
 
 
+#: The characters of a row's id `helm chat read` prints beside its [n]: enough
+#: to name one row across every lane, and the shortest id `helm chat ack`
+#: takes from a string of digits (a shorter one is a row NUMBER there, which
+#: names the row the reader's last read printed at [n]: seats_lastread).
+ID_SHOWN = 8
+_ROW_ID = re.compile(r"[0-9a-f]{%d,64}" % ID_SHOWN)
+
+
+def read_prefix(rows):
+    """`react_prefix`'s tag plus the row's id: `[n] <8 hex> ` for a message
+    with an id, the same width of blanks for a reaction row or a row without
+    one. [n] is what `react` and `reply` take; the id is what `ack` and
+    `reply` take. An id that is not plain lowercase hex (a planted row) is not
+    printed, so it cannot reshape the terminal."""
+    tag = react_prefix(rows)
+
+    def prefix(i):
+        rid = str(rows[i].get("id") or "")
+        shown = rid[:ID_SHOWN] if not rows[i].get("react") \
+            and _ROW_ID.fullmatch(rid) else ""
+        return tag(i) + shown.ljust(ID_SHOWN) + " "
+    return prefix
+
+
 def react(target, code, room="main", who=None, profile=None, sign=None):
     """TOGGLE a reaction. target: 1-based message ordinal (the `[n]` shown by
     `helm chat read`; negatives count from the end) or an explicit (ts, from)
@@ -3049,6 +4187,24 @@ def _react_state(rows):
     return state
 
 
+def _carry_rotation(room, records, cut):
+    """True when `room` may drop records[:cut]. A pair's standing meld is a
+    fold over its own rows, so its fold over the rows about to go is
+    checkpointed first (meld_standing.carry_rotation); a room with no such
+    state is always free to rotate, and a checkpoint that fails keeps the
+    standing room whole. Rows parse as read_checked parses them."""
+    from . import meld_standing
+    if not meld_standing.is_standing_room(room):
+        return True
+
+    def rows(part):
+        got = (_msg(raw.decode("utf-8", "replace").rstrip("\n"))
+               for raw, _off in part)
+        return [m for m in got if m]
+    return meld_standing.carry_rotation(room, rows(records[:cut]),
+                                        rows(records[cut:]))
+
+
 def _rotate(path, cap=None, room=None, state_guarded=False, room_locked=False):
     """Install compacted bytes under delivery-state then room serialization."""
     cap = SIZE_CAP if cap is None else cap
@@ -3107,6 +4263,8 @@ def _rotate(path, cap=None, room=None, state_guarded=False, room_locked=False):
             # Rotating anyway wrote the same bytes to a new inode and remapped
             # every cursor under the state guard on every post (task/2931).
             if not cut_offset:
+                return False
+            if not _carry_rotation(room, records, cut):
                 return False
             retained_starts = offsets[cut:]
             if not cleanup_rotation_temp(room):
@@ -3443,7 +4601,7 @@ def _transport_tag(m):
     return " [unsigned]"
 
 
-def _fmt(m, hhmm=True, idx=None):
+def _fmt(m, hhmm=True, idx=None, body=None):
     """One row, rendered. Signed rows (a recorded chain receipt) print clean;
     configured-off rows carry [unsigned], attempted signing fallbacks carry the
     precise DEGRADED diagnostic.
@@ -3451,7 +4609,9 @@ def _fmt(m, hhmm=True, idx=None):
     With an `idx` (index_rows of the room) the one-level thread renders too: a
     reply carries a compact ↳author "quote" of its parent, and a parent carries
     ↩N, its reply count. Without one — a single-row echo, an old caller — the
-    line is byte-identical to before."""
+    line is byte-identical to before. A `body` prints in the place of the
+    row's text (a short read's cut body, helm.chatshort); everything else the
+    line carries is the row's own."""
     ts = str(m.get("ts") or "")
     # HH:MM + the ZONE MARKER. Rows are stamped UTC (pk.now_ts uses gmtime),
     # but the slice used to drop the Z, so the fleet's primary coordination
@@ -3474,22 +4634,96 @@ def _fmt(m, hhmm=True, idx=None):
             m["react"], _dsan(m.get("tfrom") or "?"),
             _hhmmz(m.get("tts")), tag)
     if m.get("ack"):        # the consume-ladder ACTED marker (seats.ack)
-        note = (": " + (m.get("text") or "")) if m.get("text") else ""
-        return "%s %s ACK %s -> %s%s%s" % (
-            stamp, _dsan(m.get("from") or "?"),
-            str(m.get("ackstate") or "done").upper(),
-            str(m.get("ack") or "")[:8], note, tag)
+        return _fmt_acks([m], hhmm)
     q = quote_of(m, idx) if idx else None
     quote = ' ↳%s "%s"' % (_dsan(q[0]), q[1]) if q else ""
     n = (idx or {}).get("replies", {}).get(tkey(m), 0)
     thread_tail = " ↩%d" % n if n else ""
+    text = (m.get("text") or "") if body is None else body
     if m.get("dm"):     # a DM row is a DM everywhere it renders — never a
         return "%s %s%s -> @%s (dm): %s%s%s" % (
             stamp, _dsan(m.get("from") or "?"), quote,
-            _dsan(m.get("dm_display") or m["dm"]), m.get("text") or "",
-            thread_tail, tag)
+            _dsan(m.get("dm_display") or m["dm"]), text, thread_tail, tag)
     return "%s %s%s: %s%s%s" % (stamp, _dsan(m.get("from") or "?"), quote,
-                                m.get("text") or "", thread_tail, tag)
+                                text, thread_tail, tag)
+
+
+def ack_ids(m):
+    """The ids of the rows `m` ACKS, in its order; () when `m` is not an ack.
+    `ack`, a non-empty string, is what makes a row an ack: a row without it
+    acks nothing, whatever `acks` holds. A bulk row (seats_ack.ack_many)
+    names every id in `acks` and its first in `ack` (post); an `acks` that is
+    not a list of ids, or whose first id is not `ack`, is not the writer's
+    and falls back to `ack`. The web chat reads the same rule (chatAckIds)."""
+    if not isinstance(m, dict):
+        return ()
+    one = m.get("ack")
+    if not isinstance(one, str) or not one:
+        return ()
+    many = m.get("acks")
+    if isinstance(many, list) and many and many[0] == one \
+            and all(isinstance(a, str) and a for a in many):
+        return tuple(many)
+    return (one,)
+
+
+#: The distinct notes a folded ack line prints before it counts the rest.
+ACK_NOTES_SHOWN = 3
+
+
+def _fmt_acks(rows, hhmm=True):
+    """ONE line for ack rows from one sender: one row (`_fmt`) or a run
+    (`ack_runs`). One id prints as it always has, `HH:MMZ <from> ACK DONE ->
+    <id8>: <note>`. More ids, on one bulk row or across the run, print as
+    their count and the first and last id: `ACK DONE -> 31 rows (<id8> …
+    <id8>)`, then each distinct note. An ack is a receipt: the count is what
+    its reader needs, and `helm chat pending` names each row it closed."""
+    m = rows[0]
+    ids = [a for r in rows for a in ack_ids(r)]
+    ts = str(m.get("ts") or "")
+    stamp = _day_stamp(ts) if hhmm else (ts or "?")
+    notes = list(dict.fromkeys(r["text"] for r in rows if r.get("text")))
+    more = len(notes) - ACK_NOTES_SHOWN
+    note = (": " + " | ".join(notes[:ACK_NOTES_SHOWN])
+            + (" | +%d more notes" % more if more > 0 else "")) if notes else ""
+    what = ("%d rows (%s … %s)" % (len(ids), ids[0][:8], ids[-1][:8])
+            if len(ids) > 1 else str(m.get("ack") or "")[:8])
+    return "%s %s ACK %s -> %s%s%s" % (
+        stamp, _dsan(m.get("from") or "?"),
+        str(m.get("ackstate") or "done").upper(), what, note,
+        "".join(dict.fromkeys(_transport_tag(r) for r in rows)))
+
+
+def _folds(m):
+    """A DONE ack: a receipt a read folds with its neighbours. A blocked ack
+    carries a reason its sender must act on, so it prints on its own."""
+    return bool(ack_ids(m)) \
+        and str(m.get("ackstate") or "done").lower() == "done"
+
+
+def ack_runs(pairs):
+    """`pairs`, [(index, row)] in room order, grouped for a read:
+    consecutive DONE acks from one sender form one run, and every other row
+    is a run of one. A read prints each run as one line (`run_line`), so 31
+    acks a seat wrote one per row read as one receipt, not 31 lines of
+    conversation. The web chat folds the same runs (60-chat.js.part,
+    chatAckAppend)."""
+    runs = []
+    for i, m in pairs:
+        prev = runs[-1][-1][1] if runs else None
+        if _folds(m) and _folds(prev) and prev.get("from") == m.get("from"):
+            runs[-1].append((i, m))
+        else:
+            runs.append([(i, m)])
+    return runs
+
+
+def run_line(run, tag, idx=None):
+    """The line a read prints for one run (`ack_runs`), under its first
+    row's `tag` (read_prefix)."""
+    i, m = run[0]
+    return tag(i) + (_fmt(m, idx=idx) if len(run) == 1
+                     else _fmt_acks([x for _j, x in run]))
 
 
 def verify(room="main"):
@@ -3546,10 +4780,10 @@ def _follow(room, since=0):
         while True:
             rows, total = read(room)
             idx = index_rows(rows)
-            tag = react_prefix(rows)      # same [n] as `read` — react targets it
+            tag = read_prefix(rows)       # same [n] and id as `read`
             start = since if 0 <= since <= total else 0
-            for i, m in enumerate(rows[start:], start):
-                print(tag(i) + _fmt(m, idx=idx), flush=True)
+            for run in ack_runs(enumerate(rows[start:], start)):
+                print(run_line(run, tag, idx), flush=True)
             consume(room, total)
             since = total
             time.sleep(POLL_S)
@@ -3564,6 +4798,37 @@ def _follow(room, since=0):
 
 def journal_dir():
     return os.path.join(home.project_dir("helm"), "journal")
+
+
+def journal_write_refusal():
+    """Why THIS process must not WRITE the durable journal, else None.
+
+    HELM_CHAT_DIR moves only the RAM rooms. The journal stays under HELM_HOME,
+    so a process with an isolated chat dir and the default home reads the
+    LIVE fleet's journal, and without this check it also writes to it. One
+    such namespace, measured on the live bus, restored itself on its first
+    `list` and appended a `restored-from-journal` marker to 402 live meld
+    journals. Every real room then read UNKNOWN, and a live meld's next
+    transition was quarantined out of the flush.
+
+    Such a process may READ the journal to restore its own rooms. It may
+    never append a lifecycle event, a flush mark or a chat log line to it.
+    Only that exact pairing is refused. An explicit chat dir that names the
+    production bus is still production (home.surface_origin), and an
+    explicit chat dir under a redirected HELM_HOME is one sandbox estate
+    (the actors.py split-configuration rule)."""
+    path, origin = home.surface_origin("CHAT_DIR", "helm-chat", DEFAULT_DIR)
+    if origin != home.EXPLICIT:
+        return None
+    if os.path.realpath(path) == os.path.realpath(
+            home.default_surface(DEFAULT_DIR)):
+        return None
+    if os.path.realpath(home.helm_home()) != os.path.realpath(
+            home.default_home()):
+        return None
+    return ("isolated chat dir %s shares the live durable journal %s — it "
+            "may read that journal to restore its own rooms, never write it"
+            % (path, journal_dir()))
 
 
 def _flush_state_path():
@@ -3741,6 +5006,7 @@ def restore_journal(apply=False):
                 "meld": meld_report}
     report = {}
     flush_updates = {}
+    lock_refused = False
     for room in sorted(records):
         marker = _restore_marker(room)
         live_rows, _ = read(room)
@@ -3781,7 +5047,15 @@ def restore_journal(apply=False):
             continue
         path = room_path(room)
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        with _room_lock(room):
+        with _room_lock(room) as locked:
+            if not locked:
+                # a read-rewrite-rename run bare would drop any row appended
+                # in its window: skip the room, write nothing, say so
+                report[room] = {"restored": 0, "skipped":
+                                "room lock unavailable — nothing written; "
+                                "run again"}
+                lock_refused = True
+                continue
             live_raw = []
             if os.path.exists(path):
                 with open(path, encoding="utf-8") as f:
@@ -3793,6 +5067,8 @@ def restore_journal(apply=False):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write("".join(x + "\n" for x in out + live_raw))
             os.replace(tmp, path)
+            if not live_raw:
+                bump_rooms_generation()  # the restore created this log
             # the sweep runs INSIDE the room lock, in the same act as the
             # swap: readers are lock-free, so the window is not zero, but a
             # crash here is recovered by re-running the verb (the
@@ -3811,12 +5087,15 @@ def restore_journal(apply=False):
                                "tail": _fp(rows[-1]) if rows else None}
         report[room]["cursors_minted"] = minted
         report[room]["cursors_repaired"] = repaired
-    if apply and flush_updates:
+    # An isolated namespace rebased only its OWN rooms; writing their counts
+    # into the live flush mark would move the fleet's high-water mark.
+    if apply and flush_updates and not journal_write_refusal():
         state = pk.read_json(_flush_state_path(), {}) or {}
         state.update(flush_updates)
         os.makedirs(journal_dir(), exist_ok=True)
         pk.write_json(_flush_state_path(), state)
-    state_ = "UNKNOWN" if meld_report["state"] == "UNKNOWN" else "ok"
+    state_ = ("UNKNOWN" if meld_report["state"] == "UNKNOWN" or lock_refused
+              else "ok")
     return {"state": state_, "applied": bool(apply), "rooms": report,
             "meta": meta, "meld": meld_report}
 
@@ -4752,22 +6031,27 @@ def _steer_suppressed(sid, cmd, hit):
 # anywhere else (an argument, a quoted string, a path component) is not a
 # spawn and must not pay for a read.
 #
-# ONE SHELL GRAMMAR IN THIS FILE. The segments come from the SAME two helpers
-# the blocking argv guard runs on every Bash call — _excise_quoted_heredocs
-# and _shell_segments, called exactly as the guard calls them, with no
-# steer-private widening. So the steer sees exactly the command heads the
-# blocking guard sees, no more: where the guard's segmenter is blind (an
-# unquoted NEWLINE is not a boundary to it, so `cd /tmp` NEWLINE `kimi` is
-# one segment whose head is `cd`), the steer is silent in the same place and
-# for the same reason. That gap is the guard's, filed once as the shared
-# remainder — a shell-aware command-start lexer, built for the guard first —
-# not patched here with a second grammar that would drift from the first.
-# One such grammar — an opt-in newline split plus an all-openers heredoc
-# excision — measurably misreads quoted `<<EOF`, `<<<`, arithmetic shifts,
+# THE STEER SPLITS WITH THE GUARD'S SEGMENTER, NOT ITS OWN. The segments come
+# from the SAME two helpers the blocking argv guard runs on every Bash call —
+# _excise_quoted_heredocs and _shell_segments, called exactly as the guard
+# calls them, with no steer-private widening — and _clone_heads splits the
+# same way. The file's other shell readers answer other questions:
+# folded_commands and _readings flatten a command into the readings the
+# presence rungs scan, _mask_quoted and _shell_comment_start blank what is
+# data, and the _heredoc_* helpers find heredoc bodies. None of them is a
+# command-start lexer. So the steer sees exactly the command heads the
+# blocking guard sees, no more: where the segmenter is blind (an unquoted
+# NEWLINE is not a boundary to it, so `cd /tmp` NEWLINE `kimi` is one segment
+# whose head is `cd`), the steer is silent in the same place and for the same
+# reason. That gap is the segmenter's, and its cure belongs there, where the
+# guard gets it too, not in a second grammar here that would drift from the
+# first. One such grammar — an opt-in newline split plus an all-openers
+# heredoc excision — misreads quoted `<<EOF`, `<<<`, arithmetic shifts,
 # function bodies and inactive branches, every one a shell-lexing question
 # the guard already owns.
 _SPAWN_FAMILIES = ("codex", "kimi", "gemini", "grok", "ds4pro", "ds4flash",
-                   "openrouter", "qwen27", "dots3", "opus46", "gptoss")
+                   "openrouter", "qwen27", "dots3", "opus46", "gptoss",
+                   "qwenlocal", "bonsai", "cursor")
 _SPAWN_HEAD = re.compile(
     r"^[\s({]*(?:[A-Za-z_]\w*=(?:\"[^\"]*\"|'[^']*'|\S*)\s+)*"
     r"(?:\S*/)?(" + "|".join(_SPAWN_FAMILIES) + r")(?=\s|$)")
@@ -5123,9 +6407,10 @@ def _tree_registry():
 
 
 def tree_line(project, seat, room):
-    return ("[helm] this is %s's tree, and its lead @%s is live. Message it "
-            "(helm chat post --room %s ...), then leave: a lead works only "
-            "its own project." % (project, seat, room))
+    return ("[helm] this is %s's tree, and its lead @%s is live. Reading it "
+            "to learn an interface you consume is fine; to CHANGE anything "
+            "here, message it (helm chat post --room %s ...): a lead works "
+            "only its own project." % (project, seat, room))
 
 
 def tree_steers(text, cwd=None, session=None):
@@ -5886,9 +7171,11 @@ def _readings(command):
 # then reads the quoted bodies still standing: a SHELL's body is its script
 # and every row there counts; any other program's body counts only for an
 # ANCHORED row (task/2870), because `run cancel` in the body of a program
-# this rung does not know is more often English than an act, and `workflow`,
-# `rerun`, `.github`, `/actions` and `/dispatches` mean nothing outside
-# GitHub Actions.
+# this rung does not know is more often English than an act, while `workflow`,
+# `rerun`, `.github`, the GitHub-owned REST shapes, `.github/actions` and
+# `/dispatches` are the half of an act that is GitHub's. `rerun` is also an
+# English word, so its row names the GitHub head as well: `gh`, `run` and
+# `rerun` together (task/3696).
 #
 # WHAT THAT COSTS, said plainly: a command that MENTIONS one of these
 # spellings anywhere but in data is refused too — as an unquoted argument to
@@ -5916,11 +7203,53 @@ def _readings(command):
 # would complete has NO ANCHOR: `gh $W enable ci.yml` and `gh $W download
 # 12` run the act with a word the command text does not contain, and no
 # reading of that text can hold a piece nobody wrote. An expansion INSIDE a
-# word is refused either way (see the fold's mark). The same shape beside an
-# ANCHOR IS refused — `gh workflow $V ci.yml`, `gh $W rerun 123` — because
-# the anchor is the piece that means nothing outside GitHub Actions; the
-# blanket version of that rule, which reads every piece as evidence, refuses
-# one command in nine and is what the anchor bought out.
+# word is refused either way (see the fold's mark), except where it stands
+# for all of an anchor but its first letter and the row is not whole in the
+# text either (`gh $W r$(echo erun) 1`, `_SCOPED_ANCHORS`). A program
+# handed the re-execute row's two words with no gh WORD in the text passes
+# too (task/3696): a wrapper the rung does not read (`./wrap run rerun 1`,
+# `./gh-retry run rerun 1`), or a head the fold cannot rejoin (a glob,
+# `/usr/bin/g? run rerun 1`, or a printf format piped into a shell,
+# `printf '%sh run rerun 1' g | sh`), where the cancel row, which names no
+# head, still refuses the same spelling. The same shape
+# beside an ANCHOR IS refused — `gh workflow $V ci.yml`, `gh $W rerun
+# 123` — because the anchor is the piece that means nothing outside GitHub
+# Actions; the blanket version of that rule, which reads every piece as
+# evidence, refuses one command in nine and is what the anchor bought out.
+# THE SAME LIMIT
+# REACHES THE REST ROOT (task/3312, accepted by the integrator's ruling).
+# The common condition is an API base from a runtime value in a command
+# that names no GitHub API host literally (not `api.github.com`, a GHE
+# `/api/v3` base or a host under `ghe.com`). Under that condition these
+# pass, and each of them was
+# refused on the trunk task/3312 started from (measured on its re-read):
+#   * a client that is not gh — curl, wget, python — whose WHOLE owner root
+#     is the runtime value (`curl -X PUT "$API/actions/permissions"`);
+#   * gh reached through a runtime WORD, with a runtime endpoint:
+#     `gh $SUB -X PUT "$P/actions/permissions"` and
+#     `$GHBIN api -X PUT "$P/actions/permissions"` spell no `gh api` for
+#     the rows that name GitHub to find (the whole-token limit above);
+#   * a root spelled as a brace or a curl glob after the runtime base —
+#     `curl -X PUT $H/{repos,x}/o/r/actions/permissions`,
+#     `"$H/repo[r-s]/o/r/actions/..."`, `"$H/repos/{o/r,x/y}/actions/..."` —
+#     because the fold has no brace or glob reading, and bash or curl
+#     expands each into the real path;
+#   * a root word an expansion supplies WHOLE or BEGINS, before a literal
+#     owner path — `"$H/$ROOT/o/r/actions/..."`, `"$H/${X}s/o/r/actions/..."`
+#     — the whole-token limit above and the word-start limit `_row_piece`
+#     names.
+# The first is the text of `curl -X POST "$DO_API/droplets/$ID/actions"`,
+# the DigitalOcean act this rung exists to allow, and no reading tells a
+# value's host apart; the other three are the whole-token, brace and
+# word-start limits meeting that same runtime base.
+#
+# OUTSIDE THE TABLE ALTOGETHER, AND UNCHANGED BY task/3312: an act that
+# spells no protected path at all. Two are known. The check-suite and check-run
+# REREQUEST endpoints (`repos/<o>/<r>/check-suites/<id>/rerequest`,
+# `.../check-runs/<id>/rerequest`) ask GitHub to run checks again with no
+# Actions segment in the path (whether that reruns an Actions workflow was
+# not measured), and an SDK METHOD CALL — Octokit's `rest.actions.*` —
+# names a method and no path. Trunk passed both and still does.
 # docs/HOOKS.md says all of this in the same words.
 GITHUB_ACTIONS_OVERRIDE = "HELM_ALLOW_GITHUB_ACTIONS=1"
 # THE GRANT IS ONE WHOLE-COMMAND GRANT: the override word FIRST in the RAW
@@ -6088,9 +7417,8 @@ def _grants_whole_command(command):
 # It is not a phrase: a row of two words asks only whether the folded text
 # holds both of them, because the two positional readings this rung shipped
 # were both wrong about a gap. A piece that could run on into a longer word
-# carries the edge that stops it, so `run` is not `rerun` and not `runs`,
-# and a piece whose own first character is its edge (`/actions`) needs none
-# in front of it.
+# carries the edge that stops it, so `run` is not `rerun` and not `runs`.
+# A shaped REST piece carries its own path boundary in `_github_api_shape`.
 #
 # A PIECE WRITTEN WITH A LEADING `+` IS THE ROW'S ANCHOR — the noun or path
 # fragment that means nothing outside GitHub Actions — and that is the ONLY
@@ -6102,21 +7430,34 @@ def _grants_whole_command(command):
 # standing in several rows carries the same flag in each, which
 # `tests.test_chat_argv_guard` asserts rather than trusting the eye.
 #
-# THE ANCHORS ARE `workflow`, `rerun`, `.github`, `/actions` and
-# `/dispatches`. NOT anchors, deliberately: `run`, `list`, `view`, `watch`,
+# THE ANCHORS ARE `workflow`, `rerun`, `.github`, the five GitHub-owned REST
+# shapes, `.github/actions` and `/dispatches`. NOT anchors, deliberately:
+# `run`, `list`, `view`, `watch`,
 # `cancel`, `download`, `enable` and `disable` — ordinary English words this
 # fleet types every day, which say nothing about GitHub standing beside a
 # hole. The two-piece directory row anchors on `.github` and not on
 # `workflows`, on both readings of the word: this fleet's own agents ARE
 # workflows and it says that word in 341 of its commands against 64, and the
-# half of that path that is GitHub's is the dotted directory.
+# half of that path that is GitHub's is the dotted directory. The four
+# rows that hold the bare Actions segment beside a piece that names GitHub
+# (`gh api`, the API host, a GHE base, a host under `ghe.com`; task/3312)
+# carry NO anchor either:
+# `api.github.com` beside a token variable is an ordinary read, and an
+# anchor beside any expansion is a row. They count in every body an
+# anchored row does instead (`_GITHUB_NAMED_ROWS`). `gh` is not an anchor
+# for the same reason (`gh pr view $(...)` is an ordinary read); it is a
+# piece of the re-execute row, which it makes GitHub's (task/3696).
+#
+# THE SCOPED RULE READS AN ANCHOR ONLY PAST ITS FIRST LETTER: `r<mark>` is
+# not `rerun` to it and `w<mark>` is not `workflow` (`_SCOPED_ANCHORS`).
+# The row rule still reads them where the rest of the row stands.
 #
 # A BASE-RATE THRESHOLD STOOD HERE AND ITS OWN MEASUREMENT REFUTED IT.
 # Rarity is not the property that matters. Base rate = the share of the
 # 120,275 DISTINCT Bash and Monitor commands this project's own session
-# transcripts hold whose folded readings hold the piece, asked with the
-# shipped matchers. Below one in two thousand stand only `/dispatches`,
-# `enable`, `/actions` and `download` — so that rule ALLOWED `gh workflow $V
+# transcripts held when the table still carried the bare segment task/3312
+# removed. Below one in two thousand stood only `/dispatches`, `enable`, that
+# bare segment and `download` — so that rule ALLOWED `gh workflow $V
 # ci.yml` and REFUSED `gh $W enable ci.yml`, exactly backwards from what
 # protects the repository, because the NOUN is what makes a command an
 # Actions command and the verb is an ordinary English word. The rates still
@@ -6131,9 +7472,15 @@ def _grants_whole_command(command):
 #     workflows 341 / 353 / 181 / 140     rerun 156 / 771 / 114 / 48
 #     disable 77 / 1,562 / 51 / 48        .github 64 / 1,879 / 53 / 22
 #     /dispatches 45 / 2,673 / 18 / 0     enable 41 / 2,934 / 25 / 21
-#     /actions 12 / 10,023 / 7 / 0        download 4 / 30,069 / 4 / 1
+#     old bare action segment 12 / 10,023 / 7 / 0
+#     download 4 / 30,069 / 4 / 1
 #
-# THESE NUMBERS EXPIRE. The corpus is this project's own transcripts and it
+# The bare-segment row is historical: task/3312 replaced it with GitHub-owned
+# path shapes, so its rate does not describe the shipped table. The pieces
+# task/3312 added — the five REST shapes, `.github/actions`, and the four
+# rows that name GitHub — have NO line above: their transcript rates were
+# NOT measured, and no number here describes them. THESE NUMBERS
+# EXPIRE. The corpus is this project's own transcripts and it
 # grows with every session, and much of what makes `workflow` and `.github`
 # common in it is the fleet's work ON THIS GUARD. Re-measure before quoting
 # them: the probe is one pass of the shipped matchers over the transcript
@@ -6152,9 +7499,19 @@ def _grants_whole_command(command):
 #     this build newly refuses 176 (0.146%) and gives back 22 — every one an
 #     `enable` or `download` allow this design intends, and not one row
 #     refusal among them.
-# Over this repo's own tracked `*.sh` and `*.md` (18,232 non-blank lines):
-# 0 before the lane, 5 row-only, 16 now — 11 newly refused against the
-# 572 build (0.060%), none lost, 4 given back against the round before.
+# Those transcript counts predate task/3312 and were not re-measured for it.
+# Over this repo's tracked `*.sh` and `*.md`, re-measured on the task/3312
+# re-read (`_clear_pieces`, and four rows that name GitHub, the `ghe.com`
+# host included) against trunk 436424d9a8c: over trunk's 26,945 non-blank
+# lines trunk's rung refuses 34 and this one 33. Exactly one line became
+# allowed and none became refused: CHANGELOG.md:1282, the old statement
+# that an ordinary `src/actions/` directory was refused. Three lines keep
+# their refusal under another row's name (CHANGELOG.md:1281 now
+# `/dispatches`, scripts/install.sh:68 and :71 now `.github/actions`). The
+# build before the re-read refused the same 33 lines, so the re-read's cure
+# changes no verdict on a tracked line. Over the lane's own 26,964 lines
+# the count is 33: the rewritten CHANGELOG line is gone, and the sentence
+# that replaces it names the composite-action directory and is refused.
 #
 # NOTHING WAS DROPPED FROM THE ANCHOR SET, AND THE NUMBERS ARE WHY. The
 # budget this round carried — under 0.5% newly refused, zero lost — cannot
@@ -6171,43 +7528,89 @@ def _grants_whole_command(command):
 # 22 `.github` — most of them chat posts and notes that MENTION a workflow
 # beside a `$` or a backtick and perform nothing.
 #
-# THE FLAG IS INERT ON A ONE-PIECE ROW (`+/actions`, `+/dispatches`):
-# presence of that piece is already a whole row and refuses with no
-# expansion needed, which is why both add 0 above. It is written anyway,
-# because the anchor is a property of the PIECE and a reader comparing this
-# table to the rates must find every one of them.
+# THE FLAG IS INERT ON A ONE-PIECE ROW (the shaped REST rows, the composite
+# directory and `+/dispatches`): presence of that piece is already a whole row
+# and refuses with no expansion needed. It is written anyway because the
+# anchor is a property of the PIECE and a reader comparing this table to the
+# rates must find every one of them, measured or named as unmeasured.
 _ACTIONS_TOKENS = (
-    # gh's Actions verb families, as the NOUN and the VERB and never `gh`
-    # plus them. gh strips flags before it resolves a subcommand, so a
-    # repo flag stands BETWEEN the noun and the verb as readily as before
-    # the noun — `gh workflow --repo o/r enable ci.yml`, `gh workflow -R o/r
-    # enable 1234` and `gh -R o/r workflow enable ci.yml` are one documented
-    # act — and a table that says how much may stand in either gap is
-    # reading POSITION, which is the reading this rung deleted and the one
-    # whose fixed gap admitted the documented spellings twice.
+    # gh's Actions verb families, as the NOUN and the VERB and never as a
+    # PHRASE with `gh` in front. gh strips flags before it resolves a
+    # subcommand, so a repo flag stands BETWEEN the noun and the verb as
+    # readily as before the noun — `gh workflow --repo o/r enable ci.yml`,
+    # `gh workflow -R o/r enable 1234` and `gh -R o/r workflow enable ci.yml`
+    # are one documented act — and a table that says how much may stand in
+    # either gap is reading POSITION, which is the reading this rung deleted
+    # and the one whose fixed gap admitted the documented spellings twice.
     ("+workflow enable", "enables GitHub Actions"),
     ("+workflow disable", "is a GitHub Actions verb"),
     ("+workflow run", "runs a workflow"),
     ("+workflow view", "is a GitHub Actions verb"),
     ("+workflow list", "is a GitHub Actions verb"),
-    ("run +rerun", "runs a workflow"),
+    # …EXCEPT THE RE-EXECUTE ROW, WHICH NAMES THE GITHUB HEAD (task/3696).
+    # `run` and `rerun` are two English words, and a state note saying
+    # "rerun release.py ... dry run" was refused as this row: no gh, no
+    # workflow, nothing GitHub's. `gh` is one more PIECE of the set and
+    # never a position, so both of gh's flag gaps stay closed exactly as
+    # before (`gh -R o/r run rerun`, `gh run --repo o/r rerun`), and so is a
+    # path in front of it (`/usr/bin/gh`), its Windows name (`gh.exe`,
+    # `_PIECE_TAIL`), a wrapper's string, a program's argv list and a body
+    # a shell reads. The ANCHOR keeps its scoped rule,
+    # so a gh from a runtime value beside a typed `rerun` (`$B run rerun
+    # 1`) and a runtime `run` beside it (`gh $W rerun 123`) still refuse.
+    ("gh run +rerun", "runs a workflow"),
     ("run watch", "is a GitHub Actions verb"),
     ("run cancel", "is a GitHub Actions verb"),
     ("run download", "is a GitHub Actions verb"),
-    # the Actions REST API, whatever the client or the host, and whatever the
-    # method except where the invocation text shows a `gh api` GET, which is
-    # a read and is cut as data before this table is asked. ONE
-    # fragment covers every spelling the rounds kept adding one at a time —
-    # `repos/<o>/<r>/actions`, `orgs/<o>/actions`, `/actions/permissions`,
-    # `/actions/runs/<id>/rerun`, `/actions/jobs/<id>/rerun`,
-    # `/actions/workflows/<id>/dispatches` — because each of them spells
-    # this segment, and `.github/actions` spells it too.
-    ("+/actions", "is the GitHub Actions REST API"),
-    # …and the ONE documented trigger that spells no `/actions` segment:
+    # the Actions REST API, whatever the client or host, and whatever the
+    # method except where the invocation text proves a `gh api` GET. The REST
+    # noun is NOT a bare `/actions` segment: DigitalOcean uses that segment for
+    # droplet snapshots and polling. GitHub anchors it below one of five
+    # owner roots: the four documented ones and `organizations/<id>`, the
+    # numeric alias GitHub's own pagination links use (measured routing: an
+    # Actions path under it answers 401 unauthenticated, a bogus one 404).
+    # `*` is one owner slot (`_API_PATH_SEGMENT`); `_row_piece` gives these
+    # rows their shape matcher while retaining the fold's quoting, case,
+    # traversal and expansion readings. The composite-action directory is a
+    # separate literal row and stays refused exactly as before.
+    ("+repos/*/*/actions", "is the GitHub Actions REST API"),
+    ("+orgs/*/actions", "is the GitHub Actions REST API"),
+    ("+organizations/*/actions", "is the GitHub Actions REST API"),
+    ("+enterprises/*/actions", "is the GitHub Actions REST API"),
+    ("+repositories/*/actions", "is the GitHub Actions REST API"),
+    # …and the bare segment wherever the command itself NAMES GitHub
+    # (task/3312, the integrator's ruling), because a runtime value can
+    # supply the whole owner root and no shape above then stands: gh talks
+    # to no other host, so any Actions segment in a `gh api` endpoint is
+    # GitHub's (`gh api -X PUT "$P/actions/permissions"`), and so is one in
+    # a command that names GitHub's API host or a GHE `/api/v3` base
+    # (`API=https://api.github.com/repos/o/r; curl -X PUT
+    # "$API/actions/permissions"`), or a host under `ghe.com`, where GitHub
+    # Enterprise Cloud with data residency serves its REST API as
+    # `api.<subdomain>.ghe.com` (a cross-model read of task/3312;
+    # `_DOMAIN_PIECES`). A gh api GET is still cut before this
+    # table is asked. NO ANCHOR, deliberately: an anchor beside ANY
+    # expansion is a row, and `curl -H "Authorization: token $T"
+    # https://api.github.com/user` is a read. These rows count in every body
+    # an anchored row does instead (`_GITHUB_NAMED_ROWS`).
+    #
+    # EACH IS A SET OF WORDS OVER THE WHOLE COMMAND, as every row is, and
+    # not a phrase about one call: a gh api READ elsewhere on the line (its
+    # arguments are cut, the words `gh` and `api` stay), a `gh` command
+    # beside a DigitalOcean act whose root variable is spelled `$API`, or a
+    # token read of the API host beside a DigitalOcean act is refused, as
+    # the trunk before task/3312 refused the same lines.
+    ("gh api /actions", "is the GitHub Actions REST API"),
+    ("api.github.com /actions", "is the GitHub Actions REST API"),
+    ("/api/v3 /actions", "is the GitHub Actions REST API"),
+    (".ghe.com /actions", "is the GitHub Actions REST API"),
+    ("+.github/actions", "is the composite-action directory"),
+    # …and the ONE documented trigger that spells no Actions REST owner path:
     # `repos/<o>/<r>/dispatches` starts a run wherever a workflow subscribes
     # to `on: repository_dispatch`.
     ("+/dispatches", "triggers repository_dispatch workflows"),
-    # the workflow directory, which no `/actions` row can cover — and as two
+    # the workflow directory, which no REST or composite-action row covers —
+    # and as two
     # pieces, because a `cd` names it across two words: `cd .github &&
     # printf ... > workflows/evil.yml` writes a workflow file and spells no
     # `.github/workflows` anywhere (measured, and the write was real). The
@@ -6218,7 +7621,7 @@ _ACTIONS_TOKENS = (
 _PIECE_EDGE = re.compile(r"[\w.-]")
 
 
-def _mark_spanning(piece):
+def _mark_spanning(piece, lone=True):
     """`piece` as a pattern that may SPAN the fold's expansion mark, with no
     edges of its own — the construction both deny rungs build their pieces
     from, because a piece assembled around an expansion is present either
@@ -6227,17 +7630,68 @@ def _mark_spanning(piece):
     The mark stands for unknown text, so it may stand for a run of the
     piece's own characters; it may FINISH a piece that has begun in the text
     and never START one (see `_row_piece` for the measurement behind that
-    boundary)."""
+    boundary). `lone=False` leaves out the one spelling in which the
+    operator typed a SINGLE character of the piece — its first, with the
+    mark standing for all the rest (`r<mark>`) — which the scoped rule asks
+    for (`_SCOPED_ANCHORS`)."""
     n = len(piece)
     spans = [_MARK_GAP.join(re.escape(c) for c in piece)]
     spans.extend(re.escape(piece[:i]) + _EXPANSION_MARK_CLASS
                  + re.escape(piece[j:])
                  for i in range(1, n + 1)   # the piece BEGINS in the text
-                 for j in range(i + 1, n + 1))
+                 for j in range(i + 1, n + 1)
+                 if lone or i + n - j > 1)  # typed: i before, n - j after
     return "(?:" + "|".join(spans) + ")"
 
 
-def _row_piece(piece):
+_GITHUB_API_SHAPES = frozenset((
+    "repos/*/*/actions",
+    "orgs/*/actions",
+    "organizations/*/actions",
+    "enterprises/*/actions",
+    "repositories/*/actions",
+))
+# ONE OWNER SLOT is any run that is neither whitespace nor a slash, and it
+# may be EMPTY. A narrower class of name characters admitted real acts
+# (task/3312 review): `repos/:owner/:repo/...` is gh's other placeholder
+# (gh 2.46 expands it, measured), `%6F` in an owner is decoded by GitHub
+# (an Actions path answers 401, not 404, measured), and `${O:-o}`,
+# `$(whoami)` and a backtick span are runtime values the fold leaves as
+# their own text in the plain reading.
+# EMPTY is what the expansion reading leaves where a substitution stood WHOLE
+# between two slashes: `repos/$(whoami)/r/...` reads `repos//r/...` there,
+# and `$(gh repo view --json ...)` carries spaces no slot can hold in the
+# plain reading, so the empty slot is the only reading that still shows it.
+_API_PATH_SEGMENT = r"[^\s/]*"
+# ONE SLOT THAT HELD AN EXPANSION may supply more than one segment:
+# `repos/$GITHUB_REPOSITORY/...` is owner AND repository in one value, so a
+# shape asking for several slots also takes this one alone. A literal single
+# segment is NOT taken that way — `repos/o/actions` is the repository named
+# `actions` and no Actions endpoint.
+_API_EXPANDED_SEGMENT = r"(?:[^\s/$`\x00]*[$`\x00][^\s/]*)?"
+
+
+def _github_api_shape(piece):
+    """One GitHub Actions REST owner path as a folded matcher.
+
+    The fixed path words retain `_mark_spanning`'s expansion semantics, so
+    `act$(echo ions)` is still the protected final segment. A `*` is one
+    owner/repository slot (`_API_PATH_SEGMENT`); runtime values in those
+    slots stay visible as their own text in the plain reading (`$O`, `${R}`,
+    `${O:-o}`) or as an empty slot in the expansion reading (`$(...)`), and a
+    run of slots may be ONE slot that held an expansion
+    (`_API_EXPANDED_SEGMENT`), so the matcher needs no authority to guess
+    what they expand to. The final edge admits deeper REST resources and
+    queries but not an `actions-like` longer segment."""
+    root, *slots, noun = piece.split("/")
+    run = "/".join([_API_PATH_SEGMENT] * len(slots))
+    if len(slots) > 1:
+        run = "(?:%s|%s)" % (run, _API_EXPANDED_SEGMENT)
+    return re.compile(r"(?<![\w.-])" + _mark_spanning(root) + "/" + run
+                      + "/" + _mark_spanning(noun) + r"(?![\w.*-])")
+
+
+def _row_piece(piece, lone=True):
     """One row piece, matched as a whole piece: an edge in front of it when
     its first character could be the middle of a longer word, an edge behind
     it when its last one could.
@@ -6261,13 +7715,34 @@ def _row_piece(piece):
     expansion that supplies the BEGINNING of a word (`$Wflow enable`) is
     outside this guard, exactly as a whole token from a runtime value is.
 
+    ONE LEADING LETTER IS NOT EVIDENCE ALONE EITHER (task/3696), and
+    `lone=False` builds the matcher that says so: the operator must have
+    typed more of the piece than its first character. The ROW rule keeps
+    the lone reading, because there the row's other pieces are the evidence
+    (`gh run r$(echo erun) 1` is the re-execute row); the SCOPED rule, whose
+    only evidence is the anchor, takes the other one (`_SCOPED_ANCHORS`).
+    Only the generic spelling reads the flag: the REST shapes and the
+    domain piece are never scoped anchors of a row of more than one piece.
+    A ONE-PIECE row has no other piece to be the evidence, so its piece
+    takes the scoped reading too (`_table_row`): `cp a "$D/.$N"` is not the
+    composite-action directory, and was refused as it, while `cp a
+    .$X/actions/x.yml` still is.
+
     The mark is not a word character, so an edge is satisfied beside it.
 
     A PIECE MAY END ON A NARROWER EDGE THAN A WORD (`_PIECE_TAIL`), where the
-    act it names is a path shape and not a word."""
+    act it names is a path shape and not a word, and a DOMAIN piece begins
+    at its typed label dot or stands as a bounded bare value elsewhere in the
+    command (`_DOMAIN_PIECES`)."""
+    if piece in _GITHUB_API_SHAPES:
+        return _github_api_shape(piece)
+    if piece in _DOMAIN_PIECES:
+        suffix = re.escape(piece[0]) + _mark_spanning(piece[1:])
+        value = r"(?<![\w.-])" + _mark_spanning(piece[1:])
+        return re.compile(r"(?:%s|%s)(?![\w.-])" % (suffix, value))
     return re.compile(
         (r"(?<![\w.-])" if _PIECE_EDGE.match(piece) else "")
-        + _mark_spanning(piece)
+        + _mark_spanning(piece, lone)
         + _PIECE_TAIL.get(piece, r"(?![\w.-])" if _PIECE_EDGE.match(piece[-1])
                           else ""))
 
@@ -6279,7 +7754,27 @@ def _row_piece(piece):
 # those, and none of the 212 a real act. So the piece ends where that segment
 # ends: not before a glob `*`, and not before a deeper path segment. A lone
 # trailing slash (`.../dispatches/`) is still the trigger, and so is a query.
-_PIECE_TAIL = {"/dispatches": r"(?![\w.*-])(?!/[\w.*-])"}
+#
+# THE GITHUB HEAD ENDS AT ITS WORD OR AT ITS WINDOWS NAME (task/3696):
+# `gh.exe` is the CLI's own binary on Windows, which a seat in WSL or Git
+# Bash types to reach it. A word edge alone reads its `.exe` as the middle
+# of a longer word, and then the re-execute row, which names the head,
+# passes that spelling while the rows that name no head refuse it.
+# `gh.executor` is still not the head.
+_PIECE_TAIL = {"/dispatches": r"(?![\w.*-])(?!/[\w.*-])",
+               "gh": r"(?:\.exe)?(?![\w.-])"}
+# A DOMAIN PIECE BEGINS AT ITS LABEL DOT, with no edge in front (task/3312,
+# a cross-model read): every host under `ghe.com` is GitHub's, and the
+# subdomain before the dot is part of the host, so the word edge every
+# other piece carries would refuse to see `api.octo.ghe.com` at all. It also
+# stands as the bounded bare value `ghe.com` elsewhere in the whole command:
+# `DOMAIN=ghe.com; curl ... api.octo.$DOMAIN/...` names the same host while
+# the expansion reading leaves only the typed dot and a mark. A bare-value
+# edge keeps `notghe.com` out, and requiring the domain text in one of those
+# two places keeps `snap.$EXT` out. The tail is a word's, so
+# `ghe.company.io` and `ghe.example.com` (a GHE Server name, whose API is its
+# `/api/v3` base) are not it either.
+_DOMAIN_PIECES = frozenset((".ghe.com",))
 
 
 ANCHOR_MARK = "+"
@@ -6293,17 +7788,32 @@ def _table_row(spelling, says):
     flag cannot drift away from the piece it belongs to, and it is stripped
     here — no refusal ever shows it, because the operator did not type it.
 
-    A row marks AT MOST ONE anchor, and a row may mark none."""
+    A row marks AT MOST ONE anchor, and a row may mark none.
+
+    A ONE-PIECE ROW'S PIECE IS READ WITHOUT THE LONE LETTER (task/3696):
+    with no other piece beside it, its first character and an expansion
+    mark are the expansion alone, which is why the scoped rule reads its
+    anchors that way (`_SCOPED_ANCHORS`). A row of several pieces keeps the
+    lone reading, where the other pieces are the evidence."""
+    words = spelling.split(" ")
     pieces = []
-    for word in spelling.split(" "):
+    for word in words:
         flagged = word.startswith(ANCHOR_MARK)
         text = word[len(ANCHOR_MARK):] if flagged else word
-        pieces.append((text, _row_piece(text), flagged))
+        pieces.append((text, _row_piece(text, lone=len(words) > 1), flagged))
     return (" ".join(text for text, _m, _a in pieces), tuple(pieces), says)
 
 
 _ACTIONS_ROWS = tuple(_table_row(spelling, says)
                       for spelling, says in _ACTIONS_TOKENS)
+#: the anchorless rows that NAME GitHub: every row holding the bare Actions
+#: segment, which the table writes only beside a piece that means GitHub
+#: (`gh` with `api`, the API host, a GHE base, a host under `ghe.com`).
+#: `_row_the_shell_runs` counts them in every body it counts an anchored
+#: row; no scoped rule reads them.
+_GITHUB_NAMED_ROWS = frozenset(
+    spelling for spelling, pieces, _says in _ACTIONS_ROWS
+    if any(text == "/actions" for text, _m, _a in pieces))
 
 
 def _actions_evidence(readings, window=True):
@@ -6330,7 +7840,12 @@ def _actions_evidence(readings, window=True):
     allows (`git add .github`, `echo the workflow is local`, `helm gate run
     --repo $WT`); an ANCHOR becomes evidence beside an unresolved expansion,
     which is the scoped rule in `github_actions_refusal`, and an ordinary
-    word never does — that boundary is the table's `+` flag."""
+    word never does — that boundary is the table's `+` flag.
+
+    THE ANCHOR IS THE SCOPED RULE'S, so it is read by that rule's matcher
+    (`_SCOPED_ANCHORS`), which does not take the anchor's first letter and a
+    mark for the anchor. The row's own hit is asked first and searched again
+    only when a mark stands in it, so an ordinary command pays nothing."""
     rows, anchor = [], None
     for spelling, pieces, says in _ACTIONS_ROWS:
         hits = []
@@ -6339,9 +7854,12 @@ def _actions_evidence(readings, window=True):
             hit = matcher.search(readings)
             hits.append(hit)
             anchored_row = anchored_row or anchored
-            if hit is not None and anchored and (anchor is None
-                                                 or hit.start() < anchor[1]):
-                anchor = (text, hit.start())
+            lead = hit
+            if anchored and hit is not None and _EXPANSION_MARK in hit.group():
+                lead = _SCOPED_ANCHORS[text].search(readings)
+            if lead is not None and anchored and (anchor is None
+                                                  or lead.start() < anchor[1]):
+                anchor = (text, lead.start())
         at = _row_start(pieces, readings, hits, window)
         if at is not None:
             rows.append((spelling, at, says, pieces, anchored_row))
@@ -6403,11 +7921,18 @@ def _row_start(pieces, readings, hits, window=True):
     row overlaps it; a row stands when every piece keeps one such hit.
 
     WHAT IT GIVES UP: nothing an anchor does not still hold. Two pieces can
-    share a span only through the mark, and only where they begin with the
-    same character — in this table only `run` and `rerun`. A real act that
-    spells either word around an expansion (`gh run r$(echo eru)n 1`,
-    `gh r$(echo 'un rer')un 1`) still holds the ANCHOR `rerun` beside an
-    expansion in one region, and the scoped rule refuses it.
+    share a span only through the mark, and only where one piece's own
+    first character opens the other's span — `run` and `rerun`, and since
+    task/3312 `api`, `api.github.com` and `/api/v3` beside `/actions`,
+    because `/a<mark>` is `/actions` and its `a<mark>` is `api`. A real act
+    that spells `run` or `rerun` around an expansion (`gh run r$(echo eru)n
+    1`, `gh r$(echo 'un rer')un 1`) still holds the ANCHOR `rerun` beside
+    an expansion in one region, and the scoped rule refuses it. The rows
+    that name GitHub have no anchor, so for them the sharing is settled by
+    `_clear_pieces`: a piece the text holds CLEARLY elsewhere (`api` typed
+    after `gh`) claims no ambiguous span, and `gh api -X PUT
+    "$P/a$(echo ctions)/permissions"` is the row it spells (a cross-model
+    read of task/3312: the lane admitted it while its trunk refused it).
 
     A reading with no mark in it cannot hold an overlap at all, so the
     ordinary command is answered from the first matches with no second
@@ -6421,9 +7946,7 @@ def _row_start(pieces, readings, hits, window=True):
         return _near_start(pieces, [_every_hit(matcher, readings)
                                     for _t, matcher, _a in pieces], readings)
     every = [_every_hit(matcher, readings) for _t, matcher, _a in pieces]
-    kept = [_clear_of(mine, [other for k, theirs in enumerate(every) if k != i
-                             for other in theirs])
-            for i, mine in enumerate(every)]
+    kept = _clear_pieces(every)
     if not all(kept):
         return None
     if windowed:
@@ -6433,8 +7956,9 @@ def _row_start(pieces, readings, hits, window=True):
 
 # THE NOUN THAT IS ALSO THE OWNER'S WORD: A WINDOW FOR PROSE, NO CAP FOR AN
 # EXECUTED INVOCATION (task/2948). `workflow` anchors five rows, and it is
-# ALSO what the owner calls the canonical review fallback — "launch a fable
-# 1-agent workflow" — so the task body filing that very directive was refused
+# ALSO what the owner called the canonical review fallback — "launch a fable
+# 1-agent workflow" (task/3202 has since made Fable max QC only, never a
+# fallback) — so the task body filing that very directive was refused
 # as `workflow list` at character 394: the owner's noun in one sentence, `helm
 # seat list` in another, inside ONE quoted argument. The rows asked only that
 # both words stand SOMEWHERE in the text.
@@ -6526,11 +8050,37 @@ def _near_start(pieces, lists, readings):
     return best
 
 
-#: every anchor piece of the table, once: (text, matcher)
-_ANCHOR_PIECES = tuple({text: matcher for _s, pieces, _says in
-                        (_table_row(spelling, says)
-                         for spelling, says in _ACTIONS_TOKENS)
-                        for text, matcher, anchor in pieces if anchor}.items())
+# THE SCOPED RULE NEEDS MORE OF THE ANCHOR THAN ITS FIRST LETTER (task/3696).
+# Its only evidence IS the anchor, and a word that begins with the anchor's
+# first letter and goes on in an expansion — `r$(date)`, `w${X}` — is the
+# expansion and one letter: every piece that starts with `r` or `w` reads
+# there. A python report heredoc was refused as the re-execute anchor
+# beside an unresolved expansion for its raw-string regex alone:
+# `r'<tick>([^<tick>]+)<tick>'`, whose backtick pair the fold reads as an
+# expansion inside the word `r`. That is the blanket rule the anchor exists
+# to buy out, on a word nobody typed, so these matchers are built with
+# `lone=False`. The ROW rule keeps the lone reading, because there the
+# row's other pieces are the evidence: `gh run r$(echo erun) 1` is the
+# re-execute row, and `gh w$(echo orkflow) enable` the enable row. A
+# ONE-PIECE row has no other piece, so it reads its piece this way too
+# (`_table_row`): over this project's own 295,026 distinct Bash and Monitor
+# commands, every one of the 18 composite-directory refusals left after the
+# re-execute cure stood only on a lone dot and a mark (`"$D/.$N"`), and none
+# was an act.
+#
+# WHAT IT GIVES UP: a lone letter whose row is not whole in the text
+# either — the rest of it a runtime value too. `gh $W r$(echo erun) 1` and
+# `$B run r$(echo erun) 1` pass, as `$Wflow enable` already does; one more
+# letter typed (`gh $W re$(echo run) 1`) refuses. And a value that supplies
+# the whole composite-action path after its dot (`mkdir -p .$X`) passes,
+# while `.$X/actions` is refused.
+#: every anchor piece of the table, once, as the scoped rule reads it:
+#: (text, matcher)
+_ANCHOR_PIECES = tuple(
+    (text, _row_piece(text, lone=False)) for text in dict.fromkeys(
+        text for _s, pieces, _says in _ACTIONS_ROWS
+        for text, _m, anchor in pieces if anchor))
+_SCOPED_ANCHORS = dict(_ANCHOR_PIECES)
 #: a word of a folded reading that still holds an unresolved expansion: its
 #: `$` or backtick in the plain reading, or the fold's mark in the other
 _HOLE_WORD = re.compile(r"[^ \n]*[$`\x00][^ \n]*")
@@ -6621,6 +8171,36 @@ def _executed_windowed_row(command, readings):
     return None
 
 
+def _clear_pieces(every):
+    """Each piece's hits that no other piece of the row can claim, given
+    `every` piece's hits in row order.
+
+    ONE PASS keeps, for each piece, the hits no hit of another piece
+    overlaps (`_clear_of`). A SECOND PASS runs only where the first left
+    some piece with nothing and some other piece with a clear hit: a piece
+    the text holds clearly is evidenced by that clear hit, and the spans
+    it could ALSO read through the mark are the mark taken for a word
+    nobody typed, so they claim nothing — the pieces left with nothing are
+    asked again against the clear hits of the settled pieces and every hit
+    of the unsettled ones. The witnesses that answer are pairwise disjoint
+    either way: a kept hit of the second pass overlaps no clear hit of a
+    settled piece and no hit at all of another unsettled piece.
+
+    WHAT STAYS REFUSED-AS-NEITHER: one ambiguous word with no clear hit for
+    either piece — `r<mark>n` is `run` and `rerun` and is neither
+    (task/2855), because both pieces are unsettled and each still claims
+    the whole span against the other."""
+    def others(i, lists):
+        return [hit for k, theirs in enumerate(lists) if k != i
+                for hit in theirs]
+    kept = [_clear_of(mine, others(i, every)) for i, mine in enumerate(every)]
+    if all(kept) or not any(kept):
+        return kept
+    settled = [mine or theirs for mine, theirs in zip(kept, every)]
+    return [mine or _clear_of(every[i], others(i, settled))
+            for i, mine in enumerate(kept)]
+
+
 def _row_stands(pieces, readings, window=True):
     """Whether every piece of one row stands in `readings`, each on a span
     that is not also another piece of the row (see `_row_start`)."""
@@ -6703,7 +8283,7 @@ def _anchor_in_a_region_with_an_expansion(command, readings, anchor):
             if holds_expansion(region) else None
         if found is not None:
             text, at = found
-            hit = _row_piece(text).search(readings)
+            hit = _SCOPED_ANCHORS[text].search(readings)
             return text, (hit.start() if hit else at)
     return None
 
@@ -6901,7 +8481,10 @@ def _only_the_directory_is_read(command, readings, found):
 #     `--raw-field` or `--input` gives the request a body, so a call with none
 #     of those performs nothing, whatever its path says;
 #   * a QUOTED heredoc BODY whose program reads its stdin as data — `cat`,
-#     `tee`, `python`, `grep`, `rg` and the recording programs above.
+#     `tee`, `python`, `grep`, `rg` and the recording programs above;
+#   * an UNQUOTED heredoc body one of those reads, python excepted, LESS its
+#     `$(…)`, `$((…))` and backtick spans, which run and stay (task/3064,
+#     `_live_body`).
 #
 # WHAT STAYS, which is what keeps this a guard and not a hole:
 #
@@ -6924,13 +8507,15 @@ def _only_the_directory_is_read(command, readings, found):
 #     `ssh`, `su`, `xargs`, or a data program piped into one (`sudo -s`
 #     reads as unseen text, below, which is stricter).
 #     That body is a script, so it is read and EVERY row in it counts,
-#     including the three with no anchor that any other quoted body is
-#     forgiven (task/2870). So is the body of a program the reader does not
+#     including the three anchorless rows of ordinary words that any other
+#     quoted body forgives (task/2870). So is the body of a program the reader does not
 #     know when a shell, an evaluator or a value-run stands ANYWHERE in the
 #     command — `cat <<'EOF' | (sh)`, and `while read l; do $l; done
 #     <<'EOF'`, whose body the `done` owns and whose `$l` runs each line;
-#   * an UNQUOTED heredoc body, which substitutes, and every other body,
-#     which is read as before.
+#   * the live spans of an unquoted body a sink reads; the WHOLE of an
+#     unquoted body python, a shell or an unknown program reads, or one in
+#     a command that runs a file it writes; and every other body, which is
+#     read as before.
 #
 # IT FAILS CLOSED TWICE. First, a pipe: a data program's output is cut only
 # while EVERY pipe in the command leads into a filter that runs nothing it
@@ -6956,7 +8541,7 @@ def _only_the_directory_is_read(command, readings, found):
 # does one in a data program's body that a later VALUE re-reads (`git commit
 # -F - <<'EOF'` then `$(git log -1 --format=%B)`) — the value stops every
 # cut, and that body is then read as before, where the three anchorless rows
-# are forgiven; an evaluator re-reading it is refused. And the reader trusts
+# of ordinary words are forgiven; an evaluator re-reading it is refused. And the reader trusts
 # a NAME, as the directory's read exemption does: an alias or function that
 # an EARLIER call defined, making `echo` or `helm` a program that runs its
 # arguments, is outside this rung.
@@ -7018,9 +8603,15 @@ _REBINDS = frozenset(("alias", "enable", "function", "hash"))
 # in the shell that runs the cut words, so it is not here.
 _EVALUATORS = frozenset(("eval", "source", ".", "trap", "mapfile",
                          "readarray"))
-_REBINDING_ASSIGNMENT = re.compile(
+_REBINDING_NAMES = (
     r"(?:PATH|LD_PRELOAD|LD_LIBRARY_PATH|PYTHONPATH|PYTHONHOME|BASH_ENV"
-    r"|EDITOR|VISUAL|GIT_EDITOR|GIT_SEQUENCE_EDITOR)\+?=")
+    r"|EDITOR|VISUAL|GIT_EDITOR|GIT_SEQUENCE_EDITOR)")
+_REBINDING_ASSIGNMENT = re.compile(_REBINDING_NAMES + r"\+?=")
+# …AND A PARAMETER EXPANSION ASSIGNS TOO. `${EDITOR:=…}` and `${PATH=…}` set
+# the name as the shell expands them, on the command line or in an UNQUOTED
+# heredoc body the cut makes data (task/3064), and neither is a word the
+# check above reads, so a command spelling one is not cut at all either.
+_REBINDING_EXPANSION = re.compile(r"\$\{" + _REBINDING_NAMES + r":?=")
 
 
 def _bash_terminates(line, tag, dash):
@@ -7599,7 +9190,7 @@ _PYTHON = re.compile(r"python(?:[23](?:\.\d+)?)?")
 _STDIN_SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh", "mksh", "ash",
                            "fish", "ssh", "su", "xargs", "source", ".", "eval"))
 #: a pipe may lead into these and a data program's output stays data
-_SAFE_FILTERS = frozenset(("base64", "cat", "column", "cut", "egrep", "fgrep",
+_SAFE_FILTERS = frozenset(("base64", "cat", "column", "cut", "echo", "egrep", "fgrep",
                            "fold", "grep", "head", "jq", "nl", "rg", "sort",
                            "tail", "tee", "tr", "uniq", "wc"))
 # a gh api option: those that take a value, those that take none, and those
@@ -7827,7 +9418,240 @@ def _safe_stage(cmd):
         and not _runs_a_program(cmd.words, ("--pre", "--hostname-bin"))
 
 
-def _invocation_text(command, interpreters=None):
+# AN UNQUOTED BODY IS DATA LESS WHAT RUNS IN IT (task/3064). Bash expands an
+# unquoted heredoc body before the program reads it: `$(…)`, `$((…))` and
+# backticks RUN there, and everything else — prose, `$NAME`, a quote, which
+# is a letter there — is only text the program is handed. So a body a SINK
+# reads (`_cut_data`: a data program whose stdin is never a program, which
+# python's is) keeps its live spans and loses the rest, exactly as a quoted
+# one loses all of it. Reading the whole body as the command refused a brief
+# written by `cat > brief.txt <<EOF` because its prose said `run` and, a
+# hundred characters on, `rerun`; `$(gh run rerun 1)` in the same body is
+# still refused, because that span stays.
+#
+# IT FAILS CLOSED THREE WAYS, each to the body read whole, as before:
+#   * a body line that ENDS IN A BACKSLASH. Bash joins the next line onto it
+#     before it looks for the delimiter, so `E\` then `OF` ends a body at
+#     `EOF` — and the line after it RAN as a command while the walker, which
+#     compares raw lines, still called it body (measured with bash 5.3);
+#   * a span the shell reader cannot close, or one that opens a heredoc of
+#     its own;
+#   * a command that runs a file it writes (`_runs_what_it_wrote`): the
+#     body may be that script.
+# An assignment by expansion (`${PATH:=…}`) is `_REBINDING_EXPANSION`'s,
+# which reads the whole command whole.
+def _live_spans(body):
+    """(start, end) of every `$(…)`, `$((…))` and backtick span of an
+    UNQUOTED heredoc body, found as bash finds them there — a backslash
+    escapes the next character and a quote is a letter, so a span inside
+    `${…}` or `'…'` is found too — and read to its close by the shell
+    reader; None where one does not close or opens a heredoc."""
+    if "`" not in body and "$(" not in body:
+        return []
+    try:
+        r = _ShellReader(body)
+    except _Unsettled:
+        return None
+    spans, i = [], 0
+    while i < len(body):
+        c = body[i]
+        if c == "`" or body.startswith("$(", i):
+            try:
+                end = r.backtick(i + 1) if c == "`" else r.expansion(i)[0]
+            except _Unsettled:
+                return None
+            spans.append((i, end))
+            i = end
+        else:
+            i += 2 if c == "\\" else 1
+    return None if r.seen else spans
+
+
+def _live_body(lines):
+    """What of an unquoted heredoc body (its `lines`) RUNS when bash expands
+    it — its live spans, one to a line, "" for none — or None where the
+    body must be read whole (see above)."""
+    if any(line.endswith("\\") for line in lines):
+        return None
+    body = "\n".join(lines)
+    spans = _live_spans(body)
+    return None if spans is None else "\n".join(body[s:e] for s, e in spans)
+
+
+# ---------------------------------------------------------------------------
+# THE TWO ACTIONS-ONLY CUTS (task/3144). Both are asked for by NAME
+# (`actions=True`) and NO other rung asks: the owner-posture and delegate
+# authority rungs read the default cut, unchanged. Each was a MEASURED false
+# refusal, and each is cured behind a fail-closed condition and nothing wider
+# — the abandoned lane's sed/python/stdin/runner-list/whole-command machinery
+# does not come across, so everything outside these two conditions is trunk.
+#: CURE B's non-runner allowlist: a line every one of whose simple commands is
+#: one of these records the message and runs nothing that could replay it.
+_MESSAGE_VERB_SPELLINGS = (("chat", "post"), ("chat", "ack"), ("task", "add"))
+#: CURE A's top-level test (task/3144 F1): a subshell paren, a brace group, or
+#: a loop/if/function keyword at the top level means jq is NOT a top-level
+#: simple command. `case` and `coproc` already raise `_Unsettled` in the reader.
+_COMPOUND_WORDS = frozenset((
+    "{", "}", "for", "while", "until", "if", "then", "elif", "else", "fi",
+    "do", "done", "select", "function"))
+
+
+def _at_top_level(tokens):
+    """Whether the token stream is a flat run of simple commands and pipelines
+    — no subshell `(`, brace group, loop, if or function on the line — so a jq
+    in it is a top-level simple command whose output the reader's flat commands
+    can place (task/3144 F1)."""
+    for token in tokens:
+        kind = token[0]
+        if kind == "s" and token[1] == "(":
+            return False
+        if kind == "w" and token[1].plain and token[1].raw in _COMPOUND_WORDS:
+            return False
+    return True
+
+
+#: CURE B (task/3144 F2): git commit short options whose LAST letter takes the
+#: next word as a value (message/reuse/file/template), so that word is stepped
+#: over and not read as a flag.
+_COMMIT_VALUE_LETTERS = "cCFmt"
+#: every git commit short option that STOPS the flag walk (takes a value, the
+#: rest of the cluster or the next word being that value).
+_COMMIT_VALUE_STOP = "cCFmtSu"
+#: git commit long options that take a SEPARATE next-word value.
+_COMMIT_SEP_LONG = frozenset((
+    "--message", "--file", "--reuse-message", "--reedit-message", "--fixup",
+    "--squash", "--template", "--author", "--date", "--cleanup",
+    "--pathspec-from-file", "--trailer", "--gpg-sign"))
+
+
+def _short_cluster(v):
+    """(opens_editor, takes_a_separate_value) for a single-dash short cluster
+    (`-em`, `-am`, `-Cm`): walk the flag letters until the first value-taker.
+    An `e` among the flags opens the editor; a separate-value letter as the
+    LAST character takes the next word as its value (task/3144 F2)."""
+    body = v[1:]
+    for idx, ch in enumerate(body):
+        if ch == "e":
+            return True, False
+        if ch in _COMMIT_VALUE_STOP:
+            return False, ch in _COMMIT_VALUE_LETTERS and idx == len(body) - 1
+    return False, False
+
+
+def _commit_opens_editor(after_commit):
+    """Whether a `git commit` option list opens the editor on the message —
+    `-e`, `--edit` (or an unambiguous `--e`/`--ed`/`--edi` prefix of it), or a
+    short cluster carrying `e` (`-em`, `-ae`). A valued option's separate value
+    is stepped over, so a message that itself begins with `-e` is not read as a
+    flag (task/3144 F2)."""
+    i = 0
+    while i < len(after_commit):
+        v = after_commit[i].value()
+        if v is None:
+            i += 1
+            continue
+        if v == "--":
+            break
+        if v.startswith("--"):
+            head = v.split("=", 1)[0]
+            if head == "--edit" or (head.startswith("--e")
+                                    and "--edit".startswith(head)):
+                return True
+            i += 2 if ("=" not in v and head in _COMMIT_SEP_LONG) else 1
+            continue
+        if v.startswith("-") and v != "-":
+            edit, sep = _short_cluster(v)
+            if edit:
+                return True
+            i += 2 if sep else 1
+            continue
+        i += 1
+    return False
+
+
+def _on_message_allowlist(words):
+    """Whether a simple command is on CURE B's non-runner allowlist: `cd`,
+    `git add|commit|tag`, `helm chat post|ack`, or `helm task add`. An empty command,
+    a program the text does not settle, or anything else is NOT — the list
+    fails closed, so a runner or an unknown word anywhere reads the line trunk.
+
+    F2 (task/3144): the program must be WORD 0 (`k == 0`) — an assignment
+    prefix or a wrapper (`env`, `command`, `timeout`, `sudo`, ...) can strip
+    GIT_EDITOR or inject core.editor and is NOT on the list — and a `git
+    commit` here carries no editor flag (`_commit_opens_editor`), because git
+    runs the message it hands an editor."""
+    name, k = _program(words)
+    if name is None or k != 0:
+        return False
+    base = name.rsplit("/", 1)[-1]
+    if base == "cd":
+        return True
+    after = words[k + 1:]
+    if base == "git":
+        j = 0                       # only the safe prose globals may precede
+        while j < len(after) and after[j].value() in _GIT_PROSE_GLOBALS:
+            j += 2 if after[j].value() == "-C" else 1
+        sub = after[j].value() if j < len(after) else None
+        if sub not in ("add", "commit", "tag"):
+            return False
+        if sub == "commit" and _commit_opens_editor(after[j + 1:]):
+            return False
+        return True
+    if base == "helm":
+        v0 = after[0].value() if after else None
+        v1 = after[1].value() if len(after) > 1 else None
+        return (v0, v1) in _MESSAGE_VERB_SPELLINGS
+    return False
+
+
+_COMMIT_MSG_SHORT = re.compile(r"-[A-Za-z]*m")   # a short cluster ending in m
+
+
+def _message_value_words(words):
+    """The word(s) a CURE B message verb takes as its message TEXT — the ones
+    whose directory belt CURE B lifts. Empty for any other command; and never
+    a pathspec, a redirect target, or a flag value that is not a message, so
+    the belt still holds on `git commit -m x -- <dir>/f` and its kin."""
+    name, k = _program(words)
+    if name is None:
+        return []
+    base = name.rsplit("/", 1)[-1]
+    after = words[k + 1:]
+    if base == "helm":
+        v0 = after[0].value() if after else None
+        v1 = after[1].value() if len(after) > 1 else None
+        if (v0, v1) in (("chat", "post"), ("task", "add")):
+            return [w for w in after[2:] if w.prose and not w.subst]
+        return []
+    if base == "git":
+        j = 0
+        while j < len(after) and after[j].value() in _GIT_PROSE_GLOBALS:
+            j += 2 if after[j].value() == "-C" else 1
+        if (after[j].value() if j < len(after) else None) != "commit":
+            return []
+        out, i = [], j + 1
+        while i < len(after):
+            v = after[i].value()
+            if v is None:
+                i += 1
+            elif v == "--":
+                break                       # the rest is pathspecs
+            elif v == "--message" and i + 1 < len(after):
+                out.append(after[i + 1])
+                i += 2
+            elif v.startswith("--message="):
+                out.append(after[i])
+                i += 1
+            elif _COMMIT_MSG_SHORT.fullmatch(v) and i + 1 < len(after):
+                out.append(after[i + 1])
+                i += 2
+            else:
+                i += 1
+        return [w for w in out if w.prose and not w.subst]
+    return []
+
+
+def _invocation_text(command, interpreters=None, actions=False):
     """(text, code): `command` with its DATA cut out (see above) — each data
     word read as one `_`, each data heredoc body gone — and the ordinals, in
     the heredoc walker's order, of the quoted bodies a SHELL reads, which
@@ -7843,22 +9667,26 @@ def _invocation_text(command, interpreters=None):
     shadowed made `_git_reads`, one call further on, raise, and the hook
     admitted `git -C <dir> add <workflow file>` (tests caught it).
 
-    ONE FOLD, TWO RUNGS. The owner-posture rung (task/3018) reads the same
+    ONE FOLD, MANY RUNGS. The owner-posture rung (task/3018) reads the same
     text, passing `interpreters` so python's arguments and stdin count as
     code there (`_command_data`); every other rule, the re-executors
-    included, is this one."""
+    included, is this one. `actions=True` adds the two Actions-only cuts of
+    task/3144 (jq text and a message's directory mention); it is asked for
+    by the GitHub-Actions rung alone, so no other rung's cut moves."""
     try:
-        return _cut_data(command, interpreters)
+        return _cut_data(command, interpreters, actions)
     except Exception:           # the reader's defect must not open the rung
         return command, frozenset()
 
 
-def _cut_data(command, interpreters=None):
+def _cut_data(command, interpreters=None, actions=False):
     """`_invocation_text`'s work, which may raise."""
     try:
         reader = _ShellReader(command)
         tokens = reader.read()
     except _Unsettled:
+        return command, frozenset()
+    if _REBINDING_EXPANSION.search(command):
         return command, frozenset()
     if any(kind == "w" and (_REBINDING_ASSIGNMENT.match(word.raw)
                             or tokens[k + 1:k + 3] == [("s", "("), ("s", ")")])
@@ -7886,8 +9714,8 @@ def _cut_data(command, interpreters=None):
     # or `{ sh; }`, or a loop whose body runs each line it reads (`while read
     # l; do bash -c "$l"; done <<'EOF'`, whose heredoc the `done` owns)
     shell = any(stdin == "shell" for _data, stdin in stdins)
-    cuts, kinds = [], {}
-    for cmd, (data, stdin) in zip(commands, stdins):
+    cuts, kinds, sinks = [], {}, set()
+    for cmd, (data, stdin), (name, _k) in zip(commands, stdins, programs):
         if safe:
             cuts.extend((w.start, w.end, "_") for w in data)
         # a shell later in the body's OWN pipeline reads it, whatever the pipe
@@ -7903,19 +9731,106 @@ def _cut_data(command, interpreters=None):
                 kinds[at] = "code"
             elif stdin == "data" and safe:
                 kinds[at] = "data"
-    code, expected = set(), []
+                # a SINK: a data program whose stdin is never a program.
+                # Python's stdin is its script, so an unquoted body it reads
+                # stays whole (task/3064)
+                if not _PYTHON.fullmatch((name or "").rsplit("/", 1)[-1]):
+                    sinks.add(at)
+    if actions and safe:
+        # CURE A (task/3144, F1): jq's filter and --arg values are text jq
+        # never runs, so an Actions spelling in them is not an invocation — but
+        # ONLY where jq's output reaches the terminal. jq's own redirect/pipe
+        # is not enough: a subshell, brace group or loop AROUND jq can have its
+        # OUTPUT redirected, and `exec >f` moves the shell's stdout to a file
+        # BEFORE jq writes it (an approval-tier read of this lane). So the cut is
+        # applied only when jq is a TOP-LEVEL simple command (`_at_top_level`:
+        # not inside a subshell, brace group, loop, if or function) AND NO
+        # command on the whole line — exec included — carries a redirect
+        # target. Captured spans (`$(…)`, `` `…` ``, `<(…)`) never surface as a
+        # top-level command; the pipe check below keeps jq that feeds a later
+        # stage code; and `safe` already rejects an evaluator or an unsafe pipe
+        # stage anywhere on the line.
+        line_redirected = any(cmd.targets for cmd in commands)
+        flat = _at_top_level(tokens)
+        for cmd, (name, ki) in zip(commands, programs):
+            if name is None or name.rsplit("/", 1)[-1] != "jq":
+                continue
+            if line_redirected or not flat:          # output may reach a file
+                continue
+            if any(c.pipeline == cmd.pipeline and c.stage > cmd.stage
+                   for c in commands):               # jq's stdout piped on
+                continue
+            cuts.extend((w.start, w.end, "_")
+                        for w in cmd.words[ki + 1:] if not w.subst)
+        # CURE B (task/3144): the quoted prose of a message verb is data even
+        # when it names the workflow directory — the belt exists for paths a
+        # program WRITES, and a message writes none — but ONLY when EVERY
+        # sibling simple command on the line is on the non-runner allowlist,
+        # so nothing records the message and replays it. An allowlist fails
+        # closed where the abandoned lane's runner list failed open.
+        if commands and all(_on_message_allowlist(c.words) for c in commands):
+            for cmd in commands:
+                cuts.extend((w.start, w.end, "_")
+                            for w in _message_value_words(cmd.words)
+                            if _names_the_directory(w))
+        # CURE C (task/3464): the two measured refusals were an Actions noun
+        # in the PROSE of a printing program's quoted argument, beside a
+        # substitution that runs nothing act-like — a log line's `$(date)`, a
+        # brief's `$(...)`. The base cut withheld the whole argument the
+        # moment ANY substitution stood in it, so the prose was read as a
+        # bare folded word and refused. The argument is data the program
+        # prints; cut it when none of its executable spans — the only part
+        # bash runs before the program sees a word — spells a row or an
+        # anchor. A span that itself runs an act keeps the argument code,
+        # exactly as its unquoted spelling does, and the directory belt is
+        # mirrored from the base cut.
+        for cmd, (name, ki) in zip(commands, programs):
+            if name is None or name.rsplit("/", 1)[-1] not in (
+                    "echo", "printf"):
+                continue
+            for w in cmd.words[ki + 1:]:
+                if not (w.prose and w.subst) or _names_the_directory(w):
+                    continue
+                act_in_span = False
+                for s, e in reader.substs:
+                    if w.start <= s and e <= w.end:
+                        rows, anchor = _actions_evidence(
+                            _readings(command[s:e]))
+                        if rows or anchor is not None:
+                            act_in_span = True
+                            break
+                if not act_in_span:
+                    cuts.append((w.start, w.end, "_"))
+    code, expected, wrote = set(), [], None
     for ordinal, (at, quoted, start, end) in enumerate(reader.bodies):
         cut = quoted and kinds.get(at) == "data"
+        live = ""
+        if not quoted and at in sinks and start < end:
+            # AN UNQUOTED BODY A SINK READS keeps only what RUNS (task/3064,
+            # `_live_body`), unless the command runs a file it writes
+            if wrote is None:
+                wrote = _runs_what_it_wrote(command)
+            live = None if wrote else _live_body(reader.lines[start:end])
+            cut = live is not None
         if quoted and (evaluated or kinds.get(at) == "code"):
             code.add(ordinal)
         if cut and start < end:
-            # the body's lines go and its terminator stays; a body that runs
-            # to the end of the text takes the opener line's newline with it,
-            # or the walker would read the empty last line as its body
-            cuts.append((reader.starts[start], reader.starts[end], "")
-                        if end < len(reader.lines)
-                        else (reader.starts[start] - 1, reader.n, ""))
-        expected.append((quoted, 0 if cut else end - start))
+            last = end == len(reader.lines)
+            if live:
+                # its live spans stand in for its lines, one to a line
+                cuts.append((reader.starts[start],
+                             reader.n if last else reader.starts[end],
+                             live if last else live + "\n"))
+            else:
+                # the body's lines go and its terminator stays; a body that
+                # runs to the end of the text takes the opener line's
+                # newline with it, or the walker would read the empty last
+                # line as its body
+                cuts.append((reader.starts[start] - 1, reader.n, "") if last
+                            else (reader.starts[start], reader.starts[end],
+                                  ""))
+        expected.append((quoted, (live.count("\n") + 1 if live else 0)
+                         if cut else end - start))
     out, at = [], 0
     for start, end, fill in sorted(cuts):
         out.append(command[at:start] + fill)
@@ -7976,7 +9891,8 @@ def github_actions_refusal(command=None, path=None):
 
     BESIDE MEANS IN ONE REGION. A region is the executed text — the command
     less its quoted-tag bodies, unquoted bodies kept, because those
-    substitute — or ONE quoted body together with the line that opens it.
+    substitute (a sink's is only its live spans by then, `_live_body`) — or
+    ONE quoted body together with the line that opens it.
     The outer shell never expands a quoted body, so an expansion on a
     DIFFERENT line cannot supply a word inside it; the opener line can,
     because the program that consumes the body stands there and takes that
@@ -8029,11 +9945,20 @@ def github_actions_refusal(command=None, path=None):
     nothing about GitHub; the verb is never what makes a command an Actions
     command. A runtime value that supplies the NOUN is outside this guard,
     exactly as a whole token beside no piece at all is. THE SAME THREE
-    ANCHORLESS ROWS are what the document rule gives up, and they are the
+    ANCHORLESS ROWS are what the document rule gives up (the anchorless
+    rows that name GitHub are not among them, `_GITHUB_NAMED_ROWS`), and they are the
     same words for the same reason: `gh run cancel|watch|download` written
     inside a quoted heredoc whose program this rung does not know passes,
     while every anchored act there is refused, and so is every act in a body
     a shell reads.
+
+    AN ANCHOR IS MORE THAN ITS FIRST LETTER HERE (task/3696,
+    `_SCOPED_ANCHORS`): a word that is one typed letter and then an
+    expansion (`r$(date)`, a raw-string regex's `r` before a backtick) is
+    the expansion alone, and this rule refused it as `rerun` or `workflow`.
+    The row rule still reads that letter beside the rest of its row, so
+    what passes is a lone letter whose row is not whole either: `gh $W
+    r$(echo erun) 1`.
 
     A PATH takes the row rule and not this one: a `file_path` is handed to
     the tool literally, nothing expands it, and `$W` in a path is a
@@ -8046,11 +9971,16 @@ def github_actions_refusal(command=None, path=None):
         return None
     if _grants_whole_command(command):
         return None
+    # THE RAW PASS FIRST, as the docstring promises: a command with no row
+    # and no anchor never pays for the reader. The cut text then decides
+    # alone. A row the cut REMOVED says nothing about an anchor the cut
+    # KEPT, so it never lifts that anchor's scoped rule (task/3247 review:
+    # `gh workflow $V ci.yml; echo '<row>'` was admitted that way).
     readings = _readings(command)
     rows, anchor = _actions_evidence(readings)
     if not rows and anchor is None:
         return None             # every windowed row carries its anchor
-    text, code = _invocation_text(command)
+    text, code = _invocation_text(command, actions=True)
     if text != command:
         readings = _readings(text)
         rows, anchor = _actions_evidence(readings)
@@ -8076,15 +10006,19 @@ def _row_the_shell_runs(command, rows, code=frozenset()):
     and `code` names the quoted bodies a SHELL reads (`_invocation_text`).
 
     AN ANCHOR IS EVIDENCE WHEREVER IT STANDS IN THAT TEXT. `workflow`,
-    `rerun`, `.github`, `/actions` and `/dispatches` mean nothing outside
-    GitHub Actions, so a row carrying one is refused in any body this rung
-    still reads exactly as it is on the command line.
+    `rerun`, `.github`, the GitHub-owned REST shapes, `.github/actions` and
+    `/dispatches` are the half of an act that is GitHub's (the English
+    `rerun` only in a row that also names `gh`, task/3696), so a row
+    carrying one is refused in any body this rung still reads exactly as it
+    is on the command line — and so is a row that
+    names GitHub (`_GITHUB_NAMED_ROWS`), which carries no anchor only so that
+    no scoped rule reads it.
 
     A BODY A SHELL READS IS THE COMMAND'S OWN CODE (task/2973, the ruling:
     "a heredoc fed to a SHELL is code, so parse it"). `bash <<'EOF'`,
     `sh -s <<'EOF'`, `ssh host <<'EOF'` and `cat <<'EOF' | bash` run every
-    line of their body, so every row in one counts, the three with no anchor
-    included — which is what task/2870 gave up for them, now taken back. The
+    line of their body, so every row in one counts, the three anchorless
+    rows of ordinary words included — which is what task/2870 gave up for them, now taken back. The
     body of a program the reader does not know counts the same way when a
     shell, an evaluator or a program word that is a value stands anywhere in
     the command (`cat <<'EOF' | (sh)`, `while read l; do $l; done <<'EOF'`),
@@ -8101,7 +10035,10 @@ def _row_the_shell_runs(command, rows, code=frozenset()):
     WHAT THAT GIVES UP, exactly and not vaguely: an ANCHORLESS row — `gh run
     cancel 123`, `gh run watch 123`, `gh run download 123` and no other
     spelling — in a QUOTED body whose program is neither a shell nor a data
-    program (`docker exec -i c sh <<'EOF'` is one) passes. Nothing anchored
+    program (`docker exec -i c sh <<'EOF'` is one) passes. The anchorless
+    rows that NAME GitHub (`_GITHUB_NAMED_ROWS`) are not ordinary words and
+    count there as an anchored row does, reported after one, so the shaped
+    REST row keeps naming a command that holds both. Nothing anchored
     passes by this rule, no unquoted heredoc is touched (its body
     substitutes, so its bytes are still read), and nothing outside a heredoc
     body changes at all.
@@ -8113,7 +10050,8 @@ def _row_the_shell_runs(command, rows, code=frozenset()):
     bodies the data rule now cuts before this rule is asked."""
     if not rows:
         return None
-    anchored = [found for found in rows if found[4]]
+    anchored = [found for found in rows if found[4]] or \
+        [found for found in rows if found[0] in _GITHUB_NAMED_ROWS]
     if anchored:
         return anchored[0]
     executed = _executed_readings(command, code)
@@ -8154,7 +10092,7 @@ def _row_refusal(command, found):
 
     The clause is written only when it is TRUE of this match — the row
     stands in the command and not in the part of it a shell runs, which can
-    only happen to an ANCHORED row now — so a reader who sees it knows the
+    only happen to an ANCHORED row or one that names GitHub now — so a reader who sees it knows the
     rung read a heredoc body deliberately, and a reader who does not see it
     knows the match is on the command line. That is the residual, stated:
     for a match on the command line the offset is still fold-relative and
@@ -8242,10 +10180,218 @@ def sidechain_beacon_presence(command):
     --follow` passes (measured). A substitution that SPELLS the words is not
     that case and never was — `$(echo helm chat wait) --follow` is refused
     by the plainest reading, which holds the text a substitution's interior
-    is made of."""
+    is made of.
+
+    THE BEACON-TIMEOUT RUNG BELOW READS DIFFERENTLY, on purpose: it asks
+    whether one simple command RUNS helm `chat wait` with a beacon flag of
+    its own (`_runs_a_beacon`), because its miss costs a short lease and its
+    false hit refuses a Monitor that is no beacon. This one keeps presence,
+    because its miss costs a deaf seat, so a command whose words only
+    resemble an arm (`tail --follow=name /tmp/chat/wait.log`) is refused
+    here and passes there."""
     readings = _readings(command)
     return bool(_BEACON_FLAGS.search(readings)) and \
         all(word.search(readings) for word in _BEACON_WORDS)
+
+
+# ---------------------------------------------------------------------------
+# THE BEACON-TIMEOUT RUNG (task/3404) — a Monitor that arms an inbox beacon
+# runs for the harness's whole cap. The harness kills a Monitor at its
+# `timeout_ms`, which is 300000 (5 minutes) when the call omits it and is
+# honoured up to 1800000. Every place helm tells a seat how to arm renders
+# `seats_advice.beacon_monitor`, which carries the cap, and a local seat
+# still armed 48 of its 152 beacons at 300000, 31 of them in one hour: a
+# lease that lapses six times as often, where each lapse is a chance to end
+# a turn with nothing left to wake the seat (the class the stop guard refuses
+# once per fresh stop for a local seat, task/3382). The advice was already
+# everywhere, so the call is refused, and the refusal carries the corrected
+# call: the seat's own command, unchanged, at the cap. A refused Monitor
+# costs one retry, the same shape as that stop refusal. The corrected call is
+# a complete Monitor input (task/3435): it carries the description the tool
+# requires, the seat's own when the refused call had one and the advice's
+# fixed one otherwise, and every character as typed, never a json escape.
+#
+# IT READS WHAT THE SHELL RUNS, TOKEN BY TOKEN, NOT WHAT THE COMMAND
+# MENTIONS, and that is the opposite choice from the sidechain rung above,
+# for the opposite asymmetry. There a miss costs the seat its wake route, so
+# that rung reads PRESENCE: its three pieces anywhere in the folded text, a
+# mention refused with the act. Here a miss costs a short lease, which is
+# today's state, while a false hit refuses a Monitor that is no beacon at
+# all, and presence was measured doing that: `tail --follow=name
+# /tmp/chat/wait.log` holds all three pieces, and so does a one-shot wait
+# chained to an unrelated `tail --follow` (the cross-family read of round
+# 1). So a beacon here is ONE simple command the shell runs, as the
+# argv-guard's own reader splits the text (`_commands_run`: every pipeline
+# stage, every `&&`, `||` and `;` link, and what a substitution, a `-c`
+# string, `eval` or a shell's heredoc runs): helm by any path or
+# `python -m helm` (`_helm_argv`), past the assignments, `env` and wrappers
+# `_program` steps over, whose first two arguments are `chat` and `wait`,
+# and which carries `--follow` or `--replace` as a word of its own. A
+# Monitor that greps a log FOR the beacon's words, or echoes them, passes,
+# because grep and echo are the programs that run.
+#
+# EVERYTHING IT CANNOT READ PASSES: a tool_input that is not an object, a
+# command that is not a string (a WebSocket Monitor has none), a timeout_ms
+# that is not a finite number, and command text the reader cannot settle the
+# way bash does (an unclosed quote, a `case`). The harness validates the call
+# against its own schema, and this rung is no second validator; a word a
+# runtime value supplies (`$V` where `chat` stands) is outside it the same
+# way. A timeout at or over the cap passes without reading the command.
+#: The harness's Monitor deadline when a call omits timeout_ms (the Monitor
+#: tool's own schema: default 300000, honoured up to 1800000).
+MONITOR_DEFAULT_MS = 300000
+#: The words that make a `helm chat wait` an inbox beacon arm.
+_BEACON_ARMS = frozenset(("--follow", "--replace"))
+
+
+def _runs_a_beacon(command):
+    """Whether one simple command that `command` runs is an inbox beacon
+    arm: helm, then `chat wait`, with `--follow` or `--replace` a word of
+    that same command (see above). False where the reader cannot settle the
+    text, because a miss here costs only a short lease."""
+    try:
+        calls = _commands_run(command.replace("\\\n", ""), None)
+    except Exception:          # _Unsettled, or the reader's defect: fail open
+        return False
+    return any(argv[:2] == ["chat", "wait"]
+               and not _BEACON_ARMS.isdisjoint(argv[2:])
+               for argv in (_helm_argv(name, words, k) or []
+                            for name, words, k, _at in (
+                                c[:4] for c in calls)))
+
+
+# ---------------------------------------------------------------------------
+# THE DELEGATE MARK (helm.pull_delivery, task/3696): which delegate calls mark
+# the seat's session. A `helm chat read` delivers to the seat it runs as, and
+# a `helm chat ack` records the session that acked; a delegate (a subagent or
+# a Workflow agent) runs as its seat, so a delegate call that RUNS either verb
+# marks the session, and the seat's reads and acks inside the mark count as
+# nobody's evidence. The mark once keyed on the letters `chat` anywhere in
+# the command, and a seat that runs Workflows was marked nearly always: a
+# builder's `sed -n 1,40p tests/test_chat_argv_guard.py` or `git grep ... --
+# helm/chat.py` kept the seat's own reads from delivering for 15 minutes each,
+# without a word, so a ring the seat had answered rang again at every
+# backstop (measured: one meld row rang four times across four reads).
+#
+# So it reads what the shell RUNS, as the beacon-timeout rung above does:
+# helm by any path or `python -m helm` (`_helm_argv`) whose first argument is
+# `chat` and whose verb, as `cmd_chat` reads it (`_chat_verb`), is `read` or
+# `ack`. A miss here delivers a delegate's read to its seat, a row the seat
+# never saw, so where the text does not settle the answer the mark is set:
+# text the reader cannot settle that names `chat`, a verb a runtime value
+# supplies (`helm chat $V`), and a program a runtime value names beside the
+# word `chat` (`$H chat read`). xargs or parallel feeding helm is refused to
+# a delegate outright (`_sidechain_authority`), so it never runs to be marked.
+# A helm invocation holding the word `--help` or `-h` marks nothing, a verb a
+# runtime value supplies included (a Workflow agent's usage sweep looped `$v`
+# over helm's verbs, measured): helm answers it after any verb before work runs
+# (`cli._main`), and `cmd_chat` answers it anywhere after `read` or `ack`
+# before either runs, so it neither reads nor acks. A program a runtime value
+# names (`$H chat read --help`) still marks: nothing proves it is helm, and a
+# program that ignores the word would read. ACCEPTED: helm run by a
+# program this reader does not read as helm (`python3 -c`, `watch`, `find
+# -exec`, a here-string to a shell) is not marked, and its read delivers to
+# the seat.
+#: The chat verbs whose run reads as the seat's own evidence that it saw a row.
+_SEAT_EVIDENCE_VERBS = frozenset(("read", "ack"))
+#: The words that make a helm invocation a help ask, answered before any work.
+_HELP_WORDS = frozenset(("-h", "--help"))
+
+
+def _chat_verb(argv):
+    """The verb `helm chat` dispatches for the helm argv `argv` (argv[0] is
+    "chat"), as `cmd_chat` reads it: its first `--room R` pair dropped, then
+    the first word, and `read` when none is left. None when a runtime value
+    supplies that word."""
+    rest = list(argv[1:])
+    if "--room" in rest:
+        i = rest.index("--room")
+        del rest[i:i + 2]
+    return rest[0] if rest else "read"
+
+
+def runs_a_seat_read(command):
+    """Whether `command` runs a chat verb whose run by a delegate reads as its
+    seat's own evidence (see above): True as well where the text does not
+    settle it and names `chat`. Text without the letters `chat` is never
+    read, so the argv-guard pays nothing for it."""
+    if "chat" not in command:
+        return False
+    try:
+        calls = _commands_run(command.replace("\\\n", ""), None)
+    except Exception:          # _Unsettled, or the reader's defect: mark
+        return True
+    for name, words, k, _at in (c[:4] for c in calls):
+        if k is None:
+            continue
+        if name is None:
+            if any(w.value() == "chat" for w in words[k:]):
+                return True
+            continue
+        argv = _helm_argv(name, words, k)
+        if not argv:
+            continue
+        if any(a in _HELP_WORDS for a in argv):
+            continue                    # a help ask: nothing reads or acks
+        verb = _chat_verb(argv) if argv[0] == "chat" else ""
+        if argv[0] is None or verb is None or verb in _SEAT_EVIDENCE_VERBS:
+            return True
+    return False
+
+
+def beacon_timeout_refusal(tool_input):
+    """(timeout_ms as given, or None when omitted; the command; the seat's
+    own description, or None) for a Monitor whose command RUNS an inbox
+    beacon arm under the harness's cap; None for every other input.
+
+    The description is the seat's verbatim when it is a string with a
+    character to show; a missing, blank or non-string one is None, and the
+    corrected call falls to the advice's fixed description (task/3435).
+    Reading it refuses nothing: the harness validates the field, and this
+    rung is no second validator.
+
+    It reads tokens where `sidechain_beacon_presence` reads presence, so the
+    two differ on purpose: a Monitor whose words only RESEMBLE an arm (a
+    path holding `chat` and `wait` under `tail --follow=name`) is refused to
+    a subagent there and passes here."""
+    if not isinstance(tool_input, dict):
+        return None
+    command, given = tool_input.get("command"), tool_input.get("timeout_ms")
+    if not isinstance(command, str):
+        return None
+    if given is not None:
+        if isinstance(given, bool) or not isinstance(given, (int, float)) \
+                or not math.isfinite(given):
+            return None
+        from .seats_advice import BEACON_TIMEOUT_MS
+        if given >= BEACON_TIMEOUT_MS:
+            return None
+    if not _runs_a_beacon(command):
+        return None
+    said = tool_input.get("description")
+    return given, command, (said if isinstance(said, str) and said.strip()
+                            else None)
+
+
+def beacon_timeout_message(found):
+    """The refusal: the timeout as given (or the default it fell to), why a
+    short lease costs a wake, and the corrected call, a complete Monitor
+    input: the seat's command json-quoted and whole at any width (a cut
+    command, or a name for one, is a call that no longer runs), its own
+    description or the fixed one, and the cap (seats_advice.monitor_call).
+    Writes words and decides nothing."""
+    from .seats_advice import BEACON_TIMEOUT_MS, monitor_call
+    given, command, said = found
+    lease = ("timeout_ms %s" % given if given is not None else
+             "no timeout_ms, which means the harness default of %d"
+             % MONITOR_DEFAULT_MS)
+    return ("[helm argv-guard] BLOCKED: this Monitor arms an inbox beacon "
+            "with %s. The harness kills a Monitor at its deadline, so a "
+            "lease under the %d-minute cap lapses more often, and each lapse "
+            "can end a turn with nothing left to wake you. Arm it at the "
+            "cap:\n  %s"
+            % (lease, BEACON_TIMEOUT_MS // 60000,
+               monitor_call(command, said)))
 
 
 # ---------------------------------------------------------------------------
@@ -8295,11 +10441,13 @@ def sidechain_beacon_presence(command):
 # like a run. That covers args to a program the predicate does not know
 # (awk, node -e, a for-loop's word list), anything piped into a stage that
 # could run its input (python, sed), a heredoc fed to a program given as a
-# value (`$H dispatch send <<EOF`), an unquoted heredoc (its substitutions
-# run), and python text that starts a process. The cure is the same words
-# without `helm`, or a file written with a tool that is not a shell. A word
-# supplied WHOLE by a runtime value (`$H dispatch verdict`) is outside this
-# rung, exactly as it is outside the beacon rung.
+# value (`$H dispatch send <<EOF`), an unquoted heredoc fed to anything but
+# a sink, and the `$(…)` and backtick spans of one fed to a sink (they run;
+# its prose is data, task/3064), and python text that starts a process. The
+# cure is the same words without `helm`, or a file written with a tool that
+# is not a shell. A word supplied WHOLE by a runtime value
+# (`$H dispatch verdict`) is outside this rung, exactly as it is outside the
+# beacon rung.
 _AUTHORITY_OPTION = r"(?: +--?[\w.-]+(?:=\S*)?(?: +(?!-)\S+)?){0,3}"
 _AUTHORITY_HELM = r"(?<![\w-])" + _mark_spanning("helm") + r"(?![\w-])"
 # THE CHEAP GATE: a delegate command that never names `helm` pays for no
@@ -8577,7 +10725,7 @@ def _authority_exempt(command, cwd, hits, readings):
     except Exception:          # _Unsettled, or the reader's defect
         return set()
     runs = {}
-    for name, words, k, at in calls:
+    for name, words, k, at in (c[:4] for c in calls):
         vals = _helm_argv(name, words, k)
         if not vals or len(vals) < 2 \
                 or (vals[0], vals[1]) not in delegate_grant.REFUSED:
@@ -8819,13 +10967,6 @@ def sidechain_authority_verbs(command, cwd=None):
         + tuple(verb for verb in extra if verb not in exempt)
 
 
-def sidechain_authority_presence(command, cwd=None):
-    """The first refused verb `command` runs, or None — the one question the
-    rung asks of a delegate's command before it asks the grant."""
-    verbs = sidechain_authority_verbs(command, cwd)
-    return verbs[0] if verbs else None
-
-
 def _sidechain_authority(d, cmd):
     """(refusal-or-None, admitted lines) for a DELEGATE's Bash or Monitor
     command. Every refused verb the command runs must be admitted by a live
@@ -8942,6 +11083,53 @@ def agent_model_message(model):
                AGENT_MODEL_PREMISE))
 
 
+# THE FABLE-BUILD STEER (task/2574), the Agent rung's one pass-path line. A
+# subagent runs as its seat's model (the rung above), so a Fable seat that
+# hands a build round to the Agent tool spends Fable on it: measured, the
+# owner's Fable limits overran on cure rounds delegated that way. Fable
+# orchestrates; the build belongs in an opus Workflow. Advisory: the call
+# still runs, and an orchestrator may mean it.
+FABLE_BUILD_PREMISE = \
+    "fable-is-the-orchestrator-not-the-subagent-opus-two-to-one"
+FABLE_BUILD_STEER = ("This Agent subagent runs as this seat's model, fable, "
+                     "and the brief is build work. Fable orchestrates; run "
+                     "the build as an opus Workflow agent: agent(prompt, "
+                     "{model: 'opus'}). Why: helm store get %s"
+                     % FABLE_BUILD_PREMISE)
+# Build-shaped: the words a build brief carries and a read brief does not.
+_BUILD_SHAPED = re.compile(
+    r"\b(?:claim|commit|cure|implement\w*|arms|fab\s+test)\b", re.I)
+
+
+def fable_build_steers(d):
+    """[(steer-id, line)] for one main-thread Agent payload: the steer above
+    when its prompt is build-shaped and the seat answers as Fable, else [].
+
+    The prompt is read first, so a read-only delegation imports nothing. The
+    model is the one the approval tier reads for a native seat,
+    native_turn.native_turn_model on the payload's session (routing, the
+    newest turn), under the transcript root the payload names; an unread or
+    unknown model is not Fable. Fail-open to []."""
+    try:
+        prompt = (d.get("tool_input") or {}).get("prompt")
+        if not isinstance(prompt, str) or not _BUILD_SHAPED.search(prompt):
+            return []
+        from . import native_turn, remote_policy
+        root = None
+        path = d.get("transcript_path")
+        if isinstance(path, str) and path.endswith(".jsonl"):
+            # <root>/projects/<project>/<session>.jsonl
+            root = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+        model, _source = native_turn.native_turn_model(
+            d.get("session_id"), root=root)
+        if remote_policy.model_line(model) != "fable":
+            return []
+        return [("fable-build-via-opus-workflow",
+                 "[helm steer] " + FABLE_BUILD_STEER)]
+    except Exception:                          # noqa: BLE001 — fail open
+        return []
+
+
 # ---------------------------------------------------------------------------
 # THE OWNER'S WEB DOOR IS NOT AN AGENT'S (task/2997). helm web's decision
 # POSTs record the OWNER's verdict and comments, and the bearer that guards
@@ -8966,7 +11154,10 @@ _DOOR_CLIENT = re.compile(
     r"\bphp\s+-r\b.*\b(?:file_get_contents|curl_exec|fopen)\b")
 _DOOR_LOOPBACK = re.compile(
     r"\b127\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\blocalhost\b|\[::1\]|\b0\.0\.0\.0\b")
-_DOOR_WRITE_PATH = re.compile(r"/api/decisions/\w+|/api/decide\w*")
+# The task backlog's comment box joined (goal-ledger D1): it records the
+# owner's note through his OwnerDoor, so a post there speaks in his voice.
+_DOOR_WRITE_PATH = re.compile(
+    r"/api/decisions/\w+|/api/decide\w*|/api/tasks/comment\b")
 # The queue path, and the owner's away card (task/3018): a GET of either is a
 # read any seat may make, a body or a writing method is his door.
 _DOOR_QUEUE_PATH = re.compile(r"/api/decisions\b|/api/owner/posture\b")
@@ -9066,6 +11257,12 @@ def owner_door_post_message(path):
                 "his word, and an agent never writes there; %s. A seat that "
                 "needs him posts in helm chat, and `helm away status` reads "
                 "the card." % (path, OWNER_DOORS))
+    if "/tasks/" in path:
+        return ("[helm argv-guard] BLOCKED: this command sends to helm web's "
+                "owner task-comment door (%s). That door records the OWNER's "
+                "note on a task as his, and an agent never writes there; %s. "
+                "A seat adds to a task with `helm task comment <id> <text>`, "
+                "which records the seat." % (path, OWNER_DOORS))
     return ("[helm argv-guard] BLOCKED: this command sends to helm web's owner "
             "decision door (%s). That door records the OWNER's verdict and "
             "comments, and an agent never writes there; %s. A seat adds to a "
@@ -10289,10 +12486,12 @@ def _shell_script(args):
 
 
 def _commands_run(text, cwd, depth=0):
-    """[(name, words, k, here)] for every simple command `text` runs: the
-    program `_program` names (None where the text does not settle it), the
-    command's words, the index of the program word, and the directory the
-    command runs in, None where the text does not settle it.
+    """[(name, words, k, here, redirects, bodies)] for every simple command
+    `text` runs: the program `_program` names (None where the text does not
+    settle it), the command's words, the index of the program word, the
+    directory the command runs in (None where the text does not settle it),
+    that command's redirects as (operator, word), and the heredoc bodies it
+    owns. A reader that only wants the directory takes the first four.
 
     A `cd` or `pushd` that stands as a pipeline of its own moves every later
     command in its scope, and a subshell's parentheses close the scope; a
@@ -10318,7 +12517,7 @@ def _commands_run(text, cwd, depth=0):
         if tok[0] == "w":
             cur[0].append(tok[1])
         elif tok[0] == "r":
-            cur[2].append(tok[2])
+            cur[2].append((tok[1], tok[2]))
         elif tok[0] == "h":
             cur[1].append(tok[1])
         else:
@@ -10349,7 +12548,8 @@ def _commands_run(text, cwd, depth=0):
                 scope.pop()
             continue
         pipe, sep = item
-        for words, docs, targets in pipe:
+        for words, docs, redirects in pipe:
+            targets = [word for _op, word in redirects]
             at = scope[-1]
             for a, b in spans:
                 if any(w.start <= a < w.end for w in words + targets):
@@ -10363,7 +12563,10 @@ def _commands_run(text, cwd, depth=0):
                    or (w.value() or "").startswith("--chdir=")
                    for w in words[:k]):
                 at = None
-            out.append((name, words, k, at))
+            bodies = tuple(
+                "\n".join(reader.lines[start:stop])
+                for op, _q, start, stop in reader.bodies if op in docs)
+            out.append((name, words, k, at, tuple(redirects), bodies))
             args = words[k + 1:]
             if name in ("cd", "pushd") and len(pipe) == 1:
                 scope[-1] = None if sep == "||" else _cd_dir(args, at)
@@ -10376,9 +12579,8 @@ def _commands_run(text, cwd, depth=0):
                 if script and script[0] == "c":
                     inner(_env_text(script[1]), at)
                 elif script:
-                    for op, _q, start, stop in reader.bodies:
-                        if op in docs:
-                            inner("\n".join(reader.lines[start:stop]), at)
+                    for body in bodies:
+                        inner(body, at)
     return out
 
 
@@ -10418,9 +12620,10 @@ def _commands_run(text, cwd, depth=0):
 # (`_TREE_WRITES`). Reads, fetch, `pull --ff-only` and `merge --ff-only`
 # (which never leave a conflict), `worktree add/remove`, branch reads and a
 # `stash`/`stash push`/`stash list` pass; so does `-h`/`--help`. Anything is
-# allowed with HELM_WORK_INTEGRATOR=1 in the command or the environment, the
-# declaration the integrator already makes to the reference-transaction
-# hook. What it cannot see: a git alias, `git apply`, `rm`/`mv`, and a verb
+# allowed only when this hook process inherited HELM_WORK_INTEGRATOR=1, the
+# declaration the integrator already carries. Command text is not authority:
+# any seat can type an assignment in front of git. What it cannot see: a git
+# alias, `git apply`, `rm`/`mv`, and a verb
 # run by a script or a program that is not git.
 _TREE_GATE = re.compile(r"(?<![\w-])(?:stash|checkout|restore|reset|merge"
                         r"|rebase|cherry-pick|revert|am|switch|clean|pull)"
@@ -10478,10 +12681,14 @@ def _git_subcommand(words, k, at):
 
 def _under_the_rail(top):
     """Whether the repository at `top` DECLARES the rail guard profile. One
-    git read, through the seam: the key and the profile name are the guard's
+    git read, through the seam. The key and the profile name are the guard's
     own (work._guard.PROFILE_KEY, GUARD_PROFILES), pinned equal by a test
     rather than imported, because importing the guard costs this hook half a
-    second."""
+    second.
+
+    A rail read that does not answer reads as NOT the rail, so this step fails
+    open; the fail-closed step is the write rung's check-ignore probe, which
+    runs only once this read has said the checkout is the rail."""
     from . import vcs
     return vcs.backend(top).probe(top, "config", "--get", _RAIL_KEY,
                                   timeout=2) == _RAIL
@@ -10527,13 +12734,12 @@ def shared_checkout_refusal(command, cwd=None, env=None):
     is the payload's; `env` defaults to this process's environment."""
     text = (command or "").replace("\\\n", "")
     if "git" not in text or not _TREE_GATE.search(text) \
-            or INTEGRATOR_DECLARATION in text \
             or (os.environ if env is None else env).get(
                 "HELM_WORK_INTEGRATOR") == "1":
         return None
     try:
         start = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
-        for name, words, k, at in _commands_run(text, start):
+        for name, words, k, at in (c[:4] for c in _commands_run(text, start)):
             call = _git_subcommand(words, k, at) if name == "git" else None
             if call is None:
                 continue
@@ -10562,8 +12768,517 @@ def shared_checkout_message(hit):
             "checkout: a conflict or another lane's stash left there breaks "
             "every seat working from it (git stash is one list for every "
             "worktree). Use your lane: git -C %s-wt/<lane> %s. The integrator "
-            "declares %s." % (spelled, top, top, spelled,
-                              INTEGRATOR_DECLARATION))
+            "declares %s in the seat's environment; text in the command "
+            "does not count." % (spelled, top, top, spelled,
+                                 INTEGRATOR_DECLARATION))
+
+
+# THE RECURSIVE-GREP RUNG (task/3384). Eight orphaned ugrep processes were
+# found on the hub, 24 minutes to 9.75 days old, two of them near 1h49m of CPU
+# each. In a seat's shell `grep` is not GNU grep: it is a shell FUNCTION the
+# harness installs, which runs the harness's own ugrep (argv0 `ugrep`). A
+# recursive grep with no bound walks the whole tree, `--exclude-dir` bounds
+# nothing, and this box has crashed from one before. The standing rule (the
+# /dev search law): inside a repository `git grep`, outside one `/usr/bin/rg`
+# with an explicit path. This rung refuses the act that rule exists for and
+# names both.
+#
+# RECURSIVE, measured from ugrep's --help and in a scratch tree against both
+# engines, not invented: -r, -R, --recursive and --dereference-recursive in
+# any cluster (`-rn`, `-nri`) and in any position, because both engines
+# permute their arguments; -d/--directories with `recurse` or
+# `dereference-recurse`; GNU's unambiguous long prefixes (`--rec`, `--der`,
+# `--dir=recurse`; ugrep refuses them); and `rgrep`, which is `grep -r`. Under
+# the harness grep (ugrep) also --depth, -NUM (a directory DEPTH there, where
+# GNU reads context lines), --index, and a -g/--glob/--iglob/--include/
+# --include-dir glob that holds a `/`: each walked the scratch tree with no
+# -r. A PIPE ON STDIN STOPS NO WALK: under ugrep `cmd | grep -r x` read the
+# pipe AND walked the working directory, and GNU grep -r ignored the pipe.
+# Which engine runs is read from the text: the bare word `grep` (or `\grep`,
+# or a quoted one) runs the function; a path, `ugrep` or `ug` names its own;
+# a wrapper that execs (`command`, `env`, `sudo`, `timeout`, …) reaches the
+# PATH grep, which is GNU.
+#
+# UNBOUNDED: no path operand at all, whatever the working directory is; or an
+# operand that resolves to a broad root — `/`, `/home`, `/home/<user>`,
+# `/home/<user>/dev`, the user's home and its `dev` (spelled `~`, `$HOME`,
+# `${HOME}` or by path), `/tmp`, or an ORG directory directly under a `dev`
+# that is not itself a checkout (`~/dev/akapug` holds every lane of every
+# repository); and the stores no list of spellings names: any directory one
+# level below `/` or below a home (`/usr`, `/proc`, `/scratch`, `~/.helm`,
+# `~/.claude`), a lane parent `<checkout>-wt` and every directory between it
+# and a worktree (185 worktrees, 7.5G on the hub), and helm's own home,
+# global dir and seat store. `/tmp` and the org directory are the list of this box's PATH
+# grep shim, which the harness function never reaches. A relative operand
+# resolves against the payload cwd and any `cd` in scope (`_commands_run`),
+# `..` included, and a trailing glob segment reads as its parent (`~/dev/*` is
+# `~/dev`).
+#
+# PASSES: `git grep` and `rg` (another program); a recursive grep with a
+# narrow path (a checkout, a subdirectory, a file, `-` for stdin); a grep that
+# is not recursive, stdin filters included; one given no pattern at all (both
+# engines print usage and walk nothing, measured); and every word that is DATA
+# — the words of `echo`, `printf`, a commit message, a post, a quoted argument
+# to another program, a heredoc body no shell reads. The reader walks what
+# RUNS: `bash -c`, `sh -lc`, `eval`, `$(…)` and a heredoc a shell reads as its
+# script, so a wrapped bare grep is refused. What the text does not settle
+# passes: an operand that is an unquoted expansion (`grep -r $ARGS`, which may
+# carry the path), a directory it cannot resolve (`cd "$d"`, `$PWD`), and text
+# the shell reader cannot settle (`_Unsettled`), as the shared-checkout rung
+# passes it. A crude reading of that text, the env-dump rung's, was built and
+# measured over emberian/dregg's tracked *.sh and *.md: it refused 14 lines,
+# every one a line bash cannot parse, so nothing in it would have run, and
+# found no real one; so it is not here. NOT READ, and so passed: a grep run by
+# `xargs`, `find -exec`, `watch`, `parallel` or a script's own lines, a body
+# piped into a shell (`cat <<EOF | bash`), and anything run on another host
+# (`ssh`, `docker exec`), and a GNU long option abbreviated to a prefix that
+# takes a value (`--inc '*.py'` is read as a flag, so its value reads as the
+# pattern).
+#
+# ONE OVER-REFUSAL is known: a child shell (`bash -c`) has no harness
+# function, so its `grep -3 x` is GNU's context, but this rung reads the bare
+# word as the function wherever it stands. `rg` with no path walks the working
+# directory too; it is outside this rung, which the task scoped to the grep
+# family.
+_GREP_GATE = re.compile(r"(?<![\w.+-])(?:[efr]?grep|ugrep|ug)(?![\w.+-])")
+_GREP_NAMES = frozenset(("grep", "egrep", "fgrep", "rgrep", "ugrep", "ug"))
+_GREP_UGREP = frozenset(("ugrep", "ug"))
+# short options that take a value: GNU's A B C D d e f m, and ugrep's g J K M
+# N O t besides (each engine's --help header lines)
+_GREP_VALUED_SHORT = frozenset("ABCDdefmgJKMNOt")
+# long options that take a REQUIRED value, so a separated word is theirs
+# (the union of both engines' --help header lines; an optional value, such as
+# --color[=WHEN] or ugrep's --sort[=KEY], never takes the next word)
+_GREP_VALUED_LONG = frozenset((
+    "after-context", "before-context", "binary-files", "colors", "colours",
+    "context", "context-separator", "delay", "depth", "devices",
+    "directories", "encoding", "exclude", "exclude-dir", "exclude-from",
+    "exclude-fs", "file", "file-extension", "file-magic", "file-type",
+    "filter", "filter-magic-label", "format", "from", "glob",
+    "group-separator", "iglob", "include", "include-dir", "include-from",
+    "include-fs", "jobs", "label", "max-count", "max-files", "max-line",
+    "max-size", "min-count", "min-line", "min-size", "neg-regexp", "range",
+    "regexp", "replace", "zmax", "and", "andnot", "not"))
+# ugrep's `--and [-e] PATTERN`: the next word is theirs unless it is -e
+_GREP_BOOL_OPS = frozenset(("and", "andnot", "not"))
+_GREP_SLASH_GLOBS = frozenset(("glob", "iglob", "include", "include-dir"))
+_GREP_RECURSE = re.compile(r"(?:rec|der)")
+_GREP_DEPTH = re.compile(r"-\d|--depth")
+_GREP_GLOB = re.compile(r"[*?[]")
+_GREP_SPELL = 60
+_GREP_HOW = 24
+
+
+def _grep_scan(words, k, ugrep):
+    """(how, patterned, supplied, operands, settled) for the grep at
+    words[k]: the first spelling that makes it recursive (None where nothing
+    does), whether an option gave the pattern (so every operand is a path),
+    whether an option names the files to search (ugrep's --from), the
+    operand words, and whether every option word is one the text settles."""
+    how = None
+    patterned = supplied = False
+    operands, settled = [], True
+    n, j = len(words), k + 1
+    while j < n:
+        w, v = words[j], words[j].value()
+        j += 1
+        if v is None:
+            if w.raw.lstrip("'\"\\").startswith("-"):
+                settled = False
+            else:
+                operands.append(w)
+            continue
+        if v == "--":
+            operands.extend(words[j:])
+            break
+        if v == "-" or not v.startswith("-"):
+            operands.append(w)
+            continue
+        if v.startswith("--"):
+            opt, eq, val = v[2:].partition("=")
+            dirs = len(opt) >= 2 and "directories".startswith(opt)
+            if not eq and (opt in _GREP_VALUED_LONG or dirs) and not (
+                    opt in _GREP_BOOL_OPS and j < n
+                    and words[j].value() == "-e"):
+                val = words[j].value() if j < n else None
+                v = "%s %s" % (v, words[j].raw) if j < n else v
+                j += 1
+            val = val or ""
+            if opt in ("regexp", "file") or (ugrep and opt == "match"):
+                patterned = True
+            elif opt == "from":
+                supplied = True
+            elif len(opt) >= 3 and ("recursive".startswith(opt) or
+                                    "dereference-recursive".startswith(opt)):
+                how = how or v
+            elif dirs:
+                how = how or (v if _GREP_RECURSE.match(val) else None)
+            elif ugrep and (opt in ("depth", "index") or (
+                    opt in _GREP_SLASH_GLOBS and "/" in val)):
+                how = how or v
+            continue
+        i = 1
+        while i < len(v):
+            c = v[i]
+            i += 1
+            if c in "rR" or (ugrep and c.isdigit()):
+                how = how or v
+            elif c in _GREP_VALUED_SHORT:
+                val, spelled = v[i:], v
+                if not val and j < n:
+                    val = words[j].value()
+                    spelled = "%s %s" % (v, words[j].raw)
+                    j += 1
+                val = val or ""
+                if c in "ef":
+                    patterned = True
+                elif (c == "d" and _GREP_RECURSE.match(val)) or (
+                        c == "g" and ugrep and "/" in val):
+                    how = how or spelled
+                break
+    return how, patterned, supplied, operands, settled
+
+
+def _grep_countable(word):
+    """Whether a word is exactly one argument: settled, or one double-quoted
+    expansion. An unquoted expansion may split into any number of words."""
+    raw = word.raw
+    return word.value() is not None or (
+        len(raw) > 1 and raw[0] == raw[-1] == '"' and raw.count('"') == 2)
+
+
+def _grep_broad(word, here):
+    """The broad root a recursive grep's operand makes it walk, else None."""
+    if word.plain and word.raw.startswith("~"):         # `~user` too
+        path = os.path.expanduser(word.raw)
+        if not os.path.isabs(path):
+            if here is None:
+                return None
+            path = os.path.join(here, path)
+        path = os.path.normpath(path)
+    else:
+        path = _walk_dir(word, here)
+    if path is None:
+        return None
+    while _GREP_GLOB.search(os.path.basename(path)) \
+            and os.path.dirname(path) != path:
+        path = os.path.dirname(path)
+    home = os.path.normpath(os.path.expanduser("~"))
+    dev = os.path.join(home, "dev")
+    if path in ("/", "/home", "/tmp", home, dev) \
+            or re.fullmatch(r"/home/[^/]+(?:/dev)?", path):
+        return path
+    up = os.path.dirname(path)
+    if up in ("/", home) or re.fullmatch(r"/home/[^/]+", up):
+        return path                  # /usr, /proc, /scratch, ~/.helm, ~/.claude
+    if (up == dev or re.fullmatch(r"/home/[^/]+/dev", up)) \
+            and os.path.isdir(path) \
+            and not os.path.exists(os.path.join(path, ".git")):
+        return path                          # an org directory of checkouts
+    if _grep_lane_container(path) or path in _grep_stores():
+        return path
+    return None
+
+
+def _grep_lane_container(path):
+    """Whether `path` is a lane parent `<checkout>-wt` or a directory between
+    it and a worktree (`compose`, `seats`, `peeks`): each holds every lane
+    room below it. A worktree inside one carries its own `.git`, and is as
+    narrow as any checkout."""
+    p = path
+    while os.path.dirname(p) != p:
+        if os.path.exists(os.path.join(p, ".git")):
+            return False
+        if p.endswith("-wt") and os.path.exists(os.path.join(p[:-3], ".git")):
+            return True
+        p = os.path.dirname(p)
+    return False
+
+
+def _grep_stores():
+    """helm's own stores that hold every seat's transcripts: the helm home,
+    its global dir and the seat homes under it (HELM_HOME moves all three)."""
+    glob_dir = home.global_dir()
+    return {os.path.normpath(p) for p in (
+        home.helm_home(), glob_dir, os.path.join(glob_dir, "seats"))}
+
+
+def _grep_cut(text, width):
+    """`text` within `width` characters, a cut one ending in an ellipsis."""
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def _grep_hit(name, words, k, here, ugrep):
+    """(spelling, typed, how, root) when the grep at words[k] walks with no
+    bound, else None. `typed` and `root` are None for no path, else the
+    operand as typed and the broad root it resolves to, uncut."""
+    how, patterned, supplied, operands, settled = _grep_scan(words, k, ugrep)
+    if name == "rgrep":
+        how = how or "rgrep"
+    if how is None or not (patterned or operands):
+        return None            # no pattern: both engines print usage, walk none
+    paths = operands if patterned else operands[1:]
+    typed = root = None
+    if not paths:
+        if supplied or not settled or not all(
+                _grep_countable(w) for w in operands):
+            return None
+    else:
+        typed, root = next(((w.raw, r) for w, r in (
+            (w, _grep_broad(w, here)) for w in paths) if r), (None, None))
+        if root is None:
+            return None
+    return (_grep_cut(" ".join(w.raw for w in words[k:]), _GREP_SPELL),
+            typed and _grep_cut(typed, _GREP_SPELL),
+            _grep_cut(how, _GREP_HOW), root)
+
+
+def recursive_grep_refusal(command, cwd=None):
+    """(spelling, typed, how, root) when a Bash command runs a grep that
+    walks a tree with no bound, else None: recursive (`how`, as typed) and
+    given no path (`typed` and `root` None) or a broad root (the operand as
+    `typed`, and the `root` it resolves to). `cwd` is the payload's."""
+    text = (command or "").replace("\\\n", "")
+    if not _GREP_GATE.search(text):
+        return None
+    start = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+    try:
+        for _name, words, k, at in (c[:4] for c in _commands_run(text, start)):
+            prog = words[k].value()
+            base = os.path.basename(prog or "")
+            if base not in _GREP_NAMES:
+                continue
+            ugrep = base in _GREP_UGREP or (
+                prog == "grep" and not any(
+                    (w.value() or "") in _WRAPPERS for w in words[:k]))
+            hit = _grep_hit(base, words, k, at, ugrep)
+            if hit:
+                return hit
+    except Exception:          # _Unsettled, or the reader's defect: fail open
+        pass
+    return None
+
+
+def recursive_grep_message(hit):
+    """The refusal: the grep, why it walks with no bound, and the two routes
+    the search law names. Writes words and decides nothing."""
+    spelled, typed, how, root = hit
+    root = root and _grep_cut(root, _GREP_SPELL)
+    over = ("has no path, so it walks the whole working directory"
+            if root is None else "walks %s, a broad root" % (
+                root if typed == root else "%s (%s)" % (typed, root)))
+    depth = (" Under the harness grep, -NUM is a directory depth, not "
+             "context lines: write -C NUM." if _GREP_DEPTH.match(how) else "")
+    return ("[helm argv-guard] BLOCKED: `%s` is recursive (%s) and %s. An "
+            "unbounded grep walk left ugrep processes burning CPU for days "
+            "(task/3384).%s Inside a repo: git grep -n PATTERN -- PATH. "
+            "Outside one: /usr/bin/rg -n PATTERN <narrow path>."
+            % (spelled, how, over, depth))
+
+
+# THE WRITE RUNG (task/3301, round 2). The verb rung above does not see a
+# file tool or `git init`. Edit, Write and NotebookEdit are refused by the
+# path: symlinks and `..` resolved first, then the parent that exists, and
+# the resolved file has to sit inside that rail checkout. `git check-ignore
+# -q` exits 0 for a gitignored path, so `.remember/` stays writable, and
+# `<top>/.git/info/exclude` stays writable (private never-track names).
+# A check-ignore that errors, does not run, or times out fails closed. The
+# probe budget stays under the hook's 2 s.
+#
+# Shell writes are not parsed. Redirects, sed -i, tee, python open, cp, mv
+# and the rest never close under a shell grammar, so this rung does not grow
+# one. `helm work checkout-watch` reports the effect on the checkout.
+#
+# `git init` is judged by its directory operand, default the -C directory,
+# which is the cwd when -C is absent. Refused only when that target is the
+# shared checkout, inside it, or at or inside the lane parent `<top>-wt`.
+# An ancestor of the lane parent is not the lane parent. The exemption is
+# HELM_WORK_INTEGRATOR=1 in the process environment, never text in the
+# command. `init` is not a `_TREE_WRITES` verb.
+_CHECK_IGNORE_TIMEOUT = 0.4
+_WRITE_CLAIM = ("claim a lane with `helm work claim <name>` and work in the "
+                "room it prints")
+_INIT_VALUED = ("-b", "--initial-branch", "--template", "--separate-git-dir",
+                "--object-format", "--ref-format", "--shared")
+
+
+def _integrator(env):
+    return (os.environ if env is None else env).get(
+        "HELM_WORK_INTEGRATOR") == "1"
+
+
+def _within(path, top):
+    return path == top or path.startswith(top + os.sep)
+
+
+def _existing_dir(path):
+    """The nearest existing directory at or above `path`, or None."""
+    probe = path if os.path.isdir(path) else os.path.dirname(path)
+    while not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None
+        probe = parent
+    return probe
+
+
+def _refused_checkout(path, cwd):
+    """The shared checkout `path` would write, or None. A gitignored path is
+    allowed. A path whose realpath is inside a rail checkout fails closed when
+    `git check-ignore` does not answer. `<top>/.git/info/exclude` stays
+    writable: private never-track names go there."""
+    try:
+        if not isinstance(path, str) or not path:
+            return None
+        if not os.path.isabs(path):
+            if not isinstance(cwd, str) or not os.path.isabs(cwd):
+                return None
+            path = os.path.join(cwd, path)
+        path = os.path.realpath(path)
+        probe = _existing_dir(path)
+        if probe is None:
+            return None
+        top = _shared_checkout(probe)
+        if top is None or not _within(path, top):
+            return None
+    except Exception:
+        return None
+    if path == os.path.realpath(os.path.join(top, ".git", "info", "exclude")):
+        return None
+    try:
+        from . import vcs
+        ran, rc, _out = vcs.backend(top).probe_outcome(
+            top, "check-ignore", "-q", "--", path,
+            timeout=_CHECK_IGNORE_TIMEOUT)
+    except Exception:
+        return top
+    if ran and rc == 0:
+        return None
+    return top
+
+
+def shared_checkout_file_refusal(path, cwd=None, env=None):
+    """(checkout, path) when a file tool would write `path` inside the shared
+    checkout, else None. The integrator's environment is the exemption a file
+    tool can carry: it has no command text."""
+    try:
+        if _integrator(env):
+            return None
+        top = _refused_checkout(path, cwd)
+        if top is None:
+            return None
+        return top, path if isinstance(path, str) else ""
+    except Exception:
+        return None
+
+
+
+def _init_target(words, j, at):
+    """The directory `git init` at words[j] would create, False for help, or
+    None when a word does not settle. No operand means the -C directory."""
+    args = words[j + 1:]
+    i = 0
+    operand = None
+    while i < len(args):
+        word = args[i]
+        v = word.value()
+        if v is None:
+            return None
+        if v in ("-h", "--help"):
+            return False
+        if v == "--":
+            i += 1
+            if i >= len(args):
+                break
+            if args[i].value() is None:
+                return None
+            operand = args[i]
+            break
+        if v in _INIT_VALUED or v in _GIT_VALUED:
+            if i + 1 >= len(args) or args[i + 1].value() is None:
+                return None
+            i += 2
+            continue
+        if v.startswith("-"):
+            i += 1
+            continue
+        operand = word
+        break
+    if operand is None:
+        return at
+    return _walk_dir(operand, at)
+
+
+def _init_refused(target):
+    """The shared checkout a `git init` of `target` would claim, or None.
+
+    Refused only at or inside the checkout, or at or inside its lane parent
+    `<checkout>-wt`. An ancestor of that parent is neither, so `git init`
+    of a new project beside the checkout passes."""
+    try:
+        if not isinstance(target, str) or not target:
+            return None
+        path = os.path.realpath(target)
+        probe = _existing_dir(path)
+        if probe is not None:
+            top = _shared_checkout(probe)
+            if top is not None and _within(path, top):
+                return top
+        for row in _tree_registry().values():
+            if not isinstance(row, dict) or not row.get("path"):
+                continue
+            shared = _shared_checkout(os.path.realpath(str(row["path"])))
+            if shared is None:
+                continue
+            if _within(path, shared + "-wt"):
+                return shared
+    except Exception:
+        return None
+    return None
+
+
+def shared_checkout_write_refusal(command, cwd=None, env=None):
+    """(checkout, spelling) when `command` runs `git init` at or inside the
+    shared checkout or its lane parent, else None. The exemption is the
+    process environment only: text containing HELM_WORK_INTEGRATOR=1 does
+    not grant it. A defect fails open and decides nothing about a later
+    rung."""
+    text = (command or "").replace("\\\n", "")
+    if "init" not in text or _integrator(env):
+        return None
+    try:
+        start = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+        for name, words, k, at, _redirects, _bodies in _commands_run(
+                text, start):
+            if (name or "").rsplit("/", 1)[-1] != "git":
+                continue
+            call = _git_subcommand(words, k, at)
+            if call is None:
+                continue
+            directory, j = call
+            if words[j].value() != "init":
+                continue
+            target = _init_target(words, j, directory)
+            if target is False or target is None:
+                continue
+            top = _init_refused(target)
+            if top is not None:
+                return top, "git init"
+    except Exception:
+        return None
+    return None
+
+
+def shared_checkout_write_message(hit):
+    """The refusal for a file write or a `git init`. The checkout is said in
+    full; the command is capped the way the verb rung caps its spelling."""
+    top, spelled = hit
+    if len(spelled) > _TREE_SPELL:
+        spelled = spelled[:_TREE_SPELL - 1] + "…"
+    return ("[helm argv-guard] BLOCKED: %s would write %s, the shared "
+            "checkout. %s. The integrator declares %s in the seat's "
+            "environment; text in the command does not count."
+            % (spelled, top, _WRITE_CLAIM, INTEGRATOR_DECLARATION))
 
 
 def cmd_argv_guard(args):
@@ -10572,10 +13287,14 @@ def cmd_argv_guard(args):
 
     An Agent call whose tool_input.model is a non-empty string exits 2 (the
     agent-model rung above): the flag never changes the model a subagent runs
-    on, and the refusal names the doors that do. Every other Agent call exits
-    0 at once and meets no other rung. (A nested-spawn reflex is NOT said
-    here: PreToolUse context reaches the model after this call has run, so it
-    rides SubagentStart instead — helm/saguide.py.)
+    on, and the refusal names the doors that do. An Agent call from a
+    subagent (agent_id present) exits 2 next (the nested-spawn rung,
+    task/1775): a delegate spawns nothing, and its parent spawns what runs
+    next. Every other Agent call exits 0 and meets no Bash rung; a
+    build-shaped one on a seat answering as Fable carries one steer to an
+    opus Workflow (fable_build_steers, task/2574). (The nested-spawn REFLEX
+    is not said here: PreToolUse context reaches the model after this call
+    has run, so it rides SubagentStart instead — helm/saguide.py.)
 
     Reads the hook payload, applies argv_guard to a Bash tool_input.command,
     and exits 2 with the cure when it matches. A Bash or Monitor call from a
@@ -10586,7 +13305,16 @@ def cmd_argv_guard(args):
     rung above, the one delegate rung); an admitted call says which grant
     admitted it. A Bash or Monitor command that runs a working-tree git verb
     in the shared checkout of a registered repository exits 2 (the
-    shared-checkout rung above), for a seat and a subagent alike.
+    shared-checkout rung above), for a seat and a subagent alike, and so
+    does one that runs a recursive grep with no path or over a broad root
+    (the recursive-grep rung above, task/3384). A Write, Edit or
+    NotebookEdit of a tracked or new file there, and a Bash or Monitor
+    `git init` whose directory operand (default the cwd) is the shared
+    checkout or its lane parent `<checkout>-wt`, exits 2 the same way (the
+    write rung above). Shell writes are not parsed. A Monitor whose command
+    runs an inbox beacon arm with a timeout_ms under the harness's cap, or
+    none, exits 2 with the corrected call (the beacon-timeout rung above,
+    task/3404).
     A Bash or Monitor command whose folded text holds a GitHub-Actions
     spelling — a gh Actions noun and verb, an Actions API path, the workflow
     directory — exits 2 unless the command carries HELM_ALLOW_GITHUB_ACTIONS=1
@@ -10610,17 +13338,31 @@ def cmd_argv_guard(args):
     try:
         d = json.load(sys.stdin)
         tool = d.get("tool_name")
-        # THE AGENT-MODEL RUNG, first and alone: an Agent call is judged on
-        # its `model` key and nothing else. Its prompt is prose for a
-        # subagent, not a shell command, so no Bash rung reads it, and the
-        # admit path imports nothing and reads no file.
+        # THE AGENT RUNGS, first and alone: an Agent call is judged on its
+        # `model` key, then on who calls, then (a steer) on its prompt's
+        # shape. Its prompt is prose for a subagent, not a shell command, so
+        # no Bash rung reads it, and a read-only main-thread call imports
+        # nothing and reads no file.
         if tool == "Agent":
             model = agent_model_refusal(d.get("tool_input") or {})
-            if model is None:
-                return 0
-            print(agent_model_message(model), file=sys.stderr)
-            return 2
-        if tool in ("Write", "Edit"):
+            if model is not None:
+                print(agent_model_message(model), file=sys.stderr)
+                return 2
+            # THE NESTED-SPAWN RUNG (task/1775): a subagent spawns nothing.
+            # Only agent_id says the caller is one (actors.SIDECHAIN_RULE),
+            # and the key is read before the import, as the Bash rung does.
+            if d.get("agent_id"):
+                from . import actors
+                if actors.sidechain_agent(d):
+                    print("[helm argv-guard] BLOCKED: "
+                          + actors.sidechain_spawn_refusal(), file=sys.stderr)
+                    return 2
+            # THE FABLE-BUILD STEER (task/2574), the pass path's one line.
+            steers = fable_build_steers(d)
+            if steers:
+                advise(admit(d.get("session_id"), steers))
+            return 0
+        if tool in ("Write", "Edit", "NotebookEdit"):
             forged = owner_posture_forge_refusal(
                 path=(d.get("tool_input") or {}).get("file_path") or "")
             if forged is not None:
@@ -10631,6 +13373,14 @@ def cmd_argv_guard(args):
                 path=(d.get("tool_input") or {}).get("file_path") or "")
             if act is not None:
                 print(github_actions_message(act, tool), file=sys.stderr)
+                return 2
+            # NotebookEdit names notebook_path; Write and Edit name
+            # file_path. The forge and Actions rungs stay on file_path.
+            path = ((d.get("tool_input") or {}).get("file_path")
+                    or (d.get("tool_input") or {}).get("notebook_path"))
+            wrote = shared_checkout_file_refusal(path, d.get("cwd"))
+            if wrote is not None:
+                print(shared_checkout_write_message(wrote), file=sys.stderr)
                 return 2
             _tree_advise(d, (d.get("tool_input") or {}).get("file_path"),
                          first=_act_write_steers(d))
@@ -10658,9 +13408,18 @@ def cmd_argv_guard(args):
         # THE SIDECHAIN AUTHORITY RUNG rides the same key (task/3060): a
         # delegate may not run a verdict-class write unless its seat granted
         # it (`_sidechain_authority`, helm/delegate_grant.py).
+        # THE DELEGATE MARK rides it too: a `helm chat read` delivers to the
+        # seat it runs as, and a delegate reads as its seat, so a delegate
+        # call that RUNS a chat read or ack marks the session and a read
+        # inside the mark delivers nothing (helm.pull_delivery). A call that
+        # only names chat (a path to helm/chat.py) marks nothing
+        # (`runs_a_seat_read`, task/3696).
         granted = []
         if d.get("agent_id"):
             from . import actors
+            if actors.sidechain_agent(d) and runs_a_seat_read(cmd):
+                from .pull_delivery import mark_delegate
+                mark_delegate(d.get("session_id"))
             if actors.sidechain_agent(d) and sidechain_beacon_presence(cmd):
                 print("[helm argv-guard] BLOCKED: %s"
                       % actors.sidechain_beacon_refusal(), file=sys.stderr)
@@ -10687,7 +13446,28 @@ def cmd_argv_guard(args):
         if tree is not None:
             print(shared_checkout_message(tree), file=sys.stderr)
             return 2
+        # THE RECURSIVE-GREP RUNG, Bash and Monitor alike (task/3384): a
+        # grep that walks a tree with no bound.
+        walk = recursive_grep_refusal(cmd, d.get("cwd"))
+        if walk is not None:
+            print(recursive_grep_message(walk), file=sys.stderr)
+            return 2
+        # THE WRITE RUNG, Bash and Monitor alike (task/3301): git init
+        # whose directory operand is the shared checkout or `<checkout>-wt`.
+        # Shell writes are not parsed; checkout-watch reports those.
+        wrote = shared_checkout_write_refusal(cmd, d.get("cwd"))
+        if wrote is not None:
+            print(shared_checkout_write_message(wrote), file=sys.stderr)
+            return 2
         if tool != "Bash":
+            # THE BEACON-TIMEOUT RUNG, Monitor only (task/3404): a beacon
+            # arm under the harness's 30-minute cap. It stands after every
+            # other rung, so a subagent's arm has already met the sidechain
+            # refusal and is never told how to arm one.
+            short = beacon_timeout_refusal(d.get("tool_input"))
+            if short is not None:
+                print(beacon_timeout_message(short), file=sys.stderr)
+                return 2
             _tree_advise(d, cmd, first=granted)
             return 0
         blocked = argv_guard(cmd)
@@ -10734,8 +13514,13 @@ def cmd_argv_guard(args):
                   "variable through a quoted heredoc, then pass the "
                   "variable:\n"
                   "  evidence=$(cat <<'EOF'\n  ...evidence...\nEOF\n  )\n"
-                  "  helm dispatch verdict ID TIP --fix \"$evidence\"\n"
-                  "or single-quote evidence that needs no apostrophes."
+                  "  helm dispatch verdict ID TIP --fix --finding-count N "
+                  "--prior-relation RELATION <your other verdict flags> "
+                  "\"$evidence\"\n"
+                  "Keep your basis and exit-answer flags (including "
+                  "--patch-tip or --no-patch-because); RELATION is "
+                  "new|uncured|regression-of-cure|UNKNOWN. Or single-quote "
+                  "evidence that needs no apostrophes."
                   % why, file=sys.stderr)
             return 2
         if cure == "commit":
@@ -10767,6 +13552,13 @@ def log_flush(rooms=None, report=None):
     before a flush. HELM_CHAT_LOG=0 disables (returns -1); else returns rows
     appended."""
     if log_disabled():
+        return -1
+    isolated = journal_write_refusal()
+    if isolated:
+        # This namespace's rows are not the fleet's history. Its flush is OFF,
+        # not failed: the watchdog records nothing and alerts nobody.
+        if report is not None:
+            report["isolated"] = isolated
         return -1
     # Lifecycle truth flushes BEFORE lossy rendered rows, and its copy stays
     # WHOLE: the meld lifecycle journal is the coherent state machine, so a
@@ -11019,6 +13811,8 @@ def flush_outcome(appended, report, error=None):
         return "failed", ("log-flush raised: %s"
                           % (str(error) or error.__class__.__name__))
     if appended is not None and appended < 0:
+        if report.get("isolated"):
+            return "off", "log-flush refused: %s" % report["isolated"]
         return "off", "log-flush disabled (HELM_CHAT_LOG=%s)" % (
             home.env("CHAT_LOG") or "")
     down = report.get("lifecycle_down")
@@ -11182,8 +13976,11 @@ def _obligated_seat():
         return os.environ.get("HELM_LANDER") or ""
 
 
-def _deliver_flush_alert(text):
-    """Put the alarm in front of somebody who is ACTUALLY THERE.
+def _deliver_flush_alert(text, who=None):
+    """Put the alarm in front of somebody who is ACTUALLY THERE. `who` is the
+    alarm signing it: SIGN_WATCHDOG_WHO for the signing alarm, otherwise
+    FLUSH_WATCHDOG_WHO, so every alarm sharing this delivery keeps its own
+    filterable machine label.
 
     A DM "succeeds" for a seat that never joined — seats.dm is fail-open by
     design, and rightly so for ordinary mail, which waits in a lane until its
@@ -11227,9 +14024,9 @@ def _deliver_flush_alert(text):
     if to and membership != "ABSENT":
         # UNKNOWN still DMs — over-waking is recoverable, silence is not — the
         # send is simply no longer allowed to answer "was anybody told?".
-        if _dm_alert(to, text) and membership == "JOINED":
+        if _dm_alert(to, text, who) and membership == "JOINED":
             return True            # a live addressee has it; one message is enough
-    return _post_alert(to, text)
+    return _post_alert(to, text, who)
 
 
 def _alert_membership(to):
@@ -11245,10 +14042,16 @@ def _alert_membership(to):
         return "UNKNOWN"
 
 
-def _dm_alert(to, text):
+def _dm_alert(to, text, who=None):
     try:
         from . import seats
-        sent, why = seats.dm(to, text, who=FLUSH_WATCHDOG_WHO)
+        # EACH ALARM'S LABEL IS SPELLED AT ITS OWN CALL SITE, as a module
+        # constant, so the sender audit reads it and machine_senders must
+        # carry it; a label computed at run time would be invisible to both.
+        if who == SIGN_WATCHDOG_WHO:
+            sent, why = seats.dm(to, text, who=SIGN_WATCHDOG_WHO)
+        else:
+            sent, why = seats.dm(to, text, who=FLUSH_WATCHDOG_WHO)
         # BOTH LEGS MUST AGREE. dm's contract is (row, None) or (None, reason);
         # reading any non-None row as delivery would suppress the room leg
         # while reporting success — a silent wake-path loss inside the cure for
@@ -11258,16 +14061,229 @@ def _dm_alert(to, text):
         return False
 
 
-def _post_alert(to, text):
+def _post_alert(to, text, who=None):
     """The room leg. ADDRESSED when there is a name to address, and a plain row
     when there is not — never a literal "@" with nothing after it, which is the
     unaddressed post the whole mechanism exists to avoid. Seats homed to #helm
     are woken by an ordinary row either way."""
+    body = ("@%s %s" % (to, text)) if to else text
     try:
-        return post(("@%s %s" % (to, text)) if to else text,
-                    room=FLUSH_ALERT_ROOM, who=FLUSH_WATCHDOG_WHO) is not None
+        if who == SIGN_WATCHDOG_WHO:
+            return post(body, room=FLUSH_ALERT_ROOM,
+                        who=SIGN_WATCHDOG_WHO) is not None
+        return post(body, room=FLUSH_ALERT_ROOM,
+                    who=FLUSH_WATCHDOG_WHO) is not None
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# THE SIGNING ALARM — a live signing degradation pages the maintenance seat
+# ---------------------------------------------------------------------------
+# A signing degradation is a flag that reaches someone in charge of fixing it,
+# not a badge the owner has to find on the web console and ask about. The
+# durability alarm above already answers that question for the journal, so
+# this is the SAME alarm over the ONE transport truth, riding the same timer
+# run:
+#
+#   * it reads `transport_status(fleet=True)`, which has already resolved every
+#     failure whose cause is gone and scoped every dark seat's failure away, so
+#     only a LIVE degradation (DEGRADED) or an unmeasurable one (UNKNOWN) can
+#     page — a dark seat's history never does;
+#   * the obligated seat is `_obligated_seat()` and the channel is picked by
+#     membership in `_deliver_flush_alert` — never an @ of the owner, whose
+#     chat address wakes nobody;
+#   * two consecutive checks fire, then doubling (2, 4, 8, ...), a WORSENING
+#     (UNKNOWN to DEGRADED, or a profile or cause the last page did not name)
+#     fires on its own next check, an undelivered page is never recorded and
+#     is retried, and recovery says RESTORED with the evidence that cleared it.
+#
+# Its bookkeeping lives beside the incident map in RAM, like the map: a reboot
+# wipes both together, and the signed transport writes nothing to disk.
+SIGN_WATCHDOG_WHO = "chat-signing"
+SIGN_ALERT_STREAK = FLUSH_ALERT_STREAK
+SIGN_WATCHDOG_READER = "signing watchdog (the helm chat log-flush timer)"
+
+
+def _sign_alarm_path():
+    """The alarm's bookkeeping, beside the incident map and held to the same
+    ownership law: a squatted directory or a planted file is refused, never
+    read as the streak."""
+    _validate_sign_failure_owner()
+    path = os.path.join(sign_failures_dir(), ".sign-alarm.json")
+    if os.path.lexists(path):
+        st = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise PermissionError("signing alarm state is not owned by this uid")
+    return path
+
+
+def _sign_alarm_rows(st):
+    rows = st.get("failed_profiles") if isinstance(st, dict) else None
+    rows = rows if isinstance(rows, list) and rows else [st or {}]
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _sign_fingerprint(st):
+    """What one page is ABOUT: each live failure's profile, code and cause
+    verdict. A check whose set holds anything the last page did not name is a
+    worsening, whatever the streak says."""
+    return sorted({"%s|%s|%s" % (r.get("profile") or "?", r.get("code") or "?",
+                                 r.get("cause_state") or r.get("state") or "?")
+                   for r in _sign_alarm_rows(st)})
+
+
+def signing_watchdog(post_alert=True, now=None):
+    """Read the fleet's transport truth ONCE and page the maintenance seat on
+    the second consecutive live degradation. Returns {state, reason, streak,
+    fired, delivered, recovered}. A status read that raises is itself the
+    finding (UNKNOWN); the one thing that raises out is its own RAM
+    bookkeeping refused by the ownership law, which the timer leg reports."""
+    now = time.time() if now is None else now
+    try:
+        st = transport_status(fleet=True, reader=SIGN_WATCHDOG_READER)
+    except Exception as exc:              # noqa: BLE001 — unreadable is UNKNOWN
+        st = {"mode": "unknown", "state": "UNKNOWN", "profile": "?",
+              "code": "transport_status_raised",
+              "reason": "the transport status read raised",
+              "cause_state": CAUSE_UNKNOWN,
+              "cause": "the transport status read raised (%s)"
+                       % exc.__class__.__name__}
+    st = st if isinstance(st, dict) else {}
+    state = st.get("state") if st.get("mode") in ("degraded", "unknown") \
+        else "ok"
+    path = _sign_alarm_path()
+    rec = pk.read_json(path, {}) or {}
+    if state == "ok" and not rec:
+        # A HEALTHY FLEET WITH NO EPISODE ON RECORD WRITES NOTHING, so a quiet
+        # timer never mints incident state it has no incident to keep.
+        return {"state": state, "reason": "", "streak": 0, "fired": False,
+                "delivered": False, "recovered": False}
+    prior_streak = rec.get("streak") or 0
+    prior_alerted = rec.get("alerted_streak") or 0
+    prior_state = rec.get("alerted_state")
+    prior_fp = rec.get("alerted_fp") or []
+    restore_owed = rec.get("restore_owed") or 0
+    fp = _sign_fingerprint(st) if state != "ok" else []
+    head = _public_transport(_sign_alarm_rows(st)[0]) if state != "ok" else {}
+    reason = ("%s %s: %s" % (head.get("profile") or "?",
+                             head.get("code") or "?",
+                             head.get("cause") or head.get("reason") or "?")
+              if state != "ok" else "")
+    if state == "ok":
+        new = {"state": "ok", "streak": 0, "since": None, "alerted_streak": 0,
+               "alerted_state": None, "alerted_fp": [], "last_ok": now,
+               "restore_owed": prior_alerted or restore_owed,
+               "episode_streak": prior_streak or rec.get("episode_streak") or 0}
+    else:
+        new = dict(rec, state=state, streak=prior_streak + 1,
+                   since=rec.get("since") or now, reason=reason,
+                   alerted_streak=prior_alerted, restore_owed=0)
+    new["last_run"] = now
+    worsened = state != "ok" and prior_alerted > 0 and (
+        (state == "DEGRADED" and prior_state == "UNKNOWN")
+        or bool(set(fp) - set(prior_fp)))
+    fired = state != "ok" and new["streak"] >= SIGN_ALERT_STREAK and (
+        worsened or new["streak"] >= max(SIGN_ALERT_STREAK, prior_alerted * 2))
+    recovered = state == "ok" and new["restore_owed"] > 0
+    delivered = False
+    if fired and post_alert:
+        delivered = _deliver_flush_alert(_signing_alert_text(st, new, now),
+                                         who=SIGN_WATCHDOG_WHO)
+        # AN UNDELIVERED PAGE IS NOT A PAGE: the mark is written only when a
+        # message landed, so the very next check tries again.
+        if delivered:
+            new.update(alerted_streak=new["streak"], alerted_state=state,
+                       alerted_fp=fp, alerted_at=now)
+    if recovered and post_alert:
+        delivered = _deliver_flush_alert(
+            _signing_restored_text(st, new["episode_streak"]),
+            who=SIGN_WATCHDOG_WHO)
+        if delivered:
+            new["restore_owed"] = 0
+    os.makedirs(sign_failures_dir(), mode=0o700, exist_ok=True)
+    pk.write_json(path, new)
+    return {"state": state, "reason": reason, "streak": new["streak"],
+            "fired": bool(fired), "delivered": delivered,
+            "recovered": bool(recovered)}
+
+
+def _no_mention(text):
+    """Failure text is quoted, never addressed: an `@` inside a reason or a
+    redacted URL must not wake a seat the alarm is not written to."""
+    return str(text or "").replace("@", "(at)")
+
+
+def _signing_alert_text(st, rec, now):
+    """The page the maintenance seat wakes to. OUTCOME FIRST — who cannot
+    sign, and whether that is measured or unmeasurable — then how old, then
+    the cause verdict, then the one command that shows it."""
+    rows = [_public_transport(r) for r in _sign_alarm_rows(st)]
+    f = rows[0]
+    who = _no_mention(f.get("profile") or "?")
+    lead = ("CHAT SIGNING DEGRADED: %s cannot sign" % who
+            if rec.get("state") == "DEGRADED" else
+            "CHAT SIGNING UNKNOWN: whether %s can sign cannot be measured" % who)
+    more = len(rows) - 1
+    streak, since = rec.get("streak") or 0, rec.get("since")
+    return _no_mention(
+        "%s — %s (%s); failing since %s, last %s (%s ago), %d failure%s%s. "
+        "Cause: %s. Seen on %d consecutive checks over %s. `helm chat "
+        "transport status` shows it; remediation: %s." % (
+            lead, f.get("reason") or "unknown", f.get("code") or "?",
+            f.get("first_failure") or "?", f.get("last_failure") or "?",
+            _dur(f.get("last_age_s") or 0), f.get("failure_count") or 1,
+            "s"[:(f.get("failure_count") or 1) != 1],
+            "; +%d more failing profile%s" % (more, "s"[:more != 1])
+            if more else "",
+            f.get("cause") or "not recorded", streak,
+            _dur(now - since) if since else "?",
+            f.get("remediation") or "repair signing, then retry"))
+
+
+def _signing_restored_text(st, streak):
+    """The page that closes an episode, naming what cleared it."""
+    events = [_resolution_public(e) for e in (st.get("resolved") or ())
+              if isinstance(e, dict)]
+    if events:
+        e = events[0]
+        how = "%s's %s resolved itself — %s" % (e["profile"], e["code"],
+                                                e["probe"])
+    elif st.get("dark_failures") or st.get("expected_failures"):
+        # AN EXPECTED STATE IS STILL UNSIGNED: a failure reclassified as a
+        # seat's expected state (`_expected_unsigned`) closes the episode
+        # without anything being restored, and the page says so.
+        n = len(st.get("dark_failures") or ())
+        e = len(st.get("expected_failures") or ())
+        how = "; ".join(["no live signing failure remains"] + (
+            ["%d failure%s now scoped to a dark seat" % (n, "s"[:n != 1])]
+            if n else []) + (
+            ["%d now scoped as the expected state of a seat run outside helm "
+             "launch, whose posts still go out unsigned" % e] if e else []))
+    else:
+        how = "no live signing failure remains"
+    return _no_mention(
+        "CHAT SIGNING RESTORED: %s, after %d consecutive failing check%s. "
+        "`helm chat transport status` shows the fleet." % (
+            how, streak, "s"[:streak != 1]))
+
+
+def _signing_watchdog_leg():
+    """The timer run's signing check. Never raises and never changes the
+    log-flush exit: the flush is the unit's job, and this rides it."""
+    try:
+        got = signing_watchdog()
+    except Exception as exc:              # noqa: BLE001 — a leg, not the run
+        print("helm chat: signing watchdog raised — %s: %s"
+              % (exc.__class__.__name__, _safe_reason(str(exc))),
+              file=sys.stderr)
+        return
+    if got.get("state") not in (None, "ok"):
+        print("helm chat: signing %s — %s [consecutive check %d%s]"
+              % (got["state"], got.get("reason") or "",
+                 got.get("streak") or 0,
+                 "; paged %s" % _obligated_seat() if got.get("delivered")
+                 else ""), file=sys.stderr)
 
 
 def flush_health(now=None):
@@ -11347,7 +14363,10 @@ LOGFLUSH_INTERVAL_S = 180
 
 
 def _logflush_timer_units(interval=LOGFLUSH_INTERVAL_S,
-                          boot=LOGFLUSH_BOOT_DELAY_S):
+                          boot=LOGFLUSH_BOOT_DELAY_S, inputs=None):
+    # `inputs` replaces per-install values (timerhealth.unit_values): the
+    # drift census renders this template with wildcards (task/3405).
+    from . import timerhealth
     # Same two laws as autocompact's units: never capture a worktree's helm
     # (a persistent unit outlives the lane), and WorkingDirectory is DERIVED
     # (find_root folds a lane worktree back to the shared checkout) — a
@@ -11356,9 +14375,11 @@ def _logflush_timer_units(interval=LOGFLUSH_INTERVAL_S,
     from . import work
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cwd = work.find_root(here) or here
-    service = _LOGFLUSH_UNIT_SERVICE % {"helm": helm_bin, "cwd": cwd}
-    timer = _LOGFLUSH_UNIT_TIMER % {"interval": interval, "boot": boot}
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    service = _LOGFLUSH_UNIT_SERVICE % timerhealth.unit_values(
+        {"helm": helm_bin, "cwd": cwd}, inputs)
+    timer = _LOGFLUSH_UNIT_TIMER % timerhealth.unit_values(
+        {"interval": interval, "boot": boot}, inputs)
+    udir = timerhealth.user_unit_dir()
     return (os.path.join(udir, "helm-chat-logflush.service"), service,
             os.path.join(udir, "helm-chat-logflush.timer"), timer)
 
@@ -11392,8 +14413,15 @@ def _logflush_install_timer(args):
     rc = 0
     for argv in (("daemon-reload",),
                  ("enable", "--now", "helm-chat-logflush.timer")):
-        p = subprocess.run(["systemctl", "--user"] + list(argv),
-                           capture_output=True, text=True)
+        try:
+            p = subprocess.run(["systemctl", "--user"] + list(argv),
+                               capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            print("helm chat log-flush: systemctl %s FAILED: %s"
+                  % (" ".join(argv), exc),
+                  file=sys.stderr)
+            rc = 1
+            continue
         if p.returncode:
             print("helm chat log-flush: systemctl %s FAILED — %s"
                   % (" ".join(argv), (p.stderr or p.stdout).strip()),
@@ -11523,7 +14551,8 @@ HELP = {
             "expiry — its stdout must "
             "be a pipe; a background shell writes wake-lines to a file that "
             "wakes nobody, and the beacon refuses that shape) "
-            "[--replace] [--ambient] [--on-behalf] [--timeout SECONDS]\n"
+            "[--replace] [--ambient] [--per-row] [--on-behalf] "
+            "[--timeout SECONDS]\n"
             "  --on-behalf: this process declares no identity and is naming "
             "ANOTHER seat — a supervisor arming a beacon for a seat it is "
             "standing up. It drains that seat's inbox, so it must be said.\n"
@@ -11535,9 +14564,27 @@ HELP = {
             "(default: this session's seat).\n"
             "  --room sets the primary room (--any watches ONLY that room, "
             "every row, no cursor).\n"
-            "  --follow never returns on a match: it streams each matching "
-            "row as one flushed\n"
-            "  line (the idle-wake beacon) and returns rc 0 only on timeout. "
+            "  --follow never returns on a match (rc 0 only on timeout); it is "
+            "a DOORBELL. While the\n"
+            "  seat has unread addressed rows it prints ONE line — the whole "
+            "body (1200 characters\n"
+            "  at most) of the row to act on: the owner's, then a DM, then "
+            "the newest row addressed\n"
+            "  to you; an @all never leads while one is unread. A row whose "
+            "dispatch row or task\n"
+            "  already closed is released, not rung. Then the unread counts "
+            "and ONE pull,\n"
+            "  `helm chat read --id ID,ID,...`, naming exactly the rows to act "
+            "on — then stays silent\n"
+            "  until a new row lands, or re-rings every "
+            "HELM_BEACON_BACKSTOP_S (720 s) while the rows\n"
+            "  it announced stay unread. New rows coalesce for "
+            "HELM_BEACON_DEBOUNCE_S (60 s); an owner row\n"
+            "  or a DM rings at once, past the cap; other rings stop at "
+            "HELM_BEACON_RINGS_PER_H (12) an hour and\n"
+            "  the counts accumulate. After a ring, pull with helm chat read "
+            "and read what is\n"
+            "  addressed first. --per-row restores one line per matching row. "
             "The beacon default is\n"
             "  MENTION-ONLY: @mentions/replies/DMs/@all wake you; ambient "
             "home-room rows do NOT\n"
@@ -11560,10 +14607,12 @@ HELP = {
     "stop-guard": "usage: helm chat stop-guard [--seat S] [--room R] "
                   "[--detail]  (the idle gate: rc 2 lists every blocker — "
                   "unread inbox, live leases; rc 0 passes. --detail prints "
-                  "the long form of the lease block and bypasses its "
-                  "same-state latch — it is the flag that block's own footer "
-                  "names, and it is rendering only: no read, no write, and "
-                  "the verdict does not move)",
+                  "every line of the lease block in its long form — it is "
+                  "the flag that block's own footer names — and reads and "
+                  "writes no lease memory, so it answers as a first stop on "
+                  "that set would. Without --hook-json it reads the lease "
+                  "block alone for the session in the environment and "
+                  "writes nothing)",
     "seats": "usage: helm chat seats [--all] [--room R]  (the roster: "
              "presence, pending, home room, todo; --all shows absent seats)",
     "seat": "usage: helm chat seat rename <sid|oldname> <newname> "
@@ -11572,15 +14621,26 @@ HELP = {
             "rehome <sid|name> <room|main|none>",
     "dm": "usage: helm chat dm <seat> <text...> [--seat S]  (one private "
           "recipient — never a room)",
-    "ack": "usage: helm chat ack <id> [done|blocked] [--note ...] [--seat S]\n"
-           "  Mark a message ADDRESSED TO YOU as acted — done (loop closed) or "
+    "ack": "usage: helm chat ack <id|[n]> [<id|[n]> ...] [done|blocked] "
+           "[--note ...] "
+           "[--seat S]\n"
+           "  Mark messages ADDRESSED TO YOU as acted — done (loop closed) or "
            "blocked (--note the\n"
-           "  reason). One append-only ack row on the same lane; the sender "
-           "watches it leave their\n"
-           "  `helm chat pending`. <id> is the row's stable id (helm chat read "
-           "shows it). Only the\n"
-           "  recipient may ack; a foreign or unknown id is refused; an "
-           "identical repeat is a no-op.",
+           "  reason). Name EVERY row you handled in ONE call: it writes one "
+           "append-only ack row per\n"
+           "  room, naming each id, never one row per id; the senders watch "
+           "them leave their\n"
+           "  `helm chat pending`, and a read folds consecutive acks into one "
+           "line. <id> is the row's\n"
+           "  stable id: helm chat read prints its first %d characters beside "
+           "[n]. An [n] (or a bare\n"
+           "  n) is the row YOUR last `helm chat read` printed at [n]; an n "
+           "it did not print is\n"
+           "  refused, never matched against ids. Only the "
+           "recipient may ack; one\n"
+           "  foreign or unknown id refuses the whole call and nothing is "
+           "written; an identical\n"
+           "  repeat is a no-op." % ID_SHOWN,
     "pending": "usage: helm chat pending [--seat S]\n"
                "  YOUR outbound addressed rows (DMs, @mentions) not yet "
                "CONSUMED. Acked rows drop off —\n"
@@ -11656,9 +14716,31 @@ HELP = {
     "reply": "usage: helm chat reply <id|n> <text...> [--room R] [--seat S]  "
              "(id = the parent row's id, n = its 1-based number, -1 = latest)",
     "read": "usage: helm chat read [--room R] [--since N] [--limit N] "
-            "[--follow] [--dm [--seat S]]  (--limit = the NEWEST N rows; "
+            "[--follow] [--dm [--seat S]] [--short|--full] [--id ID]  "
+            "(--limit = the NEWEST N rows; "
             "--follow streams new rows until killed — it never returns on "
-            "its own)",
+            "its own)\n"
+            "  Each row prints as [n] <id> ...: n is what react and reply take, "
+            "the id what ack and reply take.\n"
+            "  --short prints a row nobody owes you on one line, its body "
+            "cut at 160 characters ending\n"
+            "  … [+K chars]; a row addressed to you, a DM, a row of your home "
+            "room and the owner's\n"
+            "  print whole. It is the default for a seat of a local model "
+            "family, and --full turns it\n"
+            "  off. --id ID prints one row whole, found by its id (or a unique "
+            "prefix) in any room or\n"
+            "  DM lane; --id ID,ID,... prints each of those rows whole, in "
+            "that order.\n"
+            "  A read is a DELIVERY for the seat it runs as: the rows it prints "
+            "in full leave that seat's\n"
+            "  doorbell counts, stop guard and tool-boundary hook. A row "
+            "outside the window, or one past\n"
+            "  what a harness shows of a long read, stays owed. A read piped "
+            "into another program (| tail, | head),\n"
+            "  --follow, a read as another seat, and a read by the seat's "
+            "subagent (or within 15 minutes\n"
+            "  of a subagent call that names chat) deliver nothing.",
     "react": "usage: helm chat react <n> <:shortcode:|emoji> [--room R] "
              "[--seat S]  (n counts messages, 1-based; -1 = latest; same "
              "react again toggles it off)",
@@ -11739,8 +14821,12 @@ HELP = {
     # rather than merely equal today.
     "node": _node_usage(),
     "transport": "usage: helm chat transport status | ack --profile NAME | "
-                 "ack --all  (ACK retires dead/renamed incidents; it does not "
-                 "claim signing recovered)",
+                 "ack --all  (status resolves a failure whose cause it "
+                 "measures gone, prints a dark seat's failure as a scoped "
+                 "line, and exits 1 on DEGRADED or UNKNOWN; ACK retires "
+                 "dead/renamed incidents; it does not claim signing "
+                 "recovered; ack exits 1 = no matching active incident, "
+                 "3 = the incident state could not be read or written)",
     # meld/council/standup HELP is populated dynamically by the MELD_VERBS
     # loop below (each spelling in its own voice) — main's static "meld" entry
     # is superseded by that restructure, so it is dropped here on purpose.
@@ -12389,10 +15475,11 @@ def cmd_chat(args):
         _advise_owner_post(text)
         return 0
     if verb == "read":
-        label = room
+        label, claimed = room, None
         if "--dm" in args:      # the recipient's own private lane
             args.remove("--dm")
-            room = dm_room(_seat_flag(args) or whoname())
+            claimed = _seat_flag(args)
+            room = dm_room(claimed or whoname())
             label = "dm"
         # guard_tail (the 9ce7b8c precedent): every remaining token must be a
         # known flag — `--limit` once meant 'the newest row' and returned
@@ -12402,12 +15489,20 @@ def cmd_chat(args):
         # ApplyReadersAreGuarded watches exactly that seam.
         from .cli import guard_tail
         grc = guard_tail("helm chat read", args[1:],
-                         flags=("--follow",),
-                         valued=("--since", "--limit"),
+                         flags=("--follow", "--short", "--full"),
+                         valued=("--since", "--limit", "--id"),
                          usage="usage: helm chat read [--room R] [--since N] "
-                               "[--limit N] [--follow] [--dm [--seat S]]")
+                               "[--limit N] [--follow] [--dm [--seat S]] "
+                               "[--short|--full] [--id ID]")
         if grc is not None:
             return grc
+        from . import chatshort        # one line per row (task/3382)
+        short, serr = chatshort.mode(args)
+        if serr:
+            print(serr, file=sys.stderr)
+            return 2
+        if "--id" in args:
+            return chatshort.read_row(args[args.index("--id") + 1], claimed)
         since = 0
         if "--since" in args:
             try:
@@ -12430,7 +15525,7 @@ def cmd_chat(args):
             return _follow(room, since)
         rows, total = read(room)
         idx = index_rows(rows)            # the WHOLE room indexes the thread:
-        tag = react_prefix(rows)          # [n] beside a row IS its `react n`,
+        tag = read_prefix(rows)           # [n] beside a row IS its `react n`,
         if limit is not None:
             # --limit = the NEWEST N (what every caller means), counting from
             # the END of the room; [n] tags stay whole-room so a react still
@@ -12439,11 +15534,42 @@ def cmd_chat(args):
         else:
             start = since if 0 <= since <= total else 0   # counted over the WHOLE
         msgs = rows[start:]               # room so --since never shifts [n]
-        for i, m in enumerate(rows[start:], start):   # a quote resolves to a
-            print(tag(i) + _fmt(m, idx=idx))          # parent older than --since
+        # A PULL THE SEAT CHOSE IS A DELIVERY of the rows that reached stdout
+        # whole (helm.pull_delivery): each line is flushed before it counts,
+        # and the rows printed before a failed write still count. Whether a
+        # filter reads stdout is asked before the first row, while a `head`
+        # is still there to be seen. A quote resolves to a parent older than
+        # --since.
+        from .pull_delivery import discharge, filtered
+        # a short read cuts only the rows nobody owes its reader, and prints
+        # every other row as this read does (chatshort.owed_to, task/3382)
+        render = chatshort.renderer(room, rows, claimed) if short and msgs \
+            else run_line
+        cut = filtered(sys.stdout)
+        printed = []
+        try:
+            # A RUN OF ACKS PRINTS AS ONE LINE (ack_runs), and the rows
+            # folded into it are printed with it: they carry no line of
+            # their own (None), so the pull counts the line once.
+            for run in ack_runs(enumerate(msgs, start)):
+                line = render(run, tag, idx)
+                print(line, flush=True)
+                printed.extend((i, m, None if k else line)
+                               for k, (i, m) in enumerate(run))
+        finally:
+            discharge(room, printed, claimed, cut=cut)
+            # THE [n] THIS READ PRINTED, for `helm chat ack [n]` (task/3382).
+            from . import seats_lastread
+            seats_lastread.remember(room, rows, printed, claimed)
         if not msgs:
-            print(empty_room_line(room, label))
-        consume(room, total)
+            print(chatshort.empty(room, label, start, total) if short
+                  else empty_room_line(room, label))
+        elif short:
+            chatshort.legend(printed)
+        # the owner-unread marker moves past every row printed, whole or
+        # cut: a row of the owner's origin is never cut, so only such a row
+        # cut would hold it (chatshort.seen, task/3382)
+        consume(room, chatshort.seen(printed, total))
         return 0
     if verb == "react":
         seat, _serr = _seat_actor(args, speech=True)
@@ -12539,7 +15665,8 @@ def cmd_chat(args):
                   % (len(acted), "s"[:len(acted) != 1], journal_dir()))
         # unreadable input means the answer above is a floor, not the truth
         return 1 if ((meta.get("unreadable") or ())
-                     or meld_report.get("state") == "UNKNOWN") else 0
+                     or meld_report.get("state") == "UNKNOWN"
+                     or out.get("state") == "UNKNOWN") else 0
     if verb == "argv-guard":
         return cmd_argv_guard(args[1:])
     if verb == "log-flush":
@@ -12552,6 +15679,11 @@ def cmd_chat(args):
         # failing, which is the exact silence this watchdog exists to break. It
         # also keeps the concurrent writer out of the state file.
         report, watched = {}, not room_given
+        if watched:
+            # THE SAME TIMER RUN CHECKS SIGNING: a live signing degradation
+            # pages the maintenance seat instead of waiting on the owner's
+            # panel. A scoped repair run is not the fleet's check.
+            _signing_watchdog_leg()
         try:
             n = log_flush(rooms=[room] if room_given else None, report=report)
         except Exception as exc:
@@ -12567,8 +15699,7 @@ def cmd_chat(args):
                   file=sys.stderr)
             return 1
         if n < 0:
-            print("helm chat: log-flush disabled (HELM_CHAT_LOG=%s)"
-                  % home.env("CHAT_LOG"))
+            print("helm chat: %s" % flush_outcome(n, report)[1])
             return 0
         health = (flush_watchdog(n, report) if watched
                   else dict(zip(("state", "reason"), flush_outcome(n, report))))

@@ -348,7 +348,7 @@ _MISSING = object()
 # reading as done. Found by `helm wiring` on its first real run, which is the
 # entire argument for that census: a rule cannot notice this, and a graph can.
 
-_USAGE = """usage: helm board show [--json]
+_USAGE = """usage: helm board show [<key>] [--json]
        helm board landed <name> <sha> <note...>
        helm board set <key> <value...> [--new]
        helm board note <key> <text...>
@@ -403,14 +403,26 @@ def cmd_board(args):
         if not isinstance(board, dict):
             print("helm board: no board at %s" % path(), file=sys.stderr)
             return 1
-        if "--json" in args:
-            print(json.dumps(board, indent=2, sort_keys=True))
+        key = next(
+            (a for a in args[1:] if not a.startswith("--")), None)
+        if key is None:
+            if "--json" in args:
+                print(json.dumps(board, indent=2, sort_keys=True))
+                return 0
+            for k in sorted(board):
+                v = board[k]
+                n = len(v) if isinstance(v, (list, dict)) else 1
+                print("  %-22s %s" % (k, "%d row(s)" % n
+                                      if isinstance(v, (list, dict)) else v))
             return 0
-        for key in sorted(board):
-            v = board[key]
-            n = len(v) if isinstance(v, (list, dict)) else 1
-            print("  %-22s %s" % (key, "%d row(s)" % n
-                                  if isinstance(v, (list, dict)) else v))
+        if key not in board:
+            print("helm board: no key %s on the board" % key, file=sys.stderr)
+            return 1
+        value = board[key]
+        if isinstance(value, (list, dict)) or "--json" in args:
+            print(json.dumps(value, indent=2, sort_keys=True))
+        else:
+            print(value)
         return 0
     if verb == "set":
         rest = [a for a in args[1:] if a != "--new"]

@@ -59,6 +59,12 @@ const FILL_COLS = [
 const FILL_BILLING = ["", "sub", "payg", "prepaid", "free"];
 
 let DECL_FILL = false;      // is the owner in fill mode right now?
+/* THE CELL SAVES STILL IN FLIGHT. Leaving fill mode is a click, and the
+   click blurs the box he was typing in, which is what saves it: that save is
+   posted a moment before the re-read on the way out. Sent together, the
+   re-read can be served before the write and draw the card without the record
+   the cell is creating, so the re-read waits for every save in here. */
+const FILL_POSTS = new Set();
 
 /* ── THE SAME ROWS THE TABLE SHOWS ────────────────────────────────────────
    The owner's ruling: "i dont understand why the accounts we pay for [aren't
@@ -210,13 +216,13 @@ function renderDeclFill() {
        file whose contents nobody knows. */
     host.innerHTML = `<div class="dunknown">✗ ${esc(DECL.unreadable)}<br>`
       + `<span class="rst">helm cannot read your accounts right now, so there is nothing safe to edit. `
-      + `Fix or move that file, then reload.</span></div>`;
+      + `An agent repairs or moves that file; reload once it has.</span></div>`;
     return;
   }
   const rows = declFillSort(fillRows());
   if (!rows.length) {
     host.innerHTML = declFillHeader(rows)
-      + `<div class="dundesc">nothing declared yet — hit “add an account”, or run one seed, and they will all be here.</div>`;
+      + `<div class="dundesc">nothing declared yet — hit “add an account”, or an agent can seed a row for every account helm measures, and they will all be here.</div>`;
     return;
   }
   host.innerHTML = declFillHeader(rows)
@@ -332,9 +338,12 @@ async function declFillPost(row, key, value, box) {
       (row.cred && row.cred.provider ? row.cred.provider + "-" : "") + row.label));
     cell.measured_key = row.measured_key;
   }
-  const r = await declPost({action: "save", account: cell,
-                            revision: DECL.revision,
-                            original_id: row.id || undefined});
+  const sent = declPost({action: "save", account: cell,
+                         revision: DECL.revision,
+                         original_id: row.id || undefined});
+  FILL_POSTS.add(sent);
+  const r = await sent;
+  FILL_POSTS.delete(sent);
   const msg = declFillMsg(row.key);
   if (r && r.error) {
     /* THE REFUSAL STAYS BESIDE THE ROW IT IS ABOUT and the box keeps what he
@@ -406,6 +415,18 @@ function declFillToggle() {
   const read = $("#declrows");
   if (read) read.hidden = DECL_FILL;
   renderDeclFill();
+  /* THE READING CARD IS RE-READ ON THE WAY BACK, not only redrawn. A cell's
+     save patches DECL.accounts and DECL.revision and redraws nothing that is
+     hidden, so the card he returns to was drawn before every cell he filled,
+     and its confirm and remove post DECL.revision. A redraw from DECL alone
+     is not enough either: the undescribed strip and the chips come from the
+     JOIN, which only the server computes, and a record a cell created is not
+     in the join the page holds. Redrawn from it, the strip still offers to
+     describe that account, and the describe opens an ADD: a second record for
+     one subscription. AFTER EVERY CELL SAVE STILL IN FLIGHT (FILL_POSTS),
+     because the click that got him here posted one. Returned, so a caller
+     can wait for the card. */
+  return DECL_FILL ? null : Promise.all(FILL_POSTS).then(() => loadDeclared());
 }
 
 if ($("#dFill")) $("#dFill").onclick = () => declFillToggle();

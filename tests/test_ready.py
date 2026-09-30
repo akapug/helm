@@ -32,6 +32,7 @@ from helm import harness, proxywatch, ready, web, web_ui_loader  # noqa: E402
 from helm import seat  # noqa: E402,F401 — the facade the impl imports below require
 from helm import seat_launch_assets, seat_lifecycle  # noqa: E402
 from helm import seat_lifecycle_runtime as seat_runtime  # noqa: E402
+from tests._ownerverbs import owner_verbs  # noqa: E402
 
 
 def _out(fn, *a):
@@ -795,6 +796,25 @@ class BeaconsSignalTest(unittest.TestCase):
         # helping; the clause says turns HAPPEN and do not arm.
         self.assertIn("TAKE TURNS", row["repair"])
 
+    def test_the_repair_says_what_the_rearm_pass_and_the_stop_rung_do_now(self):
+        """task/3055 B2 took the family scope off the --post re-arm pass, so
+        "native claude seats only" was false. task/3382 made the stop rung
+        REFUSE a local-model seat's unarmed stop, so "asks" was incomplete;
+        it refuses once per fresh stop and passes the continuation, so "until
+        it arms" was false."""
+        from helm import beacons
+        rep = _census(seats=[{"seat": "alpha"}],
+                      deaf=[{"seat": "alpha"}],
+                      unreachable=[{"seat": "alpha",
+                                    "verdict": beacons.DEAF, "agent": True}])
+        repair = ready.signal_beacons(census=lambda: rep)["repair"]
+        self.assertIn("agent HOME", repair)      # the clause itself rendered
+        self.assertNotIn("native claude seats only", repair)
+        self.assertIn("whatever their family", repair)
+        self.assertIn("refuses a local-model seat's unarmed stop once per "
+                      "fresh stop (the continuation stop passes)", repair)
+        self.assertNotIn("until it arms", repair)
+
     def test_a_DEAF_seat_the_census_could_not_place_is_not_named(self):
         """THE NEGATIVE CONTROL, and it is the whole reason only TRUE splits.
         `agent` None is the census saying it could not tell whether anybody is
@@ -1330,17 +1350,18 @@ process.stdout.write(JSON.stringify(out));
 
     def test_the_three_boards_render_their_states(self):
         board = {"ready": "NOT READY", "ts": 0, "signals": [
-            {"signal": "seats", "state": "RED",
-             "evidence": "codex GONE (pid-dead)",
-             "repair": "helm seat resume codex", "note": None},
-            {"signal": "families", "state": "GREEN",
-             "evidence": "codex HEALTHY",
-             "repair": "hidden while green",
-             "note": "WALLED: kimi AUTH-UNAVAILABLE"}]}
+            ready._row("seats", ready.RED, "codex GONE (pid-dead)",
+                       repair="helm seat resume codex",
+                       owner_repair="codex needs its pane started again"),
+            ready._row("families", ready.GREEN, "codex HEALTHY",
+                       repair="hidden while green",
+                       note="WALLED: kimi AUTH-UNAVAILABLE")]}
         out = self.render(bad=board, pending={"pending": True},
                           dark={"unavailable": "/api/ready did not answer"})
         self.assertIn("NOT READY", out["bad"])
-        self.assertIn("helm seat resume codex", out["bad"])
+        # the owner's line is drawn, and the terminal line it stands for is not
+        self.assertIn("codex needs its pane started again", out["bad"])
+        self.assertNotIn("helm seat resume codex", out["bad"])
         self.assertNotIn("hidden while green", out["bad"])
         self.assertIn("WALLED: kimi AUTH-UNAVAILABLE", out["bad"])
         self.assertIn("not read yet", out["pending"])
@@ -1354,6 +1375,157 @@ process.stdout.write(JSON.stringify(out));
         html = self.render(x=board)["x"]
         self.assertNotIn("<script>alert(1)</script>", html)
         self.assertIn("&lt;script&gt;", html)
+
+    def test_the_card_tells_the_owner_no_helm_verb_on_any_branch(self):
+        """RULE 2 ON THE SEATS PAGE'S READY PANEL (console walk 3, #5). The
+        panel opened with `helm ready`, `helm seat where`, `helm beacons`,
+        `helm seat resume`, `helm beacons --post` and "rerun helm proxywatch"
+        for a reader who does not use a terminal; on a phone they filled the
+        first screen.
+
+        Every row below is built by the REAL signal function on a branch that
+        carries a repair or a note, so the card is read over the text the
+        gauge actually sends rather than over a fixture that could be clean
+        by construction."""
+        from helm import beacons
+        seats = {"codex": ("GONE", "pid-dead"), "kimi": ("UNKNOWN", "stale-handle")}
+        cooldown = {"codex": {"state": proxywatch._PROXY_COOLDOWN, "since": "x",
+                              "dark": True, "falsification_bar_s": 1800,
+                              "seats": {"codex": {
+                                  "state": proxywatch._PROXY_COOLDOWN,
+                                  "dark": True, "falsification_due": True,
+                                  "falsification_age_s": 3600,
+                                  "falsification_seat": "codex"}}}}
+        deaf = _census(
+            seats=[{"seat": s} for s in ("alpha", "kappa", "omega", "vee")],
+            deaf=[{"seat": "omega"}], deaf_in_effect=[{"seat": "kappa"}],
+            unreachable=[{"seat": "alpha"},
+                         {"seat": "kappa", "verdict": beacons.DEAF_IN_EFFECT,
+                          "agent": True},
+                         {"seat": "omega", "verdict": beacons.DEAF,
+                          "agent": True}],
+            vacant=[{"seat": "vee"}], ghosts=[{"pid": 1, "seat": "vee"}])
+
+        def git(dirty, behind):
+            def text(_root, *argv):
+                if argv[0] == "status":
+                    return 0, " M f\n" if dirty else "", ""
+                return 0, "a" * 40 + " " + ("b" if behind else "a") * 40, ""
+            return ready.signal_checkout(root="/shared", text=text)
+        rows = [
+            ready.signal_daemon(detect=lambda: _Adapter(err="no transport")),
+            ready.signal_daemon(detect=lambda: None),
+            ready.signal_seats(registered=lambda: (list(seats), False),
+                               liveness=lambda n, repair: _lv(*seats[n])),
+            ready.signal_seats(registered=lambda: (["kimi"], False),
+                               liveness=lambda n, repair: _lv(*seats[n])),
+            ready.signal_beacons(census=lambda: _census(live_probe=False)),
+            ready.signal_beacons(census=lambda: deaf),
+            ready.signal_families(snapshot=lambda: (None, "proxywatch state "
+                                                    "is 61m old, bar 40m")),
+            ready.signal_families(snapshot=lambda: (cooldown, None),
+                                  minted=lambda: [("codex", "codex")]),
+            ready.signal_families(
+                snapshot=lambda: ({"grok": {"state": "UNKNOWN", "since": None,
+                                            "dark": False}}, None),
+                minted=lambda: [("grok", "grok")]),
+            git(dirty=True, behind=False),
+            git(dirty=False, behind=True)]
+        # THE BRANCHES ARE THE ONES NAMED: every row but the walled family's
+        # is a fault with a repair, and the walled row carries the cooldown's
+        # restart note, so the card below has something to say on each.
+        self.assertEqual([r["state"] for r in rows],
+                         [ready.RED, ready.UNKNOWN, ready.RED, ready.UNKNOWN,
+                          ready.UNKNOWN, ready.RED, ready.UNKNOWN, ready.GREEN,
+                          ready.UNKNOWN, ready.RED, ready.RED])
+        self.assertIn("restart this exact proxy", rows[7]["note"])
+        html = self.render(x={"ready": ready.NOT_READY, "ts": 0,
+                              "signals": rows})["x"]
+        # POSITIVE CONTROL on the same render: the card drew a repair line for
+        # each of the ten faults and the walled row's note, so a clean answer
+        # below is about text that was drawn.
+        self.assertEqual(html.count('class="rfix"'), 10, html)
+        self.assertIn("restart this exact proxy", html)
+        self.assertEqual(owner_verbs(html), [], html)
+        # NOR A SETTING'S NAME: the no-metaharness line named the environment
+        # variable that overrides detection, which is terminal jargon too
+        self.assertIn("no metaharness", html)
+        self.assertNotIn("HELM_METAHARNESS", html)
+
+
+class OwnerLineIsTheTerminalsFactTest(unittest.TestCase):
+    """THE OWNER'S LINE IS THE TERMINAL LINE'S FACT LESS ITS COMMAND (premise
+    webui-reads-what-agents-read-ax-equals-ux). It may drop a verb; it may not
+    widen a claim, drop a scope the terminal states, or send him to a place
+    that does not hold what it names."""
+
+    def test_a_down_or_unprovable_seat_is_not_sent_to_the_roster(self):
+        """The Seats roster row carries presence, doing, home and session,
+        never the pane state `helm seat where` prints, and it hides an absent
+        seat (no beat in 15 minutes: every dead pane) until the absent chip is
+        pressed. The pane state the gauge measured is on the card's own row."""
+        seats = {"codex": ("GONE", "pid-dead"),
+                 "kimi": ("UNKNOWN", "stale-handle")}
+        down = ready.signal_seats(registered=lambda: (list(seats), False),
+                                  liveness=lambda n, repair: _lv(*seats[n]))
+        dark = ready.signal_seats(registered=lambda: (["kimi"], False),
+                                  liveness=lambda n, repair: _lv(*seats[n]))
+        self.assertEqual((down["state"], dark["state"]),
+                         (ready.RED, ready.UNKNOWN))
+        self.assertIn("pane started again", down["owner_repair"])
+        self.assertNotIn("roster", down["owner_repair"])
+        self.assertNotIn("roster", dark["owner_repair"])
+        # WHAT THE UNKNOWN LINE POINTS AT IS ON THE ROW: each seat, its reason
+        self.assertIn("beside its name above", dark["owner_repair"])
+        self.assertIn("kimi: stale-handle", dark["evidence"])
+
+    def test_the_down_line_claims_only_the_seats_measured_down(self):
+        """A RED seats row with an unprovable seat beside a down one draws
+        both names on the card: the down seat in the evidence, the unprovable
+        one in the note just above the owner's line. The gauge measured only
+        the down seat's pane as gone, so the owner's line may say only that
+        seat needs its pane started again; "each seat named here" also took
+        in the seat whose pane it could not prove either way."""
+        seats = {"codex": ("GONE", "pid-dead"),
+                 "kimi": ("UNKNOWN", "stale-handle")}
+        row = ready.signal_seats(registered=lambda: (list(seats), False),
+                                 liveness=lambda n, repair: _lv(*seats[n]))
+        self.assertEqual(row["state"], ready.RED)
+        self.assertIn("codex GONE", row["evidence"])
+        # THE UNPROVABLE SEAT IS NAMED ON THE SAME ROW, above the owner's line
+        self.assertIn("kimi: stale-handle", row["owner_note"])
+        self.assertIn("pane started again", row["owner_repair"])
+        self.assertNotIn("named here", row["owner_repair"])
+        self.assertIn("named as down", row["owner_repair"])
+
+    def test_no_metaharness_says_none_was_detected_not_none_is_installed(self):  # noqa: VACUOUS_ASSERTION — the None from detect() IS the measured fact (orca on PATH, override none); the row's owner line is asserted to carry 'optional' and 'detected' unconditionally below
+        """detect() answers None with orca installed when HELM_METAHARNESS is
+        `none`, and when no binary is on this process's PATH, so "none is set
+        up on this machine" is a claim the gauge never measured; the terminal
+        line calls the companion optional."""
+        from helm import harness
+        self.assertIsNone(harness.detect(env={"HELM_METAHARNESS": "none"},
+                                         which=lambda b: "/usr/bin/" + b))
+        row = ready.signal_daemon(detect=lambda: None)
+        self.assertIn("optional", row["repair"])
+        self.assertIn("optional", row["owner_repair"])
+        self.assertIn("detected", row["owner_repair"])
+        self.assertNotIn("set up", row["owner_repair"])
+
+    def test_the_rearm_pass_keeps_its_project_scope_in_the_owners_words(self):
+        """resumeturn._auto_scope types only into the seats of the project the
+        watcher runs for (another project's DEAF seat is reported, never
+        typed into); the terminal line says so, and an owner line without it
+        claims the pass asks every such pane."""
+        from helm import beacons
+        rep = _census(seats=[{"seat": "alpha"}], deaf=[{"seat": "alpha"}],
+                      unreachable=[{"seat": "alpha", "verdict": beacons.DEAF,
+                                    "agent": True}])
+        row = ready.signal_beacons(census=lambda: rep)
+        self.assertIn("agent home", row["owner_repair"])   # the clause drew
+        self.assertIn("project's seats whatever their family", row["repair"])
+        self.assertIn("project's seats whatever their family",
+                      row["owner_repair"])
 
 
 if __name__ == "__main__":

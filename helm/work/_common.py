@@ -22,7 +22,7 @@ PEEK_DIRNAME = "peeks"
 _AGENT_ROOM_RE = re.compile(r"agent-[A-Za-z0-9_-]{8,64}$")
 _WORKFLOW_ROOM_RE = re.compile(r"(wf_[A-Za-z0-9_-]{3,64})-([1-9][0-9]*)$")
 _VALUE_FLAGS = ("--repo", "--seat", "--lease", "--ttl", "--drop", "--profile",
-                "--superseded")
+                "--superseded", "--task")
 
 
 def _read_small_nofollow(path, limit=4096):

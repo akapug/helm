@@ -268,6 +268,12 @@ class TreeSteerTest(_Rig):
         self.assertIn("beta's tree", said)
         self.assertIn("@" + LEAD_B, said)
         self.assertIn("helm chat post --room beta-room", said)
+        # the rule the line teaches: a READ of another lead's tree is allowed
+        # (learning an interface you consume); a CHANGE goes through its lead.
+        # The old "then leave" told a read-only researcher to stop reading.
+        self.assertIn("Reading it", said)
+        self.assertIn("to CHANGE anything here, message it", said)
+        self.assertNotIn("then leave", said)
         self.assertIn(said, err, "the debug-log copy drifted from the line "
                                  "the agent reads")
 

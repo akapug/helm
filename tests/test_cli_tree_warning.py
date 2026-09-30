@@ -23,6 +23,7 @@ from unittest import mock
 import os as _os, sys as _sys  # noqa: E402
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from tests._tmphome import home as _tmp_home  # noqa: E402
+from tests._tmphome import copy_live_tree  # noqa: E402
 _tmp_home(prefix="helm-test-treewarn-", var="HELM_HOME")
 
 from helm import cli, selfrepo  # noqa: E402
@@ -52,7 +53,7 @@ class TreeWarningTest(unittest.TestCase):
         for cmd in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
             subprocess.run(["git"] + cmd, cwd=root, check=True)
         if with_helm:
-            shutil.copytree(os.path.join(REPO, "helm"), os.path.join(root, "helm"))
+            copy_live_tree(os.path.join(REPO, "helm"), os.path.join(root, "helm"))
         open(os.path.join(root, "f"), "w").close()
         subprocess.run(["git", "add", "-A"], cwd=root, check=True)
         subprocess.run(["git", "commit", "-qm", name], cwd=root, check=True)
@@ -158,7 +159,7 @@ class SameCommitIsSilentTest(unittest.TestCase):
         self._git(self.repo, "init", "-q", "-b", "main", ".")
         self._git(self.repo, "config", "user.email", "t@t")
         self._git(self.repo, "config", "user.name", "t")
-        shutil.copytree(os.path.join(REPO, "helm"), os.path.join(self.repo, "helm"))
+        copy_live_tree(os.path.join(REPO, "helm"), os.path.join(self.repo, "helm"))
         with open(os.path.join(self.repo, "a.txt"), "w") as f:
             f.write("one\n")
         self._git(self.repo, "add", "-A")
@@ -808,8 +809,8 @@ class StaleTreeLineTest(unittest.TestCase):
         self._git("init", "-q", "-b", "main")
         self._git("config", "user.email", "t@t")
         self._git("config", "user.name", "t")
-        shutil.copytree(os.path.join(REPO, "helm"),
-                        os.path.join(self.root, "helm"))
+        copy_live_tree(os.path.join(REPO, "helm"),
+                       os.path.join(self.root, "helm"))
         shutil.copy2(os.path.join(REPO, "bin", "helm"),
                      os.path.join(self.root, "bin", "helm"))
         self.base = self._commit("base")

@@ -82,9 +82,17 @@ def _prepare(path, create=False):
 
 
 @contextlib.contextmanager
-def locked(path, timeout=None):
+def locked(path, timeout=None, unlock=True):
     """Yield True under the stable sibling lock, False when setup fails.
-    Mutations never proceed unlocked; local or ambient deadlines bound waits."""
+    Mutations never proceed unlocked; local or ambient deadlines bound waits.
+
+    `unlock=False` lets the lock go by CLOSING the descriptor only, never by
+    an explicit LOCK_UN. A flock belongs to the open file description, so an
+    unlock through any descriptor frees it for every process holding a copy,
+    while a close frees it only when the last copy closes. A caller that
+    hands the descriptor to a child it may outlive (auto-land's push,
+    `landorder`) asks for the close alone, so the lock lives until the child
+    is done."""
     try:
         ambient = projscope.deadline()
         if ambient is not None:
@@ -131,10 +139,11 @@ def locked(path, timeout=None):
         projscope.spend_or_raise("acquiring event ledger lock")
         yield True
     finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
+        if unlock:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
         os.close(fd)
 
 
@@ -667,6 +676,48 @@ def read_bytes(path):
     return result
 
 
+def tail_since(path, mark=None):
+    """(lines, mark, unavailable) — THE COMPLETE LINES APPENDED SINCE `mark`,
+    unparsed, through ONE descriptor: the cheap question a reader holding a
+    fold asks when all it needs to know is whether anything it cares about
+    landed after that fold (task/3382, the findings pass's re-read).
+
+    `mark` is (dev, ino, offset), `offset` at a line boundary. `lines` is the
+    bytes of every complete line past it, and the new mark stands after the
+    last of them, so a line still being written is read whole next time.
+    `lines` is None when nothing past the mark is known: no mark was given,
+    the file is another one (another inode, or shorter than the offset), or
+    it is missing; the mark returned then stands at the file's last line
+    boundary now. A missing file returns no mark at all.
+
+    THE SAME OPEN DISCIPLINE AS `read_bytes`: O_NOFOLLOW and a private
+    regular file with one link, every other failure UNKNOWN in the same
+    words, so a reader that asks this between two reads of that door never
+    calls a file it would refuse readable."""
+    fd = None
+    try:
+        p = _prepare(path)
+        fd = os.open(p, _reader_flags())
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError("ledger is not a private regular file")
+        same = mark is not None and (st.st_dev, st.st_ino) == tuple(mark[:2]) \
+            and 0 <= mark[2] <= st.st_size
+        if not same:
+            return None, (st.st_dev, st.st_ino,
+                          _trim_torn_tail(fd, st.st_size)), None
+        data = fsops.pread(fd, st.st_size - mark[2], mark[2])
+        cut = data.rfind(b"\n") + 1
+        return data[:cut], (st.st_dev, st.st_ino, mark[2] + cut), None
+    except FileNotFoundError:
+        return None, None, None
+    except OSError as exc:
+        return None, mark, "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def events(path):
     return checked_events(path)[0]
 
@@ -707,19 +758,57 @@ def _trim_torn_tail(fd, size):
     return 0
 
 
-def append_unlocked(path, row):
-    """Append one event while the caller holds ``locked(path)``.
+def oversize_reason(nbytes):
+    """The sentence for an event too big to append, naming BOTH numbers.
+
+    ONE SPELLING, because the writer below refuses on it and a domain door
+    that measured first (`encode`) must be able to say the same thing."""
+    return ("the event is %d bytes and one ledger event may be at most %d "
+            "bytes (eventledger.MAX_EVENT_BYTES)" % (nbytes, MAX_EVENT_BYTES))
+
+
+def encode(row):
+    """(payload, reason) — the EXACT bytes an append writes for `row`.
+
+    The terminator is included, because `MAX_EVENT_BYTES` bounds the line a
+    reader counts off the disk. A caller that must keep a row under a budget
+    measures it HERE rather than with its own `json.dumps`: the flags differ
+    in ways that matter (ensure_ascii triples non-ASCII), and a measurement
+    made with an encoder the ledger never runs is not a measurement.
+
+    `payload` is None when the row cannot be encoded at all; it is the bytes
+    (and `reason` names the cap) when they are too many."""
+    try:
+        payload = (json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                   + "\n").encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        return None, ("the event cannot be encoded as UTF-8 JSON (%s: %s)"
+                      % (type(exc).__name__, str(exc)[:200]))
+    if len(payload) > MAX_EVENT_BYTES:
+        return payload, oversize_reason(len(payload))
+    return payload, None
+
+
+def append_unlocked_checked(path, row):
+    """(appended, reason) — append one event while the caller holds
+    ``locked(path)``, and say WHY when it is refused.
 
     Repairs a pre-existing torn tail, writes once, fsyncs, and rolls a partial
     write back. A newly-created ledger is not acknowledged until its containing
     directory entry has also been fsynced.
+
+    A REFUSAL CARRIES ITS CAUSE. `append_unlocked` answers only True/False,
+    and every domain door above it turned False into one bare line ("ledger
+    refused the write") that was equally true of an oversized row, a symlinked
+    ledger, a short write and a failing disk — so the operator could not tell a
+    row that will never fit from a disk that might recover. `reason` is None on
+    success and otherwise a sentence fragment each door can quote.
     """
     fd, before = None, None
     try:
-        payload = (json.dumps(row, ensure_ascii=False, separators=(",", ":"))
-                   + "\n").encode("utf-8")
-        if len(payload) > MAX_EVENT_BYTES:
-            return False
+        payload, reason = encode(row)
+        if reason:
+            return False, reason
         p = _prepare(path, create=True)
         new_file = not os.path.exists(p)
         fd = os.open(p, _flags(os.O_RDWR | os.O_APPEND | os.O_CREAT), 0o600)
@@ -731,10 +820,13 @@ def append_unlocked(path, row):
         if before != st.st_size:
             os.ftruncate(fd, before)
             os.fsync(fd)
-        if os.write(fd, payload) != len(payload):
+        wrote = os.write(fd, payload)
+        if wrote != len(payload):
             os.ftruncate(fd, before)
             os.fsync(fd)
-            return False
+            return False, ("short write: %d of %d bytes reached the ledger; "
+                           "the append was rolled back"
+                           % (wrote, len(payload)))
         try:
             os.fsync(fd)
             if new_file:
@@ -743,17 +835,27 @@ def append_unlocked(path, row):
             os.ftruncate(fd, before)
             os.fsync(fd)
             raise
-        return True
-    except (OSError, TypeError, ValueError):
+        return True, None
+    except (OSError, TypeError, ValueError) as exc:
+        rolled = ""
         if fd is not None and before is not None:
             try:
                 os.ftruncate(fd, before)
+                rolled = "; the append was rolled back"
             except OSError:
-                pass
-        return False
+                rolled = "; the rollback ALSO failed"
+        return False, "%s: %s%s" % (type(exc).__name__, exc, rolled)
     finally:
         if fd is not None:
             os.close(fd)
+
+
+def append_unlocked(path, row):
+    """Append one event while the caller holds ``locked(path)`` -> bool.
+
+    The boolean door many ledgers were built on; `append_unlocked_checked`
+    is the same write with the reason kept."""
+    return append_unlocked_checked(path, row)[0]
 
 
 def append(path, row):

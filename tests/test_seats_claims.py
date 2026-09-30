@@ -383,6 +383,9 @@ class RebindRefusalTest(HolderRebindBase):
         self.assertEqual([ok, moved, self.ledger() == broken],
                          [False, [], True], msg)
         # POSITIVE CONTROL: the same call against a PARSEABLE ledger lands.
+        # The broken file is removed first: `claim` refuses it too, and never
+        # writes over it (task/3643).
+        os.unlink(claims_path())
         self.claim(RES_A, ALICE, SID_A)
         ok2, msg2, moved2 = seats_claims.rebind_claim_holder(ALICE, BOB)
         self.assertEqual([ok2, self.resources(moved2)], [True, [RES_A]], msg2)
@@ -665,15 +668,43 @@ from helm import seats, seats_common
 go, armed, call, bound = sys.argv[2:6]
 # THE BOUND IS SET HERE, IN THE CHILD: a parent-side patch never reaches it.
 seats_common.CLAIM_LOCK_WAIT_S = float(bound)
+# EVERY TAKE OF THE CLAIMS LOCK IS COUNTED: a door that waits polls, and a
+# door that does not wait takes once. The count is what the call DID, which
+# no host load can move; elapsed time is what the host let it do.
+takes = []
+_take = seats_common._flocked
+def _counted(path, *args, **kwargs):
+    if path.endswith(".claims.json.lock"):
+        takes.append(path)
+    return _take(path, *args, **kwargs)
+seats_common._flocked = _counted
+# EVERY SLEEP THE CALL ASKS FOR IS COUNTED, with the seconds it asked for.
+# A door that waits sleeps between its takes; a door that does not wait never
+# sleeps; and the seconds a door asks to sleep are what it chose to wait,
+# which a loaded host cannot lengthen the way it lengthens elapsed time.
+naps = []
+_sleep = time.sleep
+def _counted_sleep(seconds):
+    naps.append(seconds)
+    return _sleep(seconds)
 open(armed, "w").close()
 while not os.path.exists(go):
     time.sleep(0.01)
+time.sleep = _counted_sleep
 start = time.monotonic()
 try:
     out = {"result": eval(call)}
 except Exception as exc:
     out = {"error": "%s: %s" % (type(exc).__name__, exc)}
 out["elapsed"] = time.monotonic() - start
+# The wall the call actually returned: recorded in wall-clock time so the
+# parent can compare it against the wall the release file was written. The
+# monotonic "elapsed" above stays because the other arms read it; load lengthens
+# elapsed by whatever it delays the child's own timer, but it cannot make a
+# call report a wall BEFORE the release that wrote it.
+out["end_wall"] = time.time()
+out["takes"] = len(takes)
+out["naps"], out["napped"] = len(naps), sum(naps)
 print(json.dumps(out, default=str))
 """
 
@@ -850,21 +881,30 @@ class ClaimsLockWaitIsBoundedTest(HolderRebindBase):
                     text = got["result"][1]
                 self.assertIn(named, text)
                 self.assertIn(remedy, text)
-                # It WAITED the bound (a live holder gets that long) and then
-                # stopped waiting.
+                # It WAITED the bound (a live holder gets that long), polling
+                # the lock meanwhile, and then STOPPED: no more takes than
+                # the bound holds polls, and no more sleep asked for than the
+                # bound plus one poll. A loaded host lengthens every poll, so
+                # it can only lower those counts, never raise them, where it
+                # lengthens the elapsed time past any fixed ceiling.
+                poll = seats_common.CLAIM_LOCK_POLL_S
                 self.assertGreaterEqual(got["elapsed"], bound * 0.99)
-                self.assertLess(got["elapsed"], bound + self.period)
+                self.assertGreater(got["takes"], 1)
+                self.assertLessEqual(got["takes"], bound / poll + 2)
+                self.assertLessEqual(got["napped"], bound + poll)
         self.assertIsNone(out["claim"]["result"][2])
         # The GC leg only tidies: every writer persists its own sweep. So it
         # does not wait, and it never writes without the lock.
         self.assertIn(RES_A, out["claims-list"]["result"])
         self.assertNotIn(self.RES_OLD, out["claims-list"]["result"])
-        # "Does not wait" means below the floor every waiting door is held to
-        # above: a door that waited returns no sooner than 0.99 * bound. A
-        # smaller fixed fraction of the bound would also bound how slow the
-        # call's own work may be, and on a loaded build host that work alone
-        # measured 0.65 of the bound.
-        self.assertLess(out["claims-list"]["elapsed"], bound * 0.99)
+        # "Does not wait" is ONE TAKE of the lock and NO SLEEP, where every
+        # waiting door above polled it more than once and slept between
+        # polls. Elapsed time cannot say it: the call's own work (a /proc
+        # walk for liveness) grows with the host's process count, and on a
+        # loaded build host it alone outlasts the bound every waiting door is
+        # held to.
+        self.assertEqual(out["claims-list"]["takes"], 1)
+        self.assertEqual(out["claims-list"]["naps"], 0)
 
         # NOTHING PROCEEDED WITHOUT THE LOCK: once the holder is gone the
         # ledger is byte-identical, so the refused release left its lease.
@@ -883,6 +923,10 @@ class ClaimsLockWaitIsBoundedTest(HolderRebindBase):
         held = seats_claims._flock_holder(self.lock)
         self.assertEqual(held[0], holder.pid)
         self.assertNotIn(held[1], ("T", "t", "D", "Z"))
+        # RELEASE time in wall-clock: the child's end_wall must be at or after
+        # this, which load cannot break (a delayed child simply reports a later
+        # wall, never one before the release was written).
+        released_at = time.time()
         open(release, "w").close()
         out = self.collect(procs)
         self.assertEqual(
@@ -897,8 +941,13 @@ class ClaimsLockWaitIsBoundedTest(HolderRebindBase):
         self.assertEqual(out["rollback"]["result"], 1)
         for name, got in out.items():
             with self.subTest(operation=name):
-                # MUST-HIT: it really waited behind the holder.
-                self.assertGreater(got["elapsed"], self.period * 0.9)
+                # MUST-HIT: it really waited behind the holder — each call RETURNED
+                # AFTER the release was written. Proved by wall clock, not by a
+                # fraction of the period that host load can break.
+                self.assertGreaterEqual(
+                    got["end_wall"], released_at,
+                    "call %r reported a wall before the release was written: %r < %r"
+                    % (name, got["end_wall"], released_at))
         # THE BOUND, stated as the relation that keeps a live holder safe:
         # on the product's own constants, and on the scaled pair this arm ran.
         self.assertGreaterEqual(seats_common.CLAIM_LOCK_WAIT_S,

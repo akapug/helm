@@ -232,3 +232,112 @@ class UnregisteredServerTest(WebServeBase):
         self.assertTrue(out)
         self.assertIn("UNREGISTERED", out[0][1])
         self.assertIn("start time unknown", out[0][1])
+
+
+class AdHocWebServersTest(WebServeBase):
+    """task/3715: `helm doctor` lists every ad hoc `helm web` (any one that is
+    not the owner's helm-web unit) with its port, RSS, age and the tree it
+    serves. An ad hoc server has no memory bound of its own: one left polling
+    from a single open tab reached 4.5 GB in about 54 minutes.
+
+    A SYNTHETIC /proc, so the arms say what the doctor makes of each process
+    rather than what happens to be running on the host."""
+    BLIND = False               # these arms feed the sweep; see WebServeBase
+
+    UNIT_CGROUP = ("/user.slice/user-1000.slice/user@1000.service/app.slice/"
+                   "helm-web.service")
+    SEAT_CGROUP = "/agents.slice/agents-seat.slice/run-u7.scope"
+    UPTIME_S = 10000.0
+
+    def proc(self, entries):
+        """A fake /proc: `entries` is {pid: {argv, cgroup, rss_kb, swap_kb,
+        age_s}}, plus the uptime every age is measured against."""
+        root = os.path.join(self.tmp.name, "proc")
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "uptime"), "w") as fh:
+            fh.write("%.2f 0.00\n" % self.UPTIME_S)
+        hz = os.sysconf("SC_CLK_TCK")
+        for pid, e in entries.items():
+            d = os.path.join(root, str(pid))
+            os.makedirs(d)
+            with open(os.path.join(d, "cmdline"), "wb") as fh:
+                fh.write(b"\0".join(a.encode() for a in e["argv"]) + b"\0")
+            cwd = os.path.join(self.tmp.name, "cwd-%d" % pid)
+            os.makedirs(cwd)
+            os.symlink(cwd, os.path.join(d, "cwd"))
+            with open(os.path.join(d, "status"), "w") as fh:
+                fh.write("Name:\tpython3\nVmRSS:\t%d kB\nVmSwap:\t%d kB\n"
+                         % (e["rss_kb"], e.get("swap_kb", 0)))
+            with open(os.path.join(d, "cgroup"), "w") as fh:
+                fh.write("0::%s\n" % e["cgroup"])
+            start = int((self.UPTIME_S - e["age_s"]) * hz)
+            with open(os.path.join(d, "stat"), "w") as fh:
+                fh.write("%d (python3) S %s %d 0 0\n"
+                         % (pid, " ".join(["1"] * 18), start))
+        return root
+
+    def tree(self, name):
+        """A checkout the way a lane worktree looks: <tree>/bin/helm beside
+        its <tree>/helm package."""
+        t = os.path.join(self.tmp.name, "trees", name)
+        for sub in ("bin", "helm"):
+            os.makedirs(os.path.join(t, sub))
+        for rel in (("bin", "helm"), ("helm", "__init__.py")):
+            with open(os.path.join(t, *rel), "w") as fh:
+                fh.write("\n")
+        return os.path.realpath(t)
+
+    def console(self):
+        return {5001: {"argv": ["/usr/bin/python3",
+                                os.path.join(self.tree("main"), "bin", "helm"),
+                                "web", "--port", "7433"],
+                       "cgroup": self.UNIT_CGROUP, "rss_kb": 1200 * 1024,
+                       "swap_kb": 300 * 1024, "age_s": 1800}}
+
+    def adhoc_line(self, out):
+        lines = [(lvl, msg) for lvl, msg in out
+                 if msg.startswith("ad hoc web servers:")]
+        self.assertEqual(len(lines), 1, "no single ad hoc line in %r" % (out,))
+        return lines[0]
+
+    def test_no_ad_hoc_server_says_none(self):
+        out = doctor.check_web_servers(proc_dir=self.proc(self.console()))
+        # POSITIVE CONTROL: the sweep saw the console, so "none" below is a
+        # reading about ad hoc servers and not a sweep that saw nothing.
+        self.assertIn("port 7433", out[0][1])
+        lvl, msg = self.adhoc_line(out)
+        self.assertEqual(lvl, doctor.OK)
+        self.assertIn("ad hoc web servers: none", msg)
+        self.assertEqual([], levels(out, doctor.FAIL) + levels(out, doctor.WARN))
+
+    def test_an_empty_host_says_none_too(self):
+        out = doctor.check_web_servers(proc_dir=self.proc({}))
+        self.assertIn("none recorded", out[0][1])
+        self.assertIn("ad hoc web servers: none", self.adhoc_line(out)[1])
+
+    def test_one_ad_hoc_server_names_its_port_rss_age_and_tree(self):
+        lane = self.tree("wt-lane")
+        entries = self.console()
+        entries[5002] = {"argv": ["/usr/bin/python3",
+                                  os.path.join(lane, "bin", "helm"), "web",
+                                  "--port", "7488"],
+                         "cgroup": self.SEAT_CGROUP,
+                         "rss_kb": int(4.5 * 1024 * 1024), "age_s": 54 * 60}
+        out = doctor.check_web_servers(proc_dir=self.proc(entries))
+        lvl, msg = self.adhoc_line(out)
+        self.assertEqual(lvl, doctor.WARN)
+        self.assertIn("port 7488", msg)   # the control for the absence below
+        for fact in ("pid 5002", "RSS 4.5 GiB", "up 54m", "tree " + lane):
+            self.assertIn(fact, msg)
+        self.assertNotIn("7433", msg, "the owner's unit was listed as ad hoc")
+
+
+class RegisteredTreeTest(WebServeBase):
+
+    def test_a_registered_server_records_the_tree_it_serves(self):
+        self.assertTrue(webserve.register(7011))
+        mine = [x for x in webserve.live()["servers"] if x["port"] == 7011]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(mine[0].get("tree"), os.path.dirname(
+            os.path.dirname(os.path.abspath(webserve.__file__))))
+        self.assertIsInstance(mine[0].get("rss_bytes"), int)

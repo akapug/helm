@@ -177,6 +177,7 @@ def cmd_creds(args):
         # backwards for every row it names.
         "reset", "weekly left", "verdict"))
     notes = {}
+    pace = _pace_snapshot()
     for r in rows:
         wl = ("%.1f/%.1f" % (r["windows_left"], r["windows_per_week"])
               if r["windows_left"] is not None else "-")
@@ -197,6 +198,11 @@ def cmd_creds(args):
         # belongs to leaves those rows byte-for-byte as they were.
         if r["windows"]:
             print("      windows: %s" % _windows_text(r["windows"]))
+        # THE 5H PACE, the same kind of extra line (pace5h): percent, pace,
+        # projected hit and reset, from the watchdog pass's snapshot.
+        line = _pace_line(r, pace)
+        if line:
+            print("      " + line)
     # ONE FOOTNOTE PER DISTINCT NOTE, not one per row. A stale-token wall hits
     # every account of a family with the SAME note, so per-row printing would
     # bury the table in seven identical sentences; the count carries how wide it
@@ -213,10 +219,42 @@ def cmd_creds(args):
     # gets named exactly here, in one line. An EMPTY declared inventory prints
     # nothing: a pointer to nothing is noise, and noise on every run is how a
     # footer stops being read.
+    for line in _offpeak_balances():
+        print("  " + line)
     line = _declared_pointer()
     if line:
         print("  " + line)
     return 0
+
+
+def _pace_snapshot():
+    """The Claude 5h pace snapshot, or None — never a raise on a scorecard."""
+    try:
+        from . import claudepace
+        return claudepace.cached()
+    except Exception:                      # noqa: BLE001 — a line never raises
+        return None
+
+
+def _pace_line(row, snap):
+    if not snap or row.get("provider") != "anthropic":
+        return None
+    try:
+        from . import claudepace
+        return claudepace.account_line(row["account"], snap)
+    except Exception:                      # noqa: BLE001 — a line never raises
+        return None
+
+
+def _offpeak_balances():
+    """The prepaid balance behind each off-peak-only key, as the gate's own
+    timer last read it (helm/offpeak.py), or nothing — never a raise and never
+    a network call from a scorecard."""
+    try:
+        from . import offpeak
+        return offpeak.balance_lines()
+    except Exception:                      # noqa: BLE001 — a footer never raises
+        return []
 
 
 def _declared_pointer():

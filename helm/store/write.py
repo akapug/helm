@@ -4,12 +4,13 @@ The byte-shape-compatible type writers, the _WRITERS dispatch, and the
 lifecycle verbs (evidence/supersede/retire/confirm/reject/xrev-clear/demote)
 plus pinned_stats. Moved verbatim from the pre-split helm/store.py.
 """
+import contextlib
 import json
 import os
 import re
 import sys
 
-from .. import pk, promptcensus
+from .. import landorder, pk, promptcensus
 from ._common import (
     _slug, _coerce_conf, CERTAIN, BELIEF_CLAMP, derive_class, derive_load_class,
     _is_pinned, _json1, _pending_lines, _timestamp_scalar, PRIOR_PREFIX, STATUS_LIVE, STATUS_RETIRED,
@@ -19,7 +20,7 @@ from ._common import (
 )
 from .load import (FLEET, _default_dir, _find, load_all, reviewable, gate_ids,
                    gate_candidates, gate_key, resolve_gate, split_gate,
-                   find_typed, typed_id)
+                   find_typed, typed_id, entry_project)
 from .resolve import (route_cell, legacy_route_cells, _df_map, _jit_candidates, _probe_hits,
                       pinned, resolve_prompt)
 from .index import DUP_OVERLAP, _tokens
@@ -167,6 +168,179 @@ def _commit(path, body):
     pk.atomic_write(path, text)
 
 
+# ---------------------------------------------------------------------------
+# authored content — what a rewrite CARRIES instead of regenerating
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES: every writer below rebuilt the WHOLE file from the
+# parsed entry, and the parser keeps only the keys its type reads. So any write
+# verb (evidence, keywords, gates, gloss, revise/confirm, rescope, retire, …) on
+# an ADOPTED file — a premise drained from agent memory, whose body is a
+# hand-written narrative that often quotes the owner verbatim — replaced that
+# narrative with the generated template and dropped its provenance keys
+# (drained_from, origin_session, upgraded_from). Reproduced on a temp copy of
+# prior-no-dup-prefer-visible-crew-over-shadow-sa: all four verbs lost both.
+#
+# THE RULE, decided from the ARTIFACT being replaced, never from a marker key:
+#   * FRONTMATTER — the writer owns every key its type's PARSER reads (the load
+#     defaults) plus the structural keys it emits; it rewrites those or omits
+#     them on purpose (a cleared gloss, a confirmed pending_revision). Every
+#     OTHER frontmatter line is carried verbatim, in order, above the closing
+#     fence: a key the flat grammar cannot read (`drained-from:`, `sha256:`),
+#     a comment, a YAML list item or continuation line. A line the writer cannot
+#     attribute to a key it owns is a line it has no right to drop. Lines above
+#     the opening fence are kept above it.
+#   * BODY — a body is GENERATED only where it is exactly the writer's own
+#     template: a head paragraph (`PRIOR: `, `PREMISE [retired]: `,
+#     `HEURISTIC (a cross-domain MOVE…): `, `REFERENCE: `, `<term> (<kind>): `)
+#     that says the file's own frontmatter statement and nothing more, then
+#     each fixed template line (`**Why a prior:** …`, `**Trigger pattern** …`,
+#     `Source: …`), one line each, a blank line before it; a fixed line that
+#     carries a value (the trigger, the url) counts only when it says what the
+#     file's own frontmatter says, exactly as the head does. That span is
+#     regenerated. Everything AFTER it is hand-written and kept byte-identical;
+#     a body that is not that template from its first line is hand-written IN
+#     FULL and kept byte-identical.
+# A drained_from key is NOT the test: it is one producer's mark, and the live
+# adopted root also holds unmarked hand-edited files and generated bodies with
+# hand-written paragraphs appended below the template. The statement check is
+# what keeps a note written directly under the head line, or a head paragraph
+# that says more than the statement, from being read as generated.
+#
+# WHERE A NEW STATEMENT GOES on a hand-written body: the frontmatter
+# `statement:` line (and the `description:` summary) — the only place any
+# loader reads it. `revise` stages it as `pending_revision:`; `confirm`
+# installs it. The narrative is never edited: it holds no generated line.
+#
+# FAIL-CLOSED: an origin file that exists but cannot be read as UTF-8 text
+# refuses the write — a writer that cannot read the body cannot keep it.
+
+# keys the writers emit as structure or derive, beyond what a parser reads
+_STRUCTURE_KEYS = frozenset(("name", "description", "metadata", "node_type",
+                             "type", "class", "confidence", "load_class"))
+
+# the frontmatter keys that hold what a head paragraph says, parser order
+_SAID_KEYS = {"prior": ("statement",), "heuristic": ("move", "statement"),
+              "reference": ("statement", "summary"), "lexicon": ("definition",)}
+
+_FLAG_RX = r"(?: \[[^\]\n]*\])?"     # the ` [status]` flag of a non-live entry
+
+# (head regex capturing the statement slot, ((fixed line regex, optional,
+#  frontmatter keys its one group must say in parser order, the value it says
+#  when they are all empty), ...)); a line with no value slot names no keys
+_PRIOR_TEMPLATE = (
+    re.compile(r"(?:PRIOR|PREMISE)" + _FLAG_RX + r": (.*)", re.S),
+    ((re.compile(r"\*\*Why a (?:prior|premise):\*\* human-stated standing "
+                 r"(?:truth|belief); agent flags, never silently overrides"
+                 r"(?:; confidence updates on logged evidence)?\.\r?"), False,
+      (), None),))
+_HEURISTIC_TEMPLATE = (
+    re.compile(r"HEURISTIC" + _FLAG_RX + r" \(a cross-domain MOVE you APPLY, "
+               r"not a belief you hold\): (.*)", re.S),
+    ((re.compile(r"\*\*Trigger pattern\*\* \(when it fires\): (.*)"), False,
+      ("trigger", "keywords"), "(none authored)"),
+     (re.compile(re.escape(
+         "**Why a heuristic, not a premise:** this is a STRATEGY you reach for "
+         "across domains (confidence=1 by construction), distinct from a "
+         "premise/prior (a belief that gates). A reflex is this move compiled "
+         "to fire every turn. It surfaces JIT when its trigger pattern appears "
+         "in a turn - never added to the always-on digest.") + r"\r?"), False,
+      (), None)))
+_REFERENCE_TEMPLATE = (
+    re.compile(r"REFERENCE" + _FLAG_RX + r": (.*)", re.S),
+    ((re.compile(r"Source: (\S.*)"), True, ("url",), ""),))
+
+
+def _lexicon_template(term):
+    return (re.compile(re.escape(term) + r"(?: \([^)\n]*\))?: (.*)",
+                       re.S | re.IGNORECASE), ())
+
+
+def _said(text):
+    """A statement as the writers store it: quotes folded, whitespace collapsed."""
+    return re.sub(r"\s+", " ", text.replace('"', "'")).strip()
+
+
+def _owned_keys(etype):
+    from . import load
+    return _STRUCTURE_KEYS | set({"prior": load._PRIOR_DEFAULTS,
+                                  "heuristic": load._HEUR_DEFAULTS,
+                                  "reference": load._REF_DEFAULTS,
+                                  "lexicon": load._LEX_DEFAULTS}[etype])
+
+
+def _field_key(line):
+    m = pk._FIELD_LINE.match(line)
+    return m.group(1).lower() if m else None
+
+
+def _first(vals, keys):
+    """The first of `keys` the replaced file's frontmatter gives a value, raw."""
+    return next((vals[k] for k in keys if vals.get(k, "").strip()), "")
+
+
+def _template_span(body, said, template, vals):
+    """How many leading body lines are the writer's own template; 0 when the
+    body is not that template from its first line (all of it hand-written).
+    `said` is what the replaced file's frontmatter says the statement is, and
+    `vals` every value it holds, which a fixed line's value slot must say."""
+    head, fixed = template
+    j = 0
+    while j < len(body) and not body[j].strip():
+        j += 1
+    end = j
+    while end < len(body) and body[end].strip():
+        end += 1
+    m = head.match(" ".join(body[j:end]))
+    if not m or _said(m.group(1)) != _said(said):
+        return 0
+    for rx, optional, keys, default in fixed:
+        j = end
+        while j < len(body) and not body[j].strip():
+            j += 1
+        m = rx.fullmatch(body[j]) if end < j < len(body) else None
+        if m and keys and _said(m.group(1)) != _said(
+                _first(vals, keys) or default):
+            m = None            # a hand-edited trigger or source line
+        if m:
+            end = j + 1
+        elif not optional:
+            return 0
+    return end
+
+
+def _keep_authored(etype, origin, lines, template):
+    """The writer's `lines` with the replaced file's AUTHORED content carried:
+    unknown frontmatter keys and every hand-written body line (the rule above).
+    A missing origin is a new entry, returned unchanged."""
+    try:
+        with open(origin, encoding="utf-8", newline="") as f:
+            old = f.read().split("\n")
+    except FileNotFoundError:
+        return lines
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            "refusing the write: %s cannot be read as UTF-8 text (%s), so its "
+            "hand-written body and keys cannot be carried — repair the file "
+            "first" % (origin, exc)) from exc
+    fences = [k for k, l in enumerate(old) if l.strip() == "---"][:2]
+    fm = old[fences[0] + 1:fences[-1] if len(fences) > 1 else None] if fences else []
+    body = old[fences[1] + 1:] if len(fences) > 1 else ([] if fences else old)
+    pre = old[:fences[0]] if fences and "".join(old[:fences[0]]).strip() else []
+    close = lines.index("---", 1)
+    owned = (_owned_keys(etype) | {_field_key(l) for l in lines[1:close]}) - {None}
+    carried = [l for l in fm if l.strip() and _field_key(l) not in owned]
+    vals = {_field_key(l): pk._FIELD_LINE.match(l).group(2) for l in fm
+            if _field_key(l)}                   # last wins, as the parser reads
+    span = _template_span(body, _first(vals, _SAID_KEYS[etype]), template, vals)
+    out = lines[:close] + carried + lines[close:]
+    rest = body[span:]
+    if "".join(rest).strip():
+        out = (out[:close + len(carried) + 1] if not span
+               else out[:-1] if out[-1] == "" else out) + rest
+    return pre + out
+
+
 # The attestation annotations a prior carries (premise/_capture annotates;
 # write_prior carries them through every rewrite; the doctor reads them from
 # the ARTIFACT to decide whether a rewrite is allowed at all). attest_record
@@ -179,9 +353,37 @@ _ATTEST_KEYS = ("attest_payload", "attest_ts", "attest_by", "attest_record",
                 "attest_turn", "attest_receipt", "attest_supersedes_turn")
 
 
-def write_prior(e, root_dir=None, path=None):
+#: THE POLICY A LAND READS: `helm train auto` asks it, for each door car, in
+#: its last word before the push (helm/autoland.py `_door_admission`).
+LAND_POLICY = "approval-tier"
+_POLICY_KIND = re.compile(r"^\s*policy_kind:[ \t]*(.*?)[ \t]*$", re.M)
+
+
+def _land_order(kind, origin):
+    """The land order (`landorder.locked`) when this prior write changes the
+    policy a land reads: it declares that kind, or the file it replaces
+    does (a rewrite that drops it, a retire). Otherwise no lock at all: a
+    prior that carries no land authority never waits on a push. An origin
+    that exists and cannot be read is taken as declaring it."""
+    if kind == LAND_POLICY:
+        return landorder.locked()
+    try:
+        with open(origin, encoding="utf-8") as fh:
+            kinds = _POLICY_KIND.findall(fh.read())
+    except FileNotFoundError:
+        return contextlib.nullcontext()
+    except (OSError, ValueError):
+        return landorder.locked()
+    if any(k.strip().casefold() == LAND_POLICY for k in kinds):
+        return landorder.locked()
+    return contextlib.nullcontext()
+
+
+def write_prior(e, root_dir=None, path=None, origin=None):
     """Write a prior-*.md (the predecessor priors._write shape). class/load_class re-derived
-    on write so a stale authored value can never desync from confidence."""
+    on write so a stale authored value can never desync from confidence.
+    `origin` is the file this write REPLACES when that is not `path` (the
+    doctor's stage); its authored keys and body are carried (_keep_authored)."""
     if path is None:
         path = os.path.join(root_dir or _default_dir("prior"),
                             PRIOR_PREFIX + _slug(str(e["id"])) + ".md")
@@ -295,7 +497,12 @@ def write_prior(e, root_dir=None, path=None):
              + ("truth" if klass == "certain" else "belief")
              + "; agent flags, never silently overrides; confidence updates on logged evidence.",
              ""]
-    _commit(path, body)
+    # IN THE LAND ORDER (task/3265 races R2): a write of the policy a land
+    # reads waits for a push in flight, so it is seen by that push's last
+    # read or ordered after the push, never between the two.
+    with _land_order(policy_kind, origin or path):
+        _commit(path, _keep_authored("prior", origin or path, body,
+                                     _PRIOR_TEMPLATE))
     return path
 
 
@@ -308,8 +515,9 @@ def _lexicon_path(term, scope, root_dir=None):
     return os.path.join(root_dir or _default_dir("lexicon"), name)
 
 
-def write_lexicon(e, root_dir=None, path=None):
-    """Write a lex-*.md (the predecessor lexicon._write_term shape)."""
+def write_lexicon(e, root_dir=None, path=None, origin=None):
+    """Write a lex-*.md (the predecessor lexicon._write_term shape). `origin`:
+    see write_prior."""
     term = e.get("term") or str(e.get("id") or "")
     scope = e.get("term_scope") or "global"
     if path is None:
@@ -373,13 +581,14 @@ def write_lexicon(e, root_dir=None, path=None):
         body.append("  examples: " + " || ".join(ex))
     body += ["---", "", term + (" (" + e["kind"] + ")" if e.get("kind") else "")
              + ": " + (e.get("definition") or e.get("statement") or ""), ""]
-    _commit(path, body)
+    _commit(path, _keep_authored("lexicon", origin or path, body, _lexicon_template(term)))
     return path
 
 
-def write_heuristic(e, root_dir=None, path=None):
+def write_heuristic(e, root_dir=None, path=None, origin=None):
     """Write a heuristic-*.md (the predecessor heuristics_store._write shape). confidence is
-    always 1 (a move, not a belief) so it is NOT a field; load_class always jit."""
+    always 1 (a move, not a belief) so it is NOT a field; load_class always jit.
+    `origin`: see write_prior."""
     if path is None:
         path = os.path.join(root_dir or _default_dir("heuristic"),
                             "heuristic-" + _slug(str(e["id"])) + ".md")
@@ -427,13 +636,14 @@ def write_heuristic(e, root_dir=None, path=None):
              "A reflex is this move compiled to fire every turn. It surfaces JIT when its trigger "
              "pattern appears in a turn - never added to the always-on digest.",
              ""]
-    _commit(path, body)
+    _commit(path, _keep_authored("heuristic", origin or path, body, _HEURISTIC_TEMPLATE))
     return path
 
 
-def write_reference(e, root_dir=None, path=None):
+def write_reference(e, root_dir=None, path=None, origin=None):
     """Write a ref-*.md — the NEW class for harvested external reference
-    material, same house frontmatter shape as its siblings."""
+    material, same house frontmatter shape as its siblings. `origin`: see
+    write_prior."""
     if path is None:
         path = os.path.join(root_dir or _default_dir("reference"),
                             "ref-" + _slug(str(e["id"])) + ".md")
@@ -475,7 +685,7 @@ def write_reference(e, root_dir=None, path=None):
     body += ["---", "", "REFERENCE" + flag + ": " + summary_raw, ""]
     if e.get("url"):
         body += ["Source: " + e["url"], ""]
-    _commit(path, body)
+    _commit(path, _keep_authored("reference", origin or path, body, _REFERENCE_TEMPLATE))
     return path
 
 
@@ -850,7 +1060,52 @@ def _floor_profile(word_sets, folded=(), attested=None, unsealed=0, dups=()):
 
 
 def corpus_profile(entries, project=None):
-    """corpus_common's measurement, undiscarded — see corpus_common.
+    """The stem-common profile of the store's own statements. Its `common` is
+    the words those statements use EVERYWHERE — the corpus-built stop-list
+    that keeps an auto-stem DISCRIMINATING — and the rest of the profile is
+    how that set was measured.
+
+    THE HAZARD IT GATES. The /learn discipline says prefer phrases and the
+    guard auto-stems phrases of three or more words, so without a stop-list
+    the stems it mints include bare `built`, `works`, `back`, `id` and
+    `valid`, and a rule keyed on them fires on "lunch break, back in twenty
+    minutes". Following the rule would produce the violation.
+
+    WHY PROBE-DF CANNOT BE THE GATE. Those spammers are RARE in the probe
+    vocabulary, and a matched probe scores 1/df, so a common-English word that
+    few entries carry fires with near-maximal weight and DISPLACES a real rule
+    out of the cap-4 window. It is the GENERIC_KEYWORDS `should` inversion:
+    rare-yet-meaningless is exactly the population probe-df misreads.
+
+    THE STATEMENT CORPUS IS THE MEASURE THAT SEPARATES THEM. The statements
+    are written in the fleet's working language — the same language prompts
+    arrive in — so a word carried by many STATEMENTS is a word ordinary turns
+    keep containing. The spammer stems sit in the top decile of statement-df,
+    while the symptom stems a capture needs (`stash`, `freezes`, `pycache`,
+    `tombstone`) sit under the threshold max(4, n//100).
+
+    SELF-UPDATING ON PURPOSE: computed from the candidate set the guard is
+    already holding, never persisted, so it scales with the store and needs no
+    curation — a hand-kept list is GENERIC_KEYWORDS' maintenance burden grown
+    without bound.
+
+    THE VERDICT IS THEREFORE TIME-DEPENDENT, AND DELIBERATELY NOT PINNED. The
+    same phrase can stem today and be refused next month, and — the direction
+    that costs retrieval — a stem admitted while its word is rare BECOMES a
+    spammer as siblings arrive carrying it. A snapshot buys reproducibility
+    and loses both halves of the point: it freezes the measure at one day's
+    corpus (a curated list again, machine-written and unowned), and it cannot
+    see the second hazard at all, because that drift happens in the store long
+    after the write the snapshot is taken for. So the drift is accepted and
+    made VISIBLE, on both legs:
+      - WRITE: every refusal is reported with the arithmetic that produced it
+        — the word's statement-df, the corpus size, the threshold — plus the
+        fact that the number moves (guard_entry_keywords' notes, printed by
+        add). `built (statement-df 73 of 1433 statements, threshold >=14)` is
+        a verdict the author can reproduce and argue with; "refused" is not.
+      - AFTER: `helm store doctor` re-measures the current corpus against the
+        stems already stored and reports the ones that have since become
+        common (the `stem_drift` class), with the `keywords --remove` cure.
 
     THE CONTRACT: the stem-common floor counts DISTINCT VERIFIED STATEMENTS
     — a seal that verifies (_attest_verdict, the premise-check contract) is
@@ -891,65 +1146,6 @@ def corpus_profile(entries, project=None):
     dups = [(entries[i], entries[arep[i]]) for i in range(len(entries)) if arep[i] != i]
     return _floor_profile(clusters.values(), folded, len(verified),
                           len(entries) - len(verified), dups)
-
-
-def corpus_common(entries, project=None):
-    """The words the store's own statements use EVERYWHERE — the corpus-built
-    stop-list that keeps an auto-stem DISCRIMINATING (task/1077 defect 1).
-
-    THE INCIDENT, measured twice in one hour on 2026-08-11: the /learn
-    discipline says prefer phrases, the guard auto-stems >=3-word phrases, and
-    the stems it minted — bare `built`, `works`, `wired`, `back`, `came`, then
-    `id`, `content`, `matches`, `valid` minutes later — made half-arc-delivery
-    fire on "lunch break, back in twenty minutes". Following the rule produced
-    the violation, and both captures needed manual pruning.
-
-    WHY PROBE-DF CANNOT BE THE GATE, measured on the live 1430-candidate store
-    before choosing this one: every incident spammer was RARE in the probe
-    vocabulary (df: built=2, came=1, id=0, max 3), so a probe-df threshold
-    would have admitted all nine — and their rarity is the damage, because a
-    matched probe scores 1/df, so a common-English word that few entries carry
-    fires with near-maximal weight and DISPLACES a real rule out of the cap-4
-    window. It is the GENERIC_KEYWORDS `should` inversion again:
-    rare-yet-meaningless is exactly the population probe-df misreads.
-
-    THE STATEMENT CORPUS IS THE MEASURE THAT SEPARATES THEM. The store's own
-    statements are written in the fleet's working language — the same language
-    prompts arrive in — so a word carried by many STATEMENTS is a word ordinary
-    turns will keep containing. Measured on the same store: the nine spammers
-    sit at statement-df 14..72 (top decile), while the genuine symptom stems a
-    capture needs (`stash` 8, `freezes` 2, `pycache` 5, `tombstone` 3) sit
-    under 11. The threshold max(4, n//100) lands at 14 on the live corpus:
-    all nine spammers refused, the symptom vocabulary kept.
-
-    Self-updating on purpose: computed from the candidate set the guard is
-    already holding, never persisted, so it scales with the store and needs no
-    curation — a hand-kept list would be GENERIC_KEYWORDS' maintenance burden
-    grown without bound.
-
-    THE VERDICT IS THEREFORE TIME-DEPENDENT, AND DELIBERATELY NOT PINNED
-    (the choice a reviewer asked to be stated where its next reader stands).
-    The same phrase can stem today and be refused next month, and — the
-    direction that actually costs retrieval — a stem admitted when its word was
-    rare BECOMES a spammer as siblings arrive carrying it. A snapshot would buy
-    reproducibility and lose both halves of the point: it freezes the measure at
-    one day's corpus (that IS the curated list again, just machine-written and
-    unowned), and it cannot see the second hazard AT ALL, because that drift
-    happens in the store long after the write the snapshot was taken for.
-    So the drift is accepted and made VISIBLE, on both legs:
-      - WRITE: every refusal is reported with the arithmetic that produced it —
-        the word's statement-df, the corpus size, the threshold — plus the fact
-        that the number moves (guard_entry_keywords' notes, printed by add).
-        `built (statement-df 73 of 1433 statements, threshold >=14)` is a
-        verdict the author can reproduce and argue with; "refused" is not.
-      - AFTER: `helm store doctor` re-measures TODAY's corpus against the stems
-        already stored and reports the ones that have since become common
-        (the `stem_drift` class), with the `keywords --remove` cure. Measured
-        read-only with the shipped instrument against the live store on
-        2026-08-11: 217 of 1441 live keyword-typed rows carry such a stem
-        (`came`, `back`, `changed`, `worktree`, `gate`) — the drift is not
-        hypothetical, and no pin taken at their mint could have named one."""
-    return corpus_profile(entries, project=project).common
 
 
 def _refused_stem_note(cell, prof, generic, census=None, prompt_common=()):
@@ -1039,7 +1235,7 @@ def stem_probes(cells, generic=GENERIC_KEYWORDS, common=frozenset(),
         never be the specific hit the resolver requires and only dilutes the
         df of every entry that carries it.
       - 1-word stems ALSO skip `common` — the corpus-common set the caller
-        measured from the store's own statements (corpus_common). This is the
+        measured from the store's own statements (corpus_profile). This is the
         task/1077 cure: `built`/`works`/`back` are not in any curated generic
         list and never will be, because the population is open-ended and
         store-relative; the store's own language is the measurement. A refused
@@ -1494,7 +1690,7 @@ def guard_entry_keywords(etype, eid, kw, project=None, force=False,
         notes.append("  +%d stem probes auto-added from >=%d-word phrases "
                      "(originals kept): %s"
                      % (len(added), _STEM_MIN_WORDS, ", ".join(added)))
-    # THE REFUSAL IS SPOKEN, NOT SILENT (the corpus-drift leg — corpus_common).
+    # THE REFUSAL IS SPOKEN, NOT SILENT (the corpus-drift leg — corpus_profile).
     # Re-running the SAME decomposition with the gate OFF is what names the
     # refused stems without re-deriving the word split: the difference between
     # the two runs IS the gate's effect, so this note can never drift from it.
@@ -1547,15 +1743,6 @@ def guard_entry_keywords(etype, eid, kw, project=None, force=False,
             "is refused as prompt-common until it has seen %d)"
             % (census.turns, promptcensus.MIN_TURNS, promptcensus.MIN_TURNS))
     return _MintGuardResult(kw, None, notes, events)
-
-
-def guard_add_keywords(etype, eid, kw, project=None, force=False,
-                       corpus=None, exclusions=()):
-    """Legacy add-guard adapter preserving the three-value unpack contract."""
-    result = guard_entry_keywords(
-        etype, eid, kw, project=project, force=force,
-        corpus=corpus, exclusions=exclusions)
-    return result.keywords, result.refusal, result.notes
 
 
 def record_mint_events(events):
@@ -2019,7 +2206,7 @@ def _doctor_classify(entries, project=None):
     - flagged: comma-less multi-word keywords carrying prose shapes — a human
       call, never auto-split (splitting a sentence mints exactly the spam
       unigrams the stem gate refuses).
-    - stem_drift: THE CORPUS-DRIFT RE-CHECK (corpus_common's second leg). The
+    - stem_drift: THE CORPUS-DRIFT RE-CHECK (corpus_profile's second leg). The
       stop-list is measured from the store's own statements, so it MOVES: a
       stem admitted when its word was rare becomes a spammer once siblings
       arrive carrying it, and no snapshot taken at that entry's mint could ever
@@ -2443,6 +2630,10 @@ def _doctor_rekeys(report, plan, rows, ts):
                                          prefix + _slug(nid) + ".md")})
         _repoint(new, moves)
         in_place = new["path"] == e["path"]
+        # THE ENTRY MOVES, AND WHAT ITS AUTHOR WROTE MOVES WITH IT: the new
+        # file carries the old file's authored keys and body (_keep_authored),
+        # and the tombstone keeps its own. A key never serialized (underscore).
+        new["_origin"] = e["path"]
         if not (in_place or new.get("supersedes")):
             new["supersedes"] = oid
         reason = "re-keyed from '%s': an id is one kebab token" % oid
@@ -2553,7 +2744,8 @@ def doctor(project=None, fix=False, ts=None):
             if sdir not in dirs:
                 dirs.append(sdir)
             stage = os.path.join(sdir, os.path.basename(row["path"]))
-            _WRITERS[row["type"]](row, path=stage)
+            _WRITERS[row["type"]](row, path=stage,
+                                  origin=row.get("_origin") or row["path"])
             staged.append((stage, e, row, klass, reason))
     except Exception as exc:  # noqa: BLE001 — ANY writer refusal lands nothing
         residue = _doctor_unstage([s for s, *_ in staged], dirs)
@@ -2685,7 +2877,7 @@ def _pick_candidate(eid, project=None, ctype=None):
 
 
 def confirm(eid, ts, new_statement=None, project=None, ctype=None,
-            force=False, guard_notes=None, by=""):
+            force=False, guard_notes=None, by="", allow_rescope=False):
     """Owner ratify -> live (the owner/confirm gate that makes inferred capture
     safe to leave on) — works on BOTH a candidate (fires nothing) AND a
     provisional (xrev-cleared, already firing tagged): either way the owner's
@@ -2699,7 +2891,11 @@ def confirm(eid, ts, new_statement=None, project=None, ctype=None,
     confirming ratifies the capture, never inflates the belief); the other types'
     receipt is the events journal row. ctype disambiguates a slug shared across
     reviewable types (ambiguity without it is refused — never ratify the wrong
-    entry)."""
+    entry). ``allow_rescope`` (task/3520): a confirmed statement that would
+    DERIVE a different project than the entry currently has records the OLD
+    one and says so in one line; with it, the new derivation stands and the
+    line says the scope moved. A recorded field, and a statement that derives
+    the same project, trigger neither."""
     bad = _refuse_bad_ts(ts)
     if bad:
         return None, bad
@@ -2776,6 +2972,11 @@ def confirm(eid, ts, new_statement=None, project=None, ctype=None,
             force=force, exclusions=(e,))
         if err:
             return None, err
+    # THE SCOPE LAW'S INPUT (task/3520): the project this entry is ABOUT now,
+    # read BEFORE the edit block below changes the statement, because an
+    # unrecorded entry's project IS its statement line — the comparison after
+    # the edit is the flip.
+    old_owner = entry_project(e)
     edited = bool(str(new_statement or "").strip())
     if edited:
         s = new_statement.strip()
@@ -2829,6 +3030,43 @@ def confirm(eid, ts, new_statement=None, project=None, ctype=None,
         e["evidence_log"] = list(e.get("evidence_log") or []) + [
             {"ts": ts, "type": "confirmed", "delta": 0, "reason": note,
              "by": actor}]
+    # THE SCOPE LAW, CHECKED AT THE MOMENT THE STATEMENT CHANGES (task/3520).
+    # A statement edit or a staged revision that lands can move an UNRECORDED
+    # entry's derived project — fleet -> helm when the new wording names a
+    # helm artifact — and that is a scope change the owner did not ask for in
+    # this verb: every non-helm seat stops receiving a belief it had been
+    # told was fleet-wide. A RECORDED field is not a flip candidate: entry_scope
+    # reads it first, so a recorded entry's project cannot move with its
+    # wording (rule 4 falls out of the check's shape). No flip: nothing is
+    # recorded and nothing is printed — the law never pins what it did not
+    # move.
+    if edited or pending:
+        new_owner = entry_project(e)
+        if new_owner != old_owner:
+            if allow_rescope:
+                notes.append("helm store: scope %s -> %s (--rescope)"
+                             % (old_owner, new_owner))
+            else:
+                # KEEP THE OLD PROJECT BY RECORDING IT, through the existing
+                # rescope door rather than a second writer: it validates the
+                # name against BOTH the registry's and the frontmatter's
+                # contracts and mints the event a hand-edit would skip.
+                # "fleet" is a valid recorded value by that door's own law, so
+                # the old owner always passes. The door's write pins the
+                # record; confirm's single writer call below must carry it
+                # too, because the writers serialize only the keys the
+                # in-memory dict holds.
+                _e, rerr = rescope(str(e["id"]), ts, old_owner,
+                                   project=project, ctype=e["type"])
+                if rerr:
+                    return None, rerr
+                if not _e:
+                    return None, ("'%s' not found by the rescope door; "
+                                  "nothing was pinned" % eid)
+                e["project"] = old_owner
+                notes.append("helm store: scope kept at %s (the new statement "
+                             "would derive %s); pass --rescope to take %s"
+                             % (old_owner, new_owner, new_owner))
     _WRITERS[e["type"]](e, path=e["path"])
     record_mint_events(events)
     if guard_notes is not None:
@@ -2893,7 +3131,13 @@ def revise(eid, ts, new_statement, project=None, ctype=None, by=""):
     RATIFICATION IS PRESERVED BECAUSE THE ID IS. A revision is not a new
     belief; it is the same belief said correctly. Confidence is untouched here
     for the same reason confirm does not inflate it — ratifying a wording is
-    not evidence about the world."""
+    not evidence about the world.
+
+    IT WARNS AT THE STEP WHERE THE FLIP IS MADE (task/3520): if the staged
+    statement would DERIVE a different project than the entry currently does,
+    one line says so — both projects named, and that the confirm will KEEP
+    the old one unless run with --rescope. The pin itself happens in confirm;
+    this is the operator's warning before the stage dries."""
     bad = _refuse_bad_ts(ts)
     if bad:
         return None, bad

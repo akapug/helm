@@ -71,7 +71,8 @@ class ProjectInstallTest(unittest.TestCase):
     def test_fresh_install_writes_every_spec_and_permits_no_estate_defaults(self):
         r = self._install()
         self.assertEqual(r.returncode, 0, r.stderr)
-        s = json.load(open(self.sp))
+        with open(self.sp, encoding="utf-8") as fh:
+            s = json.load(fh)
         from helm.hooks import (SPECS, ESTATE_DEFAULTS, _lane_live,
                                 _permits_live, resolved_specs)
         # RESOLVED, not raw: an EXTERNAL spec whose binary this host lacks is
@@ -106,7 +107,8 @@ class ProjectInstallTest(unittest.TestCase):
                for s in ext}
         r = self._install(**env)
         self.assertEqual(r.returncode, 0, r.stderr)
-        s = json.load(open(self.sp))
+        with open(self.sp, encoding="utf-8") as fh:
+            s = json.load(fh)
         self.assertIn(fake, json.dumps(s), "the resolved path is what landed")
         # THE PIN MUST BE SET IN THIS PROCESS TOO. `_lane_live` recomputes the
         # expected command from `external_bin`, so a parent without the pin
@@ -139,7 +141,8 @@ class ProjectInstallTest(unittest.TestCase):
                 "model": "opus"}, f)
         r = self._install()
         self.assertEqual(r.returncode, 0, r.stderr)
-        s = json.load(open(self.sp))
+        with open(self.sp, encoding="utf-8") as fh:
+            s = json.load(fh)
         cmds = [h["command"] for g in s["hooks"]["PostToolUse"]
                 for h in g["hooks"]]
         self.assertIn("my-custom-formatter", cmds)

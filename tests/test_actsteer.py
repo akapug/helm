@@ -407,10 +407,15 @@ class SteerRowsTest(Isolated):
             ("cd /x && helm work claim act-steers --ttl 100",),
             ("helm work list", "helm chat claims",
              "helm chat post 'I will helm work claim x soon'")),
+        "found-broken-contain-now-fix-now": (
+            ("helm task add 'the bridge drops tool calls' --priority P1",
+             "cd /x && ./bin/helm task add 'autocompact loops' --note n"),
+            ("helm task comment 5 'filed as task/9'", "helm task list",
+             "helm chat post 'I will helm task add x later'")),
     }
 
     def test_every_row_fires_on_its_act_and_is_silent_on_its_look_alike(self):
-        self.assertEqual(len(self.CASES), 7, "a row's arms were dropped")
+        self.assertEqual(len(self.CASES), 8, "a row's arms were dropped")
         self.assertEqual(self.ids("git diff --stat HEAD~1 | grep x", {}),
                          ["git-stat-grep"], "control: the table is dead")
         for sid, (hits, misses) in self.CASES.items():
@@ -493,6 +498,112 @@ class SteerRowsTest(Isolated):
                          "cwd": self.tmp})
         self.assertTrue(chat.steer_unfired("bound-1", "x"),
                         "the boundary left the steer latched")
+
+
+# THE INCIDENT'S COMMAND, with its home and project names made neutral: a `cd`
+# into the projects root, then a quoted python heredoc that globs the newest
+# transcripts and reads each one WHOLE. One of the files it read was 461 MB;
+# the process reached 9.51G and wedged its seat's slice (task/3083).
+INCIDENT_READ = """cd /home/u/.claude/projects/ && python3 - <<'EOF'
+import json,glob,os
+def mt(f):
+    try: return os.path.getmtime(f)
+    except OSError: return 0
+files=sorted(glob.glob("-home-u-dev-proj*/*.jsonl"), key=mt)[-80:]
+hits=0
+for f in files:
+    prev=None
+    prevcmd=None
+    try:
+        lines=open(f).read().splitlines()
+    except Exception: continue
+    for l in lines:
+        try: r=json.loads(l)
+        except Exception: continue
+        if r.get("type")!="assistant" or r.get("isSidechain"): continue
+print("done", len(files))
+EOF"""
+# The same subagent's call a few seconds earlier: the newest file by name,
+# read whole through argv.
+INCIDENT_READ_ONE = """cd /home/u/.claude/projects/-home-u-dev-proj/ 2>/dev/null && f=$(ls -t *.jsonl | head -1) && python3 - "$f" <<'EOF'
+import json,sys
+recs=[json.loads(l) for l in open(sys.argv[1]).read().splitlines()[-400:] if l.strip()]
+print(len(recs))
+EOF"""
+
+
+class WholeTranscriptReadTest(Isolated):
+    """A WHOLE read of session transcripts hears the sharpened line of the
+    transcript rule: they run to hundreds of MB, stream them per line or ask
+    cv. It is the same rule, the same id and the same latch."""
+
+    def test_the_incident_command_hears_stream_it_per_line(self):
+        rc, said, _err = self.hook("Bash", {"command": INCIDENT_READ})
+        self.assertEqual(rc, 0)
+        for want in ("hundreds of MB", "for line in open(f)", "cv recall"):
+            self.assertIn(want, said)
+        self.assertEqual(self.ids(INCIDENT_READ), ["transcript-read"])
+        # THE HOLE IT CLOSES: the plain rule reads the command with its quoted
+        # heredoc bodies cut, and the root sat in a `cd` with no reader before
+        # it, so the plain rule alone never fired on this command.
+        self.assertFalse(actsteer._reads_transcript(
+            chat._excise_quoted_heredocs(INCIDENT_READ)))
+
+    def test_the_earlier_read_through_argv_hears_it_too(self):
+        rc, said, _err = self.hook("Bash", {"command": INCIDENT_READ_ONE})
+        self.assertEqual(rc, 0)
+        self.assertIn("hundreds of MB", said)
+
+    def test_each_whole_read_form_hears_it(self):
+        # control, unconditional, on the same reader the loop drives
+        self.assertIn(("transcript-read", actsteer.TRANSCRIPT_WHOLE_STEER),
+                      chat.argv_steers(INCIDENT_READ, None, {}))
+        for cmd in (
+                "python3 -c \"import json; [json.loads(l) for l in open("
+                "'/home/u/.claude/projects/-x/a.jsonl').readlines()]\"",
+                "python3 - <<'EOF'\nfrom pathlib import Path\n"
+                "Path('/home/u/.claude/projects/-x/a.jsonl').read_text()\nEOF",
+                "cd ~/.codex/sessions && python3 - <<'PY'\nimport glob\n"
+                "[open(f).read() for f in glob.glob('*/*.jsonl')]\nPY"):
+            with self.subTest(cmd=cmd[:50]):
+                self.assertIn(("transcript-read",
+                               actsteer.TRANSCRIPT_WHOLE_STEER),
+                              chat.argv_steers(cmd, None, {}))
+
+    def test_look_alikes_do_not_hear_the_whole_read_line(self):
+        """The cure itself (stream per line), prose ABOUT the incident in a
+        chat body, a memory file, and a whole read of a file that is no
+        transcript. Control: the plain rule still fires on a plain read."""
+        plain = "jq -r .message ~/.claude/projects/-home-x/abc.jsonl | head"
+        self.assertEqual(chat.argv_steers(plain, None, {}),
+                         [("transcript-read", actsteer.TRANSCRIPT_STEER)])
+        stream = INCIDENT_READ.replace("lines=open(f).read().splitlines()",
+                                       "lines=open(f)")
+        for cmd in (
+                stream,
+                "helm chat post --room r <<'EOF'\nthe subagent ran "
+                "open(f).read() over ~/.claude/projects/x/*.jsonl\nEOF",
+                "python3 -c \"import json; json.load(open('/home/u/.claude/"
+                "projects/-x/memory/a.jsonl'))\"",
+                "python3 -c \"import json; json.load(open('package.json'))\"",
+                "cat <<'EOF' > notes.md\nnever open(f).read() a "
+                "~/.claude/projects/x.jsonl\nEOF"):
+            with self.subTest(cmd=cmd[:50]):
+                self.assertNotIn(("transcript-read",
+                                  actsteer.TRANSCRIPT_WHOLE_STEER),
+                                 chat.argv_steers(cmd, None, {}))
+
+    def test_one_rule_one_latch(self):
+        """The sharpened line spends the transcript rule's own latch: a plain
+        read after it in the same context stays silent."""
+        self.assertIn("hundreds of MB", self.hook(
+            "Bash", {"command": INCIDENT_READ}, session="latch-1")[1])
+        self.assertEqual(self.hook("Bash", {
+            "command": "tail -3 ~/.codex/sessions/2026/09/x.jsonl"},
+            session="latch-1")[1], "")
+        self.assertIn("cv recall", self.hook("Bash", {
+            "command": "tail -3 ~/.codex/sessions/2026/09/x.jsonl"},
+            session="latch-2")[1], "control: the plain read speaks alone")
 
 
 class ForegroundSteerTest(Isolated):
@@ -690,7 +801,7 @@ class ByteCapTest(unittest.TestCase):
         rows = {sid: text for sid, _p, text in chat._STEERS}
         out = [rows[sid] for sid in NEW_ROWS]
         out += [actsteer.PGREP_STEER, actsteer.TRANSCRIPT_STEER,
-                actsteer.TIMEOUT_STEER,
+                actsteer.TRANSCRIPT_WHOLE_STEER, actsteer.TIMEOUT_STEER,
                 actsteer.CL_STEER, actsteer.PUBLIC_STEER,
                 actsteer.SWEEP_STEER,
                 actsteer.FOREGROUND_STEER % max(chat._SPAWN_FAMILIES, key=len),
@@ -701,7 +812,7 @@ class ByteCapTest(unittest.TestCase):
 
     def test_every_steer_is_one_short_line(self):  # noqa: VACUOUS_ASSERTION — the widest-line assertion before the loop is the unconditional control on the same lines
         lines = self.lines()
-        self.assertEqual(len(lines), 11, "a steer went unmeasured")
+        self.assertEqual(len(lines), 12, "a steer went unmeasured")
         self.assertLessEqual(len(actsteer.STEER_PREFIX + max(lines, key=len)),
                              actsteer.STEER_CAP, "the widest line is a wall")
         for text in lines:

@@ -287,6 +287,83 @@ class TestWebDecisions(unittest.TestCase):
         # the DM speaks as the RECORDED author, the owner, in his handle
         self.assertEqual([m["from"] for m in lane], ["daria", "daria"])
 
+    # -- goal-ledger L1: the card the owner read is the card he rules on ----
+    def revise_as_asker(self, context):
+        """builder-9, this card's asker, revises it in place through the one
+        library door (`helm decide revise` calls the same function)."""
+        sid = "sid-builder-9"
+        seats.write_roster("builder-9", session=sid, cwd=self.tmp)
+        ctx, opts, err = ownerasks.parse_card_body(BODY)
+        self.assertIsNone(err)
+        with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "builder-9",
+                                          "CLAUDE_CODE_SESSION_ID": sid}):
+            row, problem = ownerasks.revise_decision(self.rid, context, opts)
+        self.assertIsNotNone(row, problem)
+        return row
+
+    def test_the_queue_carries_each_cards_rev_and_why_it_moved(self):
+        _status, d = self.req("/api/decisions")
+        e = d["entries"][0]
+        self.assertEqual((e["rev"], e["revised_after_comment"]), (1, False))
+        status, d = self.req("/api/decisions/comment",
+                             {"id": self.rid, "text": "rebase cost?"})
+        self.assertEqual(status, 200, d)
+        self.revise_as_asker("Proxy fork drifted 40 commits; the rebase is "
+                             "one afternoon.")
+        _status, d = self.req("/api/decisions")
+        e = d["entries"][0]
+        self.assertEqual((e["id"], e["rev"], e["revised_after_comment"]),
+                         (self.rid, 2, True))
+        self.assertIn("one afternoon", e["context"])
+        self.assertEqual(len(d["entries"]), 1, "one card, never a second")
+
+    def test_a_verdict_on_a_stale_rev_is_409_and_records_nothing(self):  # noqa: VACUOUS_ASSERTION — the open status and empty lane are the refusal contract; the rev-2 verdict at the end records and delivers through the SAME endpoint, the unconditional positive control
+        self.revise_as_asker("Proxy fork drifted 40 commits; the rebase is "
+                             "one afternoon.")
+        for payload in ({"id": self.rid, "choice": "2", "rev": 1},
+                        {"id": self.rid, "choice": "2"},
+                        {"id": self.rid, "choice": "2", "rev": "1"}):
+            status, d = self.req("/api/decisions/verdict", payload)
+            self.assertEqual(status, 409, (payload, d))
+            self.assertEqual((d["code"], d["rev"]), ("stale_rev", 2), payload)
+            self.assertIn("rev 2", d["error"])
+        status, d = self.req("/api/decisions/verdict",
+                             {"id": self.rid, "choice": "2", "rev": "two"})
+        self.assertEqual(status, 400, d)
+        self.assertIn("rev", d["error"])
+        self.assertEqual(ownerasks.decision_rows()[self.rid]["status"], "open")
+        self.assertEqual(self.dm_lane("builder-9"), [])
+        status, d = self.req("/api/decisions/verdict",
+                             {"id": self.rid, "choice": "2", "rev": 2})
+        self.assertEqual(status, 200, d)
+        self.assertEqual(ownerasks.decision_rows()[self.rid]["verdict"]["rev"],
+                         2)
+        self.assertIn("rev 2", self.dm_lane("builder-9")[0]["text"])
+
+    def test_a_digit_like_rev_that_is_no_number_is_400_not_500(self):  # noqa: VACUOUS_ASSERTION — the open status is the refusal contract; the rev-1 verdict at the end records through the SAME endpoint, the unconditional positive control
+        """`str.isdigit()` is true of "²" and "①" while `int()` refuses them,
+        so the malformed-rev check let a ValueError out of the handler as a
+        500 ("the server broke") instead of the 400 the contract names."""
+        for raw in ("²", "①"):
+            status, d = self.req("/api/decisions/verdict",
+                                 {"id": self.rid, "choice": "2", "rev": raw})
+            self.assertEqual(status, 400, (raw, d))
+            self.assertIn("rev", d["error"])
+            self.assertNotIn("ValueError", d["error"])
+        self.assertEqual(ownerasks.decision_rows()[self.rid]["status"], "open")
+        status, d = self.req("/api/decisions/verdict",
+                             {"id": self.rid, "choice": "2", "rev": "٣"})
+        self.assertEqual(status, 409, d)   # a real digit: a number, and stale
+        status, d = self.req("/api/decisions/verdict",
+                             {"id": self.rid, "choice": "2", "rev": 1})
+        self.assertEqual(status, 200, d)
+
+    def test_ui_sends_the_rev_it_rendered_and_names_a_revision(self):
+        _status, body = self.req("/", raw=True)
+        body = body.decode("utf-8")
+        self.assertIn("revised after your comment", body)
+        self.assertIn("stale_rev", body)
+
     # -- mutation hardening: every decision POST demands the bearer ---------
     def test_decision_posts_403_without_token(self):  # noqa: VACUOUS_ASSERTION — the byte-identity and empty-lane absences have their unconditional positive control at the END of this same test: the bearer'd comment CHANGES the byte map and fills the SAME lane, so the identity above measured the 403
         before = self.tree_bytes()
@@ -335,14 +412,15 @@ class TestWebDecisions(unittest.TestCase):
         """The owner merged the board, the work tab and the scheduler into one
         Work page, and what is waiting on HIM comes first on it: the ON YOU
         section — its line, then the decision queue — before the project
-        rows, the kanban and the task backlog. Pinned by document order."""
+        rows, and the Work page (the backlog and the pipeline, task/3643)
+        after them. Pinned by document order."""
         _status, body = self.req("/", raw=True)
         body = body.decode("utf-8", "replace")
         self.assertIn('data-a="work">Work</button>', body,
                       "the Work area is missing from the nav")
         order = [body.index(m) for m in (
             'id="view-work"', 'id="onyou"', 'id="onyouline"', 'id="odq"',
-            'id="board"', 'id="worksections"', 'id="view-quota"')]
+            'id="board"', 'id="view-flow"', 'id="view-quota"')]
         self.assertEqual(order, sorted(order),
                          "markup order broke the ON YOU placement")
         self.assertIn('"work"', body.split("const VIEWS")[1][:120],

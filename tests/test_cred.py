@@ -920,8 +920,12 @@ class DoctorTest(CredBase):
         cred.backup(admin, apply=True)
         self.plant("admin-example-com", "user@example.com")
         msgs = [m for lvl, m in cred.doctor_rows() if lvl == "WARN"]
-        self.assertTrue(any("credhome admin-example-com HOLDS user@example.com (drift" in m
-                            for m in msgs), msgs)
+        # The account is oauthAccount metadata. The same line carries the
+        # token-lineage state; it must not say the home holds that account.
+        self.assertTrue(any(
+            "credhome admin-example-com metadata says user@example.com "
+            "(lineage MISMATCH) (drift" in m and "HOLDS" not in m
+            for m in msgs), msgs)
         self.assertTrue(any("`helm cred heal` restores admin-example-com from its 1 "
                             "snapshot" in m for m in msgs), msgs)
 
@@ -958,7 +962,9 @@ class DoctorTest(CredBase):
         cred.backup(d, apply=True)
         rows = cred.doctor_rows()
         self.assertEqual([lvl for lvl, _ in rows], ["OK"])
-        self.assertIn("every dir name matches", rows[0][1])
+        self.assertIn("every dir name matches the account its metadata names "
+                      "(lineage 1 MATCH)", rows[0][1])
+        self.assertNotIn("holds", rows[0][1])
 
     def test_doctor_check_is_wired_into_the_report(self):
         self.assertIn("check_cred_drift", doctor.CHECKS)
@@ -974,7 +980,7 @@ class CliTest(CredBase):
         rc, out, _ = self.out(cred.cmd_cred, ["list"])
         self.assertEqual(rc, 0)
         self.assertIn("DIR NAME", out)
-        self.assertIn("ACTUAL ACCOUNT", out)
+        self.assertIn("METADATA ACCOUNT", out)
         self.assertIn("admin-example-com", out)
         self.assertIn("user@example.com", out)
         self.assertIn("DRIFT", out)
@@ -985,7 +991,7 @@ class CliTest(CredBase):
         self.plant("user-example-com", "user@example.com")
         rc, out, _ = self.out(cred.cmd_cred, [])
         self.assertEqual(rc, 0)
-        self.assertIn("ACTUAL ACCOUNT", out)
+        self.assertIn("METADATA ACCOUNT", out)
 
     def test_list_json(self):
         self.plant("admin-example-com", "user@example.com")
@@ -1002,6 +1008,24 @@ class CliTest(CredBase):
         self.assertEqual(rc, 0)
         self.assertIn("protected", out)
         self.assertIn("claude /login", out)      # the exact command, human-run
+        self.assertIn(
+            "shows what this home's metadata now says; `helm cred heal` puts "
+            "back the login whose metadata says user@example.com (lineage "
+            "MATCH) when no session holds it.", out)
+        self.assertNotIn("now holds", out)
+
+    def test_sync_orca_names_metadata_and_lineage_not_a_hold(self):
+        self.plant("user-example-com", "user@example.com")
+        fake = {"account": "user@example.com", "verdict": "FRESH",
+                "reason": None, "action": "none", "pre_image": None}
+        with mock.patch.object(cred, "sync", return_value=fake):
+            rc, out, err = self.out(
+                cred.cmd_cred, ["sync-orca", "--home", "user-example-com"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(
+            "home user-example-com metadata says user@example.com "
+            "(lineage UNKNOWN) — FRESH", out)
+        self.assertNotIn("holds", out + err)
 
     def test_switch_guard_quiet_backup_prints_nothing(self):
         """SessionStart hook mode: stdout becomes session context — stay silent."""
@@ -2133,6 +2157,22 @@ class TornPairTest(CredBase):
         self.assertIn("alice@ex.example", plan["reason"])
         self.assertEqual(cred.account_of(home)["email"], "alice@ex.example")
 
+    def test_occupant_evidence_names_metadata_and_lineage(self):
+        """The occupant branch names oauthAccount, not a home that holds it.
+        Dry-run does not census, so the snapshot's own account stays the only
+        lineage row and the occupant sentence is the one that fires."""
+        home = self.plant("user-example-com", "user@example.com", token="FAKE-AL")
+        old = time.time() - 60
+        os.utime(os.path.join(home, ".claude.json"), (old, old))
+        cred.cache_clear()
+        self.assertTrue(cred.backup(home, apply=True)["ok"])
+        self.plant("user-example-com", "alice@ex.example", token="FAKE-AL")
+        plan = cred.heal()["plans"][0]
+        self.assertIn(
+            "metadata says alice@ex.example (lineage MISMATCH)", plan["reason"])
+        self.assertNotIn("holds live", plan["reason"])
+        self.assertNotIn("HOLDS", plan["reason"])
+
     def test_a_mixed_home_never_becomes_a_snapshot(self):
         """The post-tear mixed home — account A's token bytes under account
         B's identity — is refused at CAPTURE, where the estate's own snapshot
@@ -2233,12 +2273,13 @@ class SecrecyTest(CredBase):
 
 
 class LaunchNoteTest(CredBase):
-    def test_launch_prints_the_account_the_home_actually_holds(self):
+    def test_launch_prints_the_metadata_account_and_its_lineage(self):
         from helm import launch
         d = self.plant("admin-example-com", "user@example.com")
         _, _, err = self.out(launch.home_note, d, "admin-example")
-        self.assertIn("HOLDS user@example.com", err)
+        self.assertIn("metadata says user@example.com (lineage UNKNOWN)", err)
         self.assertIn("DRIFT", err)
+        self.assertNotIn("HOLDS", err)
 
     def test_launch_note_on_an_unreadable_home_never_claims_an_account(self):
         from helm import launch
@@ -2247,6 +2288,159 @@ class LaunchNoteTest(CredBase):
         _, _, err = self.out(launch.home_note, d, "mystery")
         self.assertIn("account unreadable", err)
         self.assertNotIn("HOLDS", err)
+        self.assertNotIn("metadata says", err)
+
+
+class TokenLineageTest(CredBase):
+    """task/2636: which account the TOKEN a home holds was seen under, read
+    from the family lineage earlier censuses recorded, beside the
+    .claude.json metadata Orca rewrites on every switch. `claude auth status`
+    was measured (2.1.284) and prints that same metadata, so it is not a
+    second source. Every fixture token is fake; the lineage is planted
+    through the writer the census uses."""
+
+    TOKEN = "FAKE-LINEAGE-REFRESH-not-a-secret"
+
+    def home(self, name, email, lineage_account=None, token=TOKEN):
+        d = self.plant(name, email, token=token)
+        if lineage_account:
+            fam = homes._token_family("claude", d)
+            cred._lineage_record([(fam, name, lineage_account)])
+        return d
+
+    def list_text(self):
+        _, out, err = self.out(cred.cmd_cred, ["list"])
+        _, jout, jerr = self.out(cred.cmd_cred, ["list", "--json"])
+        return out + err, jout + jerr
+
+    def test_a_family_seen_under_another_account_is_a_mismatch_naming_both(self):
+        d = self.home("b-user-example", "b@user.example", "a@user.example")
+        lin = cred.token_lineage(d)
+        self.assertEqual(lin["state"], "MISMATCH")
+        self.assertEqual(lin["accounts"], ["a@user.example"])
+        self.assertEqual(lin["metadata"], "b@user.example")
+        out, _ = self.list_text()
+        line = [ln for ln in out.splitlines() if "MISMATCH" in ln]
+        self.assertEqual(len(line), 1, out)
+        self.assertIn("a@user.example", line[0])
+        self.assertIn("b@user.example", line[0])
+        self.assertIn("earlier census", out)
+        self.assertNotIn("token's own identity", out)
+
+    def test_a_family_seen_under_the_metadata_account_has_no_mismatch(self):
+        d = self.home("b-user-example", "b@user.example", "b@user.example")
+        self.assertEqual(cred.token_lineage(d)["state"], "MATCH")
+        out, _ = self.list_text()
+        self.assertNotIn("MISMATCH", out)
+        self.assertIn("lineage MATCH", out)
+
+    def test_a_family_never_seen_is_unknown_never_the_metadata(self):
+        d = self.home("b-user-example", "b@user.example")
+        cred._lineage_record([("0123456789", "elsewhere", "c@user.example")])
+        lin = cred.token_lineage(d)
+        self.assertEqual(lin["state"], "UNKNOWN")
+        self.assertEqual(lin["accounts"], [])
+        self.assertIn("never recorded", lin["reason"])
+        out, _ = self.list_text()
+        self.assertNotIn("MISMATCH", out)
+        self.assertIn("lineage UNKNOWN", out)
+
+    def test_an_unreadable_credentials_file_is_unknown(self):
+        d = self.home("b-user-example", "b@user.example", "b@user.example")
+        with open(os.path.join(d, ".credentials.json"), "w") as f:
+            f.write("{not json")
+        lin = cred.token_lineage(d)
+        self.assertEqual(lin["state"], "UNKNOWN")
+        self.assertIsNone(lin["tag"])
+        self.assertEqual(lin["accounts"], [])
+        self.assertIn("unreadable", lin["reason"])
+        out, _ = self.list_text()
+        self.assertIn("lineage UNKNOWN", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_an_unreadable_lineage_is_unknown(self):
+        d = self.home("b-user-example", "b@user.example", "a@user.example")
+        with open(cred._lineage_path(), "w") as f:
+            f.write("{garbage")
+        lin = cred.token_lineage(d)
+        self.assertEqual(lin["state"], "UNKNOWN")
+        self.assertEqual(lin["accounts"], [])
+        self.assertIn("lineage", lin["reason"])
+        self.assertIn("unreadable", lin["reason"])
+        out, _ = self.list_text()
+        self.assertNotIn("MISMATCH", out)
+        self.assertIn("lineage UNKNOWN", out)
+
+    def test_the_chrome_extension_account_is_a_named_unknown(self):
+        d = self.home("b-user-example", "b@user.example", "b@user.example")
+        self.assertEqual(cred.token_lineage(d)["chrome"], "UNKNOWN")
+        out, jout = self.list_text()
+        self.assertIn("chrome extension account: UNKNOWN", out)
+        self.assertEqual(json.loads(jout)[0]["token_lineage"]["chrome"], "UNKNOWN")
+
+    def test_a_family_recorded_under_two_accounts_is_ambiguous_never_match(self):
+        d = self.home("b-user-example", "b@user.example", "a@user.example")
+        cred._lineage_record([(homes._token_family("claude", d),
+                               "b-user-example", "b@user.example")])
+        lin = cred.token_lineage(d)
+        self.assertEqual(lin["state"], "AMBIGUOUS")
+        self.assertEqual(lin["accounts"], ["a@user.example", "b@user.example"])
+        out, _ = self.list_text()
+        line = [ln for ln in out.splitlines() if "lineage AMBIGUOUS" in ln]
+        self.assertEqual(len(line), 1, out)
+        self.assertIn("a@user.example", line[0])
+        self.assertIn("b@user.example", line[0])
+        self.assertNotIn("lineage MATCH", out)
+        self.assertNotIn("MISMATCH", out)
+
+    def test_a_two_account_family_with_metadata_in_neither_is_a_mismatch(self):
+        d = self.home("c-user-example", "c@user.example", "a@user.example")
+        cred._lineage_record([(homes._token_family("claude", d),
+                               "c-user-example", "b@user.example")])
+        lin = cred.token_lineage(d)
+        self.assertEqual(lin["state"], "MISMATCH")
+        self.assertEqual(lin["accounts"], ["a@user.example", "b@user.example"])
+        out, _ = self.list_text()
+        line = [ln for ln in out.splitlines() if "MISMATCH" in ln]
+        self.assertEqual(len(line), 1, out)
+        for who in ("a@user.example", "b@user.example", "c@user.example"):
+            self.assertIn(who, line[0])
+
+    def test_a_switch_between_the_two_reads_is_unknown(self):
+        """The metadata is rewritten after the token family is read and before
+        the account is: a torn pair, deterministically, with no timing."""
+        d = self.home("b-user-example", "b@user.example", "b@user.example")
+        real = homes._token_family
+
+        def switch_after(provider, home):
+            fam = real(provider, home)
+            with open(os.path.join(d, ".claude.json"), "w") as f:
+                json.dump({"oauthAccount": {
+                    "emailAddress": "switched-in@user.example"}}, f)
+            return fam
+        with mock.patch.object(homes, "_token_family", switch_after):
+            lin = cred.token_lineage(d)
+        self.assertEqual(lin["state"], "UNKNOWN")
+        self.assertIn("moved", lin["reason"])
+        self.assertEqual(lin["accounts"], [])
+
+    def test_the_list_labels_the_account_column_as_metadata(self):
+        self.home("b-user-example", "b@user.example", "b@user.example")
+        out, _ = self.list_text()
+        self.assertIn("METADATA ACCOUNT", out)
+        self.assertNotIn("ACTUAL ACCOUNT", out)
+        self.assertIn("the METADATA account", out)
+
+    def test_no_token_and_no_long_hash_reaches_any_output(self):
+        d = self.home("b-user-example", "b@user.example", "a@user.example")
+        full = hashlib.sha256(self.TOKEN.encode()).hexdigest()
+        lin = cred.token_lineage(d)
+        self.assertEqual(lin["tag"], full[:8])
+        out, jout = self.list_text()
+        text = out + jout + json.dumps(lin)
+        self.assertIn(full[:8], out)
+        self.assertNotIn(self.TOKEN, text)
+        self.assertNotIn(full[:9], text)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ from helm import chat, cli, hooks, landreq  # noqa: E402
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DOCS = os.path.join(_ROOT, "docs")
 _WORDS = {2: "two", 6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
-          11: "eleven", 12: "twelve", 13: "thirteen"}
+          11: "eleven", 12: "twelve", 13: "thirteen", 14: "fourteen"}
 
 
 def _doc(name):
@@ -139,9 +139,10 @@ class HooksEstatePinTest(unittest.TestCase):
         # arm entirely. The command is checked for the SHAPE that reaches the
         # script instead.
         import os as _os
-        ladder = open(_os.path.join(
-            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-            "bin", hooks.HOOK_WRAPPER), encoding="utf-8").read()
+        with open(_os.path.join(
+                _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                "bin", hooks.HOOK_WRAPPER), encoding="utf-8") as fh:
+            ladder = fh.read()
         for arm in ("2)", "124)", "127)", "*)"):
             self.assertIn(arm, ladder,
                           "the doc pins an arm the shipped ladder lost")

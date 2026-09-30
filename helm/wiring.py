@@ -55,6 +55,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from . import pk, projscope
 
 # The real front doors. `cli` dispatches every verb; `__main__` is `python -m
@@ -89,12 +90,15 @@ ALLOWED = {
                       "OUTSIDE the import graph: the composed pre-push guard "
                       "snapshots this file beside the shared hook and runs "
                       "that stable copy as `python3 hostpath_guard.py "
-                      "--pre-push`, so it works with no importable helm package "
+                      "--pre-push` (and, for its shared-history rung, "
+                      "`--shared-history`), so it works with no importable "
+                      "helm package "
                       "and an installing lane cannot mutate the live guard. "
                       "The import edge sits in "
                       "work/_guard.py's _hostpath_scanner_path() — invisible "
-                      "to module-granular scan. The hostpath-pre-push "
-                      "obligation re-reads the executable installed hook; an "
+                      "to module-granular scan. The hostpath-pre-push and "
+                      "shared-history-pre-push obligations re-read the "
+                      "executable installed hook; an "
                       "uninstalled promise is reported. Exercised by "
                       "tests/test_hostpath_guard.py.",
     "inflight_gate": "same stable-snapshot class as nevertrack. The "
@@ -157,9 +161,9 @@ ALLOWED = {
                          "The composed pre-commit hook runs an installed copy "
                          "as `python3 retired_name_rung.py --staged`, refusing "
                          "a commit whose staged diff retires a top-level name "
-                         "the index still spells elsewhere. The import edge "
-                         "sits in work/_guard.py outside this module-granular "
-                         "scan. Exercised end-to-end by "
+                         "the index still reads from its module. The import "
+                         "edge sits in work/_guard.py outside this "
+                         "module-granular scan. Exercised end-to-end by "
                          "tests/test_retired_name_rung.py.",
     "lane_discipline": "same stable-snapshot class as nevertrack (above). The "
                        "composed pre-commit hook snapshots this file beside "
@@ -227,6 +231,18 @@ ACTUATORS = {
                         r'\s+\|\|\s+exit\s+\$\?',
         "kinds": ("git-hook",), "names": ("pre-push",),
     },
+    # The shared-history rung rides the same snapshot as the host-path scan,
+    # so it is its own obligation on the same hook: a pre-push that credits
+    # the scan but never asks whether the destination shares the pushed
+    # history lets a whole private history out in one push. The feeder is
+    # REQUIRED here: the rung reads nothing from an empty stdin, and allows.
+    "shared-history-pre-push": {
+        "tokens": ("hostpath_guard.py", "--shared-history"),
+        "refusal_line": r'helm_push_refs\s+\|\s+python3\s+\S*shared_history'
+                        r'\S*\s+--shared-history(?:\s+\S+)?'
+                        r'\s+\|\|\s+exit\s+\$\?',
+        "kinds": ("git-hook",), "names": ("pre-push",),
+    },
     "vacuous-assertion-pre-commit": {
         "tokens": ("vacuous_assertion.py",),
         "line_tokens": ("python3", "$vacuous", "--staged", "||", "true"),
@@ -284,6 +300,15 @@ ACTUATORS = {
     # --install-timer` installs the unit this census looks for.
     "upstream-watch": {
         "tokens": ("helm upstream-watch",),
+        "kinds": ("systemd", "crontab"),
+    },
+    # The fleet's own stall (task/3714). A reader inside agents.slice stalls
+    # with the seats it reads; the watcher runs from an app.slice timer, and
+    # a watcher nobody schedules watches nothing, so
+    # doctor names it NO ACTUATOR until `helm pressure-watch --install-timer`
+    # has written and enabled the unit this census looks for.
+    "pressure-watch": {
+        "tokens": ("helm pressure-watch --post",),
         "kinds": ("systemd", "crontab"),
     },
     "worktree-gc": {
@@ -389,10 +414,25 @@ _GATESLICE_MUTABLE = {
 }
 
 
+# The load recorder's memo event (helm/gateloads.py MEMO_EVENT; spelled out,
+# not imported, so every module that reaches wiring does not reach the
+# recorder too). A test that REUSES a memo read no file itself, so the memo
+# says when it computes and when it is reused, and a recording gate charges
+# each reuse with the files the computation read.
+_MEMO_EVENT = "helm.memo"
+
+
 def _real(name, compute):
     """`compute()` once per process under `name`."""
+    key = "wiring." + name
     if name not in _REAL:
-        _REAL[name] = compute()
+        sys.audit(_MEMO_EVENT, key, "miss")
+        try:
+            _REAL[name] = compute()
+        finally:
+            sys.audit(_MEMO_EVENT, key, "done")
+    else:
+        sys.audit(_MEMO_EVENT, key, "hit")
     return _REAL[name]
 
 
@@ -1013,9 +1053,12 @@ def consumer_census(repo=None, hook_dir=None, unit_dir=None, crontab=None,
     Shipped unit files and comments are documentation, not actuators.
     """
     repo = repo or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # The units are read where the installers wrote them, unless the caller
+    # names a home of its own (timerhealth.user_unit_dir).
+    from . import timerhealth
+    unit_dir = unit_dir or timerhealth.user_unit_dir(home_dir)
     home_dir = home_dir or os.path.expanduser("~")
     hook_dir = hook_dir if hook_dir is not None else _default_hook_dir(repo)
-    unit_dir = unit_dir or os.path.join(home_dir, ".config", "systemd", "user")
     settings_paths = (_settings_candidates(home_dir, repo)
                       if settings_paths is None else settings_paths)
     rows, unknown = [], set()

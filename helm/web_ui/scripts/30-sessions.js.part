@@ -22,7 +22,7 @@ function ensureCatalog() { if (!CATP) CATP = loadCatalog(false); return CATP; }
 function initSessions() {
   if (SINIT) return;
   SINIT = true;
-  if (!CREDS.length) loadCreds();  // resume-as picker needs the roster; quota tab may never have opened
+  if (!CREDS.length) loadCreds();  // resume-as picker needs the roster; Fleet › credit may never have opened
   else renderResumeAs();
   ensureCatalog();
 }
@@ -66,7 +66,7 @@ function rowHTML(r) {
   <div class="title">${hl(r.t, q)}${r.b ? `<span style="font-size:.76rem;color:var(--mut);font-family:ui-monospace,monospace"> ⑂ ${esc(r.b)}</span>` : ""}
     <div class="l2">${r.i.slice(0, 8)} · ${hl(r.c, q)}${flags}</div></div>
   <div class="rmeta">${r.m ? r.m.toLocaleString() + " msg · " : ""}${fmtB(r.z)}<br>${r.u}</div>
-  <div class="act"><button data-a="resume" data-i="${r.i}" title="hover to preview the command · click to copy">⧉ resume</button><button data-a="team" title="add to team tray">+ team</button></div></div>`;
+  <div class="act"><button data-a="resume" data-i="${r.i}" title="hover to preview the command · click to copy">⧉ resume</button><button data-a="team" title="add to the launch tray: sessions to resume together, one per terminal">+ tray</button></div></div>`;
 }
 // {project basename: session count} over the viewer's REAL sessions — one
 // computation, two readers: the scope box's autocomplete list and the hint's
@@ -189,7 +189,7 @@ function renderSessions() {
   }
 }
 
-/* ---------- resume-as strip (shows the quota tab's SEL pick; click cycles) ---------- */
+/* ---------- resume-as strip (shows the Fleet › credit's SEL pick; click cycles) ---------- */
 function renderResumeAs() {
   const el = $("#resumeAs");
   if (!el) return;
@@ -198,7 +198,7 @@ function renderResumeAs() {
     const a = SEL[p];
     return `<span class="rachip" data-p="${p}" title="click to cycle the ${p === "anthropic" ? "claude" : "codex"} resume account">${p === "anthropic" ? "claude" : "codex"} → <b style="color:${a ? acol(a) : "var(--mut)"}">${a ? esc(short(a, 24)) : "—"}</b></span>`;
   };
-  el.innerHTML = `resume as: ${mk("anthropic")} ${mk("codex")} <span style="color:var(--mut)">· full picker on the quota tab</span>`;
+  el.innerHTML = `resume as: ${mk("anthropic")} ${mk("codex")} <span style="color:var(--mut)">· full picker on <a href="#quota">Fleet › credit →</a></span>`;
   $$(".rachip").forEach(ch => ch.onclick = () => {
     const p = ch.dataset.p, list = CREDS.filter(c => c.provider === p && c.state === "ok");
     if (!list.length) return;
@@ -282,8 +282,8 @@ document.addEventListener("click", async e => {
   const r = DATA.find(x => x.i === rowEl.dataset.i);
   if (!r) return;
   const account = pickAccount(r.h);
-  if (!account) { toast("no " + fam(r.h) + " account selected — pick one on the quota tab"); return; }
-  if (b.dataset.a === "team") { TEAM.push({r, account}); trayCount(); renderTray(); toast(`seat ${TEAM.length} added — open the tray (top right) when your team is composed`); return; }
+  if (!account) { toast("no " + fam(r.h) + " account selected — pick one on Fleet › credit"); return; }
+  if (b.dataset.a === "team") { TEAM.push({r, account}); trayCount(); renderTray(); toast(`session ${TEAM.length} added — open the launch tray (top right) when the set is ready`); return; }
   const res = await fetchCmd(r, account);
   if (res.error) { toast("✗ " + res.error); return; }
   await navigator.clipboard.writeText(res.cmd);
@@ -327,7 +327,7 @@ async function openSession(sid, opts = {}) {
   }
   const S = d.session || {};
   DRAW.start = d.start; DRAW.resumable = S.resumable !== false && !!r;
-  const acts = [DRAW.resumable ? `<button id="dresume" title="copy the resume command for the selected account">⧉ resume</button><button id="dteam">+ team</button>` : `<span class="rst" style="padding:6px">read-only</span>`,
+  const acts = [DRAW.resumable ? `<button id="dresume" title="copy the resume command for the selected account">⧉ resume</button><button id="dteam" title="add to the launch tray">+ tray</button>` : `<span class="rst" style="padding:6px">read-only</span>`,
     DRAW.resumable ? `<button id="dcwd" title="re-home this session: change the directory its resume opens in">⌂ cwd</button>` : "",
     DRAW.resumable && r && r.h === "claude" ? `<button id="doptimize" title="create a resume-optimized copy: same session, cleaner context, cheaper resume — the original is never touched">⚗ optimize</button>` : "",
     `<button id="dclose">✕</button>`].join("");
@@ -346,7 +346,7 @@ async function openSession(sid, opts = {}) {
       const rn = resumeNote(res);
       toast((rn.big ? "⚠ " + rn.big + "  ·  copied anyway for inspection" : "copied ➜ " + res.cmd) + (rn.big ? "" : rn.note), rn.ms);
     };
-    $("#dteam").onclick = () => { TEAM.push({r, account: SEL[fam(r.h)]}); trayCount(); renderTray(); toast("added to team tray"); };
+    $("#dteam").onclick = () => { TEAM.push({r, account: SEL[fam(r.h)]}); trayCount(); renderTray(); toast("added to the launch tray"); };
     $("#dcwd").onclick = () => $("#cwdedit").classList.toggle("show");
     if ($("#doptimize")) $("#doptimize").onclick = () => {
       let menu = $("#optmenu");
@@ -412,7 +412,11 @@ async function loadEarlier() {
 }
 document.addEventListener("keydown", e => { if (e.key === "Escape") { $("#drawer").classList.remove("show"); $("#tray").classList.remove("show"); hidePop(); } });
 
-/* ---------- team tray ---------- */
+/* ---------- launch tray ----------
+   Sessions to resume together, one per terminal, each on the account picked
+   for it, and a named preset of them kept in this browser. It is a LAUNCH SET,
+   never a project's team (task/3445: saving a team is the Team tab's one
+   control, and this tray's words are its own). */
 function trayCount() { const b = $("#trayBtn"); b.innerHTML = "⊞" + (TEAM.length ? `<span class="n">${TEAM.length}</span>` : ""); b.classList.toggle("has", TEAM.length > 0); }
 function renderTray() {
   const seats = $("#seats");
@@ -421,7 +425,7 @@ function renderTray() {
     <div class="m">${s.r.i.slice(0, 8)} · ${s.r.h} · ${esc(s.r.c)}</div>
     <select data-i="${i}">${CREDS.filter(c => c.provider === fam(s.r.h)).map(c => `<option ${c.name === s.account ? "selected" : ""}>${esc(c.name)}</option>`).join("") || '<option>(default)</option>'}</select>
     <button class="showcmd" data-i="${i}">${s.copied ? "✓ copied — show again" : "show command"}</button>
-    <div class="cmdslot"></div></div>`).join("") || '<div class="empty">click “+ team” on sessions to compose a team</div>';
+    <div class="cmdslot"></div></div>`).join("") || '<div class="empty">click “+ tray” on sessions to collect a launch set</div>';
   seats.querySelectorAll(".rm").forEach(el => el.onclick = () => { TEAM.splice(+el.dataset.i, 1); trayCount(); renderTray(); });
   seats.querySelectorAll("select").forEach(el => el.onchange = () => { TEAM[+el.dataset.i].account = el.value; renderTray(); });
   seats.querySelectorAll(".showcmd").forEach(el => el.onclick = async () => {
@@ -448,7 +452,7 @@ const PKEY = "helm.presets";
 const loadPresets = () => JSON.parse(localStorage.getItem(PKEY) || "{}");
 function renderPresets() {
   const ps = loadPresets(), host = $("#presets");
-  host.innerHTML = Object.keys(ps).map(n => `<span class="chip" data-n="${esc(n)}" title="load this team (right-click to delete)">${esc(n)} (${ps[n].length})</span>`).join(" ") || "";
+  host.innerHTML = Object.keys(ps).map(n => `<span class="chip" data-n="${esc(n)}" title="load this launch set (right-click to delete)">${esc(n)} (${ps[n].length})</span>`).join(" ") || "";
   host.querySelectorAll(".chip").forEach(el => {
     el.onclick = async () => {
       await ensureCatalog();
@@ -467,7 +471,7 @@ $("#savePreset").onclick = () => {
   ps[n] = TEAM.map(s => ({sid: s.r.i, account: s.account}));
   localStorage.setItem(PKEY, JSON.stringify(ps));
   renderPresets();
-  toast(`saved team “${n}” (${TEAM.length} seats)`);
+  toast(`saved launch set “${n}” (${TEAM.length} sessions)`);
 };
 
 /* ---------- sessions controls ---------- */

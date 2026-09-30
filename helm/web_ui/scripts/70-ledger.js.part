@@ -51,6 +51,7 @@ function ledgerMode(tp) {
   const labels = {
     signed: "signing is ON — committed entries appear below; signing evidence belongs to each row",
     degraded: "signing is degraded — unresolved failure for " + ((tp && tp.profile) || "an unknown profile") + "; committed entries may still arrive",
+    unknown: "signing status is UNKNOWN — the cause of " + ((tp && tp.profile) || "an unknown profile") + "'s signing failure could not be re-probed; committed entries may still arrive",
     ready: "signing is ready (unproven) — no committed signing success reported",
     unsigned: "signing is off for this transport — existing shared entries remain readable",
     "unsigned (no signer)": "signing is off (no signer) — existing shared entries remain readable"
@@ -96,11 +97,19 @@ function nativeChat(p) {
   const read = !p || typeof p.age_s !== "number" ? ''
     : ' · <span class="lmeta" title="how long ago helm last walked the rooms for this pulse — the counts can lag a new post by that much">read ' +
       (p.age_s < 1 ? 'just now' : Math.round(p.age_s) + 's ago') + '</span>';
-  ledgerHTML($("#nativechat"), !p || !p.msgs
+  // A ROOM THE SERVER COULD NOT READ IS NAMED HERE (task/3715): the counts
+  // above leave it out, and "quiet" over a room nobody could open is a claim
+  // this reading cannot make.
+  const bad = p && Array.isArray(p.unreadable) && p.unreadable.length
+    ? ' · <span class="lbadge tent" title="rooms helm could not read for this pulse; their posts are not in these counts">' +
+      p.unreadable.length + ' room(s) unreadable: ' +
+      p.unreadable.map(u => esc(u.room || "the room list") + ' (' + esc(u.reason || "?") + ')').join(", ") + '</span>'
+    : '';
+  ledgerHTML($("#nativechat"), (!p || !p.msgs
     ? 'chat pulse: quiet — nothing posted yet' + read
     : 'chat pulse: <b>' + p.msgs + '</b> msg(s) · ' + p.rooms + ' room(s) · last ' +
       ledgerAgeHTML(p.last_ts) + ' (<b>' + esc(p.last_from) + '</b> in ' + esc(p.last_room) +
-      tail + read);
+      tail + read) + bad);
 }
 
 function nativeRows(d) {
@@ -115,7 +124,7 @@ function nativeRows(d) {
     if (x.rec) {
       const r = x.rec;
       return '<div class="lrow"><div class="lhead"><span class="lidx">#' + (r.chain_index ?? "?") + '</span>' +
-        '<span class="mono lhash copy" data-copy="' + esc(r.rec_hash || "") + '" title="native record hash — click to copy; verify with helm premise-check">' + lsh(r.rec_hash) + '</span>' +
+        '<span class="mono lhash copy" data-copy="' + esc(r.rec_hash || "") + '" title="native record hash — click to copy">' + lsh(r.rec_hash) + '</span>' +
         '<span class="lbadge final">chained</span>' +
         (r.op !== "create" ? '<span class="lbadge">' + esc(r.op || "") + '</span>' : '') +
         ledgerAgeHTML(r.ts) + '</div>' +
@@ -164,7 +173,7 @@ function cavePulseClock(el, now) {
   if (span.textContent !== a.span) span.textContent = a.span;
 }
 
-/* PURE (data in, string out — the lrCardHTML pattern, so tests run this
+/* PURE (data in, string out — the renderers' pattern, so tests run this
    exact source under node): the signing-pulse line for the signed-entries
    card. Composes the SAME turns payload the rows below render — no second
    fetch, no second truth — into the three facts the list itself cannot show
@@ -237,9 +246,8 @@ function ledgerStrip(d) {
     const tp = d.transport, degraded = tp && tp.mode === "degraded";
     ledgerHTML(el, '<span class="offline">substrate offline — node unreachable at <code>' +
       esc(d.node) + '</code>; retrying quietly…</span>' + (degraded
-        ? '<span title="' + esc(tp.remediation || "repair signing and retry") +
-          '">chat signing <span class="lbadge tent">DEGRADED</span> · <b>' +
-          esc(tp.profile || "?") + '</b> · ' + esc(tp.reason || "signing failed") +
+        ? '<span title="a seat\'s signing failure is still open while the node is unreachable">chat signing <span class="lbadge tent">DEGRADED</span> · ' +
+          esc(tp.owner_say || (tp.profile || "a seat") + "'s posts went out unsigned") +
           ' · first ' + esc(tp.first_failure || "?") + ' · last ' +
           esc(tp.last_failure || "?") + ' (' + ledgerAgeHTML(tp.last_failure) +
           ')</span>' : ''));
@@ -248,21 +256,41 @@ function ledgerStrip(d) {
   const s = d.status || {}, fin = s.latest_height ?? 0, tp = d.transport;
   const sig = !tp ? ''
     : tp.mode === "signed"
-      ? '<span title="chat posts and lesson captures are being signed onto the shared record (helm chat status)">signing <span class="lbadge final">live</span></span>'
+      ? '<span title="chat posts and lesson captures are being signed onto the shared record">signing <span class="lbadge final">live</span></span>'
       : tp.mode === "degraded"
-        ? '<span title="A profile has an unresolved signing failure; other profiles may still commit signed entries. Remediation: ' + esc(tp.remediation || "repair signing and retry") + '">signing <span class="lbadge tent">DEGRADED</span> · <b>' + esc(tp.profile || "?") + '</b> · ' + esc(tp.reason || "signing failed") + ' · first ' + esc(tp.first_failure || "?") + ' · last ' + esc(tp.last_failure || "?") + ' (' + ledgerAgeHTML(tp.last_failure) + ')</span>'
-        : '<span title="chat transport truth (helm chat status)">signing <span class="lbadge tent">' + esc(tp.label || tp.mode) + '</span></span>';
+        ? '<span title="a seat has an open signing failure; other seats may still sign their entries">signing <span class="lbadge tent">DEGRADED</span> · ' + esc(tp.owner_say || (tp.profile || "a seat") + "'s posts went out unsigned") + ' · first ' + esc(tp.first_failure || "?") + ' · last ' + esc(tp.last_failure || "?") + ' (' + ledgerAgeHTML(tp.last_failure) + ')</span>'
+        // UNKNOWN is its own word: the failure's cause could not be
+        // re-probed, which is neither healthy nor a measured break.
+        : tp.mode === "unknown"
+          ? '<span title="a seat has a signing failure whose cause could not be checked again from here; it is not healthy and not proven broken">signing <span class="lbadge tent">UNKNOWN</span> · ' + esc(tp.owner_say || (tp.profile || "a seat") + "'s posts went out unsigned") + ' · first ' + esc(tp.first_failure || "?") + ' · last ' + esc(tp.last_failure || "?") + ' (' + ledgerAgeHTML(tp.last_failure) + ')</span>'
+          : '<span title="how chat posts reach the record right now">signing <span class="lbadge tent">' + esc(tp.label || tp.mode) + '</span></span>';
+  // A DARK SEAT'S FAILURE IS ITS OWN LINE, never the fleet's badge, and so is
+  // the expected state of a seat run outside helm's launcher: the server
+  // composes each in the owner's words (`owner_scoped`) and this prints it.
+  // THE OWNER'S COPY ONLY, here and on every failure above: `reason`, `cause`,
+  // `remediation` and `scoped` are the agents' text and name helm verbs
+  // (console walk 4, P1 2).
+  const scoped = tp && Array.isArray(tp.owner_scoped) ? tp.owner_scoped.map(line =>
+    '<span class="lscoped" title="one seat\'s signing state, not a fleet-wide degradation">' + esc(line) + '</span>').join("") : "";
   // THE RECORD IN ONE COMPARISON — Tufte's analytical act put where the eye
   // lands first: entries on the shared signed record (provable anywhere)
   // beside chained notes that exist only on this computer (provable only
   // here). Either side unread says UNKNOWN — a "0" here would claim a record
   // nobody counted.
   const sharedN = typeof s.dag_height === "number" ? s.dag_height : null;
-  const split = '<span title="the two records side by side: signed entries on the shared record (checkable by anyone) vs tamper-evident notes that exist only on this machine (helm premise-check). Different contents, one question: how much of what helm knows is PROVABLE off this box.">'
+  const split = '<span title="the two records side by side: signed entries on the shared record (checkable by anyone) vs tamper-evident notes that exist only on this machine. Different contents, one question: how much of what helm knows is PROVABLE off this box.">'
     + "record: <b>" + (sharedN === null ? "UNKNOWN" : sharedN) + "</b> signed·shared vs <b>"
     + (NATIVE_COUNT === null ? "UNKNOWN" : NATIVE_COUNT) + "</b> local-only</span>";
+  // The post labels on the entries below come from a join over the chat
+  // rooms; a room it could not read is named, so a missing label is never
+  // mistaken for "not ours to name" (task/3715).
+  const bad = Array.isArray(d.about_unreadable) && d.about_unreadable.length
+    ? '<span class="lbadge tent" title="rooms helm could not read when it labelled these entries with the posts they carry">' +
+      d.about_unreadable.length + ' room(s) unreadable for post labels: ' +
+      d.about_unreadable.map(u => esc(u.room || "the room list") + ' (' + esc(u.reason || "?") + ')').join(", ") + '</span>'
+    : '';
   ledgerHTML(el,
-    '<span><b>' + (s.healthy === true ? "healthy" : "degraded") + '</b></span>' + sig +
+    '<span><b>' + (s.healthy === true ? "healthy" : "degraded") + '</b></span>' + sig + scoped + bad +
     '<span title="turns accepted at ingress">ingress <b>' + esc(String(s.dag_height ?? "?")) + '</b></span>' +
     '<span title="consensus-finalized height">finalized <b>' + fin + '</b>' + (fin === 0 ? ' <span class="lbadge tent">tentative</span>' : '') + '</span>' +
     '<span>producer <b>' + esc(String(s.state_producer ?? "?")) + '</b>' + (s.lean_producer ? " ✓" : "") + '</span>' +
@@ -321,7 +349,7 @@ function ledgerTurns(turns) {
   if (cls !== "rows") {
     ledgerHTML($("#ledgerturns"), '<div class="empty">' + (cls === "mismatch"
       ? 'the signing service reports entries up to #' + LEDGER_HEAD +
-        ', but this read found none — helm is likely reading the wrong service; run <code>helm chat status</code>'
+        ', but this read found none — helm is likely reading the wrong service'
       : cls === "fresh"
         ? 'no shared entries returned yet — signing is available, but this read has no committed entries'
         : 'no shared entries returned by this read — this does not establish whether new entries are being created') + '</div>');

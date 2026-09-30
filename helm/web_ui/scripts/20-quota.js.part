@@ -13,6 +13,14 @@ let CREDS = [], HIST = [], ALLOC = {}, SDATA = [], SEL = {anthropic: null, codex
    answers with `measured_unavailable`, one surface further out. null = read
    (or nothing measures); a string = the class name of what stopped it. */
 let CREDS_UNREADABLE = null;
+/* WHETHER EACH OF THE ACCOUNTS TABLE'S TWO READS HAS ANSWERED at least once
+   (the measured rows, the declared inventory). The board redraws the table
+   before either lands, and until both have, the table's groups are not an
+   answer to "which accounts bill this family" (renderAccts). */
+let CREDS_READ = false, DECL_READ = false;
+/* whether the declared read has been asked for at all, so the measured read
+   asks for it once on a page that is not the credit page (task/3635) */
+let DECL_ASKED = false;
 let QWIN = "7d", AFILTER = "all", EMPH = null, QINIT = false;
 const short = (n, l = 26) => n.length > l ? n.slice(0, l - 1) + "…" : n;
 /* single-unit reset ETA (was "1h05m" compound → ragged quota cells) */
@@ -37,6 +45,7 @@ function initQuota() {
   // the declared inventory loads with the tab, not on the fold: the measured
   // table's chips come from it, so waiting for a click would render the quota
   // rows undescribed and then silently change them under him.
+  DECL_ASKED = true;
   loadDeclared();
   setInterval(() => { loadCreds(true).then(() => { loadHist(); loadAlloc(); }); }, 120e3);
 }
@@ -46,6 +55,7 @@ async function loadCreds(refresh) {
   let d;
   try { d = await j("/api/creds" + (refresh ? "?refresh=1" : "")); } catch (e) { d = null; }
   CREDS = Array.isArray(d) ? d : [];
+  CREDS_READ = true;
   /* a non-list is the server saying it could not read; a fetch that failed
      outright is this page not being able to ask. Both are UNKNOWN, neither is
      "you have no accounts". */
@@ -57,7 +67,12 @@ async function loadCreds(refresh) {
       SEL[p] = best ? best.name : null;
     }
   }
-  NAV_ACC = CREDS.length ? statCell(CREDS.length, "accounts") : "";
+  /* THE NAV'S ACCOUNT COUNT IS THE CREDIT TABLE'S (task/3635), drawn by
+     renderAccts once both of its reads have landed — so the declared half is
+     read here too the first time any page reads the measured half. A count
+     of the credential HOMES here reads as accounts to the owner and matches
+     no group on the table. */
+  if (!DECL_READ && !DECL_ASKED) { DECL_ASKED = true; loadDeclared(); }
   renderNav();
   renderAttn(); renderAccts(); renderResumeAs();
 }
@@ -67,15 +82,24 @@ let NAV_ACC = "", NAV_SESS = "", NAV_CHAT = 0, NAV_CHAT_MENTION = false;
 function statCell(val, label, title) {
   return `<span class="stat"${title ? ` title="${esc(title)}"` : ""}><b>${typeof val === "number" ? val.toLocaleString() : esc(val)}</b><span>${esc(label)}</span></span>`;
 }
+/* A BADGE'S TEXT: a count past 99 is "99+" (itself a floor), a floor
+   (`bound` "at_least", a count not wholly read) is "≥94", anything else as
+   given — the one formatting, so a copy of a badge (the Work page's "same
+   numbers" fold) draws what the nav draws, and a badge never prints a bare
+   94 beside the page's ≥94 (task/3723, walk 3 finding 2). PURE. */
+function navBadgeText(n, bound) {
+  return typeof n !== "number" ? String(n) : n > 99 ? "99+" : (bound === "at_least" ? "≥" : "") + n;
+}
 /* one tab's badge. `n` falsy removes it; a NON-NUMERIC n (the land pipeline's
    "?") is rendered verbatim, because an unreadable pipeline must not be able
-   to present itself as a count of zero. */
-function navBadge(view, n, mention, title) {
+   to present itself as a count of zero; `bound` "at_least" draws the count
+   as the floor it is. */
+function navBadge(view, n, mention, title, bound) {
   // The value AS GIVEN, recorded before anything renders, because the area
   // roll-up below must read the count and not the badge's text: that text is a
   // RENDERING ("99+"), and Number("99+") is NaN, which would report a section
   // as unreadable where it had a perfectly good count.
-  NAV_BADGE[view] = {n: n, mention: !!mention, title: title || ""};
+  NAV_BADGE[view] = {n: n, bound: bound || null, mention: !!mention, title: title || ""};
   // First, and on every return path: the roll-up depends only on NAV_BADGE, so
   // a view with no tab in the markup still contributes to its area.
   areaBadge(AREA_OF[view]);
@@ -87,7 +111,7 @@ function navBadge(view, n, mention, title) {
     return;
   }
   if (!b) { b = document.createElement("span"); b.className = "navbadge"; tab.appendChild(b); }
-  b.textContent = (typeof n === "number" && n > 99) ? "99+" : n;
+  b.textContent = navBadgeText(n, bound);
   b.classList.toggle("mention", !!mention);
   b.title = title;
   // A BADGE CHANGES STRIP GEOMETRY AFTER showView ALREADY SCROLLED. Measured at
@@ -106,7 +130,7 @@ function navBadge(view, n, mention, title) {
 function areaBadge(area) {
   const btn = $('.navarea[data-a="' + area + '"]');
   if (!btn) return;
-  let sum = 0, unknown = null, mention = false;
+  let sum = 0, unknown = null, mention = false, floor = false;
   const titles = [];
   for (const view in AREA_OF) {
     if (AREA_OF[view] !== area) continue;
@@ -114,6 +138,8 @@ function areaBadge(area) {
     if (!b || !b.n) continue;
     if (typeof b.n === "number") sum += b.n;
     else unknown = b.n;
+    // A SUM WITH A FLOOR IN IT IS A FLOOR: it keeps the section's "≥"
+    if (b.bound === "at_least") floor = true;
     if (b.mention) mention = true;
     if (b.title) titles.push(b.title);
   }
@@ -128,7 +154,7 @@ function areaBadge(area) {
     el.className = "navbadge";
     btn.appendChild(el);
   }
-  el.textContent = (typeof val === "number" && val > 99) ? "99+" : val;
+  el.textContent = navBadgeText(val, floor ? "at_least" : null);
   el.classList.toggle("mention", mention);
   el.title = titles.join(" · ");
 }
@@ -146,12 +172,9 @@ function renderNav() {
   // the chat tab's unread badge — the owner must see an @mention from ANY tab
   navBadge("chat", NAV_CHAT, NAV_CHAT_MENTION,
     NAV_CHAT_MENTION ? "unread @mentions for you in chat" : "unread chat messages");
-  // the land pipeline's ALARM badge — a lane contradicting its verdict, a
-  // stalled one, or a pipeline that could not be read. It badges WORK, the
-  // page that holds the pipeline's kanban, fed by the always-on pollLr so it
-  // reaches him from ANY page. Routine motion never badges: good news waits
-  // for a glance, contradictions come find him.
-  navBadge("work", NAV_LR, true, NAV_LR_TITLE);
+  // THE WORK PAGE'S STUCK COUNT badges its tab (and so the Work button),
+  // painted by the always-on work read (`wkPaintAll`, task/3643), so it
+  // reaches him from ANY page. Routine motion never badges.
 }
 async function loadHist() {
   let d;
@@ -234,21 +257,24 @@ function renderAttn() {
   // expired-token is its OWN pill (task/381): a reauth-needed account is not a
   // broken one, and lumping an expired login into "need attention" told the owner four
   // healthy Max 20x accounts were erroring. The word is the whole fix.
+  // THE DETAIL IS HIS SENTENCE, NOT THE PROVIDER'S STATUS (task/3735): the
+  // status is the CLI's line and names the verbs an agent runs; the pill
+  // says the fact and who does it, in the id cell's own words (CRED_SAID).
   const stale = CREDS.filter(c => c.state === "expired-token");
-  if (stale.length) bits.push(attnPill("warn", `${stale.length} need re-login`, stale.map(c => c.name + ": " + c.status).join(" · ")));
+  if (stale.length) bits.push(attnPill("warn", `${stale.length} need re-login`, stale.map(c => c.name).join(" · ") + " — each " + CRED_SAID.login));
   // AND A DUE TOKEN IS NOT A DEAD ACCOUNT (task/2749): a home whose refresh
   // chain helm can still grant on costs the owner nothing but a cadence, so it
-  // gets its OWN pill naming the verb that fixes it. Under the re-login pill it
+  // gets its OWN pill saying no login is needed. Under the re-login pill it
   // told him six healthy accounts needed six logins. Same shape, different
   // sentence — the word is the whole fix, twice over now.
   const due = CREDS.filter(c => c.state === "due-refresh");
-  if (due.length) bits.push(attnPill("warn", `${due.length} keepalive due`, due.map(c => c.name + ": " + c.status).join(" · ")));
+  if (due.length) bits.push(attnPill("warn", `${due.length} keepalive due`, due.map(c => c.name).join(" · ") + " — " + CRED_SAID.due));
   const hyg = CREDS.filter(c => c.name_lies || c.duplicate_homes);
   // A DRIFTED HOME SAYS WHAT IT HOLDS AND WHAT IT PROMISES. "dir-name-lies" is
-  // true and unactionable; the two account names plus the verb that repairs it
-  // are what the owner needs, and without them a drifted home reads as one more
+  // true and unactionable; the two account names plus who repairs it are what
+  // the owner needs, and without them a drifted home reads as one more
   // account wanting a login.
-  if (hyg.length) bits.push(attnPill("warn", `${hyg.length} home ${hyg.length > 1 ? "issues" : "issue"}`, hyg.map(c => c.name + (c.name_lies ? ` drifted: holds ${c.identity || "?"}, named ${c.home_name || "?"} (helm cred heal)` : "") + (c.duplicate_homes ? " " + c.duplicate_homes.length + "-homes" : "")).join(" · ")));
+  if (hyg.length) bits.push(attnPill("warn", `${hyg.length} home ${hyg.length > 1 ? "issues" : "issue"}`, hyg.map(c => c.name + (c.name_lies ? ` drifted: metadata says ${c.identity || "?"}, named ${c.home_name || "?"}; ${CRED_SAID.drifted}` : "") + (c.duplicate_homes ? " " + c.duplicate_homes.length + "-homes" : "")).join(" · ")));
   const waste = CREDS.filter(c => c.windows_verdict && c.windows_verdict !== "ok" && c.windows_verdict !== "no-weekly");
   if (waste.length) {
     const det = waste.map(c => { const st = HIST.length ? strandAtReset(c.name) : null; return short(c.name, 18) + (st != null ? ` strands ~${st}%` : ""); }).join(", ");
@@ -257,9 +283,9 @@ function renderAttn() {
   /* ONE WORD, TWO CAUSES (task/2981). A codex Team member whose workspace is
      pooled while no pool file is proven to be it reads state "unknown" too,
      and this pill told him it had no auth. It is measured, and its cure is
-     to pool that member's own credential. */
+     an agent pooling that member's own credential. */
   const unproven = CREDS.filter(c => c.member_unproven);
-  if (unproven.length) bits.push(attnPill("warn", `${unproven.length} member unproven`, unproven.map(c => c.name + ": helm codex pool " + (c.home_name || "<home>")).join(" · ") + " — no pool file matches this member, so its budget is UNKNOWN until its own credential is pooled"));
+  if (unproven.length) bits.push(attnPill("warn", `${unproven.length} member unproven`, unproven.map(c => c.name).join(" · ") + " — " + CRED_SAID.unproven));
   /* …and a row whose windows helm could not READ this minute is neither: it
      has auth, and the "no auth" sentence below was the wrong cause for it. */
   const unread = CREDS.filter(c => c.quota_unreadable && !c.member_unproven);
@@ -509,12 +535,16 @@ async function loadBurn() {
 $("#burncard").addEventListener("toggle", () => { if ($("#burncard").open) loadBurn(); });
 
 /* ================= credential homes =================
-   helm prepares/verifies/moves home DIRECTORIES; every login is human-run and
-   credentials are never read, written, copied, or moved (one home = one login). */
+   helm prepares/verifies/moves home DIRECTORIES; every login is approved by a
+   human in the browser (an agent may start it), and credentials are never
+   read, written, copied, or moved (one home = one login). */
 let HOMES = [];
 // rides post() so home actions share the stale-bearer retry; callers keep the
 // {error: ...}-object contract they were written against (never a throw).
-const homePost = body => post("/api/homes", body).catch(e => ({error: e.message}));
+// A REFUSAL IS SAID IN HIS WORDS TOO (task/3735): where the server carries
+// `owner_error` beside its CLI line (which can name a verb), the card shows
+// that, as it shows `owner_next` and `owner_fixes`.
+const homePost = body => post("/api/homes", body).catch(e => ({error: (e.body && e.body.owner_error) || e.message}));
 async function loadHomes() {
   const host = $("#homerows");
   host.innerHTML = '<div class="empty">scanning homes…</div>';
@@ -584,8 +614,7 @@ async function homeAction(btn) {
     const r = await homePost({action: "verify", name, provider});
     btn.disabled = false;
     if (r.error) { fixEl.textContent = "✗ " + r.error; return; }
-    fixEl.innerHTML = `verdict: <b class="${r.verdict === "ok" ? "st-ok" : "st-approaching"}">${esc(r.verdict)}</b>`
-      + (r.fixes.length ? "<br>" + r.fixes.map(f => "fix: " + esc(f)).join("<br>") : " — all checks pass");
+    fixEl.innerHTML = homeVerifyHTML(r);
     return;
   }
   if (act === "archive" && !confirm(`Archive home ${name} (${provider})?\n\nMoves the whole directory into ~/.helm-home-archive — reversible via unarchive. Refuses if a live agent is on it.`)) return;
@@ -597,17 +626,28 @@ async function homeAction(btn) {
   toast("✓ " + (r.archived_to ? ("archived → " + r.archived_to) : r.restored_to ? ("restored → " + r.restored_to) : r.note || "done"), 6000);
   loadHomes(); loadCreds(true);
 }
+/* THE CARD SAYS WHAT THE SERVER SAYS TO HIM, NEVER ITS TERMINAL LINES
+   (task/3735). `home_create` and `home_verify` keep the CLI's lines — the
+   login command, `next`, `fixes` — for agents, and carry the owner's words
+   beside them (`owner_next`, `owner_fixes`), as a READY row carries
+   `owner_repair`. The card renders only those: a login is his to approve in
+   the browser and an agent can start it, so there is no command to show and
+   nothing to copy. PURE. */
+function homeCreatedHTML(r) {
+  return `<div class="homenext">${esc(r.owner_next || "")}</div>`;
+}
+function homeVerifyHTML(r) {
+  const said = r.owner_fixes || [];
+  return `verdict: <b class="${r.verdict === "ok" ? "st-ok" : "st-approaching"}">${esc(r.verdict)}</b>`
+    + (said.length ? "<br>" + said.map(f => esc(f)).join("<br>") : " — all checks pass");
+}
 $("#hCreate").onclick = async () => {
   const email = $("#hEmail").value.trim(), provider = $("#hProv").value;
   if (!email) { toast("enter the account email — the home name derives from it"); return; }
   const r = await homePost({action: "create", provider, email});
   const slot = $("#hCmd");
   if (r.error) { slot.innerHTML = `<div class="dupwarn">✗ ${esc(r.error)}</div>`; return; }
-  slot.innerHTML = `<div class="cmdbox">${esc(r.login_cmd)}<div class="hintline">click to copy — run it in YOUR terminal, approve in the browser, then hit verify on the new row (logins are human-only)</div></div>`;
-  slot.querySelector(".cmdbox").onclick = async () => {
-    await navigator.clipboard.writeText(r.login_cmd);
-    toast("login command copied ✓ — run it yourself, then verify");
-  };
+  slot.innerHTML = homeCreatedHTML(r);
   toast(`home ${r.existing ? "already prepared" : "created"}: ${r.home}`, 5000);
   loadHomes();
 };
@@ -634,6 +674,21 @@ $("#homescard").addEventListener("toggle", () => { if ($("#homescard").open) loa
 let DECL = {accounts: [], bad: [], unreadable: null, revision: "", totals: null,
             join: {matched: {}, declared_only: [], measured_only: []}, cap: 64};
 let DECL_EDIT = null;   // the id being edited, or null when adding
+/* THE REVISION THE FORM WAS OPENED AGAINST, and the one its save posts.
+   DECL.revision is the CARD's, and every re-read replaces it — the fold
+   reopening, a confirm or a remove on any row — while the form keeps the
+   fields it opened with. Posting the card's revision let another writer's
+   save pass the compare-and-set and the stale fields merge over it with no
+   409. "" while no form is open: it matches no inventory, so a save from a
+   closed form is refused, never unguarded (null would skip the check). */
+let DECL_REV = "";
+/* THE FORM'S GENERATION, bumped by every open and every close. A save takes
+   it before it posts, and what comes back acts on the form only while the
+   number is unchanged: an answer or a reload that lands after he has opened
+   another form is about the FIRST one, and re-pointing the new form's
+   revision to that reload would hand fields drawn before it a revision
+   after it — the lost update DECL_REV exists to stop. */
+let DECL_GEN = 0;
 /* the OPAQUE HANDLE of the measured account the form is describing, or null on
    every other flow. The card is never given the provider's own spelling for an
    undescribed account — it is usually an address — so this is the only thing
@@ -677,6 +732,7 @@ async function loadDeclared() {
   DECL = Object.assign({accounts: [], bad: [], unreadable: null, revision: "",
                         totals: null, join: {matched: {}, declared_only: [], measured_only: []},
                         cap: 64}, d || {});
+  DECL_READ = true;
   renderDeclared();
   renderDeclFill();       // …and the fill table, when he is in fill mode
   renderAccts();          // the measured table's chips come from this data
@@ -787,16 +843,24 @@ function declDupHTML(a) {
   return bits.join("");
 }
 
-/* accounts N · monthly spend $X — so he never has to recount. UNPRICED ROWS ARE
-   NAMED, never assumed free: a total that silently treats "unknown" as zero
-   understates the bill and reads authoritative doing it. */
+/* accounts N (paid, free) · monthly spend $X — so he never has to recount. UNPRICED
+   ROWS ARE NAMED, never assumed free: a total that silently treats "unknown"
+   as zero understates the bill and reads authoritative doing it.
+
+   ONE NOUN FOR ONE THING (task/3635). The subscriptions are "accounts",
+   split into paid and free as the nav, Home and the table above split the
+   same count, and a subscription written down on several rows counts once
+   (accounts.totals). The rows he wrote down are "rows": calling them
+   accounts too puts two numbers under one word on one page. */
 function declTotalsHTML(t, cap) {
   if (!t) return "";
-  return `<div class="decltotals"><b>${t.accounts}</b> account${t.accounts === 1 ? "" : "s"} declared`
-    + ` · <b>${t.units}</b> subscription${t.units === 1 ? "" : "s"} in total`
+  const free = t.free || 0;
+  return `<div class="decltotals"><b>${t.units}</b> account${t.units === 1 ? "" : "s"} declared (${t.units - free} paid, ${free} free)`
     + ` · <b>$${t.monthly_spend}</b>/month`
     + (t.unpriced ? ` <span class="rst">(${t.unpriced} with no price recorded — the total is a floor)</span>` : "")
-    + (cap ? ` <span class="rst">· ${t.accounts}/${cap}</span>` : "") + `</div>`;
+    + ` <span class="rst">· ${t.accounts} row${t.accounts === 1 ? "" : "s"} written down`
+    + (t.units < t.accounts ? `; rows marked “same subscription as” count once` : "")
+    + (cap ? `, ${cap} allowed` : "") + `</span></div>`;
 }
 
 /* a MEASURED account nobody has described: one click, prefilled from what is
@@ -824,7 +888,7 @@ function renderDeclared() {
     // same shape as the truth.
     host.innerHTML = `<div class="dunknown">✗ ${esc(DECL.unreadable)}<br>`
       + `<span class="rst">helm does NOT know how many accounts you have right now — this is not "none". `
-      + `Fix or move that file, then reload.</span></div>`;
+      + `An agent repairs or moves that file; reload once it has.</span></div>`;
     return;
   }
   const matched = (DECL.join && DECL.join.matched) || {};
@@ -863,7 +927,15 @@ function declAct(btn) {
    prefilling a fresh slug for it would mint a second row for one account and
    leave the first still asking to be described. */
 function declOpenFor(name) {
-  const have = (DECL.join && DECL.join.matched) ? DECL.join.matched[name] : null;
+  const joined = (DECL.join && DECL.join.matched) ? DECL.join.matched[name] : null;
+  /* THE LIVE RECORD, NEVER THE JOIN'S COPY OF IT. The join is drawn once per
+     load, and a fill cell's save patches DECL.accounts and DECL.revision but
+     not the join. Opened from the join's copy, the form showed the fields from
+     before those saves and posted the revision after them, so the stale
+     fields passed the compare-and-set and merged over what he had just
+     filled. The join says WHICH record; DECL.accounts says what it holds. */
+  const have = joined
+    && ((DECL.accounts || []).find(a => a.id === joined.id) || joined);
   declFormOpen(have || {measured_as: name, id: declSlug(name)});
 }
 
@@ -917,7 +989,9 @@ const DECL_FIELDS = [["#dId", "id"], ["#dVendor", "vendor"], ["#dPlan", "plan"],
                      ["#dKeyWhere", "key_where"]];
 
 function declFormOpen(a) {
+  DECL_GEN++;
   DECL_EDIT = a && a.id && (DECL.accounts || []).some(x => x.id === a.id) ? a.id : null;
+  DECL_REV = DECL.revision || "";
   DECL_MKEY = (a && a.measured_key) || null;
   for (const [sel, key] of DECL_FIELDS) {
     const el = $(sel);
@@ -950,8 +1024,10 @@ function declFormOpen(a) {
 }
 
 function declFormClose() {
+  DECL_GEN++;
   DECL_EDIT = null;
   DECL_MKEY = null;
+  DECL_REV = "";
   const form = $("#declform");
   if (form) form.hidden = true;
 }
@@ -983,28 +1059,50 @@ function declPayload() {
 
 async function declSave() {
   const msg = $("#dMsg");
-  // THE REVISION THE FORM WAS OPENED AGAINST. Two tabs cannot clobber each
-  // other: the second save is refused with a plain sentence and writes nothing.
+  // the form this save is about; see DECL_GEN
+  const gen = DECL_GEN;
+  const mine = () => gen === DECL_GEN;
+  // THE REVISION THE FORM WAS OPENED AGAINST (DECL_REV), never the card's
+  // live one. Two tabs cannot clobber each other: the second save is refused
+  // with a plain sentence and writes nothing.
   const r = await declPost({action: "save", account: declPayload(),
-                            revision: DECL.revision, original_id: DECL_EDIT});
+                            revision: DECL_REV, original_id: DECL_EDIT});
   if (r && r.error) {
     // `stale` is the one error that means the write LANDED — the list moved
     // between the write and the read that should have confirmed it — so it
     // closes the form like a success and never wears a ✗.
     const landed = r.code === "stale";
-    if (msg) msg.innerHTML = landed
-      ? `<span class="dseeded">✓ saved — ${esc(r.error)}</span>`
-      : `<span class="dupwarn">✗ ${esc(r.error)}</span>`;
     // "gone" is the row he was editing having been removed under him: the same
     // lost-update answer as a conflict, and the same cure — redraw the card.
-    if (r.code === "conflict" || r.code === "gone" || landed) {
-      if (landed) declFormClose();
+    const moved = r.code === "conflict" || r.code === "gone";
+    // HIS EDITS STAY IN THE FORM, the way the team card keeps a draft on its
+    // 409, and the sentence says so: the server's own words end "make the
+    // change again", and the change is still here to make.
+    // A FORM HE HAS LEFT CANNOT CARRY ITS ANSWER, so it is said in a toast:
+    // painted into the form now open it would describe the wrong one, and
+    // dropped it would read as a save that took.
+    if (!mine()) toast((landed ? "✓ saved — " : "✗ ") + r.error, 7000);
+    else if (msg) msg.innerHTML = landed
+      ? `<span class="dseeded">✓ saved — ${esc(r.error)}</span>`
+      : `<span class="dupwarn">✗ ${esc(r.error)}${moved
+          ? " Your edits are kept here. The list above now shows it as it stands: save again to write yours over it, or cancel to drop them."
+          : ""}</span>`;
+    if (moved || landed) {
+      if (landed && mine()) declFormClose();
       await loadDeclared();
+      // HE HAS BEEN SHOWN THE CONFLICT, with the row as it stands drawn behind
+      // the form, so the form now stands on what he was shown: a second press
+      // is his choice to write over it. Without this the next save re-sends
+      // the refused revision, forever. Only while it is still THIS form: a
+      // form opened or closed during the reload has a generation of its own.
+      if (moved && mine()) DECL_REV = DECL.revision || "";
     }
     return r;
   }
-  if (msg) msg.textContent = "";
-  declFormClose();
+  if (mine()) {
+    if (msg) msg.textContent = "";
+    declFormClose();
+  }
   await loadDeclared();
   toast("✓ saved — agents read this now, so nobody has to ask you again", 5000);
   return r;

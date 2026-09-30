@@ -72,7 +72,7 @@ def _claude_identity(home):
     """oauthAccount email from a home's .claude.json — identity METADATA, never
     tokens. ONE content reader for the whole repo: cred.account_of (mtime-cached,
     fail-closed) so `helm cred`, this row, launch and doctor can never disagree
-    about who a home holds."""
+    about which account a home's metadata names."""
     from . import cred          # function-level: cred imports homes
     return cred.account_of(home)["email"]
 
@@ -283,7 +283,11 @@ def _resolve(name, provider=None):
         return None, {"error": f"ambiguous: {name} matches "
                                + ", ".join(f"{r['provider']}:{r['name']}" for r in hits)
                                + " — pass a provider"}
-    return None, {"error": f"unknown home {name!r} (see `helm homes`)"}
+    # the homes card shows this when a row went away under it (archived from
+    # elsewhere); it says so in his words, never the verb (task/3735)
+    return None, {"error": f"unknown home {name!r} (see `helm homes`)",
+                  "owner_error": f"no home named {name} is here now; reopen "
+                                 "this card to read the homes again"}
 
 
 def _link_deck(deck, skills_dir):
@@ -351,40 +355,45 @@ def _mcp_provision(home):
         return "source-unreadable", str(e)
     if not want:
         return "source-empty", ""
+    from . import projectmcp
     path = os.path.join(home, ".claude.json")
-    if os.path.lexists(path):
-        cur = _read_json(path)
-        if cur is None:
-            return "unreadable", path
-        if not isinstance(cur, dict):
-            return "unreadable", path
-    else:
-        cur = {}                      # a home before its first login has no file yet
-    have = cur.get("mcpServers")
-    have = have if isinstance(have, dict) else {}
-    missing = [k for k in want if k not in have]
-    if not missing:
-        return "ok", str(len(want))
-    merged = dict(have)
-    for k in missing:
-        merged[k] = want[k]
-    cur["mcpServers"] = merged
-    tmp = path + ".helm-tmp"
+    if os.path.islink(path):
+        return "refused", "%s is a symlink (a rewrite would cut it)" % path
+    missing = []
+
+    def change(cur):
+        # recomputed on every compare-and-swap try, on the file as it is then
+        have = cur.get("mcpServers")
+        have = have if isinstance(have, dict) else {}
+        missing[:] = [k for k in want if k not in have]
+        if not missing:
+            return None
+        merged = dict(have)
+        for k in missing:
+            merged[k] = want[k]
+        cur["mcpServers"] = merged
+        return True
+
+    def backup(p):
+        # THE BACKUP SITS BESIDE THE FILE, named the way the hand cure of the
+        # live fleet named it, so a rewrite is always one `mv` from undone. A
+        # new file has nothing to keep.
+        if os.path.exists(p):
+            shutil.copy2(p, _beside(p, "bak-mcp"))
+
+    # the ONE state writer (projectmcp.update_state), a compare-and-swap: a
+    # running session's own write between our read and our replace is kept,
+    # and a file that keeps changing is refused with nothing written
     try:
-        if os.path.lexists(path):
-            # THE BACKUP SITS BESIDE THE FILE, named the way the hand cure of
-            # the live fleet named it, so a rewrite is always one `mv` from
-            # undone. A new file has nothing to keep.
-            shutil.copy2(path, _beside(path, "bak-mcp"))
-        with open(tmp, "w") as fh:
-            json.dump(cur, fh, indent=2)
-        os.replace(tmp, path)
+        _r, wrote = projectmcp.update_state(path, change, before_write=backup)
+    except ValueError:
+        return "unreadable", path
+    except projectmcp.HomeHeld as e:
+        return "held", str(e)
     except OSError as e:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
         return "error", str(e)
+    if not wrote:
+        return "ok", str(len(want))
     return "linked", ", ".join(sorted(missing))
 
 
@@ -397,6 +406,8 @@ _MCP_NOTE = {
                     "— nothing to copy, and helm never invents a server list",
     "unreadable": "mcp servers NOT provisioned: %s is unreadable or not an object "
                   "— left untouched rather than overwritten",
+    "refused": "mcp servers NOT provisioned: %s — left untouched",
+    "held": "mcp servers NOT provisioned: %s",
     "error": "mcp servers NOT provisioned (%s) — sessions here see no MCP tools",
 }
 
@@ -589,6 +600,122 @@ def _miss_mcp(home):
     return ("servers absent: %s" % ", ".join(gone)) if gone else None
 
 
+def _approval_gaps(home):
+    """[(project key, [names])] the home's TRUSTED projects read from their
+    `.mcp.json` and the home has not approved (projectmcp.recorded_plans).
+    Raises ValueError when the state file cannot be read or extended."""
+    from . import projectmcp
+    gaps = []
+    for p in projectmcp.recorded_plans(home):
+        if p["error"]:
+            raise ValueError(p["error"])
+        gaps += p["adds"]
+    return gaps
+
+
+def _prov_project_mcp(home):
+    """Approve, in the home's `.claude.json`, the project `.mcp.json` servers
+    of every project the home already trusts (task/2698, task/2692): the
+    backfill of what a launch approves for its own cwd. Additive; a name the
+    home rejected stays rejected; an unreadable file is named, never
+    rewritten."""
+    from . import projectmcp
+    try:
+        plans = projectmcp.recorded_plans(home)
+    except ValueError as e:
+        return ["project mcp approvals NOT written: %s — left untouched" % e], None
+    notes = []
+    for p in plans:
+        notes += p["warnings"]
+        verdict, detail = projectmcp.apply(p)
+        if verdict == "applied":
+            notes.append("project mcp servers approved: %s" % detail)
+        elif verdict == "FAIL":
+            notes.append("project mcp approvals NOT written: %s" % detail)
+    return notes, None
+
+
+def _miss_project_mcp(home):
+    gaps = _approval_gaps(home)
+    return ("unapproved project servers: %s" % "; ".join(
+        "%s (%s)" % (k, ", ".join(g)) for k, g in gaps)) if gaps else None
+
+
+def _instructions_carried(home):
+    """True when the home's OWN CLAUDE.md already is the global instructions
+    (the same file, or the same bytes): the rules link would load them twice."""
+    from . import skillsync
+    try:
+        src, _named = skillsync.instructions_canonical()
+        own = os.path.join(home, "CLAUDE.md")
+        if not src or not os.path.isfile(own) or not os.path.isfile(src):
+            return False
+        if os.path.realpath(own) == os.path.realpath(src):
+            return True
+        with open(own, "rb") as a, open(src, "rb") as b:
+            return a.read() == b.read()
+    except Exception:
+        return False
+
+
+def _prov_instructions(home):
+    """A credhome session reads its OWN config dir's user memory, never
+    ~/.claude/CLAUDE.md, so without this link a seat on a credhome runs with
+    none of the host's global instructions (task/3089). The link is
+    skillsync.link_instructions', the primitive seat mint and `helm tidy`
+    use; the home's own CLAUDE.md is never touched."""
+    from . import skillsync
+    if _instructions_carried(home):
+        return [], None
+    res = skillsync.link_instructions(home)
+    if res.action in ("linked", "relinked"):
+        return ["global instructions linked: %s -> %s"
+                % (res.link, os.readlink(res.link))], None
+    if res.action in ("ok", "none"):
+        return [], None
+    return ["global instructions NOT linked (%s)" % res.detail], None
+
+
+def _miss_instructions(home):
+    from . import skillsync
+    if _instructions_carried(home):
+        return None
+    res = skillsync.link_instructions(home, apply=False)
+    if res.action in ("ok", "none"):
+        return None
+    if res.action in ("unavailable", "error"):
+        raise ValueError(res.detail)
+    if res.action == "would-link":
+        return "%s absent (source %s)" % (skillsync.INSTRUCTIONS_LINK, res.detail)
+    if res.action == "would-relink":
+        return "%s %s" % (skillsync.INSTRUCTIONS_LINK, res.detail)
+    return res.detail
+
+
+def reconcile_seat_home(home, cwd=None):
+    """THE SEAT-HOME RECONCILE a launch runs on the credhome it execs on: the
+    same BENEFITS writers `helm homes provision --apply` runs (the default
+    home's user-scope MCP servers, the global instructions link), plus the
+    approval of the launch cwd's project `.mcp.json` servers. -> [lines]: only
+    what changed or could not be done; a home already carrying all of it is
+    silent. Never raises — a launch is never stopped by this."""
+    from . import projectmcp
+    lines = []
+    try:
+        if not _proxy_home(home):
+            action, detail = _mcp_provision(home)
+            if action not in ("ok", "source-empty"):
+                note = _MCP_NOTE[action]
+                lines.append(note % detail if "%s" in note else note)
+            lines += _prov_instructions(home)[0]
+    except Exception as e:
+        lines.append("seat home not reconciled (%s: %s)"
+                     % (e.__class__.__name__, e))
+    if cwd:
+        lines += projectmcp.reconcile(home, cwd)
+    return lines
+
+
 # OWNER RULING (premise opus-agents-xhigh-ultracode-subagents-for-same-
 # model): every Opus agent runs at xhigh effort with ultracode on. Two
 # settings.json keys carry it (measured on Claude Code 2.1.280): "ultracode"
@@ -702,15 +829,43 @@ def _hook_row(home):
 
 
 def _miss_hook_contract(home):
-    """The inject hook, every required guard lane and the beacon permits —
-    the same `_gap_row` `helm hooks status` and doctor's guard rungs read."""
+    """The inject hook, every required guard lane, the beacon permits and the
+    estate defaults (hooks.ESTATE_DEFAULTS, the no-AI-attribution block among
+    them) — the same `_gap_row` `helm hooks status` and doctor's guard rungs
+    read, and the post-write check `hooks.install_home` runs."""
+    from . import hooks
     row = _hook_row(home)
     parts = []
     if row["missing"]:
         parts.append("lanes not live: " + ", ".join(sorted(row["missing"])))
     if not row["permits"]:
         parts.append("beacon permits absent")
+    path, body = _settings_body(home)
+    if body is None:
+        raise ValueError("%s is unreadable or not an object" % path)
+    stale = [k for k, v in hooks.ESTATE_DEFAULTS.items()
+             if not hooks._default_live(body.get(k), v)]
+    if stale:
+        parts.append("estate defaults absent or drifted: " + ", ".join(stale))
     return "; ".join(parts) or None
+
+
+def _prov_hook_contract(home):
+    """Write the hook contract through its one writer, `hooks.install_home`,
+    at prepare (task/3591): a credential home is used by `claude /login` and
+    by orca before any `helm hooks install`, and the estate defaults it
+    carries (hooks.ESTATE_DEFAULTS) include the owner's no-AI-attribution
+    block. A proxy seat's config dir is its launch's to write (seat
+    `_write_launch_assets` runs the same writer). A failed write is named,
+    never silent, and does not stop the rest of the pass."""
+    if _proxy_home(home):
+        return [], None
+    from . import hooks
+    action, detail = hooks.install_home(home)
+    if action == "fail":
+        return ["hook contract not written (%s) — `helm hooks install` "
+                "writes it" % detail], None
+    return [], None
 
 
 def _miss_memory_base(home):
@@ -733,12 +888,12 @@ Benefit = collections.namedtuple(
 # parent of the projects link), and the hub before the deck (the deck is the
 # fallback when skills/ is not a link).
 #
-# THE HOOK CONTRACT AND THE MEMORY BASE ARE LISTED BUT NOT WRITTEN HERE. Their
-# one writer is `hooks.install_home`, whose config write gate admits the
-# credential homes it globbed at IMPORT time, so a home minted in this same
-# process is refused by it. `helm hooks install` (a fresh process) and
-# `helm launch` (which installs at launch) write them; this pass names them
-# as absent on the new home so the gap is said, not silent.
+# THE HOOK CONTRACT IS WRITTEN HERE through its one writer,
+# `hooks.install_home` (task/3591): its config write gate admits a direct child
+# of the homes root created after import, so a home minted in this process is
+# written in the same pass, estate defaults (the no-AI-attribution block)
+# included, before its first session. The memory base rides the same write,
+# so its entry only checks. `helm launch` still installs at launch.
 BENEFITS = (
     Benefit("shared session store", "SHARED_PROJECTS (~/.claude/projects)",
             _prov_projects, _miss_projects, False,
@@ -749,32 +904,56 @@ BENEFITS = (
             "`helm skills sync --apply`"),
     Benefit("skill deck", "HELM_SKILL_DECK (only when skills/ is no link)",
             _prov_skill_deck, _miss_skill_deck, False,
-            "`helm homes provision {name}`"),
+            "`helm homes provision {name} --apply`"),
     Benefit("mcp servers", "the default home's state-file mcpServers",
             _prov_mcp, _miss_mcp, False,
-            "`helm homes provision {name}`"),
+            "`helm homes provision {name} --apply`"),
+    Benefit("project mcp approvals",
+            "each trusted project's .mcp.json (projectmcp)",
+            _prov_project_mcp, _miss_project_mcp, False,
+            "`helm homes provision {name} --apply`"),
+    Benefit("global instructions",
+            "skillsync.instructions_canonical() (the default home's CLAUDE.md)",
+            _prov_instructions, _miss_instructions, False,
+            "`helm homes provision {name} --apply`"),
     Benefit("opus xhigh + ultracode",
             "SETTINGS_DEFAULTS (the owner's Opus effort ruling)",
             _prov_settings_defaults, _miss_settings_defaults, True,
-            "`helm homes provision {name}` (the default home: a "
+            "`helm homes provision {name} --apply` (the default home: a "
             "`helm launch` with neither --home nor --no-install)", True),
-    Benefit("hook contract", "hooks.SPECS + beacon permits",
-            None, _miss_hook_contract, True, "`helm hooks install`"),
+    Benefit("hook contract",
+            "hooks.SPECS + beacon permits + hooks.ESTATE_DEFAULTS",
+            _prov_hook_contract, _miss_hook_contract, True,
+            "`helm hooks install`"),
     Benefit("auto-memory base", "hooks.memory_base(home)",
             None, _miss_memory_base, True, "`helm hooks install`"),
 )
 
 
-def provision(home, at_launch=False):
+def provision(home, at_launch=False, apply=True):
     """THE ONE PROVISIONING PASS: walk BENEFITS over one claude home, in
     order. -> (notes, error); an error stops the pass. An entry this pass does
     not write is checked instead, and its absence becomes a note naming the
     command that writes it. Reads the module-level list at call time.
     `at_launch` walks only the entries marked `launch` (what `helm launch`
-    runs on each home it wires)."""
+    runs on each home it wires). `apply=False` is the DRY RUN: every entry is
+    checked, never written, and each gap becomes a `would provision` note."""
     notes = []
     for b in BENEFITS:
         if at_launch and not b.launch:
+            continue
+        if not apply:
+            try:
+                gap = b.missing(home)
+            except Exception as e:
+                notes.append("%s: cannot tell whether it is present (%s: %s)"
+                             % (b.name, e.__class__.__name__, e))
+                continue
+            if gap and b.provision is not None:
+                notes.append("%s: would provision (%s)" % (b.name, gap))
+            elif gap:
+                notes.append("%s not written here (%s) — %s writes it"
+                             % (b.name, gap, b.remedy.format(name=os.path.basename(home))))
             continue
         if b.provision is not None:
             more, err = b.provision(home)
@@ -845,8 +1024,16 @@ def home_create(provider, account_email):
         if r["authed"] and r["identity"] == email:
             hint = "" if r["canonical"] in (True, None) else \
                 f" (its name is non-canonical — `helm homes migrate {r['name']}` fixes that)"
+            # THE CARD'S WORDS BESIDE THE CLI'S (task/3735): the same fact,
+            # and the migrate button on that row in place of the verb
             return {"error": f"{email} is already seated in {r['path']} (home {r['name']})"
-                             f" — one home = one login; use that home{hint}"}
+                             f" — one home = one login; use that home{hint}",
+                    "owner_error": f"{email} already has a home, {r['name']}: one "
+                                   "account keeps one home, so use that one"
+                                   + ("" if r["canonical"] in (True, None) else
+                                      "; its folder is not named for that account "
+                                      "yet, and the migrate button on its row "
+                                      "renames it")}
     home = os.path.join(ROOTS[provider], name)
     existing = os.path.isdir(home) and not os.path.islink(home)
     if not existing and os.path.lexists(home):
@@ -854,7 +1041,14 @@ def home_create(provider, account_email):
     if existing:
         held = _IDENTITY[provider](home)
         if held and held != email:
-            return {"error": f"{home} already holds {held} — one home = one login; "
+            # Claude's reader is oauthAccount metadata. Codex's is the token's
+            # id_token email, and that claim stays a hold.
+            if provider == "claude":
+                from . import cred
+                label = cred.metadata_says(held, home)
+            else:
+                label = "already holds %s" % held
+            return {"error": f"{home} {label} — one home = one login; "
                              "archive it first or pick the right email"}
     os.makedirs(home, mode=0o700, exist_ok=True)
     notes = []
@@ -868,13 +1062,20 @@ def home_create(provider, account_email):
             "login_cmd": LOGIN_CMDS[provider](home),
             "next": "run the login command in YOUR terminal, approve in the browser, "
                     f"then: helm homes verify {name} --provider {provider}",
+            # THE SAME NEXT STEP IN THE OWNER'S WORDS, for the console's homes
+            # card (task/3735): he does not use a terminal, so it names no
+            # command. The login stays his to approve; an agent can start it.
+            "owner_next": f"home {name} is ready and needs signing in: an agent "
+                          "can start the login for you, and you approve it in "
+                          "the browser. Then press verify on its row.",
             "note": "; ".join(notes) or None}
 
 
-def home_provision(name):
+def home_provision(name, apply=True):
     """Run the one provisioning pass over an EXISTING claude home — the door
     the drift report names for a benefit only this pass writes. Additive as
-    at creation; the default home is the source of the set and is refused."""
+    at creation; the default home is the source of the set and is refused.
+    `apply=False` plans it and writes nothing (the verb's default)."""
     row, err = _resolve(name, "claude")
     if err:
         return err
@@ -882,53 +1083,85 @@ def home_provision(name):
         return {"error": "REFUSED: the default home is the SOURCE of the set "
                          "every other home is provisioned from"}
     real = os.path.realpath(row["path"])
-    notes, err = provision(real)
+    notes, err = provision(real, apply=apply)
     if err:
         return {"error": err, "notes": notes}
-    return {"home": row["name"], "path": real, "notes": notes}
+    return {"home": row["name"], "path": real, "notes": notes, "apply": apply}
 
 
 def home_verify(name, provider=None):
     """Post-login check: authed, identity, canonical name, projects link, duplicate
-    identities. Verdict + concrete fixes — helm flags, the human (or a verb) fixes."""
+    identities. Verdict + concrete fixes — helm flags, the human (or a verb) fixes.
+
+    `fixes` are the terminal's lines and name the verb or command that fixes
+    each. `owner_fixes` are the same lines in the OWNER'S words, one for one,
+    for the console's homes card (task/3735): the fact and who fixes it, never
+    a command, because he does not use a terminal — as `ready._row` carries
+    `owner_repair` beside `repair`."""
     row, err = _resolve(name, provider)
     if err:
         return err
     prov, real = row["provider"], os.path.realpath(row["path"])
-    fixes = []
+    fixes, owner_fixes = [], []
+
+    def fix(line, owner):
+        fixes.append(line)
+        owner_fixes.append(owner)
     if not row["authed"]:
-        fixes.append("not logged in — run (human-only): " + LOGIN_CMDS[prov](real))
+        fix("not logged in — run (human-only): " + LOGIN_CMDS[prov](real),
+            "not signed in yet: an agent can start the login for you, and you "
+            "approve it in the browser")
     elif not row["identity"]:
-        fixes.append("authed but identity unreadable — "
-                     + (".claude.json has no oauthAccount yet; open the agent once"
-                        if prov == "claude" else "auth.json id_token carries no email claim"))
+        fix("authed but identity unreadable — "
+            + (".claude.json has no oauthAccount yet; open the agent once"
+               if prov == "claude" else "auth.json id_token carries no email claim"),
+            "signed in, but which account it holds cannot be read yet: "
+            + ("it can be once an agent has been opened in this home"
+               if prov == "claude" else "its login names no email address"))
     if row["canonical"] is False:
-        fixes.append(f"dir name lies: identity {row['identity']} wants "
-                     f"{canonical_name(row['identity'])} — `helm homes migrate {row['name']}`")
+        fix(f"dir name lies: identity {row['identity']} wants "
+            f"{canonical_name(row['identity'])} — `helm homes migrate {row['name']}`",
+            f"its folder is not named for the account it holds: it holds "
+            f"{row['identity']}, so it should be named "
+            f"{canonical_name(row['identity'])}; the migrate button on this row "
+            "renames it")
     if prov == "claude" and row["projects_link_ok"] is False:
         pl = os.path.join(real, "projects")
         if os.path.isdir(pl) and not os.path.islink(pl):
-            fixes.append(f"projects is a REAL dir — sessions born here are STRANDED; merge "
-                         f"{pl}/* into {SHARED_PROJECTS}, then: ln -sfn {SHARED_PROJECTS} {pl}")
+            fix(f"projects is a REAL dir — sessions born here are STRANDED; merge "
+                f"{pl}/* into {SHARED_PROJECTS}, then: ln -sfn {SHARED_PROJECTS} {pl}",
+                "its sessions folder is a folder of its own, so sessions started "
+                "here are stranded outside the shared store; an agent moves them "
+                "in and links the folder")
         elif os.path.islink(pl):
-            fixes.append(f"projects symlink points at {os.path.realpath(pl)}, not the shared "
-                         f"store — re-point: ln -sfn {SHARED_PROJECTS} {pl}")
+            fix(f"projects symlink points at {os.path.realpath(pl)}, not the shared "
+                f"store — re-point: ln -sfn {SHARED_PROJECTS} {pl}",
+                "its sessions folder points somewhere other than the shared "
+                "store; an agent points it back")
         else:
-            fixes.append(f"projects link missing — create: ln -s {SHARED_PROJECTS} {pl}")
+            fix(f"projects link missing — create: ln -s {SHARED_PROJECTS} {pl}",
+                "its sessions folder is not linked to the shared store yet; an "
+                "agent links it")
     dups = row.get("duplicate_identity") or []
     # default-home sharing is the orchestrator pattern (see _hygiene_flags) —
     # only named-home <-> named-home duplication demands a survivor
     named_dups = [d for d in dups if not d.startswith("(default-")] \
         if not row["default"] else []
     if named_dups:
-        fixes.append(f"identity {row['identity']} also lives in: {', '.join(named_dups)} — one "
-                     "identity should hold ONE named home; the human picks a survivor and archives "
-                     "the rest (`helm homes archive`) — NEVER copy credentials between homes")
+        fix(f"identity {row['identity']} also lives in: {', '.join(named_dups)} — one "
+            "identity should hold ONE named home; the human picks a survivor and archives "
+            "the rest (`helm homes archive`) — NEVER copy credentials between homes",
+            f"the same account also lives in {', '.join(named_dups)}: one account "
+            "keeps one home, so pick the one to keep and archive the others with "
+            "their archive buttons; a login is never copied between homes")
     fam = row.get("shared_family") or []
     if fam:
-        fixes.append(f"BYTE-COPIES of one refresh-token family with: {', '.join(fam)} — "
-                     "reuse detection revokes the WHOLE family at once; a fresh login per "
-                     "home is the only fix (one home = one login = one token family)")
+        fix(f"BYTE-COPIES of one refresh-token family with: {', '.join(fam)} — "
+            "reuse detection revokes the WHOLE family at once; a fresh login per "
+            "home is the only fix (one home = one login = one token family)",
+            f"it holds a copy of the same login as {', '.join(fam)}, and the "
+            "vendor cancels every copy at once when it sees one reused: each "
+            "home needs its own fresh sign-in, which an agent can start for you")
     verdict = "pending-login" if not row["authed"] else ("issues" if fixes else "ok")
     return {"home": row["name"], "provider": prov, "path": row["path"],
             "checks": {"authed": row["authed"], "identity": row["identity"],
@@ -936,7 +1169,7 @@ def home_verify(name, provider=None):
                        "projects_link_ok": row["projects_link_ok"],
                        "duplicate_identity": dups, "shared_family": fam,
                        "live_pids": row["live_pids"]},
-            "verdict": verdict, "fixes": fixes}
+            "verdict": verdict, "fixes": fixes, "owner_fixes": owner_fixes}
 
 
 def home_archive(name, provider=None):
@@ -1035,7 +1268,11 @@ def home_migrate(name, provider=None):
     if os.path.lexists(target):
         return {"error": f"{target} already exists — that is a duplicate-identity situation, "
                          "not a rename: the human picks a survivor and archives the other "
-                         "(`helm homes archive`); credentials are never merged or copied"}
+                         "(`helm homes archive`); credentials are never merged or copied",
+                "owner_error": f"a home named {want} already exists, so this one "
+                               "cannot be renamed to it: pick the one to keep and "
+                               "archive the other with its archive button; a login "
+                               "is never copied between homes"}
     os.rename(real, target)
     os.symlink(target, real)  # alias at the old path so nothing referencing it breaks
     return {"ok": True, "from": real, "to": target, "alias_left": real,
@@ -1133,7 +1370,7 @@ def _print_archives():
 
 
 def cmd_homes(args):
-    """homes [prepare <provider> <email> | provision [<name>] | verify [<name>] |
+    """homes [prepare <provider> <email> | provision [<name>] [--apply] | verify [<name>] |
     archive <name> | restore <name> | migrate <name> | archives]
     [--provider claude|codex]"""
     args = list(args)
@@ -1158,18 +1395,34 @@ def cmd_homes(args):
         print("  then: " + res["next"].split("then: ")[-1])
         return 0
     if verb == "provision":
+        # a mutation door: a junk flag refuses (rc 2) before any home is read
+        from .cli import guard_tail
+        rc = guard_tail("helm homes provision",
+                        [a for a in rest if a.startswith("-")],
+                        flags=("--apply",),
+                        usage="homes provision [<name>] [--apply]")
+        if rc is not None:
+            return rc
+        apply = "--apply" in rest
+        rest = [a for a in rest if not a.startswith("-")]
         names = rest or [r["name"] for r in homes_list()
                          if r["provider"] == "claude" and not r["archived"]
                          and not r.get("broken_alias") and not r["default"]]
         worst = 0
         for n in names:
-            res = home_provision(n)
+            res = home_provision(n, apply=apply)
             for line in res.get("notes") or ():
                 print("  %s: %s" % (res.get("home", n), line))
             if "error" in res:
                 worst = max(worst, _fail(res))
                 continue
-            print("helm homes: provisioned %s (%s)" % (res["home"], res["path"]))
+            if apply:
+                print("helm homes: provisioned %s (%s)" % (res["home"], res["path"]))
+            else:
+                print("helm homes: %s (%s) — dry run, %s; `--apply` writes it"
+                      % (res["home"], res["path"],
+                         "nothing to provision" if not res["notes"]
+                         else "nothing written"))
         return worst
     if verb == "verify":
         names = rest or [r["name"] for r in homes_list()
@@ -1218,6 +1471,6 @@ def cmd_homes(args):
         print("helm homes: " + (res.get("note") or "ok"))
         return 0
     print("helm homes: unknown subverb '%s' (prepare <provider> <email>|"
-          "provision [<name>]|verify [<name>]|archive <name>|restore <name>|"
+          "provision [<name>] [--apply]|verify [<name>]|archive <name>|restore <name>|"
           "migrate <name>|archives)" % verb, file=sys.stderr)
     return 2

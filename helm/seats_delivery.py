@@ -30,11 +30,12 @@ from .seats_common import (MAX_BYTES, ROOM_SCAN_CAP, SCAN_CAP, _canonical_recipi
 from .seats_identity import (_delivery_guard, _reaction_wake_body,
                              _same_reaction_target, _warn_disagreement,
                              _warn_once, acting_seat, deliverable,
-                             seat_scope)
+                             boundary_scope, seat_scope)
 from .seats_roster import (nonpane_session, roster_checked, seat_for_session,
                            touch_seen, write_roster)
 from .seats_runtime import runtime_for_session
 from .seats_receipts import receipt_cli, record_delivery_receipt
+from .beacon_doorbell import WakeLine, _acked_at
 from .seats_cursor import (_all_cursor_locks, beacon_cursor_path,
                            _commit_cursor_updates, _cursor_checked,
                            _cursor_estate_locks, _cursor_locks, _cursor_pair,
@@ -47,7 +48,6 @@ from .seats_cursor import (_all_cursor_locks, beacon_cursor_path,
                            normalize_rotated_cursor, parse_cursor_path,
                            recover_room_rotation, rotation_journal,
                            room_active, seat_state_lock)
-
 
 def _own_delivery_seat(session, cwd, where):
     """The seat this process may move CURSORS and PRESENCE for, or None.
@@ -77,7 +77,6 @@ def _own_delivery_seat(session, cwd, where):
         _warn_once("no-admitted-actor:%s:%s" % (where, session), err + "\n")
         return None
     return actor.canonical_name if actor else acting_seat(session, cwd)
-
 
 def _cursor(room, seat, session=None, beacon=False, report=None):
     """This consumer's cursor for one room, or None.
@@ -110,121 +109,11 @@ def _cursor(room, seat, session=None, beacon=False, report=None):
         _say(report, "unreadable",
              "the cursor file is present and does not parse as a cursor")
     return None
-def remap_rotated_cursors(room, old_dev, old_ino, cut, new_dev, new_ino,
-                          retained_starts, prepare=None, install=None):
-    """Remap every cursor and install the compacted room in one transaction."""
-    room_key = pk.slug(room)
-    with _cursor_topology_lock(), _cursor_room_locks({room_key}):
-        try:
-            names = os.listdir(chat.chat_dir())
-        except OSError:
-            return False
-        parsed = [item for name in names
-                  for item in [parse_cursor_path(
-                      os.path.join(chat.chat_dir(), name))]
-                  if item and item["room"] == room_key]
-        paths = [item["path"] for item in parsed]
-        mapping = {old: _occurrence(new_dev, new_ino, old - cut)
-                   for old in retained_starts}
-        with _cursor_estate_locks({item["seat_key"] for item in parsed}), \
-                _cursor_locks(paths, estate=False):
-            updates, before = {}, {}
-            journal = rotation_journal(room)
-            for path in paths:
-                cur = pk.read_json(path, None)
-                cur = normalize_rotated_cursor(room, cur, journal, path)
-                if not isinstance(cur, dict) \
-                        or (cur.get("dev"), cur.get("ino")) != (old_dev, old_ino):
-                    continue
-                before[os.path.basename(path)] = cur
-                row = dict(cur)
-                row["dev"], row["ino"] = new_dev, new_ino
-                row["off"] = max(0, int(row.get("off") or 0) - cut)
-                row["base"] = max(0, int(row.get("base") or 0) - cut)
-                for field in ("held", "done"):
-                    tokens = [mapping[parts[2]] for token in row.get(field) or ()
-                              for parts in [_occurrence_parts(token)]
-                              if parts and parts[:2] == (old_dev, old_ino)
-                              and parts[2] in mapping]
-                    if tokens:
-                        row[field] = sorted(set(tokens))
-                    else:
-                        row.pop(field, None)
-                updates[path] = row
-            if prepare is not None:
-                try:
-                    prepare(before, updates)
-                except (OSError, ValueError, TypeError):
-                    return False
-            return _commit_cursor_updates(updates, finish=install)
-
-
-def rotation_hold_offset(room, dev, ino, state):
-    """Earliest paused or wake-held offset rotation must retain, or None."""
-    earliest, room_key = None, pk.slug(room)
-    with _cursor_topology_lock(), _cursor_room_locks({room_key}):
-        paused = []
-        for seat, row in roster().items():
-            if not isinstance(row, dict):
-                continue
-            sessions = [s for s in ([row.get("session")] +
-                                    list(row.get("sessions") or [])) if s]
-            for session in list(dict.fromkeys(sessions)) or [None]:
-                runtime, verified = runtime_for_session(row, session)
-                try:
-                    from . import proxywatch
-                    pause, _err = proxywatch.delivery_pause(
-                        seat, state=state, runtime=runtime,
-                        runtime_verified=verified)
-                except Exception:
-                    pause = {"state": "UNKNOWN"}
-                if pause:
-                    paused.append((seat, session))
-        try:
-            names = os.listdir(chat.chat_dir())
-        except OSError:
-            return 0
-        held_paths = [item["path"] for name in names
-                      for item in [parse_cursor_path(
-                          os.path.join(chat.chat_dir(), name))]
-                      if item and item["beacon"] and item["room"] == room_key]
-        # `_init_cursor`'s resume order for a paused session: its delivery
-        # cursor, its wake cursor, then its seat's. A session with none of
-        # them resumes at EOF and holds nothing (task/2930: holding it at 0
-        # rewrote the whole room on every post over the cap).
-        chains = [[cursor_path(room, seat, session),
-                   beacon_cursor_path(room, seat, session)]
-                  + ([cursor_path(room, seat)] if session else [])
-                  for seat, session in paused]
-        paths = held_paths + [path for chain in chains for path in chain]
-        parsed = [parse_cursor_path(path) for path in paths]
-        seats = {item["seat_key"] for item in parsed if item}
-        with _cursor_estate_locks(seats), _cursor_locks(paths, estate=False):
-            for path in held_paths:
-                try:
-                    cur = normalize_rotated_cursor(
-                        room, _strict_json(path), path=path)
-                except OSError:
-                    return 0
-                if not isinstance(cur, dict) or not isinstance(cur.get("off"), int):
-                    return 0
-                for token in cur.get("held") or ():
-                    parts = _occurrence_parts(token)
-                    if parts and parts[:2] == (dev, ino):
-                        earliest = min(parts[2], earliest) \
-                            if earliest is not None else parts[2]
-            for chain in chains:
-                path = next((p for p in chain if os.path.exists(p)), None)
-                if path is None:
-                    continue
-                cur = normalize_rotated_cursor(room, pk.read_json(path, None),
-                                               path=path)
-                valid = isinstance(cur, dict) and isinstance(cur.get("off"), int)
-                if not valid or (cur.get("dev"), cur.get("ino")) != (dev, ino):
-                    return 0
-                earliest = min(cur["off"], earliest) \
-                    if earliest is not None else cur["off"]
-    return earliest
+# ROTATION'S CURSOR TRANSACTIONS MOVED OUT, and `seats_rotation` says why:
+# compaction's hold-and-remap passes are not delivery. Re-exported so no
+# existing import path changed.
+from .seats_rotation import (remap_rotated_cursors,  # noqa: F401,E402
+                             rotation_hold_offset)
 def _write_cursor(room, seat, dev, ino, off, rid, session=None, active=False,
                   skip=None, base=0, beacon=False, held=(), done=(), occ=None):
     chat._ensure_dir()
@@ -285,6 +174,48 @@ def _baseline_state(room, at_start=False):
         return st.st_dev, st.st_ino, off, rid
     except OSError:
         return None, None, 0, None
+def _born_after_join(room, seat):
+    """Was the room's log born after the seat joined? -> bool, False when
+    either side is unknown.
+
+    THE EOF SELF-HEAL LOST A ROOM'S FIRST POST (task/3519). A missing cursor
+    baselines at EOF so pre-join backlog never floods, and a seat that
+    joined while its home room had no log, and then lost those pre-log
+    baselines, met the room's first post as backlog: skipped, never
+    delivered. A log whose FIRST row is stamped after the seat's roster
+    `joined` holds no pre-join backlog at all, so a missing cursor there
+    starts at 0. Strictly after, to the second: a room with rows from the
+    join's own second keeps the self-heal, because those may be the
+    backlog. A restored or rotated log keeps its old first rows, so it is
+    never taken for young. This is narrower than the multi-room law
+    `deliver_any` already applies to a tracked seat's other rooms, which
+    backfill any cursor-less room from 0."""
+    rows, failed = roster_checked()
+    if failed or not isinstance(rows, dict):
+        return False
+    key = _seat_key(seat)
+    joined = [pk.parse_ts_epoch(row.get("joined"))
+              for name, row in rows.items()
+              if isinstance(row, dict) and _seat_key(name) == key]
+    joined = [at for at in joined if at is not None]
+    if not joined:
+        return False
+    try:
+        with open(chat.room_path(room), "rb") as f:
+            head = f.readline(SCAN_CAP)
+    except OSError:
+        return False
+    if not head.endswith(b"\n"):
+        return False                    # an in-flight first append: unknown
+    try:
+        first = json.loads(head.decode("utf-8", errors="replace"))
+    except ValueError:
+        return False
+    born = pk.parse_ts_epoch(first.get("ts")) \
+        if isinstance(first, dict) else None
+    return born is not None and born > max(joined)
+
+
 def _backfill_missing_room_cursors(room, seat, sessions=()):
     """Start every missing paired cursor at zero for a post-join room."""
     for session in [None] + list(sessions):
@@ -482,7 +413,7 @@ def _tail(room, cur, report=None):
 # every consumer of the rotation reaches for exactly these three names.
 # Re-exported so no existing import path changed.
 from .seats_roomscan import (_fair_room_slice,  # noqa: F401,E402
-                             _scan_rooms, scan_path)
+                             _give_back, _scan_rooms, scan_path)
 def _room_dirty(room, seat, session=None, beacon=False):
     """Lock-free precheck: could `room` hold rows past this consumer cursor?
     A missing cursor is dirty (a room this seat has never looked
@@ -518,7 +449,7 @@ def _room_dirty(room, seat, session=None, beacon=False):
         or st.st_size != cur.get("off")
 def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
             backfill=False, scope=None, ambient=True, channel=None,
-            sink_usable=None):
+            sink_usable=None, announce_only=False, shown=frozenset(), render=None):
     """Serialize the live credential-wall decision with one delivery event."""
     # ORDER IS LOAD-BEARING: the DISPUTE rung speaks first. Both refusals stop
     # the same beat, but a disputed pane's operator is looking for the words
@@ -533,12 +464,12 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
         if pause:
             return None
         return _deliver_unpaused(
-            session=session, room=room, seat=seat, emit=emit, cwd=cwd,
+            session=session, room=room, seat=seat, emit=emit, cwd=cwd, render=render,
             backfill=backfill, scope=scope, ambient=ambient, channel=channel,
-            sink_usable=sink_usable)
+            sink_usable=sink_usable, announce_only=announce_only, shown=shown)
 def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
-                      backfill=False, scope=None, ambient=True, channel=None,
-                      sink_usable=None):
+                      backfill=False, scope=None, ambient=True, channel=None, render=None,
+                      sink_usable=None, announce_only=False, shown=frozenset()):
     """The tool-boundary nudge, ONE room: at most ONE delivery event, oldest
     first; later matches stay PENDING (their count shows, their cursor ground is
     not consumed — codex H6). A reaction event consumes a contiguous same-target
@@ -555,7 +486,7 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
 
     At-most-once: cursor state lands before the external effect. Effect failure
     or process death leaves the receipt UNKNOWN but never replays that physical
-    occurrence.
+    occurrence, so `render` composes the line BEFORE the commit (_owed_wake).
 
     Fan-out: the cursor is per (seat, session) — every co-named session sees
     the same @mention on its own boundary; consuming here never starves a
@@ -563,12 +494,15 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
 
     backfill=True (deliver_any's tracked-seat path) makes a MISSING cursor
     baseline at offset 0 and scan THIS boundary — the multi-room law for a
-    room born after the seat joined; default keeps the EOF self-heal.
+    room born after the seat joined; default keeps the EOF self-heal, except
+    on a log whose first row is younger than the seat's join
+    (`_born_after_join`), which starts at 0 too.
 
     The public wrapper holds proxywatch's state-transition lock across this
     whole operation. A dark record therefore exists either before the decision
     (nothing mutates) or after the cursor commit (this delivery preceded the
-    measured wall); it can never race between check and consumption."""
+    measured wall); it can never race between check and consumption. `shown`
+    is the rows a pull printed whole (helm.pull_delivery): see its docstring."""
     if not recover_room_rotation(room):
         return None                         # interrupted rotation stays fail-open
     if not touch_seen(seat, session=session):               # presence FIRST — a seat muted by the
@@ -593,8 +527,10 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
     beacon = channel == "beacon"
     had_delivery = _cursor(room, seat, session) is not None
     if not had_delivery or _cursor(room, seat, session, beacon=True) is None:
-        inherited = _init_cursor(room, seat, session, at_start=backfill)
-        if not had_delivery and not inherited and not backfill:
+        at_start = backfill or (not had_delivery
+                                and _born_after_join(room, seat))
+        inherited = _init_cursor(room, seat, session, at_start=at_start)
+        if not had_delivery and not inherited and not at_start:
             return None                 # fresh EOF baseline: backlog never floods
     paths = _cursor_pair(room, seat, session)
     # Quiet delivery takes exact locks; rename/rotation take the same locks.
@@ -608,10 +544,10 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
         if got is None:
             return None
         dev, ino, base, entries, last_rid, skip = got
-        held = set(wake_cur.get("held") or ())
-        done = set(wake_cur.get("done") or ())
-        same_wake_file = (dev, ino) == (wake_cur.get("dev"),
-                                        wake_cur.get("ino"))
+        held, done = set(wake_cur.get("held") or ()), set(wake_cur.get("done") or ())
+        # rows THIS session acked after them, in this window (beacon_doorbell)
+        acked = _acked_at(entries, seat, session)
+        same_wake_file = (dev, ino) == (wake_cur.get("dev"), wake_cur.get("ino"))
 
         def decision(candidate, start, end):
             """Pure routing decision. Coordination mutates only on commit."""
@@ -629,8 +565,8 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
                 return wakes, hold, False, token
             already_woke = same_wake_file and end <= wake_cur.get("off", 0) \
                 and token not in held
-            reaches = token in held or (not already_woke and deliverable(
-                candidate, seat, room, sc, ambient, False))
+            reaches = start not in acked and (token in held or (
+                not already_woke and deliverable(candidate, seat, room, sc, ambient, False)))
             return reaches, False, False, token
 
         def cross(rows):
@@ -641,10 +577,10 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
                 if beacon:
                     if suppressed:
                         done.discard(token)
-                    elif hold:
-                        held.add(token)
+                    elif hold or (announce_only and reaches):  # a doorbell
+                        held.add(token)  # wake is not a delivery: hook-owed
                     continue
-                if token in held and reaches:
+                if token in held and (reaches or start in acked):
                     held.discard(token)
 
         def coordinated_updates(target):
@@ -678,13 +614,14 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
         crossed = []
         last_end = base
         for i, (row, start, end) in enumerate(entries):
-            if decision(row, start, end)[0]:
+            if decision(row, start, end)[0] and _occurrence(dev, ino, start) not in shown:
                 hit = (i, row, start, end)
                 break
             crossed.append((row, start, end))
             last_end, last_rid = end, (row or {}).get("id") or last_rid
-        if hit is None:
+        if hit is None or shown:
             cross(crossed)
+            held.difference_update(shown)   # shown past an owed row: the hook passes it
             target = _cursor_state((dev, ino, last_end, last_rid),
                                    active=cur.get("active") or bool(entries),
                                    base=cbase)
@@ -769,31 +706,31 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
             # it belongs.
             return None
         cross(crossed)
-        target = _cursor_state((dev, ino, cursor_end, cursor_rid),
-                               active=True, base=cbase)
+        target = _cursor_state((dev, ino, cursor_end, cursor_rid), active=True, base=cbase)
+        wake = WakeLine(render(line) if render else line, room, grouped, (dev, ino, cursor_end), start)
         with hookrun.deadline_held():   # a deadline cannot split commit from emit
             if not _commit_cursor_updates(coordinated_updates(target)): return None
-            if emit is not None: emit(line)
+            if emit is not None: emit(wake)
         if emit is not None:            # best-effort evidence, still bounded
             record_delivery_receipt(row, room, seat, session, channel,
                                     occurrence=_occurrence(dev, ino, start))
         return line
 def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main",
-                ambient=True, channel=None, sink_usable=None):
+                ambient=True, channel=None, sink_usable=None,
+                announce_only=False, render=None, project_only=False):
     """The MULTI-ROOM boundary nudge (slice 5 — what the PostToolUse hook and
     the beacon actually call): one delivery event per boundary from the first
-    room that has one — the primary room first, then the rest of
-    _scan_rooms' bounded, newest-activity-first list. An @mention in a
-    channel the seat never joined must wake it (the owner's helm-dogfood
-    mention post), so a TRACKED seat — it holds
-    a primary-room cursor — meeting a cursor-less room BACKFILLS from offset
-    0: a room born after its join is all post-join news. An UNtracked seat
-    (never joined / reaped / pre-install) keeps the EOF self-heal everywhere:
-    pre-join backlog never floods. Scanning a clean room advances only that
-    room's cursor; a hit STOPS the scan, so later rooms keep their pending
-    for the next boundary (one nudge per boundary — the budget stays flat).
-    Exceptions propagate exactly like deliver's (H7: commit precedes emit, so
-    a died effect remains UNKNOWN and never replays); callers wrap fail-open."""
+    room that has one — the primary room first, then the rest of _scan_rooms'
+    bounded, dirty-first list. An @mention in a channel the seat never joined
+    must wake it (the owner's helm-dogfood mention post), so a TRACKED seat —
+    it holds a primary-room cursor — meeting a cursor-less room BACKFILLS from
+    offset 0: a room born after its join is all post-join news. project_only:
+    own mail only (seat_scope). An UNtracked seat (never joined / reaped /
+    pre-install) keeps the EOF self-heal everywhere: pre-join backlog never
+    floods. Scanning a clean room advances only that room's cursor; a hit STOPS
+    the scan and hands the hit room and every later one back unread, so they
+    lead the next boundary (one nudge per boundary). Exceptions propagate as
+    deliver's do (H7); callers wrap fail-open."""
     # DISPUTE SPEAKS FIRST, then admission — see deliver for why the order is
     # load-bearing. Either way: no beat, no consume; the beat must stop HERE
     # too or the dispute reads as presence.
@@ -827,27 +764,26 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main",
     # this pass's ability to spend rows.
     if sink_usable is False:
         return None
-    sc = seat_scope(seat)     # ONE roster read for the whole pass
+    sc = boundary_scope(seat, room, project_only)  # ONE roster read
     primary = (cursor_path(room, seat, session), cursor_path(room, seat))
     tracked = sc["tracked"] or any(
         _cursor_transaction_pending(path) for path in primary) \
         or (_cursor(room, seat, session) or _cursor(room, seat)) is not None
-    for r in _scan_rooms(
-            room, seat=seat, scope=sc, session=session,
-            scan_lane="deliver"):
+    rooms = _scan_rooms(room, seat=seat, scope=sc, session=session,  # lent:
+                        scan_lane="deliver", lent=(lent := {}))  # handed back
+    for i, r in enumerate(rooms):
         if not _room_dirty(r, seat, session, beacon=channel == "beacon"):
             continue
         # the DM lane ALWAYS backfills from 0 — every row in it is addressed
         # to this seat, so even an untracked (reaped/pre-install) seat must
         # get the DM that created its lane, never an EOF skip
         line = deliver(session=session, room=r, seat=seat, emit=emit, cwd=cwd,
-                       backfill=(tracked and r != room)
+                       render=render, backfill=(tracked and r != room)
                        or r.startswith(chat.DM_PREFIX), scope=sc,
-                       ambient=ambient, channel=channel,
-                       sink_usable=sink_usable)
-                                          # the hook passes nothing (full scope);
-                                          # only the beacon narrows this
+                       ambient=ambient, channel=channel, sink_usable=sink_usable,
+                       announce_only=announce_only)  # the beacon alone narrows ambient
         if line:
+            _give_back(rooms[i:], seat, session, "deliver", lent, hit=r)
             return line
     return None
 def _resolve_against(to, r):

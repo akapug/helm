@@ -101,8 +101,13 @@ def setUpModule():
 
 
 def tearDownModule():
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT, as tests.test_landreq's does
+    # (task/3039): a stopped patcher left here is module data the sliced
+    # gate's leak audit reads as a rebinding, and fails the run.
+    _LIVE_SEATS_PATCH = None
     for key, value in _ENV_PRIOR.items():
         if value is None:
             os.environ.pop(key, None)
@@ -1213,13 +1218,13 @@ class ContraryProvenanceReachesTheOperatorTest(_landreq.LandReqBase):
             "the recorded branch no longer covers the discharge path at all; "
             "both persisted-string branches must map to recorded: %r" % found)
 
-    def test_the_card_and_the_terminal_print_the_same_provenance_words(self):  # noqa: VACUOUS_ASSERTION — this arm asserts an EQUALITY of two parsed tables, not an absence, and it already carries its own non-vacuity guards: assertIsNotNone on the python table (a walk that finds nothing must not read as agreement), assertTrue on the card path, and assertIsNotNone on the regex block, each failing loudly if its source went unread
-        """THE SEAM ARM. Both renderer files' comments already PROMISE they
-        print the same words, and they had drifted anyway on the unread case.
-        A promise in a comment is not a mechanism; this reads both sources.
-        """
+    def test_the_terminal_holds_the_one_provenance_table(self):  # noqa: VACUOUS_ASSERTION — the python table is asserted found and non-empty before the page's absence is read, and the page is asserted to be the assembled console (its Work page's script banner) first
+        """THE SEAM ARM. The land board's card and the terminal printed the
+        same provenance words from two tables, and they had drifted once on
+        the unread case. The board is retired (task/3643) and the Work page
+        prints no provenance word, so the terminal's table is the only one:
+        a second copy in the page would be a second rule to drift."""
         import ast as _ast
-        import os as _os
         import re as _re
         with open(landreq.__file__, encoding="utf-8") as _fh:
             src = _fh.read()
@@ -1233,17 +1238,14 @@ class ContraryProvenanceReachesTheOperatorTest(_landreq.LandReqBase):
                              "never found _CONTRARY_PROVENANCE_WORDS — a walk "
                              "that finds nothing must not read as agreement")
 
-        card = _os.path.join(_os.path.dirname(landreq.__file__),
-                             "web_ui", "scripts", "00-core.js.part")
-        self.assertTrue(_os.path.exists(card), "the card source moved: %s" % card)
-        with open(card, encoding="utf-8") as fh:
-            js = fh.read()
-        block = _re.search(r"const PROV = \{(.*?)\};", js, _re.S)
-        self.assertIsNotNone(block, "never found the card's PROV table")
-        js_words = dict(_re.findall(r'(\w+)\s*:\s*"([^"]+)"', block.group(1)))
-        self.assertEqual(js_words, py_words,
-                         "the card and the terminal name the same provenance "
-                         "differently, so one row reads two ways")
+        self.assertTrue(py_words, "the terminal's table is empty")
+        # THE ASSEMBLED PAGE, not one fragment, so a table moved between
+        # parts is still found
+        from helm import web_ui_loader as _loader
+        js = _loader.read_text()
+        self.assertIn("WORK, START TO FINISH (task/3643", js)
+        self.assertIsNone(_re.search(r"const PROV = \{", js),
+                          "the page carries a second provenance table")
 
 
 class ContraryDischargeArmsTest(unittest.TestCase):

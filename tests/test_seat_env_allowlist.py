@@ -95,6 +95,17 @@ CC_ENV_ALLOWLIST = {
         "turn are, the same unsettled note MAX_CONTEXT_TOKENS carries.",
     "CLAUDE_CODE_SESSION_ID":
         "binary (9). Stripped on launch alongside the other child stamps.",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":
+        "binary (24 total) at claude 2.1.282, DOCUMENTED AND READ: "
+        "`if(process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)return"
+        "\"essential-traffic\"`, the mode whose gates skip error reporting, "
+        "the org-status prefetch, claude.ai downloads and the MCP directory. "
+        "NO FAMILY MINTS IT: measured at claude 2.1.284 by capturing the "
+        "request body, it (and DISABLE_TELEMETRY alone) takes Monitor out of "
+        "the tool list, so the seat can arm no beacon. No gate on a "
+        "background model call was found beside its definition, so what it "
+        "would save a per-request-billed family is unmeasured. Kept here only "
+        "so a re-mint reads this line first; tests/test_seat.py refuses it.",
     "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS":
         "binary (1 exact, 5 total) at claude 2.1.273, UNDOCUMENTED AND READ: "
         "the Workflow tool reads it as the per-run concurrent-agent cap "
@@ -106,6 +117,30 @@ CC_ENV_ALLOWLIST = {
     "CLAUDE_CONFIG_DIR":
         "binary (6). The seat's isolated config dir, so CC discovers no "
         "skills, agents or MCP servers from the minting host.",
+    # The lite profile's settings.json pins (task/3253, seat_catalog
+    # profile_env), VERIFIED against the shipped binary at claude 2.1.283
+    # (`strings -a | grep -cx`): each name appears once exactly.
+    "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS":
+        "binary (1 exact, 4 total) at claude 2.1.283, LISTED in the "
+        "bundle's env-var table AND READ: "
+        "`let e=a.CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS;if(e!==void 0&&e>0)"
+        "return e`, which overrides defaultFileReadingLimits, so a Read past "
+        "it is refused with the tokens-exceed-maximum error. On the bonsai "
+        "entry: one Read result fits a window that keeps only the compaction "
+        "floor.",
+    "MAX_MCP_OUTPUT_TOKENS":
+        "binary (1 exact, 5 total) at claude 2.1.283, LISTED in the "
+        "bundle's env-var table AND READ: "
+        "`let e=a.MAX_MCP_OUTPUT_TOKENS;if(e!==void 0&&e>0)return e`, beside "
+        "the 25000 default (`P=25000`) and the \"[OUTPUT TRUNCATED - exceeded "
+        "... token limit]\" notice. Not CLAUDE_-prefixed, so the launch-line "
+        "scan cannot see it; the profile-env arm below does.",
+    "BASH_MAX_OUTPUT_LENGTH":
+        "binary (1 exact, 8 total) at claude 2.1.283, LISTED in the "
+        "bundle's env-var table AND READ: "
+        "`uLe(\"BASH_MAX_OUTPUT_LENGTH\",process.env.BASH_MAX_OUTPUT_LENGTH,"
+        "x1n,KRr).effective`, a character count clamped to an upper limit "
+        "and outranked by the bashOutputMaxChars setting when that is set.",
 }
 
 # Anything matching this is spoken TO Claude Code and must be on the list.
@@ -222,6 +257,32 @@ class SeatEnvAllowlistTest(unittest.TestCase):
         self.assertGreater(checked, 0,
                            "no family declares max_context, so this test "
                            "proved nothing")
+
+    def test_every_profile_env_name_is_on_the_allowlist(self):  # noqa: VACUOUS_ASSERTION — after the loop `seen` must hold the window knob and a name outside the CLAUDE_ vocabulary, so an empty sweep fails; the loop asserts memberships, never an absence
+        """The lite profile (task/3253) writes env names into a seat's
+        settings.json `env` map, which Claude Code applies to its own
+        process, so EVERY name there is spoken to Claude Code whatever its
+        prefix: MAX_MCP_OUTPUT_TOKENS and BASH_MAX_OUTPUT_LENGTH match no
+        CLAUDE_/ANTHROPIC_ vocabulary, and the launch-line arm above can
+        never see them. Each must be on the list with its evidence. The
+        enumeration is every family in the catalog through the profile's
+        own producer (seat_catalog.profile_env), never a hand list."""
+        from helm import seat_catalog
+        seen = set()
+        for family in seat.FAMILIES:
+            for name, value in seat_catalog.profile_env(family):
+                seen.add(name)
+                self.assertIn(name, CC_ENV_ALLOWLIST,
+                              "%s's lite profile pins %s in settings.json and "
+                              "nobody has checked that Claude Code reads it; "
+                              "verify it against the shipped binary, then add "
+                              "it to CC_ENV_ALLOWLIST with that evidence"
+                              % (family, name))
+                self.assertRegex(value, r"\A[1-9][0-9]*\Z", (family, name))
+        # POSITIVE CONTROL: the window knob every pinned family carries, and a
+        # name outside the CLAUDE_ vocabulary, or this scan read nothing
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", seen)
+        self.assertTrue([n for n in seen if not _CC_VOCABULARY.match(n)], seen)
 
     @unittest.skipIf(_claude_binary() is None,
                      "no shipped claude binary on this box — the grounding arm "

@@ -33,7 +33,9 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 #: Recognition rules, reused verbatim rather than re-derived: they are applied
 #: to a preserved candidate population instead of to a helper's final answer.
-OPTION = re.compile(r"^\s*(\d+)\.\s+(\S.*?)\s*$")
+#: The focused row carries Claude Code's pointer (`❯ 1. Yes`); see
+#: seat_lifecycle._OPTION_RE, which this mirrors.
+OPTION = re.compile(r"^\s*(?:\u276f\s*)?(\d+)\.\s+(\S.*?)\s*$")
 PROMPT = re.compile(r"^\s*❯")
 RULE_COMPOSER = re.compile(r"^\s*[─━]{2}([^─━].*)$")
 AFFIRMATIVE = re.compile(r"^yes\b", re.I)
@@ -445,3 +447,344 @@ def wall_standing(parsed):
     return Standing(IN_FORCE, newest,
                     "the newest wall is not expired and no attributed work is "
                     "rendered below it")
+
+
+
+
+# ---------------------------------------------------------------------------
+# DIALOG KINDS — what the one dialog door (`harness._CLIAdapter.answer_dialog`)
+# may answer, each with its own SHAPE question (task/3209)
+# ---------------------------------------------------------------------------
+#
+# A DIALOG IS ANSWERABLE WHEN IT IS PROVEN TO AWAIT INPUT NOW, and the door
+# asks three questions at the act: WITNESS first, then SHAPE and KEY of one
+# fresh pane read taken after it. This module owns SHAPE: each kind's
+# recogniser says whether that kind's dialog is the thing on screen now — its
+# own rows in their places, nothing (no composer, no draft, no newer output)
+# below it. WITNESS and KEY are the door's; see its docstring.
+#
+# THE ROW EVERY CLAUDE CODE DIALOG IN THIS TABLE ENDS ON. The exit-confirm
+# dialog's footer, MEASURED on a live pane; the usage-limit menu is drawn by
+# the same Dialog component (Claude Code 2.1.283, TRACED from the program), so
+# a live one ends on the same row.
+DIALOG_FOOTER = re.compile(r"^\s*Enter to confirm\s*·\s*Esc to cancel\s*$")
+EXIT_FOOTER = DIALOG_FOOTER
+#: The focused row: Claude Code's pointer in front of the number.
+FOCUS = re.compile(r"^\s*❯\s*(\d+)\.\s")
+
+#: One recognised dialog. `kind` names its table row; `standing` is the SHAPE
+#: answer and `why` says what decided it; `focus` is the (n, label) the pointer
+#: sits on, or None when no row or more than one row carries it; `options` is
+#: the dialog's own numbered run; `tasks` is what the exit dialog will stop (a
+#: task's KIND only, never its description).
+Dialog = namedtuple("Dialog", "kind standing focus options tasks why")
+
+#: One row of the door's table. `recognise(tail)` answers SHAPE. `opens_on` is
+#: the row the dialog opens with the pointer on, when MEASURED, else None.
+#: `waiting_for` is the value the vendor's presence record carries while the
+#: dialog is up. `evidence` says how each of those was established. `unproven`
+#: is None for a kind the door may answer, else WHY it may not yet and what
+#: would enable it — the door refuses such a kind by name before any read.
+DialogKind = namedtuple(
+    "DialogKind", "name recognise opens_on waiting_for evidence unproven")
+
+
+def _pointer(lines, run):
+    """(n, label) the pointer sits on inside `run`, or None: no pointer row,
+    or more than one, is no focus — never a default."""
+    pointed = [int(m.group(1)) for m in (FOCUS.match(lines[i]) for i in
+                                         range(run.start.line, run.end.line + 1))
+               if m]
+    labels = dict(run.options)
+    if len(pointed) == 1 and pointed[0] in labels:
+        return pointed[0], labels[pointed[0]]
+    return None
+
+
+def _no(kind, why):
+    return Dialog(kind, False, None, [], [], why)
+
+
+#: CLAUDE CODE'S EXIT-CONFIRM DIALOG (task/3201). A session holding background
+#: tasks answers `/exit` with this instead of exiting, and every helm seat
+#: holds one — its armed inbox-beacon Monitor. Measured on Claude Code 2.1.283:
+#:
+#:        Background work is running
+#:        The following will stop when you exit:
+#:        monitor · <seat> inbox beacon
+#:        shell · <command line, truncated>…
+#:        ❯ 1. Exit and stop tasks
+#:          2. Move to background and exit
+#:          3. Stay
+#:        Enter to confirm · Esc to cancel
+#:
+#: It is not a Yes/No run, so every option reader above calls it UNQUALIFIED,
+#: and it replaces the composer, so every composer reader calls the pane
+#: unreadable. Both answers are true and neither says what the pane is.
+EXIT_HEADER = re.compile(r"^\s*The following will stop when you exit:\s*$")
+#: The one option a helm verb that typed `/exit` may confirm, and the row the
+#: dialog opens on. Anything else is somebody's choice, not helm's.
+EXIT_CONFIRM = (1, "Exit and stop tasks")
+#: A background-task row: its KIND, then ` · `, then a description that is
+#: often a shell command line. Only the kind is ever kept.
+TASK_ROW = re.compile(r"^\s*(\S+)\s+·\s+\S")
+
+
+def exit_dialog(tail):
+    """Dialog — is the exit-confirm dialog the thing on screen NOW?
+
+    STANDING needs all three of its parts in their places, because each one
+    alone is a string a transcript can quote: the header, the numbered choices
+    below it, and the footer as the BOTTOM visible row directly under those
+    choices. A seat that prints the dialog as tool output has its composer and
+    status chrome below it; a session that exited has the shell's prompt below
+    it. Either way the dialog is scrollback, not the screen, and nothing may
+    answer it.
+
+    THE POINTER IS REPORTED, NEVER ASSUMED; `tasks` carries each background
+    task's KIND only, because the description is frequently a command line.
+    """
+    name = EXIT_KIND_NAME
+    lines = normalize(tail)
+    visible = [i for i, line in enumerate(lines) if line.strip()]
+    heads = [i for i in visible if EXIT_HEADER.match(lines[i])]
+    if not heads:
+        return _no(name, "no exit-confirm header (%r) in the tail"
+                   % "The following will stop when you exit:")
+    head = heads[-1]
+    runs = [r for r in option_runs(lines) if r.start.line > head]
+    if not runs:
+        return _no(name, "the exit-confirm header has no numbered choices "
+                         "below it")
+    run = runs[0]
+    bottom = visible[-1]
+    if not (DIALOG_FOOTER.match(lines[bottom]) and run.ended_by is not None
+            and run.ended_by.line == bottom):
+        return _no(name, "the dialog's footer is not the bottom row directly "
+                         "under its choices, so something newer than the "
+                         "dialog is on screen (a composer, a shell prompt, "
+                         "more output)")
+    tasks = [m.group(1) for m in (TASK_ROW.match(lines[i]) for i in visible
+                                  if head < i < run.start.line) if m]
+    return Dialog(name, True, _pointer(lines, run), list(run.options), tasks,
+                  "header, %d choices and the footer as the bottom row"
+                  % len(run.options))
+
+
+#: One row the exit dialog lists, whatever its kind is spelled as: a
+#: scheduled task's kind is two words ("scheduled task · Every hour at :13"),
+#: which TASK_ROW's one-word kind never matches.
+ITEM_ROW = re.compile(r"^\s*\S.*?\s·\s+\S")
+#: The longest item kept. The dialog already truncates its own rows; this is
+#: a bound for a screen that did not.
+ITEM_CAP = 200
+
+
+def exit_dialog_items(tail):
+    """[row] — every item a STANDING exit-confirm dialog says it will stop,
+    WHOLE (kind and description), in the dialog's order; [] when the dialog
+    is not the thing on screen.
+
+    NOT FOR A REFUSAL. `exit_dialog` keeps kinds only because a description
+    is often a command line, and a refusal is read by whoever runs the verb.
+    This reader is for the ONE caller that typed the /exit and owes the seat
+    an account of what the exit took from it (task/3515: monitors, scheduled
+    tasks and background shells do not survive a relaunch), which it writes
+    to its own ledger and to the seat's own lane.
+    """
+    if not exit_dialog(tail).standing:
+        return []
+    lines = normalize(tail)
+    visible = [i for i, line in enumerate(lines) if line.strip()]
+    head = [i for i in visible if EXIT_HEADER.match(lines[i])][-1]
+    run = [r for r in option_runs(lines) if r.start.line > head][0]
+    return [lines[i].strip()[:ITEM_CAP] for i in visible
+            if head < i < run.start.line and ITEM_ROW.match(lines[i])]
+
+
+def vendor_dialog(tail):
+    """Dialog — is a vendor usage-limit menu the thing on screen NOW?
+
+    task/2386's rule, stated in its design and applied here for the first
+    time: A MODAL IS CURRENT ONLY WHEN IT IS THE LAST EVENT AND NO COMPOSER
+    DRAFT FOLLOWS IT. So the newest numbered run must be a real dialog
+    (QUALIFIED), and nothing the parser can place may sit below its last
+    choice: not a composer (a draft is the incident that parked this escape; a
+    BARE composer is a dialog already answered), not a newer run, and not a
+    quota wall on a line of its own, whose chronology a tail cannot settle.
+
+    THE REFUSALS KEEP THE WORDS THE ESCAPE'S OWN DOOR ALWAYS USED, because an
+    operator reads them on the escape's HELD row: an ended or absent dialog, a
+    newer run that is not a dialog, and a wall below the choices whose owner
+    is UNKNOWN, quoted from the pane rather than from the recogniser.
+    """
+    name = VENDOR_KIND_NAME
+    parsed = parse(tail)
+    runs = [e for e in parsed.events if e.kind == RUN]
+    if not runs:
+        return _no(name, "not showing a dialog that owns input (no numbered "
+                         "run in the tail)")
+    run = runs[-1].detail
+    if run.qualification != QUALIFIED:
+        return _no(name, "the newest numbered run is not a dialog, so no "
+                         "choice is on offer — helm does not fall through to "
+                         "an older list")
+    # BELOW MEANS BELOW THE LAST CHOICE. Claude Code's pointer row
+    # (`❯ 2. Switch…`) matches the composer shape too, so a composer event on
+    # a line the run occupies is the dialog's own pointer, never a composer;
+    # `modal_standing` counts it and calls a live dialog whose pointer sits
+    # below its first row ENDED. This reads only what sits under the run.
+    below = [e for e in parsed.events if e.pos.line > run.end.line]
+    if any(e.kind == COMPOSER_EVENT and e.detail.ownership != BARE
+           for e in below):
+        return _no(name, "not showing a dialog that owns input (a composer "
+                         "holding text is rendered below the run)")
+    wall = wall_standing(parsed)
+    if wall.state == IN_FORCE and wall.occurrence.pos.line > run.end.line:
+        # POSITION IS NOT CHRONOLOGY AND IT IS NOT OWNERSHIP. A wall above
+        # the first option row is the banner that RAISED the dialog, and one
+        # on a line the run occupies is the reason spelled inside a label;
+        # both admit. Below the last numbered row settles nothing: it reads
+        # the same as the final label's wrapped continuation. The line quoted
+        # is the PANE's, never the recogniser's pattern.
+        observed = (wall.occurrence.detail.line or "").strip()
+        return _no(name, "quota-wall text (%r) sits on line %d with the "
+                         "choices on lines %d to %d, and a pane tail cannot "
+                         "say whether that wall is a newer screen or the last "
+                         "option's own wrapped label: which of them holds the "
+                         "keys is UNKNOWN"
+                   % (observed[:200], wall.occurrence.pos.line,
+                      run.start.line, run.end.line))
+    others = sorted({e.kind for e in below if e.kind != WALL_EVENT})
+    if others:
+        return _no(name, "a %s is rendered below the choices, so the dialog "
+                         "is not the last thing on screen"
+                   % " and a ".join(others))
+    return Dialog(name, True, _pointer(parsed.lines, run), list(run.options),
+                  [], "a qualifying run with nothing below its last choice")
+
+
+EXIT_KIND_NAME = "exit-confirm"
+VENDOR_KIND_NAME = "vendor-limit"
+
+EXIT_KIND = DialogKind(
+    EXIT_KIND_NAME, exit_dialog, EXIT_CONFIRM[0], "dialog open",
+    "MEASURED on two throwaway panes (Claude Code 2.1.283): header, choices "
+    "and footer as the bottom row, pointer on option 1 when it opens, the "
+    "presence record `waiting` for 'dialog open' while it stands, and option "
+    "1's digit ending the session with no Enter",
+    None)
+
+VENDOR_KIND = DialogKind(
+    VENDOR_KIND_NAME, vendor_dialog, None, "dialog open",
+    "TRACED: Claude Code 2.1.283 draws the usage-limit menu "
+    "(`fable_overage_consent_prompt`) with the Dialog component that draws "
+    "the measured exit dialog, and its dialog table gives that kind "
+    "waitingFor 'dialog open' (needs 'choose: continue on usage credits or "
+    "switch models'); the free option is chosen by "
+    "seat_lifecycle.vendor_escape_choice",
+    "its screen has never been read off a live pane: the fixtures are "
+    "synthetic, the row it opens on is unknown, and every refusal it would "
+    "make on a real screen is untested; a registered seat's escape also "
+    "carries no process identity to read the vendor's presence record by. "
+    "What enables it: one live capture of a seat parked at the menu (the "
+    "escape's HELD row names the seat and what it saw) committed as a "
+    "fixture, this reason cleared in the same commit, and its five door arms "
+    "re-pointed at that capture (task/3209)")
+
+#: THE DOOR'S TABLE, in the order its rows were proven.
+DIALOG_KINDS = (EXIT_KIND, VENDOR_KIND)
+
+#: EVERY OTHER DIALOG HELM RECOGNISES, and why the door does not answer it.
+#: A row here is a decision, not an omission: each names where that dialog is
+#: handled instead, so "helm never types into a dialog" is not a rule anyone
+#: can read out of this tree.
+NOT_ANSWERED = (
+    ("permission prompt",
+     "a tool permission is answered by the prompt-stall watch "
+     "(planprompt.answer_stall), which already asks this door's three "
+     "questions with its own witnesses: the presence record waiting for "
+     "'permission prompt' and bound to its episode, the dialog within "
+     "DIALOG_FOOT_LINES of the bottom, the option's digit; and it adds what "
+     "only it can judge, the owner's named exceptions. Moving its keystroke "
+     "onto this door is a refactor with no change of rule"),
+    ("plan-execution prompt",
+     "answered by planprompt.act for a REGISTERED seat only, after reading "
+     "the plan it names, under the seat lifecycle lock; a plan is judged, "
+     "not keyed, so it is never this door's"),
+    ("trust prompt",
+     "never reaches a seat's pane: seat_launch_assets seeds "
+     "hasTrustDialogAccepted for the seat's workspace before launch, and "
+     "trusting a folder is a security grant no keystroke makes on anyone's "
+     "behalf"),
+    ("bypass-permissions warning",
+     "never reaches a seat's pane: seat_launch_assets seeds "
+     "bypassPermissionsModeAccepted in the seat's config before launch, and "
+     "accepting that mode is the owner's grant, never a keystroke's"),
+)
+
+
+def dialog_summary(dialog):
+    """One sentence naming a STANDING dialog: what it is, what it will stop
+    (the exit dialog's task KINDS only) and where its pointer is."""
+    where = ("the pointer on '%d. %s'" % dialog.focus if dialog.focus
+             else "NO readable pointer on any of its choices")
+    if dialog.kind != EXIT_KIND_NAME:
+        return "a %s dialog is open, with %s" % (dialog.kind, where)
+    kinds = dialog.tasks
+    held = ("%d background task%s (%s)" % (len(kinds), "s"[:len(kinds) != 1],
+                                           ", ".join(kinds))
+            if kinds else "background tasks")
+    return ("Claude Code's exit-confirm dialog is open (it will stop %s), "
+            "with %s" % (held, where))
+
+
+# THE PERMISSION-MODE FOOTER (task/3515), measured on throwaway panes of
+# Claude Code 2.1.284 started with each --permission-mode (bypass from the
+# fleet's own panes, seat_lifecycle._PANE_CHROME). `default` draws the manual
+# row, and a session started with NO flag draws `auto`, so the startup
+# layers alone never say what a session runs in; a live shift+tab moves it
+# too. This row is the one reading of the LIVE mode.
+FOOTER_MODES = (("⏵⏵ bypass permissions on", "bypassPermissions"),
+                ("⏵⏵ accept edits on", "acceptEdits"),
+                ("⏵⏵ auto mode on", "auto"),
+                ("⏵⏵ don't ask on", "dontAsk"),
+                ("⏸ plan mode on", "plan"),
+                ("⏸ manual mode on", "manual"))
+#: how many of the tail's last non-blank rows the footer may sit in
+FOOTER_ROWS = 6
+#: the input box's top and bottom rule: a row of box-drawing dashes only
+_BOX_RULE = re.compile(r"[─━]{8,}")
+
+
+def permission_footer(tail):
+    """(mode, row) for the permission mode the pane's footer shows, or
+    (None, why) when no row names one or rows name more than one. The footer
+    is CHROME BELOW THE INPUT BOX: only rows under the rule that closes the
+    box (a composer row under the rule before it), and within the last
+    FOOTER_ROWS, are read, so a transcript line quoting a footer, or a
+    transcript's own rule and mode line, is never taken for it, and a tail
+    with no whole input box proves nothing. The one shape not refused is a
+    transcript that prints a whole fake box at the very bottom of a pane
+    whose real box is hidden; the dry run names the footer row it read."""
+    rows = [r.strip() for r in str(tail or "").splitlines() if r.strip()]
+    rules = [i for i, r in enumerate(rows) if _BOX_RULE.fullmatch(r)]
+    # A WHOLE INPUT BOX: the last rule closes a box whose composer row (❯)
+    # sits under the rule before it. A transcript that prints a rule and a
+    # mode line of its own, while a dialog hides the real box, has no
+    # composer between its rules and proves nothing.
+    if len(rules) < 2 or not any(r.startswith("❯")
+                                 for r in rows[rules[-2] + 1:rules[-1]]):
+        return None, "the pane tail draws no whole input box, so no footer row is proved"
+    found = {}
+    for row in rows[rules[-1] + 1:][-FOOTER_ROWS:]:
+        for mark, mode in FOOTER_MODES:
+            if row.startswith(mark):
+                found.setdefault(mode, row)
+    if len(found) == 1:
+        (mode, row), = found.items()
+        return mode, row
+    if not found:
+        return None, "the pane shows no permission-mode footer"
+    return None, "the pane's footer names %s at once" % " and ".join(
+        sorted(found))

@@ -114,7 +114,6 @@ from ._common import (
     DEFAULT_PROFILE,
     DIGEST_TAG,
     EXIT_NO_NATIVE_PROOF,
-    RETRY_PAUSE_S,
     canonicalize,
     digest_payload,
     payload_digest,

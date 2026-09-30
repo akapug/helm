@@ -64,7 +64,7 @@ import stat
 import sys
 import time
 
-from . import eventledger, gate, gateauthority, home, openflags, pk, projscope, seats, vcs
+from . import eventledger, gate, gateauthority, gateloads, home, openflags, pk, projscope, seats, vcs
 
 IMPORTS = "gate-imports.jsonl"
 BINDINGS = "gate-import-bindings.jsonl"
@@ -360,12 +360,37 @@ def _canonical(row):
                       separators=(",", ":"))
 
 
+ATTEMPT_ERR = "attempt is not an integer of 2 or more"
+
+
+def identity_without_attempt(identity):
+    """The identity's field set with `attempt` set aside, or None."""
+    if not isinstance(identity, dict):
+        return None
+    fields = set(identity)
+    fields.discard("attempt")
+    return fields
+
+
+def attempt_err(identity):
+    """None when attempt is absent or an int of 2 or more."""
+    if "attempt" not in identity:
+        return None
+    attempt = identity["attempt"]
+    if type(attempt) is int and attempt >= 2:
+        return None
+    return ATTEMPT_ERR
+
+
 def _fab_identity_contract(identity):
     """Canonical whole-gate identity shared by admission and direct import."""
-    if not isinstance(identity, dict) or set(identity) != {
+    if identity_without_attempt(identity) != {
             "format", "repository", "tree", "scope", "interpreter", "runner"} \
             or identity.get("format") != FAB_KEY_FORMAT:
         return None, "Fab completion identity is malformed"
+    err = attempt_err(identity)
+    if err:
+        return None, err
     repository = identity.get("repository")
     if not isinstance(repository, dict) or set(repository) != {"common_dir"} \
             or type(repository.get("common_dir")) is not str \
@@ -996,7 +1021,7 @@ def _divergence_note(repo, row):
                 "it covers the commit you would land is UNKNOWN because %s"
                 % (row.get("id"), head[:12], why))
     try:
-        verdict, _relation, _sequence = gate.carriage(repo, mine, head)
+        verdict, _relation, sequence = gate.carriage(repo, mine, head)
     except Exception as exc:                      # noqa: BLE001 — see _head_sha
         return ("gate import: NOTE — receipt %s measured commit %s; whether "
                 "it covers HEAD (%s) is UNKNOWN — the containment read failed "
@@ -1010,6 +1035,12 @@ def _divergence_note(repo, row):
                 "derived. This receipt is NOT shown to cover the commit you "
                 "would land; the BINDER is the authority and will say "
                 "so." % (row.get("id"), head[:12], mine[:12], repo))
+    if sequence and sequence[0] == vcs.PATCH_SEQUENCE_BACKWARD:
+        return ("gate import: NOTE — receipt %s measured commit %s, which "
+                "carries HEAD's (%s) own patches on an OLDER trunk point than "
+                "HEAD sits on in %s, so it did not run on the base you would "
+                "land. The BINDER will refuse this receipt for that commit."
+                % (row.get("id"), head[:12], mine[:12], repo))
     return ("gate import: NOTE — receipt %s measured commit %s, which does "
             "NOT carry HEAD (%s) in %s — not by ancestry and not as a "
             "contiguous run of its patches. Either the gate ran on a snapshot "
@@ -1114,6 +1145,40 @@ def _stored_timings():
         return None, None, unavailable
     timings, poisoned, _skipped = gate._timings(rows)
     return timings, poisoned, None
+
+
+def _artifact_loads(row, rows):
+    """The artifact's load record for this receipt (task/3039), or None.
+
+    ADVISORY LIKE TIMING: a record travels home beside the receipt it was
+    minted with, so the planner on this host can select from it. Absent,
+    ambiguous, unreadable or about another tree, it is simply not brought:
+    nothing about the receipt's authority depends on it."""
+    hits = [r for r in rows if isinstance(r, dict)
+            and r.get("event") == gateloads.EVENT
+            and r.get("receipt") == row.get("id")]
+    if len(hits) != 1:
+        return None
+    _record, err = gateloads.read_event(hits[0])
+    if err or hits[0].get("tree") != row.get("tree") \
+            or hits[0].get("head") != row.get("head"):
+        return None
+    try:
+        if gate._event_bytes(hits[0]) > eventledger.MAX_EVENT_BYTES:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return hits[0]
+
+
+def _stored_loads_ids():
+    """The ids of the load records the ledger already holds, or None."""
+    rows, unavailable = eventledger.checked_events(
+        gate.receipts_path(), strict=True)
+    if unavailable:
+        return None
+    return {r.get("id") for r in rows if isinstance(r, dict)
+            and r.get("event") == gateloads.EVENT}
 
 
 def _stored_plan(row, chunks, stored, poisoned):
@@ -1489,7 +1554,7 @@ def _matching_binding(rows, receipt_id, importing_repo):
     return (hits[0] if hits else None), None
 
 
-def _ensure_receipt(row, chunks, timing=None):
+def _ensure_receipt(row, chunks, timing=None, loads=None):
     """Place authority first, then repair its optional advisory timing sibling.
 
     Missing content-addressed failure chunks append before the gate row. A
@@ -1527,6 +1592,10 @@ def _ensure_receipt(row, chunks, timing=None):
             if timing_err is None and row["id"] not in timing_poisoned \
                     and row["id"] not in timings:
                 eventledger.append_unlocked(path, timing)
+        if loads is not None:
+            stored_loads = _stored_loads_ids()
+            if stored_loads is not None and loads["id"] not in stored_loads:
+                eventledger.append_unlocked(path, loads)
         if duplicate:
             return "repaired" if needed else "existing", None
         return "appended", None
@@ -2624,7 +2693,8 @@ def _import_receipt(artifact, repo, want_id=None, actor=None,
                 row, repo, artifact_identity, custody)
             if err:
                 return None, None, err
-    receipt_state, err = _ensure_receipt(row, chunks, timing=timing)
+    receipt_state, err = _ensure_receipt(row, chunks, timing=timing,
+                                         loads=_artifact_loads(row, rows))
     if err:
         return None, None, err
     binding, binding_state, err = _record_binding(

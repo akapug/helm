@@ -18,6 +18,7 @@ import hashlib
 import os
 
 from . import chat, home, pk
+from .beacon_doorbell import _acked_at
 from .seats_common import _seat_key
 from .seats_cursor import (_cursor_transaction_epoch, _occurrence, _sid8,
                            cursor_path)
@@ -53,19 +54,34 @@ def _room_epoch(room, seat, session):
 
 
 def _occurrence_owed(row, start, end, dev, ino, wake, held, done, seat, room,
-                     scope, ambient, beacon):
+                     scope, ambient, beacon, acked=()):
     """Is the row at (dev, ino, start, end) still pending for this consumer?
 
     ONE PREDICATE for the scan and for the validation of an act taken on one
     of its rows. The wake cursor suppresses what a wake already crossed, its
     `done` set what was consumed out of order, and `deliverable` decides the
     tier; a second spelling of this conjunction is a second answer to the
-    same question."""
+    same question.
+
+    A HELD row is crossed on the beacon tier and owed on the tool-boundary
+    one. `held` names rows the wake cursor passed that the hook still owes: a
+    mute or owner-rail hold (which never wakes, so the beacon tier drops it
+    anyway) and a row a beacon doorbell RANG. The beacon tier asks which rows
+    would have woken a seat that was not woken, and a rung row woke it; the
+    boundary tier asks what the seat has not been shown, and it was not.
+
+    A row THIS SESSION ACKED is pending on neither tier: it saw the row.
+    `acked` is the starts `beacon_doorbell._acked_at` finds in the rows the
+    scan already read, the ack the tool-boundary hook reads too; a
+    delegate's ack, a sibling session's, one that records no session and one
+    placed before its row are not in it. A validation passes none, so an ack
+    after its scan does not make it stale."""
     token = _occurrence(dev, ino, start)
     same = isinstance(wake, dict) and \
         (wake.get("dev"), wake.get("ino")) == (dev, ino)
-    crossed = same and end <= wake.get("off", 0) and token not in held
-    return not crossed and token not in done \
+    crossed = same and end <= wake.get("off", 0) \
+        and (beacon or token not in held)
+    return not crossed and token not in done and start not in acked \
         and deliverable(row, seat, room, scope, ambient=ambient, beacon=beacon)
 
 
@@ -116,6 +132,7 @@ def _pending_rows(room, seat, session=None, backfill=False, scope=None,
     if not got:
         return []
     dev, ino, _base, entries, _rid, _skip = got
+    acked = _acked_at(entries, seat, session)
     wakemark = {}
     wake = _cursor(room, seat, session, beacon=True, report=wakemark)
     if wake is None and wakemark.get("outcome") == "unreadable":
@@ -146,7 +163,7 @@ def _pending_rows(room, seat, session=None, backfill=False, scope=None,
         if row is None:
             continue
         if _occurrence_owed(row, start, end, dev, ino, wake, held, done,
-                            seat, room, sc, ambient, beacon):
+                            seat, room, sc, ambient, beacon, acked):
             out.append(row)
             if watch and window is not None:
                 woff, data = window[2], window[3]

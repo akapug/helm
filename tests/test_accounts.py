@@ -704,8 +704,10 @@ class SecretRefusalTest(AccountsBase):
         accounts.save(row(id="acct-clean"))
         for _clean, dirty in SECRET_PAIRS:
             accounts.save(row(notes=dirty))
-        blob = "" if not os.path.exists(self.path) else open(
-            self.path, encoding="utf-8").read()
+        blob = ""
+        if os.path.exists(self.path):
+            with open(self.path, encoding="utf-8") as fh:
+                blob = fh.read()
         self.assertIn("acct-clean", blob)
         for _clean, dirty in SECRET_PAIRS:
             self.assertNotIn(dirty, blob)
@@ -918,7 +920,8 @@ class RevisionConflictTest(AccountsBase):
         self.assertEqual(code, "conflict", err)
         # the positive control for the absence below, on the same observable:
         # the file HAS content and this read really saw it.
-        on_disk = open(self.path, encoding="utf-8").read()
+        with open(self.path, encoding="utf-8") as fh:
+            on_disk = fh.read()
         self.assertIn("acct-b", on_disk)
         self.assertNotIn("sk-", on_disk)
 
@@ -957,6 +960,48 @@ class RevisionConflictTest(AccountsBase):
         self.assertIsNone(err, err)
         self.assertTrue(saved["confirmed"])
         self.assertEqual(saved["vendor"], "vendor-x")
+
+    def test_a_save_answers_the_revision_it_wrote_and_a_refusal_none(self):
+        """`.revision` is the inventory THIS save put on disk, computed under
+        the lock, so the web door can hand it to the page without a read after
+        the lock that a third writer can already have moved."""
+        wrote = accounts.save(row())
+        self.assertIsNone(wrote[1])
+        self.assertEqual(wrote.revision, accounts.read()["revision"])
+        self.assertNotEqual(wrote.revision, accounts.MISSING_REVISION)
+        # the three every caller unpacks are unchanged
+        saved, err, code = wrote
+        self.assertEqual((saved["id"], err, code), ("acct-a", None, None))
+        # A REFUSAL WROTE NOTHING and answers no revision, never the old one
+        refused = accounts.save(row(plan="Clobbered"), expected_revision="stale")
+        self.assertEqual(refused[2], "conflict")
+        self.assertIsNone(refused.revision)
+        self.assertIsNone(accounts.save(row(notes="sk-abcdefabcdefabcdefabcdef")).revision)
+
+    def test_a_saved_answer_survives_copy_deepcopy_and_pickle(self):  # noqa: VACUOUS_ASSERTION — the None is the refusal's revision, and the unconditional positive control on the same observable is assertTrue(wrote.revision) on the save's answer just above it, carried through every clone by the same assertEqual
+        """`Saved` is a tuple of three with `.revision`, and tuple's own
+        `__getnewargs__` hands `__new__` ONE argument: every copy and every
+        pickle of an answer raised TypeError. Each must come back equal, still
+        a `Saved`, with the revision it carried — the written one on a save,
+        None on a refusal."""
+        import copy
+        import pickle
+        wrote = accounts.save(row())
+        refused = accounts.save(row(plan="Clobbered"), expected_revision="stale")
+        # THE CONTROL: the two answers differ where it matters, so "came back
+        # with the same revision" is a claim about each and not about None
+        self.assertTrue(wrote.revision)
+        self.assertIsNone(refused.revision)
+        clones = {"copy": copy.copy, "deepcopy": copy.deepcopy}
+        clones.update({"pickle-%d" % n: (lambda s, n=n: pickle.loads(pickle.dumps(s, n)))
+                       for n in range(pickle.HIGHEST_PROTOCOL + 1)})
+        for how, clone in clones.items():
+            for answer in (wrote, refused):
+                with self.subTest(how=how, code=answer[2]):
+                    got = clone(answer)
+                    self.assertIsInstance(got, accounts.Saved)
+                    self.assertEqual(tuple(got), tuple(answer))
+                    self.assertEqual(got.revision, answer.revision)
 
     def test_the_missing_revision_admits_the_first_ever_save(self):
         saved, err, _ = accounts.save(row(),
@@ -1100,7 +1145,8 @@ class TotalsTest(AccountsBase):
     def test_an_empty_inventory_totals_zero_without_dividing_by_anything(self):
         t = accounts.read()["totals"]
         self.assertEqual(sorted(t),
-                         ["accounts", "monthly_spend", "units", "unpriced"])
+                         ["accounts", "free", "monthly_spend", "units",
+                          "unpriced"])
         self.assertEqual((t["accounts"], t["units"], t["monthly_spend"],
                           t["unpriced"]), (0, 0, 0.0, 0))
 
@@ -1182,15 +1228,21 @@ class SeedFamiliesTest(AccountsBase):
     helm does not measure, which is every key-mode family on this host — so the
     owner read a card that looked complete and was not."""
 
-    #: A synthetic catalog in the shape the real one has: a plain family, one
-    #: whose vendor is its provider, one whose vendor is its login, and one
-    #: that fronts a pool of separately-billed upstream accounts.
+    #: A synthetic catalog in the shape the real one has: a family that names
+    #: its vendor outright (cursor's shape: its provider is a local bridge),
+    #: one whose vendor is its provider, one whose vendor is its login, one
+    #: that fronts a pool of separately-billed upstream accounts, one served
+    #: from the operator's own box, and one that names no vendor at all.
     FAMILIES = {
-        "fam-plain": {"port": 1, "mode": "proxy"},
+        "fam-plain": {"port": 1, "mode": "proxy", "provider": "a-bridge",
+                      "vendor": "vendor-plain"},
         "fam-provider": {"provider": "vendor-p", "mode": "proxy-key"},
         "fam-login": {"auth_type": "login-l", "mode": "proxy-oauth"},
         "fam-pool": {"mode": "proxy-key",
                      "pool_providers": {"pool-a": {}, "pool-b": {}}},
+        "fam-ownbox": {"mode": "proxy-key", "pool_default": "box-pool",
+                       "pool_providers": {"box-pool": {"base_url_from": "k"}}},
+        "fam-unnamed": {"mode": "proxy-key"},
     }
 
     def setUp(self):
@@ -1224,6 +1276,11 @@ class SeedFamiliesTest(AccountsBase):
         self.assertIn("fam-plain", written)
         self.assertIn("pool-a", written)
         self.assertNotIn("fam-pool", written)
+        # A GPU ON THE OPERATOR'S OWN BOX IS NO ACCOUNT: it has no key and no
+        # bill, so neither it nor the family it serves is a row — and a family
+        # that names no vendor is not billed under its own name either.
+        for absent in ("box-pool", "fam-ownbox", "fam-unnamed"):
+            self.assertNotIn(absent, written)
 
     def test_a_family_whose_vendor_already_has_a_row_mints_nothing(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control on the same list is `assertTrue(written)` before the absence claims: the seed really ran and really wrote, so "fam-provider is not among them" is about that family
         """The bare `codex` row sat on his card beside the six codex accounts
@@ -1246,12 +1303,21 @@ class SeedFamiliesTest(AccountsBase):
         self.assertIn("fam-login", written)
 
     def test_the_vendor_is_the_catalogs_own_word_for_who_is_billed(self):
+        """…read through `seat.billing_accounts`, the one reading the credit
+        page joins on too (task/3461): an explicit `vendor` first, then the
+        provider, then the login; a pool provider under its own name."""
+        from helm import seat
         accounts.seed([], families=self.FAMILIES)
         rows = {a["id"]: a for a in accounts.read()["accounts"]}
         self.assertEqual(rows["fam-provider"]["vendor"], "vendor-p")
         self.assertEqual(rows["fam-login"]["vendor"], "login-l")
-        # a family that carries neither is named after itself, never guessed
-        self.assertEqual(rows["fam-plain"]["vendor"], "fam-plain")
+        # the explicit vendor, never the bridge it bills through
+        self.assertEqual(rows["fam-plain"]["vendor"], "vendor-plain")
+        self.assertEqual(rows["pool-a"]["vendor"], "pool-a")
+        for family in self.FAMILIES:
+            for account, group in seat.billing_accounts(
+                    family, self.FAMILIES) or ():
+                self.assertEqual(rows[account]["vendor"], group, family)
 
     def test_a_family_row_is_unconfirmed_undescribed_and_unpriced(self):
         accounts.seed([], families=self.FAMILIES)
@@ -1283,7 +1349,7 @@ class SeedFamiliesTest(AccountsBase):
                          "seed — not re-stamped, not re-marked unconfirmed")
 
     def test_a_missing_family_is_added_beside_the_rows_already_there(self):
-        accounts.seed([], families={"fam-plain": {"mode": "proxy"}})
+        accounts.seed([], families={"fam-plain": self.FAMILIES["fam-plain"]})
         first = self.ids()
         self.assertIn("fam-plain", first)
         self.assertNotIn("fam-login", first)
@@ -1318,24 +1384,33 @@ class SeedFamiliesTest(AccountsBase):
         said the two were one account. Such a family is accounted for by its
         pool providers, every one of which is a row — which is the property
         that actually keeps the fleet from guessing, and the one this sweeps."""
-        from helm import seat
+        from helm import burnflags, seat
         declared = set(seat.FAMILIES)
         self.assertTrue(declared, "the control: the catalog declares families "
                                   "at all, so the sweep below sees input")
-        got = {c["id"] for c in accountseed.candidates("for", "not for")}
+        got = {c["id"]: c for c in accountseed.candidates("for", "not for")}
         self.assertTrue(got, "the control: the seeder returns candidates at "
                              "all, so the set differences below are real")
         pooling = {f for f in declared
                    if (seat.FAMILIES[f] or {}).get("pool_providers")}
-        self.assertEqual((declared - pooling) - got, set(),
+        self.assertEqual((declared - pooling) - set(got), set(),
                          "a family the catalog declares has no row on the "
                          "owner's card, so the fleet still guesses about it")
-        for family in pooling:
+        local = set(burnflags.local_families())
+        self.assertTrue(local and pooling - local, "the control: the catalog "
+                        "pools both billed and own-box providers")
+        for family in sorted(pooling):
+            billed = seat.billing_accounts(family) or []
             pool = set(seat.FAMILIES[family]["pool_providers"])
-            self.assertTrue(pool, family)
-            self.assertEqual(pool - got, set(),
+            self.assertEqual(set(a for a, _g in billed) - set(got), set(),
                              "%s pools accounts that have no row, so its bills "
                              "are invisible" % family)
+            for account, group in billed:
+                self.assertEqual(got[account]["vendor"], group, family)
+            # A GPU ON THE OPERATOR'S OWN BOX IS NO BILL, so no row
+            self.assertEqual((pool - set(a for a, _g in billed)) & set(got),
+                             set(), family)
+            self.assertEqual(family in local, not billed, family)
             self.assertNotIn(family, got,  # noqa: VACUOUS_ASSERTION — the loop runs only for families that POOL, which is a property of the live catalog and not of this arm; `pool - got` two lines up is this family's unconditional positive control, and `assertTrue(got)` above is the sweep's
                              "%s is a route to those accounts, not a seventh "
                              "subscription beside them" % family)

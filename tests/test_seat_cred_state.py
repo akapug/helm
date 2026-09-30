@@ -39,6 +39,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import seat  # noqa: E402
+from tests._offpeak_clock import pin as _pin_offpeak_clock  # noqa: E402
 
 
 def _fake_jwt(exp):
@@ -389,8 +390,18 @@ class DoctorExitStatusTest(unittest.TestCase):
         self.assertEqual(state, seat.CRED_ABSENT)
 
 
-if __name__ == "__main__":
-    unittest.main()
+_STOP_OFFPEAK_PIN = []
+
+
+def setUpModule():
+    # seat paths cross the off-peak door; pin its vendor clock so no test
+    # here makes the live proof or leaves offpeak._CLOCK_CACHE filled for a
+    # later unit (the sliced gate's leak audit; task/3238)
+    _STOP_OFFPEAK_PIN.append(_pin_offpeak_clock())
+
+
+def tearDownModule():
+    _STOP_OFFPEAK_PIN.pop()()
 
 
 class CredRemainderAndRollingTest(unittest.TestCase):
@@ -486,3 +497,7 @@ class CredRemainderAndRollingTest(unittest.TestCase):
         self.assertEqual(seat._cred_rolling({"expires_in": 3599}), "",
                          "no refresh_token means no rolling claim at all")
         self.assertEqual(seat._cred_rolling(None), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

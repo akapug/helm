@@ -243,10 +243,13 @@ function renderRoster(rep) {
     $("#rtbody").querySelectorAll(".rseat").forEach(el =>
       el.onclick = ev => { ev.stopPropagation(); seatPop(el, el.dataset.seat, el.dataset.sess); });
   }
-  // the counts stay SEAT counts \u2014 the owner's row is a person, not capacity
-  const seatsOnly = all.filter(s => !s.owner);
-  const live = seatsOnly.filter(s => s.presence !== "absent" && !s.ephemeral).length;
-  $("#rostercount").innerHTML = '<b>' + live + ' live</b> \u00b7 ' + seatsOnly.length + ' total' +
+  // the counts stay SEAT counts \u2014 the owner's row is a person, not capacity,
+  // and a done SA is no seat either. ONE WORD PER COUNT (console walk 3,
+  // finding 4): "active" is the Seats strip's and Home's own set (a fresh,
+  // verified beat), and "joined" the picker's (every non-ephemeral seat).
+  const seatsOnly = all.filter(s => !s.owner && !s.ephemeral);
+  const act = seatsOnly.filter(s => !s.unverified && s.presence === "fresh").length;
+  $("#rostercount").innerHTML = '<b>' + act + ' active</b> \u00b7 ' + seatsOnly.length + ' joined' +
     (all.some(s => s.owner) ? ' \u00b7 <span class="rhere">you\u2019re here</span>' : '');
   // A DEAD HOLDER'S LOCK MUST NOT READ AS A WORKING SEAT HERE EITHER. The
   // roster JSON carries `stale` per claim; the footer used to drop it, so the
@@ -457,7 +460,7 @@ function seatPicker(rep) {
   if ($("#seatlist").classList.contains("show")) renderSeatPicker();
   const c = $("#seatpickcount");
   if (c) c.textContent = SEAT_CHOICES.length
-    ? SEAT_CHOICES.length + (SEAT_CHOICES.length === 1 ? " live seat" : " live seats") +
+    ? SEAT_CHOICES.length + (SEAT_CHOICES.length === 1 ? " joined seat" : " joined seats") +
       (hidden ? " · " + hidden + " done SA" + (hidden === 1 ? "" : "s") + " hidden" : "") +
       " · pick or type @all"
     : "no seats joined yet · type @all or a seat";

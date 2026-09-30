@@ -37,7 +37,7 @@ def _token_in_command(command):
 
 
 def _free_pid():
-    """A pid NOTHING is using, verified, not a hopeful constant.
+    """A pid the kernel can never hand to a process: pid_max itself, read live.
 
     This module hardcoded 4242. After the 2026-07-28 reboot the pid space
     refilled and 4242 became a live ROOT-owned process, so the reap path's
@@ -45,19 +45,17 @@ def _free_pid():
     headless codex pid 4242 NOT reaped ([Errno 1] Operation not permitted)".
 
     The PRODUCTION code was right — refusing to signal a process you do not own
-    is correct. The test's premise (this pid is free) was simply never checked,
-    which made the suite depend on which pids the kernel had handed out. Scan
-    downward from the max and confirm /proc has no such entry."""
-    import os as _os
+    is correct. The test's premise (this pid is free) must hold for the whole
+    run, not just at import: the kernel allocates pids in [1, pid_max - 1], so
+    pid_max itself is never handed out and stays free for the life of the
+    suite. Read it live; the fallback 4194304 stands only when
+    /proc/sys/kernel is unreadable."""
+    # pid_max ITSELF, not pid_max - 1: the kernel allocates pids in [1, pid_max - 1], so pid_max can never be handed to a process.
     try:
         with open("/proc/sys/kernel/pid_max") as f:
-            top = int(f.read().strip())
+            return int(f.read().strip())
     except Exception:
-        top = 4194304
-    for cand in range(top - 1, top - 5000, -1):
-        if not _os.path.exists("/proc/%d" % cand):
-            return cand
-    raise RuntimeError("no free pid found in the top 5000 — cannot fake a dead process")
+        return 4194304  # the common default, when /proc/sys/kernel is unreadable
 
 
 # Computed ONCE so every assertion in this module talks about the same pid.
@@ -131,6 +129,11 @@ class FakeOrcaAdapter(FakeAdapter):
     def resolve_pane(self, pane_key):
         self.pane_keys.append(pane_key)
         return dict(self.resolved)
+
+    def panes(self):
+        """The RPC inventory leg (`OrcaAdapter.panes`): the same rows as
+        `list`, as (rows, error)."""
+        return list(self.rows), None
 
 
 class KeyedOrcaAdapter(FakeOrcaAdapter):
@@ -522,6 +525,9 @@ class AdapterSpawnTest(SpawnBase):
             rec = json.load(f)
         self.assertEqual(rec["role"], "lead")
         self.assertEqual(rec["model"], "gpt-5.3-codex-spark")
+        # an operator's --model is recorded as a CHOICE, so a later catalog
+        # change never overrides it (seat_remint: a default is not a choice)
+        self.assertEqual(rec["model_source"], "explicit")
 
     def test_session_start_binds_new_session_to_spawn_register(self):
         d, _ = self._mint()
@@ -675,6 +681,47 @@ class AdapterSpawnTest(SpawnBase):
         self.assertIsNone(err)
         self.assertEqual(fields["handle"], "p9")
         self.assertEqual(fields["pane_key"], "tab:leaf")
+
+    def test_the_pane_proof_never_spawns_the_cli_inventory(self):
+        """task/3259 -- THE PROOF RUNS INSIDE A 2 s HOOK BUDGET. A killed
+        SessionStart join is replayed by the next PostToolUse delivery
+        (`seats_join.owed_emitter`), and this proof read its inventory through
+        `list()`, an `orca terminal list` subprocess: 17 of 30 hook timeouts in
+        a two-day window were that one stack. The inventory now comes over the resident
+        RPC `resolve_pane` already uses. POSITIVE: a `list()` that fails the
+        arm is never called and the proof still binds. NEGATIVE: a failed RPC
+        refuses the proof, naming the RPC's error, and still never falls back
+        to the subprocess."""
+        row = {"handle": "p9", "status": "connected", "writable": True,
+               "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+
+        class NoCli(FakeOrcaAdapter):
+            def list(self):
+                raise AssertionError("the pane proof spawned `orca terminal "
+                                     "list` inside a hook budget")
+
+        class RpcDown(NoCli):
+            def panes(self):
+                return [], "orca runtime rpc terminal.list: deadline exceeded"
+
+        env = {"ORCA_PANE_KEY": "tab:leaf", "ORCA_WORKTREE_ID": "workspace:/w"}
+
+        def prove(fake):
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(seat.shutil, "which",
+                                      return_value="/bin/orca"), \
+                    mock.patch.object(harness, "OrcaAdapter",
+                                      return_value=fake):
+                return seat._sessionstart_pane_fields(
+                    {"harness": "orca", "handle": "p9"})
+
+        resolved = {"handle": "p9", "pty_id": "pty-1"}
+        fields, err = prove(NoCli(rows=[row], resolved=resolved))
+        self.assertIsNone(err)
+        self.assertEqual(fields["handle"], "p9")
+        fields, err = prove(RpcDown(rows=[row], resolved=resolved))
+        self.assertIsNone(fields)
+        self.assertIn("deadline exceeded", err or "")
 
     def test_session_start_persists_orca_remint_identity(self):
         d, _ = self._mint()
@@ -1741,12 +1788,15 @@ class SparkModelPersistenceTest(SpawnBase):
             self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=76000", refreshed)
             self.assertNotIn("320000", refreshed)
             with open(os.path.join(d, "spawn.json")) as f:
-                self.assertEqual(json.load(f).get("model"), self.SPARK,
-                                 "resume %d dropped the persisted model" % n)
+                rec = json.load(f)
+            self.assertEqual(rec.get("model"), self.SPARK,
+                             "resume %d dropped the persisted model" % n)
+            self.assertEqual(rec.get("model_source"), "explicit",
+                             "resume %d dropped the choice's source" % n)
 
     def test_default_seat_still_tracks_the_family_model_through_resume(self):
         """POSITIVE CONTROL on the same observable: with NO --model the
-        refresh DOES write the family default (sol + 320k) — which is what
+        refresh DOES write the family default (gpt-6.1-sol + 220k) — which is what
         makes the spark arm's assertNotIn(320000) a measurement and not a
         vacuous absence — and the record persists model None. Only an
         explicit choice is sticky: a default-following seat must keep
@@ -1764,7 +1814,7 @@ class SparkModelPersistenceTest(SpawnBase):
         self.assertEqual(rc, 0, err)
         with open(launch) as f:
             refreshed = f.read()
-        self.assertIn("--model gpt-6-astra", refreshed)
+        self.assertIn("--model gpt-6.1-sol", refreshed)
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=220000", refreshed)
         self.assertNotIn("76000", refreshed)
 
@@ -3006,8 +3056,10 @@ class ProjectCanonicalSeatNameTest(ProjectRegistryBase):
         command, title, _ = fake.spawned[0]
         self.assertIn("launch --seat proj-a-claude", command)
         self.assertEqual(title, "proj-a-claude")
-        rec = json.load(open(os.path.join(
-            seat._instance_dir("claude", "proj-a-claude"), "spawn.json")))
+        with open(os.path.join(
+                seat._instance_dir("claude", "proj-a-claude"), "spawn.json"),
+                encoding="utf-8") as fh:
+            rec = json.load(fh)
         self.assertEqual(rec["project"], "proj-a")
         self.assertEqual(rec["family"], "claude")
         self.assertEqual(rec["seat"], "proj-a-claude")
@@ -3276,8 +3328,10 @@ class ProjectSeatLifecycleTest(ProjectRegistryBase):
         self.assertTrue(command.startswith("env HELM_SEAT_ROLE=lead "), command)
         self.assertIn("-- --settings", command)
         self.assertIn('{"ultracode":true}', command)
-        rec = json.load(open(os.path.join(
-            seat._instance_dir("claude", "proj-a-claude"), "spawn.json")))
+        with open(os.path.join(
+                seat._instance_dir("claude", "proj-a-claude"), "spawn.json"),
+                encoding="utf-8") as fh:
+            rec = json.load(fh)
         self.assertEqual(rec["role"], "lead")
 
     def _launched_role(self, command, inherited="lead"):
@@ -3341,9 +3395,10 @@ class ProjectSeatLifecycleTest(ProjectRegistryBase):
                 command = fake.spawned[0][0]
                 self.assertIn("--seat proj-a-claude", command)
                 self.assertEqual(self._launched_role(command), expect)
-                rec = json.load(open(os.path.join(
-                    seat._instance_dir("claude", "proj-a-claude"),
-                    "spawn.json")))
+                with open(os.path.join(
+                        seat._instance_dir("claude", "proj-a-claude"),
+                        "spawn.json"), encoding="utf-8") as fh:
+                    rec = json.load(fh)
                 self.assertEqual(rec["role"], role)
                 # the register and the launched env agree, which is the property
                 # the finding says they did not have
@@ -3379,9 +3434,56 @@ class ProjectSeatLifecycleTest(ProjectRegistryBase):
         self.assertEqual(text, "Run `helm seat boot-brief` and follow it.")
         self.assertEqual(fake.sent[1], ("pane-1", "", True))
         self.assertIn("onboarding submitted", out)
-        rec = json.load(open(os.path.join(
-            seat._instance_dir("claude", "proj-a-claude"), "spawn.json")))
+        with open(os.path.join(
+                seat._instance_dir("claude", "proj-a-claude"), "spawn.json"),
+                encoding="utf-8") as fh:
+            rec = json.load(fh)
         self.assertEqual(rec["onboarding"], harness.DELIVERED)
+
+    def test_native_spawn_submits_past_the_empty_composer_hint(self):
+        """task/1896 — a fresh Claude pane draws `Try "…"` in its EMPTY
+        composer, and the onboarding pre-read read it as a human draft and
+        never typed the brief. The kimi refusal quoted exactly this body.
+
+        CONTROL: `test_native_spawn_refuses_a_draft_that_starts_with_try`
+        below drives the same door with a real draft and gets rc 1 with
+        nothing typed, so a green here is the classifier, not a bypass."""
+        self._register("proj-a")
+
+        class HintComposer(FakeAdapter):
+            def read(self, handle, limit=3000, timeout=60):
+                if self.typed.get(handle) is None:
+                    return ADVANCED_PANE.replace(
+                        "\n❯\n",
+                        '\n❯\xa0\x1b[2mTry "how do I log an error?"\x1b[22m\n')
+                return FakeAdapter.read(self, handle, limit, timeout)
+
+        fake = HintComposer()
+        rc, out, err, _wla, _popen = self._spawn(["proj-a-claude"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(fake.sent), 2)
+        self.assertEqual(fake.sent[0][1],
+                         "Run `helm seat boot-brief` and follow it.")
+        self.assertEqual(fake.sent[1], ("pane-1", "", True))
+        self.assertIn("onboarding submitted", out)
+
+    def test_native_spawn_refuses_a_draft_that_starts_with_try(self):
+        """The control for the arm above: text that only BEGINS like the
+        hint is a possible human draft, and nothing is typed into it."""
+        self._register("proj-a")
+
+        class DraftComposer(FakeAdapter):
+            def read(self, handle, limit=3000, timeout=60):
+                if self.typed.get(handle) is None:
+                    return ADVANCED_PANE.replace(
+                        "\n❯\n", '\n❯\xa0Try "x" then the other flag\n')
+                return FakeAdapter.read(self, handle, limit, timeout)
+
+        fake = DraftComposer()
+        rc, _out, err, _wla, _popen = self._spawn(["proj-a-claude"], fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.sent, [])
+        self.assertIn("may be a human draft", err)
 
     def test_native_spawn_reports_an_unsubmitted_brief_honestly(self):  # noqa: VACUOUS_ASSERTION — the no-register assert is the finding's other half and stands beside unconditional positives on rc 1, the shipped failure text and the closed pane handle
         """FINDING 6's negative: an unreadable/held composer is NOT success."""
@@ -3898,7 +4000,8 @@ class ProjectSeatFailureStateTest(ProjectRegistryBase):
         path = seat._instance_ports_path()
         held, err = seat.allocate_instance_port("proj-a-codex")
         self.assertEqual((held, err), (seat.PROJECT_PORT_BASE, None))
-        intact = open(path).read()
+        with open(path) as fh:
+            intact = fh.read()
         with open(path, "w") as fh:
             fh.write("{not json")
         ledger, why = seat.instance_port_ledger()
@@ -3912,7 +4015,8 @@ class ProjectSeatFailureStateTest(ProjectRegistryBase):
         self.assertIn(path, gate or "")
         self.assertIn("no provable per-instance proxy endpoint", gate)
         # and A's allocation was not rewritten: the bytes are exactly as left
-        self.assertEqual(open(path).read(), "{not json")
+        with open(path) as fh:
+            self.assertEqual(fh.read(), "{not json")
         # a ledger whose ENTRIES are malformed is the same refusal one level down
         with open(path, "w") as fh:
             json.dump({"proj-a-codex": str(seat.PROJECT_PORT_BASE)}, fh)
@@ -4082,8 +4186,10 @@ class ProjectSeatFailureStateTest(ProjectRegistryBase):
                          "the pane command was created before its seat had a "
                          "register a SessionStart could resolve")
         self.assertEqual(fake.ghost_at_spawn, (None, None))
-        rec = json.load(open(os.path.join(
-            seat._instance_dir("claude", "proj-a-claude"), "spawn.json")))
+        with open(os.path.join(
+                seat._instance_dir("claude", "proj-a-claude"), "spawn.json"),
+                encoding="utf-8") as fh:
+            rec = json.load(fh)
         self.assertEqual(rec["handle"], "pane-1")   # the handle still lands
         register_probe.assertEqual(rec["project"], "proj-a")
 
@@ -4130,7 +4236,8 @@ class ProjectSeatFailureStateTest(ProjectRegistryBase):
             ["proj-a-claude"], unproven)
         self.assertEqual(rc2, 1)
         self.assertIn("KEPT as an incomplete attempt", err2)
-        kept = json.load(open(path))
+        with open(path, encoding="utf-8") as fh:
+            kept = json.load(fh)
         self.assertEqual(kept["attempt"]["state"], seat.SPAWN_ATTEMPT_INCOMPLETE)
         self.assertIn("no handle exists to prove the pane absent",
                       kept["attempt"]["reason"])
@@ -4161,7 +4268,8 @@ class ProjectSeatFailureStateTest(ProjectRegistryBase):
             rc, _out, err, _wla, _popen = self._spawn(["proj-a-claude"], fake)
         self.assertEqual(rc, 0, err)
         d = seat._instance_dir("claude", "proj-a-claude")
-        rec = json.load(open(os.path.join(d, "spawn.json")))
+        with open(os.path.join(d, "spawn.json"), encoding="utf-8") as fh:
+            rec = json.load(fh)
         self.assertEqual(rec["config_home"], native_home)
         self.assertEqual(rec["session"], "session-live")
         self.assertEqual(rec["pane_key"], "tab:leaf")
@@ -4177,8 +4285,8 @@ class ProjectSeatFailureStateTest(ProjectRegistryBase):
                                return_value=({}, fields, None)):
             self.assertFalse(seat._backfill_spawn_session(
                 "proj-a-claude", d, fake))
-        self.assertIsNone(json.load(open(os.path.join(d, "spawn.json")))
-                          ["session"])
+        with open(os.path.join(d, "spawn.json"), encoding="utf-8") as fh:
+            self.assertIsNone(json.load(fh)["session"])
 
     def test_native_up_and_down_answer_instead_of_denying_the_family(self):  # noqa: VACUOUS_ASSERTION — the never-says-unknown-family assert sits beside three unconditional positives per verb (rc 2 and two clauses of the shipped sentence) and a final positive control: the bare family name still gets the unknown-family refusal
         """FINDING 9 — the synopsis promises a project seat round-trips into
@@ -4262,7 +4370,8 @@ class ProjectSeatFailureStateTest(ProjectRegistryBase):
                                                 "finalize are two writes")
                 self.assertEqual(os.path.exists(path), survives)
                 if survives:
-                    kept = json.load(open(path))
+                    with open(path, encoding="utf-8") as fh:
+                        kept = json.load(fh)
                     self.assertEqual(kept["attempt"]["state"],
                                      seat.SPAWN_ATTEMPT_INCOMPLETE)
                     self.assertIn("UNKNOWN", kept["attempt"]["reason"])
@@ -4545,7 +4654,8 @@ class EndpointLedgerAuthorityTest(ProjectRegistryBase):
         for label, obj, raw, clause in cases:
             with self.subTest(case=label):
                 path = self._ledger(obj, raw=raw)
-                intact = open(path).read()
+                with open(path) as fh:
+                    intact = fh.read()
                 table, why = seat.instance_port_ledger()
                 self.assertIsNone(table, "an invalid table is never usable")
                 self.assertIn(path, why)
@@ -4557,9 +4667,10 @@ class EndpointLedgerAuthorityTest(ProjectRegistryBase):
                 # and the admission gate refuses before any mint
                 self.assertIn("no provable per-instance proxy endpoint",
                               seat._instance_gate("codex", "proj-b-codex") or "")
-                self.assertEqual(open(path).read(), intact,
-                                 "a refusal must preserve the bytes a human has "
-                                 "to read")
+                with open(path) as fh:
+                    self.assertEqual(fh.read(), intact,
+                                     "a refusal must preserve the bytes a human has "
+                                     "to read")
         # CONTROL 1: a VALID populated mapping is stable and keeps serving
         path = self._ledger({"proj-a-codex": base, "proj-b-codex": top})
         self.assertEqual(seat.instance_port_ledger(),
@@ -4666,8 +4777,9 @@ class EndpointLedgerAuthorityTest(ProjectRegistryBase):
                          (base, None))
         home = seat._mint_instance_proxy("codex", "proj-a-codex")
         cfg = os.path.join(home, "config.yaml")
-        self.assertIn("port: %d" % base, open(cfg).read(),
-                      "the fixture must be the MINTER's own bytes")
+        with open(cfg) as fh:
+            self.assertIn("port: %d" % base, fh.read(),
+                          "the fixture must be the MINTER's own bytes")
         os.unlink(seat._instance_ports_path())     # the allocation is gone
         # pi resolves a PROJECT seat's family from its own register, so the seat
         # has to be registered for that consumer to be asked about it at all
@@ -4912,7 +5024,8 @@ class LaunchIdentityAndLifecycleOrderTest(ProjectRegistryBase):
                     rc, _out, err, _wla, _popen = self._spawn(
                         ["proj-a-claude"], fake)
                 self.assertEqual(rc, 0, err)
-                recorded = json.load(open(register))["config_home"]
+                with open(register, encoding="utf-8") as fh:
+                    recorded = json.load(fh)["config_home"]
                 self.assertEqual(recorded, expect)
                 launched = subprocess.run(
                     fake.spawned[0][0], shell=True, text=True,
@@ -4984,7 +5097,8 @@ class LaunchIdentityAndLifecycleOrderTest(ProjectRegistryBase):
                                  seat.SPAWN_ATTEMPT_PENDING)
                 self.assertIsNone(published["session"])
                 self.assertIsNone(published.get("handle"))
-        final = json.load(open(os.path.join(d, "spawn.json")))
+        with open(os.path.join(d, "spawn.json"), encoding="utf-8") as fh:
+            final = json.load(fh)
         self.assertEqual(final["attempt"]["state"], seat.SPAWN_ATTEMPT_COMPLETE)
         self.assertEqual(final["pid"], _FAKE_PID)
 
@@ -5157,8 +5271,10 @@ class LaunchIdentityAndLifecycleOrderTest(ProjectRegistryBase):
         self.assertIn(", ".join(seat.SESSION_BINDING_HARNESSES), err)
         self.assertNotIn("so the session binds at the pane's first SessionStart",
                          err)
-        rec = json.load(open(os.path.join(
-            seat._instance_dir("claude", "proj-a-claude"), "spawn.json")))
+        with open(os.path.join(
+                seat._instance_dir("claude", "proj-a-claude"), "spawn.json"),
+                encoding="utf-8") as fh:
+            rec = json.load(fh)
         self.assertIsNone(rec["session"], "the warning's whole subject")
         # the capability the warning quotes is the binder's own
         fields, why = seat._sessionstart_pane_fields(dict(rec, harness="herdr"))
@@ -5266,14 +5382,16 @@ class SpawnAttemptTokenTest(ProjectRegistryBase):
         with mock.patch.object(seat, "_up", return_value=0):
             rc2, _out2, err2, _wla2, _p2 = self._spawn(["proj-a-codex"], pane)
             self.assertEqual(rc2, 0, err2)
-            finals = {"pane": json.load(open(os.path.join(d_codex,
-                                                          "spawn.json")))}
+            with open(os.path.join(d_codex, "spawn.json"), encoding="utf-8") as fh:
+                finals = {"pane": json.load(fh)}
             os.unlink(os.path.join(d_codex, "spawn.json"))
             rc3, _out3, err3, _wla3, _p3 = self._spawn(
                 ["proj-a-codex"], None, popen=popen_probe)
             self.assertEqual(rc3, 0, err3)
-        finals["headless"] = json.load(open(os.path.join(d_codex, "spawn.json")))
-        finals["native"] = json.load(open(os.path.join(d_claude, "spawn.json")))
+        with open(os.path.join(d_codex, "spawn.json"), encoding="utf-8") as fh:
+            finals["headless"] = json.load(fh)
+        with open(os.path.join(d_claude, "spawn.json"), encoding="utf-8") as fh:
+            finals["native"] = json.load(fh)
         for leg in ("native", "pane", "headless"):
             with self.subTest(leg=leg):
                 carried, published = seen[leg]
@@ -5370,7 +5488,8 @@ class SpawnAttemptTokenTest(ProjectRegistryBase):
         self.assertIsNone(own.pending_at_hook["handle"])
         self.assertTrue(own.bound, "the spawn's own child, carrying the token "
                                    "from its launch line, must bind")
-        final = json.load(open(register))
+        with open(register, encoding="utf-8") as fh:
+            final = json.load(fh)
         self.assertEqual(final["session"], "session-child")
         self.assertEqual(final["handle"], "pane-1")
         self.assertEqual(final["pane_key"], "tab:pane-1")
@@ -5391,7 +5510,8 @@ class SpawnAttemptTokenTest(ProjectRegistryBase):
                 self.assertIn("PENDING spawn attempt %s" % attempt_id, err2)
                 self.assertIn(said, err2)
                 self.assertIn("manual `helm launch --seat proj-a-claude`", err2)
-                kept = json.load(open(register))
+                with open(register, encoding="utf-8") as fh:
+                    kept = json.load(fh)
                 self.assertIsNone(kept["session"],
                                   "a foreign pane's session bound into this "
                                   "spawn's record")
@@ -5518,7 +5638,8 @@ class SpawnAttemptTokenTest(ProjectRegistryBase):
             rc, _out, err, _wla, _popen = self._spawn(["proj-a-claude"], orca)
         self.assertEqual(rc, 1)
         self.assertEqual(len(calls), 2)
-        kept = json.load(open(os.path.join(d_claude, "spawn.json")))
+        with open(os.path.join(d_claude, "spawn.json"), encoding="utf-8") as fh:
+            kept = json.load(fh)
         self.assertEqual(kept["attempt"]["state"], seat.SPAWN_ATTEMPT_INCOMPLETE)
         self.assertEqual(kept["handle"], "pane-1",
                          "the handle the adapter returned was discarded")
@@ -5535,7 +5656,8 @@ class SpawnAttemptTokenTest(ProjectRegistryBase):
             rc2, _out2, err2, _wla2, _p2 = self._spawn(["proj-a-codex"], orca2)
         self.assertEqual(rc2, 1)
         self.assertEqual(len(calls), 2)
-        kept2 = json.load(open(os.path.join(d_codex, "spawn.json")))
+        with open(os.path.join(d_codex, "spawn.json"), encoding="utf-8") as fh:
+            kept2 = json.load(fh)
         self.assertEqual(kept2["attempt"]["state"], seat.SPAWN_ATTEMPT_INCOMPLETE)
         self.assertEqual(kept2["handle"], "pane-1")
         self.assertIsNone(kept2["session"])
@@ -5551,7 +5673,8 @@ class SpawnAttemptTokenTest(ProjectRegistryBase):
             rc3, _out3, err3, _wla3, _p3 = self._spawn(["proj-a-codex"], None)
         self.assertEqual(rc3, 1)
         self.assertEqual(len(calls), 2)
-        kept3 = json.load(open(os.path.join(d_codex, "spawn.json")))
+        with open(os.path.join(d_codex, "spawn.json"), encoding="utf-8") as fh:
+            kept3 = json.load(fh)
         self.assertEqual(kept3["attempt"]["state"], seat.SPAWN_ATTEMPT_INCOMPLETE)
         self.assertEqual(kept3["pid"], _FAKE_PID,
                          "the pid the launch produced was discarded")
@@ -5827,7 +5950,8 @@ class SpawnAttemptTokenTest(ProjectRegistryBase):
         self.assertEqual(rc, 1, err)
         self.assertEqual(len(published), 1, "the publication itself failed, so "
                                             "this arm is not about settlement")
-        on_disk = json.load(open(register))
+        with open(register, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
         attempt_id = on_disk["attempt"]["id"]
         self.assertIsNone(on_disk["handle"])
         self.assertEqual(on_disk["attempt"]["state"], seat.SPAWN_ATTEMPT_PENDING)
@@ -5895,7 +6019,8 @@ class SpawnAttemptTokenTest(ProjectRegistryBase):
             rc3, _out3, err3, _wla3, _p3 = self._spawn(["proj-a-claude"],
                                                        FakeOrcaAdapter())
         self.assertEqual(rc3, 1, err3)
-        kept = json.load(open(register))
+        with open(register, encoding="utf-8") as fh:
+            kept = json.load(fh)
         self.assertEqual(kept["handle"], "pane-1")
         self.assertEqual(kept["attempt"]["state"],
                          seat.SPAWN_ATTEMPT_INCOMPLETE)

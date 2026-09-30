@@ -29,7 +29,7 @@ import json
 import os
 import time
 
-from . import chat, home, pk, projscope, record
+from . import chat, home, pk, projscope, record, seat_rest
 from .seats_common import (UNVERIFIED, _canonical_recipient, _clip, _scrub,
                            _sweep, claims_path)
 from .seats_identity import _delivery_pause, _git_project, safe_cwd
@@ -160,8 +160,10 @@ def _row_project(repo_id):
     row looks foreign, the rung goes silent, and a silent rung is
     indistinguishable from an empty backlog.
 
-    No new git shell-out: _git_project is already on the stop-hook path via
-    homing, so this costs nothing a stop was not already paying."""
+    EACH CALL IS TWO GIT PROCESSES (`_git_root_typed`), so `_offer_rows` asks
+    it once per repository and never once per row: a backlog is many rows in
+    few repositories, and asking per row spawned 120 git processes on one
+    idle stop over sixty rows (task/3556)."""
     p = str(repo_id or "").strip().rstrip(os.sep)
     if not p:
         return None
@@ -220,6 +222,9 @@ def _offer_rows(seat, dispatch_snapshot=None):
     me, _ = _canonical_recipient(seat)
     me = str(me or "")
     mine_proj = _git_project(safe_cwd())
+    # ONE DERIVATION PER REPOSITORY, keyed on the string `_row_project` itself
+    # reads, so two rows that name one repository get one answer.
+    projects = {}
     out = []
     for r in rows:
         rid = str(r.get("id") or "")
@@ -235,7 +240,10 @@ def _offer_rows(seat, dispatch_snapshot=None):
         # stophooks"). Unknown on EITHER side stays offerable — a row with no
         # repo_id is legacy, and a seat whose cwd names no repo has nothing
         # to be foreign to; only a PROVEN mismatch excludes.
-        row_proj = _row_project(r.get("repo_id"))
+        repo = str(r.get("repo_id") or "")
+        if repo not in projects:
+            projects[repo] = _row_project(repo)
+        row_proj = projects[repo]
         if mine_proj and row_proj and row_proj != mine_proj:
             continue                     # another repository's backlog
         recip, _ = _canonical_recipient(r.get("recipient"))
@@ -244,14 +252,13 @@ def _offer_rows(seat, dispatch_snapshot=None):
             continue                     # in-flight to another live seat — theirs
         line = _clip(_scrub(str(r.get("lane") or "review")).strip(), 48) \
             or "review"
-        # ASSIGNED ROWS STAY OFFERABLE BUT MUST SAY SO. A named recipient who
-        # is not live is the STRANDED-WORK case this rung exists to rescue, so
-        # excluding it would starve the rung (and break the tests that pin the
-        # rescue). What was wrong is the FRAMING: presented as "top of
-        # backlog", three seats in one afternoon each spent a turn discovering
-        # it belonged to someone else. Naming the recipient turns that turn
-        # into a glance — and surfaces the real anomaly, a recipient whose
-        # presence beat went stale while its process kept running.
+        # AN ASSIGNED ROW IS REPORTED AND SAYS SO. A named recipient who is
+        # not live is STRANDED work, and the label names whose it is: three
+        # seats in one afternoon each spent a turn discovering such a row
+        # belonged to someone else, and the label also surfaces a recipient
+        # whose presence beat went stale while its process kept running. The
+        # free-seat OFFER drops it anyway (task/3696, `_assigned_elsewhere`),
+        # so what reaches an idle seat is its own work or the unowned pool.
         if recip and recip != me:
             shown = r.get("recipient_display") or recip
             line += " [assigned: " + _clip(_scrub(shown), 16) + "]"
@@ -402,6 +409,10 @@ def _finalize_work_offer(session, seat, offer, line, actor=None):
                                          _AUTOCLAIM_KINDS)
     except actors.ActorRefused:
         return None      # no admissible identity: surface, never actuate
+    # THE REST IS RE-READ AT THE CLAIM (task/3280): the candidate read it
+    # before the landing probe above, and a rest recorded since claims nothing.
+    if seat_rest.holds(seat):
+        return None
     try:
         projscope.spend_or_raise("work offer lease claim")
         ok, _m, _l = claim("dispatch:" + cap.ref, seat, session=session)
@@ -432,19 +443,20 @@ def _work_offer_candidate(session, seat, ask, dsp, pending, inbox_blocked,
     `dispatch:<id8>` lease itself — the SAME resource, through the SAME
     flocked claim() the offer's printed command would reach — and the
     whisper flips from take-it-or-pass to here-is-your-task. Everything
-    AMBIGUOUS stays an OFFER, unchanged: a row assigned to someone else
-    (stranded work — routing it is a judgment call that stays surfaced), a
-    no-recipient pool row, an unrecorded/unrecognised kind, or ANY claim
-    trouble. A lost claim race is NORMAL: claim() is the mutex (check+sweep+
-    write under one flock), so two idle seats racing the same head resolve
-    to exactly one holder and the loser merely offers.
+    AMBIGUOUS stays an OFFER, unchanged: a no-recipient pool row, an
+    unrecorded/unrecognised kind, or ANY claim trouble. A row assigned to
+    another seat, live or absent, is not offered at all (task/3696): routing
+    stranded work is its sender's check-in, not an idle seat's pick. A lost
+    claim race is NORMAL: claim() is the mutex (check+sweep+write under one
+    flock), so two idle seats racing the same head resolve to exactly one
+    holder and the loser merely offers.
 
     fp discipline: autoclaim:<id8> is DISTINCT from offer:<id8> so neither
     latch shadows the other — a head offered yesterday and dispatched to me
-    today still actuates. And the acquired lease is self-reinforcing: on the
-    next stop _session_holds_claim() silences this rung and the guard's
-    session-lease BLOCK names the held dispatch, so a seat that idles past
-    the whisper is told, louder, that it is idling ON ITS OWN TASK. The lease
+    today still actuates. On the next stop _session_holds_claim() silences
+    this rung, and the lease rung names the held dispatch IN PROGRESS once
+    (task/3696): the lease is the in-progress mark, so it refuses no stop
+    until it nears expiry or its row is discharged. The lease
     is minted only when this rung WINS selection (mint-on-win — see
     _stop_whisper), so a higher own-work rung outranking the offer can never
     leave a stray claim behind.
@@ -473,6 +485,11 @@ def _work_offer_candidate(session, seat, ask, dsp, pending, inbox_blocked,
     owed dispatch, or a held lease is still refused. FAIL-CLOSED to None."""
     if not seat or ask:
         return None
+    # A RESTING SEAT IS NOT IDLE (task/3280): the owner paused it, so it is
+    # offered nothing and claims nothing. A rest record that cannot be read
+    # holds too (`seat_rest.holds`), because a claim here starts its turn.
+    if seat_rest.holds(seat):
+        return None
     # `dsp` IS NOT AN IDLE SIGNAL AND MUST NOT GATE THIS RUNG. It is
     # _dispatch_candidate(), which takes NO seat argument: it scans the WHOLE
     # ledger and returns the oldest OVERDUE row anywhere in the fleet — work
@@ -488,7 +505,14 @@ def _work_offer_candidate(session, seat, ask, dsp, pending, inbox_blocked,
     if _session_holds_claim(session):
         return None
     try:
-        rows = _offer_rows(seat, dispatch_snapshot=dispatch_snapshot)
+        # ANOTHER SEAT'S ROW IS NEVER OFFERED (task/3696), live or absent: the
+        # producer still reports it labelled, but on the integrator seat the
+        # free-seat line offered a row assigned to another seat, a turn spent
+        # declining work that was never this seat's to take. Rescuing it is
+        # its sender's check-in; the unowned pool and this seat's own rows stay.
+        rows = [r for r in _offer_rows(seat,
+                                       dispatch_snapshot=dispatch_snapshot)
+                if not _assigned_elsewhere(r)]
     except projscope.Expired:
         raise
     except Exception:
@@ -518,13 +542,32 @@ def _work_offer_candidate(session, seat, ask, dsp, pending, inbox_blocked,
         # permission boundary: a higher red/stuck/dirty rung can still win and
         # discard this candidate. _stop_whisper carries this selected row to the
         # offer finalizer only after autoclaim:<id8> WINS; proof and mint live there.
+        # THE START COMMAND RIDES THE CLAIM. The lease this mints makes the row
+        # read WORKING, which quiets the owed-row rung for the lease's life,
+        # so this line is the one place that stop can name how to begin.
+        # Worded to stay inside the 240-byte whisper budget at the 48-byte
+        # lane clip, with the latch sentence the clip would otherwise eat.
+        start = _scrub(str((own[5] or {}).get("id") or rid))[:12]
         return ("autoclaim:%s" % rid,
-                "auto-claimed dispatch %s (%s) — it was dispatched TO YOU and "
-                "you are idle. The lease is yours: START it now." % (rid, line),
+                "auto-claimed dispatch %s (%s): it is yours and you are idle. "
+                "START it now: helm dispatch triage %s" % (rid, line, start),
                 own)
     return ("offer:%s" % rid,
             "you're free — top of backlog is %s: %s. Take it (%s) or pass."
             % (rid, line, take))
+def _assigned_elsewhere(offer):
+    """Is this offer another seat's assigned work? Read off the RAW row, never
+    the display line: not this seat's (`mine`), and naming a holder — a
+    dispatch row's recipient or a task row's owner."""
+    if offer[3]:
+        return False
+    raw = offer[5] if isinstance(offer[5], dict) else {}
+    if offer[4] == "task":
+        from . import tasks
+        return bool(tasks.owner_of(raw))
+    return bool(_canonical_recipient(raw.get("recipient"))[0])
+
+
 def _session_delegated(session):
     """Has THIS session handed work to a subagent AT ALL? One listdir of
     chat.chat_dir(), no locks, no git, no snapshot fold (reflex law).
@@ -684,10 +727,10 @@ def _solo_load_candidate(session, seat):
 def _whisper_candidates(session, seat, pending, inbox_blocked, cwd=None,
                         dispatch_snapshot=None):
     """LIVE whisper candidate tuples, salience-ordered: owner-ask >
-    stuck > red-gate > stale-pending > unverified > unbanked-green > dirty >
-    solo-load > work-offer. The first two fields are always (fp, line);
-    autoclaim alone carries its selected raw offer as a third field for
-    winner finalization.
+    verb-timeout > stuck > red-gate > stale-pending > unverified >
+    unbanked-green > dirty > solo-load > work-offer. The first two fields
+    are always (fp, line); autoclaim alone carries its selected raw offer as
+    a third field for winner finalization.
     Signals are cheap local reads only (reflex law): the session's record.py
     counters + verify-grounding logs (command-log/edit-targets) + the
     pending rows the guard already computed + one claims read and one chat-dir
@@ -704,6 +747,17 @@ def _whisper_candidates(session, seat, pending, inbox_blocked, cwd=None,
     ask = _ask_candidate()   # owner-ask rung: unsurfaced owner debt outranks all
     if ask:
         out.append(ask)
+    try:  # a helm verb killed by a timeout owes a diagnosis (task/1822)
+        from . import verbtimeout
+        vto = verbtimeout.stop_candidate(session)
+    except projscope.Expired:
+        raise
+    except Exception as _swallowed:
+        record.swallow("seats_work_offer._whisper_candidates.verbtimeout",
+                       _swallowed)
+        vto = None
+    if vto:
+        out.append(vto)
     # THE STOP FACTS' OWN UNAVAILABILITY IS NOT A LEDGER FINDING. The Stop
     # guard hands this ladder the resident's owed frontier; when those facts
     # are absent or behind, the ledger itself is fine and the claims footer
@@ -711,13 +765,15 @@ def _whisper_candidates(session, seat, pending, inbox_blocked, cwd=None,
     # (the whisper law) instead of telling the seat its ledger is unreadable.
     facts_out = dispatch_snapshot is not None and str(
         dispatch_snapshot[1] or "").startswith("stop-facts")
-    dsp = None if facts_out else _dispatch_candidate(dispatch_snapshot)
+    dsp = None if facts_out else _dispatch_candidate(dispatch_snapshot, seat)
     if dsp:
         out.append(dsp)
     c = {}
     if session:
         try:
-            from . import record
+            # NO LOCAL IMPORT: `record` is this module's own, and a local one
+            # made it local to the whole ladder, so the verb-timeout rung's
+            # handler above raised UnboundLocalError (CURE 1822 F2).
             got = record.counters(session)
             c = got if isinstance(got, dict) else {}
         except projscope.Expired:

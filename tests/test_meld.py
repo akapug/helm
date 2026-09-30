@@ -33,9 +33,18 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
 
 
 class MeldBase(unittest.TestCase):
+    """The fixture's environment is put back by a CLEANUP registered before
+    the test body runs, never by tearDown. Cleanups run after tearDown, last
+    registered first, so a restore in tearDown is undone by any
+    `mock.patch.dict(os.environ)` a test starts and stops through
+    addCleanup: that patcher's stop puts back the snapshot it took while the
+    fixture's values stood. Registered here, the restore runs after every
+    cleanup the test adds, and the module leaves the environment it found."""
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-meld-")
         self.env_prior = {k: os.environ.get(k) for k in ENV_KEYS}
+        self.addCleanup(self._restore)
         for k in ENV_KEYS:
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
@@ -43,13 +52,22 @@ class MeldBase(unittest.TestCase):
         os.environ["HELM_CHAT_NODE_URL"] = ""
         os.environ["HELM_CHAT_OWNER_NAMES"] = "daria"
 
-    def tearDown(self):
+    def _restore(self):
         for k, v in self.env_prior.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def plant_roster(self, rows):
+        """The roster FILE the membership guard reads (task/3247): a dict is
+        written as JSON, a str as-is (an unreadable roster). A mock of one
+        reader would not reach whichever door the guard reads through."""
+        path = seats.roster_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(rows if isinstance(rows, str) else json.dumps(rows))
 
     def open_meld(self):
         """invite(a→b) + join(b) → (room, epoch). The standard fixture."""
@@ -91,14 +109,20 @@ class TestInvite(MeldBase):
         self.assertIn(room, chat.list_rooms())
 
     def test_invite_refuses_topic_addressing_nonmember(self):
+        # The _outside_member_mentions guard now validates @tokens through
+        # the roster (task/3247); set up a roster so @seat-c counts as a
+        # real address rather than prose.
+        self.plant_roster({"seat-a": {}, "seat-b": {}, "seat-c": {}})
         with self.assertRaises(SystemExit) as cm:
-            meld.invite("seat-b", "@seat-c verifies the shape", seat="seat-a")
+            meld.invite("seat-b", "@seat-c verifies the shape",
+                        seat="seat-a")
         self.assertIn("MEMBERSHIP-MISMATCH", str(cm.exception))
         self.assertIn("seat-c", str(cm.exception))
         self.assertFalse(chat.list_rooms())
         # Positive control on the same observable: a plain-name REFERENCE does
         # not address seat-c and therefore creates the room normally.
-        room, _ = meld.invite("seat-b", "seat-c verifies the shape", seat="seat-a")
+        room, _ = meld.invite("seat-b", "seat-c verifies the shape",
+                              seat="seat-a")
         self.assertIn(room, chat.list_rooms())
 
     def test_invite_delivers_to_tracked_peer(self):
@@ -207,6 +231,7 @@ class TestRecv(MeldBase):
         meld.recv(room, timeout=0, seat="seat-b", poll=0.01)  # seed [HOLD]
         chat.post("[MELD e:%d] @seat-c verify the shape [YIELD]" % epoch,
                   room=room, who="seat-a", sign=False)
+        self.plant_roster({"seat-a": {}, "seat-b": {}, "seat-c": {}})
         code, lines = meld.recv(room, timeout=0, seat="seat-b", poll=0.01)
         self.assertEqual(code, meld.EXIT_ABORT)
         self.assertIn("MEMBERSHIP-MISMATCH", "\n".join(lines))
@@ -264,7 +289,7 @@ class TestRecv(MeldBase):
         self.assertIn("recv %s" % room, out)      # the true next action
 
         # THE CONTROL: the same seat, the same room, once the meld has actually
-        # run — now the window really did close and the old line is correct.
+        # run — now the quiet-peer line fires instead of the no-join one.
         meld.join(room, seat="seat-b")
         meld.recv(room, timeout=0, seat="seat-a", poll=0.01)       # READY
         meld.say(room, "YIELD", "my half", seat="seat-b")
@@ -272,8 +297,41 @@ class TestRecv(MeldBase):
         code, lines = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
         out = "\n".join(lines)
         self.assertEqual(code, meld.EXIT_BOUND)
-        self.assertIn("the synchronous window is over", out)
+        self.assertIn("no reply yet: recv again", out)
         self.assertNotIn("MELD-NOJOIN", out)
+
+    def test_a_timeout_after_the_meld_ran_says_recv_again_not_fall_to_async(self):  # noqa: VACUOUS_ASSERTION — each absence sits beside an unconditional assertIn on the same emitted text, and the cap half asserts the absent line appears there
+        """The recv bound is 90 s. Measured over 104 meld turns in 44 rooms,
+        18% of peer replies took longer, and the Claude side's 90th
+        percentile was 533 s. The old text, "the synchronous window is over —
+        fall to async NOW", told the waiting side to close a meld its peer
+        was still answering. The bound is a poll limit, not the peer leaving.
+
+        BOTH BOUNDS ON ONE ROOM: the timeout says recv again, while the
+        exchange CAP, which really ends the synchronous window, keeps the
+        fall-to-async line. Without the cap half this arm would pass for a
+        build that deleted the fall-to-async text everywhere."""
+        room, _ = self.open_meld()
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)       # READY
+        meld.say(room, "YIELD", "my half", seat="seat-b")
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)       # the chunk
+        code, lines = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
+        out = "\n".join(lines)
+        self.assertEqual(code, meld.EXIT_BOUND)
+        self.assertIn("no reply yet: recv again", out)
+        self.assertIn("helm chat meld recv %s" % room, out)
+        self.assertIn("reason=timeout", out)
+        self.assertNotIn("the synchronous window is over", out)
+        self.assertNotIn("fall to async NOW", out)
+        st = meld.state(room, "seat-a")
+        st["exchanges"] = st["cap"]
+        meld._write_state(room, "seat-a", st)
+        code, lines = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
+        out = "\n".join(lines)
+        self.assertEqual(code, meld.EXIT_BOUND)
+        self.assertIn("reason=cap", out)
+        self.assertIn("fall to async NOW", out)
+        self.assertNotIn("no reply yet", out)
 
     def test_nojoin_names_only_the_peers_still_out_in_a_standup(self):  # noqa: VACUOUS_ASSERTION — `assertIn("seat-c", out)` is the unconditional control on the same emitted string, so an empty or missing line fails before the absence arm is reached.
         """A 2+ standup: one peer in, one still out. Every READY is recorded
@@ -332,8 +390,10 @@ class TestSay(MeldBase):
     def test_say_refuses_floor_chunk_addressing_nonmember(self):  # noqa: VACUOUS_ASSERTION — valid-YIELD count controls the absence
         room, _ = self.open_meld()
         before = chat.read(room)[1]
+        self.plant_roster({"seat-a": {}, "seat-b": {}, "seat-c": {}})
         with self.assertRaises(SystemExit) as cm:
-            meld.say(room, "YIELD", "@seat-c verify the shape", seat="seat-a")
+            meld.say(room, "YIELD", "@seat-c verify the shape",
+                     seat="seat-a")
         self.assertIn("MEMBERSHIP-MISMATCH", str(cm.exception))
         self.assertIn("seat-c", str(cm.exception))
         self.assertEqual(chat.read(room)[1], before)       # refusal posts nothing
@@ -343,6 +403,138 @@ class TestSay(MeldBase):
         meld.say(room, "YIELD", "seat-c is a non-participant reference",
                  seat="seat-a")
         self.assertEqual(chat.read(room)[1], before + 1)
+
+    def test_say_refuses_every_token_that_can_wake_an_outsider(self):  # noqa: VACUOUS_ASSERTION — the prose chunk's +1 append count controls every refusal's zero
+        """task/3247: the roster gate admits prose that names no seat, and
+        nothing delivery can wake — hyphen/digit names beside punctuation,
+        any case, and a LIVE RENAME ALIAS, on which `seat_names` still wakes
+        the renamed seat."""
+        room, _ = self.open_meld()
+        # the rename EVENT as `seats_rename` writes it: stamps, not epochs
+        self.plant_roster({"seat-a": {}, "seat-b": {}, "codex-8": {},
+                           "demo-claude-2": {},
+                           "seat-d": {"renamed": {
+                               "old": "seat-c", "at": pk.now_ts(),
+                               "until": pk.epoch_ts(time.time() + 3600)}}})
+        self.assertEqual(seats.live_alias("seat-c")[0], "seat-d")
+        before = chat.read(room)[1]
+        for text, who in (("@demo-claude-2, verify the shape",
+                           "demo-claude-2"),
+                          ("verify it (@codex-8)", "codex-8"),
+                          ("@codex-8: verify", "codex-8"),
+                          ("@CODEX-8 verify", "CODEX-8"),
+                          ("@seat-c verify the shape", "seat-c")):
+            with self.assertRaises(SystemExit, msg=text) as cm:
+                meld.say(room, "YIELD", text, seat="seat-a")
+            self.assertIn("MEMBERSHIP-MISMATCH", str(cm.exception), text)
+            self.assertIn("@" + who, str(cm.exception), text)
+        self.assertEqual(chat.read(room)[1], before)
+        # THE REPORTED FALSE REFUSAL: prose tokens that name no seat post
+        meld.say(room, "YIELD", "an @all-only rule, @no-one-sure yet",
+                 seat="seat-a")
+        self.assertEqual(chat.read(room)[1], before + 1)
+
+    def test_say_fails_closed_when_the_roster_is_unreadable(self):  # noqa: VACUOUS_ASSERTION — the missing-roster post's +1 append count controls the refusal's zero
+        """An unreadable roster proves no token is prose: delivery wakes a
+        seat on its own name without reading the roster. A MISSING roster
+        is proven empty — a different answer, never the same value."""
+        room, _ = self.open_meld()
+        before = chat.read(room)[1]
+        self.plant_roster("{not json")
+        with self.assertRaises(SystemExit) as cm:
+            meld.say(room, "YIELD", "@seat-c verify the shape", seat="seat-a")
+        self.assertIn("MEMBERSHIP-MISMATCH", str(cm.exception))
+        self.assertEqual(chat.read(room)[1], before)
+        os.remove(seats.roster_path())
+        meld.say(room, "YIELD", "@seat-c verify the shape", seat="seat-a")
+        self.assertEqual(chat.read(room)[1], before + 1)
+
+    def _peer_said_done(self):
+        """A pair where seat-b spoke and then said DONE, and seat-a has NOT
+        run recv since: the exact state a live seat was in when it
+        posted 5 YIELDs into a room its codex peer had left."""
+        room, _ = self.open_meld()
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)       # READY
+        meld.say(room, "YIELD", "a proposal", seat="seat-a")
+        meld.recv(room, timeout=0, seat="seat-b", poll=0.01)       # the seed
+        meld.recv(room, timeout=0, seat="seat-b", poll=0.01)       # the proposal
+        meld.say(room, "DONE", "agreed; b lands it", seat="seat-b")
+        return room
+
+    def test_a_YIELD_after_the_peers_UNREAD_done_is_refused(self):
+        """The mirror of recv's late-chunk branch. seat-b's closing recv skips
+        any YIELD or HOLD after its own DONE, so seat-a's chunk reaches
+        nobody. The DONE is still unread by seat-a, so the check must read
+        the room, not only seat-a's state (still `active` here)."""
+        room = self._peer_said_done()
+        self.assertEqual(meld.state(room, "seat-a")["status"], "active")
+        before = chat.read(room)[1]
+        for marker in ("YIELD", "HOLD"):
+            with self.assertRaises(SystemExit) as cm:
+                meld.say(room, marker, "one more thought", seat="seat-a")
+            msg = str(cm.exception)
+            self.assertIn("MELD-PEER-CLOSED", msg)
+            self.assertIn("seat-b", msg)                   # names who closed
+            self.assertIn("[DONE]", msg)
+            self.assertIn("--marker DONE", msg)            # the true next act
+        self.assertEqual(chat.read(room)[1], before, "a refusal posted a row")
+        self.assertEqual(meld.state(room, "seat-a")["status"], "active",
+                         "a refusal changed the lifecycle")
+        # THE WAY OUT STILL WORKS: DONE posts, and recv then takes the peer's
+        # DONE as the countersign.
+        meld.say(room, "DONE", "closing too", seat="seat-a")
+        self.assertEqual(chat.read(room)[1], before + 1)
+        code, lines = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
+        self.assertEqual(code, 0)
+        self.assertEqual(meld.state(room, "seat-a")["status"], "done-mutual")
+
+    def test_a_YIELD_before_the_peers_done_still_posts(self):  # noqa: VACUOUS_ASSERTION — the row count must rise by exactly two, a positive on the room
+        """THE CONTROL on the same observable: the same pair, one step
+        earlier, before seat-b closes. A build that refused every YIELD would
+        pass the arm above."""
+        room, _ = self.open_meld()
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)       # READY
+        before = chat.read(room)[1]
+        meld.say(room, "YIELD", "a proposal", seat="seat-a")
+        meld.say(room, "HOLD", "and more", seat="seat-a")
+        self.assertEqual(chat.read(room)[1], before + 2)
+
+    def test_a_YIELD_after_a_CONSUMED_peer_done_is_refused_before_posting(self):
+        """recv already took seat-b's DONE (status peer-done). The lifecycle
+        refused a local YIELD there, but only AFTER the row was posted, so
+        the room gained a chunk the state machine said never happened."""
+        room = self._peer_said_done()
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)       # b's DONE
+        self.assertEqual(meld.state(room, "seat-a")["status"], "peer-done")
+        before = chat.read(room)[1]
+        with self.assertRaises(SystemExit) as cm:
+            meld.say(room, "YIELD", "too late", seat="seat-a")
+        self.assertIn("MELD-PEER-CLOSED", str(cm.exception))
+        self.assertEqual(chat.read(room)[1], before, "the row posted anyway")
+
+    def test_a_forged_DONE_from_OUTSIDE_the_pair_closes_nothing(self):  # noqa: VACUOUS_ASSERTION — the row count must rise by one, a positive on the room
+        """The same filters as recv: a seat outside the pinned pair cannot
+        silence a member by posting a DONE-shaped row."""
+        room, epoch = self.open_meld()
+        chat.post("[MELD e:%d] leave now [DONE]" % epoch, room=room,
+                  who="seat-c", sign=False)
+        before = chat.read(room)[1]
+        meld.say(room, "YIELD", "still talking to b", seat="seat-a")
+        self.assertEqual(chat.read(room)[1], before + 1)
+
+    def test_a_standup_refuses_only_once_EVERY_member_closed(self):
+        """A 2+ standup keeps its floor open until every member has closed,
+        so one member's DONE leaves the others to talk to."""
+        room, _ = meld.invite("seat-b,seat-c", "converge the wire format",
+                              seat="seat-a")
+        meld.join(room, seat="seat-b")
+        meld.join(room, seat="seat-c")
+        meld.say(room, "DONE", "b is out", seat="seat-b")
+        meld.say(room, "YIELD", "c, your view?", seat="seat-a")   # c remains
+        meld.say(room, "DONE", "c is out", seat="seat-c")
+        with self.assertRaises(SystemExit) as cm:
+            meld.say(room, "YIELD", "anyone?", seat="seat-a")
+        self.assertIn("seat-b, seat-c", str(cm.exception))
 
     def test_done_status_transitions(self):
         """After your own DONE, recv is the COUNTERSIGN WATCH (
@@ -421,6 +613,16 @@ class TestConvergenceLoop(MeldBase):
         out = "\n".join(meld.status(seat="seat-a"))
         self.assertIn(room, out)
         self.assertIn("role=convener", out)
+
+    def test_meld_status_does_not_deadlock_with_nested_lock(self):
+        """meld.status replays rooms holding the room lock; if state() or
+        _repair_from_ram re-acquires the room lock, it must re-enter cleanly
+        instead of self-deadlocking (task/3535)."""
+        room, _ = self.open_meld()
+        with chat._room_lock(room):
+            # Nested status call while the room lock is already held
+            out = "\n".join(meld.status(seat="seat-a"))
+            self.assertIn(room, out)
 
 
 class TestPinnedPair(MeldBase):
@@ -506,7 +708,8 @@ class TestIdentity(MeldBase):
 
     def test_invite_no_warning_for_tracked_peer(self):
         seats.join(session="sid-b", cwd=self.tmp, seat="seat-b")
-        _room, lines = meld.invite("seat-b", "topic x", seat="seat-a")
+        with _census({"seat-b": "covered"}):
+            _room, lines = meld.invite("seat-b", "topic x", seat="seat-a")
         out = "\n".join(lines)
         self.assertNotIn("NOT on the chat roster", out)
         self.assertIn("never lost, only delayed", out)
@@ -514,6 +717,115 @@ class TestIdentity(MeldBase):
     def test_invite_rejects_hostile_peer_name(self):
         with self.assertRaises(SystemExit):
             meld.invite("evil\x1b[2Jseat", "topic x", seat="seat-a")
+
+
+def _census(verdicts, age_s=10):
+    """The attendance register answering `verdicts` ({seat: verdict}),
+    measured `age_s` ago, as `beacons.attend` writes it onto roster rows."""
+    real = seats.roster
+
+    def roster():
+        r = real()
+        for s, v in verdicts.items():
+            r.setdefault(s, {})["attendance"] = {
+                "state": v, "why": "planted %s" % v,
+                "at": time.time() - age_s}
+        return r
+    return mock.patch.object(seats, "roster", side_effect=roster)
+
+
+def _owed(rows, why=None):
+    """Stop-facts whose owed frontier is `rows`, or unavailable for `why`."""
+    from helm import stopfacts
+
+    class View(object):
+        def owed_pair(self, seat=None):
+            return ({} if why else {r["id"]: r for r in rows}), why
+    return mock.patch.object(stopfacts, "read", return_value=View())
+
+
+def _review(recipient, age_s):
+    return {"id": os.urandom(8).hex(), "kind": "review", "status": "open",
+            "recipient": recipient,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                time.gmtime(time.time() - age_s))}
+
+
+class InviteOnlyALiveSeatTest(MeldBase):
+    """MELD PROGRAM A3, DESIGN 3.4.1 (task/3088). The invite told every tracked
+    peer "never lost, only delayed", and an IDLE seat with no live beacon never
+    takes that turn: the spiral rung once prescribed a meld with gemini while
+    the census read it DEAF-IN-EFFECT. The verb now says so and names the
+    route verb. A WARNING, never a refusal: a busy seat with no beacon still
+    gets the row at its next tool boundary. The verdict is READ from the
+    attendance register the beacons timer writes, never re-measured, so an
+    invite costs a roster read and not a process-table sweep."""
+
+    def invite(self):
+        """One invite per call, each under its own topic: a room is named by
+        topic and epoch second, so a loop reusing one topic collides."""
+        self.n = getattr(self, "n", 0) + 1
+        seats.join(session="sid-b", cwd=self.tmp, seat="seat-b")
+        _room, lines = meld.invite("seat-b", "topic %d" % self.n,
+                                   seat="seat-a")
+        return "\n".join(lines)
+
+    def test_the_REGISTER_the_census_writes_is_the_one_invite_reads(self):  # noqa: VACUOUS_ASSERTION — the `before` invite is the positive control on the same line
+        """Producer to consumer, nothing planted: the real census over the
+        hermetic fixture finds seat-b on the roster with no beacon (DEAF), the
+        real attendance pass writes that, and the invite names it. Before the
+        pass there is no register row, so the invite says nothing."""
+        from helm import beacons
+        seats.join(session="sid-b", cwd=self.tmp, seat="seat-b")
+        with _owed([]):
+            before = self.invite()
+            self.assertIsNone(beacons.attend(
+                beacons.census(seats=["seat-b"]))["error"])
+            after = self.invite()
+        self.assertIn("never lost, only delayed", before)
+        self.assertIn("seat-b is DEAF", after)
+        self.assertIn("helm route review", after)
+        self.assertNotIn("never lost", after)
+
+    def test_every_unreachable_verdict_warns_and_a_covered_one_does_not(self):
+        """Positive control on the same observable: a covered seat keeps the
+        durable-row line and no warning."""
+        for verdict in ("DEAF", "DEAF-IN-EFFECT", "VACANT", "MISROUTED"):
+            with _census({"seat-b": verdict}), _owed([]):
+                out = self.invite()
+            self.assertIn("seat-b is %s (planted %s" % (verdict, verdict), out)
+        with _census({"seat-b": "covered"}), _owed([]):
+            out = self.invite()
+        self.assertNotIn("WARNING", out)
+        self.assertIn("never lost, only delayed", out)
+
+    def test_UNKNOWN_says_nothing(self):  # noqa: VACUOUS_ASSERTION — the fresh-DEAF invite after the loop is the unconditional positive control
+        """An UNPROVEN verdict, a register older than two census intervals,
+        and stop-facts that are not exact each leave the ordinary line: an
+        unreadable or stale reading is never a claim about a seat. The same
+        verdict fresh is the positive control."""
+        from helm import beacons
+        stale = 2 * beacons.INTERVAL_S + 60
+        for patch in (_census({"seat-b": "UNPROVEN"}),
+                      _census({"seat-b": "DEAF"}, age_s=stale)):
+            with patch, _owed([_review("seat-b", 3600)] * 2, why="stale"):
+                out = self.invite()
+            self.assertNotIn("WARNING", out)
+            self.assertIn("never lost, only delayed", out)
+        with _census({"seat-b": "DEAF"}), _owed([]):
+            self.assertIn("seat-b is DEAF", self.invite())
+
+    def test_a_peer_holding_two_STALE_reviews_is_named_busy(self):  # noqa: VACUOUS_ASSERTION — the two-stale invite before the loop is the positive control
+        """Two owed review rows each older than 15 min: the meld queues behind
+        them. One such row, or two fresh ones, is an ordinary reader."""
+        rows = [_review("seat-b", 3600) for _ in range(2)]
+        with _census({"seat-b": "covered"}), _owed(rows):
+            self.assertIn("holds 2 open review rows", self.invite())
+        for n, age in ((1, 3600), (2, 60)):
+            rows = [_review("seat-b", age) for _ in range(n)]
+            with _census({"seat-b": "covered"}), _owed(rows):
+                out = self.invite()
+            self.assertNotIn("open review rows", out, (n, age))
 
 
 class TestCLI(MeldBase):
@@ -895,6 +1207,436 @@ class TestLifecycleJournal(MeldBase):
         out = "\n".join(meld.status(seat="seat-z"))
         self.assertIn("UNKNOWN", out)
         self.assertNotIn("no live melds", out)
+
+
+class _DurableAheadFixtures:
+    """Meld journals driven through the real verbs, then made durable-ahead
+    the two ways the live bus measured: foreign markers, or lost events."""
+
+    def ran_meld(self, a="seat-a", b="seat-b", topic="converge the wire format"):
+        """A meld that exchanged a chunk, flushed so durable equals RAM."""
+        room, _ = meld.invite(b, topic, seat=a)
+        meld.join(room, seat=b)
+        meld.recv(room, timeout=0, seat=a, poll=0.01)       # READY
+        meld.say(room, "YIELD", "a view", seat=a)
+        meld.recv(room, timeout=0, seat=b, poll=0.01)       # the seed
+        meld.recv(room, timeout=0, seat=b, poll=0.01)       # a view
+        chat.log_flush(rooms=[room])
+        self.assertEqual(self.events(room), self.events(room, True),
+                         "precondition: the flush mirrored RAM whole")
+        return room
+
+    def events(self, room, durable=False):
+        evs, why = meld._events(meld.lifecycle_path(room, durable))
+        self.assertIsNone(why)
+        return evs
+
+    def plant_marker(self, room):
+        """The residue on the 402 live journals: a restore marker in DURABLE
+        only, in exactly the shape replay_room appends one."""
+        last = self.events(room, True)[-1]
+        seq = last["seq"] + 1
+        self.assertTrue(meld.eventledger.append(
+            meld.lifecycle_path(room, True),
+            {"v": meld.LIFECYCLE_V, "id": meld._event_id(room, seq),
+             "room": room, "seq": seq, "ts": pk.now_ts(),
+             "actor": last["actor"], "epoch": last["epoch"],
+             "transition": "restored-from-journal",
+             "projection": last["projection"]}))
+
+    def drop_ram_tail(self, room, n=1):
+        """RAM loses its last n events while durable keeps them."""
+        evs = self.events(room)
+        with open(meld.lifecycle_path(room), "w", encoding="utf-8") as f:
+            for ev in evs[:-n]:
+                f.write(json.dumps(ev) + "\n")
+
+    def rows_for(self, out, room):
+        return [x for x in out if x.startswith("  %s " % room)]
+
+
+class DurableAheadReplayTest(_DurableAheadFixtures, MeldBase):
+    """replay_room over a LIVE room whose durable journal is ahead of RAM.
+
+    Measured on the live bus: all 402 durable-ahead journals were ahead only by
+    `restored-from-journal` markers that another chat namespace appended, and
+    13 live melds read UNKNOWN in `meld status` because replay_room demanded
+    durable be a prefix of RAM. The flush path already accepted durable-ahead
+    (451f56bfa83). Replay now accepts the marker-only shape too, and keeps
+    UNKNOWN, naming the event, when durable holds a real transition RAM lacks.
+    """
+
+    def test_durable_ahead_by_MARKERS_ONLY_reads_live(self):  # noqa: VACUOUS_ASSERTION — state ok, exactly one status row and its status/durability text are unconditional positives
+        room = self.ran_meld()
+        self.plant_marker(room)            # the measured journals carry two
+        self.plant_marker(room)
+        ram = self.events(room)
+        out = meld.replay_room(room, apply=True)
+        self.assertEqual(out["state"], "ok", out)
+        self.assertFalse(out["replayed"], "a live room reported a restore")
+        self.assertEqual(self.events(room), ram,
+                         "the foreign markers were copied into live RAM")
+        rows = self.rows_for(meld.status(seat="seat-a"), room)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("status=active ", rows[0])
+        self.assertIn("durability=durable-live", rows[0])
+        self.assertNotIn("UNKNOWN", rows[0])
+
+    def test_durable_ahead_by_a_REAL_transition_is_UNKNOWN_and_names_it(self):
+        """THE CONTROL for the arm above: the same room, one real event
+        ahead instead of a marker. RAM has lost live state, so reading it as
+        live would be a lie; the reason names the first missing event."""
+        room = self.ran_meld()
+        missing = self.events(room)[-1]
+        self.drop_ram_tail(room)
+        out = meld.replay_room(room, apply=True)
+        self.assertEqual(out["state"], "UNKNOWN")
+        self.assertIn("ahead of RAM by 1 real transition", out["reason"])
+        self.assertIn("first: %s at seq %d" % (missing["transition"],
+                                               missing["seq"]), out["reason"])
+        rows = self.rows_for(meld.status(seat="seat-a"), room)
+        self.assertEqual(len(rows), 1, "one room, one row: %r" % rows)
+        self.assertIn("status=UNKNOWN", rows[0])
+        self.assertIn("ahead of RAM by 1 real transition", rows[0])
+        # A marker after the real event does not launder it.
+        self.plant_marker(room)
+        out = meld.replay_room(room, apply=True)
+        self.assertEqual(out["state"], "UNKNOWN")
+        self.assertIn("ahead of RAM by 1 real transition", out["reason"])
+
+    def test_a_FORK_names_the_sequence_where_the_streams_part(self):  # noqa: VACUOUS_ASSERTION — the reason must contain the exact seq and both transitions
+        room = self.ran_meld()
+        durable_tail = self.events(room, True)[-1]
+        self.drop_ram_tail(room)
+        # The fork a writer from before task/2648's refusal left behind: it
+        # allocated the live event from RAM over a durable journal ahead of it.
+        with mock.patch.object(meld, "_durable_refusal", return_value=None):
+            meld.say(room, "HOLD", "a different next event", seat="seat-b")
+        ram_tail = self.events(room)[-1]
+        self.assertEqual(ram_tail["seq"], durable_tail["seq"])
+        out = meld.replay_room(room, apply=True)
+        self.assertEqual(out["state"], "UNKNOWN")
+        self.assertIn("fork at seq %d (RAM: %s, durable: %s)"
+                      % (ram_tail["seq"], ram_tail["transition"],
+                         durable_tail["transition"]), out["reason"])
+
+
+class DurableAheadLiveTransitionTest(_DurableAheadFixtures, MeldBase):
+    """A live transition on a room whose durable journal is ahead of RAM by a
+    restore marker (task/2648). The transition allocated seq from RAM alone,
+    so it took the marker's seq and event id with different content: neither
+    stream was a prefix of the other, the flush raised a divergence and chat
+    quarantined the room, withholding its chat rows too."""
+
+    def test_live_transition_after_a_durable_marker_extends_durable(self):
+        room = self.ran_meld()
+        self.plant_marker(room)
+        spent = self.events(room, True)[-1]
+        meld.say(room, "YIELD", "b replies", seat="seat-b")
+        ram = self.events(room)
+        live = [e for e in ram if e["transition"] == "local-yield"][-1]
+        self.assertGreater(live["seq"], spent["seq"])
+        self.assertEqual(len({e["id"] for e in ram}), len(ram))
+        self.assertIn(spent, ram, "RAM never adopted the durable marker")
+        report = {}
+        chat.log_flush(rooms=[room], report=report)
+        self.assertNotIn(room, report.get("quarantined") or {}, report)
+        self.assertEqual(self.events(room, True), self.events(room))
+        rows = self.rows_for(meld.status(seat="seat-b"), room)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertNotIn("UNKNOWN", rows[0])
+
+    def test_a_REAL_transition_durable_ahead_refuses_before_posting(self):
+        """Durable ahead by a real event RAM lost is not the marker shape: the
+        live transition is REFUSED before any append, naming why, so it never
+        takes a durable seq and no chat row is posted for it; the room is
+        not forked, so the flush accepts it and does not quarantine."""
+        room = self.ran_meld()
+        self.drop_ram_tail(room)
+        ram, rows = self.events(room), chat.read(room)[1]
+        with self.assertRaises(meld.LifecycleError) as got:
+            meld.say(room, "HOLD", "a different next event", seat="seat-b")
+        self.assertIn("real transition", str(got.exception))
+        self.assertEqual(self.events(room), ram, "RAM was appended to")
+        self.assertEqual(chat.read(room)[1], rows, "a refused say posted")
+        report = {}
+        chat.log_flush(rooms=[room], report=report)
+        self.assertNotIn(room, report.get("quarantined") or {}, report)
+
+    def test_an_UNKNOWN_durable_journal_refuses_before_posting(self):
+        """A marker followed by a corrupt line: durable cannot be read whole,
+        so a live transition cannot know the next free seq and refuses."""
+        room = self.ran_meld()
+        self.plant_marker(room)
+        with open(meld.lifecycle_path(room, True), "a", encoding="utf-8") as f:
+            f.write("{not json\n")
+        ram, rows = self.events(room), chat.read(room)[1]
+        with self.assertRaises(meld.LifecycleError) as got:
+            meld.say(room, "YIELD", "b replies", seat="seat-b")
+        self.assertIn("durable journal UNKNOWN", str(got.exception))
+        self.assertEqual(self.events(room), ram)
+        self.assertEqual(chat.read(room)[1], rows)
+
+    # A PEER WRITER in its own process: it takes the room's flock without
+    # waiting (the lock another process's writer would take) and, when it
+    # gets it, drops RAM's last event, the shape a concurrent abort or
+    # replay leaves (RAM behind durable by a real transition).
+    PEER = r"""
+import fcntl, json, sys, time
+lock, ram = sys.argv[1], sys.argv[2]
+with open(lock, "a") as lf:
+    deadline = time.monotonic() + 0.5
+    while True:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() > deadline:
+                print("locked-out")
+                sys.exit(0)
+            time.sleep(0.02)
+    with open(ram, encoding="utf-8") as f:
+        lines = [l for l in f if l.strip()]
+    with open(ram, "w", encoding="utf-8") as f:
+        f.writelines(lines[:-1])
+    print("changed")
+"""
+
+    def test_a_peer_cannot_change_the_journal_between_the_check_and_the_post(self):  # noqa: VACUOUS_ASSERTION — exact locked-out peer and positive posted/transition counts are asserted
+        """CURE2 2648: the check, the chat post and the append are ONE room
+        lock span. A peer process that tries to change RAM while say() posts
+        its chat row is locked out, so the transition that follows is the
+        one the check allowed: no chat row is posted for a transition that
+        refuses. Before the cure the lock was released after the check, the
+        peer got in, the row posted and the transition then refused."""
+        import subprocess
+        room = self.ran_meld()
+        rows = chat.read(room)[1]
+        seen = []
+        real = meld._post
+
+        def post_with_a_peer(text, room_, seat, marker=None):
+            p = subprocess.run(
+                [sys.executable, "-c", self.PEER, chat._room_lock_path(room_),
+                 meld.lifecycle_path(room_)],
+                capture_output=True, text=True, timeout=30)
+            seen.append(p.stdout.strip() or p.stderr.strip())
+            return real(text, room_, seat, marker=marker)
+
+        refused = None
+        with mock.patch.object(meld, "_post", post_with_a_peer):
+            try:
+                meld.say(room, "HOLD", "b holds", seat="seat-b")
+            except meld.LifecycleError as exc:
+                refused = str(exc)
+        self.assertEqual(seen, ["locked-out"], "the peer got the room lock "
+                         "between the check and the append")
+        posted = chat.read(room)[1] - rows
+        held = [e for e in self.events(room) if e["transition"] == "local-hold"]
+        self.assertIsNone(refused, refused)
+        self.assertEqual((posted, len(held)), (1, 1),
+                         "a chat row and its transition must stand together")
+
+    def test_a_refused_transition_posts_no_chat_row(self):
+        """The order inside the span: the transition runs first and the chat
+        row posts only once it succeeded, so a refusal found under the lock
+        (here the durable journal ahead of RAM) posts nothing."""
+        room = self.ran_meld()
+        self.drop_ram_tail(room)
+        rows = chat.read(room)[1]
+        with mock.patch.object(meld, "_live_refusal", return_value=None,
+                               create=True):
+            with self.assertRaises(meld.LifecycleError):
+                meld.say(room, "YIELD", "b replies", seat="seat-b")
+        self.assertEqual(chat.read(room)[1], rows, "a refused say posted")
+
+    def test_several_markers_and_two_transitions_extend_durable(self):
+        room = self.ran_meld()
+        self.plant_marker(room)
+        self.plant_marker(room)
+        spent = self.events(room, True)[-1]["seq"]
+        meld.say(room, "YIELD", "b replies", seat="seat-b")
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
+        meld.say(room, "YIELD", "a again", seat="seat-a")
+        ram = self.events(room)
+        lives = [e for e in ram if e["transition"] == "local-yield"
+                 and e["seq"] > spent]
+        self.assertEqual(len(lives), 2, ram)
+        self.assertEqual(len({e["seq"] for e in ram}), len(ram))
+        report = {}
+        chat.log_flush(rooms=[room], report=report)
+        self.assertNotIn(room, report.get("quarantined") or {}, report)
+        self.assertEqual(self.events(room, True), self.events(room))
+
+
+class RefusedPostTest(_DurableAheadFixtures, MeldBase):
+    """CURE3 2648: the chat post can refuse too. chat.post rejects a padded
+    sha before it appends, and CURE2 ran the transition before the post, so a
+    refused post left the transition sealed with no row a peer could see,
+    and a peer-done seat's retry was then refused as sealed. Both checks now
+    run inside the one room lock span before either write."""
+
+    PADDED = "tip PADDEDSHA"
+
+    @contextlib.contextmanager
+    def post_refuses(self):
+        """shaguard finds a padded sha in any body carrying PADDEDSHA; the
+        refusal itself is chat.post's own, unpatched."""
+        from helm import shaguard
+        with mock.patch.object(
+                shaguard, "refusals",
+                side_effect=lambda text, root=None:
+                ["PADDEDSHA"] if "PADDEDSHA" in text else []), \
+                mock.patch.object(shaguard, "warnings", return_value=[]):
+            yield
+
+    def test_a_body_the_post_refuses_changes_no_state_and_posts_nothing(self):
+        room = self.ran_meld()
+        ram, durable = self.events(room), self.events(room, True)
+        st, rows = meld.state(room, "seat-b"), chat.read(room)[1]
+        with self.post_refuses():
+            # CONTROL: chat.post itself refuses this body.
+            with self.assertRaises(ValueError):
+                chat.post(self.PADDED, room=room, who="seat-b", sign=False)
+            with self.assertRaises(ValueError) as got:
+                meld.say(room, "YIELD", self.PADDED, seat="seat-b")
+        self.assertIn("padded short sha", str(got.exception))
+        self.assertEqual(self.events(room), ram, "a refused post sealed a "
+                         "transition in RAM")
+        self.assertEqual(self.events(room, True), durable)
+        self.assertEqual(meld.state(room, "seat-b"), st)
+        self.assertEqual(chat.read(room)[1], rows, "a refused say posted")
+        # CONTROL: the same say with a clean body posts and transitions.
+        meld.say(room, "YIELD", "tip resolved", seat="seat-b")
+        self.assertEqual(chat.read(room)[1], rows + 1)
+        self.assertEqual(len(self.events(room)), len(ram) + 1)
+
+    def test_a_peer_done_retry_after_a_refused_post_is_not_sealed(self):
+        room = self.ran_meld()
+        meld.say(room, "DONE", "b closes", seat="seat-b")
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
+        self.assertEqual(meld.state(room, "seat-a")["status"], "peer-done")
+        rows = chat.read(room)[1]
+        with self.post_refuses():
+            with self.assertRaises(ValueError):
+                meld.say(room, "DONE", self.PADDED, seat="seat-a")
+        self.assertEqual(meld.state(room, "seat-a")["status"], "peer-done")
+        self.assertEqual(chat.read(room)[1], rows)
+        meld.say(room, "DONE", "a closes too", seat="seat-a")
+        self.assertEqual(meld.state(room, "seat-a")["status"], "done-mutual")
+        got = chat.read(room)[0][-1]
+        self.assertIn("a closes too", got["text"])
+        self.assertEqual(chat.read(room)[1], rows + 1)
+
+    def test_a_durable_change_between_the_read_and_the_write_refuses_cleanly(self):
+        """say() reads the state before it takes the room lock. A peer that
+        leaves durable ahead of RAM by a real event in that gap is seen by
+        the checks under the lock: the say refuses, and nothing is appended
+        or posted."""
+        room = self.ran_meld()
+        rows = chat.read(room)[1]
+        real = meld.state
+        dropped = []
+
+        def state_then_a_peer_writes(room_, seat_, *a, **kw):
+            st = real(room_, seat_, *a, **kw)
+            if not dropped:
+                self.drop_ram_tail(room_)
+                dropped.append(self.events(room_))
+            return st
+
+        with mock.patch.object(meld, "state", state_then_a_peer_writes):
+            with self.assertRaises(meld.LifecycleError):
+                meld.say(room, "YIELD", "b replies", seat="seat-b")
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(self.events(room), dropped[0], "RAM was appended to")
+        self.assertEqual(chat.read(room)[1], rows, "a refused say posted")
+
+    def test_a_say_never_takes_the_delivery_guard_under_its_room_lock(self):
+        """helm-codex's QC of CURE4: the lock order everywhere else is the
+        delivery-state guard, then the room lock (chat._rotate takes them in
+        that order). say() posts while it holds the room lock, and a post
+        over the size cap rotates, which took the guard INSIDE the room lock:
+        a plain chat.post rotating the same room holds the guard and waits
+        for the room, and the two wait on each other for ever. A rotation a
+        say asks for runs after its room lock is released."""
+        from helm import proxywatch
+        room = self.ran_meld()
+        seen, real_guard = [], proxywatch.delivery_state_guard
+
+        @contextlib.contextmanager
+        def guard(*a, **kw):
+            seen.append(chat.is_room_locked(room))
+            with real_guard(*a, **kw) as held:
+                yield held
+
+        with mock.patch.object(chat, "SIZE_CAP", 0), \
+                mock.patch.object(proxywatch, "delivery_state_guard", guard):
+            meld.say(room, "YIELD", "b replies", seat="seat-b")
+        self.assertTrue(seen, "must-hit: the post asked for a rotation")
+        self.assertNotIn(True, seen, "the delivery-state guard was taken "
+                         "while say held the room lock")
+
+    def test_a_post_that_fails_after_the_append_says_the_transition_is_recorded(self):
+        """The one split the agreed bar admits: a write fault in the post
+        AFTER every refusal passed and the transition appended. It must be
+        loud and labelled, naming the recorded transition and the row that
+        did not post, so nobody reads it as a refusal that changed nothing."""
+        room = self.ran_meld()
+        ram, rows = self.events(room), chat.read(room)[1]
+        with mock.patch.object(meld, "_post",
+                               side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(meld.LifecycleError) as got:
+                meld.say(room, "YIELD", "b replies", seat="seat-b")
+        msg = str(got.exception)
+        for word in ("RECORDED", "did NOT post", "No space left on device"):
+            self.assertIn(word, msg)
+        self.assertIsInstance(got.exception.__cause__, OSError)
+        # must-hit: the transition really is recorded and the row is absent
+        self.assertEqual(len(self.events(room)), len(ram) + 1)
+        self.assertEqual(chat.read(room)[1], rows)
+
+
+class StatusScopeTest(_DurableAheadFixtures, MeldBase):
+    """`meld status` lists UNKNOWN rows only for melds the calling seat is in.
+    The replay reads every room on the bus, and the unfiltered list showed
+    the integrator's seat other seats' melds it was never part of."""
+
+    def test_UNKNOWN_rows_are_the_callers_own_melds(self):
+        mine = self.ran_meld("seat-a", "seat-b", "topic one")
+        theirs = self.ran_meld("seat-c", "seat-d", "topic two")
+        self.drop_ram_tail(mine)
+        self.drop_ram_tail(theirs)
+        # UNCONDITIONAL POSITIVE: the filter still shows a seat its own room.
+        self.assertEqual(len(self.rows_for(meld.status(seat="seat-a"), mine)), 1)
+        for seat, want, not_want in (("seat-a", mine, theirs),
+                                     ("seat-b", mine, theirs),
+                                     ("seat-c", theirs, mine)):
+            with self.subTest(seat=seat):
+                out = meld.status(seat=seat)
+                self.assertEqual(len(self.rows_for(out, want)), 1, out)
+                self.assertIn("status=UNKNOWN", self.rows_for(out, want)[0])
+                self.assertEqual(self.rows_for(out, not_want), [],
+                                 "%s was shown a meld it is not in" % seat)
+
+    def test_a_seat_in_NO_meld_reads_an_empty_slate_not_UNKNOWN(self):
+        """Every UNKNOWN room is provably another seat's, so this seat's
+        empty slate is measured. Saying UNKNOWN here would blame it for
+        rooms it was never in."""
+        self.drop_ram_tail(self.ran_meld("seat-a", "seat-b", "topic one"))
+        out = "\n".join(meld.status(seat="seat-z"))
+        self.assertIn("no live melds for seat seat-z", out)
+        self.assertIn("1 meld(s) of other seats read UNKNOWN", out)
+
+    def test_membership_is_read_from_the_EVENTS_when_the_snapshot_is_gone(self):
+        """A member whose snapshot is missing is still named by the room's
+        lifecycle events, so its UNKNOWN row survives the filter."""
+        room = self.ran_meld("seat-c", "seat-d", "topic two")
+        self.drop_ram_tail(room)
+        os.remove(meld.state_path(room, "seat-d"))
+        out = meld.status(seat="seat-d")
+        self.assertEqual(len(self.rows_for(out, room)), 1, out)
+        self.assertIn("status=UNKNOWN", self.rows_for(out, room)[0])
 
 
 class ReplayedStatusRenderTest(MeldBase):
@@ -1817,9 +2559,27 @@ class CouncilJudgesANamedSubjectTest(unittest.TestCase):
         # MUST-MISS: council never writes into it, in either direction.
         self.assertNotIn("dispatches.", src)
         self.assertNotIn("landreq", src)
-        # and no land-path module reads council storage
-        self.assertNotIn("council.registry_path", inspect.getsource(L))
-        self.assertNotIn("council.registry_path", inspect.getsource(D))
+        # and no land-path module reads council storage. A land-path module
+        # is its WHOLE surface: `landreq` and `dispatches` hand questions to
+        # satellites, and `getsource` of the module reads one file of them.
+        from tests._satellite_resolution import ledger_sources
+        land_path = ledger_sources(L) + ledger_sources(D)
+        self.assertEqual([p for p, s in land_path
+                          if "council.registry_path" in s], [])
+        # POSITIVE CONTROL, REACH: the read spans the satellites, not only
+        # the two owner files.
+        files = {os.path.basename(p) for p, _s in land_path}
+        self.assertLessEqual({"landreq_close.py", "dispatches_spiral.py",
+                              "dispatches_announce.py"}, files)
+        self.assertLessEqual({"%s.py" % s for m in (L, D)
+                              for s, _n in m._OWNER_NAMES}, files)
+        # POSITIVE CONTROL, PREDICATE: the same test fires on a satellite.
+        planted = [(p, s + "\ncouncil.registry_path\n"
+                    if p.endswith("dispatches_announce.py") else s)
+                   for p, s in land_path]
+        self.assertEqual([os.path.basename(p) for p, s in planted
+                          if "council.registry_path" in s],
+                         ["dispatches_announce.py"])
 
     # ---- the SURFACE: computed, recorded, and actually SHOWN -----------
 
@@ -1925,6 +2685,21 @@ class SayTakesTheSafeRouteTest(MeldBase):
         self.assertEqual(len(texts), before, "a refusal still posted a row")
         for body in ("the piped body", "the positional body"):
             self.assertNotIn(body, "\n".join(texts))
+
+    def test_a_late_YIELD_through_the_CLI_is_refused_with_rc_2(self):  # noqa: VACUOUS_ASSERTION — rc 2 and the named refusal on stderr are unconditional positives; the unchanged row count is the point
+        """The CLI door of the say-after-peer-DONE refusal: rc 2, the reason
+        on stderr, and nothing posted."""
+        room, _epoch = self.open_meld()
+        meld.say(room, "DONE", "b is out", seat="seat-b")
+        before = len(self.posted(room))
+        err = io.StringIO()
+        with self.piped_stdin("one more thought\n"), \
+                contextlib.redirect_stderr(err):
+            rc = meld.cmd(["say", room, "--marker", "YIELD",
+                           "--seat", "seat-a"])
+        self.assertEqual(rc, 2)
+        self.assertIn("MELD-PEER-CLOSED", err.getvalue())
+        self.assertEqual(len(self.posted(room)), before)
 
     def test_NO_BODY_ANYWHERE_STILL_REFUSES(self):  # noqa: VACUOUS_ASSERTION — the refusal rc and the unchanged row count are both unconditional positives on the observables this arm is about; the absence assertion is the point (a bare marker must post nothing)
         """MUST-MISS. Adding a stdin leg must not turn a bare marker into an

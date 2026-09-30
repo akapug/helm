@@ -365,15 +365,34 @@ class SuiteNeverWritesTheGateLedgerTest(unittest.TestCase):
         from helm import gateshard, pathenv
         keys = (gateshard._TEST_ENV_KEYS + pathenv.IDENTITY_PATH_ENV_KEYS
                 + gateshard._ROLE_ENV_KEYS + gateshard._MEASURE_ENV_KEYS
-                + ("OLDTOOL_CONFIG_ROOTS",))
+                + gateshard._LAUNCH_ENV_KEYS + ("OLDTOOL_CONFIG_ROOTS",))
         with mock.patch.dict(os.environ, {k: "/planted/" + k for k in keys}):
             # CONTROL: every key is present to be dropped.
             self.assertEqual(sorted(k for k in keys if k in os.environ),
                              sorted(keys))
             worker = gateshard._fresh_env("HELM_GATESLICE_WORKER")
             serial = gate._suite_env()
-        self.assertEqual(sorted(k for k in keys if k in worker), [])
+        # The worker's own role is the one key it carries, and it carries
+        # the runner's value, never the launcher's.
+        self.assertEqual(sorted(k for k in keys if k in worker),
+                         ["HELM_GATESLICE_WORKER"])
+        self.assertEqual(worker["HELM_GATESLICE_WORKER"], "1")
         self.assertEqual(sorted(k for k in keys if k in serial), [])
+
+    def test_a_window_jobs_label_is_the_gates_and_never_its_suites(self):  # noqa: VACUOUS_ASSERTION — the control reads train209 from the launcher env both suite envs are built from, so an absent label is a drop
+        """train209 ran through `gate window launch --label train209`: the job's
+        own gate minted the label, and the suite it spawned inherited it, so 18
+        arms that run `gate run` with no label took the train rule and failed."""
+        from helm import gateshard
+        launch = {"FAB_GATE_GENERATION": "run-x", "FAB_GATE_LABEL": "train209"}
+        with mock.patch.dict(os.environ, launch):
+            # CONTROL: the launcher's gate reads the label its launch carried.
+            self.assertEqual(gate.fab_job_label(), "train209")
+            worker = gateshard._fresh_env("HELM_GATESLICE_WORKER")
+            serial = gate._suite_env()
+        for env in (worker, serial):
+            self.assertIsNone(gate.fab_job_label(env))
+            self.assertFalse(set(launch) & set(env))
 
 
 class TheSwitchIsReachedByThisSuiteTest(unittest.TestCase):

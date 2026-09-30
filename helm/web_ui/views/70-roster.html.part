@@ -1,9 +1,21 @@
 <div class="view" id="view-roster">
+  <!-- READINESS (moved here from the Work page, task/3445 — the Home seats
+       tile carries its one-word verdict): `helm ready`'s five signals — may forward work resume after
+       a crash/reboot? (#163). ALWAYS visible: a readiness gauge that hides
+       when unread is a gauge nobody checks after the reboot it exists for.
+       It boots saying "not read yet" (the dash law: zero and unread are
+       different facts). Advisory — it renders, it never gates. -->
+  <section id="readysec"></section>
+  <!-- WHO IS ON, one row (task/3445): the presence poll's seats by state and
+       the vendor wall, with the read behind them; Home's seats tile is its
+       two totals. -->
+  <section id="fleetsum" class="hsum"><div class="drow"><span class="dlab" title="who is on right now — same vocabulary as chat + roster: green active <2m · orange unverified · yellow quiet <15m · gone">on now</span>
+    <div class="dval" id="dfleet"><span class="dmut">not read yet</span></div></div></section>
   <div class="lcard" style="margin-bottom:14px">
     <h3>message a seat <span class="lsub" id="seatpickcount">rides the groupchat</span></h3>
     <form id="seatform" autocomplete="off">
       <div class="seatpick">
-        <input id="seatkey" placeholder="pick a live seat — or type @all / a name" maxlength="120" aria-label="seat name" title="live seats from the roster; free-type @all or a not-yet-joined seat" role="combobox" aria-autocomplete="list" aria-controls="seatlist" aria-expanded="false">
+        <input id="seatkey" placeholder="pick a joined seat — or type @all / a name" maxlength="120" aria-label="seat name" title="joined seats from the roster; free-type @all or a not-yet-joined seat" role="combobox" aria-autocomplete="list" aria-controls="seatlist" aria-expanded="false">
         <div id="seatlist" role="listbox"></div>
       </div>
       <input id="seatline" placeholder="one-line message…" maxlength="400" required aria-label="message">

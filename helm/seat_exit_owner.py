@@ -178,10 +178,6 @@ def latest_archived_exit(d, seat_name=None):
     return rec, None
 
 
-def has_archived_exit(d):
-    paths, unavailable = archive_inventory(d)
-    return bool(paths) or unavailable is not None
-
 
 def _archive_path(d, stamp):
     root = os.path.join(d, _ARCHIVE_DIR)

@@ -27,7 +27,7 @@ _STATE_MARKERS = (
     ".cursor.", ".seen.", ".scan.", ".stopfp.", ".stopbeacon.",
     ".stopwhisper.", ".stopclaime.", ".stopwiring.", ".stoppunt.",
     ".stoplease.", ".stopndp.", ".stopseam.", ".stopseamshare.",
-    ".stopspiral.",
+    ".stopspiral.", ".stopowed.",
 )
 
 

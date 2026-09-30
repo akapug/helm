@@ -17,8 +17,12 @@ outcome on the row, or the chat row read back out of a temp room. Hermetic —
 HELM_HOME/HELM_CHAT_DIR are temp dirs, liveness is injected, and NO pane is ever
 opened. Seat names and plan paths are synthetic fixtures.
 """
+import functools
+import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,7 +30,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import chat, harness, planprompt, seat  # noqa: E402
+from helm import chat, harness, planprompt, resumeturn, seat  # noqa: E402
 from helm import seat_lifecycle  # noqa: E402
 
 SEAT = "fixture-seat"
@@ -38,7 +42,9 @@ GATED_PLAN = ("# Plan\n\nRebase the lane, then git push to origin so the "
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG",
-            "HELM_CHAT_OWNER_NAMES", "HELM_CHAT_NAME", "MELD_CHAT_NAME")
+            "HELM_CHAT_OWNER_NAMES", "HELM_CHAT_NAME", "MELD_CHAT_NAME",
+            "HELM_PROMPT_ANSWER", "MELD_PROMPT_ANSWER", "HELM_RESUME_TURN",
+            "MELD_RESUME_TURN")
 
 
 def blocked(plan=None, options=(("1", "Yes, and bypass permissions"),
@@ -773,6 +779,14 @@ class PromptStallBlindTest(unittest.TestCase):
         self.assertIn("no seat is blocked", out.getvalue())
 
 
+#: An owner-routed verdict: what `answer_stall` returns for a prompt that is
+#: one of the owner's named exceptions. The latch and repeat arms below drive
+#: the pass's routing with it; the typist arms further down drive the real one.
+OWNER_VERDICT = {"outcome": "owner", "typed": False,
+                 "why": "it asks to run `gh auth login` — a login or a password "
+                        "('gh auth login'), one of the owner's named exceptions"}
+
+
 class PromptStallPassTest(PlanPromptBase):
     """End to end, asserted on the chat rows a human reads and on the push."""
 
@@ -786,8 +800,9 @@ class PromptStallPassTest(PlanPromptBase):
                                wraps=planprompt._post_stall) as posted:
             if not post_ok:
                 posted.side_effect = lambda *_a: False
-            res = planprompt.stall_pass(now=now, found=found, dry=dry,
-                                        memory=memory or {})
+            res = planprompt.stall_pass(
+                now=now, found=found, dry=dry, memory=memory or {},
+                answer=lambda _row, now=None: dict(OWNER_VERDICT))
         return res, push
 
     def test_a_stall_reaches_the_owner_and_integrator_loudly(self):
@@ -795,8 +810,9 @@ class PromptStallPassTest(PlanPromptBase):
         rows = self.room()
         self.assertEqual(len(rows), 1, rows)
         text = rows[0]["text"]
-        for want in ("@%s" % OWNER, "@%s" % INTEGRATOR, NATIVE, "FROZEN",
-                     "permission prompt", "06:47Z", "answer it"):
+        for want in ("@%s" % OWNER, "@%s" % INTEGRATOR, NATIVE, "gh auth login",
+                     "permission prompt", "06:47Z", "yours to decide",
+                     "the watch typed nothing", "Answer it in seat"):
             self.assertIn(want, text)
         self.assertEqual(rows[0]["from"], planprompt.STALL_WHO)
         push.assert_called_once()
@@ -857,3 +873,573 @@ class PresenceReaderTest(unittest.TestCase):
                              (None, "record-stale"))
             self.assertEqual(session._read_session_record(root, 4242, uid, "1000"),
                              (STALL_SID, "record-ok"))
+
+
+# ---------------------------------------------------------------------------
+# THE WATCH ANSWERS — a stuck prompt is a keypress, not a freeze
+# ---------------------------------------------------------------------------
+
+HANDLE = "term_fixture"
+POINTER = "❯"
+
+
+def file_dialog(path, verb="create"):
+    """Claude Code's file-permission dialog as a pane renders it: the title,
+    the path, the question naming the file, and the select with its focused
+    row drawn behind the pointer."""
+    return ("\n".join([
+        " %s file" % verb.capitalize(), " %s" % path,
+        " ╭───", " │ ---", " │ name: fixture note",
+        " ╰───",
+        " Do you want to %s %s?" % (verb, os.path.basename(path)),
+        " %s 1. Yes" % POINTER,
+        "   2. Yes, and allow Claude to edit files in its ~/.claude folder "
+        "for this session",
+        "   3. No, and tell Claude what to do differently (esc)"]) + "\n")
+
+
+def bash_dialog(command):
+    return ("\n".join([
+        " Bash command", "   %s" % command, "   Fixture description",
+        " Do you want to proceed?", " %s 1. Yes" % POINTER,
+        "   2. Yes, and don't ask again for this command in /work",
+        "   3. No, and tell Claude what to do differently (esc)"]) + "\n")
+
+
+class FakePane(object):
+    """The fake typist's pane: it records every keystroke, and once one has
+    landed it reads back `after` (by default the same screen: nothing moved)."""
+
+    def __init__(self, tail, after=None, printed_at=None):
+        self.tail, self.after, self.printed_at = tail, after, printed_at
+        self.sent = []
+
+    def read(self, handle, limit=3000, timeout=60):
+        return self.tail if not self.sent or self.after is None else self.after
+
+    def send(self, handle, text, enter=True, timeout=60):
+        self.sent.append((handle, text, enter))
+
+    def list(self):
+        return [{"handle": HANDLE, "last_output_at": self.printed_at}]
+
+
+class FakeRecord(object):
+    """The fake session record: waiting at the stall's own stamp until a key
+    lands, then busy when `moves` (the vendor's proof the prompt cleared)."""
+
+    def __init__(self, pane, moves=True, left_already=False):
+        self.pane, self.moves, self.left = pane, moves, left_already
+
+    def __call__(self, row):
+        if self.left or (self.pane.sent and self.moves):
+            return ({"status": "busy", "statusUpdatedAt": row["stamp"] + 5000},
+                    "record-ok")
+        return ({"status": "waiting", "statusUpdatedAt": row["stamp"]},
+                "record-ok")
+
+
+def typist(pane, record=None, calls=None):
+    """`answer_stall` with its three seams faked: the delivery transaction
+    hands the operation our pane, the record is `record`, the transcript
+    names `calls` (None: it could not be read)."""
+    def deliver(_seat, _text, _session, adapter=None, pids=None,
+                operation=None, **_kw):
+        state, proof = operation(pane, HANDLE, None)
+        return resumeturn._mode_for(state, proof)
+    return functools.partial(
+        planprompt.answer_stall, deliver=deliver,
+        presence=record or FakeRecord(pane),
+        calls=lambda _row: ((calls, None) if calls is not None
+                            else (None, "fixture: no transcript")),
+        sleep=lambda _s: None)
+
+
+class StallAnswerTest(PlanPromptBase):
+    """Each row of the surface x state table, driven end to end through the
+    REAL stall_pass and answer_stall with a fake record and a fake typist.
+    Every assertion is an effect: the keys the pane received, the chat rows
+    read back out of the room and whom they address, and the phone push."""
+
+    def setUp(self):
+        super(StallAnswerTest, self).setUp()
+        self.home = os.path.join(self.tmp, "home-fixture")
+        self.memdir = os.path.join(self.home, "projects", "-work", "memory")
+        os.makedirs(self.memdir)
+        self.note = os.path.join(self.memdir, "fixture-note.md")
+
+    def row(self, seat_name=NATIVE, waiting_for="permission prompt",
+            answer_env=None, pid=4242):
+        return {"seat": seat_name, "pid": pid, "root": self.home,
+                "start": "1000", "session": STALL_SID,
+                "waiting_for": waiting_for, "since": T0,
+                "stamp": int(T0 * 1000), "waited_s": 300, "pane_key": None,
+                "answer_env": answer_env}
+
+    def run_pass(self, rows, answer, now=T0 + 300, memory=None, dry=False,
+                 preview=None):
+        found = {"read": True, "why": None, "sessions": len(rows),
+                 "stalls": rows, "unnamed": 0, "blind": []}
+        with mock.patch("helm.notify.owner_push", return_value=True) as push, \
+             mock.patch("helm.seats.owner_name", return_value=OWNER), \
+             mock.patch("helm.seats_integrator.integrator_seat",
+                        return_value=(INTEGRATOR, None)):
+            res = planprompt.stall_pass(now=now, found=found, memory=memory or {},
+                                        answer=answer, dry=dry, preview=preview)
+        return res, push
+
+    def addressed(self, text):
+        return ("@%s" % OWNER in text, "@%s" % INTEGRATOR in text)
+
+    def test_a_memory_write_gets_the_session_wide_yes_and_one_quiet_line(self):
+        pane = FakePane(file_dialog(self.note), after="%s \n" % POINTER)
+        res, push = self.run_pass([self.row()], typist(pane))
+        self.assertEqual(pane.sent, [(HANDLE, "2", False)])
+        rows = self.room()
+        self.assertEqual(len(rows), 1, rows)
+        text = rows[0]["text"]
+        self.assertEqual(self.addressed(text), (False, False))   # QUIET
+        for want in (NATIVE, "answered 2", "allow Claude to edit files",
+                     "the pane moved", "create ", "fixture-note.md",
+                     "--resume"):
+            self.assertIn(want, text)
+        push.assert_not_called()
+        self.assertEqual([r["seat"] for r in res["answered"]], [NATIVE])
+
+    def test_a_routine_tool_prompt_gets_plain_yes_and_never_widens(self):  # noqa: VACUOUS_ASSERTION — the keys are a non-empty observable asserted exactly; the push silence is the quiet route, and test_a_credential_prompt_is_never_answered_and_pages_the_owner_plainly records the same push mock firing
+        pane = FakePane(bash_dialog("git status"), after="%s \n" % POINTER)
+        _res, push = self.run_pass([self.row()], typist(pane))
+        # `2` would write a persistent allow rule; a routine ask takes `1`.
+        self.assertEqual(pane.sent, [(HANDLE, "1", False)])
+        text = self.room()[0]["text"]
+        self.assertEqual(self.addressed(text), (False, False))
+        self.assertIn("run `git status`", text)
+        push.assert_not_called()
+
+    def test_a_credential_prompt_is_never_answered_and_pages_the_owner_plainly(self):  # noqa: VACUOUS_ASSERTION — the empty keystroke list is the product law; test_a_routine_tool_prompt_gets_plain_yes_and_never_widens drives the same typist and records a key, and this arm's own room row and push are asserted present
+        cases = (
+            ("a login command", FakePane(bash_dialog("gh auth login")), None,
+             "gh auth login"),
+            ("Claude Code's own key dialog", FakePane(
+                " Do you want to use this API key?\n %s 1. Yes\n   2. No\n"
+                % POINTER), None, "use this API key"),
+            ("a blind pane over a credential read", FakePane(""),
+             [{"name": "Read", "input": {"file_path": "~/.ssh/id_rsa"}}],
+             ".ssh/id_rsa"),
+        )
+        for n, (label, pane, calls, named) in enumerate(cases):
+            with self.subTest(case=label):
+                who = "credential-seat-%d" % n
+                _res, push = self.run_pass([self.row(who, pid=100 + n)],
+                                           typist(pane, calls=calls))
+                self.assertEqual(pane.sent, [])
+                rows = [r for r in self.room() if who in r["text"]]
+                self.assertEqual(len(rows), 1, rows)
+                text = rows[0]["text"]
+                self.assertEqual(self.addressed(text), (True, True))
+                self.assertIn(named, text)
+                self.assertIn("the watch typed nothing", text)
+                push.assert_called_once()
+
+    def test_a_disguised_outward_or_destructive_command_is_never_answered(self):  # noqa: VACUOUS_ASSERTION — each pane's empty keystroke list is the law; the routine arm drives the same typist and records a key
+        """kimi's read of this lane: a Bash prompt whose command pushes,
+        posts, deletes or writes over HTTP under a disguise the table did
+        not name got the routine Yes. Each of these now pages the owner."""
+        for label, command, named in (
+                ("an HTTP write", "curl -d 'payload' https://hooks.example.com/x",
+                 "HTTP write"),
+                ("curl -X POST", "curl -X POST https://api.example.com/x",
+                 "HTTP write"),
+                ("find deletes", "find . -name '*.tmp' -delete",
+                 "destroying work"),
+                ("a fleet post", "helm chat post --room helm hello",
+                 "message sent to people"),
+                ("a ledger write", "helm dispatch verdict abc def --fix e",
+                 "message sent to people"),
+                # rm -rf with its flags split or spelled long is the same act
+                ("rm split flags", "rm -r -f build", "destroying work"),
+                ("rm long flags", "rm --recursive --force build",
+                 "destroying work"),
+        ):
+            with self.subTest(case=label):
+                who = "disguise-%s" % label.replace(" ", "-")
+                pane = FakePane(bash_dialog(command))
+                _res, push = self.run_pass([self.row(who, pid=1)],
+                                           typist(pane))
+                self.assertEqual(pane.sent, [], label)
+                rows = [r for r in self.room() if who in r["text"]]
+                self.assertEqual(len(rows), 1, rows)
+                self.assertIn(named, rows[0]["text"])
+                self.assertIn("the watch typed nothing", rows[0]["text"])
+                push.assert_called_once()
+
+    def test_an_unknown_shape_addresses_the_integrator_never_the_owner(self):  # noqa: VACUOUS_ASSERTION — the silence is the claim; the integrator row read back from the room is the positive observable, and the routine arm records keys through the same typist
+        pane = FakePane(" Which target should I use?\n %s 1. src/main.py\n"
+                        "   2. src/util.py\n" % POINTER)
+        _res, push = self.run_pass([self.row(waiting_for="input needed")],
+                                   typist(pane))
+        self.assertEqual(pane.sent, [])
+        text = self.room()[0]["text"]
+        self.assertEqual(self.addressed(text), (False, True))
+        for want in ("input needed", "orca terminal send --terminal %s" % HANDLE,
+                     "Which target should I use?"):         # the pane excerpt
+            self.assertIn(want, text)
+        push.assert_not_called()
+
+    def test_keys_that_do_not_move_it_go_to_the_integrator_then_FREEZE(self):
+        pane = FakePane(bash_dialog("git status"))
+        answer = typist(pane, record=FakeRecord(pane, moves=False))
+        repeat = planprompt.STALL_REPEAT_S
+        self.run_pass([self.row()], answer, now=T0 + 300)
+        self.assertEqual(pane.sent, [(HANDLE, "1", False)])
+        first = self.room()[-1]["text"]
+        self.assertEqual(self.addressed(first), (False, True))
+        self.assertIn("did not move", first)
+        # ONE ATTEMPT PER LATCH WINDOW: the same stall inside it retypes nothing.
+        self.run_pass([self.row()], answer, now=T0 + 310)
+        self.assertEqual(len(pane.sent), 1)
+        self.assertEqual(len(self.room()), 1)
+        _res, push = self.run_pass([self.row()], answer, now=T0 + 300 + repeat)
+        self.assertEqual(len(pane.sent), 2)
+        second = self.room()[-1]["text"]
+        self.assertEqual(self.addressed(second), (True, True))
+        for want in ("FREEZE candidate", "--resume %s" % STALL_SID,
+                     "helm launch --seat %s" % NATIVE):
+            self.assertIn(want, second)
+        push.assert_called_once()
+        # A FREEZE is paged again on the repeat and never typed into again.
+        self.run_pass([self.row()], answer, now=T0 + 300 + 2 * repeat)
+        self.assertEqual(len(pane.sent), 2)
+        self.assertIn("FREEZE candidate", self.room()[-1]["text"])
+
+    def test_someone_at_the_pane_gets_no_keystroke_and_no_post(self):  # noqa: VACUOUS_ASSERTION — the control is IN this arm and unconditional: the same dialog on a quiet pane records exactly one key
+        busy = FakePane(bash_dialog("git status"),
+                        printed_at=(T0 + 300 - 10) * 1000)
+        _res, push = self.run_pass([self.row()], typist(busy))
+        self.assertEqual((busy.sent, self.room()), ([], []))
+        push.assert_not_called()
+        # CONTROL: the same dialog on a pane quiet since the prompt appeared.
+        quiet = FakePane(bash_dialog("git status"), after="%s \n" % POINTER,
+                         printed_at=(T0 + 5) * 1000)
+        self.run_pass([self.row()], typist(quiet), now=T0 + 320)
+        self.assertEqual(quiet.sent, [(HANDLE, "1", False)])
+
+    def test_a_pane_that_keeps_printing_past_a_window_reaches_the_integrator(self):  # noqa: VACUOUS_ASSERTION — the empty keystroke list is the hold; the one integrator row read back from the room is the positive observable
+        busy = FakePane(bash_dialog("git status"))
+        for at in (T0 + 300, T0 + 300 + planprompt.STALL_REPEAT_S):
+            busy.printed_at = (at - 10) * 1000
+            self.run_pass([self.row()], typist(busy), now=at)
+        self.assertEqual(busy.sent, [])
+        rows = self.room()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(self.addressed(rows[0]["text"]), (False, True))
+        self.assertIn("someone may be at it", rows[0]["text"])
+
+    def test_the_kill_switch_pages_the_owner_and_types_nothing(self):  # noqa: VACUOUS_ASSERTION — the control is IN this arm and unconditional: the sibling seat in the same pass records exactly one key
+        on = FakePane(bash_dialog("git status"), after="%s \n" % POINTER)
+        off = FakePane(bash_dialog("git status"), after="%s \n" % POINTER)
+        panes = {NATIVE: on, "seat-at-its-keyboard": off}
+
+        def answer(row, now=None):
+            return typist(panes[row["seat"]])(row, now=now)
+        # The seat's OWN environment disarms that seat; its sibling is answered
+        # in the same pass (the control).
+        self.run_pass([self.row(),
+                       self.row("seat-at-its-keyboard", answer_env="0", pid=7)],
+                      answer)
+        self.assertEqual(on.sent, [(HANDLE, "1", False)])
+        self.assertEqual(off.sent, [])
+        paged = [r["text"] for r in self.room()
+                 if "seat-at-its-keyboard" in r["text"]]
+        self.assertEqual(len(paged), 1)
+        self.assertIn("HELM_PROMPT_ANSWER is off in seat", paged[0])
+        self.assertEqual(self.addressed(paged[0])[0], True)
+        # The WATCH's environment disarms the fleet.
+        os.environ["HELM_PROMPT_ANSWER"] = "0"
+        fleet = FakePane(bash_dialog("git status"))
+        self.run_pass([self.row("fleet-seat", pid=9)], typist(fleet),
+                      now=T0 + 400)
+        self.assertEqual(fleet.sent, [])
+        self.assertIn("the watch's environment", self.room()[-1]["text"])
+
+    def test_a_blind_pane_takes_one_enter_only_for_an_answerable_transcript(self):  # noqa: VACUOUS_ASSERTION — the control is IN this arm and unconditional: the memory call's blind pane records exactly one Enter
+        write = [{"name": "Write", "input": {"file_path": self.note,
+                                             "content": "a credential note"}}]
+        blind = FakePane("")
+        self.run_pass([self.row()], typist(blind, calls=write))
+        self.assertEqual(blind.sent, [(HANDLE, "", True)])
+        # CONTROL: a pending plan approval is not a prompt this watch answers.
+        plan = FakePane("")
+        self.run_pass([self.row("plan-seat", pid=8)],
+                      typist(plan, calls=[{"name": "ExitPlanMode", "input": {}}]),
+                      now=T0 + 320)
+        self.assertEqual(plan.sent, [])
+        self.assertEqual(self.addressed(self.room()[-1]["text"]), (False, True))
+
+    def test_a_prompt_answered_before_the_keystroke_gets_none(self):  # noqa: VACUOUS_ASSERTION — test_a_routine_tool_prompt_gets_plain_yes_and_never_widens drives this same dialog through this same typist and records the key; the silence here is the record having moved first
+        pane = FakePane(bash_dialog("git status"))
+        self.run_pass([self.row()],
+                      typist(pane, record=FakeRecord(pane, left_already=True)))
+        self.assertEqual((pane.sent, self.room()), ([], []))
+
+    def test_the_dry_run_reads_the_transcript_and_types_and_posts_nothing(self):  # noqa: VACUOUS_ASSERTION — the verdict line read back from the pass is the positive control on the same call
+        pane = FakePane(bash_dialog("git status"))
+        write = [{"name": "Write", "input": {"file_path": self.note}}]
+        res, push = self.run_pass(
+            [self.row()], typist(pane), dry=True,
+            preview=lambda r: planprompt.preview_stall(
+                r, calls=lambda _r: (write, None)))
+        self.assertEqual((pane.sent, self.room()), ([], []))
+        push.assert_not_called()
+        self.assertTrue(any("would answer (an auto-memory write" in line
+                            for line in res["lines"]), res["lines"])
+
+    def test_the_rewritten_text_says_what_the_watch_did(self):  # noqa: VACUOUS_ASSERTION — the loop is over planprompt.ROUTES, a fixed non-empty table, and every subTest asserts the seat is named in the text
+        row = self.row()
+        gone = ("helm does not answer a permission for a human",
+                "until a human answers")
+        for outcome in planprompt.ROUTES:
+            with self.subTest(outcome=outcome):
+                text = planprompt.stall_text(
+                    row, OWNER, INTEGRATOR, None,
+                    planprompt._result(outcome=outcome, why="fixture why",
+                                       detail="fixture detail"))
+                for phrase in gone:
+                    self.assertNotIn(phrase, text)
+                self.assertIn(NATIVE, text)
+
+
+def git_repo(root, files):
+    """A real repository at `root` with `files` ({relpath: text}) TRACKED
+    (staged: `ls-files` reads the index, so no commit or identity is needed),
+    under an environment scrubbed of any ambient repository selection."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    for rel, text in files.items():
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    subprocess.run(["git", "init", "-q", root], check=True, env=env)
+    subprocess.run(["git", "-C", root, "add", "--", *files], check=True,
+                   env=env)
+    return root
+
+
+class LegibleCommandTest(PlanPromptBase):
+    """THE LEGIBILITY RULE (the integrator's ruling on kimi's read of this
+    lane): a Bash prompt gets the routine Yes only when every program its
+    command runs can be read from its own text. An opaque command types
+    nothing and reaches the INTEGRATOR, naming the opaque part; a tracked
+    script's text is read one level deep and gated like the command itself.
+    Each row is driven end to end through the REAL stall_pass and
+    answer_stall, with the pending call carrying the directory it runs in,
+    exactly as the routine arm is; the assertions are the keys the pane
+    received, the room row and whom it addresses, and the phone push."""
+
+    row = StallAnswerTest.row
+    run_pass = StallAnswerTest.run_pass
+    addressed = StallAnswerTest.addressed
+
+    def setUp(self):
+        super(LegibleCommandTest, self).setUp()
+        self.home = os.path.join(self.tmp, "home-fixture")
+        os.makedirs(self.home)
+        self.repo = git_repo(os.path.join(self.tmp, "repo"), {
+            "scripts/ship.sh": "#!/bin/bash\nset -e\ngit push origin main\n",
+            "scripts/tidy.sh": "#!/bin/bash\nls -la\ngrep -n TODO *.py\n",
+            "scripts/a.sh": "#!/bin/bash\nbash scripts/b.sh\n",
+            "scripts/b.sh": "ls\n",
+            "scripts/big.sh": "#!/bin/bash\n" + "ls\n" * (
+                planprompt.SCRIPT_READ_BYTES // 3 + 1),
+            "tools/__init__.py": "",
+            "tools/inert.py": "import json\nprint(json.dumps({}))\n",
+            "tools/spawn.py": "import subprocess\nsubprocess.run(['ls'])\n"})
+        self.outside = os.path.join(self.tmp, "elsewhere", "x.sh")
+        os.makedirs(os.path.dirname(self.outside))
+        with open(self.outside, "w", encoding="utf-8") as f:
+            f.write("ls\n")
+
+    def bash(self, command):
+        """The transcript's pending call, as pending_calls returns one."""
+        return [{"name": "Bash", "input": {"command": command},
+                 "cwd": self.repo}]
+
+    def test_every_row_of_the_ruling_through_the_typist(self):  # noqa: VACUOUS_ASSERTION — the table is fixed and non-empty, and its routine rows record exactly one key through the same typist the silent rows leave empty
+        routine, unknown, owner = "routine", "unknown", "owner"
+        for n, (command, kind, named) in enumerate((
+                ("git status", routine, "run `git status`"),
+                ("C=push; git $C origin main", unknown,
+                 "its word `$C`, an expansion whose value is not on screen"),
+                ("bash scripts/ship.sh", owner, "scripts/ship.sh, whose text "
+                 "holds a push to a remote ('git push')"),
+                ("bash scripts/tidy.sh", routine, "run `bash scripts/tidy.sh`"),
+                ("bash %s" % self.outside, unknown,
+                 "not a file tracked in its repo"),
+                ("./scripts/a.sh", unknown, "in that script it runs a script "
+                 "whose text is not on screen: scripts/b.sh"),
+                ('eval "$(cat f)"', unknown, "it runs `eval`"),
+                # no gate names `xargs rm` (the destructive row wants rm -rf
+                # or its split spelling), so the re-executor decides it
+                ("find . -name x | xargs rm", unknown, "it runs `xargs`"),
+                ("python3 -m unittest tests.test_x", routine,
+                 "run `python3 -m unittest tests.test_x`"),
+                # no OWNER gate names a bare `deploy` (GATED_OPS is the plan
+                # table), so the runner rule decides it
+                ("make deploy", unknown, "it runs `make deploy`, a runner"),
+                ("bash scripts/big.sh", unknown, "larger than 64 KiB"),
+        )):
+            with self.subTest(command=command):
+                who = "legible-%02d-seat" % n   # no name holds another
+                pane = FakePane(bash_dialog(command), after="%s \n" % POINTER)
+                _res, push = self.run_pass(
+                    [self.row(who, pid=500 + n)],
+                    typist(pane, calls=self.bash(command)))
+                rows = [r["text"] for r in self.room() if who in r["text"]]
+                self.assertEqual(len(rows), 1, rows)
+                self.assertIn(named, rows[0])
+                if kind == routine:
+                    self.assertEqual(pane.sent, [(HANDLE, "1", False)])
+                    self.assertEqual(self.addressed(rows[0]), (False, False))
+                    push.assert_not_called()
+                elif kind == owner:
+                    self.assertEqual(pane.sent, [])
+                    self.assertEqual(self.addressed(rows[0]), (True, True))
+                    push.assert_called_once()
+                else:
+                    self.assertEqual(pane.sent, [])
+                    self.assertEqual(self.addressed(rows[0]), (False, True))
+                    self.assertIn("nothing was typed", rows[0])
+                    push.assert_not_called()
+
+    def test_a_script_is_opaque_when_the_watch_cannot_know_its_repo(self):  # noqa: VACUOUS_ASSERTION — the control is IN this arm and unconditional: the same command with its pending call's directory records exactly one key
+        blind = FakePane(bash_dialog("bash scripts/tidy.sh"))
+        self.run_pass([self.row("no-cwd", pid=601)], typist(blind))
+        self.assertEqual(blind.sent, [])
+        text = self.room()[-1]["text"]
+        self.assertEqual(self.addressed(text), (False, True))
+        self.assertIn("cannot tell which repo the command runs in", text)
+        # CONTROL: the transcript names where it runs, and the script is read.
+        seen = FakePane(bash_dialog("bash scripts/tidy.sh"),
+                        after="%s \n" % POINTER)
+        self.run_pass([self.row("with-cwd", pid=602)],
+                      typist(seen, calls=self.bash("bash scripts/tidy.sh")))
+        self.assertEqual(seen.sent, [(HANDLE, "1", False)])
+
+    def test_the_shapes_the_ruling_names_read_as_it_says(self):  # noqa: VACUOUS_ASSERTION — the loop is over two fixed non-empty tuples and every subTest asserts the verdict's kind; the routine tuple is the positive control on the same call
+        """The reader over the other spellings of each clause, through
+        judge_ask with the repo known: a re-executor, an expansion in command
+        position, a runner, and a python module resolve as the ruling says,
+        and a plain program with an expansion in a word no gate reads stays
+        routine."""
+        unknown = (
+            "bash -c 'ls'", "cat x | sh", "sh -s", "python3 -c 'print(1)'",
+            "python3 - <<'EOF'\nprint(1)\nEOF", "node -e 1", "node x.js",
+            "source env.sh", ". ./env.sh", "env bash -c ls",
+            "find . -name x -exec grep y {} +", "PATH=. git status",
+            "npx some-tool", "pnpm build", "npm run release", "just ship",
+            "cargo run", "echo $(./scripts/a.sh)", "$C status",
+            "timeout 60 ./scripts/a.sh", "rm $X build",
+            "cd scripts && bash tidy.sh", "bash scripts/absent.sh",
+            "cat <<EOF\n$(bash x.sh)\nEOF", "python3 -m tools.spawn",
+            "python3 tools/spawn.py", "case x in a) ls;; esac")
+        routine = (
+            "ls $HOME", "npm --version", "bash --version", "/usr/bin/rg -n x",
+            "exec >log 2>&1", "cat <<'EOF'\n$(not run)\nEOF",
+            'for f in a b; do wc -l "$f"; done', "python3 -m pytest -q",
+            "python3 -m tools.inert", "python3 tools/inert.py",
+            "sh scripts/tidy.sh", "git log --oneline -5",
+            "echo $(bash scripts/tidy.sh)")
+        for command in unknown + routine:
+            with self.subTest(command=command):
+                kind, why, _cat = planprompt.judge_ask(
+                    {"tool": "Bash", "command": command, "cwd": self.repo},
+                    self.home)
+                self.assertEqual(kind, planprompt.UNKNOWN if command in unknown
+                                 else planprompt.ROUTINE, why)
+
+    def test_every_program_a_gate_reads_is_one_whose_words_are_checked(self):
+        """`_GATE_PROGRAMS` is the set whose expansions are opaque because a
+        gate reads their words. It must be exactly the programs the command
+        gates name, both directions: a new gate row naming a program owes it a
+        row there, and a program no gate names is not the gates' to protect."""
+        not_programs = {"branch", "worktree", "force", "buy", "purchase",
+                        "payment", "subscribe", "tweet", "drop", "oauth", "id"}
+        named = set()
+        for fields, pat, _category, _words in planprompt.OWNER_GATES:
+            if "command" not in fields:
+                continue
+            for pre, alts in re.findall(
+                    r"\\b([a-z][a-z0-9]*-)?\(\?:([a-z0-9|-]+)\)", pat.pattern):
+                named.update(pre + a for a in alts.split("|"))
+            named.update(w for w in re.findall(r"\\b([a-z][a-z0-9-]*)",
+                                               pat.pattern)
+                         if not w.endswith("-"))
+        self.assertIn("git", named)                  # the census reads rows
+        self.assertEqual(named - not_programs, set(planprompt._GATE_PROGRAMS))
+
+
+class PendingCallsTest(unittest.TestCase):
+    """The transcript witness: the LAST assistant message's calls that have no
+    result yet, with a subagent spawn left out."""
+
+    def test_only_the_last_messages_unanswered_calls_are_pending(self):
+        root = tempfile.mkdtemp(prefix="helm-test-pending-")
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "projects", "-work"))
+
+        def use(mid, uid, name, **inp):
+            return {"type": "assistant", "message": {"id": mid, "content": [
+                {"type": "tool_use", "id": uid, "name": name, "input": inp}]}}
+
+        def result(uid):
+            return {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": uid}]}}
+        recs = [use("m1", "u0", "Bash", command="git log"),     # history
+                use("m2", "u1", "Bash", command="git status"),
+                use("m2", "u2", "Write", file_path="/w/a.md"),
+                use("m2", "u3", "Agent", prompt="spawn"),
+                result("u1")]
+        with open(os.path.join(root, "projects", "-work",
+                               STALL_SID + ".jsonl"), "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in recs))
+        calls, why = planprompt.pending_calls(STALL_SID, root)
+        self.assertIsNone(why)
+        self.assertEqual([c["name"] for c in calls], ["Write"])
+        self.assertEqual(calls[0]["input"]["file_path"], "/w/a.md")
+        self.assertIsNone(calls[0]["cwd"])      # the record named none
+        # CONTROL: no transcript is an unread witness, never "nothing pending".
+        self.assertIsNone(planprompt.pending_calls("d" * 36, root)[0])
+
+    def test_a_pending_call_carries_the_directory_its_record_names(self):
+        """Claude Code writes the shell's current directory into every record;
+        the Bash call's own record is where its command runs."""
+        root = tempfile.mkdtemp(prefix="helm-test-pending-")
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "projects", "-work"))
+        rec = {"type": "assistant", "cwd": "/work/sub", "message": {
+            "id": "m1", "content": [{"type": "tool_use", "id": "u1",
+                                     "name": "Bash",
+                                     "input": {"command": "bash x.sh"}}]}}
+        with open(os.path.join(root, "projects", "-work",
+                               STALL_SID + ".jsonl"), "w") as f:
+            f.write(json.dumps(rec) + "\n")
+        calls, why = planprompt.pending_calls(STALL_SID, root)
+        self.assertIsNone(why)
+        self.assertEqual([c["cwd"] for c in calls], ["/work/sub"])
+        self.assertEqual(planprompt.call_ask(calls[0])["cwd"], "/work/sub")
+
+
+class FocusPointerOptionsTest(unittest.TestCase):
+    """Claude Code draws the focused choice as `❯ 1. Yes`. An option parser
+    that breaks its run on that row reads a real dialog as NO options, and no
+    answerer can read its digits."""
+
+    def test_the_pointer_row_is_part_of_the_run(self):
+        tail = bash_dialog("git status")
+        self.assertEqual([n for n, _label in seat._prompt_options(tail)],
+                         [1, 2, 3])
+        self.assertEqual(seat.affirmative_choice(seat._prompt_options(tail)),
+                         ("1", "Yes"))
+        # CONTROL: a newer numbered list below it still wins (newest-run law).
+        self.assertEqual(seat._prompt_options(
+            tail + " 1. src/main.py\n 2. src/util.py\n"), [])

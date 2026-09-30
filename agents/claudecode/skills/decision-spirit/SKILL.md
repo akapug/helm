@@ -142,7 +142,10 @@ while continuing with the best reversible probe path.
     mentioned.** Build the ideal DEPENDENCY GRAPH over ALL known work (not just the current ask) and
     do what UNBLOCKS or CHANGES the most still-undone tasks first - global topological impact, not
     greedy-local "what's next on the list" (a change that reshapes 5 pending tasks comes before a
-    self-contained one, even if the self-contained one was mentioned first). Exploit HOT CONTEXT:
+    self-contained one, even if the self-contained one was mentioned first). Friction is in the
+    graph: a tax cut (a fix that removes a step agents repeat by hand, a workaround or a false
+    refusal) ranks by payback days = build cost / tax removed per day, and one that pays back within
+    about 2 days goes ahead of new features. Exploit HOT CONTEXT:
     finish what this context is already warm on before it goes cold - re-grounding a dropped thread
     costs a full reload, so context is a prime resource to spend, not refill. Cheapest premise/probe
     checks first (#18); secure a verified base before the next layer (never stack on unverified

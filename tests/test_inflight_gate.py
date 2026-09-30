@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 from helm import gate, inflight_gate
+from tests import _pids
 
 
 class InflightMarkerTest(unittest.TestCase):
@@ -57,7 +58,7 @@ class InflightMarkerTest(unittest.TestCase):
         forever, the guard would be worse than the gap it closes — the room
         would be uncommittable until someone found the file by hand."""
         with open(gate.inflight_path(self.room), "w", encoding="utf-8") as fh:
-            json.dump({"pid": 999999, "ts": "stale"}, fh)
+            json.dump({"pid": _pids.DEAD_PID, "ts": "stale"}, fh)
         self.assertTrue(os.path.exists(gate.inflight_path(self.room)))  # present
         live = gate.inflight(self.room)
         self.assertIsNone(live)                                         # not live
@@ -115,7 +116,8 @@ class InflightMarkerTest(unittest.TestCase):
         Uses the non-suite argv path so the run is a millisecond, not a whole
         gate: the marker bracket is shared by both paths."""
         import subprocess
-        open(os.path.join(self.room, "f"), "w").write("x")
+        with open(os.path.join(self.room, "f"), "w") as fh:
+            fh.write("x")
         subprocess.run(["git", "add", "-A"], cwd=self.room, capture_output=True)
         subprocess.run(["git", "commit", "-qm", "seed", "--no-verify"],
                        cwd=self.room, capture_output=True)

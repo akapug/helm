@@ -7,8 +7,11 @@ from helm import dispatches
 
 
 @contextlib.contextmanager
-def native_author(case, family="claude"):
-    """Supply runtime evidence; leave tier capture and validation entirely real."""
+def native_author(case, family="claude", model=None):
+    """Supply runtime evidence; leave tier capture and validation entirely real.
+
+    `model` is the model the seat's runtime records (HELM_MODEL_ID), which
+    the verdict carries as its resolved model; None records none."""
     author_session = "verdict-author-session"
 
     def family_evidence(identity, session=None, require_exact_session=False):
@@ -16,6 +19,8 @@ def native_author(case, family="claude"):
         case.assertIs(require_exact_session, True)
         runtime = {"family": family, "agent_harness": "claude",
                    "backend": "native"}
+        if model:
+            runtime["model"] = model
         evidence = {"v": 5, "identity": identity,
                     "roster_identity": identity, "session": author_session,
                     "runtime": runtime, "runtime_verified": True}

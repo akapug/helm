@@ -20,8 +20,10 @@ rows; a TRACKED seat's delivery lane backfills a room born after its join
 from offset 0, so the mention that created the meld MUST deliver (seats.py
 multi-room law); (2) event path — @mention → PostToolUse boundary (busy) or
 the join-mandated `wait --follow` beacon (idle); (3) self-timeout — recv's
-blocking bound and the exchange cap are BEHAVIOR (exit 3, fall-to-async
-instruction printed), never advice. Layers affect latency, never delivery.
+blocking bound and the exchange cap are BEHAVIOR (exit 3), never advice. The
+cap prints the fall-to-async instruction; the bound prints "recv again",
+because many real peer replies take longer than the bound. Layers affect
+latency, never delivery.
 
 Mentions fire ONLY at act-moments — invite (@peer), READY (@convener),
 DONE/ABORT (@peer). Mid-meld YIELD/HOLD chunks carry NO mention: both
@@ -64,6 +66,7 @@ or kill a meld with a forged DONE/ABORT. Identity is env-first
 silently overrode HELM_CHAT_NAME for any roster-known session.
 """
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -329,6 +332,20 @@ def _validate_event(ev, room):
     return None
 
 
+#: The two transitions that may start an actor's NEXT ROUND in a room it has
+#: already spoken in: a persistent room (a task's pair meld) holds one round
+#: per dispatch, each fenced by its own, strictly newer epoch.
+_ROUND_OPENERS = ("invited", "accepted")
+
+
+def _opens_round(kind, before_epoch, epoch):
+    """Does a `kind` event at `epoch` open a new round over an actor whose
+    last event was at `before_epoch`? Only an invite or a join, and only
+    FORWARD: an older epoch can never reopen a round the room moved past."""
+    return (kind in _ROUND_OPENERS and isinstance(before_epoch, int)
+            and isinstance(epoch, int) and epoch > before_epoch)
+
+
 def _reduce(events, room):
     """(states, unique, why, roomproj) — the OWNER layer: one fold over the
     validated event stream yields both the per-actor states AND the room-level
@@ -358,8 +375,11 @@ def _reduce(events, room):
         actor = ev["actor"]
         before = states.get(actor)
         if before is not None and ev["epoch"] != before["epoch"]:
-            return {}, [], "actor epoch changed at sequence %d" % seq, \
-                _EMPTY_ROOMPROJ
+            if not _opens_round(ev["transition"], before["epoch"],
+                                ev["epoch"]):
+                return {}, [], "actor epoch changed at sequence %d" % seq, \
+                    _EMPTY_ROOMPROJ
+            before = None                 # a new round starts from nothing
         after = ev["projection"]
         if not _valid_transition(ev["transition"],
                                  before["projection"] if before else None,
@@ -481,6 +501,29 @@ def _cache_key(room):
     return os.path.abspath(lifecycle_path(room)), room
 
 
+def converged_with(st, peer):
+    """True iff actor snapshot `st` records a CLOSED meld that `peer` spoke in.
+
+    Closed means `done` or `done-mutual`. Spoke means recv accepted at least
+    one chunk from `peer` (its DONE counts): `exchanges >= 1` and `peer` in
+    `spoke_peers`. One side's own DONE writes `done` whether or not the peer
+    ever joined, so status alone reads a meld closed alone as converged.
+    Measured on the live bus: 17 of 83 meld records were `done` with 0
+    exchanges and no peer in spoke_peers, and the stop guard's spiral rung
+    (seats_stop_signals._melded_with) took each one as the cure.
+
+    Fails closed: a missing or malformed field is not convergence, and a bool
+    is never an exchange count."""
+    if not isinstance(st, dict) or str(st.get("status") or "") not in (
+            "done", "done-mutual"):
+        return False
+    who = [st.get("peer")] + list(st.get("peers") or [])
+    ex, spoke = st.get("exchanges"), st.get("spoke_peers")
+    return (peer in [str(x) for x in who if x]
+            and isinstance(ex, int) and not isinstance(ex, bool) and ex >= 1
+            and isinstance(spoke, list) and peer in [str(x) for x in spoke])
+
+
 def _unknown_state(room, seat, reason):
     _UNKNOWN[_cache_key(room)] = reason
     return {"room": room, "self": seat, "status": "UNKNOWN", "_unknown": reason}
@@ -508,9 +551,10 @@ def _repair_from_ram(room, seat):
         # snapshots, a markerless stream) folds its bits into typed room
         # markers on this first journaled read — then the bits are retired
         # and never read again. Skipped when the caller already holds the
-        # room lock (replay_room's no-restore path folds there instead):
-        # flock is not recursive.
-        with chat._room_lock(room):
+        # room lock: replay_room's no-restore path folds there instead.
+        with chat._room_lock(room) as locked:
+            if not locked:
+                return _unknown_state(room, seat, "meld lifecycle room lock unavailable")
             why = _migrate_parent_bits_locked(room, seat, states, unique)
         # the helper's tri-state: "folded" is SUCCESS (markers appended), a
         # reason string is UNKNOWN, None is nothing-to-fold. r6b made it
@@ -551,21 +595,55 @@ def state(room, seat):
     return d if isinstance(d, dict) else None
 
 
+_CLOSED_SIDE = ("done", "done-mutual", "aborted")
+
+
+def finished(room):
+    """True iff every member of the room's NEWEST round has closed its side.
+
+    CLOSED, NEVER QUIET. A side is closed when its actor's lifecycle status
+    is done, done-mutual or aborted; the meld is finished only when EVERY
+    member of the newest round -- each actor at that epoch and every peer
+    one of them pinned -- holds one. So a convener who closes an invite
+    nobody joined has not finished a meld, a pair room whose next round has
+    opened is a meld in progress again, and a room that is merely idle is
+    never finished for being idle (task/3519: a standing or slow room must
+    not read as over). The retirement that reads this adds its own quiet
+    bound on top; this answers only whether the meld is over.
+
+    A PURE READ OF THE LIFECYCLE STREAM, RAM first and then the durable
+    copy: no snapshot repair, no migration and no lock, so a caller already
+    holding the room lock may ask. A stream that is absent, unreadable or
+    does not reduce is UNKNOWN, and UNKNOWN is not finished."""
+    path = lifecycle_path(room)
+    if not os.path.exists(path):
+        path = lifecycle_path(room, durable=True)
+    events, unavailable = _events(path)
+    if unavailable or not events:
+        return False
+    states, _unique, why, _roomproj = _reduce(events, room)
+    if why or not states:
+        return False
+    epoch = max(s["epoch"] for s in states.values())
+    current = {actor: s["projection"] for actor, s in states.items()
+               if s["epoch"] == epoch}
+    members = set(current)
+    for proj in current.values():
+        members.update(proj.get("peers") or ())
+    return all(m in current and current[m].get("status") in _CLOSED_SIDE
+               for m in members)
+
+
 def _write_state(room, seat, st):
     chat._ensure_dir()
     pk.write_json(state_path(room, seat), st)
 
 
 def _lock_held(room):
-    """True when THIS process already holds the room's flock. chat._room_lock
-    is a non-recursive POSIX flock — re-taking it from the same process
-    deadlocks (replay_room holds it across its whole critical section and
-    calls _repair_from_ram inside). Linux /proc/locks is the ground truth
-    (FLOCK ADVISORY WRITE <pid> <dev>:<ino>); the OWNER pid must be ours —
-    a lock held by a SIBLING process is not ours, and answering True there
-    would skip the migration exactly when it is owed. A platform without
-    /proc/locks answers False (the lock-taking behavior is unchanged from
-    before the guard existed)."""
+    """True when THIS process already holds the room's flock. Checks the
+    in-process re-entrancy tracker first, falling back to Linux /proc/locks."""
+    if chat.is_room_locked(room):
+        return True
     path = os.path.abspath(os.path.join(chat.chat_dir(), pk.slug(room) + ".lock"))
     try:
         st = os.stat(path)
@@ -657,8 +735,8 @@ def _migrate_parent_bits_locked(room, seat, states, unique):
         # durable copy against the PRE-FOLD stream (the fold's input), never
         # the post-fold one — the markers are exactly what durable lacks.
         dpath = lifecycle_path(room, True)
-        if not os.path.exists(dpath):
-            return True
+        if not os.path.exists(dpath) or chat.journal_write_refusal():
+            return True          # an isolated namespace folds its RAM only
         durable, dunavailable = _events(dpath)
         if dunavailable:
             return False
@@ -747,8 +825,77 @@ def _reload_after_append(room, seat):
     return states, unique
 
 
-def _transition(room, seat, kind, st, cause=None):
-    with chat._room_lock(room):
+def _adopt_durable_markers(room, path, unique):
+    """Copy into RAM the restore markers the durable journal holds past RAM's
+    tail, so the next live event takes a sequence durable has not spent. The
+    caller holds the room lock (the flush reads durable under the same one).
+
+    The flush accepts durable-ahead as the steady state, while the next
+    sequence was counted from RAM alone. A live event then took the durable
+    marker's seq and event id with different content, neither stream was a
+    prefix of the other, and the flush quarantined the room and its chat
+    rows. Adopting the markers makes RAM a prefix of durable again, so the
+    live event flushes as an extension.
+
+    Only the marker-only shape is adopted (_replay_divergence's rule). An
+    isolated namespace or no durable file adopts nothing. A durable journal
+    that cannot be read or reduced, or one ahead of RAM by anything but
+    restore markers, or forked from it, REFUSES the transition before any
+    append (LifecycleError naming why): allocating from RAM there reuses a
+    durable seq and id, and the next flush quarantines the room for good.
+    True when RAM was appended to."""
+    why = _durable_refusal(room, unique)
+    if why:
+        raise LifecycleError(why)
+    dpath = lifecycle_path(room, True)
+    if chat.journal_write_refusal() or not os.path.exists(dpath):
+        return False
+    durable, _unavailable = _events(dpath)
+    _ds, dunique, why, _rp = _reduce(durable, room)
+    if (why or len(dunique) <= len(unique)
+            or dunique[:len(unique)] != unique
+            or _replay_divergence(unique, dunique) is not None):
+        return False
+    for ev in dunique[len(unique):]:
+        if not eventledger.append(path, ev):
+            raise LifecycleError("could not append meld lifecycle RAM journal")
+    return True
+
+
+def _durable_refusal(room, unique):
+    """Why a live transition must not be allocated over `room`'s durable
+    journal, or None. The caller holds the room lock and has reduced RAM to
+    `unique`. None when there is no durable copy to collide with (an isolated
+    namespace, no file), when durable is a prefix of RAM (the flush extends
+    it), or when durable is ahead only by restore markers (adopted)."""
+    dpath = lifecycle_path(room, True)
+    if chat.journal_write_refusal() or not os.path.exists(dpath):
+        return None
+    durable, unavailable = _events(dpath)
+    if unavailable:
+        return ("meld lifecycle durable journal UNKNOWN for %s: %s — a live "
+                "transition would reuse a sequence it may have spent"
+                % (room, unavailable))
+    _ds, dunique, why, _rp = _reduce(durable, room)
+    if why:
+        return ("meld lifecycle durable journal UNKNOWN for %s: %s — a live "
+                "transition would reuse a sequence it may have spent"
+                % (room, why))
+    if dunique == unique[:len(dunique)]:
+        return None
+    why = _replay_divergence(unique, dunique)
+    return ("refusing a live meld transition in %s: %s" % (room, why)) \
+        if why else None
+
+
+def _transition(room, seat, kind, st, cause=None, before_write=None):
+    """Append one lifecycle event under the room lock. `before_write` runs
+    after every check passed and before the append, still under the lock: a
+    caller whose own write must stand with this one (say's chat row) refuses
+    there, so a refusal on either side leaves both unwritten."""
+    with chat._room_lock(room) as locked:
+        if not locked:
+            raise LifecycleError("meld lifecycle room lock unavailable for %s" % room)
         path = lifecycle_path(room)
         events, unavailable = _events(path)
         if unavailable:
@@ -756,7 +903,18 @@ def _transition(room, seat, kind, st, cause=None):
         states, unique, why, roomproj = _reduce(events, room)
         if why:
             raise LifecycleError("meld lifecycle RAM journal UNKNOWN: %s" % why)
+        if _adopt_durable_markers(room, path, unique):
+            events, unavailable = _events(path)
+            if unavailable:
+                raise LifecycleError("meld lifecycle RAM journal unavailable: %s"
+                                     % unavailable)
+            states, unique, why, roomproj = _reduce(events, room)
+            if why:
+                raise LifecycleError("meld lifecycle RAM journal UNKNOWN: %s" % why)
         before = states.get(seat)
+        if before is not None and _opens_round(kind, before["epoch"],
+                                               st["epoch"]):
+            before = None                 # the actor's next round, see _reduce
         seq = len(unique) + 1
         ev = {"v": LIFECYCLE_V, "id": _event_id(room, seq), "room": room,
               "seq": seq, "ts": pk.now_ts(), "actor": seat,
@@ -770,6 +928,8 @@ def _transition(room, seat, kind, st, cause=None):
                                         ev["projection"], cause):
             raise LifecycleError("refusing impossible meld transition %s: %s" %
                                  (kind, why or "state mismatch"))
+        if before_write is not None:
+            before_write()
         if not eventledger.append(path, ev):
             raise LifecycleError("could not append meld lifecycle RAM journal")
         # Provenance is a STREAM fact, not a snapshot bit: the FIRST live
@@ -805,13 +965,229 @@ def room_name(topic, epoch):
     return "meld-%d-%s" % (epoch, s)
 
 
-def _post(text, room, seat):
+_SEED_RE = re.compile(r"\A\s*\[MELD e:(\d+)\] PROBLEM: ")
+
+
+def seeds(rows):
+    """[(epoch, convener, seedtext, index)] — every round opened in a room, in
+    room order. A seed is a PROBLEM row whose `convener=` field names the seat
+    that posted it; a room made by `invite` into a fresh name holds one, a
+    persistent room (a task's pair meld) holds one per round."""
+    out = []
+    for i, m in enumerate(rows or ()):
+        text, frm = m.get("text") or "", str(m.get("from") or "")
+        sm = _SEED_RE.match(text)
+        if not sm or not frm or m.get("react"):
+            continue
+        conv = re.findall(r"convener=([\w.-]+) invited=", text)
+        if conv and conv[-1] != frm:
+            continue                      # a seed in another seat's name
+        out.append((int(sm.group(1)), frm, text, i))
+    return out
+
+
+def latest_seed(rows):
+    """(epoch, convener, seedtext) of the room's NEWEST round, or (None, None,
+    None). A room with no PROBLEM-shaped row falls back to its first
+    epoch-marked row, which is what every reader took before a room could
+    hold more than one round."""
+    found = seeds(rows)
+    if found:
+        epoch, conv, text, _i = max(found, key=lambda s: (s[0], s[3]))
+        return epoch, conv, text
+    for m in rows or ():
+        em = _EPOCH_RE.search(m.get("text") or "")
+        if em and m.get("from"):
+            return int(em.group(1)), str(m["from"]), m.get("text") or ""
+    return None, None, None
+
+
+def _room_epoch_max(room):
+    """The newest epoch any row or lifecycle event of `room` names, or 0."""
+    best = 0
+    rows, _total = chat.read(room)
+    for m in rows:
+        em = _EPOCH_RE.search(m.get("text") or "")
+        if em:
+            best = max(best, int(em.group(1)))
+    events, _unavailable = _events(lifecycle_path(room))
+    for ev in events or ():
+        ep = ev.get("epoch") if isinstance(ev, dict) else None
+        if isinstance(ep, int) and not isinstance(ep, bool):
+            best = max(best, ep)
+    return best
+
+
+#: A joiner's share of carried history: this fraction of its context window,
+#: at four bytes a token, clamped. A 115072-token seat gets 4602 bytes; a
+#: 1M-token seat gets the ceiling; a seat with no stamp gets the floor. The
+#: rest stays one `chat read` away.
+DIGEST_WINDOW_FRACTION = 0.01
+DIGEST_FLOOR, DIGEST_CEILING = 1024, 8192
+
+
+def digest_budget(window=None):
+    """(bytes, window_tokens | None) a joiner may take of a room's earlier
+    rounds.
+
+    The window is the joiner's OWN stamp (CLAUDE_CODE_MAX_CONTEXT_TOKENS, set
+    at launch for every seat whose model is not the harness default). A seat
+    with NO stamp, or an unreadable one, gets the FLOOR and a window of None:
+    its size is unknown, and guessing it large is how a small-window seat
+    would take a digest it cannot hold (the integrator's ruling). Carrying a
+    whole room into a small window is how a pair meld would cause the
+    compaction it exists to prevent, so no answer here is ever the log."""
+    if window is None:
+        try:
+            window = int(os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                         or 0)
+        except ValueError:
+            window = 0
+        if window < 1:
+            return DIGEST_FLOOR, None
+    window = max(1, int(window))
+    raw = int(window * 4 * DIGEST_WINDOW_FRACTION)
+    return max(DIGEST_FLOOR, min(DIGEST_CEILING, raw)), window
+
+
+def history_digest(room, rows, epoch, budget=None):
+    """[lines] — the rounds of `room` before `epoch`, newest first, one line
+    each, cut at `budget` bytes, and ALWAYS the pointer to the whole log.
+
+    Each line names the round's pair, its problem head and how it ended (the
+    parties' MELD OUTCOME, or open). It is a digest, never the log: the log
+    is `helm chat read --room`, and a line that does not fit is counted, not
+    carried."""
+    from . import review_door
+    window = True
+    if budget is None:
+        budget, window = digest_budget()
+    prior = [s for s in seeds(rows) if s[0] < epoch]
+    total = sum(len((m.get("text") or "").encode("utf-8")) for m in rows)
+    pointer = "the whole log (%d rows, %d bytes): helm chat read --room %s" % (
+        len(rows), total, room)
+    if not prior:
+        return [pointer]
+    heading = "%d earlier round(s) in this room, newest first (a digest " \
+        "bounded to %d bytes%s):" % (
+            len(prior), budget,
+            "" if window else "; no window stamp, so the smallest")
+    omitted = "  (%d earlier round(s) not shown here)" % len(prior)
+    reserve = sum(len(x.encode("utf-8")) + 1
+                  for x in (heading, omitted, pointer))
+    lines, used, cut = [], 0, 0
+    for ep, conv, text, _i in sorted(prior, key=lambda s: -s[0]):
+        got = review_door.room_outcome(room, rows=rows, epoch=ep)
+        head = text.split("PROBLEM:", 1)[-1].split(" | convener=", 1)[0]
+        head = " ".join(head.split())
+        if len(head) > 110:
+            head = head[:109] + "…"
+        ended = got["outcome"] or "open"
+        if got.get("tip"):
+            ended += " tip " + got["tip"][:12]
+        line = "  round e:%d %s: %s -> %s" % (
+            ep, "+".join(chat._dsan(p) for p in got["parties"] or [conv]),
+            head, ended)
+        size = len(line.encode("utf-8")) + 1
+        if reserve + used + size > budget:
+            cut += 1
+            continue
+        lines.append(line)
+        used += size
+    out = [heading] + lines
+    if cut:
+        out.append("  (%d earlier round(s) not shown here)" % cut)
+    out.append(pointer)
+    return out
+
+
+def _post(text, room, seat, marker=None):
     """Every meld row rides the v1 RAM append unsigned — the latency-pure
     path by law (a node round-trip mid-meld dilutes the preset's one axis)."""
-    return chat.post(text, room=room, who=seat, sign=False)
+    return chat.post(text, room=room, who=seat, sign=False,
+                     meld_marker=marker)
 
 
-def invite(peer, topic, seat=None, via="meld"):
+BUSY_REVIEWS = 2       # open review rows that make an invitee a busy reader
+BUSY_AGE_S = 900       # ... once each has waited this long (DESIGN 3.4.1)
+
+
+def _reach(peers, now=None):
+    """{peer: the line saying why this invite may never become its turn}.
+
+    INVITE ONLY A LIVE SEAT (meld program A3, DESIGN 3.4.1). The wake line in
+    `invite` promised every tracked peer "never lost, only delayed", and an
+    IDLE seat with no live beacon never takes that turn: the spiral rung once
+    prescribed a meld with gemini while the census read it DEAF-IN-EFFECT.
+
+    A WARNING, NEVER A REFUSAL. A seat with no live beacon still receives the
+    row at its next tool boundary when it is mid-turn (the hook path
+    test_invite_delivers_to_tracked_peer drives), so a refusal would block a
+    meld that can happen. The convener decides, with the verdict in hand.
+
+    READ, NEVER RE-MEASURED. The verdict is the attendance register the
+    beacons timer writes onto each roster row, and the owed rows are the
+    stop-facts resident's frontier: a roster read and a facts read, measured
+    at 1.5 ms and ~100 ms. The first cut ran a fresh census (0.25-2 s, a
+    process-table sweep) and a ledger fold (55 s right after a land), and an
+    invite is the moment a meld should be instant.
+
+    UNKNOWN SAYS NOTHING. No register row, one older than two census
+    intervals, an UNPROVEN verdict, or stop-facts that are not exact leave a
+    peer out of the answer: an unreadable or stale reading never becomes a
+    claim about a seat."""
+    from . import beacons, seats, stopfacts
+    now = time.time() if now is None else now
+    out = {}
+    try:
+        roster = seats.roster() or {}
+    except Exception:                        # noqa: BLE001 — an unreadable
+        roster = {}                          # roster names no seat
+    asleep = (beacons.DEAF, beacons.DEAF_IN_EFFECT, beacons.VACANT,
+              beacons.MISROUTED, beacons.RESTING)
+    for p in peers:
+        att = (roster.get(p) or {}).get("attendance")
+        at = att.get("at") if isinstance(att, dict) else None
+        if not isinstance(at, (int, float)) \
+                or now - at > 2 * beacons.INTERVAL_S:
+            continue
+        if att.get("state") in asleep:
+            out[p] = ("WARNING: %s is %s (%s, read %ds ago), so nothing wakes "
+                      "it: an idle seat never sees this invite, and a busy one "
+                      "sees it only at its next tool boundary"
+                      % (chat._dsan(p), att["state"],
+                         att.get("why") or "no reason given",
+                         max(0, int(now - at))))
+    try:
+        owed, why = stopfacts.read().owed_pair(peers[0])
+    except Exception:                        # noqa: BLE001 — unreadable facts
+        owed, why = {}, "unreadable"         # say nothing
+    if why:
+        return out
+    stale = {}
+    for r in owed.values():
+        who = str(r.get("recipient") or "")
+        if r.get("kind") != "review" or who not in peers or who in out:
+            continue
+        at = pk.parse_ts_epoch(r.get("ts"))
+        if at is not None and now - at >= BUSY_AGE_S:
+            stale[who] = stale.get(who, 0) + 1
+    for who, n in stale.items():
+        if n >= BUSY_REVIEWS:
+            out[who] = ("WARNING: %s holds %d open review rows older than %d "
+                        "min, so this meld queues behind them"
+                        % (chat._dsan(who), n, BUSY_AGE_S // 60))
+    return out
+
+
+def _opening_lock_name(room):
+    """A fixed-width sibling lock key that can never truncate to `room`."""
+    return "meld-open-" + hashlib.blake2b(
+        str(room).encode("utf-8"), digest_size=16).hexdigest()
+
+
+def invite(peer, topic, seat=None, via="meld", room=None, ring=None,
+           _round_topic=None, _opened=None, _round_marker=None):
     """(room, lines) — open a meld/standup: seed the problem ([HOLD], discipline
     included so joiners need no skill file), then the @peers invite HEAD-first
     (clip-proof). `peer` is ONE seat or a comma/space list (standup = the
@@ -819,12 +1195,20 @@ def invite(peer, topic, seat=None, via="meld"):
     `invited=<set>`, the pinned SET that is the anti-hijack allowlist — join
     refuses any seat not in it, recv accepts READY/chunks only from members. A
     1-element set IS the 2-party pinned pair (strict backward-compat). Each
-    untracked peer gets its OWN loud no-delivery-lane warning."""
+    untracked peer gets its OWN loud no-delivery-lane warning.
+
+    `room` NAMES A PERSISTENT ROOM (a task's pair meld): this opening is then
+    the room's next ROUND, not a new room. Its epoch is strictly newer than
+    every epoch the room has seen, so the fence retires the rounds before it,
+    the exchange cap counts this round only, and the history stays in the one
+    room. `ring` says what already woke the peers (a dispatch row's DM): the
+    invite row then carries NO @mention, because one wake is the whole budget.
+    `_round_topic` builds a persistent room's topic from the locked count of
+    prior rounds; `_opened` receives that exact count and epoch before unlock.
+    `_round_marker` makes that opening idempotent under the same lock: an exact
+    marker immediately after `PROBLEM:` reuses its existing round instead of
+    appending another one."""
     seat = seat or _self_seat()
-    if not str(topic or "").strip():
-        raise SystemExit(
-            "helm chat %s: MELD-EMPTY-PROBLEM — invite wants a non-empty "
-            "problem statement before it can create a room" % via)
     invited = []
     for raw in str(peer or "").replace(",", " ").split():
         p = raw.lstrip("@")
@@ -842,57 +1226,159 @@ def invite(peer, topic, seat=None, via="meld"):
     if not invited:
         raise SystemExit("helm chat %s: invite wants at least one peer seat name" % via)
     members = set(invited) | {seat}
-    outside = _outside_member_mentions(topic, members)
-    if outside:
-        addressed = ", ".join("@" + chat._dsan(x) for x in outside)
-        pinned = ", ".join(sorted(chat._dsan(x) for x in members))
-        raise SystemExit(
-            "helm chat %s: MELD-MEMBERSHIP-MISMATCH addressed=%s pinned={%s} — "
-            "invite every addressed participant, or use a plain name for a "
-            "non-participant reference" % (via, addressed, pinned))
     epoch = int(time.time())
-    room = room_name(topic, epoch)
-    if state(room, seat):
-        raise SystemExit("helm chat %s: state already exists for room %s" % (via, room))
-    seed = ("[MELD e:%d] PROBLEM: %s | convener=%s invited=%s cap=%d "
-            "recv-timeout=%ds | MELD DISCIPLINE: reply FAST with what you "
-            "already know; a fork that needs research is NOT a meld — close "
-            "[DONE] with the async continuation. [HOLD]"
-            % (epoch, topic, seat, ",".join(invited), _cap(),
-               int(_recv_timeout())))
-    _post(seed, room, seat)
-    # peers validated above; laundering the EMITTED copies stays as
-    # defense-in-depth beneath the seam. topic is CONTENT, left full-fidelity
-    # by the class rule (only identity is laundered).
+    prior_rounds = 0
+    if room is not None and (not re.fullmatch(
+            r"meld-\d+-[a-z0-9-]{1,64}", str(room)) or pk.slug(room) != room):
+        raise SystemExit("helm chat %s: --room %r is not a meld room name"
+                         % (via, room))
+    if _round_topic is not None and (room is None or not callable(_round_topic)):
+        raise SystemExit("helm chat %s: a round topic builder requires one "
+                         "persistent room" % via)
+    if _round_marker is not None and (room is None or _round_topic is None
+                                      or not str(_round_marker).strip()):
+        raise SystemExit("helm chat %s: a round marker requires one persistent "
+                         "room and topic builder" % via)
+
+    def checked_topic(value):
+        value = str(value or "").strip()
+        if not value:
+            raise SystemExit(
+                "helm chat %s: MELD-EMPTY-PROBLEM — invite wants a non-empty "
+                "problem statement before it can create a room" % via)
+        outside = _outside_member_mentions(value, members)
+        if outside:
+            addressed = ", ".join("@" + chat._dsan(x) for x in outside)
+            pinned = ", ".join(sorted(chat._dsan(x) for x in members))
+            raise SystemExit(
+                "helm chat %s: MELD-MEMBERSHIP-MISMATCH addressed=%s "
+                "pinned={%s} — invite every addressed participant, or use a "
+                "plain name for a non-participant reference"
+                % (via, addressed, pinned))
+        return value
+
+    if _round_topic is None:
+        topic = checked_topic(topic)
+    # BROADCAST TOKENS in invite topics wake nobody — refuse them outright.
+    _broadcast_token_refusal(topic)
+    # A PERSISTENT ROOM'S ROUND OPEN IS ONE CRITICAL SECTION. Each post takes
+    # the room's chat lock itself and releases it, so a sibling lock held
+    # across the whole open serializes epoch allocation, both protocol rows
+    # and the lifecycle transition. Without it two concurrent dispatches
+    # read the same maximum and minted the same epoch.
+    lock_name = _opening_lock_name(room) if room is not None else None
+    opening = chat._room_lock(lock_name) if lock_name is not None \
+        else contextlib.nullcontext()
+    reused = False
     d_peers = [chat._dsan(p) for p in invited]
-    inv = ("%s [MELD-INVITE e:%d] room=%s JOIN: helm chat %s join %s "
-           "THEN: helm chat %s recv %s || topic: %s"
-           % (" ".join("@" + d for d in d_peers), epoch, room, via, room,
-              via, room, topic))
-    _post(inv, room, seat)
-    # the convener's accept-set IS the invited set; `peer` kept = invited[0]
-    # so any legacy single-peer reader still resolves (backward-compat).
-    st = {
-        "room": room, "epoch": epoch, "role": "convener", "self": seat,
-        "peer": invited[0], "peers": list(invited), "idx": 0, "exchanges": 0,
-        "cap": _cap(), "status": "invited", "created": pk.now_ts(),
-        "done_peers": [], "spoke_peers": []}
-    _transition(room, seat, "invited", st)
+    with opening as opening_locked:
+        if lock_name is not None and not opening_locked:
+            raise LifecycleError("persistent-room opening lock unavailable")
+        if room is None:
+            room = room_name(topic, epoch)
+            if state(room, seat):
+                raise SystemExit("helm chat %s: state already exists for room %s"
+                                 % (via, room))
+        else:
+            room_rows, _total = chat.read(room)
+            found = seeds(room_rows)
+            marker = str(_round_marker or "")
+            for n, (old_epoch, old_convener, old_seed, _index) in enumerate(found):
+                start = _SEED_RE.match(old_seed)
+                same_parties = old_convener == seat \
+                    and set(_invited_seats(old_seed)) == set(invited)
+                if marker and same_parties and start \
+                        and old_seed[start.end():].startswith(marker):
+                    prior_topic = old_seed[start.end():].rsplit(
+                        " | convener=", 1)[0]
+                    epoch, prior_rounds, topic, reused = \
+                        old_epoch, n, prior_topic, True
+                    break
+            if not reused:
+                epoch = max(epoch, _room_epoch_max(room) + 1)
+                prior_rounds = len(found)
+        if not reused and _round_topic is not None:
+            topic = checked_topic(_round_topic(prior_rounds))
+        if isinstance(_opened, dict):
+            _opened.update(epoch=epoch, prior_rounds=prior_rounds, topic=topic,
+                           reused=reused)
+        seed = ("[MELD e:%d] PROBLEM: %s | convener=%s invited=%s cap=%d "
+                "recv-timeout=%ds | MELD DISCIPLINE: reply FAST with what you "
+                "already know; a fork that needs research is NOT a meld — close "
+                "[DONE] with the async continuation. [HOLD]"
+                % (epoch, topic, seat, ",".join(invited), _cap(),
+                   int(_recv_timeout())))
+        if not reused:
+            _post(seed, room, seat)
+        # peers validated above; laundering the EMITTED copies stays as
+        # defense-in-depth beneath the seam. topic is CONTENT, left full-fidelity
+        # by the class rule (only identity is laundered).
+        # THE RING IS NOT REPEATED: with `ring` the invite head names the peers
+        # bare, so the row is the room's record of how to join and wakes nobody.
+        inv = ("%s [MELD-INVITE e:%d] room=%s JOIN: helm chat %s join %s "
+               "THEN: helm chat %s recv %s || topic: %s"
+               % (" ".join(("%s" if ring else "@%s") % d for d in d_peers),
+                  epoch, room, via, room, via, room, topic))
+        if ring:
+            inv += " || woken by: %s" % " ".join(str(ring).split())[:160]
+        invite_mark = "[MELD-INVITE e:%d] room=%s " % (epoch, room)
+        if not reused or not any(
+                str(message.get("from") or "") == seat
+                and invite_mark in str(message.get("text") or "")
+                and not message.get("react")
+                for message in chat.read(room)[0]):
+            _post(inv, room, seat)
+        # A durable seed is only the first third of an opening. A retry repairs
+        # an absent invite and lifecycle transition under this same lock; it does
+        # not mistake the first append for a completed round.
+        current_state = state(room, seat)
+        current_epoch = current_state.get("epoch") \
+            if isinstance(current_state, dict) else None
+        if not isinstance(current_epoch, int) or current_epoch < epoch:
+            # the convener's accept-set IS the invited set; `peer` kept = invited[0]
+            # so any legacy single-peer reader still resolves (backward-compat).
+            st = {
+                "room": room, "epoch": epoch, "role": "convener", "self": seat,
+                "peer": invited[0], "peers": list(invited), "idx": 0,
+                "exchanges": 0, "cap": _cap(), "status": "invited",
+                "created": pk.now_ts(), "done_peers": [], "spoke_peers": []}
+            _transition(room, seat, "invited", st)
     from . import seats
-    wakelines = []
+    wakelines, tracked = [], []
     for p, d in zip(invited, d_peers):
+        if ring:
+            wakelines.append("no @mention posted: %s is woken by %s"
+                             % (d, " ".join(str(ring).split())[:160]))
+            continue
         try:  # the wake-truth line: honest per EACH peer's ACTUAL lane
-            tracked = seats.seat_scope(p)["tracked"]
+            on = seats.seat_scope(p)["tracked"]
         except Exception:
-            tracked = False
-        wakelines.append(
+            on = False
+        if on:
+            tracked.append(p)
+        else:
+            wakelines.append(
+                "WARNING: %s is NOT on the chat roster — no delivery lane "
+                "exists; nothing wakes it until it joins or reads %s itself"
+                % (d, room))
+    reach = _reach(tracked) if tracked else {}
+    for p in tracked:
+        wakelines.append(reach.get(p) or (
             "the invite is a durable row — %s wakes at its next tool boundary "
-            "or beacon (never lost, only delayed)" % d if tracked else
-            "WARNING: %s is NOT on the chat roster — no delivery lane exists; "
-            "nothing wakes it until it joins or reads %s itself" % (d, room))
+            "or beacon (never lost, only delayed)" % chat._dsan(p)))
+    if reach:
+        # THE COMMAND, NOT A NAME. `route.answer` folds the ledger, measured at
+        # 54 s right after a land, and an invite must not pay that to print one
+        # seat: the convener runs the verb when the warning is one it acts on.
+        wakelines.append("find a live reader: helm route review")
+    if prior_rounds:
+        wakelines.append("round %d of this room: the %d before it stay in the "
+                         "room (helm chat read --room %s)"
+                         % (prior_rounds + 1, prior_rounds, room))
     return room, [
-        "MELD-INVITED room=%s epoch=%d peers=%s"
-        % (room, epoch, ",".join(d_peers))] + wakelines + [
+        "MELD-%s room=%s epoch=%d peers=%s"
+        % ("REUSED" if reused else "INVITED", room, epoch,
+           ",".join(d_peers))] + wakelines + [
         "next: helm chat %s recv %s   (returns on the FIRST READY; then speak "
         "the first chunk: helm chat %s say %s --marker YIELD \"...\")"
         % (via, room, via, room)]
@@ -909,12 +1395,9 @@ def join(room, seat=None, via="meld"):
     (no invited= field) grandfather in unpinned."""
     seat = seat or _self_seat()
     rows, _total = chat.read(room)
-    epoch = convener = seedtext = None
-    for m in rows:
-        em = _EPOCH_RE.search(m.get("text") or "")
-        if em and m.get("from"):
-            epoch, convener, seedtext = int(em.group(1)), m["from"], m["text"]
-            break
+    # THE NEWEST ROUND. A persistent room holds one seed per round; the first
+    # one is a round the fence already retired.
+    epoch, convener, seedtext = latest_seed(rows)
     if epoch is None:
         raise SystemExit("helm chat %s: no meld seed in room %s — was it "
                          "invited? (helm chat read --room %s)" % (via, room, room))
@@ -948,9 +1431,14 @@ def join(room, seat=None, via="meld"):
         "cap": _cap(), "status": "active", "created": pk.now_ts(),
         "done_peers": [], "spoke_peers": []}
     _transition(room, seat, "accepted", st)
+    # THE HISTORY IS IN THE ROOM, and a joiner gets it as a DIGEST bounded to
+    # its own window plus the pointer to the whole log — never the log, which
+    # in a long task would fill a small window on arrival.
+    history = history_digest(room, rows, epoch) if len(seeds(rows)) > 1 \
+        else []
     return ["MELD-JOINED room=%s epoch=%d convener=%s" % (room, epoch, d_convener),
             "next: helm chat %s recv %s   (the seeded problem statement "
-            "is your first chunk)" % (via, room)]
+            "is your first chunk)" % (via, room)] + history
 
 
 def _fall_lines(room, reason, st, via="meld"):
@@ -961,6 +1449,30 @@ def _fall_lines(room, reason, st, via="meld"):
             "(it @mentions the peer; the durable row guarantees it lands):",
             "  helm chat %s say %s --marker DONE \"<state + next action>\""
             % (via, room)]
+
+
+def _quiet_lines(room, bound, st, via="meld"):
+    """The recv timeout on a meld that has RUN: no reply yet, so recv again.
+
+    `_fall_lines` says "the synchronous window is over — fall to async
+    NOW", then post DONE. That is wrong here: the bound is this verb's poll
+    limit, not the peer leaving. Measured over 104 meld turns in 44 rooms,
+    18% of peer replies took longer than 90 s, and the Claude-side 90th
+    percentile was 533 s. That text told the waiting side to close a meld
+    its peer was still answering.
+
+    It stays EXIT_BOUND: the bound really did fire. Only the next action
+    changes. The exchange CAP is a real end and keeps `_fall_lines`."""
+    return [
+        "MELD-BOUND room=%s reason=timeout waited=%ds exchanges=%d/%d"
+        % (room, int(bound), st.get("exchanges", 0), st.get("cap", _cap())),
+        "no reply yet: recv again. The meld is still open and nothing was "
+        "consumed; a peer reply can take several minutes.",
+        "    helm chat %s recv %s" % (via, room),
+        "  only if the peer is genuinely out, close it as async:",
+        "    helm chat %s say %s --marker DONE \"<state + next action>\""
+        % (via, room),
+    ]
 
 
 def _nojoin_lines(room, bound, unjoined, st, via="meld"):
@@ -1044,6 +1556,20 @@ def _ignored_note(ignored, peers):
             % (len(ignored), who, members)]
 
 
+def _broadcast_token_refusal(text):
+    """Refuse exact broadcast @tokens (@all, @fleet, @everyone) in meld prose.
+
+    They wake nobody in a meld context, so using them only misleads the writer.
+    Prose like "@all-online" or "@no-one-sure" stays admitted (not exact match).
+    """
+    from . import seats
+    for tok in seats._BROADCAST.findall(text or ""):
+        raise SystemExit(
+            "helm chat %s: REFUSING broadcast token @%s in meld prose — "
+            "broadcast tokens wake nobody in a meld context; use a seat "
+            "name or plain prose" % ("meld", tok))
+
+
 def _outside_member_mentions(text, members):
     """Direct @addresses not named by this meld's immutable member set.
 
@@ -1051,11 +1577,36 @@ def _outside_member_mentions(text, members):
     prose. Outsider-authored rows stay ignored (the anti-hijack invariant), but
     a PINNED member cannot assign a load-bearing YIELD/HOLD role to somebody the
     decision transcript refuses to hear. Case-fold because delivery does too.
+
+    Only an @token that can WAKE a seat is an address (task/3247). Prose like
+    "@all-online" or "@no-one-sure" matches the token regex but names no
+    seat, so it is not a mention. A token wakes what delivery's `seat_names`
+    answers for: a roster key, OR a live rename alias of one — the renamed
+    seat still wakes on its old name inside the window, so an alias of an
+    outsider is an outside address and an alias of a member is the member.
+
+    AN UNREADABLE ROSTER PROVES NO TOKEN IS PROSE. Delivery never consults
+    the roster to wake a seat on its own name, so a roster this read cannot
+    see (`roster_acquired` failed) would otherwise admit every outsider at
+    once; there every non-member token counts, as before the roster gate. A
+    MISSING roster is proven empty, and a different answer from unreadable.
     """
     from . import seats
     known = {str(x).casefold() for x in members if x}
-    return sorted({name for name in seats._MENTION_TOKEN.findall(text or "")
-                   if name.casefold() not in known}, key=str.casefold)
+    rows, failed = seats.roster_acquired()
+    keys = {str(k).casefold() for k in rows}
+    out = {}
+    for tok in seats._MENTION_TOKEN.findall(text or ""):
+        cf = tok.casefold()
+        if cf in known or seats._BROADCAST.search("@" + tok):
+            continue
+        if not failed:
+            alias, _until = seats.live_alias(tok, rows)
+            seat = cf if cf in keys else str(alias or "").casefold()
+            if not seat or seat in known:
+                continue
+        out.setdefault(cf, tok)
+    return sorted(out.values(), key=str.casefold)
 
 
 def _membership_mismatch_lines(room, names, members, via="meld"):
@@ -1248,14 +1799,42 @@ def recv(room, timeout=None, seat=None, poll=MELD_POLL, via="meld"):
             if unjoined and not st.get("exchanges"):
                 return EXIT_BOUND, _nojoin_lines(room, bound, unjoined, st, via) \
                     + _ignored_note(ignored, accept)
-            return EXIT_BOUND, _fall_lines(room, "timeout", st, via) \
+            return EXIT_BOUND, _quiet_lines(room, bound, st, via) \
                 + _ignored_note(ignored, accept)
         time.sleep(min(poll, deadline - now))   # the last nap ends AT the bound
 
 
+def _peers_closed(room, st, seat):
+    """(members, closed): this meld's members and those whose [DONE] is
+    already in the room. A DONE counts whether recv consumed it (done_peers)
+    or it still sits unread past `idx`.
+
+    The unread rows are filtered exactly as recv filters them: reactions,
+    own rows, unattributed rows, stale epochs and non-members never count.
+    A forged DONE from outside the pinned set cannot silence a member."""
+    members = set(st.get("peers") or ([st["peer"]] if st.get("peer") else []))
+    closed = set(st.get("done_peers") or []) & members
+    rows, _total = chat.read(room, since=st.get("idx") or 0)
+    for m in rows:
+        text, frm = m.get("text") or "", str(m.get("from") or "")
+        if m.get("react") or not text or not frm or frm == seat:
+            continue
+        if members and frm not in members:
+            continue
+        em = _EPOCH_RE.search(text)
+        if em and int(em.group(1)) != st["epoch"]:
+            continue
+        mk = _MARKER_RE.search(text)
+        if mk and mk.group(1) == "DONE":
+            closed.add(frm)
+    return members, closed
+
+
 def say(room, marker, text, seat=None, via="meld"):
     """(lines) — append one bounded chunk: content + floor marker in the one
-    text field (text-or-it-didn't-happen). DONE/ABORT @mention the peer (the
+    text field (text-or-it-didn't-happen). The row also records which suffix
+    say generated, so a diff's literal trailing [DONE] remains distinguishable.
+    DONE/ABORT @mention the peer (the
     act-moments — a closing that lands silently strands the peer's bound);
     YIELD/HOLD stay mention-free (the peer is inside recv; no cursor spam)."""
     seat = seat or _self_seat()
@@ -1280,13 +1859,47 @@ def say(room, marker, text, seat=None, via="meld"):
         # countersign — the exact double-command an agent replays post-compaction.
         raise SystemExit("helm chat %s: room %s is sealed (done-mutual) — both "
                          "sides closed; nothing further posts" % (via, room))
-    text = (text or "").strip()
-    if not text:
+    raw = text or ""
+    if not raw.strip():
         raise SystemExit("helm chat %s: say wants text — a bare marker is not "
                          "a chunk (text-or-it-didn't-happen)" % via)
+    # A trailing unified-diff context line is spaces only, and an added or
+    # removed line may end in a significant space. strip() deletes both, so
+    # the floor marker glues on and the posted hunk is a different patch.
+    # Keep those bytes; still drop a leading empty margin (task/3774).
+    kept = raw.rstrip("\n")
+    tail = []
+    while True:
+        head, sep, last = kept.rpartition("\n")
+        if not sep or last.strip():
+            break
+        tail.append(last)
+        kept = head
+    text = kept.lstrip()
+    if tail:
+        text += "\n" + "\n".join(reversed(tail))
+        if raw.endswith("\n"):
+            text += "\n"
     if marker in ("YIELD", "HOLD"):
-        members = set(st.get("peers") or ([st["peer"]] if st.get("peer") else []))
+        # THE MIRROR OF RECV'S LATE-CHUNK BRANCH. After my own DONE, recv
+        # skips the peer's YIELD/HOLD. After the peer's DONE, my YIELD/HOLD
+        # reaches nobody: the peer's closing recv skips it too. Measured on
+        # the live bus: one seat posted 5 YIELDs over 24 minutes into a room
+        # its codex peer had already left. The check reads the room, not only
+        # my state, because that seat had not run recv since the peer's DONE.
+        # Refused BEFORE posting: in peer-done, a post without this check
+        # lands and the lifecycle transition then raises.
+        members, closed = _peers_closed(room, st, seat)
+        if members and members <= closed:
+            who = ", ".join(sorted(chat._dsan(p) for p in closed))
+            raise SystemExit(
+                "helm chat %s: MELD-PEER-CLOSED room=%s — %s already said "
+                "[DONE] in this room, so a %s reaches nobody. Close your side "
+                "with your closing state:\n  helm chat %s say %s --marker "
+                "DONE \"<closing state>\"" % (via, room, who, marker, via, room))
+        members = set(members)
         members.add(seat)
+        _broadcast_token_refusal(text)
         outside = _outside_member_mentions(text, members)
         if outside:
             raise SystemExit("helm chat %s: %s" % (
@@ -1298,15 +1911,57 @@ def say(room, marker, text, seat=None, via="meld"):
     # fleet-wide, so a hostile peer would reshape every reader's terminal. Raw
     # stays in state (only this mention emits it; recv matches on frm==seat).
     mention = "@%s " % chat._dsan(st["peer"]) if marker in ("DONE", "ABORT") else ""
-    _post("%s[MELD e:%d] %s [%s]" % (mention, st["epoch"], text, marker),
-          room, seat)
+    row = "%s[MELD e:%d] %s [%s]" % (mention, st["epoch"], text, marker)
     if marker == "DONE":
+        # THE DOOR'S WORD, SAID BEFORE THE SEAL (task/3223). A sealed room
+        # takes nothing further, so a closing block the review door would
+        # refuse, or a round it cannot bind to its row, is refused here by
+        # the door's own predicates, on the exact row that would post.
+        from . import review_door
+        why = review_door.done_refusal(room, row, st["epoch"], seat)
+        if why:
+            raise SystemExit("helm chat %s: %s" % (via, why))
         st["status"] = "done" if st["status"] != "peer-done" else "done-mutual"
     elif marker == "ABORT":
         st["status"] = "aborted"
     elif st["status"] == "invited":
         st["status"] = "active"           # convener spoke GO
-    st = _transition(room, seat, "local-" + marker.lower(), st)
+    # ONE LOCK SPAN, BOTH CHECKS BEFORE EITHER WRITE (task/2648). The
+    # transition checks RAM and the durable journal under the room lock, then
+    # asks the chat post's own pre-append refusal (a padded sha), and only
+    # then appends; the row posts after, still under that lock (re-entrant in
+    # this thread). A peer's abort or a replay cannot change the journal
+    # between the checks and the writes, a refused transition posts no row,
+    # and a refused post seals no transition, so a peer-done retry is not
+    # refused as sealed. The event does not carry the row's id.
+    def post_allowed():
+        why = chat.post_refusal(row)
+        if why:
+            from . import friction
+            friction.record("shaguard", reason="padded-sha")
+            raise ValueError(why)
+
+    # The post's rotation waits until the room lock is released
+    # (chat.rotation_deferred): rotating takes the delivery-state guard, which
+    # every other writer takes BEFORE the room lock.
+    with chat.rotation_deferred(), chat._room_lock(room) as locked:
+        if not locked:
+            raise LifecycleError("meld lifecycle room lock unavailable for %s"
+                                 % room)
+        st = _transition(room, seat, "local-" + marker.lower(), st,
+                         before_write=post_allowed)
+        # Every refusal ran before the append, so a failure here is a write
+        # fault, the one split the agreed bar admits: it must say so, never
+        # read as a refusal that changed nothing.
+        try:
+            _post(row, room, seat, marker=marker)
+        except Exception as exc:
+            raise LifecycleError(
+                "meld %s: the %s transition is RECORDED (epoch %d, now %s) "
+                "but its chat row did NOT post (%s: %s), so the peer cannot "
+                "see it; post the text to %s by hand"
+                % (room, marker, st["epoch"], st["status"],
+                   type(exc).__name__, exc, room)) from exc
     out = ["[meld %s e:%d] %s: … [%s]" % (room, st["epoch"], seat, marker)]
     if marker == "DONE":
         out.append("you left the meld — /premise anything durable; the room "
@@ -1394,7 +2049,14 @@ def flush_lifecycle(rooms=None):
     is QUARANTINED rather than silently continued — log_flush skips exactly the
     rooms named here. What changes is the blast radius, never the coherence
     rule. A quarantine is reported, never swallowed: the divergence itself is a
-    separate defect and resetting the cursor here would destroy its evidence."""
+    separate defect and resetting the cursor here would destroy its evidence.
+
+    AN ISOLATED NAMESPACE RAISES before any work (chat.journal_write_refusal):
+    its RAM holds copies of live rooms, and mirroring them would fork the live
+    journal. log_flush refuses first; this guard is for any other caller."""
+    isolated = chat.journal_write_refusal()
+    if isolated:
+        raise LifecycleError(isolated)
     _import_legacy(rooms)
     targets, unavailable = _lifecycle_rooms()
     if unavailable:
@@ -1416,7 +2078,9 @@ def _flush_one_lifecycle(room):
     """Mirror ONE meld room's lifecycle. Raises LifecycleError; the caller
     quarantines that room rather than abandoning its siblings."""
     appended = 0
-    with chat._room_lock(room):
+    with chat._room_lock(room) as locked:
+        if not locked:
+            raise LifecycleError("meld lifecycle room lock unavailable for %s" % room)
         ram, unavailable = _events(lifecycle_path(room))
         if unavailable:
             raise LifecycleError("meld lifecycle RAM journal UNKNOWN for %s: %s" %
@@ -1462,8 +2126,41 @@ def _flush_one_lifecycle(room):
     return appended
 
 
+def _replay_divergence(ram, durable):
+    """Why a live RAM stream and its durable replay disagree, or None when
+    durable is ahead only by `restored-from-journal` markers.
+
+    None is the flush path's rule (_flush_one_lifecycle) applied to replay.
+    A marker records that ANOTHER namespace restored the room. It carries no
+    transition, so RAM is still this room's whole live state. The measured
+    402 durable-ahead journals were all this shape, and each one read UNKNOWN
+    here while the flush beside it accepted it.
+
+    A real transition that RAM lacks is not that shape: RAM has lost live
+    events or another writer moved the room. Each reason names the first
+    event where the streams part."""
+    if durable[:len(ram)] == ram:
+        extra = durable[len(ram):]
+        real = [e for e in extra if e["transition"] != "restored-from-journal"]
+        if not real:
+            return None
+        return ("durable lifecycle journal is ahead of RAM by %d real "
+                "transition(s) RAM never saw (first: %s at seq %d) — RAM lost "
+                "live events or another writer moved this room"
+                % (len(real), real[0]["transition"], real[0]["seq"]))
+    at = next(i for i, (r, d) in enumerate(zip(ram, durable)) if r != d)
+    return ("RAM and durable lifecycle journals fork at seq %d (RAM: %s, "
+            "durable: %s) — neither is a prefix of the other"
+            % (ram[at]["seq"], ram[at]["transition"],
+               durable[at]["transition"]))
+
+
 def replay_room(room, apply=True):
-    with chat._room_lock(room):
+    with chat._room_lock(room) as locked:
+        if not locked:
+            reason = "meld lifecycle room lock unavailable for %s" % room
+            _UNKNOWN[_cache_key(room)] = reason
+            return {"state": "UNKNOWN", "reason": reason, "actors": 0}
         # r4 LOCK: _transition holds this SAME lock; a replay_room run
         # bare lets a live transition racing a restore interleave
         # after the durable copy but before the restore marker — both
@@ -1497,9 +2194,12 @@ def replay_room(room, apply=True):
             _UNKNOWN[_cache_key(room)] = ram_why
             return {"state": "UNKNOWN", "reason": ram_why, "actors": 0}
         if runique and runique[:len(unique)] != unique:
-            reason = "RAM lifecycle journal diverges from durable replay"
-            _UNKNOWN[_cache_key(room)] = reason
-            return {"state": "UNKNOWN", "reason": reason, "actors": 0}
+            reason = _replay_divergence(runique, unique)
+            if reason:
+                _UNKNOWN[_cache_key(room)] = reason
+                return {"state": "UNKNOWN", "reason": reason, "actors": 0}
+            # Durable is ahead only by restore markers another namespace
+            # wrote. RAM is still the live room, so it is read as-is below.
         restored = not runique
         if restored:
             for ev in unique:
@@ -1526,7 +2226,12 @@ def replay_room(room, apply=True):
                 reason = "could not rebuild RAM lifecycle journal"
                 _UNKNOWN[_cache_key(room)] = reason
                 return {"state": "UNKNOWN", "reason": reason, "actors": 0}
-            if not eventledger.append(lifecycle_path(room, True), marker):
+            # An isolated namespace records its own restore in its own RAM
+            # only. Mirrored, the marker takes the next sequence number of
+            # the LIVE room's journal, and that room's next real transition
+            # then forks from it (chat.journal_write_refusal).
+            if (not chat.journal_write_refusal() and not eventledger.append(
+                    lifecycle_path(room, True), marker)):
                 reason = "could not mirror restore marker to the durable journal"
                 _UNKNOWN[_cache_key(room)] = reason
                 return {"state": "UNKNOWN", "reason": reason, "actors": 0}
@@ -1700,6 +2405,40 @@ def _durability(room, st):
         else "live-not-yet-durable"
 
 
+def _member(room, seat):
+    """True if `seat` is a party to `room`, False if the room's records name
+    other parties only, None if no record can be read.
+
+    This seat's own snapshot answers first. Otherwise any lifecycle event,
+    in RAM or durable, that names the seat as its actor or as a peer
+    answers. The events are read without the strict fold on purpose: a room
+    is UNKNOWN exactly when its stream does not reduce, and a stream that
+    does not reduce still names who wrote it."""
+    if os.path.exists(state_path(room, seat)):
+        return True
+    want = str(seat).casefold()
+    seen = False
+    for durable in (False, True):
+        events, _unavailable = eventledger.checked_events(
+            lifecycle_path(room, durable))
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            proj = ev.get("projection")
+            names = [ev.get("actor")]
+            if isinstance(proj, dict):
+                peers = proj.get("peers")
+                names += [proj.get("peer")] + (
+                    peers if isinstance(peers, list) else [])
+            names = [str(x).casefold() for x in names if isinstance(x, str)]
+            if not names:
+                continue
+            seen = True
+            if want in names:
+                return True
+    return False if seen else None
+
+
 def status(seat=None, via="meld"):
     """[lines] — this actor's live melds, with honest durability provenance."""
     from . import seats
@@ -1713,14 +2452,27 @@ def status(seat=None, via="meld"):
         names = []
     out = []
     ram_root = os.path.abspath(os.path.join(chat.chat_dir(), _LIFECYCLE_DIR))
+    foreign = 0
     for (path, room), reason in sorted(_UNKNOWN.items()):
         if os.path.dirname(path) != ram_root:
+            continue
+        # THIS SEAT'S MELDS ONLY, like every other row here. The replay reads
+        # every room on the bus, so an unfiltered list gave each seat the
+        # whole fleet's UNKNOWN melds (one seat's status listed 13, including
+        # melds between other seats it was never in). A room whose membership
+        # cannot be read stays listed: it cannot be proven someone else's.
+        if _member(room, seat) is False:
+            foreign += 1
             continue
         out.append("  %s  status=UNKNOWN durability=UNKNOWN reason=%s" %
                    (room, reason))
     for n in names:
         raw = pk.read_json(os.path.join(d, n), None) or {}
         room = raw.get("room") or n.split(".meld.")[0]
+        if any(line.startswith("  %s " % room) for line in out):
+            # ONE ROW PER ROOM. The replay already said UNKNOWN; a second row
+            # read from RAM alone printed durability=durable-live beside it.
+            continue
         st = state(room, seat) or raw
         if st.get("status") == "UNKNOWN":
             if not any(line.startswith("  %s " % room) for line in out):
@@ -1753,9 +2505,15 @@ def status(seat=None, via="meld"):
                       durability, _age_suffix(room, st)))
     if out:
         return out
-    if replay["state"] in ("absent", "UNKNOWN"):
+    if replay["state"] == "absent" or (replay["state"] == "UNKNOWN"
+                                       and not foreign):
         return ["helm chat %s: meld state UNKNOWN for seat %s — no readable durable "
                 "lifecycle journal proves an empty slate" % (via, seat)]
+    if foreign:
+        # Every UNKNOWN room was proven to be another seat's: this seat's
+        # empty slate is measured, and the other rooms are not its to report.
+        return ["helm chat %s: no live melds for seat %s (%d meld(s) of other "
+                "seats read UNKNOWN; not yours)" % (via, seat, foreign)]
     return ["helm chat %s: no live melds for seat %s" % (via, seat)]
 
 
@@ -1770,13 +2528,19 @@ def _flag(args, name, default=None):
 
 
 def usage(via="meld"):
-    return ("usage: helm chat %s invite <peer> <topic...> [--wait] | "
+    from . import review_door
+    return ("usage: helm chat %s invite <peer> <topic...> [--wait] "
+            "[--into ROOM] | "
             "join <room> | recv <room> [--timeout S] | say <room> --marker "
-            "YIELD|HOLD|DONE|ABORT [<text...>] | status   [--seat S on any] "
+            "YIELD|HOLD|DONE|ABORT [<text...>] | status | standing <peer> "
+            "| pull <standing-room> <seat> <question...> | leave "
+            "<standing-room>   [--seat S on any] "
             "(one preset, three spellings: meld = the genus, council/standup "
             "= species; say with NO text reads the chunk from stdin, which is "
             "the safe route for prose carrying backticks or $( ) — "
-            "`helm chat %s say R --marker YIELD <<'EOF'`)" % (via, via))
+            "`helm chat %s say R --marker YIELD <<'EOF'`). A review or pair "
+            "round closes with each side's [DONE] carrying one line: %s"
+            % (via, via, review_door.OUTCOME_LINE))
 
 
 def cmd(args, via="meld"):
@@ -1808,7 +2572,52 @@ def cmd(args, via="meld"):
     if wait:                              # (every convener's literal next call)
         args.remove("--wait")
     verb = args[0] if args else "status"
+    from . import meld_standing
+    # THE STANDING MODE (task/3560) shares these verbs and none of the
+    # capped meld's bounds: a room named for a pair routes there.
+    standing = len(args) >= 2 and meld_standing.is_standing_room(args[1])
     try:
+        if verb == "standing":
+            if len(args) >= 2 and args[1] in ("-h", "--help"):
+                print(usage(via))
+                return 0
+            if len(args) >= 2:
+                room, lines = meld_standing.open_room(
+                    args[1], " ".join(args[2:]) or None, seat=seat, via=via)
+                print("\n".join(lines))
+                return 0
+            print("helm chat %s: standing wants a peer to open a room with"
+                  % via, file=sys.stderr)
+            print(usage(via))
+            return 2
+        if verb == "pull" and len(args) >= 3:
+            asked, _prc = freetext.tail("helm meld", "pull", args[3:],
+                                        "the question")
+            if _prc is not None:
+                return _prc
+            print("\n".join(meld_standing.pull(args[1], args[2], asked or "",
+                                               seat=seat, via=via)))
+            return 0
+        if verb == "leave" and standing:
+            print("\n".join(meld_standing.leave(args[1], seat=seat, via=via)))
+            return 0
+        if verb == "invite" and "--into" in args and \
+                meld_standing.is_standing_room(
+                    args[args.index("--into") + 1]
+                    if args.index("--into") + 1 < len(args) else ""):
+            into = _flag(args, "--into")
+            for peer in args[1].replace(",", " ").split():
+                print("\n".join(meld_standing.add(into, peer, seat=seat,
+                                                  via=via)))
+            return 0
+        if verb == "join" and standing:
+            print("\n".join(meld_standing.join(args[1], seat=seat, via=via)))
+            return 0
+        if verb == "recv" and standing:
+            _flag(args, "--timeout")          # never waits: nothing to bound
+            code, lines = meld_standing.recv(args[1], seat=seat, via=via)
+            print("\n".join(lines))
+            return code
         if verb == "invite" and len(args) >= 3:
             threshold = _flag(args, "--threshold")   # council only; popped here
             ctip = _flag(args, "--tip")              # ditto: the judged artifact
@@ -1816,11 +2625,16 @@ def cmd(args, via="meld"):
             # decision has no sha, and requiring one is what made `council`
             # unable to convene the exact conversations it exists for.
             cq = _flag(args, "--question")
+            # --into ROOM: the next ROUND in a persistent room (a task's
+            # pair meld) instead of a new room. Not --room: `helm chat`
+            # consumes that flag for every verb before this one runs.
+            into = _flag(args, "--into")
             subject, _irc = freetext.tail("helm meld", "invite", args[2:],
                                           "the subject")
             if _irc is not None:
                 return _irc
-            room, lines = invite(args[1], subject or "", seat=seat, via=via)
+            room, lines = invite(args[1], subject or "", seat=seat, via=via,
+                                 room=into)
             print("\n".join(lines))
             if via == "council":
                 # the FORMAL species convenes an embargoed quorum over the same
@@ -1876,10 +2690,16 @@ def cmd(args, via="meld"):
             body, rc = chat.resolve_one_body(said or "", "%s say" % via)
             if rc is not None:
                 return rc
+            if standing:
+                print("\n".join(meld_standing.say(
+                    args[1], body, marker=marker, seat=seat, via=via)))
+                return 0
             print("\n".join(say(args[1], marker, body, seat=seat, via=via)))
             return 0
         if verb == "status":
-            print("\n".join(status(seat=seat, via=via)))
+            print("\n".join(status(seat=seat, via=via)
+                            + meld_standing.status_lines(
+                                seat or _self_seat(), via)))
             return 0
     except (SystemExit, LifecycleError) as e:
         print(str(e), file=sys.stderr)

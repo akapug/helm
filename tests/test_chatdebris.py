@@ -445,6 +445,117 @@ class RetireRoomsTest(DebrisBase):
         self.assertLess(len(entries()), before - 40)
 
 
+# ── (task/3519) a FINISHED meld leaves the bus ──────────────────────────────
+
+
+class FinishedMeldTest(DebrisBase):
+    """Measured on the live bus: 272 of 306 room logs were meld pair rooms,
+    carrying about 22,000 cursors, 20,600 of them on melds idle over a day --
+    each one re-minted by the delivery pass for as long as the room is
+    listed. A meld whose every member has closed its side is over; its room
+    leaves the bus a day after the last post, with every cursor it carried.
+
+    THE RULE KEYS ON THE MELD BEING CLOSED, NEVER ON IDLENESS ALONE: an open
+    meld as quiet as a finished one stays until the 7-day idle bound, so a
+    slow or standing room is not retired for being slow."""
+
+    QUIET = 2 * 86400
+
+    def open_meld(self, peer="bob", topic="converge the spec"):
+        room, _ = meld.invite(peer, topic, seat="alice")
+        meld.join(room, seat=peer)
+        return room
+
+    def finish(self, room, peer="bob"):
+        meld.say(room, "DONE", "my side is settled", seat="alice")
+        meld.say(room, "DONE", "mine too", seat=peer)
+
+    def quiet(self, room, age):
+        t = time.time() - age
+        os.utime(chat.room_path(room), (t, t))
+
+    def retire(self, *args):
+        return run(chat.cmd_chat, ["retire-rooms"] + list(args))
+
+    def test_finished_needs_every_member_to_have_closed(self):
+        room = self.open_meld()
+        self.assertFalse(meld.finished(room))
+        meld.say(room, "DONE", "my side", seat="alice")
+        self.assertFalse(meld.finished(room), "one side's DONE is not the end")
+        meld.say(room, "DONE", "mine too", seat="bob")
+        self.assertTrue(meld.finished(room))
+
+    def test_a_convener_closing_an_unjoined_invite_is_not_finished(self):
+        room, _ = meld.invite("bob", "a question", seat="alice")
+        meld.say(room, "DONE", "never mind", seat="alice")
+        self.assertFalse(meld.finished(room), "the invitee never spoke")
+
+    def test_a_room_with_no_lifecycle_is_not_finished(self):
+        chat.post("spec", room=MELD, who="alice")
+        self.assertFalse(meld.finished(MELD))
+
+    def test_a_finished_meld_quiet_a_day_is_retired_with_its_cursors(self):  # noqa: VACUOUS_ASSERTION — the dry run's nomination line and the archive's presence are the positive controls
+        room = self.open_meld()
+        self.finish(room)
+        cursors = [self.cursor(room, "alice"),
+                   self.cursor(room, "bob", LIVE[:8]),
+                   self.cursor(room, "carol", beacon=True)]
+        self.quiet(room, self.QUIET)
+        rc, out, _err = self.retire()
+        self.assertEqual(rc, 0)
+        self.assertIn("would retire  " + room, out)
+        for c in cursors:
+            self.assertTrue(os.path.exists(c), "dry-run touched " + c)
+        rc, out, err = self.retire("--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("retired  " + room, out)
+        self.assertFalse(os.path.exists(chat.room_path(room)))
+        for c in cursors:
+            self.assertFalse(os.path.exists(c), c)
+        self.assertTrue(os.path.exists(os.path.join(
+            chat.journal_dir(), "retired-rooms", room, room + ".jsonl")))
+
+    def test_an_open_meld_as_quiet_is_kept(self):  # noqa: VACUOUS_ASSERTION — the finished room beside them is asserted retired
+        open_ = self.open_meld()
+        half = self.open_meld("carol", "a second topic")
+        meld.say(half, "DONE", "my side only", seat="alice")
+        done = self.open_meld("dave", "a third topic")
+        self.finish(done, "dave")
+        for room in (open_, half, done):
+            self.quiet(room, self.QUIET)
+        rc, out, err = self.retire("--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(chat.room_path(done)),
+                         "must-hit: the finished meld stayed")
+        self.assertTrue(os.path.exists(chat.room_path(open_)),
+                        "retired an open meld for being quiet")
+        self.assertTrue(os.path.exists(chat.room_path(half)),
+                        "retired a meld one member has not closed")
+
+    def test_a_finished_meld_posted_to_within_the_day_is_kept(self):
+        from helm import chatdebris
+        room = self.open_meld()
+        self.finish(room)
+        self.quiet(room, 3600)
+        self.assertEqual(chatdebris.retirable_rooms(), [])
+        rc, _out, err = self.retire("--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.exists(chat.room_path(room)))
+
+    def test_a_new_round_in_the_room_is_not_finished(self):
+        """A task's pair room holds one round per dispatch. A finished round
+        followed by a new invite is a meld in progress again."""
+        room = self.open_meld()
+        self.finish(room)
+        self.assertTrue(meld.finished(room), "must-hit: round one finished")
+        meld.invite("bob", "round two", seat="alice", room=room)
+        self.assertFalse(meld.finished(room))
+        self.quiet(room, self.QUIET)
+        rc, _out, err = self.retire("--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.exists(chat.room_path(room)))
+
+
 # ── the restore honours a retirement ────────────────────────────────────────
 
 

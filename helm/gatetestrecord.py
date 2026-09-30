@@ -1129,6 +1129,47 @@ def _find_program():
     return None
 
 
+_GATELOADS = None
+# THE SLICE RUNNER'S DATA AUDIT (helm/gateslice.py) reports any module
+# data a test unit leaves behind; these names are process-wide by design.
+_GATESLICE_MUTABLE = {
+    "_GATELOADS": (
+        "a sibling module loaded by path once; loading it again yields the "
+        "same code"),
+}
+
+
+def _gateloads():
+    """helm/gateloads.py loaded BY PATH, as the slice runner loads it: the
+    recorder must never be `helm.gateloads` in the process it observes, so a
+    test importing that module gets its own copy, not the live recorder."""
+    global _GATELOADS
+    if _GATELOADS is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_helm_gateloads_runner",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "gateloads.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _GATELOADS = module
+    return _GATELOADS
+
+
+def _arm_loads(context):
+    """The serial runner's load recorder (task/3039), armed NOW -- during
+    discovery, before the first test module imports -- when the gate asked
+    for one. Only the timing census arms it: that is the whole-suite gate's
+    own serial run. Never raises: a recorder that cannot arm leaves the run
+    unrecorded, which the gate reads as no record."""
+    if not context.get("timing"):
+        return None
+    try:
+        return _gateloads().arm_runner(os.getcwd())
+    except Exception:                           # noqa: BLE001
+        return None
+
+
 def arm_serial_from_env():
     context = context_from_env("serial")
     target = _find_program()
@@ -1137,6 +1178,7 @@ def arm_serial_from_env():
     original = unittest.TestProgram.runTests
     if getattr(original, "_helm_gate_record_armed", False):
         return False
+    loads = _arm_loads(context)
 
     def run_tests(program):
         if program is not target:
@@ -1156,8 +1198,13 @@ def arm_serial_from_env():
             results = []
             uninstrument = []
             if context.get("timing"):
+                timed = controlled_result_class(ledger)
+                if loads is not None:
+                    loads.begin_run()
+                    timed = loads.result_class(timed)
+
                 class TimingRunner(unittest.TextTestRunner):
-                    resultclass = controlled_result_class(ledger)
+                    resultclass = timed
                 program.testRunner = TimingRunner
             else:
                 program.testRunner = _recording_runner(
@@ -1177,6 +1224,10 @@ def arm_serial_from_env():
             program.testRunner = None
             for cleanup in uninstrument:
                 cleanup()
+            if loads is not None:
+                _gateloads().write_runner(
+                    loads, sorted(set(ledger.planned_modules))
+                    if context.get("timing") else ())
             result = getattr(program, "result", None)
             observed = result is not None if context.get("timing") else (
                 bool(results) and results[0] is result)
@@ -1323,6 +1374,3 @@ def validate_artifact(row, token=None):
     return row
 
 
-def read_artifact(path, token=None):
-    with open(path, encoding="utf-8") as fh:
-        return validate_artifact(json.load(fh), token)

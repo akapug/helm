@@ -1244,16 +1244,26 @@ class BlindSpotTest(SeamBase):
                       "\n".join(self.guard(seat="s2", session="s-b",
                                            cwd=theirs)[1]))
 
-    def test_it_speaks_ONCE_per_arrangement_and_a_new_cotenant_re_arms_it(self):
+    def test_it_speaks_ONCE_per_session_in_a_room_however_its_cotenants_churn(self):  # noqa: VACUOUS_ASSERTION — the first stop in each session asserts the line on the same warn observable the churn stops assert absent
+        """REVERSED (task/3696): a new co-tenant no longer re-arms it. The
+        latch was keyed on the room AND its seat set, and on the integrator
+        seat the set churned all afternoon (seats appearing and vanishing),
+        so a line promising to speak once per arrangement printed on most
+        stops. The blind spot is a property of the ROOM, not of who stands
+        in it, so it is said once per session per room."""
         room = self.share()
         self.assertIn("BLIND SPOT", "\n".join(self.guard(cwd=room)[1]))
-        for _ in range(3):
-            self.assertNotIn("BLIND SPOT", "\n".join(self.guard(cwd=room)[1]),
-                             "the same arrangement spoke twice")
+        self.assertNotIn("BLIND SPOT", "\n".join(self.guard(cwd=room)[1]),
+                         "the same room spoke twice in one session")
         self.roster("cass", room)
-        joined = "\n".join(self.guard(cwd=room)[1])
-        self.assertIn("BLIND SPOT", joined)
-        self.assertIn("3 seats", joined)
+        self.assertNotIn("BLIND SPOT", "\n".join(self.guard(cwd=room)[1]),
+                         "a co-tenant arriving re-armed the disclosure")
+        self.roster("cass", os.path.join(self.tmp, "elsewhere"))
+        self.assertNotIn("BLIND SPOT", "\n".join(self.guard(cwd=room)[1]),
+                         "a co-tenant leaving re-armed the disclosure")
+        # A NEW SESSION of the same seat has not heard it: it speaks there.
+        self.assertIn("BLIND SPOT", "\n".join(
+            self.guard(session="sess-2", cwd=room)[1]))
 
     def test_a_SUPPRESSED_disclosure_is_still_owed_at_the_next_stop(self):
         """THE BUG THIS RUNG SHIPPED, and it needed two correct decisions.
@@ -1931,21 +1941,46 @@ class CouldNotTellTest(SeamBase):
         """`census_complete` answered only "could /proc be LISTED", which is
         the smaller half. Every per-pid cwd read can fail — a hidepid mount, a
         container — and the census then reported NOBODY IS ANYWHERE using the
-        same two values a genuinely empty board produces."""
-        from helm.work import _lanes
-        real = os.path.realpath
+        same two values a genuinely empty board produces.
 
-        def blind(path, *a, **k):
-            p = str(path)
-            if p.startswith("/proc/") and p.endswith("/cwd"):
-                raise OSError(13, "Permission denied")
-            return real(p, *a, **k)
-        with mock.patch("helm.work._lanes.os.path.realpath", side_effect=blind):
-            occ, complete = _lanes._occupants_many([self.root])
+        THE BLINDNESS IS PLANTED IN A PROC TREE, NEVER MOCKED INTO realpath.
+        `os.path.realpath` does not raise on a cwd link it cannot read: it
+        answers with the link's own path, so a reader built on it counts every
+        unreadable pid as a measured non-occupant, and a mock that makes it
+        raise tests a reader this box does not have. The tree holds a cwd
+        entry that is not a link, which readlink refuses under any uid, and,
+        where this uid can be refused, a link INTO the room behind a
+        directory it cannot search: the shape another user's pid has here.
+
+        UNKNOWN IS THE UNLISTABLE-TABLE SHAPE, per room. `_occupants` carries
+        no completeness flag to gc, reap, release or drop, so an empty list
+        would reach them as a room nobody is in."""
+        from helm.work import _lanes
+        proc = os.path.join(self.tmp, "blind-proc")
+        os.makedirs(os.path.join(proc, "4194401", "cwd"))
+        locked = os.path.join(proc, "4194402")
+        if os.geteuid() != 0:
+            os.makedirs(locked)
+            os.symlink(self.root, os.path.join(locked, "cwd"))
+            os.chmod(locked, 0)
+        try:
+            occ, complete = _lanes._occupants_many([self.root], proc_root=proc)
+        finally:
+            if os.path.isdir(locked):
+                os.chmod(locked, 0o700)
         self.assertFalse(complete,
                          "a /proc pass that read NO process reported complete")
-        self.assertEqual(occ, {self.root: []})
-        # MUST-HIT: the unmocked pass on this very box reads at least this
+        self.assertEqual(occ, {self.root: ["unknown"]},
+                         "a blind census handed its consumers an empty room")
+        # CONTROL on the same seam: a readable link into the room is found,
+        # so the answer above is the planted blindness and not a seam that
+        # reads nothing.
+        seen = os.path.join(self.tmp, "seen-proc")
+        os.makedirs(os.path.join(seen, "4194403"))
+        os.symlink(self.root, os.path.join(seen, "4194403", "cwd"))
+        self.assertEqual(_lanes._occupants_many([self.root], proc_root=seen),
+                         ({self.root: ["4194403"]}, True))
+        # MUST-HIT: the real pass on this very box reads at least this
         # process's own cwd, so the branch above is reachable only under the
         # failure and the assertion is not measuring a broken instrument.
         _occ2, complete2 = _lanes._occupants_many([self.root])

@@ -22,18 +22,20 @@ the modules calling this exist to replace.
 import os
 
 
-def process_age(pid=None):
-    """Seconds since this process (or `pid`) started, or None when unknown."""
+def process_age(pid=None, proc_dir=None):
+    """Seconds since this process (or `pid`) started, or None when unknown.
+    `proc_dir` reads another /proc (a test's synthetic one) for both files."""
     who = "self" if pid is None else str(int(pid))
+    root = proc_dir or "/proc"
     try:
-        with open("/proc/%s/stat" % who, "rb") as fh:
+        with open(os.path.join(root, who, "stat"), "rb") as fh:
             raw = fh.read()
         # The comm field can contain spaces AND parentheses, so the fields
         # resume after the last ')' -- never from a left-to-right split.
         rest = raw[raw.rindex(b")") + 2:].split()
         started_ticks = int(rest[19])
         hz = os.sysconf("SC_CLK_TCK") or 100
-        with open("/proc/uptime", "rb") as fh:
+        with open(os.path.join(root, "uptime"), "rb") as fh:
             up = float(fh.read().split()[0])
         age = up - (started_ticks / float(hz))
     except Exception:                     # noqa: BLE001 — every failure here

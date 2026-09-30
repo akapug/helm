@@ -36,6 +36,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from helm import beacon_origin, beacons, chat, home, pk, seats  # noqa: E402
+from tests import _pids  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -172,8 +173,9 @@ class CorruptRosterIsNotAnEmptyFleetTest(unittest.TestCase):
 
 
 class LockFailureMustNotWriteUnlockedTest(unittest.TestCase):
-    """`_flocked` FAILS OPEN BY DESIGN — on OSError it sets .f = None and still
-    returns, so a bare `with` acquires nothing and the body runs UNLOCKED.
+    """These sites take `_flocked(..., check=True)` (task/2520): on OSError it
+    yields `.f` None instead of raising, so a bare `with` acquires nothing and
+    the body runs UNLOCKED unless the site reads `.f` and refuses.
 
     gate.py:1207 already reads it correctly (`if lock.f is None: return`). Both
     roster writers here did not, so a lock failure silently became a concurrent
@@ -185,7 +187,7 @@ class LockFailureMustNotWriteUnlockedTest(unittest.TestCase):
 
     class _Unlockable:
         """Stands in for a lock that could not be taken — .f is None, exactly
-        as _flocked leaves it after an OSError."""
+        as a `check=True` take leaves it after an OSError."""
         f = None
         def __enter__(self): return self
         def __exit__(self, *a): return False
@@ -732,9 +734,9 @@ class LauncherRungTest(Base):
 class NoOverclaimOnAnySurfaceTest(Base):
     """CODEX-3 FIX (3). DEAF said "nothing can wake it" and the push said
     "nothing can wake them". This census reads BEACONS, so what it can prove is
-    the state of HELM'S leg — never the absence of every leg. playapal-qwen has
-    a designed external, non-consuming wake path and rendered DEAF the moment
-    this lane made its panes visible at all.
+    the state of HELM'S leg — never the absence of every leg. A project's
+    qwen seat has a designed external, non-consuming wake path and rendered
+    DEAF the moment this lane made its panes visible at all.
 
     THE PUSH IS THE SURFACE THAT MATTERS MOST and is the one I missed first: I
     grepped the singular phrasing, found seven sites, fixed them, and reported
@@ -2250,7 +2252,7 @@ while True:
             self.assertTrue(beacons.register(self.seat, SID_A, old.pid))
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
                 mock.patch.object(beacons, "holder_from_records",
-                                  return_value=(99999999, 1)):
+                                  return_value=(_pids.DEAD_PID, 1)):
             row = beacons.entries(self.seat)[0]
             classified = beacons.classify(old.pid, self.seat, row, live={})
             self.assertEqual(classified["state"], beacons.GHOST,
@@ -2269,7 +2271,7 @@ while True:
         with mock.patch.object(beacons, "live_sessions",
                                return_value={SID_A: os.getpid()}), \
                 mock.patch.object(beacons, "holder_from_records",
-                                  return_value=(99999999, 1)):
+                                  return_value=(_pids.DEAD_PID, 1)):
             report = beacons.arm(self.seat, session=SID_A, pid=new.pid)
         self.assertIsNone(report["already_live"])
         self.assertCountEqual(report["stopped"], [live_waiter.pid, ghost.pid])
@@ -2929,7 +2931,8 @@ class VacantTest(Base):
         # still accounts for every seat. MISROUTED broke it on arrival and
         # that is the arm working, not the arm being brittle.
         self.assertIn("2 seats, 1 covered, 0 WAKING, 0 DEAF, "
-                      "0 DEAF-IN-EFFECT, 0 MISROUTED, 1 VACANT, 0 UNPROVEN",
+                      "0 DEAF-IN-EFFECT, 0 RESTING, 0 MISROUTED, 1 VACANT, "
+                      "0 UNPROVEN",
                       CensusTest.render(self, rep))
 
     def test_the_census_still_signals_NOTHING_at_a_VACANT_seat(self):
@@ -5862,6 +5865,15 @@ class PromptStallLegTest(Base):
         sp.assert_called_once_with()
         self.assertEqual(out, [self.STALL])
         self.assertIn("seat alpha FROZEN", err)
+
+    def test_a_stall_the_watch_answered_is_not_a_fault_found(self):
+        """The watch answers a routine prompt itself; only the stalls it did
+        NOT clear are this pass's faults. CONTROL: the unanswered sibling in
+        the same pass is still returned."""
+        other = dict(self.STALL, seat="beta", pid=4343)
+        out, _sp, _err = self.leg(got={"stalls": [self.STALL, other],
+                                       "answered": [self.STALL], "lines": []})
+        self.assertEqual(out, [other])
 
     def test_a_seat_read_or_a_foreign_proc_tree_never_reads_the_live_host(self):  # noqa: VACUOUS_ASSERTION — test_the_real_host_fleet_pass_runs_the_watch_and_prints_it drives the same seam and records the call
         """CONTROL above proves the leg calls the watch; here it must not."""

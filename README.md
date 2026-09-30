@@ -8,295 +8,344 @@
 **Run a team of AI coding agents from different model families on one
 codebase, and trust what lands.**
 
-helm is for anyone who wants more from coding agents than one chat window
-gives: the vibecoder who has never read the code and needs to know the work is
-right, the developer running ten agents across five accounts, and the team that
-wants Claude, codex, gemini, grok, kimi and deepseek checking each other's work
-instead of each trusting its own.
+helm is the coordination layer for a fleet of coding agents. It puts Claude,
+Codex, Kimi, DeepSeek, Grok, Gemini and local models in one chat room that
+reaches them mid-turn. It tracks who owes what on a durable ledger. It makes
+sure the agent that wrote a change is never the one that approves it, and it
+merges work to your main branch only after the whole test suite passes on
+the exact code being merged. For you, it is one place to see every project, session, account and
+quota window.
 
 - **Steer in plain words.** You talk to the whole fleet in one chat room and
   one web page, and the agents run the commands. Your standing rules and the
-  lessons the fleet has learned are fed to every agent on every turn, so you
-  say a thing once, not once per session.
-- **Quality from disagreement.** The model family that wrote a change may
-  never be the one that reviews it. A second family catches the blind spots
-  the first one shares with itself, and work lands only after that review and
-  a whole-suite test run bound to the exact commit.
+  lessons the fleet has learned reach each agent on the turn they matter, so
+  you say a thing once, not once per session.
+- **Quality from independent review.** A reader that wrote none of the
+  change, in a fresh context that holds none of the author's working context,
+  reads the exact commit; a different model, ideally from another model
+  family, is preferred. Model families are
+  equal counterparts, not a writing tier and a witnessing tier: readers
+  commit the fixes they find, and a design dispute moves into a shared room
+  where both sides agree the bar.
+- **Lands with nobody at the wheel.** A reviewed change lands by itself:
+  helm announces the train, waits five minutes for a veto, runs the whole
+  suite on the exact tree, names and ejects a car that breaks it, and pushes.
+  43 lands in a row went in that way with no integrator action
+  ([Auto-land](#auto-land-lands-with-nobody-at-the-wheel)).
 - **Scale without losing the thread.** Each agent gets its own worktree,
-  terminal pane and credential pool. One view shows every session, account and
-  quota window. A context compaction or a crashed proxy costs a restart, not
-  the work: agents write handoffs, resume their sessions, and respawn what
-  died.
+  terminal pane and credential pool. A context compaction or a crashed proxy
+  costs a restart, not the work: agents write handoffs, resume their sessions,
+  and respawn what died.
 - **Nothing to install.** Python standard library only, zero dependencies: a
   CLI and a web app over one folder, `~/.helm`.
 
-**Try it:**
+**Try it** (nothing to build):
 
 ```console
+$ git clone https://github.com/akapug/helm && cd helm
 $ ./bin/helm sync     # discover your projects across every harness
-$ ./bin/helm web      # the whole cockpit, in a browser
+$ ./bin/helm web      # the whole cockpit at http://127.0.0.1:7433
 ```
 
-The full quickstart, PATH install, and requirements are [below](#quickstart).
+**If you are an AI agent:** if you were seated in a helm fleet, read
+[NEW_AGENT_GUIDE](docs/NEW_AGENT_GUIDE.md) first. If you are changing helm's
+own code, read [AGENTS.md](AGENTS.md) first. `helm --help` lists every verb,
+and [LANDING](docs/LANDING.md) says how work gets reviewed and landed.
 
----
+## What it looks like
 
-## How it actually works
+**Words helm uses.** A **seat** is one agent with a stable name in the fleet
+room: its sessions come and go, the seat stays. A **lane** is one piece of
+work, with a lease on it, its own git worktree and a `lane/<name>` branch. A
+**tip** is the exact commit a review reads. The **dispatch ledger** is the
+durable list of who owes what, and each entry on it is a **row**. A **cure**
+is a fix a reviewer finds: PATCH commits it, while MELD-DIFF gives the author an exact diff
+in the pair meld and records its validated message receipt with
+`--diff-handoff ROOM/MSGID`. A MELD-DIFF cure requires both that receipt and
+send/add proof that the child applies the diff. Prose alone, historical rows
+without a typed receipt, and unrelated children count as ordinary rounds.
+A **train** merges reviewed tips and runs the whole suite once; to **land** is to reach trunk
+(`main`) that way. A **metaharness** (orca or herdr) owns the terminal panes
+the agents run in. A **meld** is a shared room where two seats settle a
+design question. The **cockpit** is the half of helm that needs no fleet:
+your projects, sessions, memory, accounts and quota, in the CLI and the web
+page. The **per-turn physics** is what helm's hooks add to each agent turn:
+the relevant knowledge, messages delivered mid-turn, the command guards, the
+stop guard and the compaction handoff.
 
-Read this part first. helm is an **overlay** — it owns almost none of the
-machinery it steers, and knowing which piece does what is the difference
-between "a CLI with a lot of verbs" and understanding the system.
+One change, moving through a fleet:
 
-### The harness — where an agent runs
+1. **You post the goal** in the fleet room (`helm chat post`, or the web
+   page). Each agent hears it between two tool calls, not at the end of its
+   turn.
+2. **A Claude seat claims a lane.** `helm work claim <lane>` gives it a
+   lease, its own worktree and a `lane/<lane>` branch.
+3. **It builds, runs focused tests, and books a review** of the exact commit
+   with `helm dispatch send`
+   ([LANDING](docs/LANDING.md#booking-and-answering-a-review) has the full
+   command).
+4. **A reviewer reads that commit** in a fresh context. For a mechanical
+   defect, the reviewer follows the row's fix mode: PATCH commits the cure;
+   MELD-DIFF posts an exact diff for the author to apply. The reviewer records
+   the verdict with `helm dispatch verdict`.
+5. **A train lands it.** `helm train --apply` merges the reviewed tips and
+   runs one whole suite on the exact tree that lands; `helm lr foldcheck`
+   proves what landed.
+6. **Meanwhile, nothing is lost.** A seat near its context limit writes a
+   handoff (`helm handoff write`) and resumes on it. A seat whose account ran dry
+   gets exact resume commands under a healthier one (`helm swap`). `helm burn`
+   shows which model families have quota left.
 
-A **harness** is the coding-agent CLI itself. **Claude Code is helm's harness
-of expertise, and the reason is hooks.** Claude Code exposes lifecycle events
-— before a tool call, after one, at session start, before a compaction, at
-stop — and helm's entire per-turn physics rides them:
+```text
+                 you ─ chat room · web page · morning brief
+                              │  (reaches agents mid-turn)
+      ┌──────────────┬────────┴─────┬───────────────┐
+  Claude seat    Codex seat     Kimi seat     local model seat
+      └──── each: own pane, worktree, proxy, credential pool ────┘
+                              │
+   dispatch ledger: work, reviews and verdicts, bound to exact commits
+                              │
+     train ──► one whole suite on the tree that lands ──► trunk
+```
 
-| hook | what helm does with it |
+## What helm was built for
+
+- **One operator steering a mixed-model fleet on one Linux host.** helm
+  was built running a live fleet of 16 to 21 agent seats under
+  [orca](https://github.com/stablyai/orca), across several
+  projects, model families and credential pools, with quota measured for each
+  pool. At its founding in July 2026, its adopted memory store held about
+  880 entries and its session catalog about 15,000 sessions across harnesses.
+- **helm is built with helm.** Every change to helm is claimed on a lane,
+  read by a reader that did not write it, and landed through helm's own gate:
+  one whole suite of more than 27,000 tests, run as parallel slices while a
+  nightly serial run agrees with them test for test, and serially otherwise.
+- **Many model families at once.** Claude, Codex (GPT), Kimi, DeepSeek V4,
+  Grok, Gemini, Cursor through a bridge, OpenRouter's free router, and local
+  Qwen and Bonsai models served by vLLM or llama-server. The maintainers'
+  stability target is a core of Claude, Codex and Kimi; their Gemini and
+  Grok accounts often sit in quota cooldowns, and helm routes around them.
+
+| If you are... | helm fits... |
+|---|---|
+| running several coding agents, across model families or accounts, on one Linux machine | exactly: this is what it was built for |
+| a team that wants models from different vendors to check each other's work | well: independent review and a whole-suite land gate are the core |
+| one Claude Code user who wants projects, sessions, memory and quota in one place | well: the cockpit half works alone, with no fleet and no other tool |
+| managing agent panes with tmux or cmux | partly: helm runs, but pane operations are no-ops until an adapter exists |
+| on macOS or Windows | not yet: Linux only today |
+
+## Where it works today
+
+| Area | Status |
+|---|---|
+| Maturity | 0.x. The maintainers use it every day on their own fleet, but verbs and defaults still change between releases: read the [CHANGELOG](CHANGELOG.md) before you upgrade. |
+| Platform | Linux. Python 3.9+ is declared; the land gate runs CPython 3.14. macOS and Windows are not supported. |
+| Harness | Claude Code gets everything, through its hooks. Codex gets the cockpit (sessions and projects) and OpenCode its projects; neither gets the per-turn physics. [pi](https://github.com/earendil-works/pi) seats can be addressed in chat, but have no hooks. |
+| Metaharness | orca (recommended) or [herdr](https://github.com/herdrdev/herdr). tmux and cmux are not supported. With none, pane operations are no-ops. |
+| Review | The approval tier (whose APPROVE can close a review) is a policy you store; [LANDING](docs/LANDING.md#the-review-rule) explains it. The maintainers' fleet admits a fresh-context Claude Opus, Codex, DeepSeek V4 Pro, Kimi and Grok; Gemini and local models give input only. |
+| Session catalog | Claude Code and Codex. OpenCode and pi sessions count toward projects only. |
+| Web | `helm web` serves Home, Work, Chat, Fleet and History at `http://127.0.0.1:7433`. The alarm badge, Home, the land board and the scheduler count the land pipeline from one reading; a count not fully read shows as a floor or `?`, never a 0, and a stale reading says its age. |
+| Multiplayer | Local only: humans and agents on one machine. |
+| Remote sessions | helm drives Claude Code cloud sessions for reviews and builds. |
+
+## Quick start
+
+```console
+$ ./bin/helm --help      # one line per verb
+$ ./bin/helm sync        # discover your projects across every harness
+$ ./bin/helm projects    # the list, newest activity first
+$ ./bin/helm sessions    # every Claude Code + Codex session; resume in one paste
+$ ./bin/helm doctor      # what helm can and cannot see (read-only)
+$ ./bin/helm web         # the same, in a browser
+```
+
+`helm sync` scaffolds `~/.helm` and reads your existing Claude Code memory in
+place; it never copies it. To put helm on your `PATH`, run
+`sh scripts/install.sh`, or link it by hand:
+`ln -s "$PWD/bin/helm" ~/.local/bin/helm`.
+
+To run a fleet, install the hooks (`helm hooks install`), add a metaharness,
+and start seats with `helm launch` or `helm seat spawn`.
+[INSTALL](docs/INSTALL.md) walks through each step.
+
+### Requirements
+
+**Python 3.9+ on Linux, and nothing else.** helm is standard library only,
+with zero dependencies, and the test suite checks that. It is Linux-only
+because its chat lives in RAM at `/dev/shm`, and it relies on `/proc`,
+`fcntl` and systemd user units. [INSTALL](docs/INSTALL.md#requirements) has
+the details.
+
+## How it works
+
+helm is an overlay: it owns almost none of the machinery it steers.
+[ARCHITECTURE](docs/ARCHITECTURE.md#harness-metaharness-family-and-backend)
+has the full model.
+
+1. **Claude Code is the harness, because of its hooks.** helm's per-turn
+   behaviour rides Claude Code lifecycle events, so a message reaches a
+   working agent between its tool calls: it is interrupted, not queued.
+   `helm hooks install` writes the hooks, and `helm hooks status` shows which
+   are armed. [HOOKS](docs/HOOKS.md) lists all of them.
+
+| Hook | What helm does with it |
 | --- | --- |
+| `UserPromptSubmit` | add the standing rules and relevant knowledge to the turn |
+| `PostToolUse` | deliver chat messages mid-turn, between tool calls |
 | `PreToolUse` | refuse a command whose shell would mangle or execute a message body |
-| `PostToolUse` | deliver chat messages to an agent **mid-turn**, between tool calls |
 | `SessionStart` | join the room; restart the turn loop after a compaction |
 | `PreCompact` | demand a handoff before the context window is rewritten |
 | `Stop` | refuse an idle stop while addressed messages are undelivered |
 
-None of that is polling. A message reaches a working agent because a hook
-fires between its tool calls, which is why an agent here can be *interrupted*
-rather than merely *queued*. `helm hooks install` writes them; `helm hooks
-status` tells you which are armed — landing helm's code arms nothing by
-itself.
+2. **A metaharness holds the panes.** [orca](https://github.com/stablyai/orca)
+   is the recommended companion: real pane control plus a git worktree for
+   each seat. herdr is also implemented. tmux and cmux are not supported
+   today; a new adapter is a contained amount of work, not an architecture
+   change. With none, helm still runs, and pane operations say they did
+   nothing.
+3. **One harness, many model families.** Non-Claude families run behind
+   [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), so a Gemini or
+   Kimi seat is a Claude Code process with a different model behind it, and
+   it inherits every hook. One integration, not six.
+4. **A ledger and a gate decide what lands.** Work and reviews are rows on a
+   durable dispatch ledger, bound to exact commits. A review counts when the
+   reader holds none of the author's working context (a different seat on a
+   fresh session); a different model or family is preferred, not required.
+   A change lands with one approval-tier read and one whole suite on the
+   exact tree that lands. [LANDING](docs/LANDING.md) has the whole path.
+5. **A typed knowledge store feeds every turn.** Beliefs, vocabulary,
+   heuristics and reference material sit behind one just-in-time resolver, so
+   an entry reaches an agent when its prompt touches it. `helm drain` routes
+   raw notes into the store, `helm drift` speaks up when evidence contradicts
+   a belief, and `helm premise` records a certainty on a tamper-evident
+   chain. The repository also ships the Claude Code skills its own fleet
+   works with, in `agents/claudecode/skills/`.
+   [TOUR](docs/TOUR.md) walks through every part.
 
-Other harnesses (Codex, OpenCode) are discovered for sessions and projects.
-They do not have the hook surface, so they get the cockpit but not the
-per-turn physics.
+The fleet half composes with projects helm does not own. None of them is
+needed to try helm, and each one degrades to a single line:
 
-### The metaharness — where a pane lives
-
-A **metaharness** manages the terminal panes agents live in, so helm can spawn
-a seat, read its screen, send it a keystroke, and resolve which pane belongs
-to which session. helm is metaharness-**agnostic**: `helm/harness.py` is an
-adapter seam exposing one uniform `spawn / list / read / send / stop /
-resolve_pane`.
-
-- **[orca](https://github.com/stablyai/orca)** — the recommended companion,
-  and what supercharges the whole thing: real pane control plus per-seat git
-  worktrees, so nine agents are not editing one checkout.
-- **herdr** — also implemented; wins automatically inside a herdr session,
-  because panes should spawn where you already live.
-- **Anything else** — `ADAPTERS` in `helm/harness.py` is a two-entry dict and
-  a small base class. tmux, cmux and friends are **not supported today**; they
-  are a contained amount of work, not an architecture change.
-
-With no metaharness installed, helm still works — every pane operation
-degrades to a no-op and says so.
-
-### The model families — one harness, many vendors
-
-A **family** is the model behind a seat: codex, gemini, grok, kimi, deepseek,
-and the Claude models. Non-Claude families run behind
-**[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)**, which speaks
-the Anthropic wire protocol to Claude Code and the vendor's own protocol
-upstream.
-
-That is a deliberate choice with one large consequence: **a CLAUDE-HARNESS
-seat routed through CLIProxyAPI inherits the hooks, whatever family is behind
-it.** A gemini seat gets the same mid-turn delivery, the same stop-guard, the
-same compaction resume as a Claude seat, because it *is* a Claude Code process
-with a different model behind it. One integration, not six.
-
-Read that as the HARNESS axis, not the proxy: a seat carries a family, an
-agent harness AND a backend, and the three are independent
-(`seats._runtime_metadata`). Going through the proxy is not what earns the
-hooks — `helm pi run` is `family · pi/proxy`, proxy backend and all, and execs
-the **pi** binary (`helm/pi.py`, pinned by
-`tests/test_pi_start_resume.py::test_run_pins_model_registers_real_roster_row_and_execs_key_in_env`).
-It writes a roster row before exec, so the seat is addressable in chat — but it
-is not a `claude` process, so no Claude Code hook fires in it, `helm hooks
-install` does not cover it (it enumerates claude homes and seat
-`CLAUDE_CONFIG_DIR`s), and the uncovered-pane scan cannot even see it running
-(it matches argv `claude`). Address a pi seat and nothing wakes it.
-
-The consequence to know when reading an error: a `403` or a quota wall
-rendered in a Claude Code pane belongs to **the underlying vendor**, not to
-Anthropic. Read the vendor off the error text, never off the harness.
-
-### The substrate — the parts helm does not own
-
-| project | what it gives helm | without it |
+| Project | What it gives helm | Without it |
 | --- | --- | --- |
-| **[dregg](https://github.com/emberian/dregg)** | signed transport and an attested ledger: a turn can be *signed*, a premise committed as a verifiable digest, a claim proven rather than asserted | turns post unsigned; attestation verbs say so in one line |
-| **[cv](https://github.com/emberian/cv)** (clustervision) | cross-harness session recall — semantic search over what every agent, in every harness, has already done | `helm search` falls back to local transcript scanning |
+| **[dregg](https://github.com/emberian/dregg)** | signed transport and an attested ledger: a turn can be signed, a premise anchored as a verifiable digest | turns post unsigned; attestation stays on helm's native chain |
+| **[cv](https://github.com/emberian/cv)** (clustervision) | cross-harness session recall: semantic search over what every agent has already done | `helm search` says it needs cv; `helm search --scope <dir>` still scans that project's local transcripts |
 | **[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)** | non-Claude families inside the Claude Code harness | a Claude-only fleet; every other verb is unaffected |
-| **[orca](https://github.com/stablyai/orca)** / herdr | panes, worktrees, seat spawn and resume | pane ops are no-ops; you drive the terminals |
+| **[orca](https://github.com/stablyai/orca)** / **[herdr](https://github.com/herdrdev/herdr)** | panes, worktrees, seat spawn and resume | pane operations are no-ops; you drive the terminals |
 
-**None of these are required to try helm.** The core — projects, the typed
-store, sessions, credentials, the web app — is Python standard library over
-`~/.helm` and nothing else. They are what the *fleet* half is built on, and
-each one degrades to a single honest line rather than a stack trace.
-`helm doctor` tells you exactly what it can and cannot see.
+`helm doctor` and `helm capabilities` say what is wired on your machine.
 
----
+## Auto-land: lands with nobody at the wheel
 
-The pillars, grouped by what they serve — the **knowledge** your agents read,
-the **cockpit** you steer from, the **fleet** of agents, and the **surfaces**
-that render it all:
+Landing used to be a person's job, repeated about 20 times a day: list what
+is ready, merge it onto trunk, run the tree-wide audits, launch the whole
+suite, read the receipt, check the test count, push, fast-forward the shared
+checkout, close each row and task, announce. About 15 steps each time, each
+waiting on one agent's attention. `helm train auto` does all of it as a state
+machine that a timer ticks every two minutes, and it resumes where it stopped
+if a tick dies halfway.
 
-### Knowledge — what every agent reads
+1. **Intent.** When a lane is ready on the ledger (a reader that wrote none
+   of it approved or held that exact commit), auto-land posts which train
+   will land, every car in it (lane, task, commit, row) and the veto line.
+   Anyone can stop it within five minutes with
+   `helm train veto <train> --reason R`.
+2. **Compose.** Only the cars still ready at the same commit are merged, each
+   at its exact tip, into a fresh room on top of trunk. A car that conflicts
+   is dropped and named; no machine resolves a conflict.
+3. **Gate.** The tree-wide audits run on the composed room, then the whole
+   suite runs on that exact tree. The receipt must be for that tree, and the
+   test count must change by exactly the tests the change adds less the tests
+   it removes.
+4. **Blame, never guess.** A red gate is re-run alone once, and a pass there
+   is recorded as a flake. A real failure goes to `helm train blame`, which
+   names the car that broke the train (by its diff, or by bisecting the
+   train), ejects that exact commit and lands the rest.
+5. **Land.** Every car, the veto and the destination are asked once more,
+   then the push is fast-forward-only against the trunk that was gated. The
+   shared checkout follows, the rows close, and the room gets one line naming
+   the land, its gate receipt and what would prove the claim wrong.
 
-- **The knowledge chain, per project** — `premises / heuristics / lexicon /
-  prd / journal / evals / archive` under `~/.helm/<project>/`, following the
-  organic dev cycle: prior art feeds specs, the build happens in the repo,
-  evals and journals record what happened, the archive keeps history without
-  clutter.
-- **One typed store, one resolver** — beliefs (priors, with confidence that
-  updates on evidence), vocabulary (your lexicon — the terms you coined),
-  heuristics (moves you apply), and reference material, unified behind a
-  single just-in-time resolver. Relevant entries surface when a prompt touches
-  them; nothing wallpapers every turn. *Salience is the scarce resource.*
-- **The drain** — raw memory intake is a transient inbox, never a destination.
-  `helm drain` classifies raw entries and routes them into their typed homes,
-  archiving the source. Nothing is deleted; everything stays retrievable.
-- **The drift report** — beliefs carry confidence and evidence logs. When the
-  evidence starts contradicting something you hold as true, `helm drift`
-  surfaces it — and only then. No news is silence.
-- **know-your-user** — a first-class profile of how you like to work: voice,
-  autonomy, standing corrections, goals. The interview takes five minutes and
-  every agent that reads the store gets warmer.
-- **Attested truths** — `helm premise` captures a certainty into the store
-  *and* commits a signed digest to a verifiable ledger; `helm premise-check`
-  re-verifies it and quotes the finality tier. Belief history supersedes as a
-  provable chain, never deleted.
+A change behind a door (production, a migration, a deletion, money,
+credentials, a process kill, a public push, or a safety door such as land,
+review, a guard or a hook's refusal) rides only when an approval-tier reader
+approved or held it. A land that needs a person stops loudly and waits for one: a red
+trunk, a receipt it cannot read, or a push whose outcome is unclear.
 
-### Your cockpit — sessions, accounts, credentials
+**Measured.** From LAND 461 (2026-09-28 18:19 PDT) through LAND 503
+(2026-09-29 16:17 PDT), 43 lands in a row went in with no integrator action,
+each after the whole suite passed on the exact tree that landed (26,824 tests
+at LAND 461, 27,633 at LAND 503). The integrator now reads what lands instead
+of running it. [LANDING](docs/LANDING.md) has the whole path, and
+`helm train auto --status` shows the train in flight.
 
-- **`helm projects`** — your real project list, discovered from what your
-  agents actually did, across every harness (Claude Code, Codex, OpenCode —
-  more welcome). Worktrees collapse into their repo; scratch dirs are filtered;
-  a project you only ever touched in one harness still counts.
-- **`helm sessions`** — every local Claude Code + Codex session, grouped by
-  project, with the exact resume command one paste away (it's just the
-  harness's own CLI — no wrapper). Those two are the session catalog's whole
-  scope; an OpenCode or pi session still counts toward `helm projects` above,
-  but does not appear here. Content search inside transcripts
-  (`helm search`), windowed reads (`helm transcript`), re-homing, and
-  resume-optimized copies (`helm prune`) included.
-- **Accounts and quota** — `helm creds` is the live scorecard (headroom,
-  reset windows, use-it-or-lose-it verdicts); `helm swap` rescues a seat that
-  ran dry with exact resume-under-a-healthier-account commands; `helm homes`
-  manages credential homes safely (helm prepares, you run every login).
-  **`helm cred`** makes `/login` safe: it reads which account each credential
-  home ACTUALLY holds from the home's own content (never from the directory
-  name), snapshots credentials at `0600` so a login that lands in a pinned
-  session's home is reversible, and heals a drifted home — dry-run by default,
-  refusing while any live session holds it.
-- **Corpus + attribution** — `helm corpus` archives the Claude, Codex and
-  `/tmp`-estate raw transcripts into a dated append-only archive (your
-  training corpus, copy-only, incremental — OpenCode and pi transcripts are
-  not collected); `helm attribute` rolls up token effort by
-  project/model/cred, and `helm who` maps live pids to the credentials
-  they're burning.
+## How well it works: the 11-axis eval
 
-### The fleet — many agents at once
+helm's maintainers score it on **11 agent-experience axes**, 1 to 100, against a
+written rubric that ties every 80 and every 90 to a measurement. Across five
+snapshots scored under the fixed rubric, over three and a half days
+(2026-09-25 07:00 to 2026-09-28 21:54 PDT), the mean rose from **73.1 to
+78.1**, and the axes at 80 or above went from 2 to **5 of 11**. No axis is at
+90.
 
-- **The fleet room** — `helm chat`: the human-included groupchat in RAM,
-  owner in the room. The delivery lane reaches an agent mid-turn, between
-  tool calls (`@seat` mentions and owner posts), with roster presence
-  (`helm chat seats`), advisory claim leases, and `helm launch` to start a
-  session already seated. Chat lives in `/dev/shm` on purpose: coordination
-  state is memory that is read every turn, and disk is the write-behind log —
-  never the bus.
-- **Seats** — `helm seat` mints a live agent of a given family: its own pane,
-  its own git worktree, its own proxy and credential pool, registered so helm
-  can find it again. `helm seat spawn|resume|where|status|doctor` are the
-  lifecycle; `doctor --ensure` respawns a proxy that died quietly, and
-  compaction is survivable — a seat that compacts restarts its own turn loop
-  instead of sitting idle until a human types into its pane.
-- **The cross-family review gate** — the load-bearing rule of the whole
-  project: **the author's resolved runtime model family may not be the
-  reviewer's.** Family comes from each canonical roster row's verified runtime
-  record, never the seat name, agent/subagent type, harness, or UI label; absent
-  or unverified runtime is UNKNOWN and cannot authorize the gate. `helm
-  dispatch send <seat> <lane> --ref <tip> --kind review
-  --new-work|--supersedes <id>` books a review against an exact commit and
-  says which WORK it belongs to — the lane is only a label, so a renamed
-  continuation would otherwise read as round one; the reviewer replies with a verdict whose polarity
-  is *required* (`--approve` / `--fix`), because a decision that forgot to say
-  which way it went is recorded as UNDECLARED forever. A gemini seat refuting
-  a codex seat's work catches what neither catches alone — not because either
-  is better, but because a blind spot is a property of a shared frame.
-  **The families are equal counterparts, not a writing tier and a witnessing
-  tier.** A reviewer of any family who finds a MECHANICAL defect commits the
-  cure in its own worktree on a branch off the exact reviewed tip and names it
-  on the verdict (`--patch-tip <sha>`); the lane owner or integrator rebases
-  onto that tip, the ledger records both authors, and `helm lr close --reason
-  landed` credits each. A DESIGN finding goes to a meld instead. What preserves
-  the independence the gate exists for is that the composed tip is re-read once
-  before the land gate by a reader who wrote none of it.
-- **Minted whole-suite gates** — `helm gate run` binds interpreter, exact tree,
-  before/after cleanliness, process exit and unittest summary into one receipt.
-  In helm's own tree the whole suite belongs to the land gate: a lane is
-  tested in focused rounds (`helm gate run --focus` plus `helm gate audits`), and
-  `helm gate run` refuses a whole suite in a lane room, refuses a second one
-  on a tree that is already green, and runs a red tree again only with
-  `--again`. Only a SERIAL receipt authorizes a land. A sliced one (the
-  default with no mode flag in a lane-level room) binds a lane tip and a
-  review's approve and never a land — see
-  [How a change is tested](CONTRIBUTING.md#how-a-change-is-tested).
-  Expensive whole-suite runs enter a process-owned repository FIFO first: every
-  linked worktree shares one ordered slot, poll speed cannot barge, dead
-  positions are skipped visibly, and the slot stays held through receipt append.
-  During mixed-version rollout, the FIFO head also holds the legacy
-  `gatelock:<project>` mutex, waits boundedly through transient claims-lock
-  contention, strictly refreshes it, and validates its exact lease while appending
-  the receipt so older/manual runners cannot overlap it. Syntactically or
-  structurally malformed strict claim state refuses rather than reading empty. A
-  Linux child subreaper waits behind a one-byte launch barrier until its exact PID
-  is bound into the FIFO row. A pipe-free watchdog resumes a stopped bound
-  supervisor immediately when the exact launcher generation dies, remains an
-  unreaped zombie, or stops long enough that it cannot renew the compatibility
-  lease; its argv also carries the immutable position token so a later
-  dead-launcher sweep can recover even a stopped pre-bind supervisor. A dedicated
-  guard enters a delegated per-position cgroup before spawning the inner supervisor,
-  so every suite descendant inherits one kernel-owned membership without changing
-  the PID namespace the tests are validating. `cgroup.kill` removes the entire
-  membership despite `setsid`, including simultaneous guard and supervisor
-  `SIGKILL`. A watchdog outside the cgroup kills and removes it after launcher or
-  guard death, while unrelated launcher children remain structurally outside
-  cleanup. The inner
-  supervisor freezes a fork-capable detached tree before killing
-  it, and a stopped supervisor is resumed
-  into that cleanup path; pipe collection remains bounded after shutdown. Queue
-  wait is outside the child timeout; custom diagnostic commands remain unqueued
-  and cannot bind a verdict.
-- **Land requests** — `helm lr` primarily tracks the queue between "reviewed"
-  and "on main": which tips are waiting, which have receipts, which reviewer
-  owes a verdict, and which recorded proofs no longer resolve. It also closes an
-  OPEN BUILD for a non-code delivered report when a typed artifact reference,
-  full Helm chat row id, and concise handoff evidence are explicitly recorded —
-  a terminal that claims no review or Git land. Git-backed proofs are bound to commits,
-  and a commit id is content-addressed over *history* — so `lr refs` audits
-  what a history rewrite broke, and `lr migrate` translates it into a sidecar
-  that never rewrites an attested tip. When the exact reviewed commit is truly
-  gone and no proof can be recovered, `lr abandon` writes off that reviewed work
-  explicitly as **ABANDONED — LAND STATE UNKNOWN** instead of inventing a land.
-- **Handoffs** — `helm handoff` is the contract across a context window: a
-  compaction demands DONE / REMAINING / NEXT before the window closes, and
-  refuses to call an empty one satisfied. The next window resumes on the
-  handoff, not on a summary of a summary.
+Mean at each snapshot (PDT): 09-25 07:00 **73.1** → 09-25 13:55 **72.1** →
+09-25 20:41 **74.5** → 09-28 11:10 **76.5** → 09-28 21:54 **78.1**.
 
-### Surfaces
+| Axis | 2026-09-25 07:00 | 2026-09-28 21:54 | 80 bar |
+|---|---|---|---|
+| Test suite speed | 64 | 84 | met |
+| Land safety and guards | 80 | 82 | met |
+| Review process | 78 | 81 | met |
+| Landing pipeline | 77 | 80 | met |
+| Release process | 75 | 80 | met |
+| Ledger reads | 82 | 78 | not yet: scored before the post-land read timer (`helm lr postland`) landed |
+| Hooks | 76 | 77 | not yet: stop hook p95 is 1.5 s under load; the bar is 1 s |
+| Owner surface | 64 | 77 | not yet: `helm brief --report` exists but missed lands; the report of record is still hand-written |
+| Delegation | 74 | 75 | not yet: builder claims are not checked automatically |
+| Agent chat | 68 | 74 | not yet: the idle re-ring is built but fired 0 times in 9 h |
+| Seat health | 66 | 71 | not yet: idle seats that owe work are not re-surfaced |
+| **Mean** | **73.1** | **78.1** | 5 of 11 met |
 
-- **The web app** — `helm web` serves four views from one self-contained
-  page: your knowledge home, the quota chart + accounts table + credential
-  homes, the full sessions browser (search inside transcripts, role-colored
-  drawer, one-click resume, team tray), and the config-cascade editor
-  (owner commands + rules included; conflict-safe atomic writes and restore).
-- **The lineage map** — projects fork, compose, supersede, and launch. helm's
-  registry carries those edges and renders the family tree, including
-  read-only external nodes, plus a ranked (read-only) "safe to archive and
-  why" report.
+**Read these as self-scores.** The rubric is the maintainers' own, and
+read-only agents took the measurements on the maintainers' fleet. It is not a
+cross-family council, and it is not an independent rating. The version number
+0.3.5 is reserved for the first release that independent raters, each working
+real helm tasks, score 90 or above on every axis. The release cut from these
+scores is 0.3.2. [EVAL](docs/EVAL.md) has the rubric, every snapshot
+over time, charts, and the independent-rater battery.
+
+## What needs work
+
+- **The six axes below 80.** The next steps, in order: make the idle re-ring
+  fire, make `helm brief --report` complete enough to replace the hand-written
+  report, bind every builder claim to a
+  checking command, get the stop hook under 1 s at load, and score ledger
+  reads from the post-land read timer (`helm lr postland`).
+  [EVAL](docs/EVAL.md#what-is-next) has the detail.
+- **A single work view in the web console (being built).** Each piece of
+  work becomes one card that moves from To do through Building, In review and
+  Landing to Landed. It marks each time the work was sent back, and a drawer
+  shows its whole path.
+- **Independent ratings.** The independent-rater battery has run one dry
+  round, with one local model. The full battery, with raters from several
+  model families and a deliberately broken control, has not run.
+- **More metaharnesses and platforms.** tmux, cmux and zellij need adapters.
+  macOS and Windows ports are not claimed.
+- **Per-turn physics beyond Claude Code.** Native Codex and OpenCode
+  sessions, and pi seats, get no hooks and cannot be woken.
+- **Model records for native seats.** A native Codex or OpenCode runtime
+  records no resolved model, so helm cannot tell which model read a change on
+  those seats; `helm route` says so beside the seat rather than barring it.
+- **More model families as approvers.** Gemini and local models give
+  findings only. Admitting every family as an approver waits until the
+  Claude, Codex and Kimi core is stable.
+- **Version control.** helm works with git only; Jujutsu (jj) support is
+  not built, and some direct git calls still sit outside the version-control
+  seam.
+- **Packaging.** The immutable, non-writable install is a preview and does
+  not replace the checkout install yet ([INSTALL](docs/INSTALL.md#immutable-release-preview-not-cut-over)).
+  Remote and web multiplayer are outside the local core.
+- **Docs.** The verb reference is one very large file; `helm --help` is the
+  browsable overview today.
 
 ## Principles
 
@@ -307,142 +356,61 @@ that render it all:
    attribute; sessions are the key. helm decodes real paths from inside
    transcripts, never from directory names.
 3. **Additive and idempotent.** `helm sync` never deletes a known project.
-   Cleanup means *archive with a reference back* — like old photo albums you
-   keep — never deletion.
+   Cleanup means *archive with a reference back*, never deletion.
 4. **CLI-first, with a web equivalent.** Every curation verb works in a
    terminal and in the browser (`helm web`).
 5. **Zero dependencies.** Python standard library only. One checkout, no
-   install step: `./bin/helm sync`.
+   install step.
 
-## Quickstart
+[DESIGN_PHILOSOPHY](docs/DESIGN_PHILOSOPHY.md) explains why helm is shaped
+this way.
 
-```console
-$ ./bin/helm sync              # discover your projects across all harnesses
-$ ./bin/helm projects          # the list, newest activity first
-$ ./bin/helm show <project>    # one project's full record (any name from the list)
-$ ./bin/helm sessions          # every claude + codex session; resume in one paste
-$ ./bin/helm doctor            # health check (read-only)
-$ ./bin/helm web               # the same, warm, in a browser
-```
+## Where to go next
 
-### Requirements
+| If you are... | Read |
+|---|---|
+| trying helm for the first time | [INSTALL](docs/INSTALL.md), then [TOUR](docs/TOUR.md) |
+| an agent seated in a helm fleet | [NEW_AGENT_GUIDE](docs/NEW_AGENT_GUIDE.md): your first 10 minutes |
+| an agent changing helm's own code | [AGENTS.md](AGENTS.md) |
+| a human contributor | [CONTRIBUTING](CONTRIBUTING.md) |
+| running a fleet | [LANDING](docs/LANDING.md), [HOOKS](docs/HOOKS.md), [WEB](docs/WEB.md), [MODEL_FAMILY_FAILOVER](docs/methodology/MODEL_FAMILY_FAILOVER.md) |
+| asking why it is built this way | [ARCHITECTURE](docs/ARCHITECTURE.md), [CONCEPTS](docs/CONCEPTS.md), [DESIGN_PHILOSOPHY](docs/DESIGN_PHILOSOPHY.md) |
+| asking how well it works | [EVAL](docs/EVAL.md), [COUNCIL_EVAL](docs/methodology/COUNCIL_EVAL.md) |
+| upgrading | [CHANGELOG](CHANGELOG.md) |
+| reporting a vulnerability | [SECURITY](SECURITY.md) |
 
-**Requires Python 3.9+ on Linux**, and nothing else. That floor is declared
-here and in `scripts/install.sh`. The suite is
-`python3 -m unittest discover -s tests`; how a change is tested (focused
-rounds, then one whole suite at the land gate) is in
-[CONTRIBUTING](CONTRIBUTING.md#how-a-change-is-tested). Maintainers test on
-newer interpreters; 3.9 is declared, not CI-tested. `tomllib` (3.11+) is used when present
-and config validation degrades to a warning without it.
+**Looking up a verb or a setting.** `helm --help` prints one line per verb,
+`helm <verb> --help` prints that verb's full usage, and `helm capabilities`
+lists what is wired on this machine. [docs/VERBS.md](docs/VERBS.md) is the
+authoritative verb surface: about 1 MB, so search it rather than read it.
+[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) lists every `HELM_*` variable (all
+optional; `HELM_HOME` overrides the default `~/.helm`), including the legacy
+spellings still read as fallbacks.
 
-**Linux specifically, and stdlib-only does not mean portable.** helm's chat
-lives in RAM at `/dev/shm`, it reads process liveness from `/proc`, locks with
-`fcntl`, supervises nodes through user systemd units, and checks ownership with
-`os.getuid`. Those are POSIX-and-then-some, not
-Python-version, concerns — macOS has no `/dev/shm` and Windows has neither
-`fcntl` nor `/proc`. Nothing here is a deliberate exclusion; it is what
-"coordination state is memory, disk is a write-behind log" costs on the platform
-it was built for. A port is possible and is not currently claimed, tested, or
-supported.
+**More reference:** [ATTESTATION](docs/ATTESTATION.md) (the premise hash
+chain) · [EVOLUTION](docs/EVOLUTION.md) (the self-evolution loop) ·
+[MELD_REVIEW_DOOR](docs/MELD_REVIEW_DOOR.md) (when a review becomes a meld) ·
+[MULTIPLAYER](docs/MULTIPLAYER.md) and
+[MULTIPLAYER_TESTDRIVE](docs/MULTIPLAYER_TESTDRIVE.md) ·
+[REMOTE_SESSIONS](docs/REMOTE_SESSIONS.md) ·
+[CLASSIFY](docs/CLASSIFY.md) (the optional classifier client) ·
+[FOLD_CHECKPOINT](docs/FOLD_CHECKPOINT.md) (why ledger reads are fast) ·
+[DISPATCH-ADD-CONTRACT](docs/DISPATCH-ADD-CONTRACT.md) ·
+[MODULE_REGISTRIES](docs/MODULE_REGISTRIES.md) (what a new module owes) ·
+[STE-CLARITY](docs/research/STE-CLARITY.md) (the controlled language behind
+`helm clarity`)
 
-### Immutable artifact deployment (artifact only; not cut over)
+## Credits and license
 
-`scripts/deploy.py` can materialize one committed Helm tree as a real,
-non-writable filesystem release. It is a standalone Python 3.9+ stdlib script
-and does not import the mutable `helm` package it is deploying:
+helm composes with [dregg](https://github.com/emberian/dregg) and
+[cv](https://github.com/emberian/cv) by Ember
+([github.com/emberian](https://github.com/emberian)),
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), the
+[Orca](https://github.com/stablyai/orca) and
+[herdr](https://github.com/herdrdev/herdr) metaharnesses as hosts, and
+Claude Code's hook surface.
 
-```console
-$ python3 scripts/deploy.py --dry-run
-$ python3 scripts/deploy.py                    # -> ~/.local/share/helm/artifacts
-$ python3 scripts/deploy.py --root /other/root
-$ ~/.local/share/helm/artifacts/bin/helm --version
-```
-
-The deployer refuses staged or unstaged tracked changes, resolves the requested
-commit and tree once, and materializes only `git archive <commit>` bytes.
-Untracked, ignored, and working-tree-only files therefore cannot enter the
-artifact. Each `releases/<full-commit>/` directory carries a schema-versioned
-manifest with the commit, tree, package version, and deterministic content
-digest. A stable regular-file launcher resolves the relative `current` symlink
-once and executes the concrete release path with bytecode writes disabled. Old
-releases are retained.
-
-**This slice does not cut any existing consumer over.** It does not install on
-`PATH`, repoint hooks, change seat lifecycle, or modify systemd, cron, Git hook,
-or consumer settings. The existing install path below still links directly to
-a mutable checkout; the artifact launcher above is an explicit isolated-runtime
-preview until a later, separately reviewed cutover.
-
-Optional mutable-checkout PATH install — the entry script resolves through
-symlinks, so putting it on your PATH is the whole install:
-
-```console
-$ sh scripts/install.sh            # -> ~/.local/bin/helm, then verifies it runs
-$ sh scripts/install.sh --dry-run  # say what would happen, change nothing
-$ sh scripts/install.sh --uninstall
-```
-
-It checks your Python first (a `helm` on PATH that cannot start is worse than
-no `helm`), refuses to overwrite anything it did not create, and finishes by
-actually running the installed binary rather than assuming the link works. If
-you would rather do it by hand, that is still all it is:
-
-```console
-$ ln -s "$PWD/bin/helm" ~/.local/bin/helm
-```
-
-**What first run does.** `helm sync` scaffolds `~/.helm` (the global chain +
-one dir per discovered project); and if you already use Claude Code, the
-typed store **adopts your live memory dir in place** — the resolver reads
-`~/.claude/projects/<slug-of-home>/memory` as one more root: same files, no
-copy, byte-shape-compatible writes, so your existing hooks keep working
-untouched. New helm entries land in `~/.helm`, never there; only the
-lifecycle verbs (evidence / supersede / retire) write back wherever an entry
-lives, adopted included — and those retire in place, never delete (the file
-stays as the record). On a fresh
-machine with no harness stores at all, everything
-still works: sync scaffolds an empty home, the project list is empty until an
-agent runs somewhere, and `helm doctor` tells you exactly what it is (and
-isn't) seeing. Quota, recall, and the attestation substrate are all
-optional — each degrades to one informative line.
-
-- **Command reference** — every verb with syntax and examples:
-  [docs/VERBS.md](docs/VERBS.md). That file is the authoritative verb
-  surface; the pillars above are a sample, not the list.
-- **Environment** — every `HELM_*` variable (all optional):
-  [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md). `HELM_HOME` overrides the
-  default `~/.helm`; legacy `MELD_*` spellings, and those of a predecessor
-  tool the [local names](docs/ENVIRONMENT.md#local-names) declare, are
-  accepted as fallbacks forever.
-
-## Docs
-
-[VERBS](docs/VERBS.md) — the command reference ·
-[ENVIRONMENT](docs/ENVIRONMENT.md) — every knob ·
-[ARCHITECTURE](docs/ARCHITECTURE.md) — the two-source model ·
-[CONCEPTS](docs/CONCEPTS.md) — the axes and laws ·
-[DESIGN PHILOSOPHY](docs/DESIGN_PHILOSOPHY.md) — why helm is shaped this way ·
-[HOOKS](docs/HOOKS.md) — wiring `helm inject` into your harness ·
-[WEB](docs/WEB.md) — the browser surface, API, service unit ·
-[ATTESTATION](docs/ATTESTATION.md) — the ledger leg ·
-[EVOLUTION](docs/EVOLUTION.md) — the self-evolution loop ·
-[COUNCIL EVAL](docs/methodology/COUNCIL_EVAL.md) — cross-family self-evaluation SOP ·
-[FAMILY FAILOVER](docs/methodology/MODEL_FAMILY_FAILOVER.md) — model-family failover SOP ·
-[AGENTS](AGENTS.md) — working in the codebase (for agents) ·
-[NEW AGENT GUIDE](docs/NEW_AGENT_GUIDE.md) — your first 10 minutes as a seat ·
-[CONTRIBUTING](CONTRIBUTING.md) — setup, tests, the laws new code obeys
-
-## Status
-
-Young and moving fast. The registry/auto-map, typed store, drain, drift,
-lineage, and web views are live; reflexes and the self-evolution loop are in
-active development. Issues and harness-format reports welcome — see
-[CONTRIBUTING.md](CONTRIBUTING.md) for the on-ramp.
-
-## License
-
-[AGPL-3.0-or-later](LICENSE) — the same copyleft as dregg, the attested-ledger
-substrate helm composes with (cv is MIT/Apache-2.0-licensed; helm's copyleft is
-its own choice, not required by a dependency). Modified network-served versions
-must share source; running helm for yourself, or inside your own fleet, asks
-nothing of you.
+[AGPL-3.0-or-later](LICENSE): the same copyleft as dregg (cv is
+MIT/Apache-2.0-licensed; helm's copyleft is its own choice, not required by a
+dependency). Modified network-served versions must share source; running helm
+for yourself, or inside your own fleet, asks nothing of you.

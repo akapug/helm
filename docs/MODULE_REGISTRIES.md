@@ -1,7 +1,8 @@
 # The registries a new module owes
 
 A new file under `helm/` is not just a file. **Twenty-two test modules
-enumerate the package** and assert a property of every module they find, and
+enumerate the package** and assert a property of every module they find (the
+hand census in §7; the scan that keeps `helm gate audits` whole finds more), and
 **nine more registration points live outside `tests/`** — four rungs
 (`helm/wiring.py`, `helm/docref_guard.py`, `helm/splitbudget.py`,
 `helm/registry.py`), one dispatcher (`helm/cli.py`) and four docs
@@ -188,7 +189,7 @@ citation reads as making an unaccounted one and the guard blocks its own cure.
 | Trigger | What refuses | What you write |
 |---|---|---|
 | a new `cmd_<name>` | nothing yet — an unregistered verb is simply invisible | `helm/cli.py` `VERBS`, via `_lazy` so one broken leg cannot take the CLI down |
-| a registered verb | `helm <verb> --help` prints nothing useful | `helm/cli.py` `_VERB_HELP[<verb>]` — `cli.py` prefers it over `fn.__doc__`, so a docstring-only mention is **never printed** |
+| a registered verb | `helm <verb> --help` prints nothing useful | `helm/cli_help.py` `_VERB_HELP[<verb>]` — `cli.py` prefers it over `fn.__doc__`, so a docstring-only mention is **never printed**. Write the usage, then ` — `, then a first sentence that stands alone: `helm --help` lists each verb on one line cut from them — the subverbs and positional `<args>` (every `[...]` and `(...)` group dropped but an optional subverb group such as `[show\|record]`; a pipe typed inside one argument keeps its spaces, as `<id> \| <stmt>`), then that sentence |
 | a registered verb | the repo's own law: a verb without a doc entry is a bug | a `docs/VERBS.md` entry |
 | your dispatcher compares `args[0]` against literal subverbs | `tests/test_surface_wiring.py::test_every_accepted_subverb_is_printed_or_reasoned` | put every accepted token in the root synopsis (`_VERB_HELP[<verb>]`), or add it to that file's `ALLOWED` with a reason **and its death condition** |
 | your dispatcher takes an unknown subverb | `tests/test_dispatch_honest.py::test_every_discovered_dispatcher_refuses_unknown_subverb` — discovery is source-driven, so your dispatcher joins the fleet with no edit to the test | refuse an unknown head token BY NAME. A quietly-dropped `--gaet` reports a clean answer to a question nobody asked. Exemptions live in that file's `EXEMPT` and are checked for rot |
@@ -284,16 +285,19 @@ Write `<verb>` when you mean a placeholder.
 | `tests/test_env_hygiene.py::test_every_test_module_restores_the_env_vars_it_sets` | a test that sets an env var and leaks it into the next test | restore it; the detector accepts every restoration form already in use |
 | `tests/test_env_hygiene.py::test_no_test_runs_its_own_setUp_over_a_live_fixture` | a test (or a helper it calls) that runs `self.setUp()` while the fixture is live, so tearDown restores the fixture's own temporary values and the next test in the process inherits them | a test of its own, or a per-case scope such as `mock.patch.dict(os.environ, ...)`. `self.tearDown()` as the statement immediately before is the one exempt shape |
 | `tests/test_assertion_hygiene.py::test_no_assertion_in_tests_renders_the_ambient_environment` | an assertion whose expected value comes from the ambient environment | pin the value |
+| `tests/test_elapsed_ceilings.py::test_no_elapsed_ceiling_is_unlisted_growing_or_stale` | an assertion that holds elapsed wall time under a ceiling (`assertLess(time.monotonic() - t0, 2)`, `assertLess(elapsed, ...)` and the mirrored forms). A loaded build host, and a sliced suite is one, crosses such a ceiling with no defect | count the operation's own events or polls, or give it a fake clock through a deterministic seam. A genuine hang bound (seconds of headroom over a sub-second call) goes in that file's `ALLOWLIST` with its kind and a reason; the list only shrinks, and an entry a conversion leaves stale is refused |
 | `tests/test_scratch.py::test_no_test_module_unroutes_the_process` | a test that moves the process off the routed scratch estate | leave the routing alone |
 | `tests/test_socket_paths.py::test_every_socket_fixture_file_is_represented` | a socket fixture outside the path budget | keep fixture socket paths inside the budget |
 | `tests/test_suite_collection.py` | a test file `unittest discover` cannot collect | name and place it so discovery descends to it |
+| `tests/test_gateaudits_drift.py::TheListIsTheScans` | a test module that walks the tree from its own `__file__` (a walk, a listing, a glob, `git ls-files`, `git grep`) that no list in `helm/gateaudits.py` names, so no lane runs it before a gate | add it to `TREE_READERS`, or to `EXEMPT` with the reason no other lane's change can redden it |
 
 Tests must also point `HELM_HOME` and `HELM_ADOPTED_DIR` at temp dirs and never
 touch the real stores — see [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 **This section is not claimed complete.** §1, §2 and §4 come from a deliberate
-enumeration of everything that walks `helm/`; these eight arms were found as a
-by-product of that sweep, and the `tests/` tree was never swept the same way.
+enumeration of everything that walks `helm/`; eight of these arms were found as
+a by-product of that sweep, the elapsed-ceiling audit was written as a
+tree-wide audit of `tests/`, and the `tests/` tree was never swept the same way.
 Treat a red arm here as evidence the list is short, not as a surprise.
 
 ---
@@ -305,7 +309,7 @@ second, stricter set. If it is not, none of these can see it.
 
 | Arm | Property | What you write |
 |---|---|---|
-| `helm/splitbudget.py`, at pre-commit | a per-file line ceiling, asked against the **staged blob**. It refuses only what your commit makes WORSE: growth past the budget refuses, a shrinking over-budget file passes, a standing debt you did not touch is reported and never refuses | split the module, or shrink it |
+| `helm/splitbudget.py`, at pre-commit | a per-file line ceiling, asked against the **staged blob**. It refuses only what your commit makes WORSE: growth past the budget refuses, a shrinking over-budget file passes, a standing debt you did not touch is reported and never refuses | split the module: move whole functions into a new sibling `helm/<module>_<topic>.py` and import them back. The refusal prints the steps and three past splits to copy, and records itself in `<git common dir>/helm/refusals.jsonl` |
 | `tests/test_seats_split_contract.py::test_the_facade_only_ever_shrinks` | a ratchet on `seats.py`'s size | every extraction lowers `CEILING`; it may never rise |
 | `::test_no_extracted_module_references_an_undefined_global` | a moved function may not call a name that stayed behind. Import does not catch this — the reference lives in a function body — and neither does a green suite | define it, import it, or let the facade export it |
 | `::test_no_scanned_module_has_a_module_scope_annotation` | a module-scope annotated assignment confuses the undefined-global checker on 3.14 | drop the annotation |
@@ -362,10 +366,12 @@ registrations, which it paid the same way: reachable because
 `helm/dispatches.py` imports it, imported by `tests/test_foldckpt.py`, its git
 reads routed through the `vcs` seam (so no `_DIRECT_SPAWN_DEBT` row), and no
 new `HELM_*` variable. Its store is declared as
-`row("dispatch-fold", "projection", "home", ...)` in `helm/registry.py`
-`projections()`: the files live under `_global/.state/dispatch-fold/` in the
-helm home, so HELM_HOME isolates them in every test — a cache outside the home
-would be a cross-test channel — and its rebuild is any read of the ledger. The
+`row("ledger-fold", "projection", "home", ...)` in `helm/registry.py`
+`projections()`: the files live under `_global/.state/ledger-fold/<ledger
+key>/` in the helm home (the flat `dispatch-fold/` globs beside them are the
+retired address, declared so a leftover is not read as a squatter), so
+HELM_HOME isolates them in every test — a cache outside the home would be a
+cross-test channel — and its rebuild is any read of the ledger. The
 glob names `pk.atomic_write`'s `*.tmp` too, because a crash between write and
 rename leaves one, and an undeclared leftover is a squatter.
 
@@ -395,6 +401,15 @@ Working §1 then §2 in order would have caught all four before the gate.
 prints it as one `fab test` command. `helm/gateaudits.py` carries the same
 twenty-two names as the list at the end of this section, and
 `tests/test_gateaudits.py` reddens when either changes without the other.
+
+**Pass 1 below now runs on every gate.** `gateaudits.scan` reads every
+`tests/test*.py` for a walk of the tree rooted at its own `__file__`, and
+`tests/test_gateaudits_drift.py` reddens on a reader that no list in
+`helm/gateaudits.py` names, or on a listed module the scan cannot see that
+`DECLARED` does not explain. Its first run found twelve readers no list
+carried: nine ride in `TREE_READERS`, and the walking arms of the other three
+moved into small modules of their own, which ride instead. Passes 2 and 3
+still find what no scan of walks can see.
 
 Start here, but do not stop here:
 

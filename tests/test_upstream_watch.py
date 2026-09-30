@@ -588,8 +588,121 @@ class DocsTest(Fixture):
 
 
 class TimerAndCliTest(Fixture):
+    """`timer_units` writes the two unit files; the CLI verbs install, stop,
+    start, and show them. The timer unit's `ExecStart` is the real watcher's
+    daily/nightly run, so its `Environment=` lines must be the ones the census
+    reads back without drift."""
+
+    # task/3441 — the NBSP trap: `_knob` reads knobs over Python `str.strip()`,
+    # which eats every Unicode whitespace char. systemd 259's `strip` of a unit
+    # value is the systemd-space set `_SYSTEMD_SPACE = " \t\n\r"` — NOT the
+    # Python `.strip()` — and the census (`timerhealth._directives`) reads the
+    # installed file back over that set only. So an install that went through
+    # `_knob` (Python `.strip()`) with an NBSP-terminated value writes a value
+    # the census reads back DIFFERENTLY: `_knob` stripped the NBSP, so the unit
+    # carries the clean path, but a fresh install (the cure) keeps the NBSP and
+    # the census would report DRIFT. The cure reads the knob over `_SYSTEMD_SPACE`,
+    # so the install and its census agree: NBSP-terminated values are written
+    # through exactly. A form feed (a control char) is a separate contract:
+    # `timerhealth.env_word` returns None for control chars, so a form-feed
+    # value is left OUT of the unit, not written through.
+    #
+    # These tests pin that. The install must write the NBSP-terminated value
+    # through exactly (the census, stripping only `_SYSTEMD_SPACE`, reads it
+    # back unchanged). On the buggy `_knob` code, `timer_units` eats the NBSP
+    # and the written line is the clean path -> the assertion on the NBSP
+    # line FAILS (RED). After the cure, the NBSP survives in the unit -> PASS.
+
+    def test_nbsp_terminates_knob_value_intact_through_install(self):
+        """A trailing NBSP is part of the value systemd 259 keeps (task/3441).
+        The census strips only `_SYSTEMD_SPACE` (space, tab, newline, CR) — not
+        NBSP — so it reads an NBSP-terminated value back unchanged. The install
+        must write the value through exactly: with `_knob` (Python `.strip()`)
+        it eats the NBSP and the unit carries the clean path (drift); with the
+        cure, the NBSP survives in the unit text."""
+        nbsp_value = "/opt/claude\xa0"
+        spath, service, tpath, timer = watch.timer_units(env={
+            "HELM_UPSTREAM_WATCH_CLAUDE": nbsp_value,
+            "HELM_UPSTREAM_WATCH_CLAUDE_HOME": ""})
+        # Assert on the raw written line the same way the existing idiom at
+        # `test_the_daily_units_run_a_real_pass_with_absolute_programs` does:
+        # `Environment=...` is joined over the service text, and the NBSP is
+        # kept unquoted (env_word quotes only space/quote/backslash, NBSP is
+        # none of those). With the buggy `_knob` the NBSP is eaten and this
+        # line is the clean path, so the assertion fails -> RED.
+        self.assertIn("Environment=HELM_UPSTREAM_WATCH_CLAUDE=/opt/claude\xa0\n",
+                      service,
+                      "the install must write an NBSP-terminated value through "
+                      "exactly, so the census (stripping only `_SYSTEMD_SPACE`) "
+                      "reads it back unchanged; `_knob` (Python `.strip()`) eats "
+                      "the NBSP and the census would drift")
+
+    def test_formfeed_value_is_left_out_not_written_through(self):  # noqa: VACUOUS_ASSERTION — the absence is the contract (no line can carry a control char); the NBSP test at the same observable is the positive control on the same writes
+        """A trailing form feed is a control character. `timerhealth.env_word`
+        returns None for control chars, so a form-feed value is left OUT of the
+        unit entirely — the CLAUDE line is absent — rather than written through.
+        This is the correct contract for a form-feed-terminated knob: it cannot
+        be written through (systemd would split or drop it), so the census
+        reads the line's ABSENCE back, not a mangled value."""
+        ff_value = "/opt/claude\f"
+        spath, service, tpath, timer = watch.timer_units(env={
+            "HELM_UPSTREAM_WATCH_CLAUDE": ff_value,
+            "HELM_UPSTREAM_WATCH_CLAUDE_HOME": ""})
+        # A form feed is a control char: env_word returns None, so no
+        # Environment=HELM_UPSTREAM_WATCH_CLAUDE= line is written at all.
+        self.assertNotIn("Environment=HELM_UPSTREAM_WATCH_CLAUDE=", service,
+                         "a form-feed-terminated knob (a control char) is left "
+                         "out of the unit, not written through; systemd would "
+                         "split or drop a value systemd itself would not set "
+                         "(task/3423)")
+
+    def test_trailing_space_is_stripped_by_both_install_and_census(self):  # noqa: VACUOUS_ASSERTION — the clean value is asserted equal (positive), and the space is asserted absent in the same line
+        """Control: a trailing ASCII space IS in `_SYSTEMD_SPACE`, so BOTH the
+        install and the census strip it. They agree on the un-spaced value and
+        no drift is reported for it. The cure must not change this: an
+        ASCII-space-terminated value is still stripped to its un-spaced form
+        by the census read-back, exactly as `_knob` did before the fix."""
+        space_value = "/opt/claude "
+        spath, service, tpath, timer = watch.timer_units(env={
+            "HELM_UPSTREAM_WATCH_CLAUDE": space_value,
+            "HELM_UPSTREAM_WATCH_CLAUDE_HOME": ""})
+        # A trailing ASCII space is in `_SYSTEMD_SPACE`. `timer_units` reads the
+        # knob over that set, so the space is already stripped before
+        # env_assignment writes the un-spaced path unquoted (no special char
+        # remains). The census reads the value back over the same set, also
+        # un-spaced. Assert that exact line, and that no stray space survives.
+        self.assertIn("Environment=HELM_UPSTREAM_WATCH_CLAUDE=/opt/claude\n",
+                      service,
+                      "a trailing ASCII space (in `_SYSTEMD_SPACE`) is stripped "
+                      "by both install and census; the cure must leave the "
+                      "census reading the clean path, unchanged from before")
+        self.assertNotIn("Environment=HELM_UPSTREAM_WATCH_CLAUDE=/opt/claude ",
+                         service,
+                         "a trailing ASCII space must not survive in the written "
+                         "line (it is in `_SYSTEMD_SPACE`); the cure must not "
+                         "keep it")
+
+    def test_all_space_value_still_falls_back_to_which(self):
+        """Control: an all-space CLAUDE value is stripped to empty, so
+        `timer_units` falls back to `shutil.which("claude")`. The cure must
+        not break this: an all-space value, stripped with `_SYSTEMD_SPACE` (all
+        of which are spaces), is still empty and still falls back to the
+        which-fallback program."""
+        with mock.patch("shutil.which", return_value="/fake/bin/claude") as which:
+            spath, service, tpath, timer = watch.timer_units(env={
+                "HELM_UPSTREAM_WATCH_CLAUDE": "   ",
+                "HELM_UPSTREAM_WATCH_CLAUDE_HOME": ""})
+            which.assert_called_once_with("claude")
+            # An all-space knob strips to empty, so the which-fallback program
+            # is written — the cure must not change this.
+            self.assertIn("Environment=HELM_UPSTREAM_WATCH_CLAUDE=/fake/bin/claude\n",
+                          service,
+                          "an all-space knob must fall back to shutil.which; the "
+                          "cure must not change this")
 
     def test_the_daily_units_run_a_real_pass_with_absolute_programs(self):
+        spath, service, tpath, timer = watch.timer_units(env={
+            "HELM_UPSTREAM_WATCH_CLAUDE": "/opt/claude", "HELM_UPSTREAM_WATCH_CLAUDE_HOME": "/h/c"})
         spath, service, tpath, timer = watch.timer_units(env={
             "HELM_UPSTREAM_WATCH_CLAUDE": "/opt/claude", "HELM_UPSTREAM_WATCH_CLAUDE_HOME": "/h/c"})
         self.assertTrue(spath.endswith("/.config/systemd/user/helm-upstream-watch.service"))
@@ -628,6 +741,41 @@ class TimerAndCliTest(Fixture):
         with contextlib.redirect_stdout(out):
             self.assertEqual(cli.main(["upstream-watch", "--help"]), 0)
         self.assertIn("--install-timer", out.getvalue())
+
+
+class ClaudeRunEncodingTest(unittest.TestCase):
+    """THE PROMPT AND THE REPLY TRAVEL AS UTF-8 WHATEVER THE LOCALE
+    (task/3423, the class of timerhealth._systemctl's decode). run_claude
+    wrote the prompt and read the reply in the locale's encoding: a Latin-1
+    or ASCII locale could not encode the em dash an evidence bundle carries,
+    and raised out of the run. claude reads and writes UTF-8."""
+
+    @unittest.skipIf(sys.flags.utf8_mode,
+                     "UTF-8 mode writes every child's input as UTF-8")
+    def test_the_prompt_and_the_reply_are_utf8_in_any_locale(self):  # noqa: VACUOUS_ASSERTION — the loop is over two literal locales; every row asserts run_claude's exact result and the exact prompt the fake received
+        import locale
+        d = tempfile.mkdtemp(prefix="helm-test-claude-")
+        self.addCleanup(shutil.rmtree, d, True)
+        got = os.path.join(d, "prompt")
+        note = {"note": "caf\u00e9 \u2014 done"}
+        reply = json.dumps({"result": json.dumps(note, ensure_ascii=False),
+                            "total_cost_usd": 0}, ensure_ascii=False)
+        program = os.path.join(d, "claude")
+        with open(program, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\ncat > '%s'\nprintf '%s'\n" % (got, "".join(
+                "\\%03o" % b for b in reply.encode("utf-8"))))
+        os.chmod(program, 0o755)
+        prompt = "evidence \u2014 caf\u00e9"
+        env = mock.patch.dict(os.environ,
+                              {"HELM_UPSTREAM_WATCH_CLAUDE": program})
+        env.start()
+        self.addCleanup(env.stop)
+        for encoding in ("iso-8859-1", "ascii"):
+            with self.subTest(encoding), mock.patch.object(
+                    locale, "getencoding", return_value=encoding):
+                self.assertEqual(watch.run_claude(prompt, {}), (note, None))
+                with open(got, encoding="utf-8") as fh:
+                    self.assertEqual(fh.read(), prompt)
 
 
 if __name__ == "__main__":

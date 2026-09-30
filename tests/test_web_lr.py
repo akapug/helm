@@ -24,7 +24,7 @@ WHAT THESE TESTS ARE FOR, in priority order:
    looks like honesty is the failure mode these pin against.
 
 3. THE RENDERER IS RUN, NOT MIRRORED. The client tests below execute the ACTUAL
-   lrCardHTML/lrRowHTML/lrNav source lifted verbatim out of the assembled web UI
+   lrShow/dashLr source lifted verbatim out of the assembled web UI
    under node, following tests/test_web_chat_client_runtime.py. A python mirror
    of JS rots silently; this cannot.
 
@@ -58,6 +58,7 @@ from helm import work  # noqa: E402
 # The module, never its TestCase: tests/test_suite_collection.py says why.
 from tests import test_landreq as _landreq  # noqa: E402
 from tests.test_landreq import run  # noqa: E402
+from tests._ownerverbs import owner_verbs  # noqa: E402
 # THE BUILDING BAND IS MEASURED AGAINST A REAL LANE TREE, so its arms borrow
 # the fixture that already mints one rather than growing a second one here: a
 # second definition of "a lane room" is how the two surfaces that read lanes
@@ -159,6 +160,9 @@ def tearDownModule():
     # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT: other modules import from this
     # one, so a stopped patcher left here is data they can reach (task/3039).
     _LIVE_SEATS_PATCH = None
+    # Join every _swr_rebuild worker this module kicked, so none leaks its late
+    # `_qstate` write into the next module's fixtures (task/3304).
+    web_cache.drain_swr()
 
 
 class TheLivenessStandInIsInEffectInWebLrTest(unittest.TestCase):
@@ -218,6 +222,7 @@ class LrApiBase(_landreq.LandReqBase):
 
     def tearDown(self):
         self.forget()          # never leak a tmp-home board into the next test
+        web_cache.drain_swr()  # ...nor a rebuild worker into it (task/3304)
         super().tearDown()
 
     def forget(self):
@@ -2342,18 +2347,23 @@ class RecomputeFloorTest(LrApiBase):
         self.assertIsNone(body["unavailable"])
         self.assertEqual(len(body["loops"]), 1)
 
-    def test_the_floor_never_outlives_the_read_it_reports(self):
+    def test_the_floor_never_outlives_the_read_it_reports(self):  # noqa: VACUOUS_ASSERTION — the first body's bound is the baseline; the positive control on the same field is the held body's read_age_s of at least 12
         """The freshness header is what makes the floor honest — a body served
         out of the cache must say how old it is, not pretend it is now."""
         self.dispatch()
+        took = time.time()
         first = self.lr()
-        self.assertEqual(first["read_age_s"], 0)
+        took = time.time() - took
+        # A fresh body is no older than its own build, in whole seconds: 0
+        # whenever the build took under a second (the slower build node's
+        # recorded whole suites took longer, and read 1).
+        self.assertLessEqual(first["read_age_s"], int(took))
         with mock.patch.object(web.time, "time",
                                mock.Mock(return_value=time.time() + 12)):
             held, _status = web.QUERY_API["/api/lr"]({})   # no forget
         self.assertGreaterEqual(held["read_age_s"], 12)
 
-    def test_read_age_is_the_readings_age_and_projected_age_the_bodys(self):  # noqa: VACUOUS_ASSERTION — the zeros on the first body are the baseline; the positive control on the same fields is the held body's projected_age_s at a full floor-gap with read_age_s strictly below it
+    def test_read_age_is_the_readings_age_and_projected_age_the_bodys(self):  # noqa: VACUOUS_ASSERTION — the first body's ages, bounded by its own build, are the baseline; the positive control on the same fields is the held body's projected_age_s at a full floor-gap with read_age_s strictly below it
         """TWO AGES ON THE WIRE. Past the floor, a poll whose fingerprint
         matches the body's is a read of every input: `read_age_s` restarts
         from that read while `projected_age_s` keeps counting from the build.
@@ -2376,9 +2386,13 @@ class RecomputeFloorTest(LrApiBase):
         equal ages, which reads as the mutation this test is here to catch
         rather than as a constant that moved underneath it."""
         self.dispatch()
+        took = time.time()
         first = self.lr()
-        self.assertEqual(first["read_age_s"], 0)
-        self.assertEqual(first["projected_age_s"], 0)
+        took = time.time() - took
+        # The baseline: a fresh body is no older than its own build, in whole
+        # seconds (0 whenever the build took under a second).
+        self.assertLessEqual(first["read_age_s"], int(took))
+        self.assertLessEqual(first["projected_age_s"], int(took))
         base = time.time()
         # BOTH POLLS MUST BE PAST THE FLOOR, AND THE SECOND ONE IS PAST IT
         # RELATIVE TO THE BODY THE FIRST ONE REBUILT — not to `base`. The
@@ -2413,2106 +2427,41 @@ class RecomputeFloorTest(LrApiBase):
         self.assertLessEqual(held["read_age_s"], 1)
 
 
-class CardRuntimeBase(unittest.TestCase):
-    """The CLIENT leg's harness: the real renderer source out of the assembled
-    web UI, run.
-
-    A server field nothing renders is the same as no field at all — the lesson
-    the stale-banner tests already encode. This lifts the renderers named in
-    EXTRACT verbatim and runs them under node, so an arm's assertion is about
-    what the OWNER SEES. Requires node; skipped (not failed) where node is
-    unavailable, like any optional toolchain.
-
-    THIS CLASS HOLDS NO `test_*` METHOD, and that is its contract. unittest
-    collects every inherited `test_*` again under each subclass's own id, so
-    an arm written here runs once per subclass, each run a fresh node process.
-    A class that needs the renderers subclasses THIS class; its arms go in
-    the subclass."""
-
-    EXTRACT = ["lrDwell", "lrDur", "lrAgo", "lrHonored", "lrMarks", "lrGate",
-               # WHAT IS BUILDING (task/2803) — the band and the count term
-               # the owner reads beside "in flight". Run, not mirrored: the
-               # three states this reader keeps apart (absent / UNKNOWN /
-               # measured zero) are three different sentences on screen and
-               # a source scan cannot tell them apart.
-               "lrBuilding", "lrBuildingTerm", "lrBuildingHTML",
-               "lrRowHTML", "lrChainRoot", "lrLaneName", "lrChainHead",
-               "lrSharedTip", "lrLaneGroups", "lrGroupHTML",
-               "lrKbRank", "lrKbKey", "lrKanbanHTML", "lrIsBoard",
-               "lrBall", "lrNonbillableLabels", "lrCardHTML", "lrNav",
-               # THE HOME-CARD LAW IS REAL HERE TOO. Every card names its read
-               # and withholds an expired value through these two helpers, and
-               # the pipeline totals are now one of those cards — a stub would
-               # let this harness render a band the page cannot produce.
-               "cardBoundS", "cardStale", "cardSource", "dashLr",
-               # THE OWNER'S TASK QUEUE (task/2622) — the headline he scans and
-               # the row he reads once a number sends him to one. Here rather
-               # than asserted as source text for this class's founding reason:
-               # counting tokens cannot see a renderer that keeps every token
-               # and emits a constant, and the queue header is five numbers
-               # whose whole value is that they are the RIGHT five.
-               # `tqTotals`/`tqEpoch`/`tqAgeS`/`tqStale` are DELIBERATELY NOT
-               # here and are not stubbed either: they no longer exist. Every
-               # age and every total is resolved by ONE server parser at the
-               # instant of ONE read and arrives as a number or null, so what
-               # is left in the page is formatting — which is exactly what
-               # these arms now run. The server half is measured in
-               # tests/test_tasks.py and tests/test_web_tasks.py; the arms
-               # below prove the RENDERING of a null is the word and never a
-               # number, which no server arm can see.
-               "tqAgeText", "tqUnknownWhy", "tqQueueOf",
-               "tqHeadHTML", "tqChipHit", "tqFilter", "tqWhen", "tqCard"]
-
-    # Module-level `const`s the extracted functions close over. `_extract_fn`
-    # lifts FUNCTION declarations only, so a renderer whose threshold lives in
-    # a const is unrunnable without them — and inlining the numbers HERE would
-    # make this harness assert against its own copy of the rule rather than
-    # against the page's.
-    CONSTS = ("const esc = ",)
-
-    @classmethod
-    def setUpClass(cls):
-        cls.node = shutil.which("node")
-        if not cls.node:
-            raise unittest.SkipTest("node not available")
-        cls.src = web_ui_loader.read_text()
-        # `esc` is a const arrow, not a function declaration — lifted by its
-        # own line so the harness escapes exactly the way the page does. The
-        # queue's staleness threshold is no longer among these because the
-        # page no longer holds one: seven days is `tasks.STALE_NOTE_S` and
-        # the row arrives carrying the server's verdict.
-        lifted = []
-        for prefix in cls.CONSTS:
-            hits = [ln for ln in cls.src.splitlines() if ln.startswith(prefix)]
-            assert len(hits) == 1, \
-                "assembled web UI's %r definition moved" % prefix
-            lifted.append(hits[0])
-        fns = "\n\n".join(lifted
-                          + [_extract_fn(cls.src, n) for n in cls.EXTRACT])
-        cls.tmp = tempfile.mkdtemp(prefix="helm-lr-runtime-")
-        cls.path = os.path.join(cls.tmp, "run.js")
-        with open(cls.path, "w", encoding="utf-8") as f:
-            f.write(fns + """
-
-const cases = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
-const out = {};
-for (const name of Object.keys(cases)) {
-  // a case may wrap its board to pick the view ({__d: board, __view: "list"})
-  // or ask for ONE row's markup ({__row: row, __reason: r}) — the byte-parity
-  // probe between the two views. A bare board (every pre-kanban case) renders
-  // exactly as the page's default caller does: lrCardHTML with no view.
-  const c = cases[name];
-  if (c && c.__dash !== undefined) {
-    // Only external DOM/adjacent dashboard cells are stubs; dashLr and its
-    // classification helpers are the assembled production functions.
-    const pipe = {innerHTML: "", querySelectorAll: () => []};
-    global.$ = selector => selector === "#dpipe" ? pipe : null;
-    global.dashChain = global.dashLands = global.dashOwner = () => {};
-    // dashOwedBy is stubbed for the SAME reason as its three siblings: this
-    // harness owns one cell (#dpipe) and the band's other cells are adjacent
-    // DOM this probe does not build. It gets its own runtime class below,
-    // driving the real function against a real element.
-    global.dashOwedBy = () => {};
-    // The two CHAT-fed cards' clock is stubbed for the same reason: it writes to
-    // cells this probe does not build, and it has its own runtime arms in
-    // DashPipelineBandRuntimeTest, driven against real elements.
-    global.dashAnswersClock = global.dashFleetClock = () => {};
-    global.DASH_FLEET_TS = 0;
-    global.DASH_ANSWERS_TS = 0;
-    global.DASH_CHAT_FAILED = 0;
-    global.DASH_CHAT_CADENCE_S = 2;
-    dashLr(c.__dash);
-    out[name] = {html: pipe.innerHTML};
-    continue;
-  }
-  if (c && c.__row !== undefined) {
-    out[name] = {html: lrRowHTML(c.__row, c.__reason ?? null)};
-    continue;
-  }
-  // THE TASK QUEUE, asked for as the two things the owner actually looks at:
-  // {__queue: [rows], __now: epochSeconds} returns the headline's computed
-  // totals AND its rendered line, so an arm can assert on the numbers and on
-  // the words that carry them. {__tqrow: row, __now: n} returns ONE backlog
-  // row's markup.
-  if (c && (c.__queue !== undefined || c.__payload !== undefined)) {
-    // {__queue: serverQueueTotalsOrNull, __rows: [...], __age: readAgeS,
-    //  __payload: theWholeBody} — the headline is RENDERED from what the
-    //  server sent (or from null), never recomputed here, because recomputing
-    //  it in the harness would test the harness's arithmetic instead of the
-    //  page's refusal to invent numbers.
-    const d = c.__payload !== undefined
-      ? c.__payload : {queue: c.__queue, entries: c.__rows || []};
-    const age = c.__age === undefined ? 0 : c.__age;
-    out[name] = {html: tqHeadHTML(tqQueueOf(d, age)),
-                 shown: tqQueueOf(d, age),
-                 why: tqUnknownWhy(d, age),
-                 filtered: tqFilter(c.__rows || [], c.__chips || [])
-                   .map(r => r && r.id)};
-    continue;
-  }
-  if (c && c.__tqrow !== undefined) {
-    out[name] = {html: tqCard(c.__tqrow)};
-    continue;
-  }
-  // the GROUPING, asked for as data rather than as markup: {__group: [rows]}
-  // returns lrLaneGroups' structure so a test can assert the SHAPE it built
-  // (which lanes, which chains under each, which round is the head) instead
-  // of pattern-matching HTML and calling a substring a structure. `__ghtml`
-  // asks the same input for the rendered box.
-  if (c && c.__group !== undefined) {
-    const gs = lrLaneGroups(c.__group);
-    out[name] = {groups: gs.map(g => ({
-      lane: g.lane, rows: g.rows, shared_tip: g.shared_tip,
-      chains: g.chains.map(ch => ({
-        root: ch.root, head: ch.head.id, rows: ch.rows.map(r => r.id),
-        earlier: ch.earlier.map(r => r.id)}))}))};
-    continue;
-  }
-  if (c && c.__ghtml !== undefined) {
-    out[name] = {html: lrLaneGroups(c.__ghtml)
-      .map(g => lrGroupHTML(g, new Map(c.__unmeas || []))).join("")};
-    continue;
-  }
-  const d = c && c.__d !== undefined ? c.__d : c;
-  out[name] = {html: c && c.__view !== undefined ? lrCardHTML(d, c.__view)
-                                                 : lrCardHTML(d),
-               nav: lrNav(d)};
-}
-process.stdout.write(JSON.stringify(out));
-""")
-        chk = subprocess.run([cls.node, "--check", cls.path],
-                             capture_output=True, text=True)
-        assert chk.returncode == 0, "node --check failed:\n" + chk.stderr
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
-
-    def render(self, **cases):
-        path = os.path.join(self.tmp, "cases.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cases, f)
-        p = subprocess.run([self.node, self.path, path],
-                           capture_output=True, text=True, timeout=60)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        return json.loads(p.stdout)
-
-    @staticmethod
-    def row(**kw):
-        base = {"id": "0123456789ab", "state": "READY", "lane": "lane/example",
-                "branch": "lane/example", "review_sha": "f7f8047ba21c",
-                "review_sha_full": "f7f8047ba21c" + "0" * 28,
-                "author": "author-seat", "reviewer": "reviewer-seat",
-                "kind": "review", "polarity": "approve",
-                "polarity_source": "dispatch-store",
-                "attest_source": "attest-sidecar", "attest_state": "attested",
-                "attest_detail": "attested (signed turn, room main)",
-                "dwell_s": 2460, "entered_ts": None,
-                # a row whose entry stamp WAS readable and which the record
-                # cannot date the closure of — the ordinary case for both
-                "dwell_known": True, "closed_ts": None,
-                "closed_ts_unreadable": False, "closed_ts_impossible": False,
-                # EVERY PROJECTED ROW CARRIES `terminal` — `_loop_rows`
-                # stamps it and `inflight_rows` reads it. This fixture omitted
-                # it, so it modelled a row shape that cannot occur, and the
-                # tests using it passed over a gap: `card()` began carrying
-                # the field (task/444, so the CLI's warm read can do the same
-                # in-flight accounting as the board) and nine of them raised
-                # KeyError. A fixture missing a field reality always supplies
-                # is not a smaller fixture, it is a wrong one.
-                "terminal": False,
-                "ledger_refused": [],
-                "stalled": False, "observable": True, "land_state": "ABSENT",
-                "landed": False,
-                "merged_local": False, "has_upstream": False, "contrary": False,
-                "contrary_state": None, "contrary_discharge": None,
-                "discharged": False,
-                "superseding_tip": None, "withdrawn": False,
-                "withdraw_contradicted": False, "abandoned": False,
-                "abandon_reason": None, "abandon_ts": None,
-                "abandon_object_state": None, "abandon_proof_mode": None,
-                "abandon_proof_version": None,
-                "abandon_trunk_mention_state": None,
-                "abandon_trunk_mention_proof_mode": None,
-                "abandon_trunk_mention_proof_version": None,
-                "abandon_branch_state": None,
-                "abandon_branch_proof_mode": None,
-                "abandon_branch_proof_version": None,
-                "abandon_worktree_state": None,
-                "abandon_worktree_proof_mode": None,
-                "abandon_worktree_proof_version": None,
-                "abandon_land_state": None,
-                "closed_by_landing": False,
-                "landing_trunk_sha": None, "owed_by": "integrator",
-                "holder_role": "integrator", "holder_seat": None,
-                "receipt_state": "none", "timeline": [], "gate": "",
-                "ungated": None}
-        base.update(kw)
-        # DERIVED FROM THIS ROW'S OWN ID, never from the base literal, and
-        # MEASURED against production before being written here: on the live
-        # ledger 2026-08-11 all 46 projected rows carried a `chain_root`, and
-        # every row filed as new work carried its OWN id there (`6546fa3543ce`
-        # → root `6546fa3543ce`) — landreq's "a root names itself" seal. A
-        # constant default would be the opposite of a smaller fixture: every
-        # row in a case would share one root and collapse into a single chain,
-        # so the grouping arms below would pass while describing a payload the
-        # server cannot send.
-        base.setdefault("chain_root", base["id"])
-        base.setdefault("supersedes", None)
-        # DERIVED, never hand-typed. `honored` rides the wire now, and a
-        # fixture that set it by hand could describe a payload the server
-        # never sends — the exact drift that having two implementations of
-        # this predicate created in the first place. A test may still override
-        # it explicitly to exercise an old server (absent field, fail-closed).
-        base.setdefault("honored", landreq.honored_display(base))
-        return base
-
-    @classmethod
-    def board(cls, rows, **kw):
-        d = {"read_age_s": 3, "ledger_age_s": 40, "unavailable": None,
-             "receipts_skipped": None, "loops": rows, "stalled_ids": [],
-             "unmeasurable": [], "closed_recent": [], "closed_unknown_when": 0}
-        d.update(kw)
-        # The server always sends the PRE-CAP total; a fixture that omits it is
-        # asking for the "no count" branch and must say so explicitly.
-        d.setdefault("closed_total", len(d["closed_recent"]))
-        # Same rule for the filed split: a rendered board always carries one;
-        # a fixture that wants the "no split" branch pops it explicitly.
-        d.setdefault("filed", {"total": len(d["loops"]),
-                               "open": len(d["loops"]), "held": 0,
-                               "landed": 0, "closed": 0, "non_loop": 0})
-        return d
-
-    # WHAT IS BUILDING (task/2803): one row of the building band.
-    @staticmethod
-    def brow(**kw):
-        base = {"lane": "a-live-build", "holder": "seat-a", "ahead": 3,
-                "lease_remaining_s": 8400, "dirty": False, "liveness": "live"}
-        base.update(kw)
-        return base
-
-    # Locators over rendered markup: a card, a column strip, the header
-    # counts, the closed strip.
-    @staticmethod
-    def columns(html):
-        """JUST THE BOARD COLUMNS — the kanban strip, cut before the closed
-        footer. A row that "left the board" must be absent HERE: asserting
-        over the whole card would pass while the row sat in the closed strip
-        below, which is exactly where it is supposed to be."""
-        return html.split('<div class="lrkb">')[1].split(
-            '<button type="button" class="lrfoot"')[0]
-
-    @staticmethod
-    def card_markup(html, rid):
-        """The ONE `.lrrow` card for `rid`, whole — opening tag to its matching
-        close, by counting `<div`/`</div>` depth.
-
-        Cutting at "the next .lrrow" instead is what a first cut did, and it is
-        wrong in exactly the place this is used: in the BOARD the last card of
-        a column is followed by column chrome rather than another row, so the
-        slice ran past the card and two identical rows compared unequal."""
-        opens = [m.start() for m in
-                 re.finditer(r'<div class="lrrow [^>]*data-id="%s">' % rid, html)]
-        assert len(opens) == 1, \
-            "expected exactly one card for %s, found %d" % (rid, len(opens))
-        depth, j = 0, opens[0]
-        i = opens[0]
-        while True:
-            nxt_o = html.find("<div", j)
-            nxt_c = html.find("</div>", j)
-            if nxt_c == -1:
-                raise AssertionError("unbalanced card markup for " + rid)
-            if nxt_o != -1 and nxt_o < nxt_c:
-                depth += 1
-                j = nxt_o + 4
-                continue
-            depth -= 1
-            j = nxt_c + 6
-            if depth == 0:
-                return html[i:j]
-
-    @staticmethod
-    def counts_span(html):
-        """The header's counts, read by CLASS rather than by an exact opening
-        tag. Two arms split on the literal `<span class="lrcounts">` and both
-        went IndexError — not red on the claim they make, but crashed — the
-        moment the span gained a `title`. A locator that breaks when an
-        unrelated attribute is added is testing the tag, not the number."""
-        after = html.split('class="lrcounts"', 1)[1]
-        return after.split(">", 1)[1].split("</span>", 1)[0]
-
-    @staticmethod
-    def closed_strip(html):
-        """Everything from the closed box onward (the box, then the
-        unknown-when footer). Rows nest <div>s, so this cuts at the top of
-        the strip rather than trying to find its end."""
-        return html.split('id="lrclosed" hidden>', 1)[1]
-
-    def discharged_board(self):
-        """One SUPERSEDED column, three rows, one of each kind: honored
-        through succession, a confirmation round, and the GENUINE contrary
-        that must not move."""
-        return self.board([
-            self.row(id="a" * 12, state="SUPERSEDED", polarity="supersede",
-                     contrary=True, contrary_state="landed",
-                     contrary_discharge="a", lane="lane/honored"),
-            self.row(id="c" * 12, state="SUPERSEDED", polarity="supersede",
-                     contrary=True, contrary_state="landed",
-                     contrary_discharge="c", lane="lane/confirmation"),
-            self.row(id="b" * 12, state="SUPERSEDED", polarity="supersede",
-                     contrary=True, contrary_state="landed",
-                     lane="lane/genuine-contrary")])
-
-    # THE OWNER'S TASK QUEUE (task/2622): rows and totals in the shape the
-    # server sends, dated against one fixed clock.
-    TQ_NOW = 1_700_000_000.0
-
-    def tqrow(self, tid, **over):
-        """A row IN THE SHAPE `/api/tasks` SERVES, ages already resolved."""
-        row = {"id": tid, "title": "a row", "status": "open", "owner": None,
-               "note": None, "refs": [], "origin": None, "priority": None,
-               "comments": 0, "last_note": None,
-               "ts": self.TQ_NOW - 3600, "ts_epoch": self.TQ_NOW - 3600,
-               "age_s": 3600.0, "noted_age_s": 3600.0, "stale": False}
-        row.update(over)
-        return row
-
-    def tqtotals(self, **over):
-        t = {"P0": 0, "P1": 0, "P2": 0, "P3": 0, "unranked": 0,
-             "in_progress": 0, "live": 0, "oldest": {"P0": None, "P1": None}}
-        t.update(over)
-        return t
-
-
-class CardRuntimeTest(CardRuntimeBase):
-    """The card's own arms, run on CardRuntimeBase's harness: lrCardHTML,
-    lrNav and the queue renderers executed verbatim under node, each assertion
-    about what the owner sees. A subclass of THIS class collects every arm
-    below again under its own id, so a class that only needs the renderers
-    subclasses CardRuntimeBase."""
-
-    def test_the_card_RENDERS_the_provenance_clause_on_every_contrary_mark(self):
-        """Third round: my source-token arms did not detect the mutation.
-
-        Counting `+ provClause` could not see `const provClause = ""`, and
-        asserting the constant reads `prov` could not see
-        `const provClause = prov ? "" : ""` — both keep every token I was
-        counting while erasing every clause the owner reads. The only thing
-        that discriminates is RUNNING the renderer and reading its output, so
-        this executes the real lrMarks/lrRowHTML under node as this class does.
-
-        THREE INPUTS AND A NEGATIVE: recorded, observed, and ABSENT. The absent
-        case is what makes the positives mean anything — a renderer appending a
-        constant would satisfy both of them.
-        """
-        recorded = self.row(contrary=True, contrary_state="landed",
-                            contrary_provenance="recorded")
-        observed = self.row(contrary=True, contrary_state="landed",
-                            contrary_provenance="observed")
-        absent = self.row(contrary=True, contrary_state="landed",
-                          contrary_provenance=None)
-        out = self.render(recorded={"__row": recorded},
-                          observed={"__row": observed},
-                          absent={"__row": absent})
-
-        # MUST-HIT FIRST: the fixture really renders a contrary mark, or every
-        # assertion below is about markup this branch never produced.
-        self.assertIn("LANDED", out["recorded"]["html"],
-                      "MUST-HIT: no contrary mark rendered at all, so this arm "
-                      "is not exercising the provenance gate")
-        self.assertIn("recorded when closed", out["recorded"]["html"],
-                      "the card dropped the RECORDED provenance the terminal "
-                      "prints, so the two surfaces have drifted")
-        self.assertIn("observed on trunk", out["observed"]["html"],
-                      "the card dropped the OBSERVED provenance")
-        for word in ("recorded when closed", "observed on trunk"):
-            self.assertNotIn(
-                word, out["absent"]["html"],
-                "a row with NO provenance rendered %r — the clause is a "
-                "constant, not a reading of the field" % word)
-
-    # --- WHAT IS BUILDING (task/2803) -----------------------------------
-    # The owner read "0 in flight" over a fleet with three live builds on it
-    # and asked whether that could be true while work was ongoing. These run the
-    # SHIPPED renderers against the band that answers him. They are runtime
-    # arms rather than source scans for the reason this class was founded: the
-    # three states the reader keeps apart — a server that sent no reading, a
-    # reading that FAILED, and a measured zero — are three different sentences
-    # on his screen, and a token count cannot tell them apart.
-
-    def test_a_BUILDING_lane_reaches_both_the_card_and_the_home_band(self):
-        """His two surfaces, one reading. The card gets the rows; the band gets
-        the count beside the number he actually read as zero."""
-        board = self.board([], building={
-            "rows": [self.brow(), self.brow(lane="second-build", ahead=12,
-                               holder="seat-b")],
-            "total": 2, "unmeasured": 0, "source": "helm work list",
-            "unavailable": None})
-        out = self.render(card=board, dash={"__dash": board})
-        card = out["card"]["html"]
-        # MUST-HIT: the band rendered at all.
-        self.assertIn("2 lanes BUILDING", card,
-                      "MUST-HIT: no building band in the card, so nothing "
-                      "below is about markup this branch produced")
-        self.assertIn("a-live-build", card)
-        self.assertIn("@seat-a", card)
-        self.assertIn("+3", card)
-        self.assertIn("second-build", card)
-        self.assertIn("@seat-b", card)
-        self.assertIn("+12", card)
-        # the lease reading says WHICH DIRECTION it runs. `helm work list`
-        # printed a bare "<seat> 13378s" and two seats read it as "held for".
-        self.assertIn("lease 2h left", card)
-        self.assertIn("2 building", card)      # the header term
-        # the band wraps its number in .dnum, so the assertion is on the
-        # rendered markup rather than on a plain-text substring that the
-        # surface never emits.
-        self.assertIn(">2</span> building", out["dash"]["html"],
-                      "the home band — the surface he read as 0 in flight — "
-                      "carries no building count")
-
-    def test_a_board_that_carries_NO_building_reading_says_NOTHING(self):
-        """An older server sends no key, and an absent reading is never a
-        measured one. THE CONTROL IS THE SAME RENDER WITH THE KEY: without it,
-        "the word is missing" is satisfied by a renderer that never emits it."""
-        absent = self.board([])
-        absent.pop("building", None)
-        out = self.render(absent=absent, dash_absent={"__dash": absent},
-                          present=self.board([], building={
-                              "rows": [], "total": 0, "unmeasured": 0,
-                              "source": "helm work list", "unavailable": None}))
-        self.assertIn("0 building", out["present"]["html"],
-                      "MUST-HIT: the renderer never emits the term at all")
-        self.assertNotIn("building", out["absent"]["html"],
-                         "a server that sent no lane reading was rendered as a "
-                         "measured statement about building")
-        self.assertNotIn("building", out["dash_absent"]["html"])
-
-    def test_an_UNREADABLE_lane_reading_is_LOUD_and_never_a_zero(self):
-        """The whole reason this band is a SECOND source: it has to be able to
-        say "I could not read the lane rooms" in words that cannot be mistaken
-        for "nobody is building"."""
-        why = "the lane rooms could not be read (OSError) — what is BUILDING is UNKNOWN, not zero"
-        board = self.board([], building={"rows": [], "total": None,
-                                         "unmeasured": 0,
-                                         "source": "helm work list",
-                                         "unavailable": why})
-        out = self.render(card=board, dash={"__dash": board})
-        card = out["card"]["html"]
-        self.assertIn("WHAT IS BUILDING — UNKNOWN", card)
-        self.assertIn("could not be read", card)
-        self.assertNotIn("0 building", card,
-                         "a FAILED lane reading rendered as a measured zero")
-        self.assertIn("building UNKNOWN", card)
-        self.assertIn("building UNKNOWN", out["dash"]["html"])
-        self.assertNotIn("0 building", out["dash"]["html"])
-
-    def test_a_MEASURED_zero_says_it_was_MEASURED(self):
-        """And this one IS printed. "nothing is being built" is exactly the
-        claim he needs to be able to trust, so the difference between it and
-        the branch above has to be legible on screen."""
-        board = self.board([], building={"rows": [], "total": 0,
-                                         "unmeasured": 0,
-                                         "source": "helm work list",
-                                         "unavailable": None})
-        card = self.render(card=board)["card"]["html"]
-        self.assertIn("0 lanes BUILDING", card)
-        self.assertIn("MEASURED zero", card)
-        self.assertIn("helm work list", card)
-
-    def test_the_display_cap_hides_rows_and_never_edits_the_count(self):
-        """The closed-footer lesson, one band over: 13 closed lanes once
-        rendered as the number 12 because a length stood in for a count."""
-        board = self.board([], building={
-            "rows": [self.brow(lane="lane-%d" % i) for i in range(12)],
-            "total": 30, "unmeasured": 0, "source": "helm work list",
-            "unavailable": None})
-        out = self.render(card=board, dash={"__dash": board})
-        card = out["card"]["html"]
-        self.assertIn("30 lanes BUILDING", card)
-        self.assertIn("18 not shown", card)
-        self.assertIn(">30</span> building", out["dash"]["html"])
-
-    def test_a_lane_whose_distance_is_UNMEASURED_is_counted_not_dropped(self):
-        """git could not answer how far this lane is from trunk. Counting it as
-        building asserts commits nobody read; dropping it asserts none exist."""
-        board = self.board([], building={
-            "rows": [self.brow()], "total": 1, "unmeasured": 2,
-            "source": "helm work list", "unavailable": None})
-        card = self.render(card=board)["card"]["html"]
-        self.assertIn("1 lane BUILDING", card)
-        self.assertIn("2 further leased lanes", card)
-        self.assertIn("could not answer", card)
-
-    def test_recorded_hold_categories_render_without_claiming_read_failure(self):
-        kinds = ["pre-tier", "advisory", "authorization-held", "unbillable", "future-kind"]
-        rows = [self.row(id="held-" + str(i), state="REVIEWED") for i in range(len(kinds))]
-        holds = [{"id": row["id"], "kind": kind, "reason": "held"}
-                 for row, kind in zip(rows, kinds)]
-        board = self.board(rows, unmeasurable=holds + [holds[0],
-                           {"id": "not-live", "kind": "pre-tier", "reason": "old"}])
-        out = self.render(card=board, dash={"__dash": board},
-                          failed=self.board(rows, unmeasurable=holds, unavailable="read denied"),
-                          dash_failed={"__dash": dict(board, unavailable="read denied")})
-        for surface in ("card", "dash"):
-            html = out[surface]["html"]
-            for label in ("1 pre-tier (not authorized)", "1 advisory (not authorized)",
-                          "1 authorization held", "1 other nonbillable", "1 unclassified nonbillable"):
-                self.assertIn(label, html)
-            self.assertNotIn("2 pre-tier", html)
-            self.assertNotIn("DISPATCH LEDGER UNREADABLE", html)
-        for surface in ("failed", "dash_failed"):
-            self.assertIn("UNKNOWN", out[surface]["html"])
-            self.assertIn("read denied", out[surface]["html"])
-            self.assertNotIn("pre-tier (not authorized)", out[surface]["html"])
-
-    def test_dashboard_hold_breakdown_uses_the_bar_partition(self):
-        rows = [self.row(id="pre", state="REVIEWED"),
-                self.row(id="stalled-pre", state="REVIEWED", stalled=True)]
-        holds = [{"id": row["id"], "kind": "pre-tier", "reason": "historical"} for row in rows]
-        board = self.board(rows, unmeasurable=holds)
-        out = self.render(card=board, dash={"__dash": board},
-                          old=self.board(rows, unmeasurable=[{"id": "pre", "reason": "held"}]))
-        self.assertIn("2 pre-tier (not authorized)", out["card"]["html"])
-        self.assertIn("1 pre-tier (not authorized)", out["dash"]["html"])
-        self.assertNotIn("2 pre-tier", out["dash"]["html"])
-        self.assertIn("1 unclassified nonbillable", out["old"]["html"])
-
-    def test_a_rebuild_deadline_RENDERS_reading_not_UNREADABLE(self):
-        """A MISSED DEADLINE DURING A REBUILD IS NOT AN UNREADABLE LEDGER.
-
-        The projection costs 22-28s (landreq.py says so in three places), so a
-        read that runs out of time while helm is computing has learned that
-        helm is BUSY. The record behind it is fine. Rendering that as
-        DISPATCH LEDGER UNREADABLE is a false alarm, and it is the one the
-        owner meets most often because it fires on every hard-TTL rebuild --
-        the reading that sent him looking for a broken pipeline when the
-        endpoint answered 200 in two seconds either side of it.
-        """
-        out = self.render(
-            busy={"rebuilding": "the read ran past 30s while helm was "
-                                "rebuilding this projection"},
-            dead={"unavailable": "PermissionError: denied", "loops": [],
-                  "stalled_ids": [], "unmeasurable": [], "closed_recent": []})
-        busy = out["busy"]["html"]
-        # WHAT THE BUSY CARD SAYS: the warming arm's promise, not the alarm.
-        self.assertIn("reading", busy)
-        self.assertIn("Nothing is wrong with the record", busy)
-        self.assertIn("refreshes itself", busy)
-        # WHAT IT MUST NOT SAY, and the control that this detector can fire:
-        # the same two probes over the genuine failure must both find them.
-        dead = out["dead"]["html"]
-        self.assertIn("DISPATCH LEDGER UNREADABLE", dead,
-                      "control: the alarm strip is still reachable")
-        self.assertIn("Check it from a terminal", dead,
-                      "control: a real failure still names the fallback")
-        self.assertNotIn("DISPATCH LEDGER UNREADABLE", busy)
-        # THE HEADER CARRIES THE VERB NAME IN EVERY ARM (it is the card's
-        # `lrhow` label, not advice), so the thing to forbid is the SENTENCE
-        # that sends the owner to a terminal, never the verb's name.
-        self.assertNotIn("Check it from a terminal", busy)
-
-    # ── the property that matters most ──────────────────────────────────
-    def test_an_unreadable_ledger_RENDERS_the_unknown_strip(self):
-        out = self.render(dead={"unavailable": "PermissionError: denied",
-                                "loops": [], "stalled_ids": [],
-                                "unmeasurable": [], "closed_recent": []})
-        html = out["dead"]["html"]
-        self.assertIn("DISPATCH LEDGER UNREADABLE — pipeline UNKNOWN", html)
-        self.assertIn("PermissionError: denied", html)     # the reason, verbatim
-        self.assertIn("helm lr list", html)                # where to go instead
-
-    def test_the_unknown_strip_shows_no_rows_and_claims_no_count(self):
-        """The failure this replaces: a comforting "0 in flight" over a board
-        nobody read."""
-        out = self.render(dead={"unavailable": "denied", "loops": [],
-                                "stalled_ids": [], "unmeasurable": [],
-                                "closed_recent": []})
-        html = out["dead"]["html"]
-        self.assertNotIn("lrrow", html)
-        self.assertNotIn("0 in flight", html)
-        self.assertNotIn("no land loops in flight", html)
-        self.assertIn("UNKNOWN", html)
-
-    # ── the FILED strip: the all-time population behind the board ────────
-    def test_the_filed_strip_renders_the_population(self):
-        out = self.render(pop=self.board([], filed={
-            "total": 542, "open": 51, "held": 3, "landed": 81,
-            "closed": 379, "non_loop": 28}))
-        html = out["pop"]["html"]
-        self.assertIn("filed 542 all-time", html)
-        self.assertIn("51 open", html)
-        self.assertIn("3 held", html)
-        self.assertIn("81 landed", html)
-        self.assertIn("379 closed", html)
-        self.assertIn("28 non-loop", html)
-
-    def test_a_PRE_RENAME_servers_split_still_renders_its_number(self):
-        """VERSION SKEW, not a broken payload. The console is served
-        from disk and hot-reloads; the SERVER process can be older than it.
-        `in_flight` was renamed `open` in this lane, so a fresh UI against a
-        not-yet-restarted server received a perfectly well-formed split and
-        printed "? open" — which reads as "the server sent garbage" and sends
-        the reader to debug the wrong thing. The legacy key is read under the
-        new name; every other term is untouched."""
-        out = self.render(pop=self.board([], filed={
-            "total": 542, "in_flight": 51, "held": 3, "landed": 81,
-            "closed": 379, "non_loop": 28}))
-        html = out["pop"]["html"]
-        self.assertIn("51 open", html)
-        self.assertNotIn("? open", html)
-        self.assertIn("filed 542 all-time", html)
-
-    def test_a_GENUINELY_absent_term_is_still_said_not_invented(self):
-        """The control that keeps the fallback from becoming a lie: reading a
-        legacy key is not the same as tolerating a missing one. A term that
-        arrived under NO name still renders "?", never 0 — the rule the strip
-        was built on and which this fallback must not erode."""
-        out = self.render(pop=self.board([], filed={
-            "total": 542, "held": 3, "landed": 81,
-            "closed": 379, "non_loop": 28}))
-        html = out["pop"]["html"]
-        self.assertIn("? open", html)
-        self.assertNotIn("0 open", html)
-
-    def test_the_strip_tooltip_DEFINES_the_word_it_actually_prints(self):
-        """The third site the rename missed. The strip says `open` while its
-        own hover text still opened "in flight = every non-terminal loop" —
-        defining the renamed bucket by the very word the rename removed from
-        it, on the same element. A tooltip is a surface."""
-        out = self.render(pop=self.board([], filed={
-            "total": 5, "open": 1, "held": 1, "landed": 1,
-            "closed": 1, "non_loop": 1}))
-        html = out["pop"]["html"]
-        self.assertIn("open = every non-terminal loop", html)
-        self.assertNotIn("in flight = every non-terminal loop", html)
-
-    def test_the_card_strip_is_byte_identical_to_the_CLI_strip(self):  # noqa: VACUOUS_ASSERTION — every absence here sits beside an unconditional positive on the SAME rendered html: the byte-identical filed_line assertion, plus "19 open on the live frontier" and "32 OFF-FRONTIER" for the split case
-        """One shape on every surface: the card's JS builds the strip and
-        `helm lr list` prints landreq.filed_line — a number the owner pastes
-        from either surface must read identically on the other. This runs the
-        REAL renderer against the REAL python formatter for the same dict."""
-        # EVERY BUCKET CARRIES A DISTINCT NUMBER so a renderer that emitted
-        # the right terms in the wrong ORDER, or read one key for another,
-        # cannot pass by coincidence.
-        f = {"total": 542, "open": 51, "held": 3, "underived": 17,
-             "landed": 81, "closed": 379, "non_loop": 28}
-        out = self.render(pop=self.board([], filed=f))
-        self.assertIn(landreq.filed_line(f), out["pop"]["html"])
-        # AND THE NEW TERM IS REALLY IN THE RENDERED STRING, because the
-        # assertion above would also pass if BOTH surfaces dropped it.
-        self.assertIn("17 underived", out["pop"]["html"])
-        # THE FRONTIER SPLIT IS THE SAME LAW ONE TERM OVER (task/2381): the
-        # header stops printing a bare `open` and both surfaces must lead with
-        # the frontier count and name the residue IDENTICALLY, including the
-        # verb that clears it. Distinct numbers again, so a renderer reading
-        # one key for the other cannot pass by coincidence.
-        g = dict(f, open=51, open_frontier=19, off_frontier=32,
-                 unclassified=7, closable=11, not_closable=21)
-        out = self.render(split=self.board([], filed=g))
-        self.assertIn(landreq.filed_line(g), out["split"]["html"])
-        self.assertIn("19 open on the live frontier", out["split"]["html"])
-        self.assertIn("32 OFF-FRONTIER", out["split"]["html"])
-        self.assertIn("helm lr retire --off-frontier", out["split"]["html"])
-        self.assertNotIn("51 open", out["split"]["html"])
-        # PLACED IS NOT CLOSABLE, ON BOTH SURFACES AND WITH DISTINCT NUMBERS.
-        # The close ladder refuses a placed row whose witness it cannot take —
-        # measured, 182 of 316 on a copy of the live ledger — so the strip that
-        # printed the placed count as "closable now" was wrong about 58% of the
-        # number the owner acts on, on the card exactly as in the CLI.
-        self.assertIn("11 closable now", out["split"]["html"])
-        self.assertIn("21 placed but NOT closable yet", out["split"]["html"])
-        self.assertNotIn("32 closable", out["split"]["html"])
-        # THE UNPLACEABLE DISCLOSURE IS THE SAME LAW ONE TERM IN: it rides
-        # inside the frontier count on BOTH surfaces, with its own number, so
-        # a reader is never told that rows no verb will clear are debris.
-        self.assertIn("incl. 7 unclassified", out["split"]["html"])
-        # AND A BODY WITH NO SPLIT MAKES NO CLEARANCE CLAIM AT ALL — the same
-        # version-skew law as FILED_WAS, one term over: an older server sends
-        # the residue and no `closable` key, and a zero invented there would
-        # say "nothing can be cleared" about a board nobody measured. Its own
-        # name, because `out` above is still the reading the assertions read.
-        skew = dict(f, open=51, open_frontier=19, off_frontier=32,
-                    unclassified=7)
-        skewed = self.render(skew=self.board([], filed=skew))
-        self.assertIn(landreq.filed_line(skew), skewed["skew"]["html"])
-        self.assertIn("censuses them", skewed["skew"]["html"])
-        self.assertNotIn("closable now", skewed["skew"]["html"])
-        # A ZERO RESIDUE SAYS NOTHING AT ALL, on both surfaces — a board with
-        # no debris must not carry a term about debris it does not have.
-        quiet = dict(f, open=19, open_frontier=19, off_frontier=0)
-        out = self.render(quiet=self.board([], filed=quiet))
-        self.assertIn(landreq.filed_line(quiet), out["quiet"]["html"])
-        # THE TERM, NOT THE WORD. "OFF-FRONTIER" is also in the strip's own
-        # hover text, which is a definition and always present; what must be
-        # absent is a COUNT labelled with it.
-        self.assertNotIn("0 OFF-FRONTIER", out["quiet"]["html"])
-        self.assertEqual(landreq.off_frontier_line(quiet), "")
-
-    def test_ONE_SURFACE_NEVER_PRINTS_TWO_PREDICATES_AS_IN_FLIGHT(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control asserts the card DOES print the phrase once (a card that rendered nothing would otherwise pass a count-of-at-most-one)
-        """task/324, and the THIRD instance of one class in one day.
-
-        The disease: two different predicates rendered under one noun on one
-        page, so a reader cannot tell which is lying — and neither is. The
-        instances, all measured: (1) the home glance list vs its own header,
-        caught by the owner 2026-08-05 ("it's still on the homepage and that
-        is crazy to me") and cured at 00-core.js:994-999; (2) filed_split's
-        raw non-terminal count vs _loop_rows' chain-folded one, which the
-        owner read as 32 and 277 on ONE PAGE, 8.6x apart; (3) whatever comes
-        next, which is what this test exists to stop.
-
-        THE RULE, and it is deliberately about the WORD not the number: the
-        phrase "in flight" belongs to exactly ONE predicate — `_loop_rows`,
-        chain-folded and honored-subtracted, i.e. work actually MOVING. Any
-        other count on the same surface must say what it actually is. The
-        filed split says `open`, because it counts what is on the books.
-
-        A count that is honest in a docstring and ambiguous on the surface is
-        not honest — that is precisely how this shipped twice."""
-        out = self.render(one=self.board([], filed={
-            "total": 9, "open": 4, "held": 1, "landed": 2,
-            "closed": 1, "non_loop": 1}))
-        html = out["one"]["html"]
-        # THE PREDICATE IS "A NUMBER LABELLED in flight", NOT THE PHRASE.
-        # My first cut counted the raw string and got 3 — because the card
-        # also says "0 in flight — pipeline read cleanly", "nothing is in
-        # flight", and a tooltip. Counting prose answers a narrower question
-        # than the one that matters; the disease is two NUMBERS under one
-        # noun, so that is what this counts.
-        import re as _re
-        text = _re.sub(r"<[^>]+>", " ", html)
-        labelled = _re.findall(r"\d+\s+in flight", text)
-        # POSITIVE CONTROL, unconditional: the card really does label the
-        # folded count this way, so the count-of-one below cannot pass by the
-        # card rendering nothing at all.
-        self.assertTrue(labelled, "the card must label the folded count")
-        self.assertEqual(len(labelled), 1,
-                         "two counts under one noun is task/324's disease; "
-                         "the second one must say what it actually is: %r"
-                         % (labelled,))
-        # and the filed strip must carry the honest word instead
-        self.assertIn("4 open", html)
-        self.assertNotIn("4 in flight", html)
-
-    def test_an_absent_filed_split_is_SAID_never_rendered_as_zero(self):
-        """An older server (or a pre-field cached body surviving a half-live
-        deploy) sends no split; the strip must say so, not count."""
-        b = self.board([])
-        b.pop("filed")
-        out = self.render(old=b)
-        html = out["old"]["html"]
-        self.assertIn("filed total UNKNOWN", html)
-        self.assertNotIn("filed 0", html)
-
-    def test_a_half_shaped_split_keeps_its_known_terms(self):
-        out = self.render(half=self.board([], filed={"total": 7,
-                                                     "open": 7}))
-        html = out["half"]["html"]
-        self.assertIn("filed 7 all-time", html)
-        self.assertIn("7 open", html)
-        self.assertIn("? held", html)          # unknown per-term, never 0
-
-    def test_the_unknown_strip_never_carries_a_filed_count(self):
-        """A lying body: unavailable AND a filed dict. The unavailable branch
-        owns the render — a count beside "pipeline UNKNOWN" would be two
-        verdicts about one read."""
-        out = self.render(dead={"unavailable": "denied",
-                                "filed": {"total": 9, "open": 9,
-                                          "held": 0, "landed": 0,
-                                          "closed": 0, "non_loop": 0},
-                                "loops": [], "stalled_ids": [],
-                                "unmeasurable": [], "closed_recent": []})
-        html = out["dead"]["html"]
-        self.assertNotIn("filed 9", html)
-        self.assertIn("UNKNOWN", html)
-
-    def test_an_honest_empty_board_says_the_read_SUCCEEDED(self):
-        """"nothing in flight" and "this did not load" must never be
-        confusable, so the empty state asserts the read, in words."""
-        out = self.render(empty=self.board([]))
-        html = out["empty"]["html"]
-        self.assertIn("no land loops in flight", html)
-        self.assertIn("READ cleanly", html)
-        self.assertNotIn("UNREADABLE", html)
-
-    def test_the_nav_badge_carries_UNKNOWN_off_the_home_tab(self):
-        out = self.render(dead={"unavailable": "denied", "loops": []},
-                          calm=self.board([self.row()]),
-                          loud=self.board([self.row(stalled=True)]))
-        self.assertEqual(out["dead"]["nav"]["n"], "?")     # never a zero
-        self.assertIn("UNKNOWN", out["dead"]["nav"]["title"])
-        self.assertEqual(out["calm"]["nav"]["n"], 0)       # routine never badges
-        self.assertEqual(out["loud"]["nav"]["n"], 1)
-
-    # ── the verification axis ───────────────────────────────────────────
-    def test_a_row_with_no_gate_receipt_SAYS_SO_behind_the_disclosure(self):
-        """The verification axis still reaches him — it stopped SHOUTING.
-
-        Owner ruling d2f490d0, 2026-08-06: the headline chip had exactly two
-        reachable outcomes and both were negative, so it was an alarm on 100%
-        of cards. The FACT is unchanged and unmoved from the record; only its
-        rung changed. Renamed from ...renders_UNVERIFIED because the old name
-        asserts the old surface, and a test whose name lies is worse than one
-        that fails."""
-        out = self.render(b=self.board([self.row()]))
-        html = out["b"]["html"]
-        headline, expand = html.split('<div class="lrx"', 1)
-        self.assertIn("nothing has gate-checked this row at all", expand)
-        self.assertNotIn("UNVERIFIED", headline)
-        # POSITIVE CONTROL on the same surface: the headline is NOT empty of
-        # verification-adjacent signal by accident — a delivered-report row
-        # still prints GATE N/A there, because that one says something true
-        na = self.render(b=self.board([self.row(
-            close_reason="delivered-report")]))["b"]["html"]
-        self.assertIn("GATE N/A", na.split('<div class="lrx"', 1)[0])
-
-    def test_delivered_report_renders_refs_and_explicitly_no_land_or_gate_claim(self):
-        row = self.row(
-            state="DELIVERED_REPORT", kind="build", polarity=None,
-            base_sha="b" * 40, observable=False, land_state="NOT_CLAIMED",
-            owed_by="nobody",
-            close_reason="delivered-report",
-            artifact_ref="artifact:reports/audit.json#abc123",
-            report_ref="deadbeef0042",
-            close_evidence="artifact handed off", closed_ts="2026-08-03T12:00:00Z",
-            dwell_known=True)
-        out = self.render(b=self.board([], closed_recent=[row]))
-        html = out["b"]["html"]
-        self.assertIn("DELIVERED_REPORT", html)
-        self.assertIn("artifact:reports/audit.json#abc123", html)
-        self.assertIn("deadbeef0042", html)
-        self.assertIn("NO LAND CLAIM", html)
-        self.assertIn("GATE N/A", html)
-        self.assertIn("verdict polarity</b> N/A", html)
-        self.assertIn("base sha", html)
-        self.assertIn("b" * 40, html)
-        self.assertIn("reference syntax only", html)
-        self.assertIn("existence is not checked", html)
-        self.assertIn("no reviewed-tip, verdict, gate, or Git landing claim", html)
-        self.assertNotIn("UNVERIFIED", html)
-        self.assertNotIn("reviewed sha", html)
-
-    def test_a_row_carrying_a_gate_id_does_not_claim_to_have_read_it(self):
-        """Phase 1 does not join the receipt. A claim that implied it had would
-        be exactly the unbacked claim this card exists to catch.
-
-        THE CLAIM MOVED, THE RULE DID NOT (owner ruling d2f490d0, 2026-08-06):
-        the headline chip that used to carry "receipt NOT READ here" is quiet
-        now, because it was negative on 100% of cards. The expand still says
-        it in words AND still carries the token, so this arm asserts the same
-        invariant one disclosure deeper."""
-        out = self.render(b=self.board([self.row(gate="0c7f3a91ab")]))
-        html = out["b"]["html"]
-        self.assertIn("gate:0c7f3a91ab", html)
-        self.assertIn("has not read the gate receipt bound to this row", html)
-        self.assertNotIn("UNVERIFIED", html)
-        # and the not-read admission is BEHIND the disclosure, not in the
-        # headline — the demotion is the ruling, so it gets pinned too
-        headline = html.split('<div class="lrx"', 1)[0]
-        self.assertNotIn("gate receipt", headline)
-
-    def test_a_bound_gate_no_longer_hides_why_READY_was_refused(self):
-        """The SECOND audit, finding 3. A row can carry BOTH a gate id
-        and a fail-closed `ungated` reason — a bound receipt whose gate_caps
-        stamp is unreadable is refused READY — and the verification chip tested
-        `gate` FIRST, so the owner read "receipt NOT READ here" and never
-        learned the record had refused to call the row READY at all.
-
-        Both facts now render, because they answer different questions: what
-        is bound to this row, and why it may not land."""
-        out = self.render(b=self.board([self.row(
-            state="REVIEWED", gate="0c7f3a91ab",
-            ungated="the verdict's gate_caps field is present but unreadable")]))
-        html = out["b"]["html"]
-        self.assertIn("gate:0c7f3a91ab", html)              # the binding
-        # the record's own sentence, escaped exactly as the page escapes it
-        self.assertIn("NOT READY — the verdict&#39;s gate_caps field is "
-                      "present but unreadable", html)       # the refusal
-        self.assertIn("REVIEWED", html)
-
-    def test_the_refusal_reaches_him_with_no_gate_bound_either(self):
-        """The other half of the same slot: an ordinary approve with no minted
-        receipt is refused too, and used to be legible only because nothing
-        else was competing for the chip."""
-        out = self.render(
-            refused=self.board([self.row(
-                state="REVIEWED",
-                ungated="approved with no minted gate receipt — run `helm gate run`")]),
-            fine=self.board([self.row()]))
-        self.assertIn("NOT READY — approved with no minted gate receipt",
-                      out["refused"]["html"])
-        self.assertNotIn("NOT READY", out["fine"]["html"])
-
-    def test_the_refusal_is_a_line_of_its_own_not_a_pill(self):
-        """Pinned by DOM position, and it is a design constraint, not a taste:
-        the reason is a sentence, the chip is a pill that ellipsizes beside the
-        sha at 390px, and `.lrmark` is the full-width, word-breaking row this
-        card already uses for everything it needs him to actually read."""
-        out = self.render(b=self.board([self.row(
-            gate="0c7f3a91ab", ungated="approved with no minted gate receipt")]))
-        html = out["b"]["html"]
-        self.assertIn('<div class="lrmark mut">NOT READY — ', html)
-        self.assertNotIn('class="lrg pend" title="the record', html)
-
-    # ── colour is a class, never a mood ─────────────────────────────────
-    def test_only_an_observed_landing_is_green_and_alarms_outrank_it(self):
-        out = self.render(
-            green=self.board([self.row(state="LANDED", landed=True)]),
-            plain=self.board([self.row()]),
-            both=self.board([self.row(state="LANDED", landed=True, contrary=True,
-                                      contrary_state="landed", polarity="fix")]))
-        self.assertIn('class="lrrow landed"', out["green"]["html"])
-        self.assertIn('class="lrrow "', out["plain"]["html"])
-        self.assertIn('class="lrrow alarm"', out["both"]["html"])
-        self.assertNotIn("lrrow landed", out["both"]["html"])
-
-    def test_a_contrary_row_prints_the_fact_the_verdict_and_the_glyph(self):
-        out = self.render(b=self.board([self.row(
-            state="CHANGES_REQUESTED", polarity="fix", contrary=True,
-            contrary_state="merged-local")]))
-        html = out["b"]["html"]
-        self.assertIn("CONTRARY: MERGED_LOCAL despite FIX verdict", html)
-        self.assertIn("⚠", html)
-
-    def test_an_unread_contrary_state_says_so_instead_of_guessing(self):
-        out = self.render(b=self.board([self.row(contrary=True, polarity="fix")]))
-        self.assertIn("CONTRARY: STATE UNREAD", out["b"]["html"])
-
-    # ── an honored contrary is the process WORKING, not an alarm ─────────
-    def test_an_honored_contrary_renders_the_succession_not_the_alarm(self):
-        """#135 two-surfaces: `lr list` said HONORED while this card shouted
-        CONTRARY over the same row and billed the integrator. The discharge
-        stamp now rides the wire, and the card prints lr list's words."""
-        out = self.render(b=self.board([self.row(
-            state="CHANGES_REQUESTED", polarity="fix", contrary=True,
-            contrary_state="landed", contrary_discharge="a")]))
-        html = out["b"]["html"]
-        self.assertIn("SUPERSEDED-CLOSED: LANDED, and the FIX verdict was "
-                      "HONORED through succession (continuation)", html)
-        self.assertNotIn("CONTRARY:", html)
-        self.assertNotIn("owed by the integrator", html)
-        # not an alarm: no glyph, no alarm row class, and no contrary count
-        self.assertNotIn('class="lrrow alarm"', html)
-        self.assertNotIn("⚠", html)
-        self.assertIn("1 honored", html)
-        self.assertNotIn("1 contrary", html)
-        # the badge does not ring for a row whose verdict was honored
-        self.assertEqual(out["b"]["nav"]["n"], 0)
-
-    def test_a_ladder_discharge_names_its_arm(self):
-        out = self.render(b=self.board([self.row(
-            state="CHANGES_REQUESTED", polarity="supersede", contrary=True,
-            contrary_state="landed", contrary_discharge="b")]))
-        self.assertIn("HONORED through succession (ladder discharge)",
-                      out["b"]["html"])
-        self.assertNotIn("CONTRARY:", out["b"]["html"])
-
-    def test_a_confirmation_row_renders_confirmation_never_contrary(self):
-        """The hydra (#149 value-space class, measured 2026-08-05): the #177
-        ladder's own confirmation rounds — supersede verdict + landed tip,
-        which is their healthy shape BY DESIGN — rendered CONTRARY on the
-        owner's card, so every cure round ADDED a contrary row. A "c" stamp
-        renders its own quiet words, counts under `honored`, and never rings
-        the badge; the genuine contrary beside it stays loud — the must-stay
-        control on the same board."""
-        out = self.render(b=self.board([
-            self.row(id="a" * 12, state="SUPERSEDED", polarity="supersede",
-                     contrary=True, contrary_state="landed",
-                     contrary_discharge="c"),
-            self.row(id="b" * 12, state="SUPERSEDED", polarity="supersede",
-                     contrary=True, contrary_state="landed")]))
-        html = out["b"]["html"]
-        self.assertIn("CONFIRMATION: LANDED by design — the resolution "
-                      "verified on trunk; the discharge instrument, never "
-                      "a debt", html)
-        self.assertIn("CONTRARY: LANDED despite SUPERSEDE verdict", html)
-        self.assertIn("1 contrary", html)
-        self.assertIn("1 honored", html)
-        # the badge rings ONLY for the genuine one
-        self.assertEqual(out["b"]["nav"]["n"], 1)
-
-    def test_a_confirmation_row_and_the_cli_print_the_same_words(self):  # noqa: VACUOUS_ASSERTION — the loop walks a LITERAL two-surface tuple (can never be empty), and its assertIn("CONFIRMATION: LANDED by design") rows are unconditional positive controls: a renderer that draws nothing fails the first iteration
-        """PARITY for the new kind, end to end: the SAME row through
-        landreq.card() into the REAL browser renderer and through
-        landreq._line — both print the confirmation words, neither alarms."""
-        lr = self.row(state="SUPERSEDED", polarity="supersede", contrary=True,
-                      contrary_state="landed", contrary_discharge="c")
-        line = landreq._line(lr)
-        html = self.render(b=self.board([landreq.card(lr)]))["b"]["html"]
-        for text in (line, html):
-            self.assertIn("CONFIRMATION: LANDED by design", text)
-            self.assertNotIn("CONTRARY", text)
-            self.assertNotIn("HONORED through succession", text)
-
-    def test_honored_and_live_contrary_are_counted_separately_never_merged(self):
-        """The header said "11 contrary" over 6 live + 5 honored (measured
-        2026-08-04). Each is its own count, and the honored row stays VISIBLE
-        with its own words — excluded from the alarm, never silently dropped.
-        (Where it is visible moved later the same day: a discharged row is
-        counted CLOSED and renders in the closed strip, pinned by
-        test_a_discharged_row_leaves_the_board_column_for_the_closed_strip.)"""
-        out = self.render(b=self.board([
-            self.row(id="a" * 12, state="CHANGES_REQUESTED", polarity="fix",
-                     contrary=True, contrary_state="landed",
-                     contrary_discharge="a"),
-            self.row(id="b" * 12, state="CHANGES_REQUESTED", polarity="fix",
-                     contrary=True, contrary_state="landed")]))
-        html = out["b"]["html"]
-        self.assertIn("1 contrary", html)
-        self.assertIn("1 honored", html)
-        self.assertIn("HONORED through succession (continuation)", html)
-        self.assertIn("CONTRARY: LANDED despite FIX verdict", html)
-        # the badge counts ONLY the live one
-        self.assertEqual(out["b"]["nav"]["n"], 1)
-
-    def test_an_unverified_discharge_stays_loud_and_says_why(self):
-        """An uncomputed ancestry pair is never guessed quiet: the row stays
-        in the contrary count, rings the badge, and names the uncertainty."""
-        out = self.render(b=self.board([self.row(
-            state="CHANGES_REQUESTED", polarity="fix", contrary=True,
-            contrary_state="landed", contrary_discharge="unverified")]))
-        html = out["b"]["html"]
-        self.assertIn("CONTRARY? LANDED despite FIX verdict — succession "
-                      "UNVERIFIED", html)
-        self.assertIn("1 contrary", html)
-        self.assertNotIn("honored", html)
-        self.assertEqual(out["b"]["nav"]["n"], 1)
-        self.assertIn('class="lrrow alarm"', html)
-
-    def test_an_old_server_row_without_the_stamp_stays_loud(self):
-        """Fail-closed: a wire row that never carried contrary_discharge (the
-        exact pre-fix shape) renders the alarm, not the friendlier word."""
-        row = self.row(state="CHANGES_REQUESTED", polarity="fix",
-                       contrary=True, contrary_state="landed")
-        del row["contrary_discharge"]
-        out = self.render(b=self.board([row]))
-        self.assertIn("CONTRARY: LANDED despite FIX verdict", out["b"]["html"])
-        self.assertEqual(out["b"]["nav"]["n"], 1)
-
-    def test_an_honored_row_that_is_also_stalled_is_quiet_on_every_count(self):
-        """The blocker on the first cut: the composite honored+stalled
-        row was quiet on the home band and STALLED-loud here — the alarm
-        mark, the ⚠, "1 stalled · 1 honored" in the header, and badge 1.
-        One predicate (lrHonored) now answers for every surface: honored
-        wins over the stalled ALARM, while `stalled` itself rides the wire
-        untouched."""
-        row = self.row(state="CHANGES_REQUESTED", polarity="fix",
-                       contrary=True, contrary_state="landed",
-                       contrary_discharge="a", stalled=True)
-        out = self.render(b=self.board([row], stalled_ids=[row["id"]]))
-        html = out["b"]["html"]
-        self.assertIn("HONORED through succession (continuation)", html)
-        self.assertNotIn("STALLED past its stage threshold", html)
-        self.assertNotIn('class="lrrow alarm"', html)
-        self.assertNotIn("⚠", html)
-        self.assertIn("0 stalled", html)
-        self.assertIn("1 honored", html)
-        self.assertNotIn("1 stalled", html)
-        self.assertEqual(out["b"]["nav"]["n"], 0)
-        # THE LOUD CONTROL on the same composite: strip the stamp and the row
-        # alarms on all of them at once — stalled mark, contrary mark, header
-        # terms, badge.
-        # RE-DERIVE, do not just strip the stamp. The classification rides the
-        # wire on its own field now, so mutating only `contrary_discharge`
-        # builds a payload the server cannot produce (no stamp, still honored)
-        # and the row would stay quiet for a reason no production read has.
-        # Recomputing through the SAME predicate the server uses is what keeps
-        # this control honest.
-        loud = dict(row, contrary_discharge=None)
-        loud["honored"] = landreq.honored_display(loud)
-        out = self.render(b=self.board([loud], stalled_ids=[loud["id"]]))
-        html = out["b"]["html"]
-        self.assertIn("CONTRARY: LANDED despite FIX verdict", html)
-        self.assertIn("STALLED past its stage threshold", html)
-        self.assertIn("1 stalled", html)
-        self.assertIn("1 contrary", html)
-        self.assertNotIn("honored</span>", html)
-        self.assertEqual(out["b"]["nav"]["n"], 1)
-
-    def test_the_card_and_the_cli_cannot_read_one_honored_row_differently(self):
-        """PARITY, pinned end to end: the SAME projected row goes through
-        landreq.card() (the exact wire shape) into the REAL browser renderer,
-        and through landreq._line (the exact `lr list` renderer). If card()
-        ever drops the stamp again, the renderer prints CONTRARY here while
-        _line prints HONORED, and this fails."""
-        lr = self.row(state="CHANGES_REQUESTED", polarity="fix", contrary=True,
-                      contrary_state="landed", contrary_discharge="a")
-        wire = landreq.card(lr)
-        self.assertEqual(wire["contrary_discharge"], "a")
-        line = landreq._line(lr)
-        self.assertIn("HONORED through succession (continuation)", line)
-        self.assertNotIn("CONTRARY:", line)
-        html = self.render(b=self.board([wire]))["b"]["html"]
-        self.assertIn("HONORED through succession (continuation)", html)
-        self.assertNotIn("CONTRARY:", html)
-        # the LOUD control through the same pair of renderers: strip the
-        # stamp and both surfaces alarm again, together.
-        loud = dict(lr, contrary_discharge=None)
-        self.assertIn("CONTRARY: LANDED despite FIX verdict",
-                      landreq._line(loud))
-        self.assertIn("CONTRARY: LANDED despite FIX verdict",
-                      self.render(b=self.board([landreq.card(loud)]))["b"]["html"])
-
-    def test_the_composite_honored_stalled_row_reads_equal_on_every_surface(self):  # noqa: VACUOUS_ASSERTION — the loop walks a LITERAL five-stamp tuple (can never be empty), and its "a"/"b"/"c" rows are the unconditional positive controls: assertEqual(...quiet-word in text, True) demands the banner rendered on both surfaces, so a renderer that draws nothing fails the very first iteration
-        """THE SEAM ROW of the re-review: honored AND stalled at once.
-        The same dict goes through landreq.honored_display (the python
-        authority), landreq._line, landreq.card() and the browser renderer +
-        badge — every reader must give the SAME verdict: quiet with the
-        stamp ("a"/"b" honored, "c" the confirmation instrument, each in its
-        own words), alarm-loud without it. Two readers of one datum may not
-        disagree, in either direction."""
-        lr = self.row(state="CHANGES_REQUESTED", polarity="fix", contrary=True,
-                      contrary_state="landed", contrary_discharge="a",
-                      stalled=True)
-        for stamp, quiet in ((("a"), True), ("b", True), ("c", True),
-                             ("unverified", False), (None, False)):
-            lr["contrary_discharge"] = stamp
-            self.assertEqual(landreq.honored_display(lr), quiet, stamp)
-            line = landreq._line(lr)
-            wire = landreq.card(lr)
-            self.assertEqual(wire["contrary_discharge"], stamp)
-            self.assertTrue(wire["stalled"], stamp)     # the FIELD still rides
-            out = self.render(b=self.board([wire], stalled_ids=[wire["id"]]))
-            html = out["b"]["html"]
-            word = "CONFIRMATION:" if stamp == "c" \
-                else "HONORED through succession"
-            for surface, text in (("cli", line), ("web", html)):
-                self.assertEqual(word in text, quiet, (stamp, surface))
-                self.assertEqual("STALLED" not in text, quiet,
-                                 (stamp, surface))
-            self.assertEqual(out["b"]["nav"]["n"], 0 if quiet else 1, stamp)
-
-    def test_a_stalled_row_alarms_and_names_who_owes_it(self):
-        out = self.render(b=self.board([self.row(stalled=True, owed_by="reviewer")],
-                                       stalled_ids=["0123456789ab"]))
-        html = out["b"]["html"]
-        self.assertIn("STALLED past its stage threshold — owed by reviewer", html)
-        self.assertIn("1 stalled", html)
-
-    def test_an_unmeasurable_row_is_annotated_not_left_looking_healthy(self):
-        out = self.render(b=self.board(
-            [self.row(state="REVIEWED", polarity=None)],
-            unmeasurable=[{"id": "0123456789ab", "reason": "polarity UNDECLARED"}]))
-        html = out["b"]["html"]
-        self.assertIn("NOT MEASURABLE: polarity UNDECLARED", html)
-        self.assertIn("UNDECLARED", html)
-        # Older wire payloads without a kind remain explicitly unclassified.
-        self.assertIn("1 unclassified nonbillable", html)
-
-    def test_the_freshness_header_says_unknown_rather_than_zero(self):
-        out = self.render(b=self.board([], read_age_s=12, ledger_age_s=None))
-        html = out["b"]["html"]
-        self.assertIn("ledger read 12s ago", html)
-        self.assertIn("newest ledger write unknown", html)
-
-    def test_ABANDONED_renders_UNKNOWN_without_landing_or_withdrawal_claims(self):
-        ghost = self.row(state="ABANDONED", abandoned=True,
-                         abandon_reason="rewrite <destroyed> evidence",
-                         abandon_land_state="UNKNOWN", land_state="UNKNOWN",
-                         observable=False, landed=False, merged_local=False,
-                         owed_by="nobody", polarity="fix")
-        out = self.render(b=self.board([], closed_recent=[ghost]))
-        html = out["b"]["html"]
-        self.assertIn("ABANDONED — LAND STATE UNKNOWN", html)
-        self.assertIn("reviewed work written off", html)
-        self.assertIn("rewrite &lt;destroyed&gt; evidence", html)
-        self.assertIn("LAND STATE UNKNOWN — commit evidence was destroyed", html)
-        self.assertNotIn("not on trunk", html)
-        self.assertNotIn('class="lrrow landed"', html)
-        self.assertNotIn("WITHDRAWN", html)
-
-    def test_the_closed_footer_never_calls_a_withdrawn_lane_landed(self):
-        """TERMINAL covers SUPERSEDED, withdrawn and closed-by-landing rows, so
-        the footer claims only that they CLOSED and each row prints its own
-        state."""
-        out = self.render(b=self.board([], closed_recent=[
-            self.row(state="CHANGES_REQUESTED", withdrawn=True, polarity="fix")]))
-        html = out["b"]["html"]
-        self.assertIn("closed in the last 24h: 1", html)
-        self.assertNotIn("landed in the last 24h", html)
-        self.assertIn("CHANGES_REQUESTED", html)
-
-    # ── nothing has answered yet is its own state ───────────────────────
-    def test_the_first_paint_says_NOT_READ_YET_rather_than_drawing_nothing(self):
-        """Finding 3. Before this the section was an empty
-        <section id="lrsec"> until a response arrived, and a hung /api/lr left
-        it that way forever — pixel-identical to a healthy quiet board."""
-        out = self.render(waiting={"pending": True})
-        html = out["waiting"]["html"]
-        self.assertIn("READING THE LAND PIPELINE", html)
-        self.assertIn("no read has COMPLETED", html)
-        self.assertIn("NOT READ YET", html)
-        self.assertNotIn("lrrow", html)
-        self.assertNotIn("0 in flight", html)
-        self.assertNotIn("nothing closed in the last 24h", html)
-
-    def test_pending_and_unreadable_do_not_render_the_same(self):
-        """"nothing has answered" and "the ledger is unreadable" are different
-        facts and the owner acts differently on each."""
-        out = self.render(waiting={"pending": True},
-                          dead={"unavailable": "PermissionError: denied",
-                                "loops": []})
-        self.assertIn("lrpending", out["waiting"]["html"])
-        self.assertNotIn("lrunknown", out["waiting"]["html"])
-        self.assertIn("lrunknown", out["dead"]["html"])
-        self.assertNotIn("lrpending", out["dead"]["html"])
-        self.assertNotIn("UNREADABLE", out["waiting"]["html"])
-
-    def test_the_nav_badge_is_a_question_mark_before_the_first_answer(self):
-        """A zero on the badge is a COUNT, and the count of a board nobody has
-        read yet does not exist."""
-        out = self.render(waiting={"pending": True})
-        self.assertEqual(out["waiting"]["nav"]["n"], "?")
-        self.assertIn("has not been read yet", out["waiting"]["nav"]["title"])
-
-    # ── the closed footer never edits its own number ────────────────────
-    def test_a_capped_closed_list_reports_the_TOTAL_and_names_the_drop(self):
-        """13 closed lanes rendered as the number 12, because the footer printed
-        the length of the list it had already truncated."""
-        rows = [self.row(id="row%02d" % i) for i in range(12)]
-        out = self.render(b=self.board([], closed_recent=rows, closed_total=13))
-        html = out["b"]["html"]
-        self.assertIn("closed in the last 24h: 13", html)
-        self.assertIn("showing the newest 12", html)
-        self.assertIn("1 not shown", html)
-
-    def test_an_uncapped_closed_list_says_nothing_about_dropping(self):
-        out = self.render(b=self.board([], closed_recent=[self.row()],
-                                       closed_total=1))
-        html = out["b"]["html"]
-        self.assertIn("closed in the last 24h: 1", html)
-        self.assertNotIn("not shown", html)
-
-    def test_a_missing_total_is_UNKNOWN_and_never_the_list_length(self):
-        """The absent-field law applied to a count: if the server did not send
-        the total, the card may not promote the length of what it received."""
-        d = self.board([], closed_recent=[self.row(), self.row()])
-        d.pop("closed_total")
-        out = self.render(b=d)
-        html = out["b"]["html"]
-        self.assertIn("TOTAL UNKNOWN", html)
-        self.assertNotIn("closed in the last 24h: 2 ", html)
-
-    def test_rows_closed_at_an_unknown_time_are_counted_never_dropped(self):
-        """The lie this replaces: "nothing closed in the last 24h" printed over
-        an approve from Tuesday whose change merged a minute ago."""
-        out = self.render(b=self.board([], closed_unknown_when=3))
-        html = out["b"]["html"]
-        self.assertIn("3 further rows are CLOSED at an UNKNOWN time", html)
-        self.assertIn("cannot say whether they closed in the last 24h", html)
-        self.assertNotIn("nothing closed in the last 24h", html)
-
-    def test_the_footer_may_still_say_nothing_closed_when_it_KNOWS_that(self):
-        """The claim is not forbidden — it is earned. With no closed rows and no
-        undateable ones, "nothing closed" is a fact the record supports."""
-        out = self.render(b=self.board([self.row()]))
-        self.assertIn("nothing closed in the last 24h", out["b"]["html"])
-
-    def test_a_closed_row_with_no_closure_stamp_says_so_when_expanded(self):
-        out = self.render(b=self.board([], closed_recent=[self.row(closed_ts=None)],
-                                       closed_total=1))
-        html = out["b"]["html"]
-        self.assertIn("WHEN this closed is UNKNOWN", html)
-        self.assertIn("git records no moment for the merge", html)
-
-    def test_an_unreadable_closure_stamp_marks_the_row_without_a_tap(self):
-        """The SECOND audit, finding 2, at the surface. The row-level
-        mark, which is all the owner sees on a phone until he taps — and a
-        corrupt stamp is a REPAIR, not the routine absence a git-observed
-        landing has."""
-        out = self.render(
-            bad=self.board([], closed_total=1, closed_recent=[
-                self.row(closed_ts=None, closed_ts_unreadable=True)]),
-            plain=self.board([], closed_total=1, closed_recent=[
-                self.row(closed_ts=None)]))
-        self.assertIn("CLOSURE STAMP UNREADABLE", out["bad"]["html"])
-        self.assertIn("WHEN it closed is UNKNOWN", out["bad"]["html"])
-        self.assertNotIn("CLOSURE STAMP UNREADABLE", out["plain"]["html"])
-
-    def test_the_closure_line_itself_stops_printing_the_junk_stamp(self):
-        """Asserted through its own DOM position so the mark above cannot
-        stand in for it: `closed not-a-stamp` was the exact rendering, and a
-        phrase both of them contain would leave this one unmeasured."""
-        out = self.render(
-            bad=self.board([], closed_total=1, closed_recent=[
-                self.row(closed_ts=None, closed_ts_unreadable=True)]),
-            absent=self.board([], closed_total=1, closed_recent=[
-                self.row(closed_ts=None)]))
-        self.assertIn("closed</b> the ledger's own retirement stamp",
-                      out["bad"]["html"])
-        self.assertNotIn("git records no moment", out["bad"]["html"])
-        # …and the ordinary undated landing keeps its OWN sentence
-        self.assertIn("closed</b> no closure stamp", out["absent"]["html"])
-
-    def test_an_in_flight_row_is_not_asked_when_it_closed(self):
-        """The closure line belongs to the closed footer; on a live row it would
-        be a question with no meaning and a permanent UNKNOWN beside it."""
-        out = self.render(b=self.board([self.row()]))
-        self.assertNotIn("WHEN this closed is UNKNOWN", out["b"]["html"])
-
-    # ── I could not look, versus there is nothing there ─────────────────
-    def test_an_unreadable_receipt_ledger_marks_the_row_without_a_tap(self):
-        """The row-level mark: visible on the collapsed row, which is all the
-        owner sees on a phone until he taps."""
-        out = self.render(
-            unread=self.board([self.row(receipt_state="unreadable")]),
-            absent=self.board([self.row(receipt_state="none")]))
-        unread, absent = out["unread"]["html"], out["absent"]["html"]
-        self.assertIn("LAND RECEIPT LEDGER UNREADABLE", unread)
-        self.assertIn("UNKNOWN, not absent", unread)
-        self.assertNotIn("UNREADABLE", absent)          # absence stays quiet
-
-    def test_the_expanded_panel_line_itself_stops_saying_none(self):
-        """The exact reproduction was this line: "land receipt none" over a
-        PermissionError. Asserted through its own DOM position so the row mark
-        above cannot stand in for it — a phrase both of them contain would leave
-        this rendering unmeasured."""
-        out = self.render(
-            unread=self.board([self.row(receipt_state="unreadable")]),
-            absent=self.board([self.row(receipt_state="none")]))
-        self.assertIn("land receipt</b> LEDGER UNREADABLE", out["unread"]["html"])
-        self.assertIn("land-receipt index", out["unread"]["html"])
-        self.assertIn("land receipt</b> none", out["absent"]["html"])
-
-    def test_a_200_whose_SCHEMA_regressed_is_UNKNOWN_not_an_empty_board(self):
-        """The fifth. `lrCardHTML({})` rendered the happiest state this
-        card has — "0 in flight", "the dispatch ledger READ cleanly", "nothing
-        closed in the last 24h" — over a response carrying no board at all. A
-        successful HTTP answer the card cannot read is an UNREAD pipeline, the
-        same fact as an unreadable ledger arriving through a different door."""
-        out = self.render(empty_object={},
-                          wrong_type={"loops": "oops", "stalled_ids": [],
-                                      "unmeasurable": [], "closed_recent": []},
-                          renamed={"land_loops": [], "stalled_ids": [],
-                                   "unmeasurable": [], "closed_recent": []})
-        for name in ("empty_object", "wrong_type", "renamed"):
-            html = out[name]["html"]
-            self.assertIn("ANSWER NOT RECOGNISED — pipeline UNKNOWN", html, name)
-            self.assertIn("NOT an empty pipeline", html, name)
-            self.assertNotIn("READ cleanly", html, name)
-            self.assertNotIn("0 in flight", html, name)
-            self.assertNotIn("nothing closed in the last 24h", html, name)
-
-    def test_the_badge_over_an_unrecognised_answer_is_not_a_zero(self):
-        """Bound separately from the body: the badge is what reaches him from
-        another tab, and a recogniser only the card consulted would leave the
-        nav saying 0 over a strip saying UNKNOWN."""
-        out = self.render(broken={}, fine=self.board([self.row()]))
-        self.assertEqual(out["broken"]["nav"]["n"], "?")
-        self.assertIn("cannot read", out["broken"]["nav"]["title"])
-        self.assertEqual(out["fine"]["nav"]["n"], 0)     # a real board still counts
-
-    def test_a_board_missing_only_its_TOTAL_is_still_a_board(self):
-        """The recogniser may not swallow the degradations this card renders
-        honestly on purpose: `closed_total` absent has its own "TOTAL UNKNOWN"
-        branch, and demanding it here would turn a designed honest answer into
-        an outage."""
-        d = self.board([self.row()], closed_recent=[self.row()])
-        d.pop("closed_total")
-        out = self.render(b=d)
-        self.assertIn("TOTAL UNKNOWN", out["b"]["html"])
-        self.assertNotIn("ANSWER NOT RECOGNISED", out["b"]["html"])
-
-    def test_an_impossible_closure_stamp_renders_as_its_own_state(self):
-        out = self.render(
-            impossible=self.board([], closed_total=1, closed_recent=[
-                self.row(closed_ts=None, closed_ts_impossible=True)]),
-            unreadable=self.board([], closed_total=1, closed_recent=[
-                self.row(closed_ts=None, closed_ts_unreadable=True)]))
-        bad = out["impossible"]["html"]
-        self.assertIn("CLOSURE STAMP IMPOSSIBLE", bad)
-        self.assertIn("closed</b> the ledger dates this row's closure in the FUTURE",
-                      bad)
-        # the two repairs are different instructions and must not swap
-        self.assertNotIn("NOT A TIMESTAMP", bad)
-        self.assertNotIn("CLOSURE STAMP IMPOSSIBLE", out["unreadable"]["html"])
-
-    def test_a_refused_ledger_row_is_marked_on_the_collapsed_row(self):
-        out = self.render(
-            refused=self.board([self.row(state="OPEN",
-                                         ledger_refused=["verdict"])]),
-            clean=self.board([self.row()]))
-        html = out["refused"]["html"]
-        self.assertIn("LEDGER ROW REFUSED", html)
-        self.assertIn("historical verdict event its fold refused", html)
-        self.assertIn("current fields come only from accepted dispatch state", html)
-        self.assertNotIn("LEDGER ROW REFUSED", out["clean"]["html"])
-
-    def test_attest_mismatch_is_visible_without_overwriting_polarity(self):
-        out = self.render(mismatch=self.board([self.row(
-            state="REVIEWED", polarity="approve", attest_state="unverifiable",
-            attest_detail="attest intent binding mismatch")]))
-        html = out["mismatch"]["html"]
-        self.assertIn("ATTEST UNVERIFIABLE", html)
-        self.assertIn("attest intent binding mismatch", html)
-        self.assertIn("verdict polarity</b> APPROVE", html)
-        self.assertIn("from dispatch store", html)
-        self.assertIn("verdict attest</b> UNVERIFIABLE", html)
-        self.assertIn("from attest sidecar", html)
-
-    def test_a_row_that_carries_NO_receipt_state_does_not_print_none(self):
-        """The THIRD rendering of "unreadable receipt storage" as "there is no
-        receipt", and the only one living in the browser: `c.receipt_state ||
-        "none"` made the card answer for a field it was never sent. The server
-        no longer defaults it, so this is the branch that must not re-invent
-        the same word one layer further out."""
-        out = self.render(
-            missing=self.board([self.row(receipt_state=None)]),
-            absent=self.board([self.row(receipt_state="none")]))
-        missing = out["missing"]["html"]
-        self.assertIn("land receipt</b> NOT SENT", missing)
-        self.assertIn("no receipt state at all", missing)
-        self.assertNotIn("land receipt</b> none", missing)
-        # …and a row that really was told "none" still says none
-        self.assertIn("land receipt</b> none", out["absent"]["html"])
-
-    def test_the_undated_closure_footer_does_not_blame_git_for_all_of_them(self):
-        """"git observed the landing and the record carries no closure stamp"
-        was printed over EVERY undateable closure — including a stamp that is
-        not a timestamp and one dated in the future, which the window now sends
-        here too. The count was honest and the explanation was not."""
-        out = self.render(b=self.board([], closed_unknown_when=2))
-        html = out["b"]["html"]
-        self.assertIn("2 further rows are CLOSED at an UNKNOWN time", html)
-        self.assertIn("no usable closure instant", html)
-        self.assertIn("dated in the future", html)
-        self.assertNotIn("git observed the landing and the record carries no", html)
-
-    def test_a_dwell_that_was_never_measured_renders_as_a_question_mark(self):
-        """dwell_s is 0 when the entry stamp could not be read, and 0m is the
-        most flattering possible reading of the oldest possible row."""
-        out = self.render(unknown=self.board([self.row(dwell_known=False,
-                                                       dwell_s=0)]),
-                          known=self.board([self.row(dwell_known=True,
-                                                     dwell_s=0)]))
-        self.assertIn('<span class="lrdwell">?</span>', out["unknown"]["html"])
-        self.assertNotIn("0m", out["unknown"]["html"])
-        self.assertIn('<span class="lrdwell">0m</span>', out["known"]["html"])
-
-    def test_an_unmeasured_dwell_says_why_in_words(self):
-        out = self.render(b=self.board([self.row(dwell_known=False)]))
-        html = out["b"]["html"]
-        self.assertIn("DWELL UNKNOWN", html)
-        self.assertIn("age was never measured", html)
-
-    def test_an_unobserved_row_does_not_claim_the_change_is_off_trunk(self):
-        """helm reads trunk only once a verdict exists, so an OPEN row's
-        landed/merged_local are both false because NOBODY LOOKED. "not on
-        trunk" there is a git fact this card never obtained."""
-        out = self.render(
-            blind=self.board([self.row(state="OPEN", observable=False)]),
-            seen=self.board([self.row(state="READY", observable=True)]))
-        self.assertIn("NOT OBSERVED", out["blind"]["html"])
-        self.assertIn("trunk position is UNKNOWN", out["blind"]["html"])
-        self.assertIn("<b>trunk</b> not on trunk", out["seen"]["html"])
-        self.assertNotIn("NOT OBSERVED", out["seen"]["html"])
-
-    def test_the_timeline_distinguishes_its_three_kinds_of_missing_stamp(self):
-        """The eleventh defect at the surface. One rendering answered for all
-        three: a corrupt stamp printed verbatim (`READY not-a-stamp`), and any
-        absent one explained as "(git-observed…)" — which is true of the
-        landing step alone and is a git reading an OPEN row never got."""
-        out = self.render(b=self.board([self.row(timeline=[
-            {"state": "OPEN", "ts": None},
-            {"state": "AWAITING_REVIEW", "ts": "2026-07-30T00:00:00Z"},
-            {"state": "READY", "ts": None, "ts_unreadable": True},
-            {"state": "LANDED", "ts": None, "observed": True}])]))
-        html = out["b"]["html"]
-        self.assertIn("OPEN (no stamp on the ledger event)", html)
-        self.assertIn("AWAITING_REVIEW 2026-07-30T00:00:00Z", html)
-        self.assertIn("READY (the ledger's stamp here is NOT A TIMESTAMP)",
-                      html)
-        self.assertIn("LANDED (git-observed, no ledger stamp)", html)
-
-    def test_the_timeline_names_the_FOURTH_kind_of_missing_stamp(self):
-        """A stamp that parses and is dated in the future. Its own sentence,
-        because "not a timestamp" sends the reader to re-read something that
-        reads perfectly."""
-        out = self.render(b=self.board([self.row(timeline=[
-            {"state": "OPEN", "ts": "2026-07-30T00:00:00Z"},
-            {"state": "WITHDRAWN", "ts": None, "ts_impossible": True}])]))
-        html = out["b"]["html"]
-        self.assertIn("WITHDRAWN (the ledger's stamp here is dated in the FUTURE)",
-                      html)
-        self.assertNotIn("WITHDRAWN (the ledger's stamp here is NOT A TIMESTAMP)",
-                         html)
-        self.assertNotIn("2099", html)
-
-    def test_an_unstamped_step_is_not_called_git_observed(self):
-        """Pinned as a NEGATIVE, because the failure was a rendering that was
-        RIGHT for one step and applied to all of them."""
-        out = self.render(b=self.board([self.row(
-            timeline=[{"state": "OPEN", "ts": None}])]))
-        self.assertNotIn("git-observed", out["b"]["html"])
-
-    def test_a_hostile_lane_name_cannot_inject_markup(self):
-        out = self.render(b=self.board([self.row(lane="<img src=x onerror=1>")]))
-        html = out["b"]["html"]
-        self.assertNotIn("<img", html)
-        self.assertIn("&lt;img", html)
-
-    # ── THE COMPACT HOME IN-FLIGHT PROJECTION IS GONE (owner ruling,
-    # task/2355: the cards that repeat the ones he uses come off). Six arms
-    # stood here over `lrInflightHTML`, and they are not lost — every property
-    # they held moved onto `dashOwedBy`, the roll-up that replaced the row, in
-    # DashOwedByRuntimeTest below: unread versus UNKNOWN versus a measured
-    # zero, honored rows dropped the way the ledger board drops them, and the
-    # holder read from the SERVER pair rather than re-derived in the browser.
-    # Keeping them here would have been six arms over a deleted renderer.
-
-    # ── the kanban board (owner 2026-08-03: board by default, list one tap away)
-    def test_kanban_is_the_default_and_carries_one_column_per_state(self):
-        """lrCardHTML with NO view argument — how every pre-kanban caller and
-        test invokes it — draws the BOARD: one column per state string the
-        rows actually carry, and never the flat wall."""
-        out = self.render(b=self.board([
-            self.row(id="a" * 12, state="OPEN"),
-            self.row(id="b" * 12, state="AWAITING_REVIEW"),
-            self.row(id="c" * 12, state="AWAITING_REVIEW", lane="lane/second"),
-            self.row(id="d" * 12, state="READY")]))
-        html = out["b"]["html"]
-        self.assertIn('class="lrkb"', html)
-        self.assertEqual(html.count('class="lrkcol'), 3)  # OPEN·AWAITING_REVIEW·READY
-        self.assertNotIn('<div class="lrrows">', html)    # the flat wall is the OTHER view
-        for rid in ("a" * 12, "b" * 12, "c" * 12, "d" * 12):
-            self.assertIn('data-id="%s"' % rid, html)     # grouping drops no row
-
-    def test_the_columns_read_left_to_right_in_pipeline_order(self):
-        """The rank mirrors landreq.STAGE_ORDER's direction, whatever order
-        the server sent the rows in."""
-        out = self.render(b=self.board([
-            self.row(id="a" * 12, state="MERGED_LOCAL"),
-            self.row(id="b" * 12, state="OPEN"),
-            self.row(id="c" * 12, state="READY")]))
-        html = out["b"]["html"]
-        self.assertIn('class="lrkb"', html)       # positive control: a board
-        self.assertIn(">OPEN<", html)             # …with every column drawn
-        self.assertIn(">READY<", html)
-        self.assertIn(">MERGED_LOCAL<", html)
-        self.assertLess(html.index(">OPEN<"), html.index(">READY<"))
-        self.assertLess(html.index(">READY<"), html.index(">MERGED_LOCAL<"))
-
-    def test_a_state_the_board_has_never_met_still_gets_a_column(self):
-        """Columns are DERIVED from the rows. A state this client has never
-        heard of must appear — last, never dropped: a dropped column is
-        dropped rows, which is the one thing this card exists to prevent."""
-        out = self.render(b=self.board([
-            self.row(id="a" * 12, state="OPEN"),
-            self.row(id="b" * 12, state="SOMETHING_NEW")]))
-        html = out["b"]["html"]
-        self.assertIn(">SOMETHING_NEW<", html)
-        self.assertLess(html.index(">OPEN<"), html.index(">SOMETHING_NEW<"))
-
-    def test_READY_rung_variants_keep_their_own_column_beside_READY(self):
-        """READY-SELF-REVIEW is the record refusing plain READY — the rung is
-        the point, so it must not be laundered into the READY column, and it
-        must sort with READY rather than falling off the end."""
-        out = self.render(b=self.board([
-            self.row(id="a" * 12, state="READY-SELF-REVIEW"),
-            self.row(id="b" * 12, state="MERGED_LOCAL")]))
-        html = out["b"]["html"]
-        self.assertIn(">READY-SELF-REVIEW<", html)
-        self.assertLess(html.index(">READY-SELF-REVIEW<"),
-                        html.index(">MERGED_LOCAL<"))
-
-    def test_alarms_stay_loud_on_the_board_card_and_column_both(self):
-        """CONTRARY/STALLED must survive the re-arrangement: the card keeps
-        its alarm class and marks, the column it sits in is edged and counted,
-        and the header's per-fact counts change not at all."""
-        out = self.render(b=self.board(
-            [self.row(id="a" * 12, state="READY", stalled=True),
-             self.row(id="b" * 12, state="READY")],
-            stalled_ids=["a" * 12]))
-        html = out["b"]["html"]
-        self.assertIn('class="lrrow alarm"', html)
-        self.assertIn("STALLED past its stage threshold", html)
-        self.assertIn('class="lrkcol alarmed"', html)
-        self.assertIn("⚠1", html)                    # the column's ⚠1
-        self.assertIn("1 stalled", html)                  # the header count stays
-
-    def test_an_unmeasurable_rows_annotation_survives_the_board(self):
-        """The unmeasurable map is keyed by id; the board must thread each
-        row's reason through to the same mark the list prints."""
-        out = self.render(b=self.board(
-            [self.row(id="a" * 12, state="REVIEWED", polarity=None)],
-            unmeasurable=[{"id": "a" * 12,
-                           "reason": "verdict polarity undeclared"}]))
-        self.assertIn("NOT MEASURABLE: verdict polarity undeclared",
-                      out["b"]["html"])
-
-    def test_the_list_view_is_byte_identical_row_markup_under_a_flat_wall(self):
-        """The toggle's contract: the SAME rows through the SAME renderer.
-        Each row's lrRowHTML output must appear verbatim in BOTH views —
-        only the grouping differs — and the list view is the exact pre-board
-        flat wall.
-
-        THE TWO ROWS CARRY DIFFERENT LANES ON PURPOSE, and they did not used to
-        — both took the fixture's default name, which made this an accidental
-        test of a SECOND property (what a shared name does) under a docstring
-        about a first. Lane grouping landed and the two properties came apart:
-        the list boxes same-named rows under one caption while the board splits
-        them across state columns, so the row inside the caption stops
-        repeating the name it now sits under. That difference is intended, is
-        CONTEXT rather than fact, and is pinned by its own arm —
-        RelatedRowsNestTest.test_the_two_views_differ_only_in_the_headline —
-        which additionally asserts every FACT stays byte-identical. This arm
-        keeps its own subject: two INDEPENDENT rows, verbatim in both views."""
-        rows = [self.row(id="a" * 12, state="OPEN", lane="lane/one"),
-                self.row(id="b" * 12, state="READY", lane="lane/two",
-                         contrary=True,
-                         contrary_state="landed", landed=True, polarity="fix")]
-        out = self.render(
-            kb={"__d": self.board(rows), "__view": "kanban"},
-            li={"__d": self.board(rows), "__view": "list"},
-            r0={"__row": rows[0]}, r1={"__row": rows[1]})
-        kb, li = out["kb"]["html"], out["li"]["html"]
-        self.assertIn('<div class="lrrows">', li)
-        self.assertNotIn("lrkb", li)
-        for r in (out["r0"]["html"], out["r1"]["html"]):
-            self.assertIn(r, kb)
-            self.assertIn(r, li)
-
-    def test_both_views_offer_the_toggle_with_the_active_choice_lit(self):
-        rows = [self.row()]
-        out = self.render(kb={"__d": self.board(rows), "__view": "kanban"},
-                          li={"__d": self.board(rows), "__view": "list"})
-        self.assertIn('data-lrview="list"', out["kb"]["html"])
-        self.assertIn('class="lrvopt on" data-lrview="kanban"', out["kb"]["html"])
-        self.assertIn('class="lrvopt on" data-lrview="list"', out["li"]["html"])
-
-    def test_the_UNKNOWN_strips_render_no_view_toggle(self):
-        """A control that re-arranges rows is a lie on a strip that has none
-        — and its presence would dress an unread pipeline as a working one."""
-        out = self.render(p={"pending": True},
-                          u={"unavailable": "denied", "loops": [],
-                             "stalled_ids": [], "unmeasurable": [],
-                             "closed_recent": []})
-        self.assertIn("READING THE LAND PIPELINE", out["p"]["html"])
-        self.assertNotIn("lrvtog", out["p"]["html"])
-        self.assertIn("DISPATCH LEDGER UNREADABLE", out["u"]["html"])
-        self.assertNotIn("lrvtog", out["u"]["html"])
-
-    # ── a VERIFIED superseded row is another kind of CLOSED ──────────────
-    # Owner 2026-08-04, over a screenshot of a 10-card SUPERSEDED column:
-    # "i feel like superseded, if verified, should just be like another type
-    # of closed. are we overcomplicating this? -- somewhere on the kanban list
-    # needs to link to a list of closed items". Measured on the live board the
-    # same day: 10 SUPERSEDED cards, of which 9 were discharged (4 honored
-    # through succession, 5 confirmation rounds) and ONE was the genuine
-    # contrary. These pin BOTH halves — the placement, and the door.
-
-    def test_a_discharged_row_leaves_the_board_column_for_the_closed_strip(self):
-        """THE OWNER'S COMPLAINT, as a placement assertion. The honored and
-        confirmation rows must not be cards in the SUPERSEDED column, and
-        must be findable in the closed strip — while the MUST-HIT control,
-        the genuine contrary, STAYS. Both directions in one render, so a
-        renderer that drew an empty board would fail the control."""
-        out = self.render(b=self.discharged_board())
-        html = out["b"]["html"]
-        cols, strip = self.columns(html), self.closed_strip(html)
-        # the control FIRST: the undischarged contrary is a card on the board
-        self.assertIn('data-id="%s"' % ("b" * 12), cols)
-        self.assertIn("CONTRARY: LANDED despite SUPERSEDE verdict", cols)
-        # …and the two discharged rows are NOT
-        self.assertNotIn('data-id="%s"' % ("a" * 12), cols)
-        self.assertNotIn('data-id="%s"' % ("c" * 12), cols)
-        # …they are in the closed strip, and the RECORD KEEPS THE DISTINCTION:
-        # each still prints its own discharge line, never a plain retirement
-        self.assertIn('data-id="%s"' % ("a" * 12), strip)
-        self.assertIn('data-id="%s"' % ("c" * 12), strip)
-        self.assertIn("SUPERSEDED-CLOSED: LANDED, and the SUPERSEDE verdict "
-                      "was HONORED through succession (continuation)", strip)
-        self.assertIn("CONFIRMATION: LANDED by design", strip)
-        # the column is left holding exactly the one undischarged row
-        self.assertEqual(cols.count('class="lrrow '), 1)
-        self.assertIn('in this state">1</span>', cols)
-
-    def test_the_board_carries_the_door_to_the_closed_list(self):
-        """The second half of the ask: the board must LINK to the closed
-        list, and it reuses the ONE closed strip rather than growing a second
-        one — the column chip and the footer carry the same data-lrclosed
-        toggle over the same #lrclosed box."""
-        out = self.render(b=self.discharged_board())
-        html = out["b"]["html"]
-        cols = self.columns(html)
-        self.assertIn('<button type="button" class="lrkfoot" data-lrclosed="1"',
-                      cols)
-        self.assertNotIn('class="lrkfoot" data-lrclosed="1" role="button"', cols)
-        self.assertIn("2 discharged — closed · tap to show</button>", cols)
-        # the card's own closed footer is the same NATIVE door, and says what
-        # joined the closed accounting
-        self.assertIn('<button type="button" class="lrfoot" data-lrclosed="1">',
-                      html)
-        self.assertNotIn('<div class="lrfoot" data-lrclosed="1">', html)
-        self.assertIn("2 honored (verified superseded/confirmation — closed, "
-                      "not in flight)", html)
-        # ONE box, ONE list: the strip is not duplicated per column
-        self.assertEqual(html.count('id="lrclosed"'), 1)
-
-    def test_a_footer_only_closed_list_has_ONE_native_keyboard_door(self):
-        """Without a discharged column the footer is the only route to CLOSED.
-
-        A clickable div cannot receive focus and native Enter/Space never fires
-        its onclick, so the owner would have no keyboard route to the list."""
-        out = self.render(b=self.board(
-            [self.row(id="a" * 12)],
-            closed_recent=[self.row(id="c" * 12, state="CLOSED")]))
-        html = out["b"]["html"]
-        self.assertNotIn("lrkfoot", html)  # no column door: footer is the control
-        self.assertEqual(html.count('data-lrclosed="1"'), 1)
-        self.assertIn('<button type="button" class="lrfoot" data-lrclosed="1">',
-                      html)
-        self.assertNotIn('<div class="lrfoot" data-lrclosed="1">', html)
-
-    def test_the_counts_line_counts_a_discharged_row_as_closed_not_in_flight(self):
-        """The accounting moves with the placement: 3 rows, 2 discharged, and
-        the header reads ONE in flight and ONE contrary — the number beside
-        the column, not a parallel one. Read off the COUNTS SPAN, because the
-        filed strip beside it legitimately says "3 in flight": that is the
-        server's all-time population, and the two are different questions."""
-        out = self.render(b=self.discharged_board())
-        html = out["b"]["html"]
-        counts = self.counts_span(html)
-        self.assertIn("1 in flight", counts)
-        self.assertIn("1 contrary", counts)
-        self.assertNotIn("3 in flight", counts)
-        self.assertNotIn("honored", counts)   # it is not an in-flight term
-        self.assertEqual(out["b"]["nav"]["n"], 1)     # only the genuine one rings
-
-    def test_a_column_whose_every_row_discharged_keeps_the_door(self):
-        """A state with no undischarged rows left must not VANISH from the
-        board: the column stays, card-less, carrying the door to where its
-        rows went. A dropped column is a dropped trace — 9 rows disappearing
-        with nothing on the board to say where."""
-        out = self.render(b=self.board([
-            self.row(id="a" * 12, state="SUPERSEDED", polarity="supersede",
-                     contrary=True, contrary_state="landed",
-                     contrary_discharge="a"),
-            self.row(id="d" * 12, state="READY")]))
-        html = out["b"]["html"]
-        cols = self.columns(html)
-        self.assertIn('data-id="%s"' % ("d" * 12), cols)   # control: READY drew
-        self.assertIn(">SUPERSEDED<", cols)                # the column survives
-        self.assertNotIn('data-id="%s"' % ("a" * 12), cols)
-        self.assertIn("1 discharged — closed · tap to show", cols)
-        self.assertIn('data-id="%s"' % ("a" * 12), self.closed_strip(html))
-
-    def test_the_discharged_card_is_byte_identical_in_the_closed_strip(self):
-        """The row does not become a different row by moving: the SAME
-        lrRowHTML markup the board would have drawn — unmeasurable reason
-        threaded and all — appears verbatim under the closed strip. It is
-        drawn WITHOUT the closed-stamp panel, because the ledger has not
-        retired it: "when did this close" is not its question."""
-        r = self.row(id="a" * 12, state="SUPERSEDED", polarity="supersede",
-                     contrary=True, contrary_state="landed",
-                     contrary_discharge="a")
-        out = self.render(
-            b={"__d": self.board([r], unmeasurable=[
-                {"id": "a" * 12, "reason": "verdict polarity undeclared"}])},
-            r0={"__row": r, "__reason": "verdict polarity undeclared"})
-        self.assertIn(out["r0"]["html"], self.closed_strip(out["b"]["html"]))
-        self.assertIn("NOT MEASURABLE: verdict polarity undeclared",
-                      out["b"]["html"])
-
-    def test_a_discharged_unmeasurable_row_keeps_its_reason_not_the_live_count(self):
-        """Moving a row to closed must move every live-accounting term with it.
-        The full reason map still feeds the closed row, but its id no longer
-        increments the header's unmeasurable count."""
-        r = self.row(id="a" * 12, state="SUPERSEDED", polarity="supersede",
-                     contrary=True, contrary_state="landed",
-                     contrary_discharge="a")
-        out = self.render(b=self.board([r], unmeasurable=[
-            {"id": "a" * 12, "reason": "verdict polarity undeclared"}]))
-        html = out["b"]["html"]
-        counts = self.counts_span(html)
-        self.assertIn("0 in flight", counts)
-        self.assertNotIn("unmeasurable", counts)
-        self.assertIn("NOT MEASURABLE: verdict polarity undeclared",
-                      self.closed_strip(html))
-
-    def test_an_unverified_superseded_row_is_never_moved_to_closed(self):
-        """FAIL-CLOSED, the whole point of the predicate: an UNVERIFIED
-        succession and a row with no stamp at all are both undischarged
-        work. They stay on the board, in the column, in the alarm — beside
-        the discharged control that proves the move happens at all."""
-        out = self.render(b=self.board([
-            self.row(id="u" * 12, state="SUPERSEDED", polarity="supersede",
-                     contrary=True, contrary_state="landed",
-                     contrary_discharge="unverified",
-                     succession_unknown_reason=
-                         "supersedes chain is malformed or unreadable"),
-            self.row(id="a" * 12, state="SUPERSEDED", polarity="supersede",
-                     contrary=True, contrary_state="landed",
-                     contrary_discharge="a")]))
-        cols = self.columns(out["b"]["html"])
-        self.assertIn('data-id="%s"' % ("u" * 12), cols)
-        self.assertIn("succession UNVERIFIED", cols)
-        self.assertIn("supersedes chain is malformed or unreadable", cols)
-        self.assertIn("no discharge was inferred", cols)
-        self.assertNotIn("it converges", cols)
-        self.assertNotIn('data-id="%s"' % ("a" * 12), cols)   # the control moved
-        self.assertIn("1 in flight", out["b"]["html"])
-        self.assertEqual(out["b"]["nav"]["n"], 1)
-
-    def test_an_ordinary_stall_renders_the_typed_succession_reason(self):
-        unknown = self.row(stalled=True, contrary=False,
-                           succession_state="unknown",
-                           succession_unknown_reason=
-                               "carrier landing proof is unreadable")
-        moved = self.row(id="m" * 12, stalled=True, contrary=False,
-                         succession_state="moved")
-        out = self.render(u={"__row": unknown}, m={"__row": moved})
-        self.assertIn("STALLED — succession UNKNOWN", out["u"]["html"])
-        self.assertIn(unknown["succession_unknown_reason"], out["u"]["html"])
-        self.assertIn("whether a successor carried it cannot be read",
-                      out["u"]["html"])
-        self.assertNotIn("STALLED", out["m"]["html"])
-
-    def test_the_list_view_moves_the_same_rows_to_the_same_strip(self):
-        """One partition, both views: the list wall and the board agree about
-        which rows are work, or the toggle changes what is closed."""
-        out = self.render(li={"__d": self.discharged_board(), "__view": "list"})
-        html = out["li"]["html"]
-        wall = html.split('<div class="lrrows">')[1].split(
-            '<button type="button" class="lrfoot"')[0]
-        self.assertIn('data-id="%s"' % ("b" * 12), wall)      # control: it drew
-        self.assertNotIn('data-id="%s"' % ("a" * 12), wall)
-        self.assertNotIn('data-id="%s"' % ("c" * 12), wall)
-        self.assertIn('data-id="%s"' % ("a" * 12), self.closed_strip(html))
-        self.assertIn('<button type="button" class="lrfoot" data-lrclosed="1">',
-                      html)
-
-    # ---- the owner's task queue (task/2622) -------------------------------
-    # RUN, NEVER READ, AND WHAT IS RUN IS FORMATTING. The page holds no
-    # timestamp parser and no counter any more: the server resolves every age
-    # against ONE parser at the instant of ONE read and sends a number or
-    # null, and it counts the headline itself. What only an executed arm can
-    # see is what this file does with a NULL — whether the word UNKNOWN comes
-    # out or a number does — and that is what these arms attack.
-
-    def test_the_queue_headline_RENDERS_the_numbers_the_server_counted(self):
-        """The page draws what it was sent. It does not re-derive the totals
-        from the rows — that is the server's one count — so this arm proves
-        the transport of five numbers onto the line the owner reads."""
-        t = self.tqtotals(P0=2, P1=1, P2=2, P3=1, unranked=1, in_progress=1,
-                          live=7, oldest={"P0": 9 * 86400, "P1": 40 * 86400})
-        out = self.render(q={"__queue": t, "__rows": [], "__age": 0})
-        html = out["q"]["html"]
-        # MUST-HIT FIRST: the headline rendered at all, so the assertions
-        # below are being read off markup this function produced.
-        self.assertIn("P0", html, "MUST-HIT: no headline rendered")
-        self.assertIn("<b>2</b> P0", html)
-        self.assertIn("<b>1</b> P1", html)
-        self.assertIn("<b>2</b> P2", html)
-        self.assertIn("<b>1</b> P3", html)
-        self.assertIn("<b>1</b> UNRANKED", html)
-        self.assertIn("<b>1</b> in progress", html)
-        self.assertIn("oldest P0 9d ago", html)
-        self.assertIn("oldest P1 40d ago", html)
-
-    def test_moving_ONE_number_moves_the_headline(self):
-        """THE POSITIVE CONTROL. Every assertion above would pass on a
-        renderer that emitted a constant line, so the same call is made with a
-        single field changed and the rendering must follow it."""
-        before = self.tqtotals(P0=0, P2=2, live=2)
-        after = self.tqtotals(P0=1, P2=1, live=2)
-        out = self.render(before={"__queue": before, "__age": 0},
-                          after={"__queue": after, "__age": 0})
-        self.assertIn("<b>0</b> P0", out["before"]["html"])
-        self.assertIn("<b>1</b> P0", out["after"]["html"],
-                      "the P0 count did not move when the number behind it "
-                      "did, so this headline is not reading its argument")
-        self.assertNotEqual(out["before"]["html"], out["after"]["html"],
-                            "the rendered line did not change when the "
-                            "numbers behind it did")
-
-    def test_an_UNKNOWN_oldest_age_is_the_WORD_and_never_a_number(self):
-        """The server answers null for a stamp it could not read. The one
-        thing this line may not do is turn that into an age."""
-        t = self.tqtotals(P0=1, live=1, oldest={"P0": None, "P1": None})
-        out = self.render(q={"__queue": t, "__age": 0})
-        self.assertIn("<b>1</b> P0", out["q"]["html"], "the row vanished")
-        self.assertIn("oldest P0 age UNKNOWN", out["q"]["html"])
-        self.assertNotIn("ago", out["q"]["html"],
-                         "an unreadable stamp was rendered as an age")
-
-    # ---- finding 1: a failed, malformed or expired read clears EVERY number
-    def test_a_FAILED_read_clears_every_number_to_UNKNOWN(self):
-        """THE DEFECT, RUN. A read that stops answering must not leave the
-        totals it drew last standing — that headline is read as current."""
-        good = {"queue": self.tqtotals(P0=3, P1=7, live=10), "entries": []}
-        dead = {"unavailable": True, "why": "connection refused",
-                "queue": None, "entries": []}
-        out = self.render(good={"__payload": good, "__age": 0},
-                          dead={"__payload": dead, "__age": 0})
-        # MUST-HIT: the good payload really did render numbers, so the
-        # absence below is an absence OF something this renderer can produce.
-        self.assertIn("<b>3</b> P0", out["good"]["html"],
-                      "MUST-HIT: the healthy payload rendered no numbers")
-        self.assertIsNone(out["dead"]["shown"],
-                          "a failed read still offered totals to render")
-        self.assertIn("UNKNOWN", out["dead"]["html"])
-        self.assertNotIn("<b>3</b>", out["dead"]["html"],
-                         "the previous P0 total survived a failed read")
-        self.assertNotIn("<b>7</b>", out["dead"]["html"],
-                         "the previous P1 total survived a failed read")
-        self.assertIn("connection refused", out["dead"]["why"])
-
-    def test_a_read_PAST_THE_BOUND_clears_every_number_to_UNKNOWN(self):
-        """Same rule for the other way a number goes wrong: the read answered
-        and then got too old to stand behind. cardBoundS(45) is 180s, so 181
-        is one second past and 179 is one second inside — both asserted, or
-        this arm would pass against a renderer that blanks unconditionally."""
-        body = {"queue": self.tqtotals(P0=3, P1=7, live=10), "entries": []}
-        out = self.render(fresh={"__payload": body, "__age": 179},
-                          expired={"__payload": body, "__age": 181})
-        self.assertIn("<b>3</b> P0", out["fresh"]["html"],
-                      "MUST-HIT: a read inside the bound was blanked, so the "
-                      "expiry below proves nothing")
-        self.assertEqual("", out["fresh"]["why"])
-        self.assertIsNone(out["expired"]["shown"])
-        self.assertNotIn("<b>3</b>", out["expired"]["html"],
-                         "an EXPIRED read kept its totals on the line")
-        self.assertIn("UNKNOWN", out["expired"]["html"])
-        self.assertIn("freshness bound", out["expired"]["why"])
-
-    def test_a_MALFORMED_payload_with_no_queue_is_UNKNOWN_not_zero(self):
-        """A body that arrived, parsed, and carries no totals. Zeroes here
-        would tell the owner the backlog is clear at the moment we lost the
-        ability to say."""
-        out = self.render(
-            nq={"__payload": {"entries": [], "counts": {}}, "__age": 0})
-        self.assertIsNone(out["nq"]["shown"])
-        self.assertIn("UNKNOWN", out["nq"]["html"])
-        self.assertNotIn("<b>0</b>", out["nq"]["html"],
-                         "a payload with no totals rendered a queue of zeroes")
-
-    def test_the_backlog_row_SHOWS_owner_age_and_the_last_notes_first_line(self):
-        """The four things the owner asked to see on a row. Asserted on
-        EXECUTED markup because the fields are interpolations, not tokens: a
-        renderer that dropped the note line keeps every identifier."""
-        loud = self.tqrow("task/1", owner=None, priority="P1",
-                          age_s=3 * 86400, noted_age_s=3 * 86400)
-        held = self.tqrow("task/2", owner="seat-b", age_s=3 * 86400,
-                          noted_age_s=7200,
-                          last_note={"ts": self.TQ_NOW - 7200, "by": "seat-c",
-                                     "line": "the signer is exporting again"})
-        out = self.render(a={"__tqrow": loud}, b={"__tqrow": held})
-        self.assertIn("UNOWNED", out["a"]["html"],
-                      "a row nobody holds rendered no owner at all, so "
-                      "unowned and not-rendered look identical")
-        self.assertIn("filed 3d ago", out["a"]["html"])
-        self.assertIn("no notes", out["a"]["html"])
-        # THE CONTROL: an owned, annotated row says the other things.
-        self.assertNotIn("UNOWNED", out["b"]["html"])
-        self.assertIn("owner: seat-b", out["b"]["html"])
-        self.assertIn("last note 2h ago", out["b"]["html"])
-        self.assertIn("the signer is exporting again", out["b"]["html"])
-        self.assertIn("seat-c", out["b"]["html"])
-
-    def test_a_row_whose_AGE_IS_UNKNOWN_renders_the_word_not_a_number(self):
-        """Finding 5 at the last inch. The server sends null for a stamp it
-        could not read, and every one of the three places a row says a time
-        must print the word rather than compute something from a null."""
-        blind = self.tqrow("task/9", age_s=None, noted_age_s=None,
-                           ts_epoch=None, ts="not a timestamp")
-        out = self.render(x={"__tqrow": blind},
-                          ok={"__tqrow": self.tqrow("task/8")})
-        html = out["x"]["html"]
-        self.assertIn("filed UNKNOWN", html,
-                      "a null filing age was rendered as something else")
-        self.assertIn("date UNKNOWN", html,
-                      "a null stamp was rendered as a date")
-        self.assertNotIn("ago", html, "a null age was rendered as an age")
-        self.assertNotIn("1970", html,
-                         "a null was coerced to zero and dated to the epoch")
-        # THE CONTROL on the same renderer: a row that DOES carry ages says
-        # them, so the absences above are absences rather than a dead branch.
-        self.assertIn("filed 1h ago", out["ok"]["html"],
-                      "MUST-HIT: the renderer printed no age at all")
-
-    def test_a_row_the_SERVER_called_stale_marks_itself_stale(self):
-        """The mark and the chip read ONE field — the server's verdict against
-        its own seven-day line — so the rows the filter selects are exactly
-        the rows that call themselves stale."""
-        stale = self.tqrow("task/1", age_s=30 * 86400,
-                           noted_age_s=30 * 86400, stale=True)
-        fresh = self.tqrow("task/2", age_s=30 * 86400, noted_age_s=3600,
-                           stale=False,
-                           last_note={"ts": self.TQ_NOW - 3600, "by": "seat-c",
-                                      "line": "still on it"})
-        out = self.render(s={"__tqrow": stale}, f={"__tqrow": fresh})
-        self.assertIn("STALE", out["s"]["html"])
-        self.assertIn("tqstalerow", out["s"]["html"])
-        # THE CONTROL: an OLD row that was commented on an hour ago is not
-        # stale, which is the whole difference between "old" and "ignored".
-        self.assertNotIn("STALE", out["f"]["html"])
-        self.assertNotIn("tqstalerow", out["f"]["html"])
-
-    def test_the_chips_slice_the_rows_the_owner_asked_to_slice_by(self):
-        """P0 and P1 are two values of ONE field so they OR each other;
-        `unowned` and `stale` are independent questions so they AND. A single
-        rule would be wrong on one of the two axes."""
-        # EVERY ROW NAMES ITS OWNER EXPLICITLY, INCLUDING THE OWNED ONES. The
-        # first cut left the default (None) on the two rows this arm cared
-        # about for other reasons, so `unowned` correctly selected three rows
-        # and the arm called the filter broken — a fixture inventing the
-        # condition it then measured.
-        rows = [self.tqrow("task/1", priority="P0", owner="seat-a"),
-                self.tqrow("task/2", priority="P1", owner=None,
-                           noted_age_s=30 * 86400, stale=True),
-                self.tqrow("task/3", priority="P2", owner="seat-c",
-                           origin="owner"),
-                self.tqrow("task/4", priority="P2", owner="seat-d",
-                           origin=None)]
-        pick = lambda chips: self.render(
-            q={"__queue": self.tqtotals(), "__rows": rows, "__age": 0,
-               "__chips": chips})["q"]["filtered"]
-        self.assertEqual(["task/1", "task/2", "task/3", "task/4"], pick([]),
-                         "MUST-HIT: no chip selected nothing, so every "
-                         "assertion below would be about an empty list")
-        self.assertEqual(["task/1"], pick(["P0"]))
-        self.assertEqual(["task/1", "task/2"], pick(["P0", "P1"]),
-                         "two ranks ANDed each other and selected nothing")
-        self.assertEqual(["task/3"], pick(["mine"]),
-                         "a row whose provenance nobody witnessed was drawn "
-                         "as the owner's, or his own row was missed")
-        self.assertEqual(["task/2"], pick(["unowned"]))
-        self.assertEqual(["task/2"], pick(["unowned", "stale"]))
-        self.assertEqual([], pick(["P0", "unowned"]),
-                         "a rank chip and a flag chip ORed, so the flag bought "
-                         "nothing")
+# THE CARD RUNTIME HARNESS WENT WITH THE CARDS IT RAN (task/3643, slice 6).
+# `CardRuntimeBase` lifted the task queue's headline and rows (`tqHeadHTML`,
+# `tqCard`) and one land request's markup (`lbReqHTML`) out of the page and
+# ran them under node; the backlog those drew is the Work page's List lens
+# now and the land requests are its cards, read from /api/work. Their arms
+# are tests/test_web_work_page.py: what a card says (CardWordsTest), a number
+# that was not read drawn as "?" or "at least" and never 0
+# (OneCountEverywhereTest), and a to-do row's drawer with its notes
+# (LensesTest, DrawerTest). The queue's server totals stay pinned in
+# tests/test_tasks.py and tests/test_web_tasks.py.
 
 
 class AHungReadIsAnAnswerTest(unittest.TestCase):
     """Finding 3, run rather than reasoned about.
 
     `pollLr` used `fetch` with no deadline, so a hung `/api/lr` never rejected,
-    the UNKNOWN branch never ran, and the card sat on its first paint — an empty
-    `#lrsec` with the nav badge at 0 — for as long as the socket stayed open.
+    the UNKNOWN branch never ran, and the card sat on its first paint — empty,
+    with the nav badge at 0 — for as long as the socket stayed open.
     Blank-and-zero is how "nothing outstanding" looks.
 
     This drives the REAL `j`/`lrShow`/`pollLr` out of assembled web UI against a
     fetch that accepts the request and never answers, and asserts what the
-    element and the badge actually hold. A structural assertion (`the source
+    answer every reader of it is handed (`LR_LAST`) and the badge actually
+    hold. A structural assertion (`the source
     mentions AbortController`) would pass against a timeout wired to nothing."""
 
     HUNG = """
 const fs = require("fs");
-const el = {innerHTML: ""};
-const $ = s => (s === "#lrsec" ? el : null);
-const $$ = () => [];
 const LR_FETCH_MS = 300;            // the real constant, shortened for the probe
-let NAV_LR = "?", NAV_LR_TITLE = "";
 let LR_LAST = null;
 const renderNav = () => {};
-const lrWire = () => {};
-const lrViewPref = () => "kanban";
-const lrCardHTML = d => (d.pending ? "PENDING"
-  : d.rebuilding ? "REBUILDING:" + d.rebuilding
-  : "UNAVAILABLE:" + d.unavailable);
-const lrNav = d => (d.pending ? {n: "?", title: "not read yet"}
-                              : {n: "?", title: "unknown"});
+// what every reader of the answer is handed, in one word
+const said = () => (LR_LAST.pending ? "PENDING"
+  : LR_LAST.rebuilding ? "REBUILDING:" + LR_LAST.rebuilding
+  : "UNAVAILABLE:" + LR_LAST.unavailable);
 // a HUNG endpoint with REAL abort semantics: the request is accepted, never
 // answered, and rejects only if something aborts it.
 let aborted = false;
@@ -4524,7 +2473,7 @@ global.fetch = (url, opt) => new Promise((_res, rej) => {
     });
 });
 lrShow({pending: true});
-const first = {dom: el.innerHTML, nav: NAV_LR};
+const first = {held: said()};
 // TWO POLLS, because one missed deadline is a rebuild and two running is a
 // fault. The old probe polled once and pinned the first miss as UNKNOWN; the
 // property it was really protecting -- a hung read must not stay PENDING --
@@ -4532,11 +2481,11 @@ const first = {dom: el.innerHTML, nav: NAV_LR};
 let busy = null;
 pollLr();
 setTimeout(() => {
-  busy = {dom: el.innerHTML, nav: NAV_LR};
+  busy = {held: said()};
   pollLr();
   setTimeout(() => {
     process.stdout.write(JSON.stringify(
-      {first, busy, aborted, dom: el.innerHTML, nav: NAV_LR}));
+      {first, busy, aborted, held: said()}));
     process.exit(0);
   }, 1500);
 }, 1500);
@@ -4562,10 +2511,11 @@ setTimeout(() => {
     def tearDownClass(cls):
         shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
 
-    def test_the_element_is_never_empty_and_the_badge_is_never_zero(self):
-        """The exact reproduction: first DOM blank, badge 0."""
-        self.assertEqual(self.out["first"]["dom"], "PENDING")
-        self.assertEqual(self.out["first"]["nav"], "?")
+    def test_the_element_is_never_empty(self):
+        """The exact reproduction: first DOM blank. (The badge it also left
+        at 0 is not this poll's any more: it is the Work page's stuck count,
+        tests/test_web_work_page.py.)"""
+        self.assertEqual(self.out["first"]["held"], "PENDING")
 
     def test_a_hung_read_becomes_an_UNKNOWN_instead_of_staying_pending(self):
         """Without a deadline this stays "PENDING" forever, which is the bug:
@@ -4581,16 +2531,15 @@ setTimeout(() => {
         not prove the card ever leaves PENDING."""
         self.assertTrue(self.out["aborted"], "the read carried no deadline")
         # FIRST MISS: out of PENDING, into the busy reading, no alarm.
-        self.assertTrue(self.out["busy"]["dom"].startswith("REBUILDING:"),
-                        self.out["busy"]["dom"])
-        self.assertIn("rebuilding this projection", self.out["busy"]["dom"])
-        self.assertNotIn("did not answer", self.out["busy"]["dom"])
+        self.assertTrue(self.out["busy"]["held"].startswith("REBUILDING:"),
+                        self.out["busy"]["held"])
+        self.assertIn("rebuilding this projection", self.out["busy"]["held"])
+        self.assertNotIn("did not answer", self.out["busy"]["held"])
         # SECOND MISS: the alarm, with the reason verbatim.
-        self.assertTrue(self.out["dom"].startswith("UNAVAILABLE:"),
-                        self.out["dom"])
-        self.assertIn("did not answer", self.out["dom"])
-        self.assertIn("timed out after", self.out["dom"])
-        self.assertEqual(self.out["nav"], "?")
+        self.assertTrue(self.out["held"].startswith("UNAVAILABLE:"),
+                        self.out["held"])
+        self.assertIn("did not answer", self.out["held"])
+        self.assertIn("timed out after", self.out["held"])
 
 
 class TheConsoleRendersItTest(unittest.TestCase):
@@ -4630,9 +2579,12 @@ class TheConsoleRendersItTest(unittest.TestCase):
                       self.ui)
 
     def test_there_is_an_element_a_renderer_and_a_poll(self):
-        self.assertIn('id="lrsec"', self.ui)
-        self.assertIn("function lrCardHTML(", self.ui)
-        self.assertIn('$("#lrsec").innerHTML = lrCardHTML(d, lrViewPref())', self.ui)
+        # THE WALL IS GONE WITH ITS RENDERERS (task/3585), and the land board
+        # after it (task/3643): the land requests are Work page cards off
+        # /api/work, and the poll still feeds every other reader of this
+        # answer — on you (the owner asks and holds) among them
+        self.assertNotIn('id="lrsec"', self.ui)
+        self.assertIn("onYouShow({lr: d})", _extract_fn(self.ui, "lrShow"))
         self.assertIn("setInterval(pollLr, LR_POLL_MS)", self.ui)
         self.assertIn("const LR_POLL_MS = 45000;", self.ui)
 
@@ -4651,54 +2603,21 @@ class TheConsoleRendersItTest(unittest.TestCase):
         poll_ms = int(re.search(r"const LR_POLL_MS = (\d+);", self.ui).group(1))
         self.assertLess(fetch_ms, poll_ms)
 
-    def test_the_wall_is_the_work_pages_kanban_and_only_lives_there(self):
-        """The owner merged the pages: "the 'work landing' section at the top
-        of history (which is really the kanban board)" moved onto Work, under
-        the project rows, and History keeps only the signing ledger. The wall's
-        element lives exactly once: a second mount would give pollLr's by-id
-        render two candidate homes and the owner two walls to disagree with
-        each other."""
-        self.assertEqual(self.ui.count('<section id="lrsec">'), 1)
-        self.assertNotIn("lrfold", self.ui)  # noqa: VACUOUS_ASSERTION — the fold is deliberately DELETED page-wide; the count-of-one above is the positive control on the surviving element
-        i = self.ui.index('<section id="lrsec">')
+    def test_the_land_requests_are_work_page_cards_and_only_live_there(self):  # noqa: VACUOUS_ASSERTION — the Work page's one mount is asserted counted exactly once and placed by index between the project rows and Fleet, the positive control for the absences
+        """The owner merged the pages, then asked why the land requests were
+        still two boards (task/3585), then why the backlog and the pipeline
+        were two pages (task/3643): the wall's mount and the land board are
+        gone, and the Work page's one section is the only place its rows are
+        drawn — after the project rows, before Fleet, none of it on History."""
+        self.assertNotIn('<section id="lrsec">', self.ui)
+        self.assertNotIn("lrfold", self.ui)  # noqa: VACUOUS_ASSERTION — the fold is deliberately DELETED page-wide; the page's single mount below is the positive control
+        self.assertNotIn('id="pipekb"', self.ui)
+        mount = '<section class="wk" id="wkmain" data-wk="main">'
+        self.assertEqual(self.ui.count(mount), 1)
+        i = self.ui.index(mount)
         self.assertGreater(i, self.ui.index('id="brows"'))
         self.assertLess(i, self.ui.index('id="view-quota"'))
-        self.assertLess(self.ui.index('id="tierpipeline"'), i)
-        # ...and none of it is on History any more
         self.assertGreater(self.ui.index('id="view-history"'), i)
-
-    def test_the_home_glance_row_carries_the_jump_to_the_wall(self):
-        """The home tab keeps the one-line pipeline glance; with the detail on
-        another tab, every branch of that row must carry the way there, or the
-        glance is a dead end on a phone. FOUR branches paint the row now: the
-        unread one, the expired one, UNKNOWN, and the board. The expired branch
-        is the one that needs the jump most — it has deliberately withheld its
-        numbers, so the way to the detail is the only thing it has left to
-        offer.
-
-        EACH BRANCH BY NAME, and the count with them. A bare count cannot say
-        WHICH branch lost the link: the same number stays green when one branch
-        drops the jump and another is added."""
-        src = _extract_fn(self.ui, "dashLr")
-        self.assertIn("data-goledger", src)
-        self.assertIn('showView("work")', src)
-        self.assertIn('$("#tierpipeline").scrollIntoView', src)
-        # one chunk per painted row, identified by the text the branch prints
-        chunks = src.split("pipe.innerHTML")[1:]
-        self.assertEqual(len(chunks), 4,
-                         "unread, expired, UNKNOWN and board paint this row")
-        marks = (("unread", '<span class="dmut">not read yet</span>'),
-                 ("expired", '<span class="dunk">STALE — not rendered</span>'),
-                 ("UNKNOWN", '<span class="dunk">UNKNOWN</span>'),
-                 ("board", "in flight</span>"))
-        for name, mark in marks:
-            owning = [c for c in chunks if mark in c]
-            self.assertEqual(len(owning), 1, name + " paints exactly one row")
-            self.assertIn("+ go", owning[0],
-                          name + " branch must append the jump to the wall")
-        self.assertEqual(src.count("+ go"), 4,
-                         "unread, expired, UNKNOWN and board branches each "
-                         "append the jump")
 
     def test_the_poll_is_not_gated_on_the_home_tab_being_open(self):
         """The badge has to reach him while he is reading chat — which is
@@ -4718,77 +2637,14 @@ class TheConsoleRendersItTest(unittest.TestCase):
         self.assertIn("\nsetInterval(pollLr, LR_POLL_MS);\n", self.ui)
 
     def test_the_work_page_gets_the_alarm_badge(self):
-        """The badge points where the wall lives — the Work page — and its
-        title says so; a badge on a page that no longer holds the rows sends
-        him to a page that cannot explain it."""
-        self.assertIn('navBadge("work", NAV_LR', self.ui)
-        self.assertNotIn('navBadge("ledger", NAV_LR', self.ui)  # noqa: VACUOUS_ASSERTION — two badges off one count would disagree someday; the assertIn above is the positive control on the same call
-        self.assertIn("on the Work page", _extract_fn(self.ui, "lrNav"))
+        """The badge points where the cards live — the Work page's own tab,
+        rolled up onto the Work button (task/3445, task/3643): it is the
+        page's stuck count, off the same /api/work body its stage row reads,
+        so a badge never sends him to a page that cannot explain it."""
+        self.assertIn('navBadge("flow", b.n, true, b.title, b.bound);',
+                      _extract_fn(self.ui, "wkPaintAll"))
+        self.assertNotIn('navBadge("pipeline"', self.ui)  # noqa: VACUOUS_ASSERTION — two badges off two counts would disagree; the assertIn above is the positive control on the same call
         self.assertIn('navBadge("chat", NAV_CHAT', self.ui)   # unchanged
-
-    def test_the_view_choice_is_stored_and_kanban_wins_when_unset(self):
-        """lrViewPref: only the stored word "list" picks the list — an absent,
-        ancient or mangled value all mean the DEFAULT, kanban — and the toggle
-        stores only an explicit choice, never the default on its behalf."""
-        src = _extract_fn(self.ui, "lrViewPref")
-        self.assertIn('localStorage.getItem("helm.lrview")', src)
-        self.assertIn('=== "list" ? "list" : "kanban"', src)
-        self.assertIn('localStorage.setItem("helm.lrview", v)',
-                      _extract_fn(self.ui, "lrWire"))
-
-    def test_the_toggle_redraws_from_the_answer_in_hand_not_a_new_fetch(self):
-        """A toggle that costs a poll is a 45s toggle; one that fetches is a
-        second reader of /api/lr with its own failure modes."""
-        src = _extract_fn(self.ui, "lrWire")
-        self.assertIn("lrShow(LR_LAST)", src)
-        self.assertNotIn("fetch(", src)
-        self.assertNotIn('j("/api/lr"', src)
-
-    def test_every_closed_door_opens_the_one_closed_box(self):
-        """The owner asked the kanban to LINK to the closed list, so the board
-        columns grew a chip beside the card footer — and a chip nothing wires
-        is a control that does nothing. The handler selects ALL data-lrclosed
-        elements ($$, not $): with the single-element `$` the column chip was
-        dead markup and only the footer worked."""
-        wire = _extract_fn(self.ui, "lrWire")
-        self.assertIn('$$("#lrsec [data-lrclosed]")', wire)
-        self.assertIn('$("#lrclosed")', wire)
-        self.assertIn("box.hidden = !box.hidden", wire)
-        # …and the board emits a native keyboard-operable control, not a div
-        # whose role claims behavior the DOM does not provide.
-        board = _extract_fn(self.ui, "lrKanbanHTML")
-        self.assertIn('<button type="button" class="lrkfoot" data-lrclosed="1"',
-                      board)
-        self.assertNotIn('class="lrkfoot" data-lrclosed="1" role="button"', board)
-        card = _extract_fn(self.ui, "lrCardHTML")
-        self.assertIn('<button type="button" class="lrfoot" data-lrclosed="1"',
-                      card)
-        self.assertNotIn('<div class="lrfoot" data-lrclosed="1"', card)
-        self.assertIn(".lrkcol .lrkfoot:focus-visible", self.ui)
-        self.assertIn("#lrsec button.lrfoot:focus-visible", self.ui)
-
-    def test_the_board_and_the_list_share_one_row_renderer(self):
-        """The parity guarantee is structural: both views reach lrRowHTML —
-        the SAME function — so they cannot drift apart row-wise. The byte-level
-        probe lives in CardRuntimeTest; this pins the mechanism.
-
-        THE CALL MOVED ONE FRAME DOWN AND THE PROPERTY DID NOT. Lane→chain
-        nesting gave both views one grouping owner, `lrGroupHTML`, and IT is
-        what calls lrRowHTML now — so pinning the literal `lrRowHTML(c,` inside
-        lrKanbanHTML pinned the call SITE rather than the sharing. The claim is
-        asserted where it lives: the board delegates to lrGroupHTML, the list
-        delegates to lrGroupHTML, and lrGroupHTML is the only one holding the
-        row renderer."""
-        board = _extract_fn(self.ui, "lrKanbanHTML")
-        card = _extract_fn(self.ui, "lrCardHTML")
-        group = _extract_fn(self.ui, "lrGroupHTML")
-        self.assertIn("lrGroupHTML(g, unmeas)", board)
-        self.assertIn("lrGroupHTML(g, unmeas)", card)
-        self.assertIn("lrRowHTML(", group)
-        # NEITHER VIEW KEEPS A SECOND DOOR TO THE ROW RENDERER — a private copy
-        # in one of them is exactly how the two would describe a row
-        # differently, which is the whole point of having one owner.
-        self.assertNotIn("lrRowHTML(", board)
 
     def test_the_endpoint_is_documented_in_WEB_md(self):
         doc = os.path.join(ROOT, "docs", "WEB.md")
@@ -5849,12 +3705,14 @@ class TheDashboardIsWiredTest(unittest.TestCase):
         self.ui = web_ui_loader.read_text()
 
     def test_the_band_exists_and_holds_no_second_pipeline_copy(self):
-        self.assertIn('<section id="dash">', self.ui)
-        # the wall is the kanban up the Work page; the band is its glance and
-        # carries no collapsed copy — that copy was the duplication the owner
-        # objected to
-        band = self.ui.split('<section id="dash">', 1)[1].split("</section>", 1)[0]
-        self.assertIn('id="dpipe"', band)     # positive control: the slice IS the band
+        # THE BAND IS HOME'S TILES NOW (task/3445 L3): the pipeline is the
+        # Work page's; its work tile is its glance and carries no copy of it,
+        # and the band's pipeline row is the stage row atop that page
+        # (task/3643)
+        self.assertIn('<div class="hgrid">', self.ui)
+        band = self.ui.split('<div class="hgrid">', 1)[1].split('<details class="grp" id="homenotes">', 1)[0]
+        self.assertIn('id="hwork"', band)     # positive control: the slice IS the band
+        self.assertNotIn('id="pipesum"', self.ui)
         self.assertNotIn('id="lrsec"', band)  # noqa: VACUOUS_ASSERTION — the wall must be ABSENT from the band; its one mount is pinned by test_the_wall_is_the_work_pages_kanban_and_only_lives_there
         self.assertNotIn("lrfold", self.ui)
 
@@ -5862,97 +3720,34 @@ class TheDashboardIsWiredTest(unittest.TestCase):
         """ZERO vs UNREAD is the band's whole law: before any poll answers,
         every cell must carry words, not an empty element a reader skims as
         a quiet zero."""
-        band = self.ui.split('<section id="dash">', 1)[1].split("</section>", 1)[0]
+        band = self.ui.split('<div class="hgrid">', 1)[1].split('<details class="grp" id="homenotes">', 1)[0]
         self.assertGreaterEqual(band.count("not read yet"), 6)
-
-    def test_owed_by_is_the_top_row_and_landed_follows_the_pipeline(self):  # noqa: VACUOUS_ASSERTION — all four unconditional index() calls prove each id exists before comparing their order
-        """The owed-by row replaced the in-flight row and went to the TOP of the
-        band, which is the owner's own placement ("an owed-by list at the top of
-        Board"). The in-flight id is asserted ABSENT in the same arm, because a
-        band that still carries the element while no renderer writes it would
-        read to the next reader as a cell that simply never loads."""
-        band = self.ui.split('<section id="dash">', 1)[1].split("</section>", 1)[0]
-        self.assertNotIn('id="dinflight"', band)
-        self.assertLess(band.index('id="downedby"'), band.index('id="dpipe"'))
-        self.assertLess(band.index('id="dpipe"'), band.index('id="dlands"'))
-        self.assertLess(band.index('id="dlands"'), band.index('id="downer"'))
-
-    def test_the_lr_renderer_feeds_the_band(self):
-        self.assertIn("function dashLr(", self.ui)
-        self.assertIn("dashLr(d)", _extract_fn(self.ui, "lrShow"))
-        dash = _extract_fn(self.ui, "dashLr")
-        self.assertIn("dashOwedBy(d || {}, pending, board)", dash)
-        # the in-flight renderers are gone from the whole page, not merely
-        # unreferenced here: a callerless renderer reads as live coverage
-        for gone in ("lrInflightHTML", "lrInflightRowHTML", "lrInflightWire",
-                     "lrInflightMoving"):
-            self.assertNotIn("function " + gone + "(", self.ui)
-        # the fold (and its summary line) is gone with the home copy
-        self.assertNotIn("lrfoldsum", self.ui)  # noqa: VACUOUS_ASSERTION — intentional page-wide deletion; the dashLr(d) assertIn above is the positive control on the surviving renderer
 
     def test_the_presence_poll_feeds_the_fleet_row(self):
         self.assertIn("function dashFleet(", self.ui)
         self.assertIn("dashFleet(list)", _extract_fn(self.ui, "chatPresence"))
 
-    def test_the_dregg_strip_is_on_the_board_headline_not_a_second_copy(self):
+    def test_the_signing_pulse_is_the_history_pages_and_home_says_one_word(self):
         """The owner explicitly dislikes duplicated UI: ONE signing pulse.
-        It lived in the band's record row until the burn board (task/2975)
-        put it beside the headline; exactly one element carries the id, it is
-        inside the board's headline, and the band no longer carries it."""
-        self.assertEqual(self.ui.count('id="dreggstrip"'), 1)
-        head = self.ui.split('<div id="bhead">', 1)[1].split("</div>\n    <details", 1)[0]
-        self.assertIn('id="dreggstrip"', head)
-        band = self.ui.split('<section id="dash">', 1)[1].split("</section>", 1)[0]
-        self.assertIn('id="dchain"', band)       # the record row is still there
-        self.assertNotIn('id="dreggstrip"', band)
-
-    def test_UNKNOWN_branches_exist_for_every_lr_fed_cell(self):
-        """Each cell renders a named UNKNOWN/NOT SENT branch — the degrade
-        path the hard rules demand — rather than throwing or going blank."""
-        for fn in ("dashLands", "dashChain", "dashOwner", "dashOwedBy",
-                   "dashAnswers"):
-            src = _extract_fn(self.ui, fn)
-            self.assertTrue("UNKNOWN" in src or "NOT SENT" in src, fn)
-        self.assertIn("UNKNOWN", _extract_fn(self.ui, "dashLr"))
-
-    def test_a_landed_row_whose_proof_mode_is_absent_says_so_in_words(self):
-        """A `landed` close whose event recorded no proof mode is a real state
-        of the record, and it renders as words. The FALSE branch is gone with
-        the trunk walk: a `landed` close IS the ledger asserting the land, so a
-        card that could render "never reached" would be contradicting the row it
-        is drawing. Only the TRUE branch may claim an answer."""
-        src = _extract_fn(self.ui, "dashLandRow")
-        self.assertIn("? proof not recorded", src)
-        self.assertIn("on_trunk === true", src)
-        self.assertNotIn("on_trunk === false", src)
-
-    def test_every_band_card_names_its_source_read_and_that_reads_age(self):
-        """The home-card law, asserted at the call sites rather than in prose:
-        the two cards this ruling added or rebuilt both go through `cardSource`,
-        and both ask `cardStale` before rendering a value."""
-        for fn in ("dashLands", "dashOwedBy"):
-            src = _extract_fn(self.ui, fn)
-            self.assertIn("cardSource(", src, fn)
-            self.assertIn("cardStale(", src, fn)
-        src = _extract_fn(self.ui, "cardSource")
-        self.assertIn("read ", src)
-        self.assertIn("lrAgo(", src)
+        It lived in the band's record row, then beside the board's headline
+        (task/2975), then on Home's signing-record tile. Its row text (the
+        last turn, its author, its age) is the history page's own pulse, so
+        the Home tile says only whether signing is live, off the same
+        /api/ledger read, and the chain's check sits atop the local record."""
+        self.assertNotIn('id="dreggstrip"', self.ui)
+        tile = self.ui.split('<section class="htile" data-go="#history">', 1)[1].split("</section>", 1)[0]
+        self.assertIn('id="hrecord"', tile)
+        self.assertNotIn('id="dchain"', tile)
+        hist = self.ui.split('id="view-history"', 1)[1]
+        self.assertIn('id="cavepulse"', hist)
+        self.assertIn('id="dchain"', hist.split('id="tierlocal"', 1)[1])
 
 
-# THE IN-FLIGHT CLICK-UPGRADER CLASS IS DELETED WITH ITS SUBJECT (owner ruling,
-# task/2355). It drove `lrInflightWire` against a stub root and asserted the
-# native anchor plus the one JS upgrade. That renderer no longer exists — the
-# per-loop row came off the band — and the roll-up that replaced it is text, not
-# a list of anchors, so there is nothing left to upgrade. The band harness below
-# now drives the REAL `dashOwedBy` against a real cell rather than a stub, which
-# is strictly more than this class measured.
-
-
-class DashPipelineBandRuntimeTest(unittest.TestCase):
-    """The home band's pipeline row, run under node — the owner-visible surface
-    that still called every open ledger row in flight after the ledger card had
-    moved discharged rows to closed. The headline and bar partition LIVE work
-    only; honored rows remain visible in the adjacent closed accounting."""
+class DashBandCardsRuntimeTest(unittest.TestCase):
+    """The band's cards that are left, run under node: the chain cell off the
+    pipeline read, and the two cards the chat poll feeds. Its pipeline rows
+    (in flight, owed by, landed) went with their renderers when the one land
+    board took their numbers (task/3585); their arms went with them."""
 
     @classmethod
     def setUpClass(cls):
@@ -5968,7 +3763,6 @@ class DashPipelineBandRuntimeTest(unittest.TestCase):
             # the band's DOM + sibling cells, stubbed to inert objects so the
             # REAL dashLr runs unmodified and its innerHTML is the assertion
             f.write("""const found = {};
-let shown = null;
 const element = sel => {
   let html = "", hidden = null;
   return {
@@ -5980,7 +3774,6 @@ const element = sel => {
   };
 };
 const $ = sel => found[sel] || (found[sel] = element(sel));
-const showView = view => { shown = view; };
 let DASH_FLEET_TS = 0, DASH_ANSWERS_TS = 0;
 let DASH_CHAT_FAILED = 0, DASH_CHAT_CADENCE_S = 2;
 const chatShort = s => String(s || "");
@@ -5991,47 +3784,20 @@ let NOW = 1.6e12;
 Date.now = () => NOW;
 """ + line[0] + "\n\n"
                     + "\n\n".join(_extract_fn(src, n)
-                                  for n in ("lrDwell", "lrDur", "lrAgo",
-                                            "lrHonored",
-                                            "lrMarks", "lrIsBoard", "lrBall",
-                                            # the glance nests related rows
-                                            # too, over the SAME lane→chain
-                                            # owner the ledger card uses
-                                            "lrChainRoot", "lrLaneName",
-                                            "lrChainHead", "lrSharedTip",
-                                            "lrLaneGroups",
-                                            # the owed-by roll-up that replaced
-                                            # the in-flight row is the REAL
-                                            # function here, not a stub, and it
-                                            # shares the staleness helpers with
-                                            # every other card on the band
+                                  for n in ("lrDur", "lrAgo",
+                                            # EVERY CARD ON THE BAND IS THE
+                                            # REAL ONE: a stub cannot hold
+                                            # the band's own law, that a card
+                                            # past its read's freshness bound
+                                            # renders none of its last values
                                             "cardBoundS", "cardStale",
-                                            "cardSource", "dashOwedBy",
-                                            # EVERY CARD ON THE BAND IS THE REAL
-                                            # ONE. Three of them were stubs here,
-                                            # and a stub cannot hold the band's
-                                            # own law: a card past its read's
-                                            # freshness bound renders none of its
-                                            # last values. The law is per-card, so
-                                            # the arm has to be per-card too.
-                                            "dashChain", "dashOwner",
-                                            "dashLandRow", "dashLandGroups",
-                                            "dashLandPrimary",
-                                            "dashLandVerdictKey",
-                                            "dashLandGroup", "dashLands",
+                                            # the pipeline reading's own
+                                            # bound (task/3632)
+                                            "lrStale",
+                                            "cardSource", "dashChain",
                                             "dashChatAgeS", "dashChatExpired",
                                             "dashAnswersClock", "dashFleetClock",
                                             "dashFleet", "dashAnswers",
-                                            "lrNonbillableLabels",
-                                            # the band's BUILDING term is the
-                                            # owner's 13:26 reading and it is
-                                            # the SAME reader the pipeline card
-                                            # uses, so it is lifted rather than
-                                            # stubbed: a stub here would let the
-                                            # two surfaces disagree about one
-                                            # payload, which is the defect
-                                            # lrHonored exists to prevent.
-                                            "lrBuilding", "lrBuildingTerm",
                                             "dashLr"))
                     + """
 
@@ -6051,11 +3817,9 @@ else dashLr(input.board);
 // their absence is a fact about that run rather than a harness failure.
 const cell = sel => (found[sel] ? found[sel].innerHTML : "");
 process.stdout.write(JSON.stringify({
-  pipe: cell("#dpipe"), owed: cell("#downedby"), chain: cell("#dchain"),
-  owner: cell("#downer"), lands: cell("#dlands"), fleet: cell("#dfleet"),
+  chain: cell("#dchain"), fleet: cell("#dfleet"),
   answers: cell("#danswers"),
-  answers_hidden: found["#danswers"] ? found["#danswers"].hidden : null,
-  shown
+  answers_hidden: found["#danswers"] ? found["#danswers"].hidden : null
 }));
 """)
         chk = subprocess.run([cls.node, "--check", cls.path],
@@ -6087,269 +3851,61 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(p.returncode, 0, p.stderr)
         return json.loads(p.stdout)
 
-    def band(self, loops, **kw):
-        return self.run_band(loops, **kw)["pipe"]
-
-    @staticmethod
-    def row(**kw):
-        base = {"id": "0123456789ab", "contrary": False,
-                "contrary_discharge": None, "stalled": False}
-        base.update(kw)
-        # DERIVED, never hand-typed. `honored` rides the wire now, and a
-        # fixture that set it by hand could describe a payload the server
-        # never sends — the exact drift that having two implementations of
-        # this predicate created in the first place. A test may still override
-        # it explicitly to exercise an old server (absent field, fail-closed).
-        base.setdefault("honored", landreq.honored_display(base))
-        return base
-
-    def test_every_painted_pipeline_row_carries_the_jump_to_the_wall(self):
-        """The pipeline detail is the kanban up the page, so every row this band
-        can paint has to carry the way there — RUN, one branch at a time, each
-        selected by the text that identifies it. The structural arm counts the
-        appends in the source; this one proves the link reaches the owner's
-        markup on each branch, including the expired branch, whose numbers are
-        withheld by design and whose only remaining offer is the jump."""
-        # UNCONDITIONAL POSITIVE CONTROL FIRST, same observable: the board row —
-        # the branch that has always carried the link — renders it, so a missing
-        # link below is a fact about that branch rather than about a harness
-        # whose band paints no link at all.
-        board = self.band([self.row()])
-        self.assertIn("data-goledger", board)
-        self.assertIn("the kanban →", board)
-        rows = (("not read yet", self.run_input({"board": None})["pipe"]),
-                ("STALE — not rendered", self.band([self.row()], read_age_s=600)),
-                ("UNKNOWN", self.band([], unavailable="LR holder truth")),
-                ("in flight", board))
-        for mark, html in rows:
-            self.assertIn(mark, html)          # the branch under test really ran
-            self.assertIn("data-goledger", html, mark + " row lost the jump")
-            self.assertIn("the kanban →", html, mark + " row lost the jump's words")
-
-    def test_the_source_line_prints_the_projections_age_beside_the_reading(self):
-        """A body confirmed unmoved twelve seconds ago over a projection built
-        four minutes ago RENDERS — the reading is what the bound judges — and
-        the source line says both numbers, so the owner is never shown a
-        four-minute-old board under a twelve-second stamp."""
-        html = self.band([self.row()], read_age_s=12, projected_age_s=250)
-        self.assertNotIn("STALE", html)
-        self.assertIn("read 12s ago", html)
-        self.assertIn("projected 4m ago", html)
-        # CONTROLS on the same line: agreeing ages print once, and a body
-        # without the field (an older server) prints the reading alone.
-        alike = self.band([self.row()], read_age_s=12, projected_age_s=14)
-        self.assertIn("read 12s ago", alike)
-        self.assertNotIn("projected", alike)
-        older = self.band([self.row()], read_age_s=12)
-        self.assertIn("read 12s ago", older)
-        self.assertNotIn("projected", older)
-
-    # ── the owed-by roll-up that replaced the in-flight row (task/2355) ────
-    # Every property the six deleted `lrInflightHTML` arms held is asserted
-    # here, against the REAL dashOwedBy driven by the REAL dashLr.
-    def test_owed_by_counts_the_holders_the_server_named(self):
-        """One bucket per holder, counted, names taken from the SERVER pair.
-        The browser must not re-derive a holder from state/owed_by — that is
-        what made confirmation rows disagree with the CLI (lrBall's own
-        comment), and this arm is what keeps the roll-up on the same answer."""
-        out = self.run_band([
-            self.row(id="a" * 12, holder_role="reviewer", holder_seat="seat-a"),
-            self.row(id="b" * 12, holder_role="reviewer", holder_seat="seat-a"),
-            self.row(id="c" * 12, holder_role="builder", holder_seat="seat-b")])
-        owed = out["owed"]
-        self.assertIn('<span class="dnum">2</span> seat-a', owed)
-        self.assertIn('<span class="dnum">1</span> seat-b', owed)
-        # most-owed first: the count, not the alphabet, orders the row
-        self.assertLess(owed.index("seat-a"), owed.index("seat-b"))
-        self.assertIn("helm lr list · read ", owed)
-
-    def test_owed_by_drops_honored_rows_the_ledger_board_already_drops(self):
-        """The property the deleted in-flight arm held, on the new renderer: a
-        verdict honored through succession is CLOSED, so nobody owes a move on
-        it and it may not be counted against a holder."""
-        out = self.run_band([
-            self.row(id="a" * 12, contrary=True, contrary_discharge="a",
-                     holder_role="integrator", holder_seat="seat-c"),
-            self.row(id="b" * 12, holder_role="reviewer", holder_seat="seat-a")])
-        owed = out["owed"]
-        self.assertIn('<span class="dnum">1</span> seat-a', owed)
-        self.assertNotIn("seat-c", owed)
-
-    def test_owed_by_separates_unread_UNKNOWN_and_a_measured_zero(self):
-        """Three different answers, three different sentences — the same
-        distinction the deleted arm made. A holder the roster could not resolve
-        is UNKNOWN and says so rather than vanishing from the counts."""
-        pending = self.run_band([], pending=True)["owed"]
-        self.assertIn("not read yet", pending)
-        down = self.run_band([], unavailable="PermissionError: denied")["owed"]
-        self.assertIn("UNKNOWN", down)
-        self.assertIn("denied", down)
-        zero = self.run_band([])["owed"]
-        self.assertIn("nobody owes a move", zero)
-        self.assertIn("0 live loop", zero)
-        unk = self.run_band([self.row(holder_role="unknown")])["owed"]
-        self.assertIn("holder UNKNOWN", unk)
-
-    def test_owed_by_never_puts_a_holder_ROLE_SENTENCE_on_the_chip(self):  # noqa: VACUOUS_ASSERTION — four unconditional positive controls on the same rendered string follow the absences: the UNKNOWN count, the nobody count, and both holder chips are asserted present
-        """MEASURED ON THE LIVE BOARD, not imagined: 11 of 29 live loops carried
-        the holder role "unknown (declared verdict held)" — a REVIEWED row whose
-        polarity nobody declared — and they sorted FIRST, so the top of Board led
-        with that sentence as if it named a person. The owner reads this row for
-        names and counts; a role sentence there is the agent jargon he says he
-        skips. The bucket is decided by the role's first word, and a known role
-        with no seat still answers plainly with the role WORD."""
-        out = self.run_band([
-            self.row(id="a" * 12, holder_role="unknown (declared verdict held)"),
-            self.row(id="b" * 12, holder_role="unknown (declared verdict held)"),
-            self.row(id="c" * 12, holder_role="nobody (undeclared)"),
-            self.row(id="d" * 12, holder_role="integrator"),
-            self.row(id="e" * 12, holder_role="reviewer", holder_seat="seat-a")])
-        owed = out["owed"]
-        # THE VISIBLE TEXT, with the hover titles stripped: a title is the
-        # agent-facing detail and is allowed to carry the role sentence, while
-        # the chip he reads at a glance is not.
-        visible = re.sub(r'title="[^"]*"', "", owed)
-        self.assertNotIn("declared verdict held", owed,
-                         "the role sentence reached the row at all")
-        self.assertNotIn("undeclared", owed)
-        self.assertNotIn("seat not recorded", visible)
-        self.assertIn("2 holder UNKNOWN", owed)
-        self.assertIn("1 owed by nobody", owed)
-        self.assertIn('<span class="dnum">1</span> integrator', owed)
-        self.assertIn('<span class="dnum">1</span> seat-a', owed)
-
-    def test_owed_by_renders_nothing_when_its_own_read_went_stale(self):
-        """The home-card rule, on the row: past four poll intervals the row
-        prints the refusal and NOT its last values. A stale name-and-count is
-        worse than an empty row, because the empty row sends him to the command
-        line and the stale one does not."""
-        fresh = self.run_band([
-            self.row(holder_role="reviewer", holder_seat="seat-a")])["owed"]
-        self.assertIn("seat-a", fresh)
-        stale = self.run_band([
-            self.row(holder_role="reviewer", holder_seat="seat-a")],
-            read_age_s=600)["owed"]
-        self.assertIn("STALE", stale)
-        self.assertNotIn("seat-a", stale)
-
-    def test_an_honored_row_joins_closed_not_the_live_headline_or_bar(self):
-        pipe = self.band([
-            self.row(id="a" * 12, contrary=True, contrary_discharge="a",
-                     stalled=True),   # its successor landed: closed, not live
-            self.row(id="b" * 12, contrary=True),
-            self.row(id="c" * 12)])
-        self.assertIn('<span class="dnum">2</span> in flight', pipe)
-        self.assertIn('<span class="dbad"><span class="dnum">1</span> contrary', pipe)
-        self.assertIn('<span class="dnum">0</span> stalled', pipe)
-        self.assertIn('class="dctr"', pipe)
-        self.assertNotIn('class="dhon"', pipe)
-        self.assertNotIn('</span> honored</span>', pipe)
-        self.assertIn("0 closed 24h · 1 honored closed", pipe)
-
-    def test_honored_only_reads_zero_in_flight_and_one_honored_closed(self):
-        pipe = self.band([self.row(contrary=True, contrary_discharge="b")])
-        self.assertIn('<span class="dnum">0</span> in flight', pipe)
-        self.assertIn('<span class="dmut"><span class="dnum">0</span> contrary', pipe)
-        self.assertIn("0 closed 24h · 1 honored closed", pipe)
-        self.assertNotIn('class="dctr"', pipe)
-        self.assertNotIn('class="dhon"', pipe)
-
-    def test_a_confirmation_row_is_closed_while_the_genuine_contrary_stays_live(self):
-        """A "c"-stamped confirmation round leaves the live partition through
-        lrHonored, while the genuine contrary beside it keeps the alarm segment
-        and headline — the must-stay control."""
-        pipe = self.band([
-            self.row(id="a" * 12, contrary=True, contrary_discharge="c",
-                     stalled=True),   # landed-by-design: closed, not live
-            self.row(id="b" * 12, contrary=True)])
-        self.assertIn('<span class="dnum">1</span> in flight', pipe)
-        self.assertIn('<span class="dbad"><span class="dnum">1</span> contrary', pipe)
-        self.assertIn('<span class="dnum">0</span> stalled', pipe)
-        self.assertIn("0 closed 24h · 1 honored closed", pipe)
-        self.assertIn('class="dctr"', pipe)
-        self.assertNotIn('class="dhon"', pipe)
-
-    def test_a_discharged_unmeasurable_row_is_not_in_the_live_bar(self):
-        pipe = self.band(
-            [self.row(id="a" * 12, contrary=True, contrary_discharge="a")],
-            unmeasurable=[{"id": "a" * 12,
-                           "reason": "verdict polarity undeclared"}])
-        self.assertIn('<span class="dnum">0</span> in flight', pipe)
-        self.assertIn('<span class="dnum">0</span> nonbillable', pipe)
-        self.assertNotIn('class="dunm"', pipe)
-        self.assertIn("0 closed 24h · 1 honored closed", pipe)
-
-    def test_unverified_and_unstamped_both_stay_in_the_alarm(self):
-        pipe = self.band([
-            self.row(id="a" * 12, contrary=True,
-                     contrary_discharge="unverified"),
-            self.row(id="b" * 12, contrary=True)])
-        self.assertIn('<span class="dbad"><span class="dnum">2</span> contrary', pipe)
-        # no honored CHIP and no honored bar segment (the partition title
-        # naming the honored class is static text and always present)
-        self.assertNotIn("</span> honored", pipe)
-        self.assertNotIn('class="dhon"', pipe)
-
-    def test_a_board_without_honored_rows_adds_no_closed_honored_term(self):
-        pipe = self.band([self.row(contrary=True)])
-        self.assertNotIn("honored closed", pipe)
-        self.assertNotIn('class="dhon"', pipe)
-        self.assertIn('<span class="dbad"><span class="dnum">1</span> contrary', pipe)
-
-    # ── the home-card law, on EVERY card rather than on two of them ────────
+    # ── the home-card law, on the pipeline-fed card ────────────────────────
     def a_card_holding_values(self, age_s):
-        """One band run over a populated read of a given age. The board carries a
-        live loop, a landed row, an owner ask and a chain reading, so EVERY card
-        on the band has something it could print."""
+        """One band run over a populated read of a given age, carrying a chain
+        reading the chain cell could print."""
         return self.run_band(
-            [self.row(id="a" * 12, holder_role="reviewer", holder_seat="seat-a")],
-            read_age_s=age_s, closed_total=7,
-            recent_lands={"rows": [{"lane": "lane/x", "task": "2355",
-                                    "reviewed_tip": "a" * 40, "gate": "g" * 16,
-                                    "trunk_sha": "t" * 40, "on_trunk": True,
-                                    "how": "ancestor", "ts": "2026-09-12T00:00:00Z",
-                                    "age_s": 60, "ts_unreadable": False,
-                                    "chain_root": None}],
-                           "total": 1, "rows_truncated": False,
-                           "source": "helm lr list", "unavailable": None},
-            native_chain={"count": 41, "verified": True, "head_index": 40},
-            scheduler={"owner_asks": [{"age_known": True, "age_s": 900,
-                                       "plain_title": "pick a node"}],
-                       "owner_ask_count": 1, "owner_asks_dropped": 0,
-                       "owner_holds": []})
+            [], read_age_s=age_s,
+            native_chain={"count": 41, "verified": True, "head_index": 40})
 
     def test_every_card_on_the_band_renders_its_values_at_a_fresh_read(self):
         """THE POSITIVE CONTROL FOR THE ARM BELOW, and it is the arm that says
         the refusal is a refusal rather than a card that never worked. A read
-        three seconds old renders every value on every card."""
+        three seconds old renders its values."""
         out = self.a_card_holding_values(3)
-        self.assertIn("7 closed 24h", out["pipe"])
-        self.assertIn("seat-a", out["owed"])
         self.assertIn("41", out["chain"])
-        self.assertIn("pick a node", out["owner"])
-        self.assertIn("lane/x", out["lands"])
-        for cell in ("pipe", "owed", "chain", "owner", "lands"):
-            self.assertIn("· read ", out[cell], cell)
+        self.assertIn("· read ", out["chain"])
 
-    def test_no_card_on_the_band_renders_a_value_past_its_read(self):  # noqa: VACUOUS_ASSERTION — the arm above is the unconditional positive control on the same five observables at age 3, and each absence below is paired with a present STALE sentence on the same cell
+    def test_no_card_on_the_band_renders_a_value_past_its_read(self):  # noqa: VACUOUS_ASSERTION — the arm above is the unconditional positive control on the same observable at age 3, and the absence below is paired with a present STALE sentence on the same cell
         """THE OWNER'S RULE, ON ALL OF THEM: "if it is there it does not go
         stale". It was implemented on two cards, so at a read past the bound the
-        totals still printed a count, the owner strip still named an ask and the
-        chain still claimed a verified record count — the three most actionable
-        values on the page, standing on a read that had stopped arriving. A
-        number he acts on is exactly the number that may not outlive its read."""
+        totals still printed a count and the chain still claimed a verified
+        record count — the most actionable values on the page, standing on a
+        read that had stopped arriving. A number he acts on is exactly the
+        number that may not outlive its read."""
         out = self.a_card_holding_values(181)
-        for cell in ("pipe", "owed", "chain", "owner", "lands"):
-            self.assertIn("STALE", out[cell], cell)
-            self.assertIn("helm ", out[cell], cell)      # the read to run instead
-        # AND THE VALUES ARE GONE, not dimmed: the counts, the ask, the record
-        # count and the lane are absent from the cells that held them.
-        self.assertNotIn("7 closed 24h", out["pipe"])
-        self.assertNotIn("in flight", out["pipe"])
-        self.assertNotIn("seat-a", out["owed"])
+        self.assertIn("STALE", out["chain"])
+        self.assertIn("comes back with the next fresh read", out["chain"])
+        # AND THE VALUE IS GONE, not dimmed
         self.assertNotIn("41", out["chain"])
-        self.assertNotIn("pick a node", out["owner"])
-        self.assertNotIn("lane/x", out["lands"])
+
+    def test_the_chain_card_tells_the_owner_no_helm_verb(self):  # noqa: VACUOUS_ASSERTION — each branch's absence of a verb is paired with an unconditional positive control on the same markup (the count, FAILS, STALE, the dchain cell), and the plain wording is asserted present
+        """RULE 2 ON HISTORY › THIS MACHINE ONLY › CHAIN (console walk 3, #6).
+        The card read "chain ✓ 96 records verified · head #95helm premise-check
+        --chain · read 0s ago · check one record: `helm premise-check <id>`":
+        two commands for a reader who does not use a terminal, and the first
+        glued to the head index with no space. Each branch the card draws is
+        read here, with the row's static half from the page itself."""
+        chain = {"count": 96, "verified": True, "head_index": 95}
+        verified = self.run_band([], native_chain=chain)["chain"]
+        failed = self.run_band([], native_chain=dict(
+            chain, verified=False, detail="record 12 re-hashes to a new digest"))["chain"]
+        stale = self.run_band([], read_age_s=181, native_chain=chain)["chain"]
+        row = web_ui_loader.read_text().split('id="chainsum"', 1)[1] \
+            .split("</section>", 1)[0]
+        # POSITIVE CONTROLS on the same renders: each branch is the one named
+        self.assertIn("96", verified)
+        self.assertIn("FAILS verification", failed)
+        self.assertIn("STALE", stale)
+        self.assertIn('id="dchain"', row)
+        for name, markup in (("verified", verified), ("failed", failed),
+                             ("stale", stale), ("row", row)):
+            self.assertEqual(owner_verbs(markup), [], "%s: %s" % (name, markup))
+        # SAID PLAINLY, and the read's age is its own clause after the index
+        text = re.sub(r"<[^>]*>", "", verified)
+        self.assertIn("chain verified: 96 records", text)
+        self.assertIn("head #95 · ", text)
 
     # ── the two cards the CHAT poll feeds expire on the CHAT clock ─────────
     PRESENCE = [{"seat": "seat-a", "presence": "fresh", "last_seen": 9}]
@@ -6411,6 +3967,37 @@ process.stdout.write(JSON.stringify({
         self.assertIn("has not answered once", out["answers"])
         self.assertIn("NOT READ", out["fleet"])
 
+    def test_the_home_answers_card_and_the_seats_row_tell_the_owner_no_helm_verb(self):  # noqa: VACUOUS_ASSERTION — each render's absence of a verb follows an unconditional positive control on the same markup, asserting the branch named was drawn
+        """RULE 2 ON THE TWO CHAT-FED ROWS (console walk 3, open points). Home's
+        answers card named `helm chat read` as its source, told him to "read
+        `helm chat read` meanwhile" when the server sent no reading, and to
+        "run `helm chat read`" when the read stopped; the Seats page's on-now
+        row named `helm fleet` as its source and told him to run it when
+        stale. Every branch each row draws is read here."""
+        fresh = self.run_input({"presence": self.PRESENCE, "chat": self.ANSWER,
+                                "board": {"pending": True}})
+        unsent = self.run_input({"chat": {"owner_mentions": 1},
+                                 "board": {"pending": True}})
+        stale = self.run_input({"presence": self.PRESENCE, "chat": self.ANSWER,
+                                "advance_s": 20, "clock_only": True,
+                                "board": {"pending": True}})
+        never = self.run_input({"chat_failed": True, "clock_only": True,
+                                "board": {"pending": True}})
+        cells = {"answers": fresh["answers"], "answers_unsent": unsent["answers"],
+                 "answers_stale": stale["answers"],
+                 "answers_never": never["answers"], "fleet": fresh["fleet"],
+                 "fleet_stale": stale["fleet"], "fleet_never": never["fleet"]}
+        # POSITIVE CONTROLS on the same renders: each is the branch named
+        self.assertIn("ready", cells["answers"])
+        self.assertIn("NOT SENT", cells["answers_unsent"])
+        self.assertIn("STALE", cells["answers_stale"])
+        self.assertIn("NOT READ", cells["answers_never"])
+        self.assertIn("seat-a", cells["fleet"])
+        self.assertIn("STALE", cells["fleet_stale"])
+        self.assertIn("NOT READ", cells["fleet_never"])
+        for name, markup in cells.items():
+            self.assertEqual(owner_verbs(markup), [], "%s: %s" % (name, markup))
+
     def test_a_page_that_has_simply_not_polled_yet_is_not_a_failure(self):  # noqa: VACUOUS_ASSERTION — the arm above is the unconditional positive control on the same cell and the same code path: with the failure stamped, that cell carries NOT READ; without it, nothing is written at all
         """The boot state is not a refusal. Between the first paint and the first
         poll there is no answer and no failure, and a card claiming UNKNOWN there
@@ -6418,244 +4005,6 @@ process.stdout.write(JSON.stringify({
         out = self.run_input({"clock_only": True, "board": {"pending": True}})
         self.assertEqual(out["answers"], "")
         self.assertNotIn("NOT READ", out["fleet"])
-
-
-class DashLandGroupingRuntimeTest(unittest.TestCase):
-    """The LANDED card folds a chain's rounds into ONE land — run under node,
-    so the assertion is about what the OWNER SEES, not about a python mirror.
-
-    THESE ARMS EXIST BECAUSE THEIR ABSENCE WAS A BLOCKING FINDING. The first
-    cut of the grouping shipped with eleven assertions and a mutation run that
-    lived in /tmp: a story about a run that happened, unable to stop the bug
-    coming back by so much as one line. It was refused on exactly that, and
-    separately proved the false collapse these pin against — lane labels are
-    reused across 2-10 distinct chain roots in the live ledger, so a
-    (lane, trunk_sha) key merged two unrelated lands and labelled one of them
-    "1 earlier round". Grouping now demands chain_root and FAILS OPEN without
-    it, and the arm that matters most is the one asserting it does not merge."""
-
-    # `dashLandWitness` is GONE from this list because it is gone from the page
-    # (task/2355). It rendered the land-receipt badge — signed / unsigned /
-    # signed ? — which was a second read beside the card's source, and the card
-    # now has ONE source. The row's own close proof took its place.
-    EXTRACT = ["dashLandRow", "dashLandVerdictKey",
-               "dashLandPrimary", "dashLandGroups", "dashLandGroup"]
-
-    @classmethod
-    def setUpClass(cls):
-        cls.node = shutil.which("node")
-        if not cls.node:
-            raise unittest.SkipTest("node not available")
-        src = web_ui_loader.read_text()
-        line = [ln for ln in src.splitlines() if ln.startswith("const esc = ")]
-        assert len(line) == 1, "assembled web UI's esc definition moved"
-        cls.tmp = tempfile.mkdtemp(prefix="helm-dashland-")
-        cls.path = os.path.join(cls.tmp, "run.js")
-        with open(cls.path, "w", encoding="utf-8") as f:
-            f.write("const lrAgo = s => String(s) + \"s\";\n" + line[0] + "\n\n"
-                    + "\n\n".join(_extract_fn(src, n) for n in cls.EXTRACT)
-                    + """
-
-const rows = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
-const groups = dashLandGroups(rows);
-process.stdout.write(JSON.stringify({
-  groups: groups.length,
-  html: groups.map(dashLandGroup).join(""),
-  primaries: groups.map(g => dashLandPrimary(g).reviewed_tip || null),
-  sizes: groups.map(g => g.length)
-}));
-""")
-        chk = subprocess.run([cls.node, "--check", cls.path],
-                             capture_output=True, text=True)
-        assert chk.returncode == 0, "node --check failed:\n" + chk.stderr
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
-
-    def render(self, rows):
-        path = os.path.join(self.tmp, "rows.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(rows, f)
-        p = subprocess.run([self.node, self.path, path],
-                           capture_output=True, text=True, timeout=60)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        return json.loads(p.stdout)
-
-    @staticmethod
-    def receipt(**kw):
-        base = {"lane": "lane/example", "trunk_sha": "t" * 40,
-                "reviewed_tip": "a" * 40, "trunk_ref": "refs/remotes/origin/main",
-                "on_trunk": True, "how": "ancestor",
-                "task": None, "gate": "g" * 16,
-                "ts": "2026-08-01T00:00:00Z", "age_s": 60}
-        base.update(kw)
-        # DERIVED, never hand-typed. `honored` rides the wire now, and a
-        # fixture that set it by hand could describe a payload the server
-        # never sends — the exact drift that having two implementations of
-        # this predicate created in the first place. A test may still override
-        # it explicitly to exercise an old server (absent field, fail-closed).
-        base.setdefault("honored", landreq.honored_display(base))
-        return base
-
-    def test_distinct_chains_same_lane_and_trunk_never_merge(self):
-        """The exact refutation. Two lands that share a lane LABEL and a
-        batch trunk but come from DIFFERENT chain roots are two lands. Merging
-        them deletes a landing from the owner's view and mislabels it as a
-        round of the other — the one direction the design forbids."""
-        out = self.render([
-            self.receipt(reviewed_tip="a" * 40, chain_root="R1"),
-            self.receipt(reviewed_tip="b" * 40, chain_root="R2"),
-        ])
-        self.assertEqual(out["groups"], 2,
-                         "distinct chain roots collapsed into one land")
-        self.assertNotIn("earlier round", out["html"],
-                         "an unrelated land was labelled a round of another")
-
-    def test_no_chain_root_fails_open_to_separate_rows(self):
-        """The default today: no receipt carries chain_root. Absent identity
-        must render every receipt separately — repetitive, never merged.
-        Repetition is a cost; invisibility is a lie."""
-        out = self.render([
-            self.receipt(reviewed_tip="a" * 40),
-            self.receipt(reviewed_tip="b" * 40),
-        ])
-        self.assertEqual(out["groups"], 2, "grouped without proven identity")
-        self.assertNotIn("<details", out["html"])
-
-    def test_same_chain_rounds_collapse_to_one_land(self):
-        """The feature itself: three receipts of one chain are ONE land, and
-        the two non-landing rounds fold underneath."""
-        out = self.render([
-            self.receipt(reviewed_tip="c" * 40, trunk_sha="c" * 40, chain_root="R1"),
-            self.receipt(reviewed_tip="a" * 40, chain_root="R1"),
-            self.receipt(reviewed_tip="b" * 40, chain_root="R1"),
-        ])
-        self.assertEqual(out["groups"], 1)
-        self.assertEqual(out["sizes"], [3])
-        self.assertIn("2 earlier rounds", out["html"])
-        self.assertIn("<details><summary", out["html"],
-                      "agreeing rounds must collapse, not open")
-
-    def test_primary_is_the_tip_that_equals_trunk_not_the_newest(self):
-        """Which receipt speaks for the land is EVIDENTIARY: the round whose
-        reviewed tip IS the trunk sha literally is the commit that landed.
-        Newest-wins is a guess about recency dressed as an answer."""
-        out = self.render([
-            self.receipt(reviewed_tip="a" * 40, chain_root="R1", ts="2026-08-01T09:00:00Z"),
-            self.receipt(reviewed_tip="t" * 40, chain_root="R1", ts="2026-08-01T01:00:00Z"),
-        ])
-        self.assertEqual(out["primaries"], ["t" * 40],
-                         "the landing round must speak, not the newest")
-
-    def test_disagreeing_rounds_open_and_say_so(self):
-        """A summary that hides the deciding fact is worse than the flat list
-        it replaced. Conflict is promoted into the summary and the group opens
-        itself; only agreement is allowed to collapse quietly."""
-        out = self.render([
-            self.receipt(reviewed_tip="t" * 40, chain_root="R1", on_trunk=True),
-            self.receipt(reviewed_tip="b" * 40, chain_root="R1", on_trunk=False),
-        ])
-        self.assertEqual(out["groups"], 1)
-        self.assertIn("THEY DISAGREE", out["html"])
-        self.assertIn("<details open>", out["html"])
-        self.assertIn("dlsplit", out["html"])
-
-    def test_a_recorded_proof_and_an_unrecorded_one_are_a_disagreement(self):
-        """Two rounds of one chain where one carries a recorded close proof and
-        the other carries none are DIFFERENT answers, and the group must promote
-        that into its summary instead of collapsing it away. The old pair was
-        `≈ correlates` against `? UNKNOWN`, both of which belonged to the trunk
-        walk; the axis survives the source change, the values do not."""
-        out = self.render([
-            self.receipt(reviewed_tip="a" * 40, chain_root="R1",
-                         on_trunk=True, how="ancestor"),
-            self.receipt(reviewed_tip="b" * 40, chain_root="R1",
-                         on_trunk=None, how=None),
-        ])
-        self.assertIn("THEY DISAGREE", out["html"])
-        # AND THE CONTROL: two rounds that agree collapse quietly, so the arm
-        # above is measuring the disagreement rather than the grouping.
-        agree = self.render([
-            self.receipt(reviewed_tip="a" * 40, chain_root="R2",
-                         on_trunk=True, how="ancestor"),
-            self.receipt(reviewed_tip="b" * 40, chain_root="R2",
-                         on_trunk=True, how="ancestor"),
-        ])
-        self.assertNotIn("THEY DISAGREE", agree["html"])
-        self.assertIn("1 earlier round", agree["html"])
-
-    def test_two_positive_proofs_by_DIFFERENT_methods_are_not_a_disagreement(self):  # noqa: VACUOUS_ASSERTION — the arm above is the unconditional positive control on the same observable and the same key: a true/none pair over the same fixture DOES render THEY DISAGREE, so a run that could never alarm fails there
-        """THE AXIS IS WHETHER THE CONTENT REACHED TRUNK, NOT WHICH INSTRUMENT
-        SAID SO. Both rounds here proved it — one by ancestry, one by
-        patch-equivalence — and folding the method into the comparison key made
-        them compare unequal, so the group opened itself and told the owner in
-        words that its receipts do not agree about whether the content ever
-        reached trunk. They agree exactly about that. The methods are already on
-        the rows; a false alarm on the one part of this card whose alarm has to
-        be believed costs more than the distinction is worth."""
-        out = self.render([
-            self.receipt(reviewed_tip="a" * 40, chain_root="R3",
-                         on_trunk=True, how="ancestor"),
-            self.receipt(reviewed_tip="b" * 40, chain_root="R3",
-                         on_trunk=True, how="patch-equivalent"),
-        ])
-        self.assertEqual(out["groups"], 1)
-        self.assertNotIn("THEY DISAGREE", out["html"])
-        self.assertNotIn("dlsplit", out["html"])
-        self.assertIn("1 earlier round", out["html"])
-        # AND BOTH METHODS ARE STILL READABLE on the rows, which is where the
-        # difference belongs: it is a fact about the proof, not about the land.
-        self.assertIn("landed (patch)", out["html"])
-
-    def test_grouping_changes_what_is_shown_never_what_is_counted(self):
-        """Every receipt still renders. Grouping is a VIEW over the record and
-        must never drop a row from it."""
-        rows = [self.receipt(reviewed_tip=c * 40, chain_root="R1") for c in "abc"]
-        out = self.render(rows)
-        self.assertEqual(out["html"].count('class="dland"'), 3,
-                         "a receipt vanished from the card")
-
-    def test_the_no_proof_banner_reads_every_row_not_the_group_primaries(self):
-        """The property survives the source change verbatim: the sentence claims
-        something about the WHOLE answer, so it is computed over `rl.rows` and
-        never over the folded primaries. Grouping changes what is shown and must
-        never change what is counted."""
-        src = _extract_fn(web_ui_loader.read_text(), "dashLands")
-        self.assertIn("rl.rows.every", src,
-                      "the no-proof banner must read every row, not the "
-                      "group primaries")
-        self.assertIn("allUnproven", src)
-
-    # ── THE RECEIPT BADGE IS GONE (task/2355) and three arms went with it.
-    # `dashLandWitness` rendered signed / unsigned / signed ? off the land
-    # RECEIPT index — a second read beside the card's own source, which the
-    # owner's rule forbids. What replaced it is the row's own recorded close
-    # proof plus the two identities he actually reads, and those are asserted
-    # below on rendered text rather than on the absence of a complaint.
-    def test_a_landed_row_renders_its_task_and_its_gate_receipt(self):
-        """The two identities the ruling names. The task comes from the close
-        evidence the ledger already carries, so a row whose closer recorded
-        none says NO TASK rather than rendering a blank a reader takes for a
-        failed render."""
-        with_task = self.render([self.receipt(task="2355")])["html"]
-        self.assertEqual(with_task.count('class="dland"'), 1, with_task)
-        self.assertIn("task/2355", with_task)
-        self.assertIn("gate:gggggggggggg", with_task)
-        # THE POSITIVE CONTROL IS THE OTHER ANSWER ON THE SAME ROW: if both
-        # renderings were one string the pair would prove nothing.
-        without = self.render([self.receipt(task=None)])["html"]
-        self.assertIn(">no task<", without)
-        self.assertNotIn("task/", without)
-        self.assertNotEqual(with_task, without)
-
-    def test_a_landed_row_with_no_gate_token_reads_UNVERIFIED_never_verified(self):
-        """An absent verification field may never default to verified — the
-        law `card()` already states for this pair, held at the render."""
-        html = self.render([self.receipt(gate="")])["html"]
-        self.assertIn("gate ?", html)
-        self.assertIn("UNVERIFIED", html)
-        self.assertNotIn("gate:", html)
 
 
 class DashAnswersCardRuntimeTest(unittest.TestCase):
@@ -6760,8 +4109,7 @@ process.stdout.write(JSON.stringify({
         self.assertIn("darow", out["html"])
         self.assertIn("the proxy is back up", out["html"])
         self.assertIn("dcsrc", out["html"])
-        self.assertIn("helm chat read", out["html"])
-        self.assertIn("read 0s", out["html"])
+        self.assertIn("chat · read 0s", out["html"])
 
     def test_the_card_is_HIDDEN_at_zero_rather_than_empty(self):
         """An empty card on this page is one more thing to look past, and chat
@@ -6784,7 +4132,7 @@ process.stdout.write(JSON.stringify({
             out = self.render(body)
             self.assertFalse(out["hidden"], body)
             self.assertIn("NOT SENT", out["html"])
-            self.assertIn("helm chat read", out["html"])
+            self.assertIn('href="#chat"', out["html"])   # where the replies are
 
     def test_the_count_it_prints_is_the_count_it_was_sent(self):
         out = self.render({"owner_answers": [self.answer(text="@daria one"),
@@ -6871,424 +4219,9 @@ process.stdout.write(JSON.stringify({
             self.assertNotIn(word, out["html"])
 
 
-# A SENTINEL, because `None` and `{}` are both bodies an arm below deliberately
-# sends. A default of None would make "send a null body" indistinguishable from
-# "build the body from keywords".
-_MISSING = object()
 
 
-class DashLandsCardRuntimeTest(unittest.TestCase):
-    """The LANDED card as a whole, run under node, because the owner reads the
-    CARD and not a row. The sentences under the rows are claims about the
-    record — how many lands it holds, and whether each was proven — and a claim
-    rendered wrong is the exact failure this card keeps having.
-
-    REWRITTEN WITH THE SOURCE (owner ruling, task/2355). Roughly half the arms
-    a trunk-walking version of this card needs are about that reader's own
-    blindness: COMPLETENESS NOT SENT and a missing-field matrix (an envelope
-    from a server that predates the disclosures), every `fold_only` arm (the
-    disclaimer saying ff lands are absent from the list), every `window_total`
-    arm (a count the grammar cannot honestly produce), and the ✗ NEVER REACHED
-    badge (git proving the reviewed content was never on trunk).
-
-    NONE OF THOSE IS REACHABLE FROM A LEDGER CLOSE, and that is the cure rather
-    than lost coverage: the card reads the same landed closes `helm lr list`
-    reads, so there is no second grammar to be blind, no window it cannot count,
-    and a `landed` close IS the record asserting the land — a card that could
-    render "never reached" would be contradicting the row it is drawing. Every
-    property that SURVIVES the source change is kept below, in the same words
-    where the words still fit, and the two the ruling added (the source-and-age
-    line, and the staleness refusal) are asserted beside them."""
-
-    EXTRACT = ["cardBoundS", "cardStale", "cardSource", "dashLandRow",
-               "dashLandVerdictKey",
-               "dashLandPrimary", "dashLandGroups", "dashLandGroup", "dashLands"]
-
-    @classmethod
-    def setUpClass(cls):
-        cls.node = shutil.which("node")
-        if not cls.node:
-            raise unittest.SkipTest("node not available")
-        src = web_ui_loader.read_text()
-        line = [ln for ln in src.splitlines() if ln.startswith("const esc = ")]
-        assert len(line) == 1, "assembled web UI's esc definition moved"
-        cls.tmp = tempfile.mkdtemp(prefix="helm-dashlands-")
-        cls.path = os.path.join(cls.tmp, "run.js")
-        with open(cls.path, "w", encoding="utf-8") as f:
-            # One inert #dlands cell so the REAL dashLands runs unmodified and
-            # its innerHTML IS the assertion — no python mirror of the string.
-            # The READ AGE is an argument now, so the payload carries it
-            # explicitly: a harness that let it default would be exercising the
-            # staleness refusal on every arm without saying so.
-            f.write("const lrAgo = s => String(s) + \"s\";\n" + line[0] + """
-let html = "";
-const cell = {get innerHTML() { return html; },
-              set innerHTML(v) { html = v; }};
-const $ = sel => (sel === "#dlands" ? cell : null);
-
-"""
-                    + "\n\n".join(_extract_fn(src, n) for n in cls.EXTRACT)
-                    + """
-
-const payload = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
-dashLands(payload.rl, false, payload.age);
-process.stdout.write(html);
-""")
-            chk = subprocess.run([cls.node, "--check", cls.path],
-                                 capture_output=True, text=True)
-            assert chk.returncode == 0, "node --check failed:\n" + chk.stderr
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
-
-    def render(self, age=3, rl=_MISSING, **kw):
-        """`age` is the card's own read age in seconds; 3 is a fresh read.
-        Pass `rl` positionally-by-keyword to send a non-dict body."""
-        body = kw if rl is _MISSING else rl
-        path = os.path.join(self.tmp, "rl.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"rl": body, "age": age}, f)
-        p = subprocess.run([self.node, self.path, path],
-                           capture_output=True, text=True, timeout=60)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        return p.stdout
-
-    @staticmethod
-    def row(**kw):
-        """One row as the CURRENT producer emits it. Every key here is written
-        by `_lr_recent_lands`; a fixture that invented one would be a card
-        rendered over a world no server can send."""
-        base = {"lane": "dash-lane", "reviewed_tip": "a" * 40,
-                "task": None, "gate": "g" * 16, "trunk_sha": "t" * 40,
-                "trunk_ref": "refs/remotes/origin/main", "on_trunk": True,
-                "how": "ancestor", "chain_root": None,
-                "ts": "2026-09-12T00:00:00Z", "age_s": 60,
-                # THE STATE THE ROW CANNOT DERIVE FOR ITSELF, written by
-                # `_lr_recent_lands`: whether the ledger's closure stamp was
-                # unreadable. The ORDER is not a row field — the producer sorts
-                # the rows and the card renders them in the order it is handed.
-                "ts_unreadable": False}
-        base.update(kw)
-        return base
-
-    def envelope(self, rows, **kw):
-        """The envelope exactly as `_lr_recent_lands` answers it, so no arm can
-        pass against a shape the producer never sends."""
-        body = {"rows": rows, "total": len(rows), "rows_truncated": False,
-                "source": "helm lr list", "unavailable": None}
-        body.update(kw)
-        return body
-
-    # ── the two sentences a ROW cannot say for itself ──────────────────────
-    def test_an_undateable_closure_says_UNREADABLE_and_not_age_unknown(self):
-        """THREE STATES, NOT TWO. A closure the ledger recorded with something
-        that is not a timestamp is a corrupt record to repair; a closure with no
-        instant anywhere never had one. Collapsing them loses the repair, and
-        substituting the stage-entry instant for either printed a confident date.
-
-        The positive control is the same card with a readable instant, which
-        renders an age and neither word."""
-        good = self.render(rl=self.envelope([self.row(age_s=7200)]))
-        self.assertIn("7200s", good)
-        self.assertNotIn("UNREADABLE", good)
-        corrupt = self.render(rl=self.envelope(
-            [self.row(ts=None, age_s=None, ts_unreadable=True)]))
-        self.assertIn("age UNREADABLE", corrupt)
-        self.assertIn("not a timestamp", corrupt)
-        self.assertIn(">dash-lane</span>", corrupt)   # the row is KEPT
-        absent = self.render(rl=self.envelope(
-            [self.row(ts=None, age_s=None, ts_unreadable=False)]))
-        self.assertIn("age unknown", absent)
-        self.assertNotIn("UNREADABLE", absent)
-
-    def test_the_card_renders_THE_ORDER_THE_PRODUCER_SENT(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control is the row count: two `dland` rows are asserted present on the same render before either position is compared, and the reversed envelope is a second render of the same two rows
-        """THE ORDER IS THE PRODUCER'S ANSWER AND THE CARD MAY NOT RESTATE IT.
-
-        `_lr_recent_lands` sorts newest close first, breaking a shared closure
-        second on the ledger's append index for the close. A card that re-sorted
-        (or reversed) that list would be a second opinion about one record, and
-        the reader would have no way to tell which one he is looking at — so what
-        is asserted here is that the rendered sequence IS the sequence handed in.
-
-        The reversed envelope is the control: the same two rows in the other
-        order render in the other order, so the first assertion is about the list
-        rather than about the lane names happening to sort that way."""
-        html = self.render(rl=self.envelope([
-            self.row(lane="dash-closed-last"),
-            self.row(lane="dash-closed-first")]))
-        self.assertEqual(html.count('class="dland"'), 2, html)
-        self.assertLess(html.index(">dash-closed-last</span>"),
-                        html.index(">dash-closed-first</span>"), html)
-        flipped = self.render(rl=self.envelope([
-            self.row(lane="dash-closed-first"),
-            self.row(lane="dash-closed-last")]))
-        self.assertEqual(flipped.count('class="dland"'), 2, flipped)
-        self.assertLess(flipped.index(">dash-closed-first</span>"),
-                        flipped.index(">dash-closed-last</span>"), flipped)
-        # AND THE DISCLAIMER IS GONE WITH ITS PREMISE: the record answers which
-        # of two same-second closes came last, so a sentence saying it does not
-        # would be the card contradicting its own producer.
-        self.assertNotIn("same second", html)
-        self.assertNotIn("order within a second", html)
-
-    # ── the law the whole rebuild rests on ────────────────────────────────
-    def test_an_unproven_land_is_never_removed_from_the_card(self):
-        """A land whose close recorded no proof mode is a ROW, never an
-        absence. The row-level arms cannot see this — they render groups
-        directly and never run dashLands, so a filter INSIDE the card survived
-        them — so it is asserted here, on the card."""
-        html = self.render(rl=self.envelope([
-            self.row(lane="dash-proven", on_trunk=True, how="ancestor"),
-            self.row(lane="dash-patch", on_trunk=True, how="patch-equivalent"),
-            self.row(lane="dash-unproven", on_trunk=None, how=None)]))
-        self.assertEqual(html.count('class="dland"'), 3, html)
-        for lane in ("dash-proven", "dash-patch", "dash-unproven"):
-            self.assertIn(">" + lane + "</span>", html)
-
-    def test_rows_are_never_discarded_to_explain_something_about_them(self):
-        """The lane's own hard-won law: replacing the card to explain a
-        disclosure hides every proven land behind a banner, which is strictly
-        worse for the reader than the thing explained. Truncation, a missing
-        total and an unrecorded proof all render BESIDE the rows."""
-        html = self.render(rl=self.envelope(
-            [self.row(lane="dash-kept", on_trunk=None, how=None)],
-            rows_truncated=True, total=None))
-        self.assertIn(">dash-kept</span>", html)
-        self.assertIn("no proof mode recorded", html)
-
-    # ── the two sentences the owner reads under the rows ──────────────────
-    def test_the_card_discloses_truncation_over_a_MEASURED_total(self):
-        """The cap is a display budget and may never edit a count. The ledger
-        holds every landed close, so unlike the trunk grammar this card can name
-        the real population — and it says `newest N of M`, not `and more`."""
-        html = self.render(rl=self.envelope(
-            [self.row(lane="dash-" + str(i)) for i in range(6)],
-            rows_truncated=True, total=434))
-        self.assertIn("newest 6 of 434 recorded lands", html)
-
-    def test_a_total_that_is_not_a_number_is_refused_not_coerced(self):
-        """A truncated list whose total cannot be read says so rather than
-        printing a number it was not sent. The old card could not send a total
-        at all; being able to does not license inventing one."""
-        html = self.render(rl=self.envelope(
-            [self.row()], rows_truncated=True, total=None))
-        self.assertIn("a total this body did not send", html)
-        self.assertNotIn("recorded lands", html)
-
-    def test_an_untruncated_card_adds_no_truncation_sentence(self):
-        """The control on the two arms above: a complete list says nothing about
-        being cut, so the sentence is measuring truncation rather than always
-        printing."""
-        html = self.render(rl=self.envelope([self.row()], total=1))
-        # UNCONDITIONAL POSITIVE CONTROL on the same observable: the card really
-        # rendered a row, so the two absences below are about the sentences and
-        # not about a card that produced nothing at all.
-        self.assertIn('class="dland"', html)
-        self.assertNotIn("newest", html)
-        self.assertNotIn("a total this body did not send", html)
-
-    def test_all_unproven_says_the_lands_are_real_and_the_proof_is_missing(self):
-        """When NO row carries a recorded proof, say it once in words: six
-        question marks read as decoration. The sentence must not cast doubt on
-        the lands themselves — they are the ledger's own claim."""
-        html = self.render(rl=self.envelope([
-            self.row(lane="dash-a", on_trunk=None, how=None),
-            self.row(lane="dash-b", on_trunk=None, how=None)]))
-        self.assertIn("no proof mode recorded", html)
-        self.assertIn("the ledger's own claim", html)
-
-    def test_one_proven_row_silences_the_all_unproven_sentence(self):
-        """The positive control on the arm above, and the reason the predicate
-        is `every` rather than `some`."""
-        html = self.render(rl=self.envelope([
-            self.row(lane="dash-a", on_trunk=True, how="ancestor"),
-            self.row(lane="dash-b", on_trunk=None, how=None)]))
-        self.assertIn(">dash-b</span>", html)
-        self.assertNotIn("no proof mode recorded", html)
-
-    # ── the badge's semantics, which survive the source change ────────────
-    def test_the_badge_is_HISTORICAL_and_never_claims_the_bytes_are_there_now(self):
-        """`on_trunk` carries landed_ever semantics whatever produced it: both
-        proofs behind it stay TRUE after a revert. So the visible words say the
-        work GOT there, never that it IS there — the distinction a first cut got
-        right in the tooltip and wrong in the badge."""
-        html = self.render(rl=self.envelope([self.row(how="ancestor")]))
-        self.assertIn("✓ landed", html)
-        self.assertNotIn("is on trunk", html)
-        self.assertIn("it says the work got there", html)
-
-    def test_the_PATCH_variant_names_its_proof_and_is_historical_too(self):
-        html = self.render(rl=self.envelope([self.row(how="patch-equivalent")]))
-        self.assertIn("✓ landed (patch)", html)
-        self.assertIn("by patch-equivalent", html)
-        self.assertIn("never that the bytes are there now", html)
-
-    def test_the_task_and_the_gate_ride_the_card_not_only_the_row(self):
-        """Asserted on the CARD because that is what the owner reads, and
-        because a filter inside dashLands could drop either without a row-level
-        arm noticing."""
-        html = self.render(rl=self.envelope(
-            [self.row(task="2355", gate="abcdef0123456789")]))
-        self.assertIn("task/2355", html)
-        self.assertIn("gate:abcdef012345", html)
-
-    # ── the three refusals, none of which may read as a quiet pipeline ────
-    def test_an_EMPTY_list_never_renders_as_no_lands(self):
-        """The phrase is banned from this card by name. An empty answer is a
-        real measurement off this reader, and it is still not a licence to
-        certify a quiet pipeline in words a skimmer takes as "nothing is
-        happening"."""
-        html = self.render(rl=self.envelope([]))
-        self.assertNotIn("no lands", html)
-        self.assertIn("records no closed-as-landed row", html)
-        self.assertIn("helm lr list --all", html)
-
-    def test_an_unavailable_reading_is_UNKNOWN_and_never_an_empty_card(self):
-        """The projection's own reason reaches the reader verbatim: the lands
-        leg relays it rather than writing a sentence of its own, so the card can
-        never name a cause the record did not give."""
-        html = self.render(rl=self.envelope(
-            [], unavailable="the dispatch ledger could not be read"))
-        self.assertIn("UNKNOWN", html)
-        self.assertIn("the dispatch ledger could not be read", html)
-
-    def test_a_body_with_no_lands_reading_at_all_says_NOT_SENT(self):
-        """An older `helm web` that answers without the field is a fact about
-        the SERVER, and it must not read as a fact about the record."""
-        # UNCONDITIONAL POSITIVE CONTROL FIRST, same observable: a current body
-        # renders rows and says nothing about NOT SENT.
-        good = self.render(rl=self.envelope([self.row(lane="dash-live")]))
-        self.assertIn(">dash-live</span>", good)
-        self.assertNotIn("NOT SENT", good)
-        for body in (None, {}, {"rows": "six"}):
-            html = self.render(rl=body)
-            self.assertIn("NOT SENT", html)
-            self.assertIn("older <code>helm web</code>", html)
-
-    # ── the two the ruling added ──────────────────────────────────────────
-    def test_the_card_names_its_source_read_and_that_reads_age(self):
-        """Owner's rule: anything on the homepage should be actually useful, and
-        a number he cannot check against the command line is not. So the card
-        says which read produced it and how old that read is."""
-        html = self.render(age=7, rl=self.envelope([self.row()]))
-        self.assertIn("helm lr list · read 7s", html)
-
-    def test_a_stale_read_renders_the_refusal_and_NOT_its_last_values(self):
-        """The other half of the rule: if it is there it does not go stale. Past
-        four poll intervals the card prints why it is empty and drops every
-        value, because a stale land looks exactly like a fresh one."""
-        fresh = self.render(age=3, rl=self.envelope(
-            [self.row(lane="dash-fresh", task="2355")]))
-        self.assertIn("dash-fresh", fresh)
-        stale = self.render(age=600, rl=self.envelope(
-            [self.row(lane="dash-fresh", task="2355")]))
-        self.assertIn("STALE — not rendered", stale)
-        self.assertNotIn("dash-fresh", stale)
-        self.assertNotIn("task/2355", stale)
-
-    def test_an_age_the_page_never_received_is_stale_never_fresh(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control runs BEFORE the loop and on the same observable: a numeric fresh age renders the lane
-        """A card that cannot tell how old its read is may not render values.
-        The safe direction is the only direction: an absent age is not a young
-        one."""
-        # UNCONDITIONAL POSITIVE CONTROL FIRST, same observable: a numeric fresh
-        # age renders the lane, so the absences below are about the age and not
-        # about a card that cannot render at all.
-        self.assertIn("dash-fresh", self.render(
-            age=3, rl=self.envelope([self.row(lane="dash-fresh")])))
-        for age in (None, "recent"):
-            html = self.render(age=age, rl=self.envelope(
-                [self.row(lane="dash-fresh")]))
-            self.assertIn("STALE — not rendered", html)
-            self.assertIn("of unknown age", html)
-            self.assertNotIn("dash-fresh", html)
-
-
-class TheGateChipGoesQuietTest(CardRuntimeBase):
-    """OWNER RULING, decision d2f490d0, 2026-08-06: "the chip goes quiet when
-    there is nothing to report ... gate state moves behind the card's expand
-    with the rest of the detail."
-
-    He was asked because it was a decision about what he wants to see, not a
-    style bug. The measurement that made it a question: lrGate had exactly two
-    reachable outcomes on a live board — "receipt NOT READ here" and
-    "UNVERIFIED" — so it was negative on 100% of cards, and a badge every card
-    wears is a badge the eye stops reading. That was the remaining half of
-    task/333's alarm saturation."""
-
-    def test_a_bound_receipt_leaves_the_headline_and_KEEPS_ITS_TOKEN(self):
-        html = self.render(r={"__row": self.row(gate="abcdef0123456789")})["r"]["html"]
-        headline, expand = html.split('<div class="lrx"', 1)
-        self.assertNotIn('class="lrg', headline)
-        self.assertNotIn("receipt NOT READ here", headline)
-        # DEMOTION, NOT DELETION — and the token is the one thing a reader
-        # needs to go check the receipt, so it must survive the move
-        self.assertIn("gate:abcdef0123", expand)
-        self.assertIn("has not read the gate receipt", expand)
-
-    def test_no_receipt_is_quiet_too_and_the_expand_still_says_so(self):
-        html = self.render(r={"__row": self.row()})["r"]["html"]
-        headline, expand = html.split('<div class="lrx"', 1)
-        self.assertNotIn('class="lrg', headline)
-        self.assertNotIn("UNVERIFIED", headline)
-        self.assertIn("nothing has gate-checked this row at all", expand)
-
-    def test_GATE_N_A_STILL_PRINTS_because_it_is_not_bad_news(self):
-        """THE CONTROL, and the whole reason the other two arms mean anything.
-        The rule is that the chip prints only when it has something to SAY, not
-        that lrGate was emptied — so the one outcome that is a true, narrow
-        statement rather than an accusation has to survive. Without this arm, a
-        build that deleted lrGate outright would pass both arms above."""
-        html = self.render(
-            r={"__row": self.row(close_reason="delivered-report")})["r"]["html"]
-        headline = html.split('<div class="lrx"', 1)[0]
-        self.assertIn('class="lrg"', headline)
-        self.assertIn("GATE N/A", headline)
-
-
-class AlreadyOnTrunkOnThePipelineWallTest(CardRuntimeBase):
-    """THE PIPELINE WALL SAYS WHAT `helm lr list` SAYS about a row whose
-    work main already holds with no verdict recorded. Without the field on
-    the wire the card draws it as a plain AWAITING_REVIEW row, and the owner
-    reads landed work as waiting. The field is the server's own answer
-    (`landreq.on_main_unverdicted`), so each fixture row carries what the
-    server would send for it."""
-
-    def wall(self, **fields):
-        row = self.row(observable=False, **fields)
-        row["on_main_unverdicted"] = landreq.on_main_unverdicted(row)
-        return {"__row": row}
-
-    def test_a_row_already_on_trunk_carries_the_CLI_mark(self):
-        got = self.render(
-            on=self.wall(state="AWAITING_REVIEW", polarity=None,
-                         trunk_contains_tip=True),
-            off=self.wall(state="AWAITING_REVIEW", polarity=None,
-                          trunk_contains_tip=False))
-        self.assertIn("ALREADY ON TRUNK", got["on"]["html"])
-        self.assertIn("NO VERDICT recorded", got["on"]["html"])
-        # THE CONTROL: a PROVEN not-on-trunk row carries no such mark
-        self.assertNotIn("ALREADY ON TRUNK", got["off"]["html"])
-
-    def test_a_verdicted_row_on_trunk_is_never_called_unverdicted(self):  # noqa: VACUOUS_ASSERTION — the unverdicted row on the SAME containment answer carries the mark in this same render, so the verdicted rows' absent mark is a measurement
-        """MEASURED on the live trunk board: seven rows whose work trunk holds
-        by patch identity carried a recorded APPROVE, CONCUR or FIX, and the
-        wall printed "NO VERDICT recorded" on every one of them — the same
-        words `lr list` printed. A FIX on main is a contradiction somebody
-        owes; the wall does not call it ledger debris."""
-        got = self.render(
-            fix=self.wall(state="CHANGES_REQUESTED", polarity="fix",
-                          trunk_contains_tip=True),
-            held=self.wall(state="REVIEWED", polarity="approve",
-                           trunk_contains_tip=True),
-            none=self.wall(state="AWAITING_REVIEW", polarity=None,
-                           trunk_contains_tip=True))
-        self.assertIn("NO VERDICT recorded", got["none"]["html"])
-        self.assertNotIn("ALREADY ON TRUNK", got["fix"]["html"])
-        self.assertNotIn("ALREADY ON TRUNK", got["held"]["html"])
-
-
-class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
+class OwnerBoardSurfaceMatrixTest(LrApiBase):
     """THE SURFACE-BY-STATE MATRIX (task/2381 round 2). Each state is built
     for real — dispatch rows, lane branches, merges, cherry-picks, the kept
     landing proof written through its one door — beside a CONTROL (a live
@@ -7298,41 +4231,53 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
 
       waits groups     `/api/board` waits: the live obligations, by holder
       waits lines      `/api/board` waits_collapsed: one counted line a class
-      kanban columns   the SHIPPED `boardKanban`, run, over `/api/board` lanes
       kanban lines     `/api/board` lanes.on_main and lanes.collapsed
       helm lr list     the CLI listing and its marks
-      the wall         the SHIPPED `lrRowHTML`, run, over each `/api/lr` card
+
+    (The pipeline wall was a fifth surface; it went with its renderers when
+    the one land board took its rows, task/3585. The page's kanban columns,
+    a project's Lanes tab, were a sixth; they went with that tab when the
+    Work page took it over, task/3643: the Work page places each row off
+    `/api/work`, the one work reader over these same lanes, whose placement
+    of a folded, on-trunk or fix-owed row is tests/test_work_model.py's.)
 
     One test per state, one subTest per surface cell. In every cell the
     accounting holds on both counting surfaces — listed plus collapsed is
     every row — and the two agree row for row: a row counted on a line on one
     is on the same line on the other, never listed there."""
 
-    SURFACES = ("waits_groups", "waits_lines", "kanban_columns",
-                "kanban_lines", "lr_list", "wall")
+    SURFACES = ("waits_groups", "waits_lines", "kanban_lines", "lr_list")
     ON_MAIN = {"waits_groups": None, "waits_lines": "on_main",
-               "kanban_columns": None, "kanban_lines": "on_main",
-               "lr_list": "ALREADY ON TRUNK", "wall": "ALREADY ON TRUNK"}
+               "kanban_lines": "on_main", "lr_list": "ALREADY ON TRUNK"}
 
-    def listed(role, column, lr_mark=None):
+    def listed(role, lr_mark=None):
         return {"waits_groups": role, "waits_lines": None,
-                "kanban_columns": column, "kanban_lines": None,
-                "lr_list": lr_mark, "wall": None}
+                "kanban_lines": None, "lr_list": lr_mark}
 
     #: state -> (lane, the expected cell on each surface). `waits_groups` is
     #: the holder ROLE of the group listing the row; `lr_list` the marks its
     #: line must carry (None: no ALREADY ON TRUNK on it).
+    #: A SOURCE-CLEAN HOLD ON TRUNK IS OWED, NEVER "NO VERDICT" (task/3053,
+    #: the author's ruling on the seam): the landing does not settle it, so it
+    #: stays a listed wait on whoever owes its move, and the waits row carries
+    #: the one sentence `landreq.source_clean_on_main` builds as `owed`.
+    CLOSE_OWED = "on main · SOURCE-CLEAN close owed by the integrator"
+    REHOLD_OWED = "on main · RE-HOLD owed by @"
     EXPECT = {
-        "live_review": ("fresh-review", listed("reviewer", "review")),
+        "live_review": ("fresh-review", listed("reviewer")),
         "clean_hold_on_trunk": ("clean-on-trunk", dict(
-            ON_MAIN, lr_list=("ALREADY ON TRUNK", "SOURCE-CLEAN"))),
+            listed("integrator",
+                   lr_mark=("ALREADY ON TRUNK", "SOURCE-CLEAN", CLOSE_OWED)),
+            owed=CLOSE_OWED)),
+        "clean_hold_no_holder_on_trunk": ("clean-no-holder", dict(
+            listed("reviewer", lr_mark=("ALREADY ON TRUNK", REHOLD_OWED)),
+            owed=REHOLD_OWED)),
         "build_merged": ("built-merged", ON_MAIN),
         "build_picked_proof": ("built-picked", ON_MAIN),
-        "build_picked_no_proof": ("picked-unproved",
-                                  listed("builder", "building")),
-        "build_unstarted": ("sent-unclaimed", listed("builder", "building")),
+        "build_picked_no_proof": ("picked-unproved", listed("builder")),
+        "build_unstarted": ("sent-unclaimed", listed("builder")),
         "fix_on_main": ("fix-on-main",
-                        listed("integrator", "building", lr_mark="CONTRARY")),
+                        listed("integrator", lr_mark="CONTRARY")),
     }
     del listed
     #: the builds whose work nobody measured on trunk: an UNKNOWN bills
@@ -7370,10 +4315,32 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
 
     def make_clean_hold_on_trunk(self):
         rid = self.delivered(self.b, "clean-on-trunk")
-        _row, err = dispatches.mark_hold(
-            rid, "SOURCE-CLEAN: read clear, the gate is the integrator's",
-            source_clean_tip=self.b)
+        # HELD BY ITS RECIPIENT: since task/3053 the hold door takes a
+        # source-clean hold only from the row's recipient, as the process's
+        # corroborated identity (`dispatches._acting_author`), and this
+        # fixture's own process is the integrator.
+        rows, unavailable = dispatches.snapshot()
+        self.assertIsNone(unavailable, unavailable)
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=(rows[rid]["recipient"], None)):
+            _row, err = dispatches.mark_hold(
+                rid, "SOURCE-CLEAN: read clear, the gate is the integrator's",
+                source_clean_tip=self.b)
         self.assertIsNone(err, err)
+        return rid
+
+    def make_clean_hold_no_holder_on_trunk(self):
+        # A HOLD WRITTEN BEFORE THE DOOR STAMPED ITS HOLDER, appended as the
+        # live ledger holds one: the door now refuses an unproven hand, so the
+        # ledger is the only way this shape exists.
+        rid = self.delivered(self.b, "clean-no-holder")
+        rows, unavailable = dispatches.snapshot()
+        self.assertIsNone(unavailable, unavailable)
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), {
+            "v": 3, "event": "hold", "seq": int(rows[rid]["seq"]) + 1,
+            "id": rid, "ts": dispatches.pk.now_ts(),
+            "reason": "SOURCE-CLEAN: read clear, the gate is the integrator's",
+            "owner_gated": False, "source_clean_tip": self.b}))
         return rid
 
     def make_build_merged(self):
@@ -7431,7 +4398,6 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
         """{state: {surface: cell}} for every row of `rows`, read off `body`
         exactly as each surface reads it, plus the two accountings."""
         from helm import scheduler, web_board
-        from tests import test_web_board as board   # the module, never its TestCase
         self.assertIsNone(body.get("unavailable"), body.get("unavailable"))
         self.assertFalse(body.get("warming"))
         # THE JOIN KEYS ITS RECORD BY THE SCOPE'S PROJECT NAME, which this
@@ -7442,14 +4408,7 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
         _sec, rec = web_board._lands_join(lambda _qs: (joined, 200))
         rec = rec[scope]
         lanes = rec["lanes"]
-        page = board.LandedOnTheKanbanTest.kanban({"m": (
-            [], lanes["loops"], rec["landed"],
-            {"on_main": lanes["on_main"], "collapsed": lanes["collapsed"]})})
-        page = page["m"]
         _rc, listing, _err = run(["list"])
-        cards = {c["id"]: c for c in body["loops"]}
-        wall = self.render(**{rid: {"__row": cards[rid]}
-                              for rid, _lane in rows.values() if rid in cards})
         waits_lines = {c["class"]: c["count"] for c in rec["waits_collapsed"]}
         kanban_lines = {c["class"]: c["count"] for c in lanes["collapsed"]}
         on_main = lanes["on_main"] or {"count": 0, "lanes": []}
@@ -7458,16 +4417,14 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
             title = scheduler.plain_title(lane)
             group = [g["label"] for g in rec["waits"]
                      if title in [r["plain_title"] for r in g["rows"]]]
-            column = [name for name in ("building", "review", "gate", "landed")
-                      if isinstance(page[name], list)
-                      and lane in [r.get("lane") for r in page[name]]]
             line = [ln for ln in listing.splitlines() if rid[:12] in ln]
+            owed = [r.get("source_clean_on_main") for g in rec["waits"]
+                    for r in g["rows"] if r.get("plain_title") == title]
             out[state] = {
+                "waits_owed": owed[0] if owed else None,
                 "waits_groups": group[0].split(" @")[0] if group else None,
-                "kanban_columns": column[0] if column else None,
                 "kanban_lines": "on_main" if lane in on_main["lanes"] else None,
-                "lr_list": line[0] if line else None,
-                "wall": wall[rid]["html"] if rid in wall else None}
+                "lr_list": line[0] if line else None}
         model = body["scheduler"]
         return out, {
             "waits_lines": waits_lines, "kanban_lines": dict(
@@ -7475,12 +4432,13 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
                                  if on_main["count"] else {})),
             "model": (model["listed_count"], model["collapsed_count"],
                       model["row_count"]),
-            "kanban": (len(lanes["loops"]), on_main["count"]
-                       + sum(kanban_lines.values()),
-                       len([c for c in body["loops"] if not c["honored"]])),
-            "page_summary": [r.get("summary") for name in ("review", "landed")
-                             if isinstance(page[name], list)
-                             for r in page[name] if r.get("summary")]}
+            # every live card is a card, a cut the cap counted, or on the
+            # re-hold line (task/3130)
+            "kanban": (len(lanes["loops"])
+                       + sum(lanes["loops_more"].values())
+                       + (lanes["rehold"] or {}).get("count", 0),
+                       on_main["count"] + sum(kanban_lines.values()),
+                       len([c for c in body["loops"] if not c["honored"]]))}
 
     def check(self, state):
         rows = self.world(state)
@@ -7497,8 +4455,6 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
                     self.assertEqual(cell["kanban_lines"], expect)
                     self.assertEqual(whole["kanban_lines"],
                                      {expect: 1} if expect else {})
-                    self.assertEqual(whole["page_summary"],
-                                     [1] if expect else [])
                 elif surface == "lr_list":
                     self.assertIsNotNone(cell["lr_list"],
                                          "the row is missing from lr list")
@@ -7510,19 +4466,17 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
                         self.assertNotIn("ALREADY ON TRUNK", cell["lr_list"])
                     if state in self.UNKNOWN_WORK:
                         self.assertNotIn("BEHIND", cell["lr_list"])
-                elif surface == "wall":
-                    self.assertIsNotNone(cell["wall"], "not on the wall")
-                    if expect:
-                        self.assertIn(expect, cell["wall"])
-                    else:
-                        self.assertNotIn("ALREADY ON TRUNK", cell["wall"])
                 else:
                     self.assertEqual(cell[surface], expect)
+        with self.subTest(state=state, surface="owed"):
+            # THE ONE SENTENCE ON THE WAITS ROW, and on no other state's
+            if want.get("owed"):
+                self.assertIn(want["owed"], cell["waits_owed"] or "")
+            else:
+                self.assertIsNone(cell["waits_owed"])
         with self.subTest(state=state, surface="control"):
-            self.assertEqual((ctl["waits_groups"], ctl["kanban_columns"],
-                              ctl["kanban_lines"]),
-                             ("reviewer", "review", None))
-            self.assertNotIn("ALREADY ON TRUNK", ctl["wall"])
+            self.assertEqual((ctl["waits_groups"], ctl["kanban_lines"]),
+                             ("reviewer", None))
         with self.subTest(state=state, surface="accounting"):
             listed_n, collapsed_n, rows_n = whole["model"]
             self.assertEqual(listed_n + collapsed_n, rows_n)
@@ -7536,6 +4490,9 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
 
     def test_a_source_clean_hold_on_trunk(self):  # noqa: VACUOUS_ASSERTION — `check` asserts every cell by exact equality or a present mark, the control row by exact tuple, and both accountings by equality
         self.check("clean_hold_on_trunk")
+
+    def test_a_NO_HOLDER_source_clean_hold_on_trunk(self):  # noqa: VACUOUS_ASSERTION — `check` asserts every cell by exact equality or a present mark, the control row by exact tuple, and both accountings by equality
+        self.check("clean_hold_no_holder_on_trunk")
 
     def test_a_build_landed_by_merge(self):  # noqa: VACUOUS_ASSERTION — `check` asserts every cell by exact equality or a present mark, the control row by exact tuple, and both accountings by equality
         self.check("build_merged")
@@ -7610,7 +4567,7 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
             # a line or a card is compared by the marks it carries: its dwell
             # text is a clock, and two reads are seconds apart
             return tuple(m for m in marks if m in cell) \
-                if surface in ("lr_list", "wall") and cell else cell
+                if surface == "lr_list" and cell else cell
         for state in rows:
             for surface in self.SURFACES:
                 if surface in got[state]:
@@ -7620,413 +4577,6 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase, CardRuntimeBase):
                                          read(surface, fresh[state][surface]))
         with self.subTest(state="schema-3", surface="lines and accounting"):
             self.assertEqual(got_whole, whole)
-
-
-class TheOwnerCanReadTheCardTest(CardRuntimeBase):
-    """task/333, and it exists because the review said the cure had NO
-    REGRESSION TEST: all 86 renderer arms passed unchanged at the parent, so
-    the clipped name and the UNDECLARED headline could regrow silently and the
-    only evidence they were fixed was a browser measurement nobody re-runs.
-
-    The owner-visible defect was arithmetic, not taste: on a 236px card the
-    name was the only flex child that could shrink, so it took 100% of the
-    squeeze and 32 of 33 titles clipped — five of them to 3px. The cure moves
-    the name OUT of that competition into its own block. These arms bind the
-    MARKUP that makes that possible; the geometry itself is CSS and is pinned
-    in the stylesheet arm below."""
-
-    def test_the_name_is_its_own_block_and_never_a_flex_sibling(self):
-        LANE = "task-offer-wire-into-the-rung"
-        html = self.render(r={"__row": self.row(lane=LANE)})["r"]["html"]
-        # POSITIVE CONTROL FIRST, on the same markup: the row rendered at all.
-        self.assertIn('class="lrrow', html)
-        self.assertIn('<div class="lrtitle">' + LANE + "</div>", html)
-        # THE REGRESSION ITSELF. .lrlane was a flex sibling of the state badge,
-        # the dwell and the warn glyph, and it was the ONLY one that could
-        # shrink. Re-emitting it puts the name back in that fight.
-        self.assertNotIn('class="lrlane"', html)
-        # and the name arrives WHOLE — an ellipsis in the markup would mean the
-        # renderer truncated, which is a different bug from CSS clipping
-        self.assertNotIn("…", html.split('class="lrl1"')[0])
-
-    def test_UNDECLARED_stays_out_of_the_headline_and_a_real_polarity_leads(self):
-        """The alarm-saturation half. UNDECLARED printed on every undecided row
-        while the expand already spelled the same fact out, so it read as an
-        accusation on the NORMAL state of a row awaiting review."""
-        # POSITIVE CONTROL, UNCONDITIONAL, ON THE SAME OBSERVABLE: a DECLARED
-        # polarity still renders its chip. Without this, "no lrpol" would also
-        # be what a build that dropped the chip entirely produces.
-        declared = self.render(
-            r={"__row": self.row(polarity="approve")})["r"]["html"]
-        self.assertIn('class="lrpol"', declared)
-        # the chip prints the polarity UPPERCASED, which is also why the
-        # suppression compares String(pol).toUpperCase() rather than the raw
-        self.assertIn('<span class="lrpol">APPROVE</span>', declared)
-
-        # THE STRING CASE IS THE ONE THAT DISCRIMINATES (the FIX). A row
-        # whose polarity is None renders no chip because `pol &&` is falsy —
-        # that path passes on a build with no suppression at all, so on its own
-        # it proves nothing. The literal word, in BOTH cases, is what exercises
-        # String(pol).toUpperCase().
-        for value in ("UNDECLARED", "undeclared", "Undeclared"):
-            undeclared = self.render(
-                r={"__row": self.row(polarity=value)})["r"]["html"]
-            headline, expand = undeclared.split('<div class="lrx"', 1)
-            self.assertNotIn('class="lrpol"', headline, value)
-            self.assertNotIn(value.upper(), headline, value)
-            # the expand NORMALISES to upper, so the fact survives the
-            # suppression in exactly one spelling whatever arrived
-            self.assertIn("UNDECLARED", expand, value)
-        # AND the production shape named in review: an absent polarity. Asserted
-        # SEPARATELY and after the discriminating cases, so it documents the
-        # null path rather than standing in for them.
-        nulled = self.render(r={"__row": self.row(polarity=None)})["r"]["html"]
-        self.assertNotIn('class="lrpol"', nulled.split('<div class="lrx"', 1)[0])
-        # AND THE FACT IS NOT DELETED, ONLY DEMOTED — this is the whole claim.
-        # Suppressing the chip would be a lie if the expand lost it too; the
-        # rule is headlines-click-to-detail, not headlines-only. This assertion
-        # is what separates the cure from silently dropping a field.
-        self.assertIn("UNDECLARED", expand)
-
-    def test_the_stylesheet_still_gives_the_name_its_own_line(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control is the five-shape hostile loop directly above the real assertion: it drives the SAME scan+comparison and requires each shape to be CAUGHT, so a broken scan or comparison fails there before the absence below can pass. The analyzer cannot credit it because the control is an assertTrue(any(...)) over a loop rather than a literal comparison
-        """The markup arms above cannot see CSS, and the defect LIVED in CSS —
-        one rule with flex:1 1 auto. This pins the two properties the cure
-        depends on and the absence of the rule it replaced, so a stylesheet
-        edit that re-creates the squeeze fails here rather than on his screen."""
-        css = web_ui_loader.read_text()
-        self.assertIn(".lrrow .lrtitle{", css)
-        title = css.split(".lrrow .lrtitle{", 1)[1].split("}", 1)[0]
-        # WRAP, never ellipsize: a lane name is the row's identity and half of
-        # one identifies nothing.
-        self.assertIn("overflow-wrap:anywhere", title)
-        # EVERY RULE THAT CAN MATCH .lrtitle, NOT JUST THE FIRST (the FIX).
-        # Checking one block let a LATER rule restore clipping and still pass —
-        # and in CSS the later rule is the one that wins, so the arm was blind
-        # in exactly the direction that matters.
-        pattern = r"([^{}]*\.lrtitle[^{}]*)\{([^}]*)\}"
-        # POSITIVE CONTROL ON THE SAME OBSERVABLE, unconditional and inline:
-        # the scan+comparison CATCHES a clipping rule when one exists, in
-        # every shape I could think of to hide one — inside @media, in a
-        # multi-selector list, and with whitespace in the declaration. Without
-        # this, "no ellipsis found" is also what a broken scan returns.
-        for hostile in (
-                "@media (max-width:680px){.lrrow .lrtitle{text-overflow:ellipsis}}",
-                ".foo,.lrrow .lrtitle{text-overflow:ellipsis}",
-                ".lrrow .lrtitle{text-overflow : ellipsis}",
-                ".lrrow .lrtitle{\n  text-overflow:\n    ellipsis;\n}",
-                ".lrrow .lrtitle{white-space : nowrap}",
-                ".lrrow .lrtitle{TEXT-OVERFLOW:ELLIPSIS}"):
-            hit = re.findall(pattern, hostile)
-            self.assertTrue(hit, hostile)
-            self.assertTrue(
-                any("text-overflow:ellipsis" in "".join(b.split()).lower()
-                    or "white-space:nowrap" in "".join(b.split()).lower()
-                    for _s, b in hit), hostile)
-        blocks = re.findall(pattern, css)
-        self.assertTrue(blocks, "the scan found no .lrtitle rule at all")
-        for sel, body in blocks:
-            # WHITESPACE-INSENSITIVE, and this is a measured hole rather than
-            # caution: `text-overflow : ellipsis` and the newline-formatted
-            # spelling BOTH slipped an exact-token check, so three of six
-            # shapes I tested passed a test that exists to refuse them. The
-            # scan itself is fine — it finds .lrtitle rules inside @media and
-            # in multi-selector lists, also measured — so the fix belongs on
-            # the comparison, not the pattern.
-            # CASE-INSENSITIVE TOO — CSS IS, AND MY COMPARISON WAS NOT
-            # measured: TEXT-OVERFLOW:ELLIPSIS is valid CSS that
-            # clips exactly as the lowercase spelling does, and it passed
-            # all five hostile entries AND this assertion. Whitespace was
-            # only half the normalisation the comparison owed.
-            flat = "".join(body.split()).lower()
-            self.assertNotIn("text-overflow:ellipsis", flat, sel)
-            self.assertNotIn("white-space:nowrap", flat, sel)
-        # the badges may wrap instead of squeezing the row on a narrow card
-        self.assertIn(".lrrow .lrl1{flex-wrap:wrap}", css)
-        # the rule that caused it is GONE, not merely unused: a stylesheet rule
-        # nothing can match is the same stale-state defect as a dead code path
-        self.assertNotIn(".lrrow .lrlane{", css)
-
-
-class RelatedRowsNestTest(CardRuntimeBase):
-    """ONE LANE NAME, ONE BOX — and the chain, not the name, is the identity.
-
-    OWNER, 2026-08-11, on the pipeline list: "if these are actually stacked
-    somehow then they should display as related, the list you print on the
-    webUI makes them look all separate". MEASURED on the live board: 41
-    in-flight rows under 30 lane names, with
-    `project-raw-batch-is-unproven-end-to-end` and
-    `compose-reads-stale-projection` drawing three top-level cards each. He had
-    been reading the header as 41 separate problems.
-
-    THESE ARMS ASSERT THE STRUCTURE, NOT THE ABSENCE OF A COMPLAINT. The
-    grouping is asked for as DATA (`__group` returns lrLaneGroups' objects), so
-    a wrong answer is a wrong shape rather than a substring that happens not to
-    appear — and the rendering arms then check that the shape reached the
-    markup. Every arm names the population it expects before it counts one, so
-    a grouping that silently returned nothing cannot read as a pass."""
-
-    @staticmethod
-    def chain(root, ids, lane, **kw):
-        """One chain: ids[0] founds it, each later id supersedes the one before
-        — the shape `--supersedes` writes, not a hand-picked head."""
-        rows, prev = [], None
-        for rid in ids:
-            rows.append(RelatedRowsNestTest.row(
-                id=rid, lane=lane, chain_root=root, supersedes=prev, **kw))
-            prev = rid
-        return rows
-
-    def groups(self, rows):
-        return self.render(g={"__group": rows})["g"]["groups"]
-
-    def test_two_chains_under_one_name_are_ONE_box_holding_TWO_chains(self):
-        # the owner's own case, minimally: one name, two unrelated efforts
-        rows = [self.row(id="aaaaaaaaaaaa", lane="shared-name"),
-                self.row(id="bbbbbbbbbbbb", lane="shared-name")]
-        gs = self.groups(rows)
-        # THE POPULATION FIRST. A grouping that dropped both rows would satisfy
-        # every "not separate" assertion below by returning nothing at all.
-        self.assertEqual(len(gs), 1, "one lane name must make exactly one box")
-        self.assertEqual(gs[0]["lane"], "shared-name")
-        self.assertEqual(gs[0]["rows"], 2, "both rows must be INSIDE the box")
-        # AND THEY STAY TWO. Merging them would be the defect landreq's own
-        # span comment records: a label is not identity.
-        self.assertEqual(len(gs[0]["chains"]), 2)
-        self.assertEqual(sorted(ch["root"] for ch in gs[0]["chains"]),
-                         ["aaaaaaaaaaaa", "bbbbbbbbbbbb"])
-
-    def test_two_names_are_TWO_boxes_and_a_lane_is_never_inferred_from_a_chain(self):
-        rows = [self.row(id="aaaaaaaaaaaa", lane="one"),
-                self.row(id="bbbbbbbbbbbb", lane="two")]
-        gs = self.groups(rows)
-        self.assertEqual([g["lane"] for g in gs], ["one", "two"])
-        self.assertEqual([g["rows"] for g in gs], [1, 1])
-
-    def test_rounds_of_ONE_chain_nest_under_the_round_happening_now(self):
-        rows = self.chain("r1", ["111111111111", "222222222222",
-                                 "333333333333"], "one-effort")
-        gs = self.groups(rows)
-        self.assertEqual(len(gs), 1)
-        self.assertEqual(len(gs[0]["chains"]), 1, "one chain, not three")
-        chain = gs[0]["chains"][0]
-        self.assertEqual(chain["rows"], ["111111111111", "222222222222",
-                                         "333333333333"])
-        # THE HEAD IS THE ROUND NO SIBLING SUPERSEDES — a READ of the record,
-        # never "the newest dwell" (a row whose entry stamp is unreadable
-        # reports a fabricated dwell of 0 and would win that election).
-        self.assertEqual(chain["head"], "333333333333")
-        self.assertEqual(chain["earlier"], ["111111111111", "222222222222"])
-
-    def test_a_chain_the_record_does_not_name_a_head_for_declines_to_elect_one(self):
-        # a FORK: two rows supersede the same parent, so two are unsuperseded.
-        # Electing either would invent the fact the whole group rests on.
-        rows = [self.row(id="111111111111", lane="forked", chain_root="r1",
-                         supersedes="000000000000"),
-                self.row(id="222222222222", lane="forked", chain_root="r1",
-                         supersedes="000000000000")]
-        chain = self.groups(rows)[0]["chains"][0]
-        self.assertEqual(len(chain["rows"]), 2, "both rounds are still here")
-        self.assertEqual(chain["head"], "111111111111",
-                         "an unadjudicable record falls back to server order")
-
-    def test_an_absent_chain_root_SPLITS_and_can_never_merge_two_efforts(self):
-        """An old server sends no `chain_root`. The fallback is the row's own
-        id — 'a root names itself' — so the failure direction is singletons on
-        a shared name, never two unrelated efforts fused into one."""
-        a = self.row(id="aaaaaaaaaaaa", lane="shared-name")
-        b = self.row(id="bbbbbbbbbbbb", lane="shared-name")
-        del a["chain_root"], b["chain_root"]
-        gs = self.groups([a, b])
-        self.assertEqual(len(gs), 1)
-        self.assertEqual([ch["root"] for ch in gs[0]["chains"]],
-                         ["aaaaaaaaaaaa", "bbbbbbbbbbbb"])
-
-    def test_a_shared_reviewed_commit_is_DISCLOSED_and_never_merged(self):
-        """Three land requests at one tip are three requests over one piece of
-        CONTENT — the 'actually stacked somehow' the owner suspected, and the
-        thing a name cannot tell him. Said, never acted on: landreq's index
-        records that a tip cited by many chains can equally be a shared BASE
-        (15 unrelated fan-out lanes once shared one)."""
-        tip = "46688400f249" + "0" * 28
-        rows = [self.row(id="aaaaaaaaaaaa", lane="one-tip", review_sha_full=tip),
-                self.row(id="bbbbbbbbbbbb", lane="one-tip", review_sha_full=tip),
-                self.row(id="cccccccccccc", lane="one-tip", review_sha_full=tip)]
-        g = self.groups(rows)[0]
-        self.assertEqual(g["shared_tip"], {"tip": tip, "chains": 3})
-        self.assertEqual(len(g["chains"]), 3, "disclosed, NOT merged")
-
-    def test_a_BUILD_rows_base_is_never_compared_against_a_reviewed_tip(self):
-        """`ref` is two different things and the row does not say which: on a
-        build it is the BASE the work started FROM. Conflating the two is what
-        once let one landing be claimed by five roots."""
-        tip = "5f78df5821a7" + "0" * 28
-        rows = [self.row(id="aaaaaaaaaaaa", lane="mixed", kind="review",
-                         review_sha_full=tip),
-                self.row(id="bbbbbbbbbbbb", lane="mixed", kind="build",
-                         review_sha_full="", base_sha=tip)]
-        gs = self.groups(rows)
-        # POSITIVE CONTROL ON THE SAME OBSERVABLE. `shared_tip` is None on a
-        # grouping that read NOTHING as surely as on one that correctly
-        # declined to compare a base with a tip, so the population is asserted
-        # before the absence is read.
-        self.assertEqual(len(gs), 1)
-        self.assertEqual(len(gs[0]["chains"]), 2)
-        self.assertIsNone(gs[0]["shared_tip"])
-        # AND THE COMPARISON IS ALIVE — the identical input with the build row
-        # re-filed as a REVIEW of that same tip DOES disclose. Without this the
-        # arm above would pass against a lrSharedTip that answered None always.
-        rows[1] = self.row(id="bbbbbbbbbbbb", lane="mixed", kind="review",
-                           review_sha_full=tip)
-        self.assertEqual(self.groups(rows)[0]["shared_tip"],
-                         {"tip": tip, "chains": 2})
-
-    def test_the_owners_three_row_lane_renders_as_ONE_box_with_THREE_inside(self):
-        """The rendering leg of the owner's own case. Verified in a browser on
-        the live board first (30 top-level entries where there were 41); this
-        pins the markup that produced it."""
-        LANE = "project-raw-batch-is-unproven-end-to-end"
-        tip = "46688400f249" + "0" * 28
-        rows = [self.row(id="aaaaaaaaaaaa", lane=LANE, review_sha_full=tip),
-                self.row(id="bbbbbbbbbbbb", lane=LANE, review_sha_full=tip),
-                self.row(id="cccccccccccc", lane=LANE, review_sha_full=tip)]
-        html = self.render(g={"__ghtml": rows})["g"]["html"]
-        # ONE BOX...
-        self.assertEqual(html.count('<div class="lrgrp multi">'), 1)
-        # ...HOLDING ALL THREE CARDS. Counted, so a box that swallowed two of
-        # them would fail here rather than pass as "nested".
-        self.assertEqual(html.count('<div class="lrrow '), 3)
-        # THE NAME IS PRINTED ONCE, AS THE CAPTION. It used to be the bold
-        # headline of every card as well — measured in the browser: four
-        # copies in one box, and three identical bold headlines still read as
-        # three identical strangers, which is the owner's complaint surviving
-        # inside its own cure.
-        self.assertIn('<span class="lrglane">' + LANE + "</span>", html)
-        self.assertNotIn('<div class="lrtitle">' + LANE + "</div>", html)
-        # each card leads with what actually tells it apart from its neighbours
-        for rid in ("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"):
-            self.assertIn("↳ chain " + rid, html)
-        # the count the owner reads off the box, and the evidence a name cannot
-        # give him
-        self.assertIn("3 chains · 3 rows", html)
-        self.assertIn("3 of these chains cite the SAME reviewed commit", html)
-
-    def test_a_lane_with_one_chain_and_one_row_is_drawn_EXACTLY_as_before(self):
-        """21 of the owner's 30 lanes are single rows. A grouping that
-        redecorated them would charge every quiet lane for a problem it does
-        not have — so this asserts BYTE EQUALITY with the ungrouped card."""
-        row = self.row(id="aaaaaaaaaaaa", lane="a-quiet-lane")
-        out = self.render(bare={"__row": row}, grouped={"__ghtml": [row]})
-        self.assertIn('class="lrrow', out["bare"]["html"])   # positive control
-        self.assertEqual(out["grouped"]["html"], out["bare"]["html"])
-
-    def test_earlier_rounds_are_FOLDED_and_still_reachable(self):
-        """Withholding must never remove access: the earlier rounds keep their
-        whole card, behind a labelled door with the fold state on it."""
-        rows = self.chain("r1", ["111111111111", "222222222222",
-                                 "333333333333"], "one-effort")
-        html = self.render(g={"__ghtml": rows})["g"]["html"]
-        self.assertEqual(html.count('<div class="lrrow '), 3,
-                         "all three rounds are RENDERED, none dropped")
-        self.assertIn("2 earlier rounds in this chain — tap to show", html)
-        self.assertIn('<div class="lrgearlier" hidden>', html)
-        # the round happening NOW is the one outside the fold
-        head, folded = html.split('<div class="lrgearlier" hidden>', 1)
-        self.assertIn('data-id="333333333333"', head)
-        self.assertIn('data-id="111111111111"', folded)
-        self.assertIn('data-id="222222222222"', folded)
-
-    def test_the_header_counts_the_grouping_it_actually_drew(self):
-        """A header counting a shape the body did not draw is this card's own
-        recorded failure, one axis over ('the count filtered and the list did
-        not'). And "in flight" is NOT redefined: it still counts ROWS, the
-        predicate `helm lr list` prints, because a noun on this card quietly
-        naming a second number is the defect task/324 exists to record."""
-        LANE = "shared-name"
-        rows = [self.row(id="aaaaaaaaaaaa", lane=LANE),
-                self.row(id="bbbbbbbbbbbb", lane=LANE),
-                self.row(id="cccccccccccc", lane="alone")]
-        html = self.render(c={"__d": self.board(rows), "__view": "list"})["c"]["html"]
-        counts = self.counts_span(html)
-        self.assertIn("3 in flight", counts)      # ROWS, unchanged
-        self.assertIn("3 chains", counts)         # distinct pieces of work
-        self.assertIn("2 lane names", counts)     # boxes drawn below
-        # and the body drew exactly that
-        body = html.split('<div class="lrrows">', 1)[1]
-        self.assertEqual(body.count('<div class="lrgrp multi">'), 1)
-
-    def test_the_two_views_differ_only_in_the_headline(self):
-        """THE CROSS-VIEW CONTRACT, NARROWED ON PURPOSE AND SAID OUT LOUD.
-
-        `test_the_list_view_is_byte_identical_row_markup_under_a_flat_wall`
-        pins that one row renders verbatim in both views, and that stays true
-        for independent rows. It cannot stay true for two rows sharing a NAME
-        in DIFFERENT states: the list boxes them under one caption, the board
-        puts them in different state columns where no caption exists, and a row
-        may only drop the name it prints when something above it prints that
-        name. So the headline is a fact about CONTEXT.
-
-        EVERY FACT ABOUT THE ROW STAYS BYTE-IDENTICAL, which is what that
-        contract protects — state, dwell, sha, author, polarity, marks, the
-        whole expand. This arm asserts that directly rather than trusting the
-        distinction: it removes ONLY the headline div from each rendering and
-        requires what is left to be equal."""
-        LANE = "one-name-two-efforts"
-        rows = [self.row(id="a" * 12, lane=LANE, state="OPEN"),
-                self.row(id="b" * 12, lane=LANE, state="READY")]
-        out = self.render(kb={"__d": self.board(rows), "__view": "kanban"},
-                          li={"__d": self.board(rows), "__view": "list"})
-        kb, li = out["kb"]["html"], out["li"]["html"]
-        # THE DIFFERENCE, NAMED. The board keeps the name on each card (its
-        # columns are STATES, so nothing else on screen would say it); the list
-        # prints it once as the caption and the cards name their chain.
-        # POSITIVE CONTROLS FIRST, one per rendering: both views drew the two
-        # cards at all. Every claim below is about WHICH headline they carry,
-        # and a view that rendered nothing would satisfy the assertNotIn.
-        for html in (kb, li):
-            for rid in ("a" * 12, "b" * 12):
-                self.assertIn('data-id="%s">' % rid, html)
-        # THE SAME OBSERVABLE, POSITIVELY: the list DOES draw a headline on
-        # each card — two of them — so "the lane name is not the headline"
-        # below is read off an element that exists, never off a missing one.
-        self.assertEqual(li.count('<div class="lrtitle"'), 2)
-        self.assertEqual(kb.count('<div class="lrtitle"'), 2)
-        self.assertIn('<div class="lrtitle">' + LANE + "</div>", kb)
-        self.assertNotIn('<div class="lrtitle">' + LANE + "</div>", li)
-        self.assertIn('<span class="lrglane">' + LANE + "</span>", li)
-        self.assertIn("↳ chain " + "a" * 12, li)
-        # ...AND NOTHING ELSE DIFFERS. Strip the headline from both renderings
-        # of each row and demand equality — a positive control first, so a
-        # regex that matched nothing cannot pass this as "equal".
-        strip = re.compile(r'<div class="lrtitle"[^>]*>.*?</div>')
-        for rid in ("a" * 12, "b" * 12):
-            pair = []
-            for html in (kb, li):
-                card = self.card_markup(html, rid)
-                self.assertIn('class="lrtitle"', card)     # positive control
-                pair.append(strip.sub("", card))
-            self.assertEqual(pair[0], pair[1],
-                             "row %s differs beyond its headline" % rid[:4])
-
-    def test_the_settled_subtraction_is_stated_where_the_number_is(self):
-        """The honored partition has been excluded from both counts since
-        2026-08-04 and was disclosed only in the closed footer, three screens
-        away. Measured 2026-08-12: a teammate with the ledger open and `git
-        merge-base` in hand read this board, concluded the header was counting
-        five settled confirmation rows as live debt, and went as far as trying
-        to `lr close` them (helm refused, correctly — they are the discharge
-        instrument). Nothing was wrong with the numbers; the disclosure was not
-        where the claim was."""
-        live = self.row(id="aaaaaaaaaaaa", lane="live-one")
-        settled = self.row(id="bbbbbbbbbbbb", lane="settled-one",
-                           state="SUPERSEDED", contrary_discharge="c",
-                           honored=True)
-        html = self.render(c={"__d": self.board([live, settled]),
-                              "__view": "list"})["c"]["html"]
-        counts = self.counts_span(html)
-        self.assertIn("1 in flight", counts)   # the settled row is NOT in it
-        self.assertIn("1 settled, not counted above", counts)
-        # NOT HIDDEN — it is still on the card, under the closed strip
-        self.assertIn('data-id="bbbbbbbbbbbb"', html)
 
 
 if __name__ == "__main__":
@@ -8178,6 +4728,36 @@ class ProjectionSurvivesARestartTest(LrApiBase):
         self.assertIsNone(web_cache.persist_load("t757", 30, self._snap("W1")),
                           "a body saved before the census stamp was restored "
                           "and would be split on fields it does not carry")
+        self._saved(now, wit="W1", body=body)
+        self.assertIsNotNone(
+            web_cache.persist_load("t757", 30, self._snap("W1")),
+            "the same record under the current schema was refused")
+
+    def test_a_body_saved_before_the_source_clean_exemption_is_refused_by_its_schema(self):
+        """task/3053, the author's ruling on the seam: `on_main_unverdicted`
+        now reads `source_clean_tip` off each card, and a HELD source-clean
+        row on trunk is a listed wait carrying `source_clean_on_main`. A body
+        saved under schema 5 carries neither, so on a matching witness its
+        source-clean hold would fold onto "on main with no verdict recorded"
+        again and the wall would call a clean read "a review that never
+        happened". A saved body proves its shape by its schema number, so the
+        number moved and 5 is refused. THE CONTROL: the same record under the
+        current schema is admitted."""
+        now = time.time()
+        path = web_cache._persist_path("t757")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        body = {"read_ts": now, "loops": [], "_scheduler_active_ids": [],
+                "_scheduler_rows": [{"id": "h", "kind": "review",
+                                     "state": "AWAITING_REVIEW",
+                                     "terminal": False, "honored": False,
+                                     "trunk_contains_tip": True,
+                                     "on_main_unverdicted": True}]}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"schema": 5, "stored_ts": now, "body": body,
+                       "input_witness": "W1"}, fh)
+        self.assertIsNone(web_cache.persist_load("t757", 30, self._snap("W1")),
+                          "a body saved before the source-clean exemption was "
+                          "restored and would fold a clean hold as no verdict")
         self._saved(now, wit="W1", body=body)
         self.assertIsNotNone(
             web_cache.persist_load("t757", 30, self._snap("W1")),

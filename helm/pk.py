@@ -11,6 +11,8 @@ and helm read/write the same files).
   - event()/read_events()      the ONE mutation-receipt chokepoint: every
                                store-adjacent WRITE appends one line to
                                _global/.state/events.jsonl (fire-ledger laws)
+  - launder()                  display-launder: strip C0/C1 (tab survives),
+                               Cf/Zl/Zp — shared by seats_common, todos, chat
 
 Import-safe, side-effect-free at import.
 """
@@ -19,6 +21,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 
 
 def slug(s, cap=60):
@@ -415,3 +418,21 @@ def read_events(limit=20):
         if isinstance(d, dict):
             out.append(d)
     return out
+
+
+# ---------------------------------------------------------------------------
+# display-launder — one shared strip-to-safe, everywhere else wraps it
+# ---------------------------------------------------------------------------
+
+
+def launder(s, keep="\t"):
+    """s without the characters that can reshape a terminal or rendered line:
+    C0/C1 controls (ESC included), format characters (bidi overrides
+    included) and line/paragraph separators, except those in `keep`.
+
+    One implementation for the display-launder helpers that wrap it:
+    seats_common._scrub, todos._scrub and chat._dsan. Takes a str; a caller
+    that also meets non-strings decides what they become (chat._dsan passes
+    them through)."""
+    return "".join(ch for ch in s if ch in keep
+                   or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))

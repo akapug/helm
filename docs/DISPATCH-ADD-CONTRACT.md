@@ -126,5 +126,5 @@ outcome explicitly — one of three states, not one unconditional assertion:
 
 A line reading `PENDING VERDICT / NEEDS CONFIRMATION` without one of these
 three outcomes is indistinguishable from the notification-having-been-posted
-case, which is how `opus-integrator` committed the exact bug this lane exists
-to fix (2026-07-27, `7524098`). The silence is the defect.
+case, which is how the bug this contract fixes was first committed. The
+silence is the defect.

@@ -280,6 +280,17 @@ def _proxy_live_text(family, seat=None):
     # whether the answer can be missing.
     shown = "port %d" % port if port is not None else \
         "port UNRESOLVED (no allocation entry, no config port)"
+    # AN OPERATOR'S `seat down` IS ITS OWN STATE ON THIS SCREEN, never folded
+    # into "proxy down" (which routes a maintainer to respawn it) and never
+    # into health. A proxy still running against the record is said as the
+    # contradiction it is. helm/seat_down.py owns the record.
+    from . import seat_down
+    down, unreadable = seat_down.read(family, seat or family)
+    if down:
+        return (("proxy UP pid %d %s — CONTRADICTS desired-down" % (pid, shown))
+                if pid else "proxy DOWN (desired)",
+                "%s; %s" % (seat_down.describe(down),
+                            seat_down.resume_hint(seat or family)))
     answering = port is not None and _port_open(port)
     why = raw = None
     if not pid:
@@ -309,11 +320,14 @@ def _proxy_live_text(family, seat=None):
     # after the drift marker so both can show — they are different failures.
     live += upstream_phrase(family, seat, compact=True)
     status, detail = proxy_drift(family, seat, record=rec)
+    marker = seat_down.unreadable_text(seat or family, unreadable) \
+        if unreadable else None
     if status == PROXY_STALE:
-        return live + " ⚠ STALE", detail
+        return live + " ⚠ STALE", "; ".join(x for x in (detail, marker) if x)
     if status == PROXY_UNKNOWN:
-        return live + " ⚠ drift UNKNOWN", "UNKNOWN — " + detail
-    return live, None
+        return live + " ⚠ drift UNKNOWN", "; ".join(
+            x for x in ("UNKNOWN — " + detail, marker) if x)
+    return live, marker
 
 
 _UNRESOLVED = "UNKNOWN — no catalog entry"
@@ -409,6 +423,22 @@ def _seat_row(family, usability=None):
         cred = "%s — %s" % (email, detail) if email else detail
     live, detail = _proxy_live_text(family)
     details = [(family, detail)] if detail else []
+    if fam.get("sidecar"):
+        # THE SECOND PROCESS IS NAMED ON THE ROW IT CAN SILENTLY BREAK. A
+        # proxy in front of a dead bridge reads "proxy UP" here, so the row
+        # carries the bridge's badge and the detail says why (task/1056).
+        # ONE PROBE A RENDER: the fleet join handed in has already read the
+        # bridge (seat_usability `_read_sidecar`), so its reading is reused.
+        from . import seat_sidecar
+        joined = (usability or {}).get(family) or {}
+        reading = (joined["sidecar"], joined.get("sidecar_why")) \
+            if joined.get("sidecar") else \
+            ("unreadable", joined["unknown"]["sidecar"]) \
+            if (joined.get("unknown") or {}).get("sidecar") else None
+        mark, why = seat_sidecar.badge(family, reading=reading)
+        live += mark
+        if why:
+            details.append((seat_sidecar.label(family), why))
     # ONE listdir for the instance census — asked twice, two renders could
     # disagree about which seats exist mid-scan and the zip below would pair a
     # usability verdict with the wrong proxy line.
@@ -419,10 +449,12 @@ def _seat_row(family, usability=None):
     # on the last PROXY line exactly as before — both are one-liners on a list
     # and neither is expressible on a concatenated string.
     # THE LAUNCH MODEL IS A PER-SEAT FACT NOW, so it is a column and not a
-    # family footnote: `instance_models` (seat_catalog) lets codex-4 launch
-    # gpt-5.6-sol while codex-7 stays gpt-6-astra off one family entry, and an
-    # operator who cannot SEE which is which has to read the catalog to know
-    # what a seat is running. Rendered for every row from the same resolver
+    # family footnote: `instance_models` (seat_catalog) lets one instance
+    # launch a model its siblings do not, off one family entry (no shipped
+    # family declares one: every codex runs gpt-6.1-sol, CODEX_MODEL_RULING),
+    # and an explicit --model pins a pane to another, so an operator who
+    # cannot SEE which is which has to read the catalog to know what a seat
+    # is running. Rendered for every row from the same resolver
     # the generator and the launch line use, so the screen cannot disagree
     # with the config; an undeclared instance shows its family's model, which
     # is the default it is declared to take.
@@ -503,6 +535,12 @@ def _seat_row(family, usability=None):
             interleaved.append(seat_usability.line(name, usability))
         lines = interleaved
     row = "\n".join(lines)
+    # THE OFF-PEAK GATE, when this family's config carries a gated provider:
+    # whether it is OPEN or CLOSED now and when that changes (UTC).
+    from . import offpeak
+    gate_line = offpeak.seat_line(family, family)
+    if gate_line:
+        row += "\n  " + gate_line
     if details:
         row += "\n" + "\n".join("  ⚠ %s: %s" % item for item in details)
     return row
@@ -709,6 +747,18 @@ def _status_render(fams):
                   % (f, e.__class__.__name__, e))
     for line in _population_note(rendered, fams):
         print(line)
+    # WHICH CODE IS RUNNING (task/2963): the proxy binary's own commit against
+    # its source checkout, so reading that checkout is not mistaken for it.
+    # The IMPORT is inside the guard too: status_lines never raises, and a
+    # reading that does not import is one UNKNOWN line, never a traceback.
+    try:
+        from . import buildskew
+        lines = buildskew.status_lines()
+    except Exception as e:                  # noqa: BLE001 — a status line
+        lines = ["  build: skew UNKNOWN (the reading did not load: %s)"
+                 % e.__class__.__name__]
+    for line in lines:
+        print(line)
     print(seat_usability.legend())
     return 0
 
@@ -841,6 +891,191 @@ def _alias_drift_lines():
     return out
 
 
+def _window_margin_lines():
+    """The lines of `_window_margin_rows`, for surfaces that only print."""
+    return [line for _failed, line in _window_margin_rows()]
+
+
+def _window_margin_rows():
+    """[(failed, line)]: one non-green row for every minted seat of a local
+    family whose EFFECTIVE window and output cap leave less than
+    LOCAL_COMPACTION_MARGIN of its server slot (task/3184), failed=True, or
+    whose stamps cannot be read, failed=False: an unreadable stamp is
+    UNKNOWN, printed loudly and never a verdict. Read-only.
+
+    EFFECTIVE, because a pin in the seat's own settings.json `env` outranks
+    the launch stamp (envtidy.seat_stamp), so a hand pin can re-open the
+    wedge the catalog closed, or close one a stale launch.sh still carries.
+    Each line names where both numbers came from, since the cure differs: a
+    stale launch stamp is re-minted by `helm seat resume`, and a settings pin
+    comes down by hand."""
+    from . import envtidy
+    from .seat_catalog import FAMILIES as catalog, compaction_margin_error, \
+        own_box
+    out = []
+    for family, seat in _minted_seats():
+        fam = catalog.get(family) or {}
+        if not own_box(fam):
+            continue
+        cdir = os.path.join(_proxy_home(family, seat), "claude")
+        window, wsrc = envtidy.seat_stamp(cdir, "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        output, osrc = envtidy.seat_stamp(cdir, "CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+        if window is None or output is None:
+            out.append((False, "window margin: %-9s UNKNOWN — no single "
+                        "readable %s in %s, so the compaction margin is "
+                        "unmeasured"
+                        % (seat, "window" if window is None else "output cap",
+                           wsrc if window is None else osrc)))
+            continue
+        reason = compaction_margin_error(seat, fam, window=window,
+                                         output=output)
+        if reason:
+            out.append((True, "window margin: %-9s NO MARGIN — %s (window "
+                        "from %s, output cap from %s; `helm seat resume` "
+                        "re-mints launch.sh from the catalog, and a "
+                        "settings.json env pin must come down by hand)"
+                        % (seat, reason, wsrc, osrc)))
+    return out
+
+
+def _profile_lines():
+    """The lines of `_profile_rows`, for surfaces that only print."""
+    return [line for _failed, line in _profile_rows()]
+
+
+def _profile_rows():
+    """[(failed, line)]: one row for EVERY minted seat whose family declares a
+    launch profile (task/3253, seat_catalog PROFILES) — `profile lite: <seat>
+    OK`, or DRIFT naming what differs between the seat's LIVE files and what
+    the catalog says its profile carries (failed=True), or UNKNOWN when a
+    file cannot be parsed (failed=False: an unreadable file is never a
+    verdict). Read-only. A line prints the profile knobs' values (counts)
+    and the paths the catalog derives, and nothing else from either file (an
+    MCP server appears by name only, never its config).
+
+    Each comparison is the profile's own switch, so the row is the
+    "maintained" half of the profile: a seat whose files fell behind the
+    catalog, or a hand edit that re-opened what the profile closed, reads
+    DRIFT instead of passing silently.
+      deny              every denied_tools entry is in settings.json
+                        `permissions.deny`;
+      env (pin_window)  each profile_env pin, for the model the seat's
+                        launch.sh runs, judged by the seeder's own rule
+                        (seat_catalog pin_action): a pin a resume would
+                        rewrite is DRIFT, and an operator's pin below the
+                        catalog, which every resume keeps, is named on its
+                        own line (`OK, operator pin X=N below the catalog M
+                        kept; lower the catalog if it is right`), never
+                        prescribed a resume;
+      claudeMdExcludes  (exclude_rules) the global-instructions entries every
+                        lite seat carries (_lite_md_excludes with no
+                        workdir), and every entry helm's own record names —
+                        a lite seat that loads the operator's rule files
+                        again is the regression this row exists to catch;
+      mcpServers        (mcp_floor) the seat's .claude.json carries no server
+                        above envtidy.MCP_FLOOR (a server there is surfaced,
+                        never removed, as `helm mcp sync` surfaces it).
+    The cure differs by line: `helm seat resume <seat>` re-seeds
+    settings.json from the catalog; an MCP server comes out by hand."""
+    from . import envtidy
+    from .seat_catalog import (FAMILIES as catalog, SEED_RECORD_EXCLUDES,
+                               SEED_RECORD_ENV, SEED_RECORD_KEY,
+                               denied_tools, instance_launch_model,
+                               launch_profile, pin_action, profile_env)
+    from .seat_launch_assets import _env_record, _lite_md_excludes
+    out = []
+    for family, seat in _minted_seats():
+        prof = launch_profile(family)
+        if not prof:
+            continue
+        head = "profile %s: %-9s" % (catalog[family]["profile"], seat)
+        d = _proxy_home(family, seat)
+        cdir = os.path.join(d, "claude")
+        settings, err = envtidy._read_json(os.path.join(cdir, "settings.json"))
+        state, serr = envtidy._read_json(os.path.join(cdir, ".claude.json"))
+        bad = ("settings.json" if err is not None or not isinstance(settings, dict)
+               else ".claude.json" if prof.get("mcp_floor") and (
+                   serr is not None or not isinstance(state, dict))
+               else None)
+        if bad:
+            out.append((False, "%s UNKNOWN — its %s cannot be read, so the "
+                        "profile is unmeasured" % (head, bad)))
+            continue
+        drift = []
+        perms = settings.get("permissions")
+        deny = perms.get("deny") if isinstance(perms, dict) else None
+        deny = deny if isinstance(deny, list) else []
+        lacks = [t for t in denied_tools(family) if t not in deny]
+        if lacks:
+            drift.append("deny lacks %s" % ", ".join(lacks))
+        env = settings.get("env")
+        env = env if isinstance(env, dict) else {}
+        rec = settings.get(SEED_RECORD_KEY)
+        rec = rec if isinstance(rec, dict) else {}
+        model = _minted_model(os.path.join(d, "launch.sh")) \
+            or instance_launch_model(catalog[family], seat)
+        # the seeder's own rule (seat_catalog pin_action): a pin a resume
+        # would rewrite is DRIFT; an operator's pin below the catalog is kept
+        # by every resume, so it is named, never prescribed a resume for
+        kept = []
+        pinned = _env_record(rec.get(SEED_RECORD_ENV))
+        for k, v in profile_env(family, model):
+            act = pin_action(env.get(k), v, pinned.get(k))
+            if k not in env:
+                drift.append("env lacks %s=%s" % (k, v))
+            elif act == "write":
+                drift.append("env %s is %.32s, the catalog says %s"
+                             % (k, env[k], v))
+            elif act == "keep-lower":
+                kept.append("operator pin %s=%s below the catalog %s kept"
+                            % (k, env[k], v))
+        if prof.get("exclude_rules"):
+            excl = settings.get("claudeMdExcludes")
+            excl = excl if isinstance(excl, list) else []
+            recorded = rec.get(SEED_RECORD_EXCLUDES)
+            want = _lite_md_excludes() + [
+                x for x in (recorded if isinstance(recorded, list) else [])
+                if isinstance(x, str)]
+            missing = [x for x in dict.fromkeys(want) if x not in excl]
+            if missing:
+                drift.append("claudeMdExcludes lacks %s" % ", ".join(missing))
+        if prof.get("mcp_floor"):
+            servers = state.get("mcpServers")
+            above = sorted(n for n in (servers if isinstance(servers, dict)
+                                       else {}) if n not in envtidy.MCP_FLOOR)
+            if above:
+                drift.append("MCP servers above the floor (%s): %s"
+                             % (", ".join(envtidy.MCP_FLOOR), ", ".join(above)))
+        note = ("%s; lower the catalog if it is right" % ", ".join(kept)
+                if kept else "")
+        if drift:
+            out.append((True, "%s DRIFT — %s (`helm seat resume %s` re-seeds "
+                        "settings.json from the catalog; an MCP server comes "
+                        "out by hand)" % (head, "; ".join(drift), seat)))
+            if note:
+                out.append((False, "%s %s" % (head, note)))
+        else:
+            out.append((False, "%s OK%s" % (head, ", " + note if note else "")))
+    return out
+
+
+def _toolless_lines():
+    """One TOOLLESS line per minted seat whose proxy.log shows the model
+    answering turn after turn with no tool call — proxywatch's own reader and
+    predicate, so doctor and the watch cannot disagree about a seat."""
+    from . import proxywatch
+    out = []
+    for family, seat in _minted_seats():
+        if proxywatch._desired_down(family, seat)[0]:
+            continue        # stood down by an operator: proxywatch's own skip
+        seen = proxywatch.toolless_observation(
+            os.path.join(_proxy_home(family, seat), "proxy.log"))
+        if proxywatch.toolless_reading({"family": family,
+                                        "log_toolless": seen}):
+            out.append("toolless: " + proxywatch.toolless_text(seat, seen))
+    return out
+
+
 def _doctor(args):
     b = _proxy_bin()
     binary_ok = False
@@ -870,8 +1105,31 @@ def _doctor(args):
             cstate, pct, window, note = _cpu_canary(family, seat, pid)
             print("cpu canary: %-9s %-9s %s"
                   % (seat, cstate.upper(), _canary_text(cstate, pct, window, note)))
+    # a seat whose model answers every turn with text and calls no tool looks
+    # alive and does no work (task/3533): a real negative, so it fails the
+    # exit status like drift
+    toolless = _toolless_lines()
+    for ln in toolless:
+        print(ln)
     drift = _config_drift_lines()
     for ln in drift:
+        print(ln)
+    # a local seat whose window leaves no compaction margin is a real negative
+    # (one large tool result wedges it), so it fails the exit status like drift
+    margin = _window_margin_rows()
+    for _failed, ln in margin:
+        print(ln)
+    # a lite seat whose live files drifted from its profile is a real negative
+    # too (task/3253): it is carrying the weight the profile exists to shed
+    profile = _profile_rows()
+    for _failed, ln in profile:
+        print(ln)
+    # a seat whose launch.sh would start a model (or env) a fresh mint would
+    # not write is the silent case that left gemini dead on a retired route:
+    # DRIFT fails the exit status, an unreadable script prints UNKNOWN only
+    from . import seat_remint
+    launch = seat_remint.doctor_rows()
+    for _failed, ln in launch:
         print(ln)
     try:      # proxy-seat context% + autocompact latch — read-only visibility
         from . import autocompact
@@ -886,7 +1144,8 @@ def _doctor(args):
     # every unreadable case as WARN and reserves exit 1 for a proven FAIL —
     # an exit 1 here would tell a machine "this fleet's creds are broken" on
     # the strength of a probe that could not see them.
-    return 0 if binary_ok and c and not drift \
+    return 0 if binary_ok and c and not drift and not toolless \
+        and not any(failed for failed, _ln in margin + profile + launch) \
         and cstate not in (CRED_EXPIRED, CRED_ABSENT) else 1
 
 
@@ -1038,8 +1297,12 @@ def _ensure_quiet_heartbeat_path():
     return os.path.join(base, "doctor-ensure.json")
 
 
-def _ensure_quiet_heartbeat(total):
-    """Publish one bounded proof-of-run line, then latch its cadence."""
+def _ensure_quiet_heartbeat(total, sidecars=0, down=()):
+    """Publish one bounded proof-of-run line, then latch its cadence.
+
+    `down` names the rows an operator stood down. They are enumerated rows,
+    so they count toward `total`, and they are NOT healthy, so the line says
+    them separately rather than folding them into the HEALTHY count."""
     now = time.time()
     interval = max(0.0, _env_float("ENSURE_QUIET_HEARTBEAT_S", "3600"))
     path = _ensure_quiet_heartbeat_path()
@@ -1054,8 +1317,13 @@ def _ensure_quiet_heartbeat(total):
 
     # Publication precedes the latch: if stdout fails, the next cron run must
     # retry rather than trusting a heartbeat that never reached the log.
-    print("helm seat doctor --ensure: HEARTBEAT — %d proxy row(s) HEALTHY"
-          % total)
+    down = list(down)
+    healthy = total - sidecars - len(down)
+    print("helm seat doctor --ensure: HEARTBEAT — %d proxy row(s) HEALTHY%s%s"
+          % (healthy,
+             " and %d sidecar row(s)" % sidecars if sidecars else "",
+             "; %d DOWN by operator (%s)" % (len(down), ", ".join(down))
+             if down else ""))
     tmp = path + ".%d.tmp" % os.getpid()
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
@@ -1072,12 +1340,27 @@ def _ensure_quiet_heartbeat(total):
     return True
 
 
-def _ensure_row(family, seat):
+def _ensure_row(family, seat, marker=None):
     """One proxy's supervise-verdict: (label, state, detail). state is
-    "healthy" | "respawned" | "unknown". The reconciler's whole job is to make
-    every row provably one of the first two; a row it cannot prove is UNKNOWN,
-    never a silent down/up (the fleet-truth fail-closed law)."""
+    "healthy" | "respawned" | "unknown" | "down". The reconciler's whole job is
+    to make every row provably one of the first two; a row it cannot prove is
+    UNKNOWN, never a silent down/up (the fleet-truth fail-closed law).
+
+    "down" is the OPERATOR'S state, not a verdict this function reached: the
+    seat carries a desired-down record (`helm seat down`, helm/seat_down.py),
+    so nothing here probes, reconciles, signals or respawns it. `marker` is
+    the (record, error) the caller already read, so one pass reads the record
+    once; an unreadable record (error set) is supervised exactly as an absent
+    one, and the caller says so."""
     label = family if seat == family else seat
+    from . import seat_down
+    down = (marker if marker is not None else seat_down.read(family, seat))[0]
+    if down:
+        pid = _running_pid(family, seat)
+        return (label, "down", "%s; not respawned — %s%s" % (
+            seat_down.describe(down), seat_down.resume_hint(seat),
+            "; ⚠ CONTRADICTION: proxy pid %d is still running against it — "
+            "`helm seat down %s` stops it" % (pid, seat) if pid else ""))
     port = _existing_instance_port(family, seat)   # reader, not admission
     if port is None:
         # UNRESOLVED IS UNKNOWN, and it is answered BEFORE the first `%d`. The
@@ -1158,6 +1441,39 @@ def _ensure_row(family, seat):
     return (label, "unknown", "post-respawn probe could not prove healthy")
 
 
+def _ensure_walk():
+    """(label, family, seat, state, detail, process, marker) per supervised
+    process. `marker` is the seat's desired-down (record, error), read ONCE
+    here so a down seat is honoured before any probe or respawn (the caller
+    never re-derives); a sidecar row carries no record — it is family-level —
+    and rides (None, None).
+
+    A family that declares a `sidecar` yields its sidecar row FIRST, so the
+    proxy row after it runs against a bridge this pass has already started:
+    a respawned proxy in front of a dead bridge would read fixed and serve
+    nothing. The sidecar is family-level (one base_url, one port), so it rides
+    the family seat's row and never an instance's. Every other family yields
+    exactly the one proxy row it always did.
+
+    A SUPERVISOR THAT RAISES IS AN UNKNOWN ROW, never an aborted walk: one
+    broken sidecar must not take every other seat's verdict down with it."""
+    from . import seat_down
+    for family, seat in _minted_seats():
+        if seat == family and (FAMILIES.get(family) or {}).get("sidecar"):
+            from . import seat_sidecar
+            try:
+                label, state, detail = seat_sidecar.ensure_row(family)
+            except Exception as exc:        # noqa: BLE001 — a watchdog never raises
+                label, state, detail = (
+                    seat_sidecar.label(family), "unknown",
+                    "the sidecar supervisor raised %s: %s"
+                    % (exc.__class__.__name__, exc))
+            yield label, family, seat, state, detail, "sidecar", (None, None)
+        marker = seat_down.read(family, seat)
+        label, state, detail = _ensure_row(family, seat, marker=marker)
+        yield label, family, seat, state, detail, "proxy", marker
+
+
 def _codexhomes():
     """The module that owns pool-side codex auth — imported lazily, because
     `seat doctor` must keep working on a host that has no codex pool at
@@ -1192,6 +1508,13 @@ def _ensure(args):
     emits the full machine-read rows; --quiet emits only non-healthy/action
     rows, with one periodic heartbeat when every enumerated row is healthy.
     An empty enumeration is one UNKNOWN in every contract, never success.
+
+    A seat an operator stood down (`helm seat down`, helm/seat_down.py) is a
+    DOWN row: never respawned, never canaried, never counted healthy or
+    UNKNOWN, and it never moves rc. --quiet leaves a steady DOWN row to the
+    heartbeat, which names it; a DOWN row whose proxy is still running is
+    printed on every contract. A record helm cannot read is supervised as if
+    absent, printed on every contract, and makes the pass a WARN (rc 1).
 
     The pass also runs the ORCA CRED-FOLLOW rung (`helm seat cred-follow`)
     with apply: a proxy that is up and healthy on a credential the owner has
@@ -1235,15 +1558,28 @@ def _ensure(args):
             and _codexhomes().cred_follow_noteworthy(follow):
         for line in _codexhomes().cred_follow_lines(follow):
             print(line)
-    unknown = thrash = cpu_unknown = total = visible = 0
-    rows = []
-    for family, seat in _minted_seats():
+    unknown = thrash = cpu_unknown = total = visible = sidecars = unreadable = 0
+    rows, down_rows = [], []
+    from . import seat_down
+    for label, family, seat, state, detail, process, marker in _ensure_walk():
         total += 1
-        label, state, detail = _ensure_row(family, seat)
+        sidecars += process != "proxy"
         cpu = None
+        # A DOWN ROW IS STEADY unless a proxy still runs against it: the
+        # --quiet cron surface then leaves it to the heartbeat, which names it,
+        # instead of printing the same operator decision every three minutes.
+        steady = state == "down" and not _running_pid(family, seat)
+        if marker[1]:
+            # SUPERVISED, AND SAID ON EVERY CONTRACT. The row above was
+            # supervised as if the record were absent; the sentence rides the
+            # row, the row is never quiet, and the pass is a WARN.
+            unreadable += 1
+            detail += " — ⚠ " + seat_down.unreadable_text(label, marker[1])
         if state == "unknown":
             unknown += 1
-        elif state == "healthy":
+        elif state == "down":
+            down_rows.append(label)
+        elif state == "healthy" and process == "proxy":
             # canary only on a proven-live row: DOWN just respawned (its own
             # tri-state arm), and a fresh respawn is inside its startup burst
             # by definition. A pid that vanished between the row's probe and
@@ -1260,13 +1596,26 @@ def _ensure(args):
             elif cstate == "unknown":
                 cpu_unknown += 1
             detail += " — " + _canary_text(*cpu)
+        if state == "healthy" and (process != "proxy" or
+                                   cpu is not None and cpu[0] == "ok"):
+            # steady includes a healthy SIDECAR row: the canary is proxy-
+            # level, and --quiet leaves a healthy sidecar to the heartbeat,
+            # which counts it as its own row(s).
+            steady = True
         if as_json:
-            rows.append({"seat": label, "family": family, "state": state,
-                         "shown": shown, "detail": detail,
-                         "cpu": None if cpu is None else
-                         {"state": cpu[0], "pct": cpu[1],
-                          "window_s": cpu[2], "note": cpu[3]}})
-        elif not quiet or state != "healthy" or cpu is None or cpu[0] != "ok":
+            row = {"seat": label, "family": family, "state": state,
+                   "shown": shown, "detail": detail,
+                   "desired_down": marker[0],
+                   "marker_error": marker[1],
+                   "cpu": None if cpu is None else
+                   {"state": cpu[0], "pct": cpu[1],
+                    "window_s": cpu[2], "note": cpu[3]}}
+            if process != "proxy":
+                # the sidecar row says it is one; a proxy row keeps the shape
+                # every existing reader of this payload already parses
+                row["process"] = process
+            rows.append(row)
+        elif not quiet or not steady or marker[1]:
             visible += 1
             print("%-10s %-9s %s" % (label, shown.upper(), detail))
     if not total:
@@ -1281,11 +1630,17 @@ def _ensure(args):
             print("helm seat doctor --ensure: UNKNOWN — " + detail,
                   file=sys.stderr)
     elif quiet and not visible:
-        _ensure_quiet_heartbeat(total)
-    rc = 2 if unknown else (1 if thrash or cpu_unknown else 0)
+        _ensure_quiet_heartbeat(total, sidecars, down_rows)
+    # DOWN NEVER MOVES rc: an operator's decision is not a failure, and a
+    # watchdog that pages on it teaches the operator to stop reading it. An
+    # UNREADABLE record is a WARN — the seat was supervised, and the marker
+    # the operator believes is in force is not.
+    rc = 2 if unknown else (1 if thrash or cpu_unknown or unreadable else 0)
     if as_json:
         print(json.dumps({"rows": rows, "unknown": unknown,
                           "thrashing": thrash, "cpu_unknown": cpu_unknown,
+                          "down": len(down_rows),
+                          "marker_unreadable": unreadable,
                           "cred_follow": follow, "rc": rc},
                          indent=2, sort_keys=True))
     if unknown:
@@ -1297,4 +1652,8 @@ def _ensure(args):
               "row(s); a pegged proxy is a struggling backend (the leading "
               "indicator before silent death)" % (thrash, cpu_unknown),
               file=sys.stderr)
+    if unreadable:
+        print("helm seat doctor --ensure: WARN — %d desired-down record(s) "
+              "UNREADABLE; those seats were supervised as if no record "
+              "existed (see the row)" % unreadable, file=sys.stderr)
     return rc

@@ -25,8 +25,10 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests._tmphome import declaring as _tmp_declaring  # noqa: E402
+from tests import _pids  # noqa: E402
+from tests import _roomclock  # noqa: E402
 
-from helm import projscope, seats, vcs, work  # noqa: E402
+from helm import gateslice, projscope, seats, vcs, work  # noqa: E402
 from helm.work import _guard as _work_guard  # noqa: E402
 from helm.work import _claims as _work_claims  # noqa: E402
 from helm.work import _cli as _work_cli  # noqa: E402
@@ -46,6 +48,47 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
 def _sh(cwd, *args):
     return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True,
                           timeout=30)
+
+
+_NO_SUCH_PID = _pids.DEAD_PID  # the suite's one dead-pid fixture (tests/_pids.py)
+
+
+def _plant_process(proc, pid, argv, ppid=1, comm="python3", cwd=None):
+    """One row of a PLANTED process table, in the files the occupancy readers
+    open: cmdline (NUL-separated argv), stat (the parent after the comm's
+    last ')') and, for a process in a room, the cwd link."""
+    d = os.path.join(proc, str(pid))
+    os.makedirs(d)
+    with open(os.path.join(d, "cmdline"), "wb") as f:
+        f.write(b"\0".join(a.encode() for a in argv) + b"\0")
+    with open(os.path.join(d, "stat"), "wb") as f:
+        f.write(("%d (%s) S %d 0 0 0" % (pid, comm, ppid)).encode())
+    if cwd:
+        os.symlink(cwd, os.path.join(d, "cwd"))
+
+
+def _planted_readers(module, table):
+    """Patch every occupancy reader `module` imported so each reads the
+    PLANTED process table `table` instead of /proc: the census, the
+    placeholder query and the occupant lines, through the proc_root each
+    already takes. No process on the host, the runner hosting the suite
+    included, can enter the table."""
+    from helm.work import _lanes
+    readers = {
+        "_occupants": lambda path: _lanes._occupants_many(
+            [path], proc_root=table)[0][path],
+        # _peek imports the many-room census as well (its reuse path reads
+        # it), so "every reader it imported" includes this one.
+        "_occupants_many": lambda paths: _lanes._occupants_many(
+            paths, proc_root=table),
+        "_disposable_worktree_occupant": lambda pid:
+            _lanes._disposable_worktree_occupant(pid, proc_root=table),
+        "describe_occupants": lambda pids, disposable=():
+            _lanes.describe_occupants(pids, disposable=disposable,
+                                      proc_root=table),
+    }
+    return mock.patch.multiple(module, **{k: v for k, v in readers.items()
+                                          if hasattr(module, k)})
 
 
 def _hook_tree(root):
@@ -109,7 +152,21 @@ class WorkBase(unittest.TestCase):
         os.environ["HELM_PRIVATE_NEEDLES"] = os.path.join(
             self.tmp, "no-needles-configured.txt")
         self.root = os.path.join(self.tmp, "proj")
-        os.makedirs(self.root)
+        # THE SAME SEEDED REPOSITORY EVERY TIME, SO IT IS BUILT ONCE (task/3039):
+        # six git spawns per test across every WorkBase arm. Each test gets
+        # its own whole copy (`WorkBase._seeded`), so nothing it writes reaches
+        # the template or the next test.
+        from tests._tmphome import repo_from_template
+        repo_from_template("work-base", WorkBase._seeded, self.root)
+
+    @staticmethod
+    def _seeded(root):
+        """The fixture repository at `root`: `main` holding one seed commit.
+        Run once per process; see setUp.
+
+        EACH STEP RAISES, NEVER A BARE `assert`: `python -O` strips an
+        assert, and a seed whose git step failed would then be the template
+        every later test in the process copies."""
         for cmd in (("git", "init", "-q", "-b", "main"),
                     ("git", "config", "user.email", "t@t"),
                     ("git", "config", "user.name", "t"),
@@ -118,12 +175,16 @@ class WorkBase(unittest.TestCase):
                     # now defaults to the leak legs (task/2441).
                     ("git", "config", "--local",
                      "helm.guard.profile", "rail")):
-            self.assertEqual(_sh(self.root, *cmd).returncode, 0)
-        with open(os.path.join(self.root, "README"), "w") as f:
+            r = _sh(root, *cmd)
+            if r.returncode != 0:
+                raise AssertionError((cmd, r.stderr))
+        with open(os.path.join(root, "README"), "w") as f:
             f.write("seed\n")
-        _sh(self.root, "git", "add", "-A")
-        r = _sh(self.root, "git", "commit", "-q", "-m", "seed")
-        self.assertEqual(r.returncode, 0, r.stderr)
+        _sh(root, "git", "add", "-A")
+        r = _sh(root, "git", "commit", "-q", "-m", "seed")
+        if r.returncode != 0:
+            raise AssertionError(r.stderr)
+        return {}
 
     def tearDown(self):
         for k, v in self.env_prior.items():
@@ -145,8 +206,15 @@ class WorkBase(unittest.TestCase):
             rc = work.cmd_work(list(args) + ["--repo", self.root])
         return rc, out.getvalue(), err.getvalue()
 
-    def room(self, lane, dirty=None):
+    def room(self, lane, dirty=None, aged=False):
         """Mint a lease-less room directly (git only, never the desk).
+
+        `aged` says the room is an ABANDONED claim: its reflog clock is
+        back-dated past the grace a sweep gives a room nobody has committed
+        in (`_gc._UNSTARTED_GRACE_S`). A fresh room at the trunk is a builder
+        about to commit, and no sweep removes it (task/3428); the arms that
+        need a room the sweep WILL remove, and are about something else —
+        a pane, an occupant, a lock, the summary — say which kind they mean.
 
         Carries HELM_WORK_INTEGRATOR=1 because once the ref-guard is installed
         this raw `worktree add -b` is REFUSED by design — minting a branch in
@@ -161,6 +229,8 @@ class WorkBase(unittest.TestCase):
                            timeout=30,
                            env=dict(os.environ, HELM_WORK_INTEGRATOR="1"))
         self.assertEqual(r.returncode, 0, r.stderr)
+        if aged:
+            _roomclock.age_room(path)
         if dirty:
             with open(os.path.join(path, dirty), "w") as f:
                 f.write("precious uncommitted bytes\n")
@@ -706,6 +776,79 @@ class ReleaseTest(WorkBase):
             proc.terminate()
             proc.wait()
 
+    def test_occupied_refusal_names_each_occupant_and_never_says_kill(self):
+        """THE FAILURE MODE: the refusal read "OCCUPIED by cwd pid(s)
+        N ... move every live pane/process out before release", a local model
+        took that as permission to kill N, and N was helm's OWN detached
+        `python -m helm.findingspass`, which exits by itself. The refusal now
+        names each occupant by pid AND command line and says whose it is:
+        helm's own self-exiting worker reads WAIT, a descendant of one reads
+        as part of it, anything else reads as its owner's to move, and no line
+        suggests a signal. Mutation killed: the old pid-list-plus-imperative
+        line fails every assertion below.
+
+        THE PROCESS TABLE IS PLANTED. The classifier walks each occupant's
+        ancestry, and on the train267 and train272 gates the real table put
+        helm's gate child above this arm's own `sleep`, which then read as
+        HELM'S OWN (OccupiedArmUnderHelmsOwnRunnerTest). Every row the release
+        reads is planted here: the cwd link, the command line, the parent.
+        The gate-child ancestry is planted ON PURPOSE for one occupant, so
+        the arm still pins the descendant rule. The real processes stand
+        OUTSIDE the room, so only a census that reads the planted table finds
+        them, and only lines that read it name the planted command lines.
+        Each planted occupant is a real `sleep` this arm started, so a
+        release that signalled one would be seen."""
+        rc, out, _err = self.work("claim", "demo", "--seat", "s1")
+        path, _branch, lease, _ttl = out.strip().split("\t")
+        procs = []
+        for _ in range(3):
+            procs.append(subprocess.Popen(
+                ["sleep", "30"], cwd=self.tmp, preexec_fn=lambda:
+                signal.signal(signal.SIGHUP, signal.SIG_DFL)))
+            self.addCleanup(procs[-1].wait)
+            self.addCleanup(procs[-1].terminate)
+        ours, child, theirs = procs
+        table, gate, shell = (os.path.join(self.tmp, "proc"), _NO_SUCH_PID,
+                              _NO_SUCH_PID + 1)
+        _plant_process(table, ours.pid, ["/usr/bin/python3", "-m",
+                                         "helm.findingspass", "deadbeefcafe"],
+                       cwd=path)
+        _plant_process(table, gate, ["/usr/bin/python3",
+                                     "/opt/helm/helm/gatechild.py", "--guard",
+                                     "--", "/usr/bin/python3", "-m", "unittest"])
+        _plant_process(table, child.pid, ["/usr/bin/python3", "-m", "unittest",
+                                          "tests.test_x"], ppid=gate, cwd=path)
+        _plant_process(table, shell, ["bash", "--login"], comm="bash")
+        _plant_process(table, theirs.pid, ["sleep", "30"], ppid=shell,
+                       comm="sleep", cwd=path)
+        with _planted_readers(_work_claims, table):
+            rc, _out, err = self.work("release", "demo", "--seat", "s1",
+                                      "--lease", lease)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("OCCUPIED", err)
+        line = {p.pid: [l for l in err.splitlines() if "pid %d " % p.pid in l]
+                for p in (ours, child, theirs)}
+        self.assertEqual(len(line[ours.pid]), 1, err)
+        self.assertIn("helm.findingspass deadbeefcafe", line[ours.pid][0])
+        self.assertIn("HELM'S OWN", line[ours.pid][0])
+        self.assertIn("exits by itself", line[ours.pid][0])
+        self.assertIn("WAIT", line[ours.pid][0])
+        self.assertEqual(len(line[child.pid]), 1, err)
+        self.assertIn("HELM'S OWN", line[child.pid][0])
+        self.assertIn("exits by itself", line[child.pid][0])
+        self.assertIn("WAIT", line[child.pid][0])
+        self.assertIn("part of a helm gate's test child (pid %d)" % gate,
+                      line[child.pid][0])
+        self.assertEqual(len(line[theirs.pid]), 1, err)
+        self.assertIn("sleep 30", line[theirs.pid][0])
+        self.assertIn("NOT helm's", line[theirs.pid][0])
+        for word in ("kill", "signal", "sigterm", "move every live"):
+            self.assertNotIn(word, err.lower())
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(len(seats.claims_list()), 1)
+        self.assertEqual([p.poll() for p in (ours, child, theirs)],
+                         [None, None, None], "a release signalled an occupant")
+
     def test_release_landed_room_stops_only_disposable_orca_shell(self):
         if not os.path.isdir("/proc"):
             self.skipTest("cwd occupancy proof requires /proc")
@@ -1201,6 +1344,215 @@ class SupersededReleaseRetiresTheRoomAndKeepsTheWorkTest(WorkBase):
         self.assertEqual(len(seats.claims_list()), 1)
 
 
+class ReleaseJudgesTheRoomByWhatItHoldsTest(WorkBase):
+    """task/3125: release judged the ROOM by the LEASE BRANCH.
+
+    The failure: `helm work release <lane>` printed "deleted branch
+    lane/<lane> — LANDED by ancestry" and "room … removed" while the room had
+    a different branch checked out, at a commit that is not on the trunk.
+    Nothing was lost there only because that other branch still held the
+    commits. A DETACHED room with unique commits loses them: its HEAD reflog
+    goes with the worktree.
+
+    Two proofs, two acts. The lease branch is deleted on the lease branch's
+    own proof, as before. The room is removed only on a proof about what the
+    room itself has checked out, and a detached or mid-operation room is
+    manual-only, the way `gc_scan` already treats it."""
+
+    def claimed(self, lane):
+        """(path, lease) for a fresh room on lane/<lane>, at the trunk."""
+        rc, out, err = self.work("claim", lane, "--seat", "s1")
+        self.assertEqual(rc, 0, err)
+        path, branch, lease, _ttl = out.strip().split("\t")
+        self.assertEqual(branch, work.lane_branch(lane))
+        return path, lease
+
+    def git(self, cwd, *args):
+        r = _sh(cwd, "git", *args)
+        self.assertEqual(r.returncode, 0, "git %s: %s" % (args, r.stderr))
+        return r.stdout.strip()
+
+    def commit(self, path, name):
+        """HEAD after one commit in `path` that no trunk commit carries."""
+        with open(os.path.join(path, name), "w") as f:
+            f.write("work that is not on the trunk: %s\n" % name)
+        self.git(path, "add", "-A")
+        self.git(path, "commit", "-q", "-m", name)
+        return self.git(path, "rev-parse", "HEAD")
+
+    def release(self, lane, lease, *extra):
+        rc, out, err = self.work("release", lane, "--seat", "s1",
+                                 "--lease", lease, *extra)
+        self.assertEqual(rc, 0, err)
+        return out
+
+    def test_a_room_on_ANOTHER_branch_with_unlanded_work_is_KEPT_and_NAMED(self):  # noqa: VACUOUS_ASSERTION — the absences (no removal line, no LANDED line, no lease, no lease branch) are the contract; the unconditional positives are the room still on disk at its tip, the TRIAGE line naming the room's branch, and that branch still at its tip
+        """(a) The symptom as measured: the lease branch is at the trunk, the
+        room holds a different branch one commit ahead of it."""
+        path, lease = self.claimed("rev3099")
+        self.git(path, "checkout", "-q", "-b", "reviewer/rev3099")
+        tip = self.commit(path, "review.txt")
+        self.assertTrue(work._merged(self.root, "lane/rev3099"),
+                        "fixture: the LEASE branch is at the trunk")
+        self.assertFalse(work._merged(self.root, "reviewer/rev3099"),
+                         "fixture: what the room holds is not on the trunk")
+
+        out = self.release("rev3099", lease)
+        self.assertTrue(os.path.isdir(path),
+                        "release removed a room whose checkout is not on the "
+                        "trunk:\n%s" % out)
+        self.assertEqual(self.git(path, "rev-parse", "HEAD"), tip)
+        self.assertNotIn("room %s removed" % path, out)
+        named = [l for l in out.splitlines() if "reviewer/rev3099" in l]
+        self.assertIn("TRIAGE rev3099 (reviewer/rev3099)", "\n".join(named),
+                      "no triage line names the branch the room holds:\n%s"
+                      % out)
+        self.assertEqual([l for l in named if "LANDED" in l], [],
+                         "a line calls the room's own work LANDED")
+        self.assertEqual(seats.claims_list(), [],
+                         "the lease itself still releases")
+        self.assertFalse(work._has_branch(self.root, "lane/rev3099"),
+                         "the lease branch retires on its own proof")
+        self.assertEqual(self.git(self.root, "rev-parse", "reviewer/rev3099"),
+                         tip, "the room's branch is not release's to touch")
+
+    def test_a_DETACHED_room_with_unique_commits_is_KEPT_MANUAL_ONLY(self):  # noqa: VACUOUS_ASSERTION — the released lease is the one absence; the positives are the room on disk at its HEAD and exactly one room line carrying gc's own manual-only wording and the HEAD sha
+        """(b) The case that loses work: the commit is reachable only from the
+        room's HEAD, so removing the room orphans it while the output still
+        says LANDED."""
+        path, lease = self.claimed("det3099")
+        self.git(path, "checkout", "-q", "--detach")
+        head = self.commit(path, "detached.txt")
+
+        out = self.release("det3099", lease)
+        self.assertTrue(os.path.isdir(path),
+                        "release removed a DETACHED room holding a commit "
+                        "nothing else reaches:\n%s" % out)
+        self.assertEqual(self.git(path, "rev-parse", "HEAD"), head)
+        self.assertEqual(seats.claims_list(), [])
+        line = [l for l in out.splitlines() if "room %s" % path in l]
+        self.assertEqual(len(line), 1, out)
+        self.assertIn("manual-only", line[0])
+        self.assertIn("DETACHED", line[0])
+        self.assertIn(head[:12], line[0])
+        # THE SAME WORDS AS GC, read from gc itself rather than copied here.
+        row = next(r for r in work.gc_scan(self.root) if r["path"] == path)
+        self.assertTrue(row["manual_only"])
+        self.assertIn(row["why"], line[0])
+
+    def test_CONTROL_a_room_on_its_lease_branch_that_landed_retires_as_before(self):  # noqa: VACUOUS_ASSERTION — a retirement is an absence by definition; the positives are the two exact output lines, the removal line and the ancestry deletion line, that say this call did it
+        """(c) Room and branch both retire, with the same two lines as
+        before this change."""
+        path, lease = self.claimed("ctl3099")
+        out = self.release("ctl3099", lease)
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(work._has_branch(self.root, "lane/ctl3099"))
+        lines = out.splitlines()
+        self.assertIn("helm work: room %s removed" % path, lines)
+        self.assertIn("helm work: deleted branch lane/ctl3099 — LANDED by "
+                      "ancestry (the tip itself is on the trunk)", lines)
+        self.assertEqual(seats.claims_list(), [])
+
+    def test_a_room_on_ANOTHER_LANDED_branch_retires_and_that_branch_stays(self):  # noqa: VACUOUS_ASSERTION — the retired room and lease branch are absences by definition; the positives are the other branch still present and exactly one line naming it with its proof
+        """(d) The room is removed on the proof about what it holds, and the
+        line says so. The other branch is left alone: release deletes only
+        its own lease branch, and that branch may belong to someone else."""
+        path, lease = self.claimed("done3099")
+        self.git(path, "checkout", "-q", "-b", "reviewer/done3099")
+        out = self.release("done3099", lease)
+        self.assertFalse(os.path.exists(path), out)
+        self.assertTrue(work._has_branch(self.root, "reviewer/done3099"),
+                        "release deleted a branch that is not its lease's")
+        self.assertFalse(work._has_branch(self.root, "lane/done3099"))
+        named = [l for l in out.splitlines() if "reviewer/done3099" in l]
+        self.assertEqual(len(named), 1, out)
+        self.assertIn("LANDED by ancestry", named[0])
+        self.assertIn("left in place", named[0])
+
+    def test_the_ROOM_and_the_LEASE_BRANCH_are_judged_apart(self):  # noqa: VACUOUS_ASSERTION — the retired room and the two false phrases are absences; the positives are the lease branch at its unlanded tip, the other branch present, and the triage line with the disposition that is true
+        """(d, second half) The lease branch carries unlanded work and the
+        room holds a landed branch. The branch stays on its own proof; the
+        room goes on its own, and the triage line does not claim the room
+        was kept or retired on stated evidence."""
+        path, lease = self.claimed("apart3099")
+        lane_tip = self.commit(path, "lane.txt")
+        self.git(path, "checkout", "-q", "-b", "reviewer/apart3099", "main")
+        out = self.release("apart3099", lease)
+        self.assertFalse(os.path.exists(path), out)
+        self.assertEqual(self.git(self.root, "rev-parse", "lane/apart3099"),
+                         lane_tip, "the unlanded lease branch must stay")
+        self.assertTrue(work._has_branch(self.root, "reviewer/apart3099"))
+        self.assertIn("TRIAGE apart3099 (lane/apart3099)", out)
+        self.assertIn("room retired on reviewer/apart3099's own proof", out)
+        self.assertNotIn("worktree + branch kept", out)
+        self.assertNotIn("room retired on stated evidence", out)
+
+    def test_SUPERSEDED_never_retires_a_DETACHED_room(self):  # noqa: VACUOUS_ASSERTION — the one absence is the retirement phrase; the positives are the room on disk at its detached HEAD, the lease branch at its tip, and the SUPERSEDED and manual-only lines
+        """--superseded retires a room without a landedness proof because the
+        lease BRANCH keeps every commit. A detached room's commit is not on
+        that branch, so the argument does not hold for it."""
+        path, lease = self.claimed("supdet3099")
+        lane_tip = self.commit(path, "lane.txt")
+        self.git(path, "checkout", "-q", "--detach")
+        head = self.commit(path, "detached.txt")
+        out = self.release("supdet3099", lease, "--superseded",
+                           "class solved on trunk")
+        self.assertTrue(os.path.isdir(path),
+                        "--superseded removed a DETACHED room:\n%s" % out)
+        self.assertEqual(self.git(path, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(self.root, "rev-parse", "lane/supdet3099"),
+                         lane_tip)
+        self.assertIn("SUPERSEDED supdet3099", out)
+        self.assertIn("manual-only", out)
+        self.assertNotIn("room retired on that stated reason", out)
+
+    def test_the_DIRTY_refusal_names_the_branch_a_park_would_write(self):
+        """The park commits onto whatever the room has checked out, so the
+        refusal and the park line must name that branch, not the lease's."""
+        path, lease = self.claimed("dirty3099")
+        self.git(path, "checkout", "-q", "-b", "reviewer/dirty3099")
+        with open(os.path.join(path, "precious.txt"), "w") as f:
+            f.write("uncommitted\n")
+        rc, _out, err = self.work("release", "dirty3099", "--seat", "s1",
+                                  "--lease", lease)
+        self.assertEqual(rc, 1)
+        self.assertIn("DIRTY", err)
+        self.assertIn("onto reviewer/dirty3099", err)
+        self.assertNotIn("onto lane/dirty3099", err)
+        out = self.release("dirty3099", lease, "--park")
+        self.assertIn("parked WIP onto reviewer/dirty3099", out)
+        self.assertEqual(
+            self.git(self.root, "show", "reviewer/dirty3099:precious.txt"),
+            "uncommitted", "the park wrote somewhere else")
+        self.assertTrue(os.path.isdir(path),
+                        "the parked commit is not landed, so the room stays")
+
+    def test_a_room_that_DETACHES_during_release_is_KEPT(self):
+        """What the room holds is read before release judges it and read
+        again just before the removal, the way `gc_enact` re-reads a scan.
+        The detach is planted inside the landedness read, which is between
+        the two."""
+        path, lease = self.claimed("race3099")
+        real = _work_claims._merge_state
+        doomed = []
+
+        def detach_then_answer(root, branch):
+            if not doomed:
+                self.git(path, "checkout", "-q", "--detach")
+                doomed.append(self.commit(path, "late.txt"))
+            return real(root, branch)
+
+        with mock.patch.object(_work_claims, "_merge_state",
+                               side_effect=detach_then_answer):
+            out = self.release("race3099", lease)
+        self.assertEqual(len(doomed), 1, "fixture: the detach never ran")
+        self.assertTrue(os.path.isdir(path),
+                        "removed a room that detached under release:\n%s"
+                        % out)
+        self.assertEqual(self.git(path, "rev-parse", "HEAD"), doomed[0])
+        self.assertIn("moved under the scan", out)
+
+
 class ListHolderlessDeltaTest(WorkBase):
     """#289 third instance: a lease expires, the room and its COMMITTED delta
     do not — and nothing listed it, so the failure mode is a seat silently
@@ -1272,7 +1624,7 @@ class GcTest(WorkBase):
         self.locked = self.room("noturn")                 # out-of-band lock
         _sh(self.root, "git", "worktree", "lock", self.locked,
             "--reason", "owner says keep")
-        self.clean = self.room("cleanmg")                 # clean + merged,
+        self.clean = self.room("cleanmg", aged=True)      # clean + merged,
         _sh(self.root, "git", "worktree", "lock", self.clean,
             "--reason", "lease:deadbeef")                 # stale key tag
         self.dirty = self.room("messy", dirty="junk.txt")  # dirty, lease-less
@@ -1855,6 +2207,32 @@ class GcTest(WorkBase):
         self.assertIsNone(error)
         kill.assert_called_once_with(123, signal.SIGHUP)
 
+    def test_a_BLIND_cwd_census_keeps_the_room_for_gc_and_for_reap(self):
+        """UNKNOWN FAILS CLOSED AT THE CONSUMERS, not only in the census flag.
+        gc and reap ask `_occupants`, which carries no completeness flag, so a
+        census that could read no cwd link must reach them as an occupant
+        they cannot clear. The table is a planted tree whose one pid has a cwd
+        entry that is not a link: realpath answers with the entry's own path,
+        readlink refuses it under any uid."""
+        from helm.work import _lanes
+        proc = os.path.join(self.tmp, "blind-proc")
+        os.makedirs(os.path.join(proc, "4194401", "cwd"))
+        # CONTROL: with sight the room is reapable, so the keep below is the
+        # blindness and not some other rung.
+        row = next(r for r in work.gc_scan(self.root) if r["path"] == self.clean)
+        self.assertEqual(row["verdict"], "remove")
+        real = _lanes._occupants_many
+        with mock.patch.object(_lanes, "_occupants_many",
+                               side_effect=lambda paths: real(paths, proc_root=proc)):
+            row = next(r for r in work.gc_scan(self.root)
+                       if r["path"] == self.clean)
+            stopped, error = _work_gc._retire_disposable_occupants(self.clean)
+        self.assertEqual(row["verdict"], "keep", row)
+        self.assertIn("OCCUPIED", row["why"])
+        self.assertEqual(stopped, [])
+        self.assertIn("OCCUPIED", error or "",
+                      "reap cleared a room the census could not see into")
+
     def test_orca_shell_identity_requires_rcfile_Ss_plus_and_no_children(self):
         proc_root = os.path.join(self.tmp, "proc")
         pid = "123"
@@ -2057,6 +2435,759 @@ class GcTest(WorkBase):
                          r"worktree gc proj: removed=0 kept=4 triage=1")
 
 
+class _RoomStory:
+    """The git a room's life is made of, for the arms that walk one: commit in
+    it, land it, detour through a detached HEAD, prune a reflog line, and read
+    back what git still records. Every step asserts its own exit code."""
+
+    def _git(self, cwd, *args):
+        r = _sh(cwd, "git", *args)
+        self.assertEqual(r.returncode, 0, "git %s: %s" % (args, r.stderr))
+        return r.stdout.strip()
+
+    def _row(self, path):
+        return next(r for r in work.gc_scan(self.root) if r["path"] == path)
+
+    def _commit_in(self, path, name, add=None):
+        """HEAD after one commit of `name` in `path`: every change when `add`
+        is None, else only the paths it names."""
+        with open(os.path.join(path, name), "w") as f:
+            f.write("work on %s\n" % name)
+        self._git(path, "add", *(add or ("-A",)))
+        self._git(path, "commit", "-q", "-m", "work on " + name)
+        return self._git(path, "rev-parse", "HEAD")
+
+    def _land(self, lane, ff=False):
+        """Merge a lane into the trunk the way this repository lands a train
+        (`--no-ff`), or by fast-forward, which puts the lane's commit on the
+        trunk's first-parent line exactly where an untouched lane sits."""
+        args = ("--ff-only",) if ff else ("--no-ff", "-m", "land " + lane)
+        self._git(self.root, "merge", "-q", *args, work.lane_branch(lane))
+
+    def _reflog(self, cwd, ref):
+        """Every sha git's reflog for `ref` (asked in `cwd`) still records."""
+        return self._git(cwd, "reflog", "show", "--format=%H", ref).split()
+
+    def _detour(self, room, branch, name):
+        """A commit made on a DETACHED HEAD in `room`, then a checkout back to
+        `branch`: afterwards only the room's own HEAD reflog records it."""
+        self._git(room, "checkout", "-q", "--detach")
+        sha = self._commit_in(room, name, add=(name,))
+        self._git(room, "checkout", "-q", branch)
+        return sha
+
+    def _drop_creation(self, branch):
+        """Delete the `branch: Created from` line from the branch's reflog, the
+        line git's own expiry takes first (the oldest)."""
+        said = self._git(self.root, "reflog", "show", "--format=%gs",
+                         "refs/heads/" + branch).splitlines()
+        at = [i for i, s in enumerate(said) if s.startswith("branch: Created")]
+        self.assertEqual(len(at), 1, said)
+        self._git(self.root, "reflog", "delete",
+                  "refs/heads/%s@{%d}" % (branch, at[0]))
+        self.assertFalse(any(s.startswith("branch: Created") for s in
+                             self._git(self.root, "reflog", "show",
+                                       "--format=%gs", "refs/heads/" + branch)
+                             .splitlines()))
+
+
+class GcUnstartedRoomTest(_RoomStory, WorkBase):
+    """A ROOM NOBODY HAS COMMITTED IN YET IS NOT A LANDED ROOM (task/3428).
+
+    MEASURED from helm-gc.service's own journal: the hourly
+    `helm work gc --apply` printed `REMOVE beacon-timeout-pin-3404
+    lease-less + clean + LANDED by ancestry`, removed the room, and deleted
+    lane/beacon-timeout-pin-3404. A builder had minted that room minutes
+    earlier with `worktree add -b ... origin/main`; it was clean, unlocked, and
+    at the trunk because the builder had not committed YET. Ancestry is true of
+    such a branch vacuously — nothing of it is missing from the trunk because
+    there is nothing of it — and the sweep spent that vacuous truth as a
+    landing proof and took the floor out from under the builder.
+
+    Every arm here asks git what happened to the room and the branch, never
+    only what the sweep printed."""
+
+    def test_a_fresh_room_at_the_trunk_is_KEPT_by_the_scan(self):
+        room = self.room("fresh")
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "keep", row)
+        self.assertIn("UNSTARTED", row["why"])
+
+    def test_a_fresh_room_at_the_trunk_SURVIVES_gc_apply_and_can_commit(self):  # noqa: VACUOUS_ASSERTION — the room and branch are asserted PRESENT after apply and the new commit is read back as the branch tip
+        """THE INCIDENT, END TO END: the sweep runs and the builder commits
+        after it, in the room it minted and on the branch it minted."""
+        room = self.room("fresh")
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertTrue(work._has_branch(self.root, "lane/fresh"), out)
+        sha = self._commit_in(room, "first.txt")
+        tip = _sh(self.root, "git", "rev-parse", "lane/fresh").stdout.strip()
+        self.assertEqual(tip, sha)
+
+    def test_the_lifecycle_created_committed_landed_reaped(self):  # noqa: VACUOUS_ASSERTION — the final absence is the reap under test; the same room's scan row reads remove with its LANDED proof immediately before it
+        """created -> first commit -> landed -> reaped, one room, one verdict
+        per stage, each read fresh from the scan."""
+        room = self.room("life")
+        self.assertEqual(self._row(room)["verdict"], "keep")        # created
+        self._commit_in(room, "life.txt")
+        self.assertEqual(self._row(room)["verdict"], "triage")      # unlanded
+        self._land("life")
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "remove", row)              # landed
+        self.assertIn("LANDED by ancestry", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(room), out)                  # reaped
+        self.assertFalse(work._has_branch(self.root, "lane/life"), out)
+
+    def test_control_a_LANDED_room_is_still_removed(self):  # noqa: VACUOUS_ASSERTION — the absence is the removal under test; the scan row reads remove and the apply output names `removed <room>`
+        """A branch that carried commits and landed keeps today's behaviour
+        exactly: removed on the next pass, branch deleted, same proof words."""
+        room = self.room("landed")
+        self._commit_in(room, "landed.txt")
+        self._land("landed")
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "remove", row)
+        self.assertIn("lease-less + clean + LANDED by ancestry", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("removed " + room, out)
+        self.assertFalse(os.path.exists(room))
+        self.assertFalse(work._has_branch(self.root, "lane/landed"))
+
+    def test_control_a_FAST_FORWARD_landed_room_is_still_removed(self):  # noqa: VACUOUS_ASSERTION — the absence is the removal under test; the same room's scan row reads remove first
+        """A fast-forward land leaves the lane's tip on the trunk's
+        first-parent line, where an untouched lane also sits, so no
+        trunk-shape test can tell them apart; the branch's own reflog can."""
+        room = self.room("ffland")
+        self._commit_in(room, "ff.txt")
+        self._land("ffland", ff=True)
+        self.assertEqual(self._row(room)["verdict"], "remove")
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(room), out)
+        self.assertFalse(work._has_branch(self.root, "lane/ffland"))
+
+    def test_control_a_dirty_unmerged_room_keeps_its_rescue_verdict(self):
+        room = self.room("messy")
+        self._commit_in(room, "unlanded.txt")
+        with open(os.path.join(room, "junk.txt"), "w") as f:
+            f.write("precious uncommitted bytes\n")
+        self.abandon(room)
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "rescue", row)
+        self.assertIn("rescue-commit", row["why"])
+
+    def test_control_a_locked_room_still_keeps(self):  # noqa: VACUOUS_ASSERTION — presence is asserted: the room directory and its branch both survive apply beside a keep row naming the lock
+        room = self.room("pinned")
+        r = _sh(self.root, "git", "worktree", "lock", room,
+                "--reason", "task/3428 builder")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "keep", row)
+        self.assertIn("locked out-of-band (task/3428 builder)", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertTrue(work._has_branch(self.root, "lane/pinned"))
+
+    def test_a_room_RESET_BACK_after_committing_is_not_reaped(self):  # noqa: VACUOUS_ASSERTION — presence is asserted: the room survives apply and the dropped sha is read back from the branch reflog
+        """The branch sits at the trunk, so ancestry reads LANDED — but the
+        lane WROTE a commit its branch no longer carries, and that commit is
+        on neither the branch nor the trunk: only the reflogs hold it, and
+        removing the room and the branch deletes both. Aged far past any
+        grace, so only the landedness of the dropped work can keep it."""
+        room = self.room("undone")
+        dropped = self._commit_in(room, "undone.txt")
+        r = _sh(room, "git", "reset", "-q", "--hard", "main")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _roomclock.age_room(room)
+        self.assertNotEqual(self._row(room)["verdict"], "remove")
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(room), out)
+        log = _sh(self.root, "git", "reflog", "show", "--format=%H",
+                  "lane/undone")
+        self.assertEqual(log.returncode, 0, log.stderr)
+        self.assertIn(dropped, log.stdout.split())
+
+    def test_an_OLD_unstarted_room_is_still_tidied(self):  # noqa: VACUOUS_ASSERTION — the absence is the tidy under test; the same room's scan row reads remove naming the abandoned-claim rule first
+        """The explicit other half of the rule: an abandoned claim — nothing
+        authored, and nobody has moved the room for longer than the grace —
+        still retires, and its row says which rule retired it."""
+        self.assertGreater(_roomclock.AGED_S, _work_gc._UNSTARTED_GRACE_S)
+        room = self.room("abandoned")
+        _roomclock.age_room(room)
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "remove", row)
+        self.assertIn("UNSTARTED", row["why"])
+        self.assertIn("an abandoned claim", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(room), out)
+        self.assertFalse(work._has_branch(self.root, "lane/abandoned"))
+
+    def test_an_UNREADABLE_room_clock_keeps_the_room(self):
+        """Age is what licenses removing a room nobody committed in, so an age
+        git cannot answer keeps it, however old the room really is. Both logs
+        git would answer from are gone; an identically aged room beside it is
+        the control that the rule, not the fixture, decided."""
+        seen = self.room("seen")
+        _roomclock.age_room(seen)
+        self.assertEqual(self._row(seen)["verdict"], "remove")
+        blind = self.room("blind")
+        _roomclock.age_room(blind)
+        for log in _roomclock.reflogs(blind):
+            os.remove(log)
+        row = self._row(blind)
+        self.assertEqual(row["verdict"], "keep", row)
+        self.assertIn("age could not be read", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(blind), out)
+        self.assertTrue(work._has_branch(self.root, "lane/blind"))
+
+    def test_enact_RE_READS_the_clock_a_room_moved_after_the_scan_is_kept(self):
+        """A scan-time age is not a license. The room is judged abandoned,
+        then its HEAD moves (a reset in place, on the same branch, so the
+        branch-identity re-read cannot be what refuses) before the enact."""
+        room = self.room("revived")
+        _roomclock.age_room(room)
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "remove", row)
+        r = _sh(room, "git", "reset", "-q", "--hard", "HEAD")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = work.gc_enact(self.root, row)
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertTrue(work._has_branch(self.root, "lane/revived"))
+        self.assertTrue(any(line.startswith("SKIPPED") and "UNSTARTED" in line
+                            for line in out), out)
+
+
+# PAST THE GRACE A SWEEP GIVES AN UNSTARTED ROOM, AND INSIDE GIT'S OWN 30-DAY
+# EXPIRY OF AN UNREACHABLE REFLOG ENTRY: a commit this old is still in the
+# reflog, so it is still work a removal can destroy.
+_DAYS_3 = 3 * 86400
+
+
+class GcDroppedWorkTest(_RoomStory, WorkBase):
+    """NO SWEEP DELETES A ROOM OR A BRANCH WHILE A COMMIT THE LANE WROTE LIVES
+    ONLY IN THE REFLOGS THAT DELETION DESTROYS AND IS NOT ON THE TRUNK
+    (task/3436, helm-codex's gap check F1-F4 on task/3428's `_sweep_state`).
+
+    F1 the sweep judged a lane by the first commit its tip carried, or by the
+    NEWEST commit it dropped, so a landed commit licensed deleting an older
+    one reset away. F2 it read the branch's reflog only, so a commit made on a
+    detached HEAD in the room (then a checkout back) lived only in the room's
+    HEAD reflog, which removing the room deletes. F3 a reflog whose creation
+    line had expired was read as saying nothing, so the dropped commit it
+    still named was ignored. F4 the last landedness read was not bound to the
+    removal, so a detour made after it was removed with the room.
+
+    Every arm asks git afterwards whether the commit is still recorded."""
+
+    def _kept(self, room, branch, sha, ref):
+        """`gc --apply`, then: the room and branch stand and git still
+        records `sha` in the reflog of `ref` (asked in `room` for HEAD)."""
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertTrue(work._has_branch(self.root, branch), out)
+        self.assertIn(sha, self._reflog(room if ref == "HEAD" else self.root,
+                                        ref))
+        return out
+
+    def test_F1_a_CARRIED_landed_commit_does_not_license_a_dropped_one(self):
+        """The lane committed a draft, reset it away, committed again and
+        landed that. Its tip carries a landed commit; the draft is on neither
+        the branch nor the trunk."""
+        room = self.room("f1")
+        dropped = self._commit_in(room, "draft.txt")
+        self._git(room, "reset", "-q", "--hard", "main")
+        self._commit_in(room, "kept.txt")
+        self._land("f1")
+        row = self._row(room)
+        self.assertNotEqual(row["verdict"], "remove", row)
+        self.assertIn(dropped[:12], row["why"])
+        self._kept(room, "lane/f1", dropped, "refs/heads/lane/f1")
+
+    def test_F1_the_NEWEST_dropped_commit_landing_does_not_license_an_older(self):  # noqa: VACUOUS_ASSERTION — the not-remove verdict is paired with the older sha read IN the same row's why, and the older sha read back from the branch reflog after apply
+        """Two commits reset away; the newer one landed under another sha (a
+        cherry-pick onto the trunk, patch identity), the older one did not."""
+        room = self.room("f1b")
+        older = self._commit_in(room, "older.txt")
+        self._git(room, "reset", "-q", "--hard", "main")
+        newer = self._commit_in(room, "newer.txt")
+        self._git(self.root, "cherry-pick", newer)
+        self._git(room, "reset", "-q", "--hard", "main")
+        self.assertEqual(self._git(room, "rev-parse", "HEAD"),
+                         self._git(self.root, "rev-parse", "main"))
+        row = self._row(room)
+        self.assertNotEqual(row["verdict"], "remove", row)
+        self.assertIn(older[:12], row["why"])
+        self._kept(room, "lane/f1b", older, "refs/heads/lane/f1b")
+
+    def test_F2_a_DETACHED_commit_in_the_room_keeps_the_room(self):  # noqa: VACUOUS_ASSERTION — the branch-reflog absence is the fixture's premise; the positives are the detached sha in the row's why and in the room's HEAD reflog after apply
+        """The lane landed; then a commit on a detached HEAD, and a checkout
+        back to the landed branch. Only the room's HEAD reflog records it."""
+        room = self.room("f2")
+        self._commit_in(room, "landed.txt")
+        self._land("f2")
+        detached = self._detour(room, "lane/f2", "detached.txt")
+        self.assertNotIn(detached, self._reflog(self.root, "refs/heads/lane/f2"))
+        row = self._row(room)
+        self.assertNotEqual(row["verdict"], "remove", row)
+        self.assertIn(detached[:12], row["why"])
+        self._kept(room, "lane/f2", detached, "HEAD")
+
+    def test_F3_a_PRUNED_creation_line_does_not_discard_a_dropped_commit(self):  # noqa: VACUOUS_ASSERTION — the not-remove verdict is paired with the dropped sha in the same row's why and in the branch reflog after apply
+        """The branch's reflog lost its creation line (git expires the oldest
+        line first), aged past the grace, while the dropped commit it still
+        names is in it. The biography is still readable, so it still counts."""
+        self.assertGreater(_DAYS_3, _work_gc._UNSTARTED_GRACE_S)
+        room = self.room("f3")
+        dropped = self._commit_in(room, "dropped.txt")
+        self._git(room, "reset", "-q", "--hard", "main")
+        _roomclock.age_room(room, by=_DAYS_3)
+        self._drop_creation("lane/f3")
+        row = self._row(room)
+        self.assertNotEqual(row["verdict"], "remove", row)
+        self.assertIn(dropped[:12], row["why"])
+        self._kept(room, "lane/f3", dropped, "refs/heads/lane/f3")
+
+    def test_F4_a_detour_made_AFTER_the_enact_verdict_keeps_the_room(self):
+        """The enact reads a landed verdict; before the removal a detached
+        commit is made and the room is put back on its branch, exactly as it
+        was. Every re-read the enact makes BEFORE the verdict passes."""
+        room = self.room("f4")
+        self._commit_in(room, "landed.txt")
+        self._land("f4")
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "remove", row)
+        real, late = _work_gc._sweep_state, []
+
+        def verdict_then_detour(*args, **kw):
+            got = real(*args, **kw)
+            if not late:
+                late.append(self._detour(room, "lane/f4", "late.txt"))
+            return got
+        with mock.patch.object(_work_gc, "_sweep_state", verdict_then_detour):
+            out = work.gc_enact(self.root, row)
+        self.assertEqual(len(late), 1, "the enact never asked the verdict")
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertIn(late[0], self._reflog(room, "HEAD"))
+        self.assertTrue(any(line.startswith("SKIPPED") and "moved" in line
+                            for line in out), out)
+
+    def test_an_UNREADABLE_branch_reflog_keeps_the_room(self):
+        """git answers an unreadable reflog as an empty one (rc 0, no
+        lines), so only the file itself can say it holds something git did
+        not read. The room is aged, so no grace keeps it; a directory stands
+        where the branch's reflog file was."""
+        room = self.room("blindlog")
+        self._commit_in(room, "landed.txt")
+        self._land("blindlog")
+        _roomclock.age_room(room)
+        log = _roomclock.reflogs(room)[1]
+        os.remove(log)
+        os.mkdir(log)
+        self.assertEqual(self._reflog(self.root, "refs/heads/lane/blindlog"),
+                         [], "fixture: git reads the unreadable log as empty")
+        row = self._row(room)
+        self.assertNotEqual(row["verdict"], "remove", row)
+        self.assertIn("cannot be read", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertTrue(work._has_branch(self.root, "lane/blindlog"), out)
+
+    def test_an_UNREADABLE_room_HEAD_reflog_keeps_the_room(self):
+        """The lane landed and its branch reflog is whole, but the room's own
+        HEAD reflog, the only record of a detached commit, cannot be read."""
+        room = self.room("blindhead")
+        self._commit_in(room, "landed.txt")
+        self._land("blindhead")
+        log = _roomclock.reflogs(room)[0]
+        os.remove(log)
+        os.mkdir(log)
+        row = self._row(room)
+        self.assertNotEqual(row["verdict"], "remove", row)
+        self.assertIn("cannot be read", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(room), out)
+
+    def test_control_EVERY_authored_commit_landed_is_still_removed(self):  # noqa: VACUOUS_ASSERTION — the absences are the removal under test; the scan row reads remove first and the apply output names `removed <room>`
+        """A draft reset away that DID land (patch identity), and a carried
+        commit landed by merge: every commit the lane wrote is on the trunk,
+        so the room and branch retire exactly as before."""
+        room = self.room("allland")
+        draft = self._commit_in(room, "draft.txt")
+        self._git(self.root, "cherry-pick", draft)
+        self._git(room, "reset", "-q", "--hard", "main")
+        self._commit_in(room, "final.txt")
+        self._land("allland")
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "remove", row)
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("removed " + room, out)
+        self.assertFalse(os.path.exists(room))
+        self.assertFalse(work._has_branch(self.root, "lane/allland"))
+
+    def test_control_a_commit_ANOTHER_BRANCH_holds_does_not_keep_the_room(self):  # noqa: VACUOUS_ASSERTION — the room's absence is the removal under test; the scan row reads remove first, and the other branch is asserted still holding its commit
+        """The room committed on another branch and came back. That commit is
+        not only in a reflog: the other branch holds it, and removing this
+        room and its landed branch leaves it exactly where it is."""
+        room = self.room("hop")
+        self._commit_in(room, "landed.txt")
+        self._land("hop")
+        self._git(room, "checkout", "-q", "-b", "side/hop")
+        side = self._commit_in(room, "side.txt")
+        self._git(room, "checkout", "-q", "lane/hop")
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "remove", row)
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("removed " + room, out)
+        self.assertFalse(os.path.exists(room))
+        self.assertEqual(self._git(self.root, "rev-parse", "side/hop"), side)
+
+
+class GcReusedRoomTest(_RoomStory, WorkBase):
+    """A REUSED ROOM'S OLDER HEAD HISTORY IS NOT ITS NEW BRANCH'S WORK
+    (task/3436 round 2, helm-codex gap check F5).
+
+    A room that held one branch, committed A there, and saw A land, then
+    checks out a NEW branch minted at the trunk. Its HEAD reflog still
+    records the room writing A, and the sweep read that as the new branch's
+    proof of work: not UNSTARTED, so retired at once, which is the fresh-room
+    reaping task/3428 cured. What retires must be about the branch the room
+    holds now: its own reflog, or what the room recorded after it last
+    checked that branch out. The older history may only KEEP."""
+
+    def _reuse(self, room, branch):
+        """The room checks out `branch`, new, at the trunk. Returns the room's
+        HEAD reflog as it then stands, for the arm's premise."""
+        self._git(room, "checkout", "-q", "-b", branch, "main")
+        self.assertEqual(self._git(room, "rev-parse", "HEAD"),
+                         self._git(self.root, "rev-parse", "main"))
+        return self._reflog(room, "HEAD")
+
+    def test_a_reused_room_on_a_NEW_branch_is_UNSTARTED_not_landed(self):
+        """A landed by merge, so ancestry puts it on the trunk. The new branch
+        has written nothing and the room is young."""
+        room = self.room("reuse")
+        old = self._commit_in(room, "old.txt")
+        self._land("reuse")
+        self.assertIn(old, self._reuse(room, "lane/reuse-next"))
+        row = self._row(room)
+        self.assertEqual(row["branch"], "lane/reuse-next", row)
+        self.assertEqual(row["verdict"], "keep", row)
+        self.assertIn("UNSTARTED", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertTrue(work._has_branch(self.root, "lane/reuse-next"), out)
+        sha = self._commit_in(room, "first.txt")
+        self.assertEqual(self._git(self.root, "rev-parse", "lane/reuse-next"),
+                         sha)
+
+    def test_a_reused_room_whose_old_work_landed_by_PATCH_IDENTITY(self):
+        """A landed as content under another sha and its branch is gone, so
+        only the room's HEAD reflog holds A, and patch identity finds it on
+        the trunk. That is still not the new branch's work."""
+        room = self.room("reusep")
+        old = self._commit_in(room, "old.txt")
+        # THE TRUNK MOVES FIRST, so the cherry-pick lands on another parent:
+        # onto A's own parent, in the same second, it rebuilds A byte for
+        # byte, and A would be on the trunk by ancestry.
+        self._commit_in(self.root, "trunk.txt", add=("trunk.txt",))
+        self._git(self.root, "cherry-pick", old)
+        self.assertIn(old, self._reuse(room, "lane/reusep-next"))
+        self._git(self.root, "branch", "-D", "lane/reusep")
+        self.assertEqual(_sh(self.root, "git", "merge-base", "--is-ancestor",
+                             old, "main").returncode, 1,
+                         "fixture: A is on the trunk only by patch identity")
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "keep", row)
+        self.assertIn("UNSTARTED", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertTrue(work._has_branch(self.root, "lane/reusep-next"), out)
+
+    def test_control_the_new_branch_once_it_COMMITS_AND_LANDS_is_removed(self):  # noqa: VACUOUS_ASSERTION — the absences are the removal under test; the scan row reads remove first and the apply output names `removed <room>`
+        room = self.room("reusel")
+        self._commit_in(room, "old.txt")
+        self._land("reusel")
+        self._reuse(room, "lane/reusel-next")
+        self._commit_in(room, "next.txt")
+        self._land("reusel-next")
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "remove", row)
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("removed " + room, out)
+        self.assertFalse(os.path.exists(room))
+        self.assertFalse(work._has_branch(self.root, "lane/reusel-next"))
+
+    def test_control_the_CURRENT_branch_work_retires_it_across_a_rebase(self):  # noqa: VACUOUS_ASSERTION — the absences are the removal under test; the rebase's finish row is asserted newest in the room's HEAD reflog and the scan row reads remove first
+        """The new branch commits, rebases onto a moved trunk in the room (a
+        `rebase (finish): returning to` row, which returns the room to its
+        branch), and lands. Its own reflog carries that work."""
+        room = self.room("reuser")
+        self._commit_in(room, "old.txt")
+        self._land("reuser")
+        self._reuse(room, "lane/reuser-next")
+        self._commit_in(room, "next.txt")
+        self._commit_in(self.root, "trunk.txt", add=("trunk.txt",))
+        self._git(room, "rebase", "-q", "main")
+        self.assertTrue(self._git(room, "reflog", "show", "--format=%gs",
+                                  "-n", "1", "HEAD").startswith(
+            "rebase (finish): returning to refs/heads/lane/reuser-next"))
+        self._land("reuser-next")
+        row = self._row(room)
+        self.assertEqual(row["verdict"], "remove", row)
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("removed " + room, out)
+        self.assertFalse(os.path.exists(room))
+        self.assertFalse(work._has_branch(self.root, "lane/reuser-next"))
+
+    def test_control_a_DROPPED_commit_in_the_older_history_still_KEEPS(self):  # noqa: VACUOUS_ASSERTION — the not-remove verdict is paired with the dropped sha and "not on the trunk" read IN the same row's why, and the sha read back from the room's HEAD reflog after apply
+        """The room made a detached commit that is on no ref and not on the
+        trunk, then checked out the new branch. Aged past the grace, so only
+        that commit can keep it: removing the room deletes its one record."""
+        self.assertGreater(_roomclock.AGED_S, _work_gc._UNSTARTED_GRACE_S)
+        room = self.room("reusex")
+        self._git(room, "checkout", "-q", "--detach")
+        dropped = self._commit_in(room, "dropped.txt")
+        self.assertIn(dropped, self._reuse(room, "lane/reusex-next"))
+        _roomclock.age_room(room)
+        row = self._row(room)
+        self.assertNotEqual(row["verdict"], "remove", row)
+        self.assertIn(dropped[:12], row["why"])
+        self.assertIn("not on the trunk", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertIn(dropped, self._reflog(room, "HEAD"))
+
+
+class GcRecreatedBranchTest(_RoomStory, WorkBase):
+    """A COMMIT THE ROOM WROTE IS NOT THE NEW BRANCH'S WORK WHEN THE BRANCH
+    WAS DELETED AND RECREATED OVER IT (task/3436 round 3, ruling 1).
+
+    Proof that a commit is a branch's own work comes only from the branch's
+    OWN reflog, which records the branch's birth. The room held one branch,
+    committed A there, and saw A land by fast-forward; the branch was then
+    deleted and recreated at the trunk, and the room is put back on it. The
+    recreated branch's own reflog shows only its creation line, while A
+    lives in the room's HEAD reflog alone — before the room's last move onto
+    this branch. That history may only KEEP: A is on the trunk, so once the
+    room's age passes the grace the room retires as UNSTARTED, nothing lost.
+    The base read the room's HEAD reflog as the new branch's proof of work — A is on the trunk — and removed the
+    room and the freshly recreated branch, a builder's floor standing there
+    minutes after the recreation. The room moved back three ways: a
+    `checkout -b` whose arrival line the reflog still holds (F1a), a raw
+    `symbolic-ref` whose reflog line is empty (F1b), and an arrival line
+    pruned out of the reflog (F1c)."""
+
+    def _kept_unstarted(self, room, branch, A):
+        """The sweep verdict, and what `gc --apply` does to it: UNSTARTED
+        keep, room and branch standing, and A still recorded where the room
+        records it — the history the room keeps for the branch it held
+        before."""
+        row = self._row(room)
+        self.assertEqual(row["branch"], branch, row)
+        self.assertEqual(row["verdict"], "keep", row)
+        self.assertIn("UNSTARTED", row["why"])
+        rc, out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertTrue(work._has_branch(self.root, branch), out)
+        self.assertIn(A, self._reflog(room, "HEAD"))
+
+    def test_F1a_a_RECREATED_branch_is_not_proven_by_the_room_history(self):
+        """The room checked the new branch out BEFORE the branch was
+        deleted, so its HEAD reflog still holds the arrival line, and the
+        base cut the reflog there: A is 'after the arrival' and reads as the
+        new branch's proof of work. The new branch's own reflog says only
+        `Created from main`."""
+        room = self.room("f1a")
+        self._git(room, "checkout", "-q", "-b", "lane/f1a-next", "main")
+        A = self._commit_in(room, "a.txt")
+        self._land("f1a-next", ff=True)
+        self._git(self.root, "update-ref", "-d", "refs/heads/lane/f1a-next")
+        self._git(self.root, "branch", "lane/f1a-next", "main")
+        self.assertEqual(self._git(self.root, "reflog", "show",
+                                   "--format=%gs", "-n", "1",
+                                   "refs/heads/lane/f1a-next"),
+                         "branch: Created from main",
+                         "premise: the recreated branch wrote nothing")
+        self.assertIn(A, self._reflog(room, "HEAD"))
+        self._kept_unstarted(room, "lane/f1a-next", A)
+
+    def test_F1b_a_room_MOVED_BY_symbolic_ref_reads_UNSTARTED(self):
+        """The room committed A on its branch, A landed, and the branch was
+        deleted and recreated at the trunk; the room then moved onto the
+        recreated branch by a raw `symbolic-ref`, which writes NO reflog line.
+        The base's arrival regex found no checkout line to cut at and read the
+        room's whole HEAD reflog — A, written under the first incarnation of
+        the branch — as the recreated branch's proof of work."""
+        room = self.room("f1b")
+        A = self._commit_in(room, "a.txt")
+        self._land("f1b", ff=True)
+        self._git(self.root, "update-ref", "-d", "refs/heads/lane/f1b")
+        self._git(self.root, "branch", "lane/f1b-next", "main")
+        self._git(room, "symbolic-ref", "HEAD", "refs/heads/lane/f1b-next")
+        self.assertEqual(self._git(self.root, "reflog", "show",
+                                   "--format=%gs", "-n", "1",
+                                   "refs/heads/lane/f1b-next"),
+                         "branch: Created from main",
+                         "premise: the recreated branch wrote nothing")
+        self.assertIn(A, self._reflog(room, "HEAD"))
+        self._kept_unstarted(room, "lane/f1b-next", A)
+
+    def test_F1c_a_PRUNED_arrival_line_keeps_the_recreated_room(self):
+        """The room checked the new branch out after the old one landed,
+        then its arrival line was pruned out of the reflog — the base found
+        no cut to make and read the whole reflog as the branch's proof."""
+        room = self.room("f1c")
+        A = self._commit_in(room, "a.txt")
+        self._land("f1c", ff=True)
+        self._git(room, "checkout", "-q", "-b", "lane/f1c-next", "main")
+        said = self._git(room, "reflog", "show", "--format=%gs",
+                         "HEAD").splitlines()
+        at = [i for i, s in enumerate(said)
+              if s.startswith("checkout: moving")
+              and s.endswith("lane/f1c-next")]
+        self.assertEqual(len(at), 1, said)
+        self._git(room, "reflog", "delete", "HEAD@{%d}" % at[0])
+        self.assertEqual(self._git(self.root, "reflog", "show",
+                                   "--format=%gs", "-n", "1",
+                                   "refs/heads/lane/f1c-next"),
+                         "branch: Created from main")
+        self.assertIn(A, self._reflog(room, "HEAD"))
+        self._kept_unstarted(room, "lane/f1c-next", A)
+
+
+class GcReflogParseTest(_RoomStory, WorkBase):
+    """A REFLOG LINE WHOSE NEW SHA IS ALL ZEROS IS NOT A ROW GIT KEEPS, SO IT
+    MUST NOT COUNT AGAINST THE PARSE (task/3436 round 3, ruling 3).
+
+    An in-room `git branch -m` of a landed lane writes one such line: the
+    rename's delete half, `<old> 0000... renamed ...`, which `git reflog show`
+    then omits. The file therefore has one more line than git parses, and the
+    base's `_reflog_rows` read the mismatch as "git parsed N of the M lines"
+    and answered UNKNOWN — so a landed lane the sweep had to read could never
+    be judged, ever. Skipping the all-zero-new line lets the parse stand."""
+
+    def test_an_all_zero_new_line_does_not_make_the_parse_unknown(self):
+        """The room commits on its lane, the lane lands, and the room renames
+        the branch. The rename's delete half is an all-zero-new line in the
+        room's HEAD reflog; the parse must still read the reflog whole and
+        keep the commit it records."""
+        room = self.room("f3r")
+        x = self._commit_in(room, "x.txt")
+        self._land("f3r", ff=True)
+        self._git(room, "branch", "-m", "lane/f3r", "lane/f3r2")
+        self.assertEqual(self._git(room, "symbolic-ref", "--short", "HEAD"),
+                         "lane/f3r2")
+        v = _work_gc.vcs.backend(room)
+        rows, blind = _work_gc._reflog_rows(v, room, "HEAD")
+        self.assertIsNotNone(rows, "base read the rename as unreadable: %s"
+                             % blind)
+        self.assertIsNone(blind, "the all-zero-new line must not be counted: %s"
+                           % blind)
+        self.assertIn(x, [sha for sha, _what in rows],
+                      "the renamed lane's commit must still be read back from "
+                      "the reflog")
+
+
+class ReleaseDroppedWorkTest(_RoomStory, WorkBase):
+    """`helm work release` BY ITS HOLDER, and the reflog-only commits under it
+    (task/3436). A holder releasing a lane that committed and reset back read
+    ANCESTOR, and `git branch -d` deleted the only reflog that held the
+    commit. The holder asked, so no age grace applies; the branch-delete proof
+    is still every-authored-commit-landed, and the room is judged by what its
+    own HEAD reflog alone records."""
+
+    def claimed(self, lane):
+        rc, out, err = self.work("claim", lane, "--seat", "s1")
+        self.assertEqual(rc, 0, err)
+        path, _branch, lease, _ttl = out.strip().split("\t")
+        return path, lease
+
+    def release(self, lane, lease):
+        rc, out, err = self.work("release", lane, "--seat", "s1",
+                                 "--lease", lease)
+        self.assertEqual(rc, 0, err)
+        return out
+
+    def test_a_dropped_unlanded_commit_KEEPS_THE_BRANCH_and_says_why(self):  # noqa: VACUOUS_ASSERTION — the room's absence is the retirement the holder asked for; the positives are the branch present, the dropped sha in its reflog and a release line naming it
+        """The room may still retire (the holder asked, and the kept branch's
+        reflog still records the commit); the branch may not."""
+        room, lease = self.claimed("relu")
+        dropped = self._commit_in(room, "dropped.txt")
+        self._git(room, "reset", "-q", "--hard", "main")
+        out = self.release("relu", lease)
+        self.assertTrue(work._has_branch(self.root, "lane/relu"), out)
+        self.assertIn(dropped, self._reflog(self.root, "refs/heads/lane/relu"))
+        kept = [l for l in out.splitlines() if "lane/relu" in l
+                and dropped[:12] in l]
+        self.assertTrue(kept, "no line names the dropped commit:\n%s" % out)
+        self.assertFalse(os.path.exists(room), out)
+
+    def test_a_detached_unlanded_commit_KEEPS_THE_ROOM_and_says_why(self):  # noqa: VACUOUS_ASSERTION — presence is asserted: the room on disk, the detached sha in its HEAD reflog, and a kept line naming it
+        """The lane landed; a detour left a commit only the room's HEAD reflog
+        records. The branch retires on its own proof; the room does not."""
+        room, lease = self.claimed("reld")
+        self._commit_in(room, "landed.txt")
+        self._land("reld")
+        detached = self._detour(room, "lane/reld", "detached.txt")
+        out = self.release("reld", lease)
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertIn(detached, self._reflog(room, "HEAD"))
+        self.assertTrue([l for l in out.splitlines() if "kept" in l
+                         and detached[:12] in l],
+                        "no line names the detached commit:\n%s" % out)
+
+    def test_a_detour_AFTER_the_room_verdict_keeps_the_room(self):
+        """Release reads what removing the room would lose, then a detached
+        commit is made and the room put back on its branch before the
+        removal: the branch identity re-read passes, the HEAD reflog moved."""
+        room, lease = self.claimed("relrace")
+        self._commit_in(room, "landed.txt")
+        self._land("relrace")
+        real, late = _work_claims._room_state, []
+
+        def verdict_then_detour(*args, **kw):
+            got = real(*args, **kw)
+            if not late:
+                late.append(self._detour(room, "lane/relrace", "late.txt"))
+            return got
+        with mock.patch.object(_work_claims, "_room_state",
+                               verdict_then_detour):
+            out = self.release("relrace", lease)
+        self.assertEqual(len(late), 1, "release never asked the room verdict")
+        self.assertTrue(os.path.isdir(room), out)
+        self.assertIn(late[0], self._reflog(room, "HEAD"))
+        self.assertIn("moved under the removal", out)
+
+    def test_control_a_landed_lane_still_retires_room_and_branch(self):  # noqa: VACUOUS_ASSERTION — the absences are the retirement under test; the release output names the removal and the ancestry proof first
+        room, lease = self.claimed("relland")
+        self._commit_in(room, "landed.txt")
+        self._land("relland")
+        out = self.release("relland", lease)
+        self.assertIn("room %s removed" % room, out)
+        self.assertIn("deleted branch lane/relland", out)
+        self.assertFalse(os.path.exists(room))
+        self.assertFalse(work._has_branch(self.root, "lane/relland"))
+
+
 class GcPaneBoundRoomTest(WorkBase):
     """GC may not delete a room the metaharness still holds a terminal in.
 
@@ -2083,7 +3214,7 @@ class GcPaneBoundRoomTest(WorkBase):
 
     def setUp(self):
         super().setUp()
-        self.clean = self.room("panelane")   # clean + merged -> REMOVE verdict
+        self.clean = self.room("panelane", aged=True)   # clean -> REMOVE
 
     def _gc_apply(self, panes, error=None):
         with mock.patch.object(_work_gc, "_panes_bound_to",
@@ -2281,7 +3412,7 @@ class GcClosesTheBoundPaneTest(WorkBase):
 
     def setUp(self):
         super().setUp()
-        self.clean = self.room("panelane")     # clean + merged -> REMOVE
+        self.clean = self.room("panelane", aged=True)  # clean -> REMOVE
 
     def _run(self, pane_reads, adapter):
         """pane_reads: successive (handles, error) answers as gc re-asks."""
@@ -2370,7 +3501,7 @@ class GcSummaryTellsPlannedVsDoneTest(WorkBase):
 
     def setUp(self):
         super().setUp()
-        self.clean = self.room("jammedlane")
+        self.clean = self.room("jammedlane", aged=True)
 
     def test_a_blocked_removal_is_NAMED_with_its_reason(self):
         h = "term_eeee"
@@ -3203,7 +4334,7 @@ class GcDetachedIsManualOnlyTest(WorkBase):
 
         This SHRINKS the window, it does not close it. Closing it needs shared
         serialization across every remover, which is a different lane."""
-        path = self.room("racy")
+        path = self.room("racy", aged=True)
         row = next(r for r in work.gc_scan(self.root) if r["path"] == path)
         self.assertEqual(row["verdict"], "remove")
         # the room moves AFTER the scan
@@ -3218,6 +4349,25 @@ class GcDetachedIsManualOnlyTest(WorkBase):
         self.assertEqual(
             _sh(self.root, "git", "cat-file", "-t", doomed).stdout.strip(),
             "commit", "the post-scan commit was destroyed")
+
+    def test_a_room_judged_on_NO_branch_never_reads_as_unmoved(self):
+        """task/3125. `_moved_under_scan` is the LAST gate every
+        remover asks before `worktree remove`, and for a room judged on no
+        branch it answered None, which is "go ahead": a DETACHED room was on
+        no branch at scan and is on no branch now, so by equality it has not
+        moved. No remover passes None with a removal today, because each
+        gates on a branch first; a gate whose contract is that no scan-time
+        answer authorizes a removal on its own must still refuse where no
+        branch was ever judged, or the next caller inherits the hole."""
+        path = self.detached_room("nojudge")
+        why = _work_gc._moved_under_scan(path, None)
+        self.assertIsNotNone(
+            why, "a DETACHED room judged on no branch read as unmoved")
+        self.assertIn("no branch", why)
+        attached = self.room("nojudge2")
+        self.assertIsNotNone(
+            _work_gc._moved_under_scan(attached, None),
+            "a room on a branch, judged on none, read as unmoved")
 
     def test_a_DIRTY_DETACHED_room_is_manual_only_not_rescued(self):
         """codex r6, and the most dangerous room there is: uncommitted bytes AND
@@ -3259,7 +4409,7 @@ class GcDetachedIsManualOnlyTest(WorkBase):
         """The re-scope must not stop gc doing the job it CAN prove. A guard
         that always fires protects nothing — it just accumulates debris behind
         a refusal."""
-        path = self.room("branchok")
+        path = self.room("branchok", aged=True)
         row = next(r for r in work.gc_scan(self.root) if r["path"] == path)
         self.assertEqual(row["verdict"], "remove")
         self.assertFalse(row.get("manual_only"))
@@ -4325,6 +5475,71 @@ class ClaimDisclosesLiveFilesTest(WorkBase):
         self.assertIn("gamma", out, "the claim itself must still report")
         self.assertIn("live lane beta", err,
                       "the sibling disclosure must survive its neighbour")
+
+    def _claim_while_raising(self, patch, lane):
+        """Claim `lane` with one disclosure's input raising -> (rc, out,
+        err, the double)."""
+        with patch as p:
+            rc, out, err = self.work("claim", lane, "--seat", "s-" + lane)
+        return rc, out, err, p
+
+    # A disclosure that raises keeps the claim and prints ONE line naming
+    # what could not be checked and the exception class. Silence reads as
+    # "nothing moved, nobody else is here, the rail is armed".
+
+    def test_a_raising_moved_target_check_says_it_could_not_check(self):
+        rc, out, err, p = self._claim_while_raising(
+            mock.patch.object(_work_gc, "moved_lane_targets",
+                              side_effect=RuntimeError("boom")), "lane-m")
+        self.assertTrue(p.called, "control: the disclosure ran")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("lane-m", out, "the claim itself must report")
+        hits = [ln for ln in err.splitlines()
+                if "could not check whether trunk moved code a live lane "
+                   "edits (RuntimeError)" in ln]
+        self.assertEqual(len(hits), 1, err)
+
+    def test_a_raising_live_lane_check_says_it_could_not_check(self):
+        rc, out, err, p = self._claim_while_raising(
+            mock.patch.object(_work_gc, "held_lane_files",
+                              side_effect=KeyError("boom")), "lane-h")
+        self.assertTrue(p.called, "control: the disclosure ran")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("lane-h", out, "the claim itself must report")
+        hits = [ln for ln in err.splitlines()
+                if "could not check which live lanes are in which files "
+                   "(KeyError)" in ln]
+        self.assertEqual(len(hits), 1, err)
+
+    def test_a_raising_guard_rail_check_says_it_could_not_check(self):
+        rc, out, err, p = self._claim_while_raising(
+            mock.patch("helm.work._cli.stale_guard_hooks",
+                       side_effect=OSError("boom")), "lane-g")
+        self.assertTrue(p.called, "control: the disclosure ran")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("lane-g", out, "the claim itself must report")
+        hits = [ln for ln in err.splitlines()
+                if "could not check whether the guard rail around this room "
+                   "is armed (OSError)" in ln]
+        self.assertEqual(len(hits), 1, err)
+
+
+    def test_a_raising_overlap_check_on_the_board_says_it_could_not_check(self):
+        """`helm work list` asks which open lanes touch the same files. A
+        raise there prints one line naming the exception class, never the
+        silence of a board with no overlaps."""
+        rc, _o, err = self.work("claim", "lane-o", "--seat", "s-o")
+        self.assertEqual(rc, 0, err)
+        with mock.patch("helm.work._cli.lane_overlaps",
+                        side_effect=RuntimeError("boom")) as p:
+            rc, out, err = self.work("list")
+        self.assertTrue(p.called, "control: the board asked for overlaps")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("lane-o", out, "the board itself still renders")
+        hits = [ln for ln in err.splitlines()
+                if "could not check which open lanes touch the same files "
+                   "(RuntimeError)" in ln]
+        self.assertEqual(len(hits), 1, err)
 
 
 class MovedLaneTargetTest(WorkBase):
@@ -5417,7 +6632,7 @@ class GuardTest(WorkBase):
         self.assertEqual(rc, 0, err)
         self.assertFalse(work._has_branch(self.root, "lane/released"))
 
-        path = self.room("collected")
+        path = self.room("collected", aged=True)
         _sh(self.root, "git", "worktree", "lock", path,
             "--reason", "lease:deadbeef")
         rc, _out, err = self.work("gc", "--apply")
@@ -6511,8 +7726,8 @@ class PeekReuseDisclosureTest(WorkBase):
 
     def test_an_unreadable_census_is_never_rendered_as_an_empty_one(self):
         # THE ARM THIS ROW IS ACTUALLY ABOUT. `_occupants_many` answers
-        # ({path: []}, False) when the process census could not be read, and
-        # that empty list is the SAME VALUE a genuinely idle room produces.
+        # ({path: ["unknown"]}, False) when the process census could not be
+        # read, and only the flag separates it from a measured room's list.
         # A caller told "no process is here" acts on a measurement nobody
         # made — which is the exact shape of the defect being cured, one
         # layer down.
@@ -6520,7 +7735,7 @@ class PeekReuseDisclosureTest(WorkBase):
         from helm.work import _peek
         # THE DOUBLE MINTS THE SHAPE PRODUCTION MINTS, and that is not a
         # detail. `_occupants_many` returns ({path: ["unknown"]}, False) when
-        # /proc cannot be listed — a NON-EMPTY list carrying a string where
+        # it read no cwd link — a NON-EMPTY list carrying a string where
         # pids belong — so a double feeding ({path: []}, False) would assert
         # against a pairing the world never produces.
         #
@@ -6763,14 +7978,25 @@ class PeekTtlTest(WorkBase):
         self.assertIn("dropped", out)
 
     def test_an_OCCUPIED_stale_peek_is_kept_with_the_refusal_printed(self):
+        """The occupant is a PLANTED row, so its line is the planted command
+        line. The arm mocked the census alone, and the occupant line then
+        read whatever live process held pid 12345 on the host: a command
+        line holding "kill" (a `skill` path, `pkill`) turned it red."""
+        from helm.work import _peek
         self._backdate(3 * 3600)
-        with mock.patch("helm.work._peek._occupants",
-                        return_value=["12345"]):
+        table = os.path.join(self.tmp, "proc")
+        _plant_process(table, _NO_SUCH_PID, ["nvim", "README"], comm="nvim",
+                       cwd=self.peek_path)
+        with _planted_readers(_peek, table):
             rc, out, _err = self.work("gc", "--apply")
         self.assertEqual(rc, 0, out)
         self.assertTrue(os.path.isdir(self.peek_path),
                         "an occupied room must survive the apply")
         self.assertIn("OCCUPIED", out)
+        # each occupant BY NAME, as release names them; never a signal
+        self.assertIn("pid %d  `nvim README`" % _NO_SUCH_PID, out)
+        self.assertNotIn("move out", out)
+        self.assertNotIn("kill", out.lower())
 
     def test_the_shipped_timer_service_runs_the_work_reap_leg(self):
         from helm import gc as streamgc
@@ -8635,17 +9861,6 @@ def _claims_unproven(root, lane):
     return _claims._row_work_elsewhere(root, lane)[2]
 
 
-# THE BRANCH ALGEBRA IS IMPORTED, NEVER REIMPLEMENTED. I wrote a body-list
-# approximation of `exclusive` and it was RED on six shapes this module already
-# handles: if-body plus unconditional sibling, try-body plus else,
-# handler plus finally, with-body plus sibling, nested same-execution, and
-# same-arm duplicate plus else. A second census inherits none of the first
-# one's scars.
-from tests.test_suite_collection import (  # noqa: E402
-    exclusive, scope_definitions,
-)
-
-
 def _loaded_test_identities(module):
     """{(filename, lineno)} for every test the loader actually returns.
 
@@ -8721,6 +9936,18 @@ def _tests_the_loader_cannot_reach(tree, loaded, prefix, path):
     to improve; a false alarm reddens live code and teaches everyone to
     distrust the one instrument that says a green suite proved nothing.
     """
+    # THE BRANCH ALGEBRA IS IMPORTED, NEVER REIMPLEMENTED. I wrote a body-list
+    # approximation of `exclusive` and it was RED on six shapes that module
+    # already handles: if-body plus unconditional sibling, try-body plus else,
+    # handler plus finally, with-body plus sibling, nested same-execution, and
+    # same-arm duplicate plus else. A second census inherits none of the first
+    # one's scars.
+    # IMPORTED HERE, NOT WITH THE MODULE: importing tests.test_suite_collection
+    # runs its whole-tree census, an AST pass over every test file, so a
+    # process that loads this module for one unrelated arm (the child
+    # OccupiedArmUnderHelmsOwnRunnerTest starts) would pay for that census
+    # before its arm ran.
+    from tests.test_suite_collection import exclusive, scope_definitions
     unreachable = []
 
     def scope(node):
@@ -8833,14 +10060,16 @@ class NoTestIsOrphanedOutsideATestCaseTest(unittest.TestCase):
         # running the arm found it.
         fixdir = tempfile.mkdtemp(prefix="unreachable-fixture-")
         fixpath = os.path.join(fixdir, "unreachable_fixture.py")
-        io.open(fixpath, "w", encoding="utf-8").write(_UNREACHABLE_FIXTURE)
+        with io.open(fixpath, "w", encoding="utf-8") as fh:
+            fh.write(_UNREACHABLE_FIXTURE)
         spec = importlib.util.spec_from_file_location(
             "unreachable_fixture", fixpath)
         fixmod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fixmod)
-        caught = _tests_the_loader_cannot_reach(
-            ast.parse(io.open(fixpath, encoding="utf-8").read()),
-            _loaded_test_identities(fixmod), prefix, fixpath)
+        with io.open(fixpath, encoding="utf-8") as fh:
+            caught = _tests_the_loader_cannot_reach(
+                ast.parse(fh.read()),
+                _loaded_test_identities(fixmod), prefix, fixpath)
         self.assertEqual(
             sorted(n.split(":")[0] for n in caught),
             ["test_appended_after_a_return", "test_at_module_scope",
@@ -8859,7 +10088,8 @@ class NoTestIsOrphanedOutsideATestCaseTest(unittest.TestCase):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "test_work.py")
         loaded = _loaded_test_identities(module)
-        tree = ast.parse(io.open(path, encoding="utf-8").read())
+        with io.open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
         # MUST-HIT: both instruments have to see this module at all, or the
         # comparison below is two empty sets agreeing with each other.
         self.assertGreater(len(loaded), 100,
@@ -9587,11 +10817,12 @@ class AnUnknownFlagIsRefusedNotDroppedTest(WorkBase):
         nothing would report.
 
         DERIVED FROM THE SOURCE, never transcribed: the expected set is read
-        out of the file's own AST, so adding a fourth call site with a new
+        out of the file's own AST, so adding another call site with a new
         valued flag reddens this rather than passing unnoticed.
         """
         import ast as _ast
-        src = open(_work_cli.__file__, encoding="utf-8").read()
+        with open(_work_cli.__file__, encoding="utf-8") as fh:
+            src = fh.read()
         passed = set()
         sites = 0
         for node in _ast.walk(_ast.parse(src)):
@@ -9610,9 +10841,9 @@ class AnUnknownFlagIsRefusedNotDroppedTest(WorkBase):
                         passed.add(elt.value)
         # MUST-HIT: the walk found call sites at all. A zero here would make
         # the subset check below trivially true and say nothing.
-        self.assertEqual(3, sites,
+        self.assertEqual(4, sites,
                          "the AST walk found %d guard_tail(valued=...) call "
-                         "sites in this file, not the 3 that are there — the "
+                         "sites in this file, not the 4 that are there — the "
                          "walk is blind and its agreement below is empty"
                          % sites)
         # ONE LIST, FILLED TWICE, AND THE POSITIVE SIDE IS SPELLED OUT. The
@@ -9621,7 +10852,8 @@ class AnUnknownFlagIsRefusedNotDroppedTest(WorkBase):
         # the empty one is asked to mean anything.
         drift = []
         drift.extend(sorted(set(_work_common._VALUE_FLAGS) - passed))
-        self.assertEqual(["--drop", "--lease", "--superseded", "--ttl"], drift,
+        self.assertEqual(["--drop", "--lease", "--superseded", "--task",
+                          "--ttl"], drift,
                          "the verb-specific valued flags are not what this "
                          "file declares, so the emptiness below is about a "
                          "table that changed rather than about drift")
@@ -9982,3 +11214,158 @@ class TheTrunkNameFlippingUnderTheMemoTest(WorkBase):
         after = work.lanes_landed(self.root, ["x"])
         self.assertEqual((after["x"]["state"], after["x"]["trunk"]),
                          (work.LANE_UNLANDED, "origin/main"), after)
+
+
+class OccupantDescriptionTest(unittest.TestCase):
+    """work.describe_occupants over a PLANTED process table: every kind of
+    occupant a refusal can meet, and the one thing none may say."""
+
+    def setUp(self):
+        self.proc = tempfile.mkdtemp(prefix="helm-test-proc-")
+
+    def tearDown(self):
+        shutil.rmtree(self.proc, ignore_errors=True)
+
+    def plant(self, pid, argv, ppid=1, comm="python3"):
+        _plant_process(self.proc, pid, argv, ppid=ppid, comm=comm)
+
+    def lines(self, pids, disposable=()):
+        return work.describe_occupants([str(p) for p in pids],
+                                       disposable=set(map(str, disposable)),
+                                       proc_root=self.proc)
+
+    def test_each_kind_of_occupant(self):
+        self.plant(100, ["/usr/bin/python3", "-m", "helm.findingspass", "abc123"])
+        self.plant(150, ["/usr/bin/python3", "/opt/helm/bin/helm", "gate", "run"])
+        self.plant(200, ["/usr/bin/python3", "-m", "unittest", "tests.test_x"],
+                   ppid=150)
+        self.plant(300, ["/usr/bin/python3", "-m", "helm", "router", "run",
+                         "--port", "8899"])
+        self.plant(400, ["bash", "--login"], comm="a) weird (comm")
+        self.plant(450, ["bash", "--rcfile", "/tmp/orca-shell-ready"], comm="bash")
+        out = self.lines([100, 200, 300, 400, 450, 500], disposable=[450])
+        self.assertEqual(len(out), 6, out)
+        by = dict(zip((100, 200, 300, 400, 450, 500), out))
+        self.assertIn("python3 -m helm.findingspass abc123", by[100])
+        self.assertIn("HELM'S OWN", by[100])
+        self.assertIn("exits by itself", by[100])
+        # a gate's unittest child is helm's by ANCESTRY, not by its own argv
+        self.assertIn("HELM'S OWN", by[200])
+        self.assertIn("pid 150", by[200])
+        self.assertIn("helm router down", by[300])
+        self.assertNotIn("exits by itself", by[300])
+        self.assertIn("NOT helm's", by[400])
+        self.assertIn("bash --login", by[400])
+        self.assertIn("release", by[450])
+        self.assertIn("unreadable", by[500])
+        for line in out:
+            for word in ("kill", "signal", "sigterm"):
+                self.assertNotIn(word, line.lower())
+
+    def test_one_line_per_occupant_and_helm_scripts_run_by_path(self):
+        """A `sh -c` argv carrying a newline must not forge a second line, and
+        a helm module run BY PATH (a seat supervisor) is a helm command, not
+        "NOT helm's" — the two defects the live-room dogfood found."""
+        self.plant(100, ["ssh", "node", "tail -f log & TP=$!\ntrap 'x' EXIT\x1b[0m"])
+        self.plant(200, ["python3", "/opt/helm/helm/seat_launch_owner.py", "--",
+                         "/bin/sh", "-c", "exec claude"])
+        out = self.lines([100, 200])
+        self.assertEqual(len(out), 2)
+        self.assertFalse(any("\n" in l or "\x1b" in l for l in out), out)
+        self.assertIn("tail -f log & TP=$! trap 'x' EXIT", out[0])
+        self.assertIn("a helm command", out[1])
+        self.assertNotIn("NOT helm's", out[1])
+
+    def test_an_unreadable_census_is_named_not_guessed(self):
+        out = self.lines(["unknown"])
+        self.assertEqual(len(out), 1)
+        self.assertIn("UNKNOWN", out[0])
+
+    def test_a_long_command_line_is_truncated(self):
+        self.plant(100, ["/usr/bin/python3", "-m", "helm.findingspass"] + ["x" * 50] * 10)
+        (line,) = self.lines([100])
+        self.assertIn("…", line)
+        self.assertLess(len(line), 400)
+
+    def test_an_argv_that_only_MENTIONS_a_helm_entry_is_not_helms(self):
+        """WHOSE A PROCESS IS COMES FROM THE PROGRAM IT RUNS, never from a
+        token anywhere in its argv. In a helm lane room the ordinary occupants
+        are an editor, a pager or git working on helm's own sources, and an
+        editor on helm/gatechild.py read "HELM'S OWN, exits by itself: WAIT"
+        although it never exits by itself. Each row below carries a helm entry
+        as DATA: a file an editor or pager opened, a git message, a pytest
+        marker, the arguments of a `-c` program or of a script. Each is NOT
+        helm's, and so is a child of one. The controls are helm's own spawn
+        shapes and still read as its own: the findings pass behind its
+        `sh -c 'exec "$@" &'` wrapper, interpreter options before `-m`, the
+        joined `-mhelm.x`, a `timeout` in front of the interpreter, and a
+        gate child run by path."""
+        data = {
+            100: ["nvim", "helm/gatechild.py"],
+            110: ["less", "/opt/helm/bin/helm"],
+            120: ["git", "commit", "-m", "helm.findingspass"],
+            130: ["/usr/bin/python3", "-c", "import time; time.sleep(30)",
+                  "-m", "helm.findingspass", "deadbeefcafe"],
+            140: ["/usr/bin/python3", "-m", "pytest", "-m", "helm.slow"],
+            150: ["/usr/bin/python3", "tools/report.py", "-m", "helm", "gate",
+                  "run"],
+            # AN INTERPRETER'S NAME IS DATA TOO, where it is not the program:
+            # an editor opened at a search, a pager's pattern, git's pickaxe,
+            # and a search under `timeout`. Found as the first python-named
+            # token anywhere, each read "HELM'S OWN ... WAIT".
+            170: ["vim", "+/python3", "helm/gatechild.py"],
+            180: ["less", "-p", "python3", "helm/gatechild.py"],
+            190: ["git", "log", "-S", "python3", "--", "helm/gatechild.py"],
+            195: ["timeout", "5", "rg", "python3", "helm/gateslice.py"],
+        }
+        helms = {
+            200: ["/bin/sh", "-c", 'exec "$@" &', "helm-findings-pass",
+                  "/usr/bin/python3.14", "-m", "helm.findingspass", "abc123"],
+            210: ["/usr/bin/python3", "-u", "-X", "dev", "-m", "helm", "gate",
+                  "run"],
+            220: ["/usr/bin/python3", "-mhelm.findingspass", "abc123"],
+            230: ["timeout", "600", "/usr/bin/python3", "-m", "helm", "gate",
+                  "run"],
+            240: ["/usr/bin/python3", "/opt/helm/helm/gatechild.py", "--guard",
+                  "--", "/usr/bin/python3", "-m", "unittest"],
+            250: ["timeout", "-k", "5", "--foreground", "600",
+                  "/usr/bin/python3", "-m", "helm", "gate", "run"],
+        }
+        for pid, argv in list(data.items()) + list(helms.items()):
+            self.plant(pid, argv, comm=os.path.basename(argv[0]))
+        self.plant(160, ["sleep", "30"], ppid=100, comm="sleep")
+        pids = sorted(data) + [160] + sorted(helms)
+        by = dict(zip(pids, self.lines(pids)))
+        self.assertEqual(sorted(by), sorted(pids))
+        self.assertIn("NOT helm's", by[100])       # the editor, unconditionally
+        self.assertIn("HELM'S OWN", by[240])       # the gate child, unconditionally
+        for pid in sorted(data) + [160]:
+            self.assertIn("NOT helm's", by[pid])
+        for pid in helms:
+            self.assertIn("HELM'S OWN", by[pid])
+
+
+class OccupiedArmUnderHelmsOwnRunnerTest(unittest.TestCase):
+    """THE OCCUPIED-REFUSAL ARM READS THE SAME WHOEVER HOSTS THE SUITE.
+
+    The train267 and train272 whole-suite gates went red on
+    ReleaseTest.test_occupied_refusal_names_each_occupant_and_never_says_kill
+    while the same arm ran green under plain `python3 -m unittest`. The
+    occupant classifier walks each occupant's /proc ancestry, and on the gate
+    the arm's own `sleep 30` descended from helm's gate child
+    (`helm/gatechild.py`), so the release named it "HELM'S OWN, exits by
+    itself — part of a helm gate's test child (pid 435224)". The arm read the
+    host's real process table. Here it runs under helm's own slice runner,
+    which the classifier reads the same way, and must pass as it does alone.
+    Bug class: a-test-may-not-read-live-state-it-did-not-plant."""
+
+    def test_the_arm_passes_under_helms_gate_slice_runner(self):
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(gateslice.__file__), "--serial",
+             "tests.test_work.ReleaseTest."
+             "test_occupied_refusal_names_each_occupant_and_never_says_kill"],
+            cwd=repo, env=dict(os.environ, HELM_GATESLICE_LEAKS="off"),
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-4000:])
+        self.assertIn("Ran 1 test", proc.stderr)

@@ -269,12 +269,12 @@ def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
     now = time.time() if now is None else now
     rows = []
     for s, row in sorted(roster().items()):
-        sids = [x for x in [row.get("session")]
-                + list(row.get("sessions") or []) if x]
         try:
+            sids = [x for x in [row.get("session")]
+                    + list(row.get("sessions") or []) if x]
             why = _gc_keep_reason(s, row, roots, proc_dir, now)
         except Exception as e:                # fail-closed, loudly
-            why = "keep-evidence probe failed (%s)" % e
+            sids, why = [], "keep-evidence probe failed (%s)" % e
         rows.append({
             "seat": s, "verdict": "keep" if why else "prune",
             "why": why or (

@@ -92,15 +92,19 @@ def _runs(text, head, opener):
 
 
 _SHELL_READERS = frozenset(("bash", "sh", "zsh", "dash", "ksh"))
+# The readers whose heredoc is CODE for the whole-read transcript steer: a
+# shell, or an interpreter (`python3.12` is read as `python`).
+_INTERPRETERS = _SHELL_READERS | frozenset(("python", "node", "ruby", "perl"))
 _LAUNCHERS = frozenset(("sudo", "env", "nice", "nohup", "command", "exec",
                         "time"))
 _PIPE_TO_SHELL = _Rx(r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b")
 
 
-def _feeds_shell(line, at):
+def _feeds_shell(line, at, readers=_SHELL_READERS):
     """True when the heredoc opened at `line[at]` is a SCRIPT a shell runs:
     its command word is a shell (`bash <<EOF`, `sudo sh -s <<'EOF'`), or the
-    command it feeds pipes into one (`cat <<EOF | bash`)."""
+    command it feeds pipes into one (`cat <<EOF | bash`). `readers` widens
+    the command words that count, for a rung that reads other scripts."""
     from . import chat
     masked = chat._mask_quoted(line)[0]
     head = masked[:at]
@@ -112,7 +116,9 @@ def _feeds_shell(line, at):
     while words and ("=" in words[0] or words[0].startswith("-")
                      or os.path.basename(words[0]) in _LAUNCHERS):
         words = words[1:]
-    if words and os.path.basename(words[0]) in _SHELL_READERS:
+    if words and (os.path.basename(words[0]) in readers
+                  or re.sub(r"[\d.]+$", "", os.path.basename(words[0]))
+                  in readers):
         return True
     return bool(_PIPE_TO_SHELL.search(masked[at:]))
 
@@ -307,7 +313,6 @@ def pkill_refusal(command):
     try:
         if "pkill" not in command and "pgrep" not in command:
             return None
-        from . import chat
         text = command.replace("\\\n", "")
         for tool, pattern, kills, fixed in _self_kills(text):
             if not kills:
@@ -535,6 +540,42 @@ _READER = _Rx(_AT + r"(?:/usr/bin/)?(?:rg|grep|ugrep|jq|find|cat|tail|head|"
 TRANSCRIPT_STEER = ("You just read a session transcript by hand. For what was "
                     "said or decided, cv recall or cv search answers first and "
                     "names the span; open a jsonl only to check that span.")
+# THE SAME RULE, SHARPENED, for a WHOLE read of a transcript. A subagent
+# read eighty transcripts with `open(f).read().splitlines()` (one was 461 MB)
+# and json-loaded every line: 9.51G RSS, its seat's slice throttled, and the
+# seat wedged for 36 minutes (task/3083). That command read the files inside
+# a quoted python heredoc after a `cd` into the projects dir, so the plain
+# rule, which reads the command with its heredoc bodies cut, never saw it.
+# One line, same id, same latch: it replaces the plain text, never adds one.
+TRANSCRIPT_WHOLE_STEER = ("You just read session transcripts WHOLE. They run "
+                          "to hundreds of MB each: stream per line (`for line "
+                          "in open(f)`), never .read(), readlines() or "
+                          "json.load, or ask cv recall or cv search first.")
+_WHOLE_READ = _Rx(r"\.read\(\s*\)|\.readlines\(|\bread_(?:text|bytes)\("
+                  r"|\bjson\.load\(")
+
+
+def _whole_reads_transcript(raw, command):
+    """Does this command whole-read a `.jsonl` under a session-transcript
+    root? It reads the command as RUN: its text outside quoted heredocs
+    (`command`) plus the body of every quoted heredoc an interpreter reads
+    (`_feeds_shell` over _INTERPRETERS). The body of a chat post or a
+    `cat > notes` is data, so prose about this very incident does not fire.
+    The root, the file and the read may sit in different parts of the
+    command: the incident put the root in a `cd`, and the glob and the read
+    in the heredoc."""
+    from . import chat
+    lines = raw.split("\n")
+    bodies = ["\n".join(lines[start:end])
+              for i, openers in chat._heredoc_openers(raw)
+              for match, quoted, start, end, _resume in openers
+              if quoted and _feeds_shell(lines[i], match.start(),
+                                         _INTERPRETERS)]
+    code = "\n".join([command] + bodies)
+    if ".jsonl" not in code or not _WHOLE_READ.search(code):
+        return False
+    return any("/memory" not in m.group(0)
+               for m in _TRANSCRIPT.finditer(code))
 
 
 def _reads_transcript(command):
@@ -784,6 +825,11 @@ def _outward(command, cwd):
 # is write_steers; one id, so one latch covers both).
 _LANE_CLAIM = _Rx(_AT + r"helm\s+work\s+claim\b")
 
+# Filing a task: the moment a found defect is most often treated as handled
+# while the broken thing keeps running. A keyword in the store cannot see this
+# moment reliably; the verb can (store premise found-broken-contain-now-fix-now).
+_TASK_ADD = _Rx(_AT + r"(?:\S*/)?helm\s+task\s+add\b")
+
 
 def bash_steers(raw, command, tool_input=None, cwd=None):
     """[(steer-id, text)] for one Bash call. `raw` is the whole command with
@@ -794,11 +840,15 @@ def bash_steers(raw, command, tool_input=None, cwd=None):
         tin = tool_input if isinstance(tool_input, dict) else {}
         joined = raw.replace("\\\n", "")
         code = _code(joined) if any(
-            w in raw for w in ("pgrep", "chat", "timeout", "claim")) else ""
+            w in raw for w in ("pgrep", "chat", "timeout", "claim", "task")) \
+            else ""
         if "pgrep" in command and any(
                 t == "pgrep" and not k for t, _p, k, _f in _self_kills(joined)):
             out.append(("pgrep-f-matches-your-own-shell", PGREP_STEER))
-        if (".claude" in command or ".codex" in command) \
+        if (".claude" in raw or ".codex" in raw) \
+                and _whole_reads_transcript(raw, command):
+            out.append(("transcript-read", TRANSCRIPT_WHOLE_STEER))
+        elif (".claude" in command or ".codex" in command) \
                 and _reads_transcript(command):
             out.append(("transcript-read", TRANSCRIPT_STEER))
         if "chat" in command and not _SCORED.search(raw) and any(
@@ -823,6 +873,10 @@ def bash_steers(raw, command, tool_input=None, cwd=None):
                 _runs(code, m.start(), _opener_before(code, m.start()))
                 for m in _LANE_CLAIM.finditer(code)):
             out.append(("sweep-before-you-build", SWEEP_STEER))
+        if "task" in command and any(
+                _runs(code, m.start(), _opener_before(code, m.start()))
+                for m in _TASK_ADD.finditer(code)):
+            out.append(("found-broken-contain-now-fix-now", FILED_STEER))
     except Exception:                          # noqa: BLE001 — fail open
         return out
     return out
@@ -847,6 +901,9 @@ SWEEP_STEER = ("New module or new lane: sweep first. Grep the repo for the "
                "noun and the symptom, read the siblings, git log --grep the "
                "concept, then write one line: prior-art: X@file:line -> "
                "build, extend or move.")
+FILED_STEER = ("You filed a task. If it records something broken that is still "
+               "running, say now what you stopped (seat held, actuator off) and "
+               "who is building the cure. A filed row replaces neither.")
 
 
 def _in_git_tree(path):

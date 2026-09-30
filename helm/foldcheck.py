@@ -914,6 +914,84 @@ def gate_authority(repo, tip, gate_ref):
                               land=False)
 
 
+def land_authority(repo, tip, gate_ref):
+    """The same rung `check` spends on a LAND, asked without a fold.
+
+    `helm gate run`'s one-suite-per-tree door asks it (task/3323, task/3589):
+    a green tree is "already gated" only by a receipt this rung would let
+    land, so the door and the fold cannot disagree about which receipt that
+    is. A wrapper, never a copy: both enter `_tree_matches_gate(land=True)`."""
+    return _tree_matches_gate(vcs.backend(repo), repo, tip, gate_ref,
+                              land=True)
+
+
+def gate_containing(repo, tip, gate_ref):
+    """(Rung, facts) — does a VERIFIED whole-suite receipt vouch for a tree
+    whose HISTORY CONTAINS `tip`?
+
+    THE QUESTION A SOURCE-CLEAN LAND ASKS (task/3053), and it is not the one
+    `gate_authority` answers. That rung asks whether a receipt passed on THIS
+    commit's tree; a reviewer's clean tip is almost never the commit the train
+    gated — the train composes it with other cars and gates the composition.
+    So the receipt's commit is read out of the RECEIPT (its own `head`, never
+    the caller's: this module's law is that a rung is not fed its own answer),
+    the SAME tree-vs-receipt rung then proves the receipt is OK, whole-suite,
+    clean and self-consistent about that commit's tree, and only then is the
+    tip asked to be an ANCESTOR of it. Ancestry, not patch identity: a
+    rebased copy of the tip in the gated history proves an identical delta
+    was gated, never that this tip was.
+
+    `facts` is {"gate", "head", "tree"} once the receipt is found, so a caller
+    can record exactly what vouched; {} before that. Every UNKNOWN is a
+    refusal to a caller that needs a PASS — not-measured is not consent."""
+    name = "gate-contains"
+    token = _GATE_TOKEN.match(str(gate_ref or "").strip())
+    if not token:
+        return Rung(name, UNKNOWN,
+                    "no gate receipt named (%r) — a source-clean land needs "
+                    "gate:<16-hex>, a verified whole-suite receipt on a commit "
+                    "containing the tip" % str(gate_ref or "")[:48]), {}
+    token = token.group(1)
+    try:
+        rows, unavailable, _skipped = gate.receipts()
+    except Exception as exc:                      # a store this rung cannot read
+        return Rung(name, UNKNOWN,
+                    "the receipt store could not be read (%s)" % (exc,)), {}
+    if unavailable:
+        return Rung(name, UNKNOWN, "the receipt store is unavailable (%s)"
+                    % (unavailable,)), {}
+    found = [r for r in rows if str(r.get("id") or "") == token]
+    if not found:
+        return Rung(name, UNKNOWN,
+                    "no VERIFIED receipt %s in this store — never minted here, "
+                    "never imported, or its content no longer hashes to its id"
+                    % token), {}
+    head = str(found[0].get("head") or "").strip().lower()
+    if not _FULL_TREE.match(head):
+        return Rung(name, UNKNOWN,
+                    "receipt %s names no full commit it ran on (%r)"
+                    % (token, head[:48])), {}
+    facts = {"gate": token, "head": head,
+             "tree": str(found[0].get("tree") or "").strip().lower()}
+    backend = vcs.backend(repo)
+    bound = _tree_matches_gate(backend, repo, head, gate_ref)
+    if bound.verdict != PASS:
+        return Rung(name, bound.verdict, bound.discriminator), facts
+    state = backend.ancestry(repo, tip, head)
+    if state == vcs.ANCESTOR:
+        return Rung(name, PASS,
+                    "%s is in the history of %s, the commit whole-suite "
+                    "receipt %s passed on" % (tip[:12], head[:12], token)), facts
+    if state == vcs.NOT_ANCESTOR:
+        return Rung(name, REFUSE,
+                    "%s is NOT in the history of %s, the commit receipt %s "
+                    "passed on — that gate never ran a tree containing it (a "
+                    "rebased or patch-identical copy does not count)"
+                    % (tip[:12], head[:12], token)), facts
+    return Rung(name, UNKNOWN, "cannot ask whether %s is in the history of %s"
+                % (tip[:12], head[:12])), facts
+
+
 def check(repo, tip, gate_ref=None, remote="origin", branch="main", fetch=True):
     """Run all five against ONE fetched moment. Returns the rungs in fold
     order, never a bare bool.

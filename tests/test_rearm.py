@@ -19,6 +19,8 @@ HEAD_SHA = "abc1234"
 
 
 class RearmBase(unittest.TestCase):
+    drift_seam = True
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-rearm-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -37,6 +39,12 @@ class RearmBase(unittest.TestCase):
         self._patch(rearm.pk, "event", mock.Mock())   # no real ~/.helm write
         self.killed = []
         self._patch(rearm.os, "kill", lambda pid, sig: self.killed.append((pid, sig)))
+        # the unit-drift census reads the user unit directory, which is the
+        # runner's own unless an arm moves it (task/3405): none by default
+        if self.drift_seam:
+            p = mock.patch.object(rearm, "_unit_drift", lambda: [])
+            p.start()
+            self.addCleanup(p.stop)
 
     def _patch(self, obj, attr, value):
         p = mock.patch.object(obj, attr, value)
@@ -536,6 +544,61 @@ class ReportTest(RearmBase):
             rc = rearm.cmd_rearm(["--nuke"])
         self.assertEqual(rc, 2)
         self.assertIn("usage: helm rearm", err.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# a land that changes a unit template is a post-land action (task/3405)
+# ---------------------------------------------------------------------------
+
+class UnitDriftReportTest(RearmBase):
+    """The land-to-live report also names every installed helm unit its
+    module's current template no longer renders, with the line that
+    re-installs it. It never rewrites one: a unit is the operator's to
+    re-install, and rearm's only writes stay the waiters and the web unit."""
+
+    drift_seam = False
+
+    def plant_nightly_without_its_source_line(self):
+        from helm import releasenightly
+        from tests._tmphome import fake_user_systemd
+        fake = fake_user_systemd(self)
+        spath, service, tpath, timer = releasenightly.timer_units()
+        line = "Environment=%s=timer\n" % releasenightly.SOURCE_ENV
+        self.assertIn(line, service)
+        os.makedirs(fake.unit_dir)
+        for path, text in ((spath, service.replace(line, "")), (tpath, timer)):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        return fake, spath
+
+    def test_the_report_names_the_drifted_unit_and_its_reinstall(self):  # noqa: VACUOUS_ASSERTION — the empty systemctl call list is the claim; the same report names the drifted unit, its missing line and its re-install line positively
+        fake, spath = self.plant_nightly_without_its_source_line()
+        with open(spath, "rb") as fh:
+            before = fh.read()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = rearm.cmd_rearm([])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("DRIFTED helm-release-nightly.service", text)
+        self.assertIn("Environment=HELM_RELEASE_NIGHTLY_SOURCE=timer", text)
+        self.assertIn("`helm release nightly --install-timer`", text)
+        self.assertIn("1 unit drifted", text)
+        with open(spath, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(fake.calls(), [])
+
+    def test_json_carries_the_drifted_rows(self):
+        import json
+        self.plant_nightly_without_its_source_line()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rearm.cmd_rearm(["--json"])
+        doc = json.loads(out.getvalue())
+        self.assertEqual([(u["unit"], u["verdict"], u["command"])
+                          for u in doc["units"]],
+                         [("helm-release-nightly.service", "drifted",
+                           "helm release nightly --install-timer")])
 
 
 if __name__ == "__main__":

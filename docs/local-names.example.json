@@ -14,17 +14,24 @@
     "                    honoured, and a keepalive it runs counts as a writer",
     "qwen27-provider     the provider name the qwen27 pool row goes by (default",
     "                    local-llamacpp); a seat minted under a name keeps it",
+    "local-operator-seat the seat that runs the local model families' hardware;",
+    "                    only it, from its own roster-bound session, certifies",
+    "                    them with `helm burn certify-local` (unset: nobody can)",
     "deploy-dir          the directory a deployed gate's scripts run from",
     "deploy-project      the registered project whose checkout owns them",
     "local-review-script the findings pass's reading script",
     "fab-node            the build node an operator's A/B eval rig runs on by default",
-    "generic-keywords    words the knowledge store never treats as a topic"
+    "generic-keywords    words the knowledge store never treats as a topic",
+    "public-names        names the private-name advisory treats as public,",
+    "                    beside its shipped allowlist (docs/CLASSIFY.md)"
   ],
   "predecessor": "oldtool",
   "qwen27-provider": "box-llamacpp",
+  "local-operator-seat": "gpu-box-claude",
   "deploy-dir": "~/.local/share/gate-bin",
   "deploy-project": "infra",
   "local-review-script": "~/dev/infra/scripts/local-review.py",
   "fab-node": "build-1",
-  "generic-keywords": ["oldtool"]
+  "generic-keywords": ["oldtool"],
+  "public-names": ["acme-cli", "Acme"]
 }

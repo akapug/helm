@@ -146,8 +146,15 @@ class TheRuleTest(unittest.TestCase):
         in a notice naming both sizes, and a rung that reported the CURE would
         train the tree straight back off itself."""
         from helm import dispatches
-        with open(os.path.abspath(dispatches.__file__), encoding="utf-8") as fh:
-            found = silent_cap.analyze_source(fh.read(), "helm/dispatches.py")
+        from tests._satellite_resolution import ledger_sources
+        # THE LEDGER'S SURFACE, NOT ITS ONE FILE: the positive control below
+        # is a truncation in the verdict announcement, which moved whole to
+        # `dispatches_announce` (task/3407); `ledger_sources` follows the
+        # `_OWNER_NAMES` declaration, so the next split needs no edit here.
+        found = []
+        for path, source in ledger_sources(dispatches):
+            found += silent_cap.analyze_source(
+                source, "helm/" + os.path.basename(path))
         self.assertEqual([row for row in found if "message" in row[2].lower()],
                          [],
                          "the marked brief cut is being reported as unmarked")

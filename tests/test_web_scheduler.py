@@ -1,20 +1,11 @@
-"""Scheduler tab assembly and real JavaScript renderer runtime contracts."""
-import json
-import os
-import shutil
-import subprocess
-import tempfile
+"""The scheduler model /api/lr carries: who waits on whom, the owner asks
+and holds, read per response and never a healthy zero."""
 import unittest
 from unittest import mock
 
-from helm import dispatches, landreq, scheduler, web, web_land, web_ui_loader
-from tests.test_web_chat_client_runtime import _extract_fn
+from helm import dispatches, landreq, scheduler, web, web_land
 # The module, never its TestCase: tests/test_suite_collection.py says why.
 from tests import test_web_lr as _web_lr
-
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-HARNESS = os.path.join(HERE, "scheduler_runtime_harness.js")
 
 
 class SchedulerApiTest(_web_lr.LrApiBase):
@@ -151,114 +142,13 @@ class SchedulerApiTest(_web_lr.LrApiBase):
         self.assertIsNone(failed["scheduler"]["row_count"])
 
 
-class SchedulerAssemblyTest(unittest.TestCase):
-    def test_the_scheduler_is_a_fold_of_the_work_page(self):
-        """The scheduler was its own Fleet tab; the owner merged it into the
-        Work page, where it folds under the land pipeline's kanban. A #scheduler
-        bookmark lands on Work and opens that fold."""
-        src = web_ui_loader.read_text()
-        self.assertNotIn('data-v="scheduler"', src)
-        self.assertNotIn('id="view-scheduler"', src)
-        work = src[src.index('id="view-work"'):src.index('id="view-quota"')]
-        self.assertIn('<details class="grp" id="schedfold">', work)
-        self.assertIn('<section id="schedulersec">', work)
-        self.assertIn("function schedulerHTML", src)
-        self.assertIn(".schgraph", src)
-        self.assertIn(".schgroupsuc.alarm", src)
-        self.assertIn('scheduler: "work"', _extract_fn(src, "canonView"))
-        self.assertIn('scheduler: "schedfold"', _extract_fn(src, "goOldSection"))
-
-    def test_lrShow_feeds_scheduler_from_the_same_answer(self):  # noqa: VACUOUS_ASSERTION — exact one-call count is the positive control; fetch absence proves the same answer is reused rather than fetched again
-        body = _extract_fn(web_ui_loader.read_text(), "lrShow")
-        self.assertIn("lrNav(d)", body)  # control: this is the live LR consumer
-        self.assertIn("schedulerShow(d)", body)
-        self.assertEqual(body.count("schedulerShow(d)"), 1)
-        self.assertNotIn("fetch", _extract_fn(web_ui_loader.read_text(),
-                                               "schedulerShow"))
-
-    def test_home_owner_strip_reads_known_asks_before_pipeline_unknown(self):
-        body = _extract_fn(web_ui_loader.read_text(), "dashOwner")
-        self.assertLess(body.index("const model = d.scheduler"),
-                        body.index("if (!board || model.unavailable)"))
-        self.assertIn("OWNER ASK", body)
-        self.assertIn("model.owner_holds", body)
-        self.assertIn("owner_asks_dropped", body)
-        self.assertNotIn("unmeasurable", body)
-        self.assertNotIn("/\\bheld\\b/i", body)
-        self.assertIn('showView("work"); goOldSection("scheduler")', body)
-
-    def test_renderer_has_no_second_endpoint_or_client_side_holder_grouping(self):
-        src = web_ui_loader.read_text()
-        body = _extract_fn(src, "schedulerHTML")
-        self.assertNotIn("/api/", body)
-        self.assertNotIn("holder_role", body)
-        self.assertIn("model.groups", body)
-        row = _extract_fn(src, "schedulerRowHTML")
-        ask = _extract_fn(src, "schedulerAskHTML")
-        self.assertIn('e.kind === "waits_on"', row)
-        self.assertIn('e.kind === "supersedes"', row)
-        self.assertNotIn("row.supersedes", row)
-        self.assertIn("waits_on_owner_", ask)
-        poll = _extract_fn(src, "pollLr")
-        self.assertEqual(poll.count('j("/api/lr"'), 1)
-
-
-class SchedulerRuntimeTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        node = shutil.which("node")
-        if not node:
-            raise unittest.SkipTest("node not available")
-        src = web_ui_loader.read_text()
-        # `cardStale` and `cardSource` are REAL here because the owner strip is
-        # one of the home cards that must name its read and withhold an expired
-        # value; stubbing them would let this harness render a strip the page
-        # cannot produce.
-        names = ("schedulerSUC", "schedulerEdgeMap", "schedulerAskHTML",
-                 "schedulerRowHTML", "schedulerAsksHTML", "schedulerFoldHTML",
-                 "schedulerHTML",
-                 "cardBoundS", "cardStale", "cardSource", "dashOwner")
-        functions = "\n\n".join(_extract_fn(src, name) for name in names)
-        with open(HARNESS, encoding="utf-8") as stream:
-            script = stream.read().replace("/*__INJECT__*/", functions)
-        cls.tmp = tempfile.TemporaryDirectory(prefix="helm-scheduler-runtime-")
-        cls.addClassCleanup(cls.tmp.cleanup)
-        path = os.path.join(cls.tmp.name, "run.js")
-        with open(path, "w", encoding="utf-8") as stream:
-            stream.write(script)
-        checked = subprocess.run([node, "--check", path], capture_output=True,
-                                 text=True)
-        if checked.returncode:
-            raise AssertionError("node --check failed:\n" + checked.stderr)
-        run = subprocess.run([node, path], capture_output=True, text=True,
-                             timeout=60)
-        if run.returncode:
-            raise AssertionError("scheduler harness failed:\n" + run.stderr)
-        cls.detail = json.loads(run.stdout)[0]["detail"]
-
-    def test_real_renderer_groups_edges_ages_suc_owner_first_and_freshness(self):  # noqa: VACUOUS_ASSERTION — literal non-empty key tuple plus hasAllGroups membership binds the loop to the real harness result
-        self.assertIn("hasAllGroups", self.detail)  # control: harness returned shape
-        for key in ("hasAllGroups", "ownerBeforeGraph", "hasSUC",
-                    "hasBlocking", "hasSupersession", "hasAges",
-                    "hasFreshness", "hasListDoor", "usageResetEdge",
-                    "ordinaryOwnerEdge"):
-            self.assertTrue(self.detail[key], key)
-
-    def test_real_renderer_keeps_unknown_and_measured_empty_distinct(self):  # noqa: VACUOUS_ASSERTION — unavailableLoud key membership is the structural control; each following boolean is a distinct rendered-state observation
-        self.assertIn("unavailableLoud", self.detail)  # control: harness returned shape
-        self.assertTrue(self.detail["unavailableLoud"])
-        self.assertTrue(self.detail["unavailableKeepsAsk"])
-        self.assertTrue(self.detail["missingLoud"])
-        self.assertTrue(self.detail["emptyMeasured"])
-        # THE GRAPH COUNTS WHAT IT DOES NOT DRAW: one line per collapsed
-        # class, above an empty graph that says the lines hold the rest
-        self.assertTrue(self.detail["foldLines"])
-        self.assertTrue(self.detail["ownerEmptyUnreadableLoud"])
-        self.assertTrue(self.detail["ownerKnownUnreadableVisible"])
-        self.assertTrue(self.detail["ownerCapDisclosed"])
-        self.assertTrue(self.detail["allCappedDisclosed"])
-        self.assertTrue(self.detail["canonicalOwnerHold"])
-
+# THE PAGE'S SCHEDULER WENT WITH THE PIPELINE PAGE (task/3643). "Who waits
+# on whom" is the Work page's List lens grouped by who has it, each card's
+# whose move read from /api/work (tests/test_web_work_page.py,
+# LensesTest.test_the_list_is_the_backlogs_rows_with_stage_and_whose_move);
+# its fold, its renderer and its node harness were retired with it. The
+# server's scheduler model on /api/lr, which the owner asks and holds still
+# ride, is the class above.
 
 if __name__ == "__main__":
     unittest.main()

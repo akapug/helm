@@ -37,6 +37,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -50,11 +51,31 @@ from helm import cell, chat, chatnode, doctor, pk  # noqa: E402
 FAUCET = "4a" * 32
 SOURCE = "c2" * 32
 NODE = "http://127.0.0.1:8898"
+# THE COMMITTEE A STUB NODE SERVES at /api/membership, in the shape the live
+# rebased node answers (ids replaced by fixtures). It is the
+# chain part of every record stamp in the arms that do not plant a genesis,
+# so those arms stay about which SOURCE answers; the chain arms below plant
+# real minted descriptors instead.
+MEMBERSHIP = {"committee_epoch": 0, "constitution_version": 0,
+              "federation_id": "f1" * 32, "membership_frozen": False,
+              "participants": ["a8" * 32], "proposals": [],
+              "self": {"key": "a8" * 32, "participant": True}, "threshold": 1}
+
+
+def membership_only(url, timeout=None):
+    """A node that answers its membership and nothing else."""
+    return json.loads(json.dumps(MEMBERSHIP)) \
+        if url.endswith("/api/membership") else None
 
 
 class FaucetBase(unittest.TestCase):
     """A hermetic HELM_HOME plus a STUBBED node HTTP surface: the only reads
-    are `cell.get_json`, the seam every helm caller already goes through."""
+    are `cell.get_json`, the seam every helm caller already goes through.
+
+    THE LOCAL UNIT IS HERMETIC TOO. The chain stamp and the local faucet
+    sources read the unit's data dir, so DATA_DIR is an empty temp dir here —
+    never the host's /dev/shm node — and a node that no arm stubs answers only
+    its membership."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-faucet-")
@@ -72,6 +93,13 @@ class FaucetBase(unittest.TestCase):
         os.environ["DREGG_HOME"] = os.path.join(self.tmp, "dregg-home")
         self.profiles = os.path.join(self.tmp, "dregg-home", "profiles")
         os.makedirs(self.profiles)
+        self.data_dir = os.path.join(self.tmp, "chat-node-data")
+        os.makedirs(self.data_dir)
+        for p in (mock.patch.object(chatnode, "DATA_DIR", self.data_dir),
+                  mock.patch.object(cell, "get_json",
+                                    side_effect=membership_only)):
+            p.start()
+            self.addCleanup(p.stop)
 
     def tearDown(self):
         for k, v in self.prior.items():
@@ -101,7 +129,7 @@ class FaucetBase(unittest.TestCase):
                 if cid in pubkeys:
                     out["public_key"] = pubkeys[cid]
                 return out
-            return None
+            return membership_only(url)
 
         return mock.patch.object(cell, "get_json", side_effect=get_json)
 
@@ -638,7 +666,7 @@ class TheRecordedCellIsBoundToItsNodeToo(FaucetBase):
 
     def plant(self, **over):
         rec = {"cell": self.STALE_CELL, "need": 9000, "have": 0,
-               "node": NODE, "at": pk.now_ts()}
+               "node": chatnode.node_identity(NODE), "at": pk.now_ts()}
         rec.update(over)
         path = chatnode.faucet_state_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -666,7 +694,7 @@ class TheRecordedCellIsBoundToItsNodeToo(FaucetBase):
         self.assertEqual(self.STALE_CELL, self.prefix())
 
     def test_a_record_from_ANOTHER_node_does_not_name_this_faucet(self):
-        self.plant(node=self.OTHER_NODE)
+        self.plant(node=chatnode.node_identity(self.OTHER_NODE))
         self.assertEqual(FAUCET, self.prefix(),
                          "the fee well helm can read NOW outranks a cell "
                          "recorded at a different node")
@@ -679,7 +707,7 @@ class TheRecordedCellIsBoundToItsNodeToo(FaucetBase):
         """THE CONSEQUENCE, at the surface an operator reads: with the stale
         cell winning, the node answered for no such cell and the whole faucet
         read UNKNOWN even though its real cell was discoverable and funded."""
-        self.plant(node=self.OTHER_NODE)
+        self.plant(node=chatnode.node_identity(self.OTHER_NODE))
         with mock.patch.object(chatnode, "_fee_well_from_journal",
                                return_value=FAUCET), \
                 self.node({FAUCET: 9000}):
@@ -694,7 +722,7 @@ class TheRecordedCellIsBoundToItsNodeToo(FaucetBase):
         against the CONFIGURED node A, so the call asked B for A's cell. The
         two halves have to answer about the same node."""
         other = "http://127.0.0.1:9999"
-        self.plant(node=other)                      # a record for the OTHER node
+        self.plant(node=chatnode.node_identity(other))  # a record for OTHER
         with mock.patch.object(chatnode, "_fee_well_from_journal",
                                return_value=FAUCET):
             # Read AS the other node: its own record names the cell and sets
@@ -737,7 +765,7 @@ class TheRecordedCellIsBoundToItsNodeToo(FaucetBase):
         from having no qualified source at all, so it keeps its own sentence
         and must not borrow the disqualification one."""
         other = "http://127.0.0.1:9999"
-        self.plant(node=other, cell="beefbeef")  # qualified, abbreviated
+        self.plant(node=chatnode.node_identity(other), cell="beefbeef")  # qualified, abbreviated
         with mock.patch.object(chatnode, "_fee_well_from_journal",
                                return_value=FAUCET), \
                 self.node({FAUCET: 9000}):       # nothing starts with it
@@ -749,7 +777,7 @@ class TheRecordedCellIsBoundToItsNodeToo(FaucetBase):
     def test_a_MATCHING_stamp_is_still_the_qualified_positive(self):
         """The pole that keeps the rule from being 'refuse every record'."""
         other = "http://127.0.0.1:9999"
-        self.plant(node=other)
+        self.plant(node=chatnode.node_identity(other))
         with mock.patch.object(chatnode, "_fee_well_from_journal",
                                return_value=FAUCET):
             self.assertEqual(self.STALE_CELL,
@@ -803,7 +831,7 @@ class TheRecordedCellIsBoundToItsNodeToo(FaucetBase):
         still a qualified source and still names its cell."""
         remote = "http://10.0.0.7:8898"
         os.environ["HELM_CHAT_NODE_URL"] = remote
-        self.plant(node=remote)
+        self.plant(node=chatnode.node_identity(remote))
         with mock.patch.object(chatnode, "_fee_well_from_journal",
                                return_value=FAUCET):
             cellid, disqualified = chatnode.faucet_cell_prefix()
@@ -826,7 +854,7 @@ class TheRecordedCellIsBoundToItsNodeToo(FaucetBase):
         record that does describe the node being asked about."""
         other = "http://127.0.0.1:9999"
         os.environ["HELM_CHAT_FAUCET_CELL"] = FAUCET
-        self.plant(node=other)
+        self.plant(node=chatnode.node_identity(other))
         cellid, disqualified = self.qualified(other)
         self.assertEqual(self.STALE_CELL, cellid)
         self.assertFalse(disqualified)
@@ -856,7 +884,7 @@ class TheRecordedCellIsBoundToItsNodeToo(FaucetBase):
         not name — and a mutation that stops threading the url survives every
         arm that drives the halves one at a time."""
         other = "http://127.0.0.1:9999"
-        self.plant(node=other, need=9000)
+        self.plant(node=chatnode.node_identity(other), need=9000)
         with mock.patch.object(chatnode, "_fee_well_from_journal",
                                return_value=FAUCET), \
                 self.node({self.STALE_CELL: 5000, FAUCET: 5000}):
@@ -881,7 +909,7 @@ class ShortfallIsBoundToItsNodeAndItsSeason(FaucetBase):
 
     def plant(self, **over):
         rec = {"cell": FAUCET, "need": 9000, "have": 0,
-               "node": NODE, "at": pk.now_ts()}
+               "node": chatnode.node_identity(NODE), "at": pk.now_ts()}
         rec.update(over)
         path = chatnode.faucet_state_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -902,7 +930,7 @@ class ShortfallIsBoundToItsNodeAndItsSeason(FaucetBase):
         self.assertEqual("dry", st["state"])
 
     def test_a_requirement_observed_at_ANOTHER_node_does_not_redefine_dry(self):
-        self.plant(node=self.OTHER_NODE)
+        self.plant(node=chatnode.node_identity(self.OTHER_NODE))
         st = self.state(5000)
         self.assertEqual(chatnode.FAUCET_DRY_BELOW, st["threshold"])
         self.assertIsNone(st["observed_need"])
@@ -919,11 +947,11 @@ class ShortfallIsBoundToItsNodeAndItsSeason(FaucetBase):
         """The retention is the other half of the same property: the max()
         that keeps a high-water mark takes its prior from THIS node's own
         record, never from a foreign one."""
-        self.plant(node=self.OTHER_NODE)
+        self.plant(node=chatnode.node_identity(self.OTHER_NODE))
         chatnode.record_faucet_shortfall(FAUCET, 1600, 0)
         rec = chatnode.faucet_shortfall()
         self.assertEqual(1600, rec["need"])
-        self.assertEqual(NODE, rec["node"],
+        self.assertEqual(chatnode.node_identity(NODE), rec["node"],
                          "the record names the node it was observed at")
         self.assertEqual(1600, self.state(5000)["threshold"])
 
@@ -935,6 +963,193 @@ class ShortfallIsBoundToItsNodeAndItsSeason(FaucetBase):
         chatnode.record_faucet_shortfall(FAUCET, 1600, 0)
         self.assertEqual(9000, chatnode.faucet_shortfall()["need"])
 
+
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "fixtures", "chatnode_rebased_genesis")
+OLD_WELL = "4a8882bb17c23b3e"   # the faucet of the chain before the re-genesis
+
+
+class TheFaucetFollowsTheChain(FaucetBase):
+    """A RE-GENESIS AT THE SAME URL IS A DIFFERENT CHAIN.
+
+    MEASURED LIVE: `helm chat node up` re-genesised the unit at
+    http://127.0.0.1:8898, and the new chain's faucet was b6a5b3f11d943606
+    (balance 1000000). helm still named the OLD chain's 4a8882bb17c23b3e,
+    which is no cell there, so the faucet read UNKNOWN and every seat's grant
+    came back send_outcome_unknown. Two sources were stale: the shortfall
+    record was stamped with the url alone, so the old chain's record
+    qualified for the new one; and the journal read ran across every boot,
+    so the old node's "fee loop" line answered for a node that prints none.
+
+    The chains here are REAL minted descriptors
+    (tests/fixtures/chatnode_rebased_genesis): the older build's genesis,
+    whose faucet cell is 4a8882bb..., and the rebased build's, whose faucet
+    cell is b6a5b3f1... — each patched by the shipped patch_genesis with the
+    devnet faucet seed beside it, exactly as prepare leaves a data dir."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("HELM_CHAT_FAUCET_CELL", None)   # the mask comes off
+
+    def genesis(self, name, patch=True):
+        """Make `name` the local unit's chain; return its fee_well."""
+        path = os.path.join(self.data_dir, "genesis.json")
+        shutil.copyfile(os.path.join(FIXTURES, name), path)
+        if patch:
+            with open(os.path.join(FIXTURES, "faucet-seed.json")) as f:
+                seed = bytes.fromhex(json.load(f)["faucet_seed_hex"])
+            with open(os.path.join(self.data_dir, "faucet.key"), "wb") as f:
+                f.write(seed)
+            self.assertIsNone(chatnode.patch_genesis(path))
+        with open(path) as f:
+            return json.load(f)["fee_well"]
+
+    def prefix(self, journal=None):
+        with mock.patch.object(chatnode, "_fee_well_from_journal",
+                               return_value=journal):
+            return chatnode.faucet_cell_prefix(NODE)
+
+    def test_a_record_from_an_OLDER_chain_at_the_same_url_is_unqualified(self):
+        old = self.genesis("older-build-genesis.json")
+        self.assertTrue(old.startswith(OLD_WELL))
+        chatnode.record_faucet_shortfall(old[:16], 697, 593)
+        # UNCONDITIONAL POSITIVE: on the chain that refused, the record
+        # qualifies and names its cell, so the refusal below is the chain.
+        self.assertEqual(697, chatnode.current_shortfall(NODE).get("need"))
+        self.assertEqual((old[:16], False), self.prefix())
+        new = self.genesis("genesis.json")              # re-genesis, same url
+        self.assertEqual({}, chatnode.current_shortfall(NODE),
+                         "a record from the old chain describes no cell here")
+        self.assertEqual((new, False), self.prefix())
+
+    def test_the_live_record_stamped_with_the_url_alone_is_unqualified(self):
+        """THE INCIDENT, as it sat on disk: a fresh record whose stamp names
+        the url and no chain. It qualified, outranked the new chain, and
+        forced UNKNOWN; it must leave the cell to the new chain's own
+        descriptor, which reads FUNDED."""
+        path = chatnode.faucet_state_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pk.write_json(path, {"cell": OLD_WELL, "need": 697, "have": 593,
+                             "node": NODE, "at": pk.now_ts()})
+        new = self.genesis("genesis.json")
+        self.assertEqual({}, chatnode.current_shortfall(NODE))
+        with mock.patch.object(chatnode, "_fee_well_from_journal",
+                               return_value=None), \
+                self.node({new: 1000000}):
+            st = chatnode.faucet_state(NODE)
+        self.assertEqual("funded", st["state"], st["reason"])
+        self.assertEqual(new, st["cell"])
+        self.assertEqual(1000000, st["balance"])
+        self.assertEqual(chatnode.FAUCET_DRY_BELOW, st["threshold"],
+                         "the old chain's need is not this chain's floor")
+
+    def test_the_local_source_is_the_NEW_genesis_not_an_older_boots_line(self):
+        """The journal source answering the previous chain's line (what the
+        unscoped read returned live) must not outrank the chain's own
+        descriptor."""
+        new = self.genesis("genesis.json")
+        self.assertTrue(new.startswith("b6a5b3f11d943606"))
+        self.assertEqual((new, False), self.prefix(journal=OLD_WELL))
+        with mock.patch.object(chatnode, "_fee_well_from_journal",
+                               return_value=OLD_WELL), \
+                self.node({new: 1000000, OLD_WELL + "0" * 48: 5}):
+            st = chatnode.faucet_state(NODE)
+        self.assertEqual(("funded", new, 1000000),
+                         (st["state"], st["cell"], st["balance"]), st["reason"])
+
+    def test_an_UNPATCHED_genesis_names_no_faucet(self):  # noqa: VACUOUS_ASSERTION — the same prefix call returns the next source's cell (a positive on that observable), and test_the_local_source_is_the_NEW_genesis_not_an_older_boots_line is the descriptor's own positive pole
+        """THE POLE of the descriptor source. A minted genesis carries its
+        own fee well — a cell fees flow into, never the one grants come out
+        of — so only helm's patch (marked by coordination_fee_exempt) makes
+        fee_well the faucet. Unpatched, the next source answers."""
+        well = self.genesis("genesis.json", patch=False)
+        self.assertTrue(_hexish64(well))
+        self.assertIsNone(chatnode.descriptor_fee_well())
+        self.assertEqual(("abcdef0123456789", False),
+                         self.prefix(journal="abcdef0123456789"))
+
+    def test_a_remote_records_chain_is_the_committee_its_node_serves(self):
+        """No local descriptor describes a remote node, so its chain is what
+        the node serves at /api/membership: a fresh committee there is a new
+        chain, and a node that cannot state its chain qualifies no record."""
+        remote = "http://10.0.0.7:8898"
+        os.environ["HELM_CHAT_NODE_URL"] = remote
+        chatnode.record_faucet_shortfall("9e" * 8, 900, 0)
+        # UNCONDITIONAL POSITIVE: the same committee still qualifies it.
+        self.assertEqual(900, chatnode.current_shortfall(remote).get("need"))
+        fresh = json.loads(json.dumps(MEMBERSHIP))
+        fresh["federation_id"] = "f2" * 32
+        with mock.patch.object(cell, "get_json", return_value=fresh):
+            self.assertEqual({}, chatnode.current_shortfall(remote))
+        with mock.patch.object(cell, "get_json", return_value=None):
+            self.assertEqual({}, chatnode.current_shortfall(remote),
+                             "a chain nobody can state qualifies nothing")
+            chatnode.record_faucet_shortfall("9e" * 8, 900, 0)
+            self.assertEqual({}, chatnode.current_shortfall(remote),
+                             "two unknown chains are never one chain")
+
+
+class TheJournalIsReadForTheCurrentRunOnly(FaucetBase):
+    """The unit's journal keeps every run it ever had. Measured on the live
+    unit: the current invocation of the re-genesised node held 50 lines and no
+    "fee loop" line, while the unscoped `-u helm-chat-node -g "fee loop"`
+    read returned three, all from the previous chain's boots. This fake
+    journalctl keeps that property: an invocation match filters to that run,
+    a unit match returns every run."""
+
+    OLD_RUN, THIS_RUN = "0f" * 16, "01" * 16
+    OLD_LINE = ("INFO dregg_node: fee loop: genesis-less devnet fee well "
+                "pointed at the faucet cell fee_well=" + OLD_WELL)
+
+    def journal(self, lines, active="active"):
+        calls = []
+
+        def run(argv, **_kw):
+            calls.append(list(argv))
+            if argv[0] == "systemctl":
+                out = ("ActiveState=%s\nSubState=running\nNRestarts=0\n"
+                       "Result=success\nInvocationID=%s\n"
+                       "ExecMainStartTimestampMonotonic=0\n"
+                       % (active, self.THIS_RUN if active == "active" else ""))
+                return subprocess.CompletedProcess(argv, 0, out, "")
+            runs = [a.split("=", 1)[1] for a in argv
+                    if a.startswith("_SYSTEMD_INVOCATION_ID=")]
+            grep = argv[argv.index("-g") + 1] if "-g" in argv else ""
+            hit = [text for run_id, text in lines
+                   if (not runs or run_id == runs[0]) and grep in text]
+            return subprocess.CompletedProcess(argv, 0, "\n".join(hit), "")
+
+        with mock.patch.object(chatnode.subprocess, "run", side_effect=run):
+            return chatnode._fee_well_from_journal(), calls
+
+    def test_an_OLDER_runs_fee_loop_line_is_never_read(self):
+        well, calls = self.journal([
+            (self.OLD_RUN, self.OLD_LINE),
+            (self.THIS_RUN, "INFO dregg_node: genesis configuration loaded")])
+        self.assertIsNone(well)
+        journal = [c for c in calls if c[0] == "journalctl"]
+        self.assertEqual(1, len(journal), calls)
+        self.assertIn("_SYSTEMD_INVOCATION_ID=" + self.THIS_RUN, journal[0])
+
+    def test_the_CURRENT_runs_fee_loop_line_is_read(self):
+        """THE POLE: a genesis-less build states its fee well in THIS run,
+        and that line is still the answer."""
+        well, _calls = self.journal([
+            (self.OLD_RUN, self.OLD_LINE),
+            (self.THIS_RUN, "fee loop: fee_well=abcdef0123456789")])
+        self.assertEqual("abcdef0123456789", well)
+
+    def test_a_unit_with_no_current_run_reads_no_journal_at_all(self):
+        well, calls = self.journal([(self.OLD_RUN, self.OLD_LINE)],
+                                   active="inactive")
+        self.assertIsNone(well)
+        self.assertEqual(["systemctl"], [c[0] for c in calls],
+                         "the unit was asked for its run, the journal never")
+
+
+def _hexish64(value):
+    return isinstance(value, str) and len(value) == 64 \
+        and all(c in "0123456789abcdef" for c in value.lower())
 
 
 def scrub_env(test, *names):

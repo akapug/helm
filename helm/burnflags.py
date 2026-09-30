@@ -55,6 +55,46 @@ LAWS, each one a measured failure somewhere:
   off the ordering, and it carries `provenance: owner-declared` wherever it
   is rendered.
 
+  A LOCAL FAMILY READS GREEN WHILE THE SEAT THAT RUNS ITS HARDWARE CERTIFIES
+  IT. The owner's ruling, the certifier's name given by its role:
+  "obvs local models should always be green burnflag as long as [the Claude
+  seat on the GPU host] certifies them as running on local hardware
+  optimally". A local family is served from the operator's own GPU: every
+  pool row it lists names its endpoint by `base_url_from` in the catalog
+  (`local_families`), so it spends no vendor money, and a GREY for its
+  missing money reader rationed it as though it did. `helm burn
+  certify-local` records the certification for at most a day, and ONLY ITS
+  OPERATOR MAKES ONE: the family's declared operator seat, acting from its
+  own roster-bound session. A declared name alone is a value any process can
+  export, so it certifies nothing. Each record carries the key of the session
+  that made it, and the fold honours a record only while that key still
+  binds to the operator on the roster. A record it cannot tie to the
+  operator (a bare `by`, a row typed with no key the roster binds to the
+  operator, a key rebound elsewhere, a certifier that is not the operator)
+  reads GREY `money:certification-unverifiable`, never GREEN. THE KEY IS
+  NOT A SECRET, so this check is exactly as strong as the roster: the sid8
+  sits in this very file (a revoked row keeps it) and on the verb's own
+  output, so a process that can write the file can replay the operator's
+  last record with a later `until` and read GREEN. That process can equally
+  rebind a session on the roster or write the snapshot every consumer reads,
+  so the replay is the same-user trust boundary of helm's own state, stated
+  here and not closed by the fold.
+  The fold reads a verified, fresh record as the money axis of a local family
+  that has no reader: GREEN until the certification's own `until`, stamped
+  `provenance: certified-local`, and GREY again, exactly as with no
+  certification, the moment it lapses or is revoked. THIS IS NOT A DECLARED
+  COLOUR, so the worse-only law above does not bind it: that law is about an
+  owner declaration, which is intent with no measurement behind it. A
+  certification is an attestation by the seat that runs the hardware, made
+  only after its own measured checks of the server pass. It is still NOT A
+  MEASUREMENT: the reviewer budget conjunct reads it UNKNOWN, and a LIVE
+  READING THAT CONTRADICTS IT WINS, so while the family's own upstream
+  record reads anything but HEALTHY the certification is withdrawn. It
+  answers only where nothing else measures money, a non-local family never
+  reads one whatever the file says, an unreadable file reads GREY naming the
+  file, and REACH IS UNTOUCHED: an outage on the local server is still RED on
+  reach and RED overall.
+
   `expires_at` IS ANCHORED TO THE PRODUCER'S OWN INSTANT. The clock at read
   time never enters it, so folding one reading at two different `now` values
   produces byte-identical expiry fields.
@@ -101,6 +141,27 @@ BEHAVIOUR = {
 
 SNAPSHOT_NAME = "burn-flags.json"
 DECLARATIONS_NAME = "burn-declarations.json"
+LOCAL_CERTIFICATIONS_NAME = "burn-local-certifications.json"
+# The provenance a certified local family's money axis carries, so no surface
+# renders it as a vendor measurement.
+CERTIFIED_LOCAL = "certified-local"
+# THE LONGEST CERTIFICATION, from `certified_at` to `until`. A certification
+# is an attestation about a server that can degrade at any moment, so it is
+# renewed, never held: the operator seat renews it from its own session two
+# hours at a time, and a day is the most any one attestation may claim.
+CERTIFICATION_CEILING_S = 86400
+# ONE RENEWAL PERIOD. A certification lapsed longer than this and never
+# revoked means the renewals stopped, which doctor says out loud.
+CERTIFICATION_LAPSE_WARN_S = 7200
+# THE CAUSE OF A RECORD THE FOLD CANNOT TIE TO THE FAMILY'S OPERATOR SEAT: no
+# operator declared, a certifier that is not the operator, no session key, or
+# a key the roster no longer binds to the operator. GREY, never GREEN, and
+# never the no-reader words, because this GREY has a repair (the operator
+# certifies again from its own session) and a forgery looks exactly like it.
+CERTIFICATION_UNVERIFIABLE = "money:certification-unverifiable"
+# THE CATALOG KEY that names, per local family, the local-names key holding
+# the seat that runs its hardware (`local_operator`).
+OPERATOR_SEAT_FROM = "operator_seat_from"
 # A fold this reader does not know reads as ABSENT, never as a row with
 # missing fields: a consumer that pattern-matched a future shape would answer
 # from fields that mean something else.
@@ -221,6 +282,89 @@ def snapshot_path():
 def declarations_path():
     return os.path.join(home.helm_home(), home.GLOBAL, ".state",
                         DECLARATIONS_NAME)
+
+
+def local_certifications_path():
+    return os.path.join(home.helm_home(), home.GLOBAL, ".state",
+                        LOCAL_CERTIFICATIONS_NAME)
+
+
+def local_families(table=None):
+    """Every family served from the operator's own GPU -> a sorted tuple.
+
+    THE CATALOG'S OWN SPELLING: a pool row on the operator's box names its
+    endpoint by `base_url_from`, a key in the operator's endpoints file, and
+    never by a host (`seat_catalog.pool_base_url`). A family is local when its
+    DEFAULT row exists and EVERY row it lists is such a row: one paid
+    alternate beside a local default is a door to vendor money, so that
+    family is not free. The declaration is read and the endpoint is never
+    resolved, so the fold stays file-free."""
+    from . import seat
+    table = seat.FAMILIES if table is None else table
+    out = []
+    for family, fam in table.items():
+        rows = fam.get("pool_providers") if isinstance(fam, dict) else None
+        if isinstance(rows, dict) and rows.get(fam.get("pool_default")) \
+                and all(isinstance(row, dict) and row.get("base_url_from")
+                        for row in rows.values()):
+            out.append(family)
+    return tuple(sorted(out))
+
+
+def local_operator(family, table=None):
+    """The seat that runs LOCAL `family`'s hardware -> its name, or None.
+
+    DATA, SPELLED THE WAY THE FAMILY'S ENDPOINT IS: the catalog entry names a
+    local-names key by `operator_seat_from`, and this host's local-names file
+    (`localnames`) holds the seat under that key. A seat name is this host's
+    own, so the source carries none, exactly as it carries no host for
+    `base_url_from`. Absent at either end is None, and None is NO OPERATOR:
+    nobody can certify that family."""
+    from . import localnames, seat
+    fam = (seat.FAMILIES if table is None else table).get(family)
+    key = fam.get(OPERATOR_SEAT_FROM) if isinstance(fam, dict) else None
+    return localnames.value(key) if key in localnames.KEYS else None
+
+
+def _session_key(session):
+    """The key a certification stamps for the session that made it: the sid8
+    cursor key (`seats_cursor._sid8`), never the id itself, because a whole
+    session id is a bearer value (`tasks.public_row`)."""
+    from .seats_cursor import _sid8
+    return _sid8(session) if isinstance(session, str) and session else None
+
+
+def _session_bindings(keys):
+    """({key: the seat the roster binds that session key to now, or None},
+    None), or ({}, why) when the roster cannot be read. Never raises.
+
+    THE ROSTER'S OWN RESOLUTION, applied to every roster session whose sid8
+    is the key: a current binding first, then a remembered one
+    (`seats_roster.seat_for_session_in`). A key therefore binds to a seat
+    exactly when a process presenting that session now would be admitted as
+    that seat, and it stays bound while the seat moves on to a new session of
+    its own. Two seats behind one key is no binding."""
+    keys = {k for k in keys if isinstance(k, str) and k}
+    if not keys:
+        return {}, None
+    try:
+        from . import seats_roster
+        from .seats_cursor import _sid8
+        rows, failed = seats_roster.roster_checked()
+        if failed:
+            return {}, "the roster could not be read"
+        index, _holders = seats_roster.roster_indexes(rows)
+        found = {}
+        for sid in index:
+            key = _sid8(sid)
+            if key in keys:
+                seat = seats_roster.seat_for_session_in(index, sid)
+                if seat:
+                    found.setdefault(key, set()).add(str(seat))
+    except Exception as exc:                # noqa: BLE001 — never raises
+        return {}, "the roster could not be read (%s)" % type(exc).__name__
+    return {k: (next(iter(found[k])) if len(found.get(k, ())) == 1 else None)
+            for k in keys}, None
 
 
 # ------------------------------------------------------------------- the axes
@@ -802,6 +946,38 @@ def credit_count(rows):
     return total
 
 
+def credit_summary(rows):
+    """{usable, unread, why} from the reset rung's own rows -> the flag's
+    credits field, or None when the rung did not run for this family.
+
+    COUNTS ONLY. A reset row carries the account it is about, and nothing of it
+    but the numbers crosses into the snapshot: the same structural redaction
+    `_money_rows` keeps.
+
+    EVERY CREDIT READ IS IN HAND. A reset credit lifts a rate-limit wall and a
+    workspace credits-depleted wall alike (measured on trunk,
+    `codexresets.CREDITS_DEPLETED_TYPES`), so no wall makes a counted credit
+    worthless, and a Pro credit the spend order holds back is still in hand.
+    An account the rung did not ask for a balance is `unread`, never 0."""
+    if rows is None:
+        return None
+    usable, unread = 0, 0
+    for row in rows or ():
+        if not isinstance(row, dict):
+            continue
+        n = row.get("spendable")
+        if n is None:
+            n = row.get("available")
+        if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+            usable += n
+        else:
+            unread += 1
+    return {"usable": usable, "unread": unread,
+            "why": ("%d account%s not asked for a balance this pass (no "
+                    "spendable wall)" % (unread, "" if unread == 1 else "s"))
+            if unread else None}
+
+
 def _unread_why(unknown):
     """Why the unread rows are unread, by STATE and count — never by name.
 
@@ -909,6 +1085,37 @@ def derive_quota_wall(family, record):
                      "proxywatch upstream record: %s vendor reset"
                      % (record.get("reset_source") or "unnamed") if at else
                      "proxywatch upstream record: no vendor reset known"))
+
+
+def derive_turn_wall(family, walls):
+    """(money axis, reach axis) a seat's OWN last turn sets, each None when
+    no standing wall of that kind is read (task/3587).
+
+    `walls` is `turnwall.family_walls()`'s entry for this family: a
+    provider's billing or credential refusal on a seat's own turn that no
+    sibling has answered past. The upstream record can read HEALTHY over it,
+    because the proxy answered and the vendor said no, so this is its own
+    reading rather than a correction of that one. Neither carries a reset:
+    the wall clears when a seat of the family completes a turn."""
+    out = []
+    for axis, cause_id, repair in (
+            ("money", "money:turn-wall", "a top-up, a plan change or the "
+                                         "vendor's reset"),
+            ("reach", "reach:turn-wall", "a person clearing the account "
+                                         "check")):
+        w = (walls or {}).get(axis) if isinstance(walls, dict) else None
+        if not isinstance(w, dict):
+            out.append(None)
+            continue
+        out.append(_axis(
+            axis, RED,
+            "seat %s's own last turn ended on a provider refusal (%s) and no "
+            "seat of the family has completed a turn since; the repair is %s"
+            % (w.get("seat") or "?", w.get("label") or "?", repair),
+            cause_id, measured_at=w.get("at"), expires_kind="none",
+            expires_source="the seat's own transcript: the wall clears on "
+                           "the family's next completed turn"))
+    return out[0], out[1]
 
 
 def _gauge(row, label):
@@ -1079,6 +1286,139 @@ def derive_declared(family, declarations, now=None):
                  measured_at=rec.get("declared_at"))
 
 
+def _finite(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) \
+        and math.isfinite(value)
+
+
+def _iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def derive_certified_local(family, certifications, now=None, local=None,
+                           record=None):
+    """The MONEY axis a certification sets on a LOCAL family -> an axis
+    record, or None.
+
+    None, which leaves the ordinary no-reader GREY, for a family that is not
+    local whatever the file says, and for a record that is absent, revoked,
+    ends at or before the fold's own instant, or claims more than
+    `CERTIFICATION_CEILING_S` from its own `certified_at`. A lapse is
+    therefore not an error: it reads exactly as no certification does.
+
+    A FRESH RECORD IS HONOURED ONLY WHILE IT IS TIED TO THE OPERATOR SEAT.
+    Its `by` must be the family's declared operator (`local_operator`, read
+    by `read_local_certifications` into `operators`), and its `session_key`
+    must still bind to that operator on the roster (`bound`, from the same
+    reader). Anything else, a bare `by`, a row typed with no key the roster
+    binds to the operator, a key rebound elsewhere or a roster that cannot be
+    read, reads GREY `CERTIFICATION_UNVERIFIABLE`, never GREEN, with a cause
+    naming the operator and why. A REPLAY is not caught here: the operator's
+    own key copied onto a later `until` binds as the original did, because
+    the key is not a secret (the module's LAWS state that boundary).
+
+    A LIVE READING THAT CONTRADICTS "RUNNING OPTIMALLY" WINS. While the
+    family's own upstream `record` reads anything but HEALTHY (a dark state,
+    an answer our validation rejected, or its seats disagreeing), the
+    certification is withdrawn and the family reads as it would uncertified.
+    No record at all contradicts nothing.
+
+    AN UNREADABLE FILE IS NOT AN ABSENT ONE: a local family then reads GREY
+    with a cause that names the file, never the no-reader words.
+
+    `expires_at` IS the certification's `until` and `measured_at` its
+    `certified_at`, both the producer's own instants."""
+    now = time.time() if now is None else now
+    if family not in (local_families() if local is None else local):
+        return None
+    certifications = certifications or {}
+    unreadable = certifications.get("unreadable")
+    if unreadable:
+        return _axis("money", GREY,
+                     "no money reader exists for this family, and its local "
+                     "certification file %s could not be read, so whether "
+                     "it is certified is unknown" % unreadable,
+                     "money:certification-unreadable", measured_at=None,
+                     provenance="unmeasured")
+    if isinstance(record, dict) and (record.get("dark")
+                                     or record.get("state") != "HEALTHY"):
+        return None
+    rec = (certifications.get("families") or {}).get(family)
+    if not isinstance(rec, dict) or rec.get("revoked_at") is not None:
+        return None
+    until, at, by = rec.get("until"), rec.get("certified_at"), rec.get("by")
+    if not _finite(until) or not _finite(at) or until <= now \
+            or not 0 < until - at <= CERTIFICATION_CEILING_S:
+        return None
+    operator = (certifications.get("operators") or {}).get(family)
+    why = _unbound(family, operator, by, rec.get("session_key"),
+                   certifications.get("bound") or {},
+                   certifications.get("roster_unreadable"))
+    if why:
+        return _axis("money", GREY,
+                     redact_why("no money reader exists for this family, and "
+                                "its local certification cannot be verified: "
+                                "%s, so it reads GREY until %s certifies "
+                                "again from its own session"
+                                % (why, operator or "a declared operator "
+                                   "seat")),
+                     CERTIFICATION_UNVERIFIABLE, measured_at=None,
+                     provenance="unmeasured")
+    return _axis("money", GREEN,
+                 redact_why("served on the operator's own GPU and certified "
+                            "running optimally by %s until %s"
+                            % (by, _iso(until))),
+                 "money:certified-local", expires_at=until,
+                 expires_kind="local-certification",
+                 expires_source="helm burn certify-local", measured_at=at,
+                 capped_by_coverage=False, provenance=CERTIFIED_LOCAL)
+
+
+def _unbound(family, operator, by, key, bound, roster_unreadable=None):
+    """Why a certification of `family` by seat `by`, from the session whose
+    key is `key`, is NOT tied to the family's operator seat -> a sentence, or
+    None when it is.
+
+    ONE PREDICATE FOR THE PRODUCER AND THE FOLD, so the verb refuses exactly
+    the record the fold would read GREY. `operator` is `local_operator`'s
+    answer and `bound` is `_session_bindings`'s map, both read by the caller,
+    so this reads no file."""
+    if not operator:
+        return ("%s declares no operator seat, so nobody can certify it (its "
+                "catalog entry names the seat by the local-names key %r, and "
+                "this host's local names do not set it)"
+                % (family, _operator_key(family)))
+    # THE FILE IS NOT TRUSTED and its `by` reaches the cause every surface
+    # renders, so only a well-formed seat name is repeated
+    named = by if isinstance(by, str) \
+        and home._SEAT_NAME_RE.fullmatch(by) else None
+    if named is None or named.casefold() != operator.casefold():
+        return ("the certifier is %s, and %s's operator seat is %s"
+                % (named or "no well-formed seat name", family, operator))
+    if not isinstance(key, str) or not key:
+        return ("no session key is recorded, so no session of the operator "
+                "seat %s stands behind it" % operator)
+    if roster_unreadable:
+        return ("%s, so the session behind it cannot be checked against the "
+                "operator seat %s" % (roster_unreadable, operator))
+    # A MATCH, NEVER A NAME: the roster's answer is compared and not printed,
+    # so no roster key reaches the cause (the display-launder tripwire's
+    # INTERNAL-MATCHING-ONLY entry for this module)
+    seat = bound.get(key)
+    if not isinstance(seat, str) or seat.casefold() != operator.casefold():
+        return ("the session behind it is not bound to the operator seat %s "
+                "on the roster (rebound to another seat, or to none)"
+                % operator)
+    return None
+
+
+def _operator_key(family):
+    from . import seat
+    fam = seat.FAMILIES.get(family)
+    return (fam.get(OPERATOR_SEAT_FROM) if isinstance(fam, dict) else None) \
+        or OPERATOR_SEAT_FROM
+
+
 # --------------------------------------------------------------- composition
 
 def _worse(a, b):
@@ -1090,7 +1430,8 @@ def _worse(a, b):
 
 
 _EXPIRY_ORDER = ("reset-credit", "weekly-reset", "window-reset", "vendor-reset",
-                 "proxy-cooldown", "owner-declared", "daily-rollover", "none")
+                 "proxy-cooldown", "owner-declared", "local-certification",
+                 "daily-rollover", "none")
 
 
 def expiry(axes, headline=None):
@@ -1121,13 +1462,18 @@ def expiry(axes, headline=None):
     return best["expires_at"], best.get("expires_kind"), best.get("expires_source")
 
 
-def compose(family, axes, now=None):
+def compose(family, axes, now=None, credits=None):
     """The four axes -> ONE flag record for one family.
 
     The headline colour is the WORST measured axis; a declaration may worsen
     it and may never improve it. On a family nothing measured, the declaration
     IS the answer, because GREY is off the ordering rather than at the good
-    end of it — but it is stamped owner-declared wherever it renders."""
+    end of it — but it is stamped owner-declared wherever it renders.
+
+    `credits` is `credit_summary` of the reset rung's rows, carried as the
+    flag's `credits` field (None where the rung did not run): it changes no
+    colour and says what reset credits are in hand and how many accounts
+    were not asked."""
     now = time.time() if now is None else now
     axes = dict(axes or {})
     for name in ("money", "reach", "policy", "declared"):
@@ -1199,6 +1545,7 @@ def compose(family, axes, now=None):
             "expires_at": at, "expires_kind": kind, "expires_source": source,
             "provenance": provenance,
             "declared_ignored": declared_ignored,
+            "credits": credits,
             "behaviour": dict(BEHAVIOUR[colour])}
 
 
@@ -1249,6 +1596,9 @@ def fold(inputs, now=None):
     before_all = inputs.get("upstream_before") or {}
     # THE RUNWAY IS AN INPUT, and `_RUNWAY_STEP_TABLE` is its only effect.
     runway = inputs.get("runway") or {}
+    turn_walls = inputs.get("turn_walls") or {}
+    certifications = inputs.get("local_certifications")
+    local = local_families()
     flags = {}
     for family in families():
         rows = money_rows.get(family, None)
@@ -1258,7 +1608,11 @@ def fold(inputs, now=None):
             record = proxywatch.join_owner_reset(
                 record, vendor_resets.get(family), now,
                 before=before_all.get(family))
-        money = derive_money(
+        # A LOCAL FAMILY WITH NO MONEY READER READS ITS CERTIFICATION, and
+        # only then: a reader, where one exists, is a measurement and answers.
+        money = (derive_certified_local(family, certifications, now=now,
+                                        local=local, record=record)
+                 if family not in money_rows else None) or derive_money(
             family, rows if family in money_rows else None,
             ceiling=ceiling, abundance=abundance.get(family),
             measured_at=money_ts.get(family),
@@ -1271,25 +1625,42 @@ def fold(inputs, now=None):
         # A measured quota refusal outranks every money reading short of RED:
         # budget rows that still show headroom are older than the refusal.
         wall = derive_quota_wall(family, record)
+        base = wall if wall and money["colour"] != RED else money
+        # A REFUSAL ON A SEAT'S OWN TURN IS A MEASURED WALL TOO (task/3587),
+        # read where the proxy's record cannot see it: the proxy answered,
+        # the vendor said no.
+        turn_money, turn_reach = derive_turn_wall(family,
+                                                  turn_walls.get(family))
+        if turn_money and base["colour"] != RED:
+            base = turn_money
+        reach = derive_reach(family, record, now=now)
+        if turn_reach and (reach is None or reach["colour"] != RED):
+            reach = turn_reach
         axes = {
-            "money": _runway_step(wall if wall and money["colour"] != RED
-                                  else money, runway.get(family)),
-            "reach": derive_reach(family, record, now=now),
+            "money": _runway_step(base, runway.get(family)),
+            "reach": reach,
             "policy": (derive_policy(history, now=now)
                        if family == NATIVE_FAMILY else None),
             "declared": derive_declared(family, declarations, now=now),
         }
-        flags[family] = compose(family, axes, now=now)
+        flags[family] = compose(
+            family, axes, now=now,
+            credits=credit_summary(credits.get(family))
+            if family in credits else None)
     return {"v": 1, "fold_version": FOLD_VERSION, "ts": now,
             "families": flags,
             "overall": overall(flags, inputs.get("critical")),
             "readers": {"money": sorted(money_rows),
                         "policy": [NATIVE_FAMILY] if history else [],
                         "reach": sorted(upstream),
+                        "turn_walls": sorted(turn_walls),
                         "runway": sorted(f for f, r in runway.items()
                                          if isinstance(r, dict)),
                         "declared": sorted(
-                            ((declarations or {}).get("families") or {}))}}
+                            ((declarations or {}).get("families") or {})),
+                        "certified_local": sorted(
+                            f for f, fl in flags.items()
+                            if fl.get("money_provenance") == CERTIFIED_LOCAL)}}
 
 
 # ------------------------------------------------------------------ the store
@@ -1330,6 +1701,212 @@ def declare(family, colour, until, why=None, now=None, path=None):
     except OSError as exc:
         return False, str(exc)
     return True, None
+
+
+def improving_declaration(colour, flag):
+    """The refusal sentence when a colour would lighten a measured axis, else None.
+
+    Equal is admitted: the fold keeps a declaration that matches the measured
+    colour and ignores only a strictly better one. A family with no measured
+    colour is admitted. The sentence names the worst measured axis, not the
+    headline. A colour off the rank (GREY) is not a lightening and is not indexed.
+    """
+    colour = str(colour).upper()
+    if colour not in _RANK:
+        return None
+    measured = None
+    axes = (flag or {}).get("axes") or {}
+    for axis in ("money", "reach", "policy"):
+        got = axes.get(axis)
+        if got in _RANK and (measured is None or _RANK[got] > _RANK[measured]):
+            measured = got
+    if measured is not None and _RANK[colour] < _RANK[measured]:
+        return ("Refused: %s is not worse than the measured %s. A "
+                "declaration may only make a colour worse. To let "
+                "one project run lighter, raise its share."
+                % (colour, measured))
+    return None
+
+
+def read_local_certifications(path=None):
+    """The local-family certifications and what ties each to its operator ->
+    {"families": {...}, "operators": {family: seat or None}, "bound": {key:
+    seat or None}}, plus `roster_unreadable` when the roster could not be
+    read, or {"families": {}, "unreadable": why} for a file that exists and
+    cannot be read. Never raises, so a bad file can never take the fold down.
+
+    ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS. No file is no certification,
+    and every local family reads GREY for its missing reader; a file that
+    will not open, parse or hold the right shape reads GREY with a cause that
+    names it, because that GREY has a repair and the other has none.
+
+    THE OPERATOR AND THE BINDING ARE READ HERE, NEVER FROM THE FILE: each
+    local family's declared operator seat (`local_operator`), and, for every
+    session key a record carries, the seat the roster binds it to now
+    (`_session_bindings`). This is the only reader both production folds
+    take (`read_inputs` and the posting pass), so the fold decides from
+    these and reads no file itself."""
+    got = _read_certification_file(path)
+    if got.get("unreadable"):
+        return got
+    rows = [rec for rec in got["families"].values() if isinstance(rec, dict)]
+    bound, why = _session_bindings(rec.get("session_key") for rec in rows)
+    got.update(operators={f: local_operator(f) for f in local_families()},
+               bound=bound)
+    if why:
+        got["roster_unreadable"] = why
+    return got
+
+
+def _read_certification_file(path=None):
+    """The certification file alone -> {"families": {...}}, or with an
+    `unreadable` entry naming the file and why. Never raises."""
+    target = path or local_certifications_path()
+    try:
+        with pk.open_regular(target, encoding="utf-8") as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        return {"families": {}}
+    except (OSError, ValueError) as exc:
+        return {"families": {}, "unreadable": "%s (%s)" % (
+            target, exc.strerror if isinstance(exc, OSError) and exc.strerror
+            else type(exc).__name__)}
+    if not isinstance(payload, dict) or not isinstance(
+            payload.get("families"), dict):
+        return {"families": {}, "unreadable": "%s (not a table of "
+                "families)" % target}
+    return {"families": payload["families"]}
+
+
+def _not_local(family):
+    """Why `family` cannot be certified, or None when it is local."""
+    local = local_families()
+    if family in local:
+        return None
+    return ("%r is not a local family: only a family whose every pool row, "
+            "its default included, names its endpoint by base_url_from, "
+            "served from the operator's own GPU, can be certified (local "
+            "families: %s)"
+            % (family, ", ".join(local) or "none"))
+
+
+def _until_instant(until, now):
+    """(epoch, None) or (None, why) for a certification's `--until`.
+
+    A DURATION in helm's one TTL grammar (`seats_common.ttl_flag`: 2h, 90m,
+    1d, 3600), resolved against the producer's own instant, or an INSTANT: an
+    epoch number from a library caller, or ISO-8601 UTC read as `helm burn
+    declare` reads it. The resolved instant must be after `now` and at most
+    `CERTIFICATION_CEILING_S` past it.
+
+    A BARE NUMBER IS A DURATION IN SECONDS, as for every `--ttl` in helm, so
+    an epoch typed as an instant resolves decades out; the ceiling refuses
+    it, and the refusal says how an instant is written."""
+    bare = False
+    if _finite(until):
+        stamp = float(until)
+    else:
+        from .seats_common import TTL_FORMS, ttl_flag
+        secs = ttl_flag(["--ttl", until], None)[0] \
+            if isinstance(until, str) else None
+        bare = bool(secs) and until.strip().isdigit()
+        stamp = now + secs if secs else pk.parse_ts_epoch(until)
+        if stamp is None:
+            return None, ("--until %r is neither a duration (%s) nor an "
+                          "ISO-8601 UTC instant (YYYY-MM-DDTHH:MM:SSZ)"
+                          % (until, TTL_FORMS))
+    if stamp <= now:
+        return None, ("--until %s is not in the future: a certification that "
+                      "ends by now certifies nothing; --revoke ends one"
+                      % _iso(stamp))
+    if stamp - now > CERTIFICATION_CEILING_S:
+        return None, ("--until %r ends %.1fh from now, past the %dh ceiling "
+                      "on one certification: renew it instead of holding it "
+                      "long%s" % (until, (stamp - now) / 3600.0,
+                                  CERTIFICATION_CEILING_S // 3600,
+                                  "; a bare number is a duration in seconds, "
+                                  "so an instant is written as ISO-8601 UTC "
+                                  "(YYYY-MM-DDTHH:MM:SSZ)" if bare else ""))
+    return float(stamp), None
+
+
+def _write_certification(family, build, path=None):
+    """Replace `family`'s record with `build(prior record)` under the file's
+    lock -> (ok, err). Last-writer-wins per family, as `declare` is; the lock
+    keeps two families certified at once from dropping each other's row."""
+    import fcntl
+    target = path or local_certifications_path()
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target + ".lock", "a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                # AN UNREADABLE FILE IS REPLACED, never merged into: its
+                # rows cannot be read, and the write is what repairs it
+                families = dict(_read_certification_file(target)["families"])
+                prior = families.get(family)
+                families[family] = build(
+                    prior if isinstance(prior, dict) else {})
+                pk.atomic_write(target, json.dumps({"families": families},
+                                                   sort_keys=True))
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:
+        return False, str(exc)
+    return True, None
+
+
+def _not_the_operator(family, by, session):
+    """Why seat `by`, acting from harness session `session`, may not certify
+    or revoke `family` -> a sentence, or None when it is the family's
+    operator seat and the roster binds that session's key to it now: the
+    same predicate the fold applies to the record this would write."""
+    key = _session_key(session)
+    bound, why = _session_bindings([key])
+    return _unbound(family, local_operator(family), by, key, bound, why)
+
+
+def certify_local(family, until, by, session, note=None, now=None,
+                  path=None):
+    """Record that the OPERATOR SEAT `by`, acting from its own roster-bound
+    harness `session`, certifies LOCAL `family` as running on the operator's
+    own hardware, optimally, until `until` -> (ok, err).
+
+    The record stamps the session's key (`_session_key`), never the id.
+    Refused for a family that is not local, a seat that is not the family's
+    declared operator, a session the roster does not bind to it, and an
+    `until` that is unreadable or not in the future. The verb is the door
+    that PROVES `session` is the caller's own (`actors.resolve_actor_reason`);
+    this checks the binding the fold will check."""
+    now = time.time() if now is None else now
+    why = _not_local(family) or _not_the_operator(family, by, session)
+    if why:
+        return False, why
+    stamp, why = _until_instant(until, now)
+    if why:
+        return False, why
+    return _write_certification(family, lambda _prior: {
+        "family": family, "certified_at": now, "until": stamp, "by": by,
+        "session_key": _session_key(session), "note": note or None}, path)
+
+
+def revoke_local(family, by, session, note=None, now=None, path=None):
+    """End LOCAL `family`'s certification now -> (ok, err), from the same
+    door `certify_local` takes: the operator seat, in its own roster-bound
+    `session`.
+
+    The revocation is recorded with who, from which session key, and when,
+    and `until` becomes that instant, so every later fold reads the family
+    GREY. The certified fields stay on the row for the record; a fresh
+    `certify_local` replaces it."""
+    now = time.time() if now is None else now
+    why = _not_local(family) or _not_the_operator(family, by, session)
+    if why:
+        return False, why
+    return _write_certification(family, lambda prior: dict(
+        prior, family=family, until=now, revoked_at=now, revoked_by=by,
+        revoked_session_key=_session_key(session),
+        revoke_note=note or None), path)
 
 
 def write_snapshot(inputs=None, now=None, path=None):
@@ -1536,6 +2113,9 @@ def render(snap, now=None):
             marks.append("DECLARED by the owner, not measured")
         if fl["provenance"] == "derived":
             marks.append("DERIVED from a proxy measure, not a direct reading")
+        if fl.get("money_provenance") == CERTIFIED_LOCAL:
+            marks.append("money CERTIFIED by the seat that runs the local "
+                         "hardware, not a vendor measurement")
         if fl.get("declared_ignored"):
             marks.append("an owner declaration is OUTRANKED by this measured "
                          "reading and did not apply")
@@ -1601,7 +2181,9 @@ def read_inputs(now=None):
     now = time.time() if now is None else now
     inputs = {"money": {}, "money_measured_at": {}, "money_fresh": {},
               "upstream": {}, "anthropic_history": None, "abundance": {},
-              "declarations": read_declarations(), "ceiling": None}
+              "declarations": read_declarations(),
+              "local_certifications": read_local_certifications(),
+              "ceiling": None}
     try:
         from . import moneyread
         snapshot, error = moneyread.read_snapshot()
@@ -1633,6 +2215,11 @@ def read_inputs(now=None):
         pass
     try:
         inputs["upstream"] = upstream_block(now=now)
+    except Exception:                       # noqa: BLE001
+        pass
+    try:
+        from . import turnwall
+        inputs["turn_walls"] = turnwall.family_walls(now=now)
     except Exception:                       # noqa: BLE001
         pass
     try:
@@ -1877,25 +2464,34 @@ def anthropic_money_rows(history, now=None, fresh_s=None, model=None):
 _USAGE = ("helm burn [--json] | helm burn why <family> [--json] | "
           "helm burn burst [--json] | "
           "helm burn runway [--json] [--window <hours>] | "
-          "helm burn declare <family> <colour> --until <iso> [reason...]")
+          "helm burn calibrate [--json] | "
+          "helm burn declare <family> <colour> --until <iso> [reason...] | "
+          "helm burn certify-local <family> --until <iso|duration> [note...] "
+          "| helm burn certify-local <family> --revoke [note...]")
 
 
 def cmd_burn(args):
-    """burn [--json]|why <family>|declare <family> <colour> --until <iso> —
+    """burn [--json]|why <family>|calibrate|declare <family> <colour>
+    --until <iso>|certify-local <family> --until <iso|duration>|--revoke —
     the fire-danger reading per model family."""
     import sys
     args = list(args or ())
     sub = args[0] if args and not args[0].startswith("-") else None
-    if sub is not None and sub not in ("why", "declare", "burst", "runway"):
+    if sub is not None and sub not in ("why", "declare", "burst", "runway",
+                                       "certify-local", "calibrate"):
         print("helm burn: unknown subcommand %r\nusage: %s"
               % (sub, _USAGE), file=sys.stderr)
         return 2
     if sub == "declare":
         return _cmd_declare(args[1:])
+    if sub == "certify-local":
+        return _cmd_certify_local(args[1:])
     if sub == "burst":
         return _cmd_burst(args[1:])
     if sub == "runway":
         return _cmd_runway(args[1:])
+    if sub == "calibrate":
+        return _cmd_calibrate(args[1:])
     as_json = "--json" in args
     rest = [a for a in args if a != "--json"]
     now = time.time()
@@ -1927,6 +2523,11 @@ def cmd_burn(args):
         # watchdog pass's own snapshot, never a live probe.
         from . import codexpace
         print(codexpace.burn_line(now=now))
+        # AND THE CLAUDE 5H PACE (pace5h): one line per account, from its own
+        # snapshot. Neither pace moves a colour.
+        from . import claudepace
+        for text in claudepace.burn_lines(now=now):
+            print(text)
     return 0 if snap else 3
 
 
@@ -2019,6 +2620,10 @@ def _cmd_declare(args):
                             known=("--until",), usage=_USAGE)
     if rc is not None:
         return rc
+    why_not = improving_declaration(colour, family_flag(family))
+    if why_not:
+        print("helm burn declare: %s" % why_not, file=sys.stderr)
+        return 2
     ok, err = declare(family, colour, until, why=why)
     if not ok:
         print("helm burn declare: %s" % err, file=sys.stderr)
@@ -2027,3 +2632,136 @@ def _cmd_declare(args):
           "renders as declared, never as measured"
           % (family, colour.upper(), until))
     return 0
+
+
+def _cmd_certify_local(args):
+    """certify-local <family> --until <iso|duration> [note...] | certify-local
+    <family> --revoke [note...] — the operator seat that runs a LOCAL
+    family's hardware attests that the family is served there, optimally,
+    until the instant it names, or ends that attestation now.
+
+    SESSION-BOUND AND OPERATOR-ONLY. The acting seat is admitted through
+    `actors.resolve_actor_reason` on this process's harness session, which
+    refuses a declared HELM_CHAT_NAME that no roster-bound session
+    corroborates (UNCORROBORATED), one the roster binds to another seat
+    (DISPUTED) and a name minted from nothing (UNRESOLVED): a declared name
+    alone is a value any process can export, and an attestation is only
+    worth the session standing behind it. `dispatches.acting_author` is NOT
+    that door: it takes a declared name at its word when no session is
+    presented. The admitted seat must then be the family's declared operator
+    seat (`local_operator`), and the record stamps its session's key, which
+    the fold checks against the roster on every pass. Exit 2 on usage, on a
+    family that is not local, on a caller with no roster-bound session, on a
+    seat that is not the operator, and on an `--until` that is unreadable,
+    not in the future or past the ceiling."""
+    import sys
+    from . import actors, freetext
+    label = "helm burn certify-local"
+    args = list(args)
+    if not args or args[0].startswith("-"):
+        print("usage: %s" % _USAGE, file=sys.stderr)
+        return 2
+    family, rest = args[0], args[1:]
+    revoke = "--revoke" in rest
+    if revoke:
+        rest.remove("--revoke")
+    until = None
+    if "--until" in rest:
+        at = rest.index("--until")
+        if at + 1 >= len(rest):
+            print("%s: --until needs a duration or an instant" % label,
+                  file=sys.stderr)
+            return 2
+        until = rest[at + 1]
+        rest = rest[:at] + rest[at + 2:]
+    if revoke == (until is not None):
+        print("%s: give exactly one of --until <iso|duration> or --revoke\n"
+              "usage: %s" % (label, _USAGE), file=sys.stderr)
+        return 2
+    why = _not_local(family)
+    if why:
+        print("%s: %s" % (label, why), file=sys.stderr)
+        return 2
+    known = ("--until", "--revoke")
+    rc = freetext.refuse_leading_flags(rest, 0, known, label, _USAGE, label,
+                                       what="the note")
+    if rc is not None:
+        return rc
+    note, rc = freetext.tail(label, "note", rest, "the note", known=known,
+                             usage=_USAGE)
+    if rc is not None:
+        return rc
+    # THE SESSION IS THE PROOF. Admission refuses every caller whose session
+    # the roster does not bind to the seat it resolves to, so an admitted
+    # actor's session IS bound to it, and that is the session stamped below.
+    session = home.session_id()
+    actor, err, _reason = actors.resolve_actor_reason(
+        session, act=("revoke a local certification" if revoke
+                      else "certify a local family"))
+    if actor is None:
+        print("%s: %s. %s" % (label, str(err).rstrip(". "),
+                              _how_to_certify(family)), file=sys.stderr)
+        return 2
+    by = actor.canonical_name
+    why = _not_the_operator(family, by, session)
+    if why:
+        print("%s: refusing: %s. %s" % (label, why, _how_to_certify(family)),
+              file=sys.stderr)
+        return 2
+    ok, err = (revoke_local(family, by, session, note=note) if revoke
+               else certify_local(family, until, by, session, note=note))
+    if not ok:
+        print("%s: %s" % (label, err), file=sys.stderr)
+        return 2
+    rec = read_local_certifications()["families"].get(family) or {}
+    if revoke:
+        print("%s: %s certification revoked by %s (session key %s); it reads "
+              "GREY from the next fold"
+              % (label, family, by, rec.get("revoked_session_key")))
+    else:
+        print("%s: %s certified by %s (session key %s) until %s; its money "
+              "reads GREEN (certified-local, never a vendor measurement) "
+              "while that session stays bound to %s on the roster, until "
+              "then, and GREY after"
+              % (label, family, by, rec.get("session_key"),
+                 _iso(rec.get("until") or 0), by))
+    return 0
+
+
+def _how_to_certify(family):
+    """The repair a refused certifier is owed: where a certification of
+    `family` can come from at all."""
+    operator = local_operator(family)
+    if not operator:
+        return ("%s declares no operator seat: set the local-names key %r to "
+                "the seat that runs its hardware, and that seat certifies it "
+                "from its own session" % (family, _operator_key(family)))
+    return ("A certification of %s comes only from its operator seat %s, in "
+            "its own session: run `helm burn certify-local %s --until 2h` "
+            "there, where the roster binds the session to %s; a declared "
+            "name with no roster-bound session certifies nothing"
+            % (family, operator, family, operator))
+
+
+def _cmd_calibrate(args):
+    """calibrate [--json] — backtest the codex runway model against its own
+    history (codexpace), reporting bias and median abs error per trailing
+    window (1/3/6/12/24h) and picking the best. Read-only: no ledger, no
+    vendor call. Exit 0 on a reading, 3 when there is no history to backtest,
+    2 on usage."""
+    import sys
+    args = list(args or ())
+    as_json = "--json" in args
+    rest = [a for a in args if a != "--json"]
+    if rest:
+        print("helm burn calibrate: unknown argument %r\nusage: %s"
+              % (rest[0], _USAGE), file=sys.stderr)
+        return 2
+    from . import codexcal
+    result = codexcal.calibrate()
+    if as_json:
+        print(json.dumps(result, indent=1, sort_keys=True))
+    else:
+        for text in codexcal.render(result):
+            print(text)
+    return 0 if result.get("lines") else 3

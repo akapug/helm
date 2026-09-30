@@ -3,17 +3,14 @@
 
 WHY THIS EXISTS, in the owner's own words: "get us ABLE TO BURN DOWN ALL ROWS."
 Until this endpoint, the answer to "what does the fleet still owe?" was reachable
-ONLY by running the obligation ledger's own verb in a terminal — and that verb
-is not even on trunk, it lives on lane/obligation-delivery-seam. The owner is
+ONLY by running the obligation ledger's own verb in a terminal. The owner is
 GUI-first. A verb only agents run does not discharge a request to SEE the
 backlog, and the fleet spent a night improving a surface he cannot open.
 
-LAND-ORDER INDEPENDENT, deliberately, and this is the whole reason the endpoint
-looks the way it does. `helm.obligation` may land AFTER this surface. Rather
-than couple the two lanes and hand the integrator a sequencing problem, the
-import is defensive and its absence is a NAMED STATE. When obligation lands,
-this lights up with no change here. Same contract `_api_tasks` already
-established for `helm.tasks`; this is that idiom, not a new one.
+A FAILURE IS A NAMED STATE, the import of `helm.obligation` included: any
+raise while building the body is `unavailable` with the exception class in
+`why`, never a 500 and never an empty backlog. Same contract `_api_tasks`
+keeps for `helm.tasks`.
 
 THE STATE TRIAD IS LOAD-BEARING and it is the reason this is not three lines:
   empty       -> the fleet genuinely owes nothing
@@ -242,8 +239,11 @@ def _cured_block(snap, unavailable):
         rows, unavailable, unplaceable, fatal, ambiguous = _cured_rows(
             snap, unavailable)
     except Exception as exc:                           # noqa: BLE001
+        # THE CLASS IS NAMED, as the owed half names it: a KeyError's str is
+        # only its key, which names no failure at all.
         return {"unavailable": True,
-                "why": "the cured-fix bucket failed to render: %s" % (exc,)}
+                "why": "the cured-fix bucket failed to render: %s: %s"
+                       % (exc.__class__.__name__, exc)}
     if fatal:
         return {"unavailable": True, "why": str(unavailable)}
     rows = list(rows)
@@ -273,14 +273,7 @@ def _owed_body(snap, unavailable):
     """
     cured = _cured_block(snap, unavailable)
     try:
-        try:
-            from . import obligation
-        except ImportError:
-            return {"unavailable": True,
-                    "why": "helm.obligation is not on this trunk yet — the "
-                           "burn-down source lands with lane/"
-                           "obligation-delivery-seam",
-                    "cured": cured}
+        from . import obligation
         try:
             # BOTH ARGUMENTS OR NEITHER — that function's own contract, and
             # the reason the failure is passed down beside the rows rather
@@ -338,10 +331,12 @@ def _owed_body(snap, unavailable):
             "cured": cured,
         }
     except Exception as exc:                           # noqa: BLE001
-        # The endpoint's own failure is still a THIRD state, not an empty
-        # backlog — see the module docstring.
+        # The endpoint's own failure, the import of helm.obligation
+        # included, is still a THIRD state, not an empty backlog — see the
+        # module docstring.
         return {"unavailable": True,
-                "why": "the burn-down surface failed to render: %s" % (exc,),
+                "why": "the burn-down surface failed to render: %s: %s"
+                       % (exc.__class__.__name__, exc),
                 "cured": cured}
 
 
@@ -414,10 +409,14 @@ def _owed_build():
         try:
             body = _owed_body(snap, unavailable)
         except Exception as exc:                       # noqa: BLE001
+            # Same wording, and the same named class, as `_owed_body`'s own
+            # catch: this one is reached when the raise is above that try.
             body = {"unavailable": True,
-                    "why": "the burn-down surface failed to render: %s" % (exc,),
+                    "why": "the burn-down surface failed to render: %s: %s"
+                           % (exc.__class__.__name__, exc),
                     "cured": {"unavailable": True,
-                              "why": "the burn-down surface failed to render"}}
+                              "why": "the burn-down surface failed to "
+                                     "render (%s)" % exc.__class__.__name__}}
     body["read_ts"] = started
     return body
 

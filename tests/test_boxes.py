@@ -8,7 +8,7 @@ from unittest import mock
 
 from helm import boxes
 from helm import storage_matrix as matrix
-from tests.test_no_private_names import hits_in
+from helm.private_names import hits_in
 
 
 def _env(**extra):

@@ -288,6 +288,7 @@ _USAGE = """usage: helm eval arms [--seat S] [--json]
        helm eval seed --atom FILE --repo DIR --run-id ID [--root DIR] [--json]
        helm eval run --seat S --atom FILE --repo DIR --run-id ID
                      [--arm NAME] [--root DIR] [--timeout SECS] [--json]
+       helm eval board [--json] [--window 7d|30d]
 
   The cc-codex vs pi-codex eval's guard rails, which exist BEFORE its runner
   on purpose — and the runner, which exists AFTER its pilot's defects.
@@ -303,6 +304,11 @@ _USAGE = """usage: helm eval arms [--seat S] [--json]
   run       seed + drive the seat's OWN launch.sh (-p) under a per-run
             hook-stripped config, in a per-run dir, with an elapsed<=0
             refusal on the row (see helm/evalrun.py for the five findings).
+  board     The model scorecard, READ-ONLY: each model's record on real
+            lanes (lands, rounds, FIX verdicts, reviewer patches, hand-back,
+            reader agreement) blended with a public benchmark prior, with n
+            and a band; the apprenticeship rungs as evidence. `helm eval
+            board --help` for its flags (--json, --window 7d|30d).
 """
 
 
@@ -318,6 +324,11 @@ def cmd_eval(args):
     if verb in ("seed", "run"):
         from . import evalrun
         return evalrun.cmd(verb, args[1:])
+    if verb == "board":
+        # THE MODEL SCORECARD (task/3448): read-only over the ledgers, the
+        # same board the web console's Fleet › models page reads
+        from . import scorecard
+        return scorecard.cmd(args[1:])
     if verb not in ("arms", "register"):
         print("helm eval: unknown verb '%s'" % verb, file=sys.stderr)
         print(_USAGE, file=sys.stderr)

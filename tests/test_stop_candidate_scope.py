@@ -23,6 +23,13 @@ invisible and a noisy one is merely expensive.
 
 Both non-ownership escapes are pinned below, because they fail in opposite
 directions and each looks like the other from the outside.
+
+THE NET IS CAST ONLY TO THE ROW'S RECIPIENT (task/3531). It used to keep an
+orphan for EVERY stopping seat, and that is how bonsai, a local seat in the
+Claude Code harness, was shown qwenlocal's row to `claude`: qwenlocal had
+handed back and stopped, so it read absent, and the row went to the whole
+fleet. A row between two other seats is never this seat's; the recipient is
+the one seat that can still discharge an orphan, so it keeps the net.
 """
 
 import time
@@ -32,8 +39,8 @@ from unittest import mock
 from helm import dispatches
 
 
-def _row(rid, sender, ts="2026-07-30T00:00:00Z"):
-    return {"id": rid, "sender": sender, "recipient": "someone", "lane": "l",
+def _row(rid, sender, ts="2026-07-30T00:00:00Z", recipient="someone"):
+    return {"id": rid, "sender": sender, "recipient": recipient, "lane": "l",
             "status": "open", "delivery": "observed", "ts": ts,
             "deadline_s": 2700, "kind": "build"}
 
@@ -77,36 +84,55 @@ class ScopeTest(unittest.TestCase):
             self._pick([_row("kimis", "kimi")], "helm-claude",
                        roster={"helm-claude": LIVE(), "kimi": LIVE()}))
 
-    def test_the_collapsed_floor_sender_STILL_surfaces(self):
+    def test_the_collapsed_floor_sender_STILL_surfaces_to_its_recipient(self):
         """Six of nine live rows. `claude` names no seat, so scoping it away
-        hides it from everyone — the strand this exception exists to prevent."""
+        from its recipient too would hide it from everyone — the strand this
+        exception exists to prevent."""
         self.assertEqual(
-            self._pick([_row("legacy", "claude")], "helm-claude",
+            self._pick([_row("legacy", "claude", recipient="helm-claude")],
+                       "helm-claude",
                        roster={"helm-claude": LIVE(), "kimi": LIVE()}),
             "legacy")
 
-    def test_a_ROSTERED_BUT_ABSENT_sender_still_surfaces(self):
+    def test_a_ROSTERED_BUT_ABSENT_sender_still_surfaces_to_its_recipient(self):
         """a peer seat's find: membership is not liveness. The
         roster holds 99 dead tmp-claude-N rows; a sender naming one would be
         skipped for EVERY seat and stranded by a different door."""
         self.assertEqual(
-            self._pick([_row("orphan", "tmp-claude-7")], "helm-claude",
+            self._pick([_row("orphan", "tmp-claude-7", recipient="helm-claude")],
+                       "helm-claude",
                        roster={"helm-claude": LIVE(), "tmp-claude-7": DEAD()}),
             "orphan")
 
-    def test_an_empty_sender_surfaces(self):
+    def test_an_empty_sender_surfaces_to_its_recipient(self):
         self.assertEqual(
-            self._pick([_row("nosender", "")], "helm-claude",
-                       roster={"helm-claude": LIVE()}),
+            self._pick([_row("nosender", "", recipient="helm-claude")],
+                       "helm-claude", roster={"helm-claude": LIVE()}),
             "nosender")
 
-    def test_an_UNREADABLE_roster_surfaces_everything(self):
+    def test_an_UNREADABLE_roster_keeps_the_net_for_the_recipient(self):
         """Cannot look -> keep the net. An unreadable roster must never read as
-        'these rows belong to other people'."""
+        'these rows belong to other people' to the seat they are addressed
+        to."""
         self.assertEqual(
-            self._pick([_row("kimis", "kimi")], "helm-claude",
-                       roster={}, roster_failed=True),
+            self._pick([_row("kimis", "kimi", recipient="helm-claude")],
+                       "helm-claude", roster={}, roster_failed=True),
             "kimis")
+
+    def test_an_orphan_between_two_OTHER_seats_is_never_mine(self):
+        """task/3531: the orphan net kept a row for every stopping seat, so a
+        row between two other seats reached a seat that could do nothing with
+        it. Each escape above, for a seat that is neither party."""
+        for row, roster, failed in (
+                (_row("legacy", "claude"), {"helm-claude": LIVE()}, False),
+                (_row("orphan", "tmp-claude-7"),
+                 {"helm-claude": LIVE(), "tmp-claude-7": DEAD()}, False),
+                (_row("nosender", ""), {"helm-claude": LIVE()}, False),
+                (_row("kimis", "kimi"), {}, True)):
+            with self.subTest(row=row["id"]):
+                self.assertIsNone(self._pick([row], "helm-claude",
+                                             roster=roster,
+                                             roster_failed=failed))
 
     def test_seat_None_keeps_the_old_fleet_wide_behaviour(self):
         """Back-compat for any caller with no identity to offer — it must not
@@ -133,17 +159,21 @@ class PredicateTest(unittest.TestCase):
     def test_both_controls(self):
         roster = {"me": LIVE(), "other": LIVE(), "corpse": DEAD()}
         cases = [
-            ("me", True, "my own row"),
-            ("other", False, "a live peer's row"),
-            ("ghost", True, "a sender naming no seat"),
-            ("corpse", True, "a rostered but absent sender"),
-            ("", True, "no sender at all"),
+            ("me", "other", True, "my own row"),
+            ("other", "me", False, "a live peer's row, addressed to me"),
+            ("ghost", "me", True, "a sender naming no seat, to me"),
+            ("corpse", "me", True, "a rostered but absent sender, to me"),
+            ("", "me", True, "no sender at all, to me"),
+            ("ghost", "other", False, "a sender naming no seat, to another"),
+            ("corpse", "other", False, "an absent sender, to another"),
+            ("", "other", False, "no sender at all, to another"),
         ]
-        for sender, want, why in cases:
+        for sender, recipient, want, why in cases:
             with self.subTest(sender=sender, why=why):
                 self.assertEqual(
                     dispatches._mine_or_unprovable(
-                        {"sender": sender}, "me", roster, False),
+                        {"sender": sender, "recipient": recipient}, "me",
+                        roster, False),
                     want, why)
 
 
@@ -169,7 +199,7 @@ class AccessorNotFieldTest(unittest.TestCase):
         roster = {"peer": {"last_seen": time.time() - 200_000, "sessions": []}}
         with mock.patch.object(seats, "last_seen", return_value=time.time()):
             keep = dispatches._mine_or_unprovable(
-                {"sender": "peer"}, "me", roster, False)
+                {"sender": "peer", "recipient": "me"}, "me", roster, False)
         self.assertFalse(keep, "a LIVE peer's row must scope away; reading the "
                                "raw field instead of the accessor grades it "
                                "absent and keeps it, which is the silent no-op")
@@ -181,7 +211,7 @@ class AccessorNotFieldTest(unittest.TestCase):
         with mock.patch.object(seats, "last_seen",
                                return_value=time.time() - 200_000):
             self.assertTrue(dispatches._mine_or_unprovable(
-                {"sender": "peer"}, "me", roster, False))
+                {"sender": "peer", "recipient": "me"}, "me", roster, False))
 
 class FixtureOutlivesALongSuiteTest(unittest.TestCase):
     """THE BOMB ITSELF, pinned — the cure landed without an arm that fails if

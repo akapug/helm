@@ -23,21 +23,22 @@ a loser serves its pages and never writes. A process whose code on disk no
 longer matches the code it imported does not write either: its facts would
 carry a policy the hooks already reject.
 
-IT RE-EXECS ITSELF ONTO A NEW TREE. After a land the tree's code digest
-(`stopfacts.code_policy`, the one the hooks compare) no longer matches what
-this process imported, and every claims exemption on the fleet is refused
-until the facts are recomputed by the new code. Nothing else restarts this
-process — no path unit, no land step, no supervisor is relied on — so the
-leg does it: once the new digest has read the same for REEXEC_SETTLE_S (a
-checkout still being written is not the tree to start on) and the new tree
-imports in a child interpreter (a broken tree is never exec'd onto, so the
-console keeps serving), it waits out any snapshot write in flight, releases
-the writer lock and calls `os.execv` on its own command line: same
-interpreter, same argv (so the same port), same environment. The window a
-land opens is then about one full compute of the new image. A digest the
-check refused, or an exec that failed, is not retried until the tree moves
-again; `helm doctor` names a resident whose loaded code is older than the
-tree.
+EVERY `helm web` RE-EXECS ITSELF ONTO A NEW TREE (task/3132). After a land
+the tree's code digest (`stopfacts.code_policy`, the one the hooks compare) no
+longer matches what the process imported: a board goes on serving the older
+code, and on the console every claims exemption on the fleet is refused until
+the facts are recomputed by the new code. Nothing else restarts the process —
+no path unit, no land step, no supervisor is relied on — so its follow thread
+does it (`Follower`, `follow_tick`): once the new digest has read the same for
+REEXEC_SETTLE_S (a checkout still being written is not the tree to start on)
+and the new tree imports in a child interpreter (a broken tree is never exec'd
+onto, so the server keeps serving), it waits out any snapshot write in flight,
+releases the writer lock and calls `os.execv` on its own command line: same
+interpreter, same argv (so the same port), same environment. On the console
+port the leg IS the follower, so the process has one exec path, and the window
+a land opens is about one full compute of the new image. A digest the check
+refused, or an exec that failed, is not retried until the tree moves again;
+`helm doctor` names a resident whose loaded code is older than the tree.
 
 WHEN IT RECOMPUTES. Every POLL_S the leg stats the ledger, the claims file
 and the roster, reads each held lane's HEAD and each repository's trunk ref by
@@ -90,9 +91,10 @@ MECHANICAL_KEY = "stop-mechanical"
 #: facts carry it into the room advice verbatim, and an arm pins THIS constant.
 LEDGER_RAISED = "the dispatch ledger raised"
 
-#: The code this process imported, taken when the leg is first loaded.
+#: The code this process imported, taken when this module is first loaded
+#: (`helm web` loads it before it binds, so it names the code it serves).
 LOADED_POLICY = stopfacts.code_policy(fresh=True)
-#: How long a changed tree's digest must read the same before the leg
+#: How long a changed tree's digest must read the same before a server
 #: re-execs onto it: one poll, so a checkout or rebase still writing files is
 #: waited out rather than started on half-written.
 REEXEC_SETTLE_S = 1.0
@@ -221,11 +223,11 @@ def lease_facts(resource, row, snap, note, seats_for=(), now=None):
         out["stem"] = rid8
         advice = {}
         for seat in sorted({s for s in seats_for if s}):
-            advice[seat] = {
-                "brief": seats_room_advice._dispatch_advice(
-                    resource, seat, snap=snap, ledger_note=note, brief=True),
-                "long": seats_room_advice._dispatch_advice(
-                    resource, seat, snap=snap, ledger_note=note, brief=False)}
+            # THE RULING RIDES BESIDE THE TWO SENTENCES (task/3696): the stop
+            # reads it to tell an in-progress claim from one owing its release.
+            ruling, brief, long_ = seats_room_advice.dispatch_reading(
+                resource, seat, snap=snap, ledger_note=note)
+            advice[seat] = {"brief": brief, "long": long_, "ruling": ruling}
         out["advice"] = advice
         return out
     if parts[0] != "worktree" or len(parts) != 3:
@@ -686,10 +688,21 @@ def _resident(replaying=None):
 def _preflight():
     """None when the tree on disk imports the modules a re-exec starts, else
     why not. Run in a child interpreter, so a tree that does not import costs
-    a line in this process's log and never the console."""
+    a line in this process's log and never the console.
+
+    THOSE ARE THE MODULES `helm web` IMPORTS BEFORE IT SERVES: the verb
+    reaches `cmd_web` through `helm.web` (the cli's lazy leg), which loads the
+    web family; `helm.web_server` alone loads none of it. Checking only that
+    passed a broken helm/web_common.py on a live board, whose exec then died
+    on import and left no server (task/3132). The process entry (`cli.main`)
+    also imports `helm.trunkroute` before it dispatches, and its stale-tree
+    line imports `helm.selfrepo` when the cwd is inside the tree, as the
+    integrator's board is; neither import is guarded, so both are checked.
+    `helm.hooks` is not: `_main` imports it under `except Exception`."""
     parent = os.path.dirname(stopfacts.code_root())
     probe = ("import sys; sys.path.insert(0, %r); "
-             "import helm.cli, helm.web_server, helm.stopfacts_resident"
+             "import helm.cli, helm.trunkroute, helm.selfrepo, helm.web, "
+             "helm.web_server, helm.webserve, helm.stopfacts_resident"
              % parent)
     try:
         r = subprocess.run([sys.executable, "-c", probe], cwd=parent,
@@ -708,7 +721,7 @@ def _preflight():
 def _say(line):
     """One line to this process's log (the unit's journal), never raised."""
     try:
-        print("helm web: stop-facts: %s" % line, file=sys.stderr, flush=True)
+        print("helm web: %s" % line, file=sys.stderr, flush=True)
     except Exception:                        # noqa: BLE001 — a log line only
         pass
 
@@ -731,11 +744,83 @@ def write(snapshot, p=None):
     return None
 
 
-class Leg(object):
+class Follower(object):
+    """The re-exec onto a changed tree, which every `helm web` runs from its
+    follow thread (`follow_tick`). A server that runs the stop-facts leg
+    follows through its `Leg`, so the leg's snapshot write and writer lock
+    are waited out and released before the exec; any other server follows
+    through one of these, which holds neither."""
+
+    def __init__(self):
+        # THE RE-EXEC'S STATE: the tree digest first seen off LOADED_POLICY
+        # and when, and every digest a re-exec was refused on, with why.
+        # `_write` is the leg's snapshot-write lock, taken by the exec.
+        self._write = threading.Lock()
+        self._moved = None
+        self.no_exec = {}
+
+    def release(self):
+        """Nothing to give up: a follower with no leg holds no writer lock."""
+
+    def code_moved(self, now=None):
+        """The tree's code digest once it has moved off LOADED_POLICY and
+        read the same for REEXEC_SETTLE_S, else None — unmoved, still
+        settling, or a digest a re-exec was already refused on."""
+        now = time.monotonic() if now is None else now
+        digest = stopfacts.code_policy(fresh=True)
+        if digest == LOADED_POLICY:
+            self._moved = None
+            return None
+        if self._moved is None or self._moved[0] != digest:
+            self._moved = (digest, now)
+            return None
+        if digest in self.no_exec or now - self._moved[1] < REEXEC_SETTLE_S:
+            return None
+        return digest
+
+    def reexec(self, digest, execv=None):
+        """Replace this process with the same command line on the new tree.
+        -> why it did not (the new tree does not import, the exec failed);
+        a real exec never returns.
+
+        IN THIS ORDER: the new tree is import-checked first, so a broken one
+        leaves this process serving; then `_write` is taken, so a snapshot
+        write in flight finishes and no other starts; then the writer lock is
+        released, so the new image (or another resident) can take it; then
+        the exec. The interpreter, argv (and with it the port) and the
+        environment are this process's own — less `--open`, so a land never
+        opens another browser tab."""
+        why = _preflight()
+        if why:
+            self.no_exec[digest] = why
+            _say("not re-exec'ing onto the changed tree: %s" % why)
+            return why
+        argv = [a for a in ARGV if a != "--open"]
+        with self._write:
+            self.release()
+            _say("the tree changed; re-exec'ing onto it: %s" % " ".join(argv))
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:            # noqa: BLE001 — exec regardless
+                    pass
+            try:
+                (execv or os.execv)(argv[0], argv)
+            except OSError as exc:
+                why = "the exec failed (%s)" % (exc.strerror or exc)
+        why = why or "the exec returned"
+        self.no_exec[digest] = why
+        _say("not re-exec'ing onto the changed tree: %s" % why)
+        return why
+
+
+class Leg(Follower):
     """The leg's state across polls: the writer lock, the inputs last seen,
-    and when the last whole refresh ran."""
+    and when the last whole refresh ran. It is its server's `Follower`, so
+    the follow thread's re-exec waits out its writes and frees its lock."""
 
     def __init__(self, p=None, lock=None):
+        Follower.__init__(self)
         self.path = p or stopfacts.path()
         self.lock = lock or stopfacts.lock_path()
         self._fd = None
@@ -744,14 +829,9 @@ class Leg(object):
         self.last = None
         # THE SEAM LEG'S OWN STATE. It refreshes on its own read-behind key,
         # and the two legs meet only in `_publish`, under `_write`.
-        self._write = threading.Lock()
         self.seam = None
         self.seam_last_full = 0.0
         self.green = {}
-        # THE RE-EXEC'S STATE: the tree digest first seen off LOADED_POLICY
-        # and when, and every digest a re-exec was refused on, with why.
-        self._moved = None
-        self.no_exec = {}
 
     def writer(self):
         """Is this process THE writer? Takes the lock once, keeps it."""
@@ -816,55 +896,6 @@ class Leg(object):
                     % ("it cannot re-exec onto the new tree: %s" % why
                        if why else "it re-execs onto the new tree"))
         return None
-
-    def code_moved(self, now=None):
-        """The tree's code digest once it has moved off LOADED_POLICY and
-        read the same for REEXEC_SETTLE_S, else None — unmoved, still
-        settling, or a digest a re-exec was already refused on."""
-        now = time.monotonic() if now is None else now
-        digest = stopfacts.code_policy(fresh=True)
-        if digest == LOADED_POLICY:
-            self._moved = None
-            return None
-        if self._moved is None or self._moved[0] != digest:
-            self._moved = (digest, now)
-            return None
-        if digest in self.no_exec or now - self._moved[1] < REEXEC_SETTLE_S:
-            return None
-        return digest
-
-    def reexec(self, digest, execv=None):
-        """Replace this process with the same command line on the new tree.
-        -> why it did not (the new tree does not import, the exec failed);
-        a real exec never returns.
-
-        IN THIS ORDER: the new tree is import-checked first, so a broken one
-        leaves this process serving; then `_write` is taken, so a snapshot
-        write in flight finishes and no other starts; then the writer lock is
-        released, so the new image (or another resident) can take it; then
-        the exec. The interpreter, argv (and with it the port) and the
-        environment are this process's own."""
-        why = _preflight()
-        if why:
-            self.no_exec[digest] = why
-            _say("not re-exec'ing onto the changed tree: %s" % why)
-            return why
-        with self._write:
-            self.release()
-            _say("the tree changed; re-exec'ing onto it: %s" % " ".join(ARGV))
-            for stream in (sys.stdout, sys.stderr):
-                try:
-                    stream.flush()
-                except Exception:            # noqa: BLE001 — exec regardless
-                    pass
-            try:
-                (execv or os.execv)(ARGV[0], ARGV)
-            except OSError as exc:
-                why = "the exec failed (%s)" % (exc.strerror or exc)
-        why = why or "the exec returned"
-        self.no_exec[digest] = why
-        _say("not re-exec'ing onto the changed tree: %s" % why)
-        return why
 
     def _publish(self, snapshot=None, seam=None):
         """Write the one snapshot from both legs' latest answers. -> why it
@@ -1004,16 +1035,12 @@ def enabled(port=None):
 
 
 def tick(leg):
-    """One poll: re-exec onto a changed tree, else kick a refresh when the
-    inputs moved and the mechanical job when it is due. The refreshes run
-    behind the caller on `_read_behind` threads."""
+    """One poll of the leg: kick a refresh when the inputs moved and the
+    mechanical job when it is due. The refreshes run behind the caller on
+    `_read_behind` threads. It never execs: the follow thread's poll
+    (`follow_tick`) on this same leg is the process's one exec path, and a
+    refresh on a changed tree refuses to write (`Leg._refused`)."""
     from . import web_cache
-    try:
-        moved = leg.code_moved()
-        if moved:
-            leg.reexec(moved)
-    except Exception:                        # noqa: BLE001 — never the server
-        pass
     try:
         web_cache._read_behind(KEY, FULL_S, HARD_TTL_S, leg.refresh,
                                changed=leg.changed)
@@ -1032,26 +1059,90 @@ def tick(leg):
             pass
 
 
-def start(port=None, poll_s=POLL_S):
-    """Start the leg on a daemon thread, or None when this server does not
-    run it. Never raises into the server."""
-    if not enabled(port):
-        return None
-    leg = Leg()
+def follow_tick(follower, now=None):
+    """One poll of the follow thread: re-exec onto a changed tree once it
+    has settled (`Follower.code_moved`, `Follower.reexec`)."""
+    try:
+        moved = follower.code_moved(now=now)
+        if moved:
+            follower.reexec(moved)
+    except Exception:                        # noqa: BLE001 — never the server
+        pass
 
-    def run():
-        try:
-            _eager_imports()
-            leg.announce()
-        except Exception:                    # noqa: BLE001
-            pass
-        while True:
-            tick(leg)
-            time.sleep(poll_s)
 
-    t = threading.Thread(target=run, name="helm-stop-facts", daemon=True)
+def _follow_off():
+    """The `HELM_WEB_FOLLOW` value that switches following off, or None."""
+    flag = str(home.env("WEB_FOLLOW") or "").strip()
+    return flag if flag.lower() in ("0", "off", "false", "no") else None
+
+
+def follows(leg=False):
+    """None when this `helm web` follows its code onto a changed tree, else
+    why not. Running this process's command line again is this server only
+    when that line IS a `helm web` on a port it keeps (never a test runner
+    that called `cmd_web`, never `--port 0`). `HELM_WEB_FOLLOW=0` stops a
+    board following, and not a server that runs the leg (`start`)."""
+    from . import webserve
+    if not webserve._is_web_argv(ARGV):
+        return ("this process's command line is not a `helm web`, so "
+                "running it again would not be this server (%s)"
+                % " ".join(ARGV)[:200])
+    if webserve._argv_port(ARGV) == 0:
+        return "it serves an ephemeral port (--port 0) a re-exec would not keep"
+    off = _follow_off()
+    if off and not leg:
+        return "HELM_WEB_FOLLOW=%s" % off
+    return None
+
+
+def _spawn(name, target, *args):
+    """A started daemon thread, or None: a thread that cannot start costs
+    what it runs, never the server."""
+    t = threading.Thread(target=target, args=args, name=name, daemon=True)
     try:
         t.start()
     except BaseException:                    # noqa: BLE001 — never the serve
         return None
     return t
+
+
+def _follow_loop(follower, poll_s):
+    while True:
+        follow_tick(follower)
+        time.sleep(poll_s)
+
+
+def _leg_loop(leg, poll_s):
+    try:
+        _eager_imports()
+        leg.announce()
+    except Exception:                        # noqa: BLE001
+        pass
+    while True:
+        tick(leg)
+        time.sleep(poll_s)
+
+
+def start(port=None, poll_s=POLL_S):
+    """Start this `helm web`'s resident threads. Never raises into the
+    server. -> {"follow": thread or None, "leg": thread or None}.
+
+    EVERY SERVER FOLLOWS ITS CODE: the follow thread re-execs it onto a
+    changed tree, unless `follows` says why not, and that is said once on
+    stderr. The console port (`enabled`) also runs the stop-facts leg, and
+    the leg is the follow thread's follower there: ONE follower per process,
+    so one exec path. `HELM_WEB_FOLLOW=0` is not honoured by a server that
+    runs the leg, whose facts are refused once its code is older than the
+    tree; it says so, and follows."""
+    leg = Leg() if enabled(port) else None
+    why = follows(leg is not None)
+    if why:
+        _say("not following code changes: %s" % why)
+    elif leg is not None and _follow_off():
+        _say("HELM_WEB_FOLLOW=%s is not honoured by the server that runs the "
+             "stop-facts leg: facts from older code are refused, so it "
+             "follows the tree" % _follow_off())
+    return {"follow": None if why else _spawn(
+                "helm-web-follow", _follow_loop, leg or Follower(), poll_s),
+            "leg": None if leg is None else _spawn(
+                "helm-stop-facts", _leg_loop, leg, poll_s)}

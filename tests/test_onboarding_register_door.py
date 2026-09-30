@@ -22,7 +22,6 @@ import inspect
 import json
 import os
 import tempfile
-import time
 import unittest
 from unittest import mock
 
@@ -330,15 +329,42 @@ class TheWriterAndTheDoorShareOneFormat(unittest.TestCase):
                 self.assertEqual(got.proof, "why it refused")
 
     def test_the_written_stamp_is_the_moment_of_the_write(self):
-        before = int(time.time())
-        self.assertTrue(runtime._record_onboarding(
-            self.tmp, "seat-under-test", harness.DELIVERED, "p"))
-        after = int(time.time())
+        """Bracketing the writer's whole-second stamp with wall-clock reads
+        before and after the write is NOT deterministic: both reads share the
+        host wall clock, and NTP can slew it back one second between them — a
+        whole-suite gate measured the writer's stamp (1789411835) a second
+        BEFORE the bracket's own before-read (1789411835 not in
+        [1789411836, 1789411836]). A bracket cannot pin a clock that is not
+        monotonic, so the arm patches the clock at the module the writer
+        imports it from: it holds SETUP while the arm sets up, then MOVES to
+        WRITE for the write, and the stamp must equal the value the clock had
+        AT THE WRITE — not the setup's. The clock is a one-slot value every
+        reader sees, not a finite queue the calls consume: runtime.time IS
+        the global time module, so the patch replaces time.time for the whole
+        process while the block runs, and any other caller in that window
+        would hand a queued slot to a read this arm did not make — and the
+        writer's read could come up empty. A writer that stamped the setup's
+        reading, a constant (0), or any other clock fails here."""
+        SETUP = 1234567800.0
+        WRITE = 1234567890.9
+        clock = [SETUP]
+        with mock.patch.object(runtime.time, "time",
+                               side_effect=lambda: clock[0]):
+            self.assertEqual(runtime.time.time(), SETUP,
+                             "the patched clock must hold the setup value "
+                             "before the write moves it")
+            clock[0] = WRITE
+            self.assertTrue(runtime._record_onboarding(
+                self.tmp, "seat-under-test", harness.DELIVERED, "p"))
         parsed = runtime.parse_onboarding(self.stored())
         self.assertEqual(parsed.kind, runtime.ONBOARDING_VALID)
         event_at = parsed.event_at
-        self.assertTrue(before <= event_at <= after,
-                        "%r not in [%r, %r]" % (event_at, before, after))
+        # The stamp is the value the clock had at the write, truncated to
+        # the whole second the format carries — not the setup's value.
+        self.assertEqual(event_at, int(WRITE),
+                         "the written stamp must be the moment of the write "
+                         "(%r), not the setup's %r" % (int(WRITE),
+                                                       int(SETUP)))
 
     def test_the_stamp_reads_the_same_clock_as_time_time(self):
         """gmtime() with no argument reads time(NULL), a coarse clock that

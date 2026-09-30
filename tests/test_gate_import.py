@@ -17,8 +17,8 @@ import types
 import unittest
 from unittest import mock
 
-from helm import eventledger, gate, gateimport, pk
-from helm import projscope
+from helm import eventledger, gate, gateimport, gateloads, pk
+from helm import projscope, vcs
 
 ENV_KEYS = ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_CHAT_DIR", "HELM_CHAT_ROOM",
             "HELM_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -205,6 +205,32 @@ class HappyPathTest(ImportBase):
         timings, poisoned, skipped = gate._timings(self._ledger())
         self.assertEqual((poisoned, skipped), (set(), 0))
         self.assertEqual(timings[row["id"]], timing)
+
+    def test_a_load_record_sibling_rides_the_import(self):
+        """The load record (task/3039 lane 2) is how a node's whole suite
+        reaches the planner on this host: it travels home beside its receipt,
+        once, however often the artifact is imported."""
+        row = self._row()
+        loads = gateloads.event(row["id"], row["head"], row["tree"], "serial",
+                                {"tests.test_remote": ["helm/x.py",
+                                                       "tests/test_remote.py"]},
+                                1.5)
+        for _round in range(2):
+            got, verdict, err = self._import(self._artifact(loads, row))
+            self.assertEqual((got["id"], err), (row["id"], None))
+        stored = [r for r in self._ledger()
+                  if r.get("event") == gateloads.EVENT]
+        self.assertEqual(stored, [loads])
+
+    def test_a_load_record_about_another_tree_stays_behind(self):  # noqa: VACUOUS_ASSERTION — the arm above imports the same shape about the receipt's own tree and asserts it stored exactly once
+        row = self._row()
+        loads = gateloads.event(row["id"], row["head"], "f" * 40, "serial",
+                                {"tests.test_remote": ["helm/x.py"]}, 1.5)
+        got, verdict, err = self._import(self._artifact(loads, row))
+        self.assertEqual((got["id"], verdict, err),
+                         (row["id"], "imported", None))
+        self.assertEqual([r for r in self._ledger()
+                          if r.get("event") == gateloads.EVENT], [])
 
     def test_complete_receipt_and_timing_reimport_is_byte_identical_noop(self):
         row = self._row()
@@ -2841,6 +2867,17 @@ class HeadDivergenceTest(ImportBase):
         self.assertIsNotNone(note, "control: an unreadable repo must still "
                                    "produce a note, or this arm encodes None")
         note.encode("utf-8")            # the whole assertion: no raise here
+
+    def test_a_BACKWARD_copy_is_named_as_an_older_base(self):
+        """A receipt whose head carries HEAD's own patches on an OLDER trunk
+        point does not cover it, and the note says why instead of calling the
+        patches absent."""
+        with mock.patch.object(gate, "carriage", return_value=(
+                gate.NOT_CARRIED, vcs.NOT_ANCESTOR,
+                (vcs.PATCH_SEQUENCE_BACKWARD, None, 1, 1))):
+            note = gateimport.head_divergence(self.repo, self._row())
+        self.assertIn("OLDER trunk point", note)
+        self.assertNotIn("not as a contiguous run", note)
 
     def test_a_raising_containment_read_cannot_fail_the_import(self):
         """This runs AFTER the durable appends. A best-effort note that raised

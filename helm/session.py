@@ -28,8 +28,12 @@ resume cannot re-enter the known trap.
 EXPERTS (expert-sessions-beat-fresh-research): sessions are also the EXPERTISE
 layer — over time, querying/resuming a preserved expert beats fresh research.
 `experts` is a durable registry (~/.helm/_global/session-experts.json:
-sid -> {domain, registered, last_refreshed, note}) so routing to an expert is
-O(1). `ask <domain> <q>` is the QUERY LADDER: registry hit -> transcript search
+sid -> {domain, registered, last_refreshed, note, handoff, subdomains, harness,
+seat, retired, successor}) so routing to an expert is O(1). `helm handoff write`
+refreshes the writing session's entry; `--retire` hides one from the list and
+`ask`. `ask` offers only harness "claude" (native Claude) entries, because its
+resume line is a bare `claude --resume`.
+`ask <domain> <q>` is the QUERY LADDER: registry hit -> transcript search
 (cv search scoped to the expert) -> else pack-digest (cv pack) -> resume-live
 is always PRINT-DON'T-LAUNCH with a mandatory RE-GROUND instruction (expertise
 goes stale like everything else — the expert re-verifies key facts against the
@@ -813,6 +817,40 @@ def read_session_presence(root, pid, uid, proc_start):
     return rec, "record-ok"
 
 
+def live_presence(pid, start):
+    """(record, config root, why) — Claude Code's presence record for the LIVE
+    process `pid` born at `start`, from the config root named in that
+    process's OWN environment, through `read_session_presence`'s bracket.
+    (None, root or None, why) when it cannot be read; `why` is None exactly
+    when a record came back. Asked at the moment of use, never cached.
+
+    One door for the two callers that hold a stamped pid and ask it a
+    question: `harness.presence_witness` (is a dialog open?) and
+    `seat_rehome.plan` (which session does the pane hold now? — task/3208)."""
+    from . import beacons
+    try:
+        n = int(pid)
+    except (TypeError, ValueError):
+        return None, None, "no process id to read a presence record by"
+    if not start:
+        return None, None, ("pid %d carries no birth stamp, so its presence "
+                            "record cannot be bound to it" % n)
+    env = beacons.proc_env(n)
+    if env is None:
+        return None, None, ("pid %d's environment could not be read, so its "
+                            "presence record could not be read" % n)
+    uid = os.geteuid()
+    root = _config_root(env.get("CLAUDE_CONFIG_DIR"), env.get("HOME"), uid)
+    if not root:
+        return None, None, ("pid %d's config root is not a trusted directory, "
+                            "so its presence record could not be read" % n)
+    rec, why = read_session_presence(root, n, uid, str(start))
+    if not isinstance(rec, dict):
+        return None, root, ("pid %d's presence record could not be read (%s)"
+                            % (n, why))
+    return rec, root, None
+
+
 def _session_record(pid, config_dir, home_dir, uid, proc_start):
     root = _config_root(config_dir, home_dir, uid)
     if not root:
@@ -950,14 +988,36 @@ def _census_matches(pid, start, cmdline, environ=None, cwd=None):
         return False if _gone(e) else None
 
 
+def _carried_seat_name(pid):
+    """HELM_CHAT_NAME on a process the seat gate already refused, or None.
+
+    None is a missing key, an empty value, or an environ that could not be
+    read. An unreadable environ is not evidence of a seat name, so it is not
+    counted as one.
+    """
+    try:
+        raw = _proc_bytes(pid, "environ")
+    except OSError:
+        return None
+    for kv in raw.split(b"\0"):
+        key, sep, value = kv.partition(b"=")
+        if not sep or key != b"HELM_CHAT_NAME":
+            continue
+        name = value.decode("utf-8", "replace")
+        return name or None
+    return None
+
+
 def _census_snapshot(pid):
     """Tri-state sibling of _proc_snapshot for the census, fail-closed — a pass
     whose input was missing is vacuous:
 
       ("ok", snap)      every mandatory fact proven.
-      ("absent", None)  structurally not ours (foreign uid, non-claude comm)
-                        or the process left mid-scan (ENOENT/ESRCH) — genuine
-                        absence, skipped.
+      ("absent", None)  structurally not ours (foreign uid) or the process
+                        left mid-scan (ENOENT/ESRCH) — genuine absence, skipped.
+      ("excluded", name) a same-uid process that is not the seat. name is its
+                        HELM_CHAT_NAME, or None when it carries none. The
+                        census counts these; it does not drop them quietly.
       ("unknown", stub) comm PROVED claude, then a mandatory read failed while
                         the pid persists — the pid is KNOWN, its facts are
                         unprovable; the census surfaces it, never drops it as
@@ -986,7 +1046,12 @@ def _census_snapshot(pid):
         comm = _proc_bytes(pid, "comm").strip()
     except OSError as e:
         return ("absent", None) if _gone(e) else ("partial", None)
-    agent = _is_agent(pid, comm)
+    # THE SEAT GATE, not `_is_agent`. A tool exec'd from the Claude binary
+    # (comm `ugrep`, exe still under claude/versions) is a claude by the exe
+    # rung and is not the seat. `_is_agent` stays the tri-state claude rung
+    # the hook path and the false-DEAD pins use.
+    from . import procid
+    agent = procid.is_seat_process(pid, comm, PROC)
     if agent is None:
         # UNDECIDABLE IS NOT ABSENT. This caller already has the third state the
         # census needs — `partial` is what raises census_partial, which turns the
@@ -994,7 +1059,9 @@ def _census_snapshot(pid):
         # `absent` is how a census certifies a world it could not see.
         return "partial", None
     if not agent:
-        return "absent", None
+        # Refused, and said out loud by whoever tallies this name. Absent
+        # would hide the orphan the reaper has to be able to see.
+        return "excluded", _carried_seat_name(pid)
     try:
         cmdline = _proc_bytes(pid, "cmdline")
     except OSError as e:
@@ -1054,6 +1121,7 @@ def _proc_claude_census():
     root; None = config-untrusted) and ``environ`` (the bracketed environ,
     whole, so env facts never need a second unbracketed read)."""
     snapshots, unknown_stubs = [], []
+    excluded = {}
     listing_failed = census_partial = False
     try:
         pids = sorted((int(p) for p in os.listdir(PROC) if p.isdigit()))
@@ -1065,6 +1133,9 @@ def _proc_claude_census():
             snapshots.append(snap)
         elif status == "unknown":
             unknown_stubs.append(snap)
+        elif status == "excluded":
+            if snap:
+                excluded[snap] = excluded.get(snap, 0) + 1
         elif status == "partial":
             census_partial = True
     who_failed, who_failed_pids = False, set()
@@ -1189,7 +1260,8 @@ def _proc_claude_census():
         })
     rows.sort(key=lambda r: r["pid"])
     return {"rows": rows, "listing_failed": listing_failed,
-            "who_failed": who_failed, "census_partial": census_partial}
+            "who_failed": who_failed, "census_partial": census_partial,
+            "excluded_by_seat": excluded}
 
 
 def _runtime_config_snapshot(pid):
@@ -2009,8 +2081,11 @@ def _experts_lock():
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
-def _experts():
-    return pk.read_json(_experts_path(), {}) or {}
+def _experts(strict=False):
+    """The registry. Every read-modify-write passes strict=True: a lenient read
+    answers {} for a file it cannot read or parse, and writing that {} back
+    erases every other expert."""
+    return pk.read_json(_experts_path(), {}, strict=strict) or {}
 
 
 def _write_experts(d):
@@ -2018,21 +2093,137 @@ def _write_experts(d):
     pk.atomic_write(_experts_path(), json.dumps(d, indent=2, ensure_ascii=False))
 
 
+def _upsert_expert_body(ex, sid, domain, handoff_path, subdomains,
+                        harness, seat):
+    """The read-modify-write core, assuming the caller ALREADY holds the
+    experts lock. `upsert_expert` and the handoff path each take the lock in
+    their own way (blocking, or bounded-fail-open) and then run this body, so
+    the registry is never read/written without a lock."""
+    if not sid:
+        return
+    subs = {s for s in subdomains or () if s}
+    now = pk.now_ts()
+    if sid not in ex:
+        ex[sid] = {"domain": domain, "registered": now,
+                   "last_refreshed": now, "note": "",
+                   "handoff": handoff_path,
+                   "subdomains": sorted(subs),
+                   "harness": harness or "unknown",
+                   "seat": seat}
+    else:
+        entry = ex[sid]
+        entry["last_refreshed"] = now
+        entry["handoff"] = handoff_path
+        entry["subdomains"] = sorted(
+            subs.union(entry.get("subdomains") or ()))
+        if harness:
+            entry["harness"] = harness
+        if seat:
+            entry["seat"] = seat
+    _write_experts(ex)
+
+
+def upsert_expert(sid, domain, handoff_path, subdomains, harness=None,
+                  seat=None):
+    """Register/refresh the expert registry from a handoff (the "register and
+    refresh on handoff" wire).
+
+    New sid: adds {domain, registered: now, last_refreshed: now, note: "",
+    handoff: handoff_path, subdomains: [...], harness: harness or
+    "unknown", seat: seat}. Already-present sid: stamps last_refreshed =
+    now and handoff = handoff_path, merges subdomains, and keeps domain and
+    registered unchanged; a KNOWN harness replaces the stored one, an
+    unknown one never does. The seat field is stamped on mint and updated
+    only when the writer declares one (an empty declaration never clobbers a
+    previously-declared seat). Subdomains are stored sorted, unique and
+    non-empty. A handoff with no session id changes nothing: there is no
+    session to route to, and every sessionless handoff would share the one
+    '' key.
+    """
+    with _experts_lock():
+        ex = _experts(strict=True)
+        _upsert_expert_body(ex, sid, domain, handoff_path, subdomains,
+                            harness, seat)
+
+
+@contextlib.contextmanager
+def _experts_lock_bounded(wait_s=2.0):
+    """The experts lock, but as a HANDOFF may take it: `write_entry` must not
+    block on a stale or contended holder — the journal entry is the durable
+    record, and a busy registry is one stderr line, never a refused handoff.
+    A context that yields the held fd when the lock is won, or None when the
+    `wait_s` budget is spent (no acquire); the caller then decides whether the
+    read-modify-write is allowed. Releasing a lock that was never acquired is
+    a no-op, so the single finalise is safe either way.
+    """
+    path = _experts_path() + ".lock"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = open(path, "a")
+    try:
+        acquired = False
+        deadline = time.monotonic() + wait_s
+        while not acquired:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                time.sleep(min(0.05, left))
+        yield fd if acquired else None
+    finally:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        fd.close()
+
+
 def cmd_experts(args):
     """session experts [--register <sid> --domain D [--note N]] [--refresh <sid>]
-    — the O(1) expert routing registry. Durable, freshness-flagged."""
+    [--retire <sid> [--to <sid2>]]
+    — the O(1) expert routing registry. Durable, freshness-flagged.
+    Retired entries are hidden from the list and ask (kept for history).
+    """
     if not args:
         ex = _experts()
         if not ex:
             print("no experts registered — helm session experts --register "
                   "<sid> --domain <domain>")
             return 0
-        print("helm session experts (%d):" % len(ex))
-        for sid, r in sorted(ex.items(), key=lambda kv: kv[1].get("domain", "")):
-            age = _fresh(r.get("last_refreshed") or r.get("registered"))
-            print("  %-14s %s  (%s, refreshed %s)%s" % (
+        # Retired entries are historical — the list shows only live experts.
+        active = {sid: r for sid, r in ex.items()
+                  if not r.get("retired")}
+        if not active:
+            print("all experts retired — helm session experts --register "
+                  "<sid> --domain <domain>")
+            return 0
+        # Per (seat, domain) only the FRESHEST row is an expert: the registry
+        # accumulates one entry per sid, and two sids of the same seat in the
+        # same domain are the same expert seen twice. Keying on (seat, domain)
+        # keeps the freshest sid, never the earliest, and never lets the two
+        # show as rival experts for one seat in one domain.
+        freshest = {}
+        for sid, r in active.items():
+            # a SEATLESS entry (--register, a --to successor, an undeclared
+            # writer) proves no shared seat, so it is its own expert: keying
+            # it on ("", domain) would fold unrelated sessions into one row
+            key = (r["seat"], r.get("domain", "?")) if r.get("seat") \
+                else (None, sid)
+            cur = freshest.get(key)
+            if cur is None or (r.get("last_refreshed") or "") > \
+                    (cur[1].get("last_refreshed") or ""):
+                freshest[key] = (sid, r)
+        rows = sorted(freshest.values(),
+                      key=lambda kv: (kv[1].get("domain", "?"),
+                                      kv[0][:12]))
+        print("helm session experts (%d):" % len(rows))
+        for sid, r in rows:
+            ts = r.get("last_refreshed") or r.get("registered")
+            age = _fresh(ts)
+            date = ts[:10] if ts else "?"
+            print("  %-14s %s  (%s, refreshed %s on %s)%s" % (
                 r.get("domain", "?"), sid[:12], r.get("note", "")[:40], age,
-                "  STALE" if age.endswith("d") and int(age[:-1] or 0) > 14 else ""))
+                date, "  STALE" if age.endswith("d") and
+                int(age[:-1] or 0) > 14 else ""))
         return 0
     if "--register" in args:
         i = args.index("--register")
@@ -2053,10 +2244,12 @@ def cmd_experts(args):
             print("helm session experts: " + err, file=sys.stderr)
             return 1
         with _experts_lock():
-            ex = _experts()
+            ex = _experts(strict=True)
             now = pk.now_ts()
+            # _resolve_sid admits Claude sessions only (v1)
             ex[full] = {"domain": domain, "registered": now,
-                        "last_refreshed": now, "note": note or ""}
+                        "last_refreshed": now, "note": note or "",
+                        "harness": "claude"}
             _write_experts(ex)
         pk.event("session-expert-register", full[:12], domain)
         print("registered %s as expert: %s" % (full[:12], domain))
@@ -2065,7 +2258,7 @@ def cmd_experts(args):
         i = args.index("--refresh")
         sid = args[i + 1] if i + 1 < len(args) else None
         with _experts_lock():
-            ex = _experts()
+            ex = _experts(strict=True)
             hits = [s for s in ex if s.startswith(sid or "")]
             if not hits:
                 print("helm session experts: no expert sid starts '%s'" % sid,
@@ -2080,8 +2273,60 @@ def cmd_experts(args):
             _write_experts(ex)
         print("refreshed %s (%s)" % (full[:12], ex[full]["domain"]))
         return 0
+    if "--retire" in args:
+        i = args.index("--retire")
+        sid = args[i + 1] if i + 1 < len(args) else None
+        to = None
+        if "--to" in args:
+            j = args.index("--to")
+            to = args[j + 1] if j + 1 < len(args) else ""
+        if not sid or to == "":
+            print("usage: helm session experts --retire <sid> [--to <sid2>]",
+                  file=sys.stderr)
+            return 2
+        if to is not None:
+            # the successor is a SESSION, resolved like --register resolves
+            # one: a raw prefix stored as a key is an expert nobody can reach
+            to, err = _resolve_sid(to)
+            if not to:
+                print("helm session experts: --to: " + err, file=sys.stderr)
+                return 1
+        with _experts_lock():
+            ex = _experts(strict=True)
+            hits = [s for s in ex if s.startswith(sid)]
+            if not hits:
+                print("helm session experts: no expert sid starts '%s' to retire"
+                      % sid, file=sys.stderr)
+                return 1
+            if len(hits) > 1:
+                print("helm session experts: %d expert sids start '%s' — "
+                      "disambiguate" % (len(hits), sid), file=sys.stderr)
+                return 1
+            full = hits[0]
+            if to == full or (to in ex and ex[to].get("retired")):
+                # either leaves the domain with no live expert while exit 0
+                # says the hand-over happened
+                print("helm session experts: --to %s is %s — nothing retired"
+                      % (to[:12], "the expert being retired" if to == full
+                         else "itself retired"), file=sys.stderr)
+                return 1
+            now = pk.now_ts()
+            entry = ex[full]
+            entry.setdefault("retired", now)   # a re-retire keeps the first stamp
+            entry.setdefault("successor", None)
+            if to is not None:
+                entry["successor"] = to
+                if to not in ex:
+                    ex[to] = {"domain": entry.get("domain"),
+                              "registered": now, "last_refreshed": now,
+                              "note": "", "handoff": None, "subdomains": [],
+                              "harness": "claude"}   # resolved Claude-only
+            _write_experts(ex)
+        print("retired %s%s" % (full[:12],
+                                " (-> %s)" % to if to else ""))
+        return 0
     print("usage: helm session experts [--register <sid> --domain D [--note N]] "
-          "[--refresh <sid>]", file=sys.stderr)
+          "[--refresh <sid>] [--retire <sid> [--to <sid2>]]", file=sys.stderr)
     return 2
 
 
@@ -2156,12 +2401,23 @@ def cmd_ask(args):
         return rc
     q = q or ""
     ex = _experts()
-    candidates = [(s, r) for s, r in ex.items() if r.get("domain") == domain]
+    live = [(s, r) for s, r in ex.items()
+            if r.get("domain") == domain and not r.get("retired")]
+    # ONLY CLAUDE SESSIONS ARE OFFERED: the ladder ends in `claude --resume
+    # <sid>`, which is a wrong command for a codex or unknown-harness id.
+    # An entry with no harness predates handoff minting and came from
+    # --register, which admits Claude sessions only.
+    candidates = [(s, r) for s, r in live
+                  if r.get("harness", "claude") == "claude"]
     hit = max(candidates, key=lambda x: x[1].get("last_refreshed") or "") \
         if candidates else None
     if not hit:
         print("no expert for domain '%s' — register one: helm session experts "
               "--register <sid> --domain %s" % (domain, domain))
+        if live:
+            print("(%d non-Claude expert(s) for '%s' skipped: helm session ask "
+                  "prints a claude resume line, so it offers Claude sessions "
+                  "only)" % (len(live), domain))
         print("falling back to a corpus search: cv search -- '%s'" % q)
         rc, out, cerr = _cv("search", "--limit", "5", "--", q)
         print(out if rc == 0 else "cv: " + (cerr or "unavailable"))
@@ -2220,7 +2476,7 @@ USAGE = ("usage: helm session ls | doctor-panes | doctor <sid> | checkpoint "
          "       helm session port --cred <home> <sid> | rescue <pid|sid> | "
          "resume <sid> [--launch]\n"
          "       helm session experts [--register <sid> --domain D [--note N]] "
-         "[--refresh <sid>]\n"
+         "[--refresh <sid>] [--retire <sid> [--to <sid2>]]\n"
          "       helm session ask <domain> <question...>")
 
 

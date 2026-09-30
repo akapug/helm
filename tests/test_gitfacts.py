@@ -30,7 +30,9 @@ an arm that writes an entry another arm reads makes the second a replay of the
 first, and the order dependency is invisible until a single method is run alone.
 Each test therefore gets its own root.
 """
+import contextlib
 import os
+import pathlib
 import shutil
 import subprocess
 import tempfile
@@ -38,7 +40,7 @@ import time
 import unittest
 from unittest import mock
 
-from helm import dispatches, doctor, gc, gitfacts, vcs
+from helm import dispatches, doctor, foldckpt, gc, gitfacts, projscope, vcs
 
 # The overlay every helm read path runs under (`rowworld._scrubbed_env`): the
 # graft file pinned at /dev/null, replacement objects switched off, and every
@@ -229,31 +231,28 @@ class OptionValueTest(RootTest):
     """AN OPTION'S VALUE IS AN OPERAND — the clause that reading only bare
     words missed entirely."""
 
-    def test_a_ref_glued_to_an_option_is_refused_and_an_id_is_not(self):
+    def test_a_ref_glued_to_an_option_is_refused_and_an_id_is_not(self):  # noqa: VACUOUS_ASSERTION — the must-hit is the same gate on the identical argv with only the option VALUE changed, asserted EQUAL to the admitted codes; two calls are two producers by construction
         """THE GATE, MEASURED APART FROM THE TABLE.
 
         `merge-tree --write-tree --merge-base=<committish> A B` is the argv
         this tree actually issues, and `--merge-base=refs/remotes/origin/main`
-        is a REF that moves under a key that would never notice. That verb is
-        no longer in `_ANSWERS`, so asking it here would be refused by the
-        table whatever the gate did — which is exactly the mistake this module
-        was cured of. So the verb is RESTORED for the length of this arm: what
-        is left to refuse the ref is the gate, and the same argv carrying an
-        object id instead is the must-hit that proves the gate admits the
-        shape it is supposed to."""
-        table = (("merge-tree",), (1,)),
-        with mock.patch.object(gitfacts, "_ANSWERS", table):
-            ref = ("merge-tree", "--write-tree",
-                   "--merge-base=refs/remotes/origin/main", A, B)
-            oid = ("merge-tree", "--write-tree", "--merge-base=" + A, A, B)
-            self.assertIsNone(gitfacts._answers_for(list(ref)),
-                              "an option value naming a ref is an operand "
-                              "about NOW")
-            self.assertEqual(gitfacts._answers_for(list(oid)), (1,),
-                             "must-hit: the identical argv whose option value "
-                             "IS an object id is admitted, so the refusal "
-                             "above is the VALUE and not the option, the verb "
-                             "or the shape")
+        is a REF that moves under a key that would never notice. The verb is
+        admitted again in exactly this shape (`_VIEWED`, task/3056, with the
+        view in its key), so the gate is the only thing left to refuse the
+        ref, and the same argv carrying an object id instead is the must-hit
+        that proves the gate admits the shape it is supposed to. (Before
+        task/3056 the verb was patched back into `_ANSWERS` for this arm.)"""
+        ref = ("merge-tree", "--write-tree",
+               "--merge-base=refs/remotes/origin/main", A, B)
+        oid = ("merge-tree", "--write-tree", "--merge-base=" + A, A, B)
+        self.assertIsNone(gitfacts._answers_for(list(ref)),
+                          "an option value naming a ref is an operand "
+                          "about NOW")
+        self.assertEqual(gitfacts._answers_for(list(oid)), gitfacts._VIEWED[1],
+                         "must-hit: the identical argv whose option value "
+                         "IS an object id is admitted, so the refusal "
+                         "above is the VALUE and not the option, the verb "
+                         "or the shape")
 
     def test_a_non_id_option_value_on_an_admitted_verb_is_refused(self):
         """`cherry --abbrev=7 A B` is a real spelling of a real git option
@@ -919,6 +918,167 @@ class AmbientStateTest(RealRepoTest):
         self.assertEqual(after, before)
 
 
+class MergeViewTest(RealRepoTest):
+    """task/3056: ONE merge-tree form, stored with the VIEW in its key.
+
+    `AmbientStateTest` measured what moves a merge while every id stands
+    still: an attributes file, `merge.renames`, `diff.renames`. Each of them is
+    inside `foldckpt.fingerprint`, so the replay witness's exact form --
+    `merge-tree --write-tree --merge-base=<id> <id> <id>` -- is admitted with
+    that fingerprint in its key, asked at a git directory, inside a scope. The
+    arms below hold the store to the ruling: the answer it serves is the one a
+    fresh spawn gives, byte for byte; a store that is present but unreadable,
+    corrupt or missing is a MISS; a view that moved is a different key; and
+    nothing outside the one form, the git directory and a scope is stored."""
+
+    def build(self, repo, mark=""):
+        super().build(repo, mark)
+        _git(repo, "checkout", "-q", "-b", "left")
+        self.write(repo, "one.txt", "LEFT\nb\nc\n")
+        _git(repo, "commit", "-q", "-am", "left")
+        _git(repo, "checkout", "-q", "-b", "right", "main")
+        self.write(repo, "one.txt", "RIGHT\nb\nc\n")
+        _git(repo, "commit", "-q", "-am", "right")
+        _git(repo, "checkout", "-q", "-b", "other", "main")
+        self.write(repo, "two.txt", "OTHER\n")
+        _git(repo, "commit", "-q", "-am", "other")
+        _git(repo, "checkout", "-q", "main")
+        return repo
+
+    def write(self, repo, name, text):
+        with open(os.path.join(repo, name), "w") as f:
+            f.write(text)
+        _git(repo, "add", "-A")
+
+    def argv(self, *sides):
+        """The replay witness's exact form over this fixture's commits."""
+        ids = [_git(self.repo, "rev-parse", side) for side in sides]
+        return ("merge-tree", "--write-tree",
+                "--merge-base=" + _git(self.repo, "rev-parse", "main")) \
+            + tuple(ids)
+
+    def gitdir(self):
+        return os.path.join(self.repo, ".git")
+
+    def ask(self, argv, where=None, scoped=True):
+        """(rc, stdout, stderr, merge processes) for one read through the seam."""
+        with self.spawns() as spawn:
+            if scoped:
+                with projscope.scope():
+                    got = self.backend.run(where or self.gitdir(), *argv,
+                                           env=PINNED)
+            else:
+                got = self.backend.run(where or self.gitdir(), *argv,
+                                       env=PINNED)
+        merges = [c for c in spawn.call_args_list
+                  if tuple(c.args[2])[:1] == ("merge-tree",)]
+        return got + (len(merges),)
+
+    def fresh(self, argv):
+        """What git answers with the table switched off."""
+        gitfacts.disable()
+        try:
+            return self.backend.run(self.gitdir(), *argv, env=PINNED)
+        finally:
+            gitfacts.enable()
+
+    def test_the_answer_served_is_a_fresh_spawn_byte_for_byte(self):  # noqa: VACUOUS_ASSERTION — the loop is a fixed two-case tuple and the closing unconditional entries()==2 proves both cases ran and stored; every served zero sits beside that case's own cold (rc, 1 merge) on the same instrument
+        """A conflict (rc 1, the answer most carried closes get) and a clean
+        merge (rc 0), each asked in one scope and served in the next."""
+        for sides, rc in ((("left", "right"), 1), (("left", "other"), 0)):
+            with self.subTest(sides=sides):
+                argv = self.argv(*sides)
+                cold = self.ask(argv)
+                self.assertEqual((cold[0], cold[3]), (rc, 1),
+                                 "the control: the first scope ran the merge "
+                                 "and got the answer the fixture was built for")
+                warm = self.ask(argv)
+                self.assertEqual(warm[3], 0,
+                                 "a later scope re-ran a merge the table holds")
+                spawned = self.fresh(argv)
+                self.assertTrue(spawned[1].strip(), "git printed a tree")
+                self.assertEqual(warm[:2], spawned[:2],
+                                 "the served (rc, stdout) is not git's")
+                self.assertEqual(cold[:2], spawned[:2])
+        self.assertEqual(self.entries(), 2)
+
+    def test_a_present_but_unreadable_or_corrupt_or_missing_store_is_a_miss(self):  # noqa: VACUOUS_ASSERTION — the served zero is the POSITIVE control here (the entry is live), bracketed by the cold run's one merge on the same instrument; each damage case asserts one merge and git's own (rc, stdout)
+        argv = self.argv("left", "right")
+        cold = self.ask(argv)
+        self.assertEqual(cold[3], 1)
+        entry, = gitfacts.entry_paths()
+        with open(entry, "rb") as f:
+            good = f.read()
+        # THE UNCONDITIONAL POSITIVE CONTROL: this entry IS served.
+        self.assertEqual(self.ask(argv)[3], 0)
+
+        def damaged(how):
+            got = self.ask(argv)
+            self.assertEqual(got[3], 1, "%s was served instead of re-asked"
+                                        % how)
+            self.assertEqual(got[:2], cold[:2],
+                             "and the re-asked answer is git's own")
+
+        if os.geteuid() != 0:                  # root reads a mode-000 file
+            os.chmod(entry, 0)
+            damaged("a present entry that cannot be read")
+            os.chmod(entry, 0o644)
+            self.assertEqual(self.ask(argv)[3], 0, "control: readable again")
+        os.unlink(entry)
+        os.mkdir(entry)                        # present, and not a file
+        damaged("an entry that is a directory")
+        os.rmdir(entry)
+        for how, blob in (("a garbage header", b"not a header\n" + good),
+                          ("a non-answer exit code",
+                           good.replace(b" 1 ", b" 128 ", 1)),
+                          ("stderr on a merge answer", good + b"hint: x\n")):
+            with open(entry, "wb") as f:
+                f.write(blob)
+            damaged(how)
+        shutil.rmtree(self.root)
+        damaged("a table that is not there")
+
+    def test_a_view_that_moved_is_a_different_key(self):
+        """The mover `AmbientStateTest` measured, through the exact form the
+        table now admits: the same ids, an attributes line, a new answer --
+        and the old answer served again once the line is gone."""
+        argv = self.argv("left", "right")
+        conflict = self.ask(argv)
+        self.assertEqual(conflict[0], 1, "the control: these two conflict")
+        info = os.path.join(self.gitdir(), "info")
+        os.makedirs(info, exist_ok=True)
+        attributes = os.path.join(info, "attributes")
+        with open(attributes, "w") as f:
+            f.write("one.txt merge=union\n")
+        union = self.ask(argv)
+        self.assertEqual((union[0], union[3]), (0, 1),
+                         "the moved view was served the old answer")
+        os.unlink(attributes)
+        back = self.ask(argv)
+        self.assertEqual((back[0], back[3]), (1, 0),
+                         "the unmoved view's own entry was not served")
+        self.assertEqual(self.entries(), 2)
+
+    def test_only_the_one_form_at_a_git_directory_inside_a_scope(self):
+        argv = self.argv("left", "right")
+        left, right, trunk = argv[3], argv[4], argv[2].split("=", 1)[1]
+        for why, question, where, scoped in (
+                ("outside a scope", argv, None, False),
+                ("inside a work tree", argv, self.repo, True),
+                ("with no merge base", ("merge-tree", "--write-tree", left,
+                                        right), None, True),
+                ("with a glued option", ("merge-tree", "--write-tree",
+                                         "--merge-base=" + trunk, "-Xours",
+                                         left), None, True),
+                ("on a ref", argv[:3] + ("left", right), None, True)):
+            with self.subTest(why=why):
+                self.ask(question, where=where, scoped=scoped)
+                self.assertEqual(self.entries(), 0, why)
+        # THE CONTROL, on the same table: the admitted form IS stored.
+        self.ask(argv)
+        self.assertEqual(self.entries(), 1)
+
+
 class ShallowTest(RootTest):
     """THE THIRD REWRITER, THE ONE WITH NO OVERLAY.
 
@@ -1110,37 +1270,119 @@ class CeilingTest(RootTest):
                          "reaper that cannot remove anything")
         self.assertGreater(reaped, 0)
 
-    def test_the_oldest_by_write_time_is_what_goes(self):
-        """AGE, AND SAID TO BE AGE. The order is the file's mtime, which
-        `record` sets and a HIT never touches, so this is write time and not
-        use — the docstring says so and this arm is what makes the sentence
-        falsifiable. An entry read a thousand times is evicted ahead of one
-        written a second ago and never read."""
-        self.fill(4)
-        # THE LAST PATH, NOT THE FIRST, and that is the whole arm. A pruner
-        # that sorted by PATH instead of by write time would evict the
-        # lexicographically smallest entry — so backdating that one makes the
-        # two implementations agree and the arm proves nothing about the axis.
-        # Measured: with the axis mutated to path order this arm went RED only
-        # after the subject moved to the far end.
-        old = sorted(gitfacts.entry_paths())[-1]
-        stamp = time.time() - 3600
-        os.utime(old, (stamp, stamp))
-        for _ in range(50):
-            self.assertIsNotNone(
-                gitfacts.lookup(self.here, ("cherry", A, "%040x" % 0), PINNED)
-                or gitfacts.lookup(self.here, ("cherry", A, "%040x" % 1), PINNED),
-                "the control: the table is serving reads while it is aged")
-        survivors = [p for p in gitfacts.entry_paths() if p != old]
-        with mock.patch.dict(self.policy(), {"count": 3}):
+    def write(self, i):
+        """Record question `i` and return the one path that record created."""
+        before = set(gitfacts.entry_paths())
+        gitfacts.record(self.here, ("cherry", A, "%040x" % i), PINNED,
+                        0, b"+ x\n", b"")
+        (path,) = set(gitfacts.entry_paths()) - before
+        return path
+
+    def aged(self, path, seconds):
+        """Set one entry's recency `seconds` into the past, to the ns."""
+        stamp = time.time_ns() - int(seconds * 1e9)
+        os.utime(path, ns=(stamp, stamp))
+        return stamp
+
+    def read_then_sweep(self, touch):
+        """ONE WORLD, run twice by the arm below with only the touch differing.
+
+        The entry a reader asks for was WRITTEN FIRST, two hours ago; the three
+        nobody reads were written after it. One hit, then gc's own sweep down
+        to a single entry. -> (served, items, read survives, [each unread
+        survives, oldest first])"""
+        for path in gitfacts.entry_paths():
+            os.unlink(path)
+        read = self.write(0)
+        unread = [self.write(i) for i in (1, 2, 3)]
+        self.aged(read, 7200)
+        for age, path in zip((3600, 3500, 3400), unread):
+            self.aged(path, age)
+        # THE TOUCHING WORLD PATCHES NOTHING, so it runs the code as shipped.
+        # `create=True` lets the other world run on a tree that predates the
+        # refresh, where it is the same read; if the refresh is ever renamed,
+        # that world stops being disabled and its eviction assertion goes red.
+        with contextlib.nullcontext() if touch else mock.patch.object(
+                gitfacts, "_used", lambda *_a: None, create=True):
+            served = gitfacts.lookup(self.here, ("cherry", A, "%040x" % 0),
+                                     PINNED)
+        with mock.patch.dict(self.policy(), {"count": 1}):
             items, _reaped = self.sweep()
-        self.assertEqual(items, 1)
-        self.assertTrue(all(os.path.exists(p) for p in survivors),
-                        "the control, on the SAME observable: the three "
-                        "younger entries are all still at their paths")
-        self.assertFalse(os.path.exists(old),
-                         "and the backdated one is what went, however often "
-                         "it was read")
+        return (served, items, os.path.exists(read),
+                [os.path.exists(path) for path in unread])
+
+    def test_the_least_recently_USED_is_what_goes(self):
+        """LAST USE, AND SAID TO BE LAST USE (task/3056). The order is the
+        file's mtime, which `record` sets and a served hit refreshes, so an
+        entry that is still being asked for survives a sweep that removes
+        entries written after it which nobody reads. That is the recorded-trunk
+        generation's case: its questions are the OLDEST writes in the table and
+        are asked again after every land.
+
+        TWO WORLDS, IDENTICAL BUT FOR THE TOUCH, on one observable — whether
+        each path is still on disk. Without the refresh the same hit leaves the
+        entry to be evicted first, by write time, and the newest unread entry is
+        the survivor: the must-differ control. So what keeps the read entry is
+        the refresh, not the sweep, the fixture or the ceiling.
+
+        THE READ ENTRY IS QUESTION 0 AND ITS PATH IS WHEREVER ITS HASH PUTS IT,
+        so a pruner that ordered by PATH instead of recency keeps one fixed path
+        in both worlds, and the two worlds expect two different survivors."""
+        answer = (0, b"+ x\n", b"")
+        served, items, kept, unread = self.read_then_sweep(touch=False)
+        self.assertEqual(served, answer, "the control: the hit was served")
+        self.assertEqual(items, 3)
+        self.assertFalse(kept, "the must-differ control: without the refresh "
+                               "the entry written first is evicted first, "
+                               "however recently it was read")
+        self.assertEqual(unread, [False, False, True],
+                         "the positive control, on the SAME observable: the "
+                         "newest write is what survives by write time")
+
+        served, items, kept, unread = self.read_then_sweep(touch=True)
+        self.assertEqual(served, answer, "the control: the hit was served")
+        self.assertEqual(items, 3)
+        self.assertTrue(kept, "an entry that was just read was evicted ahead "
+                              "of three written after it that nobody reads")
+        self.assertEqual(unread, [False, False, False],
+                         "and the entries nobody reads are what went")
+
+    def test_a_hit_inside_the_interval_writes_nothing(self):  # noqa: VACUOUS_ASSERTION — the unchanged mtime is bracketed on the SAME observable, os.stat(path).st_mtime_ns, by the assertGreater after the past-the-interval hit, and both lookups are asserted served
+        """THE THROTTLE. A hit is a ~20µs read, so a refresh on every one would
+        be a write on every read; an entry refreshed within `_TOUCH_S` is left
+        exactly as it is. The control is the same entry, the same read and the
+        same instrument, past the interval: there the recency does move."""
+        path = self.write(0)
+        argv = ("cherry", A, "%040x" % 0)
+        inside = self.aged(path, gitfacts._TOUCH_S - 60)
+        self.assertIsNotNone(gitfacts.lookup(self.here, argv, PINNED))
+        self.assertEqual(os.stat(path).st_mtime_ns, inside,
+                         "a hit inside the interval rewrote the entry")
+        outside = self.aged(path, gitfacts._TOUCH_S + 60)
+        before = time.time_ns()
+        self.assertIsNotNone(gitfacts.lookup(self.here, argv, PINNED))
+        moved = os.stat(path).st_mtime_ns
+        self.assertGreater(moved, outside,
+                           "the control, on the SAME observable: a hit past "
+                           "the interval refreshes the entry")
+        self.assertGreaterEqual(moved, before - 10 ** 9,
+                                "and refreshes it to NOW, not to some other "
+                                "time")
+
+    def test_a_refresh_that_fails_still_serves_the_answer(self):
+        """A pruner may unlink the entry between the read and its refresh, and
+        a store may be readable and not writable. Either way the answer already
+        read is served and nothing is raised into the read."""
+        path = self.write(0)
+        self.aged(path, gitfacts._TOUCH_S + 60)
+        with mock.patch("os.utime",
+                        side_effect=FileNotFoundError(path)) as utime:
+            got = gitfacts.lookup(self.here, ("cherry", A, "%040x" % 0),
+                                  PINNED)
+        self.assertEqual(utime.call_count, 1,
+                         "the control: the refresh was attempted, so the "
+                         "answer below survived a failing write")
+        self.assertEqual(got, (0, b"+ x\n", b""))
 
     def test_a_stray_temp_file_is_counted_and_evicted(self):
         """`record` writes a temp beside the entry and renames over it; a
@@ -1354,6 +1596,74 @@ class DoctorLineTest(RootTest):
     def test_the_check_is_wired_into_the_doctor_pass(self):
         """A check nobody runs is the unbounded store all over again."""
         self.assertIn("check_gitfacts_table", doctor.CHECKS)
+
+
+class RelativePathTest(RootTest):
+    """task/3105 — A RELATIVE PATH IS NOT A REPOSITORY. This table outlives
+    the process, so two processes started in two directories share it, and a
+    key that carries the relative string names a different repository in
+    each. "Immutable" holds for one repository; the key must name which.
+
+    Two parents each hold a real repository at the relative path `repo`, so
+    the shallow check admits the question in both and the key is the only
+    thing left to refuse it."""
+
+    def setUp(self):
+        super().setUp()
+        self.parents = []
+        for _ in range(2):
+            parent = os.path.realpath(
+                tempfile.mkdtemp(prefix="helm-test-gitfacts-parent-"))
+            self.addCleanup(shutil.rmtree, parent, ignore_errors=True)
+            _git(parent, "init", "-q", "-b", "main", "repo")
+            self.parents.append(parent)
+        self.addCleanup(os.chdir, os.getcwd())
+
+    def test_a_relative_path_is_never_answered_from_another_directory(self):
+        """ARM (b): recorded under `repo` from one parent, asked under `repo`
+        from the other — as two helm processes in two directories would."""
+        argv = ("merge-base", "--is-ancestor", A, B)
+        here, there = self.parents
+        os.chdir(here)
+        gitfacts.record("repo", argv, PINNED, 0, b"", b"")
+        served = gitfacts.lookup("repo", argv, PINNED)
+        os.chdir(there)
+        elsewhere = gitfacts.lookup("repo", argv, PINNED)
+        self.assertEqual(served, (0, b"", b""),
+                         "control: the entry is served where it was written")
+        self.assertIsNone(elsewhere, "an answer written for one repository "
+                                     "was served for another")
+        self.assertEqual(self.entries(), 1)
+
+    def test_every_spelling_of_one_repository_is_one_entry(self):  # noqa: VACUOUS_ASSERTION — the equality names the stored non-empty answer for every spelling, and the entry count is an exact 1
+        """ARM (c), THE CONTROL: the key names the directory, it does not
+        switch the table off. The relative, absolute, bytes and `PathLike`
+        spellings of one repository are served the one entry a relative
+        spelling wrote."""
+        argv = ("cherry", A, B)
+        here, _there = self.parents
+        os.chdir(here)
+        gitfacts.record("repo", argv, PINNED, 0, b"+ x\n", b"")
+        spellings = {"relative": "repo",
+                     "absolute": os.path.join(here, "repo"),
+                     "bytes": b"repo",
+                     "PathLike": pathlib.Path("repo")}
+        got = {name: gitfacts.lookup(where, argv, PINNED)
+               for name, where in spellings.items()}
+        self.assertEqual(got, dict.fromkeys(spellings, (0, b"+ x\n", b"")))
+        self.assertEqual(self.entries(), 1)
+
+    def test_no_path_is_a_miss_and_never_a_raise(self):  # noqa: VACUOUS_ASSERTION — the absence IS the contract for a cwd that names no repository; `admit` then moves the same entry count to an exact 1
+        """A cwd of None names no repository: nothing is stored under it and
+        nothing is served for it, and neither door raises into the read."""
+        argv = ("merge-base", "--is-ancestor", A, B)
+        gitfacts.record(None, argv, PINNED, 0, b"", b"")
+        self.assertIsNone(gitfacts.lookup(None, argv, PINNED))
+        self.assertEqual(self.entries(), 0)
+        self.admit()
+        self.assertEqual(self.entries(), 1,
+                         "control: the same table stores an answer for a "
+                         "repository it can name")
 
 
 if __name__ == "__main__":

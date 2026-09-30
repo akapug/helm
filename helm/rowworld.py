@@ -75,7 +75,11 @@ class World(object):
                  # Rows that name NO repository. Present so they stay
                  # visible, named so their state cannot be derived from
                  # THIS repository's artifacts (review addendum 4).
-                 "unscoped")
+                 "unscoped",
+                 # The approvals that take the NON-AUTHOR rule
+                 # (`non_author_approvals`): the ids whose same-family
+                 # APPROVE `rowstate._approved` counts.
+                 "non_author")
 
     def __init__(self, **kw):
         for name in self.__slots__:
@@ -556,7 +560,15 @@ def _replay_is_a_noop(gitdir, base, tip, trunk_ref):
     prove it): a rebase-landed delta conflicts BECAUSE HEAD already carries
     the change, and an adjacent follow-on conflicts while retaining it. So a
     conflict answers False to THIS witness and the caller reads that as
-    silence, not as a negative."""
+    silence, not as a negative.
+
+    `trunk_ref` IS WHATEVER TRUNK OBJECT THE CALLER IS ASKING ABOUT: the head
+    for a close being minted, and a replayed close's recorded
+    `closing_trunk_sha` while that commit is still history of trunk
+    (`dispatches._measured_trunk_is_history`, task/3056). With three object
+    ids here, `gitfacts` may answer the merge from its store, keyed by the
+    view git's merge machinery reads; the tree id it hands back is compared
+    below and no object behind it is read."""
     rc, out = _git(gitdir, "merge-tree", "--write-tree",
                    "--merge-base=" + base, trunk_ref, tip)
     if rc == 1:
@@ -909,6 +921,33 @@ def _family_seats(rows, gitdir):
     return seats
 
 
+def non_author_approvals(rows, authors):
+    """frozenset(ids) — the APPROVE rows that take the NON-AUTHOR rule.
+
+    `rowstate._approved` never counts a same-family approve, except one whose
+    recorded approval tier admitted its reader by the model its runtime
+    records, from a seat that wrote none of the work (the owner's ruling that
+    Opus seats are in the upper tier): no sender of the row, no seat its
+    chain records, and none of the builders `authors` names for its lane
+    (`landreq.non_author_error`). Read here, beside the other artifact reads,
+    so the derivation stays a function of the World.
+
+    THE READ-SIDE JOIN: the chain is read off the memoised ledger index, as
+    every board question is. A record, a chain or a model it cannot read
+    leaves the id out, which keeps the family rule."""
+    from . import landreq
+    out = set()
+    for rid, row in (rows or {}).items():
+        if not isinstance(row, dict) or row.get("polarity") != "approve" \
+                or dispatches.non_author_tier_error(row, verify=False):
+            continue
+        lane = str(row.get("lane") or "").strip()
+        if not landreq.non_author_error(
+                row, (row,), also=(authors or {}).get(lane) or ()):
+            out.add(str(rid))
+    return frozenset(out)
+
+
 def resolve_families(seats):
     """{seat: frozenset(families) or None} — the one artifact-hostile read.
 
@@ -1070,6 +1109,7 @@ def snapshot(gitdir, trunk_ref=TRUNK_REF, rows=None, families=None,
         receipts_by_head=receipts_by_head,
         approvals={k: tuple(v) for k, v in approvals.items()},
         authors={k: frozenset(v) for k, v in authors.items()},
+        non_author=non_author_approvals(mine, authors),
         carriers=carriers,
         families=families,
         patch_scan=patch_scan,

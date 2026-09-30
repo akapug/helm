@@ -204,8 +204,11 @@ class NoWriterTakesTheLockItselfTest(unittest.TestCase):
         owners = {("%s.%s" % (cls, fn.name)) if cls else fn.name
                   for cls, fn in functions if self.locks_the_ledger(fn)}
         # UNCONDITIONAL POSITIVE CONTROL: the walk finds the owner it must.
-        self.assertIn("_LedgerTxn.lock", owners)
-        self.assertEqual(owners, {"_LedgerTxn.__init__", "_LedgerTxn.lock"},
+        # `_take` is the one call site: the transaction's last try takes
+        # the lock through it from `__init__` and an optimistic try from
+        # `lock`, and it marks the thread as the holder for the fold flight.
+        self.assertIn("_LedgerTxn._take", owners)
+        self.assertEqual(owners, {"_LedgerTxn._take"},
                          "a function other than the transaction takes the "
                          "dispatch ledger lock, so it can fold under it")
 

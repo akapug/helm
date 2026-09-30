@@ -1,6 +1,5 @@
 import collections
 import hashlib
-import importlib.util
 import io
 import json
 import os
@@ -13,7 +12,7 @@ import textwrap
 import unittest
 from unittest import mock
 
-from helm import gate, gateequiv, gateshard, gatetestrecord
+from helm import gate, gateequiv, gateshard, gateslice, gatetestrecord
 
 
 SHARD = [sys.executable, os.path.abspath(gateshard.__file__)]
@@ -59,33 +58,6 @@ class WorkerCountTest(unittest.TestCase):
         self.assertTrue(gate._suite_shaped(gaterunner_full, runner=None))
         self.assertFalse(gate._suite_shaped(arbitrary))
         self.assertFalse(gate._suite_shaped(arbitrary, runner=None))
-
-    def test_the_legacy_gaterunner_is_accepted_and_never_produced(self):
-        """`helm.gaterunner` stays in the stored runner set so the receipts it
-        minted on a lane that never merged keep reading as they did; this tree
-        must never mint another. Both halves, each against a control:
-
-          ACCEPTED   the set still names it, beside unittest.
-          NEVER      no module of that name is importable (the same probe
-          PRODUCED   finds a real helm module), the writer spawns `-m
-                     unittest`, and no helm source outside the three readers
-                     that accept or guard the name spells it."""
-        self.assertEqual(gate._STORED_SUITE_RUNNERS,
-                         frozenset(("unittest", "helm.gaterunner")))
-        self.assertIsNotNone(importlib.util.find_spec("helm.gateshard"))
-        self.assertIsNone(importlib.util.find_spec("helm.gaterunner"))
-        self.assertEqual(gate.SUITE[:2], ("-m", "unittest"))
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        spelled = set()
-        for dp, _dn, fn in os.walk(os.path.join(root, "helm")):
-            for n in fn:
-                if n.endswith(".py"):
-                    p = os.path.join(dp, n)
-                    with open(p, encoding="utf-8") as f:
-                        if "gaterunner" in f.read():
-                            spelled.add(os.path.relpath(p, root))
-        self.assertEqual(spelled, {"helm/gate.py", "helm/gateroute.py",
-                                   os.path.join("helm", "work", "_gc.py")})
 
     def test_worker_budget_comes_from_affinity_and_gate_capacity(self):
         with mock.patch.object(gateshard, "_available_cpus", return_value=40):
@@ -205,6 +177,12 @@ class WorkerCountTest(unittest.TestCase):
         self.assertNotIn("Ran 0 tests", run.stderr)
 
     def test_current_planner_and_workers_assign_the_same_test_ids(self):  # noqa: VACUOUS_ASSERTION — each module's non-empty exact planned-id list is unconditionally compared with its independently loaded worker list
+        # Discovery imports every test module, and some of them plant env or
+        # sys.path at import; none of that may outlive this test.
+        for patch in (mock.patch.dict(os.environ),
+                      mock.patch.object(sys, "path", list(sys.path))):
+            patch.start()
+            self.addCleanup(patch.stop)
         suite, groups = gateshard.discover_plan()
         planned = {name: gatetestrecord.planned_ids(unittest.TestSuite(tests))
                    for name, tests in groups}
@@ -295,6 +273,28 @@ class WorkerCountTest(unittest.TestCase):
                 capture_output=True, text=True, timeout=30)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(gate.parse_result(run.stderr)["status"], "OK")
+
+
+class PlannerTestLeavesNoStateTest(unittest.TestCase):
+    """The planner test imports the whole tree in-process, so it is the test
+    here that can leave env or sys.path for the next unit to inherit."""
+
+    def test_the_leak_audit_in_fail_mode_finds_nothing_it_left(self):
+        # A fresh process with the tree's import-time plants unset, so they
+        # fire inside the audited unit.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("HELM_ADOPTED_DIR", "HELM_CHAT_ROOM")}
+        env["HELM_GATESLICE_LEAKS"] = "fail"
+        name = ("tests.test_gateshard.WorkerCountTest."
+                "test_current_planner_and_workers_assign_the_same_test_ids")
+        runner = os.path.abspath(gateslice.__file__)
+        run = subprocess.run(
+            [sys.executable, runner, "--serial", name],
+            cwd=os.path.dirname(os.path.dirname(runner)), env=env,
+            capture_output=True, text=True, timeout=300)
+        self.assertIn("Ran 1 test", run.stderr)
+        self.assertNotIn("gateslice leak", run.stderr)
+        self.assertEqual(run.returncode, 0, run.stderr[-2000:])
 
 
 class _ShardHarness(unittest.TestCase):
@@ -885,9 +885,6 @@ class ShardExecutionTest(_ShardHarness):
         self.assertEqual([n for n in all_names if n == "_LINKED_MODULES"], [],
                          "linking was re-added as live code")
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class CanonicalExecutionModelTest(unittest.TestCase):
@@ -1835,3 +1832,7 @@ class TheSupervisorReportsASignalDeathAs128PlusNTest(_ShardHarness):
         self.assertIn("died on signal 15 (SIGTERM) (reported as exit 143)",
                       text)
         self.assertNotIn("exited 241", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

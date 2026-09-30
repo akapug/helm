@@ -21,6 +21,7 @@ import unittest
 from helm import seat            # seeds the late-bound names into the impls
 from helm import seat_launch_assets as assets
 from helm.seat_catalog import FAMILIES
+from tests._two_route_catalog import patch_two_routes
 
 FAMILY = "ds4pro"                # noqa: SEAT_NAME — the family IS the subject:
 ALIAS = "ds4-pro"                # its catalogue is what carries two routes for
@@ -50,6 +51,10 @@ def _block(*providers):
 
 class EligibleRouteTest(unittest.TestCase):
     """WHICH providers are part of the desired state."""
+
+    def setUp(self):
+        # ds4pro as ONE alias on TWO vendors: the shape these arms pin
+        patch_two_routes(self)
 
     def eligible(self, block):
         return assets._eligible_providers(block, FAMILY, FAMILIES[FAMILY])
@@ -139,6 +144,10 @@ class DisabledFlagTest(unittest.TestCase):
     enabled" can mean anything.
     """
 
+    def setUp(self):
+        # ds4pro as ONE alias on TWO vendors: the shape these arms pin
+        patch_two_routes(self)
+
     def disabled(self, body):
         return assets._provider_disabled(body)
 
@@ -221,6 +230,10 @@ class DisabledFlagTest(unittest.TestCase):
 
 class DuplicateNameCustodyTest(unittest.TestCase):
     """HOSTILE STATE 2: two provider blocks sharing one name."""
+
+    def setUp(self):
+        # ds4pro as ONE alias on TWO vendors: the shape these arms pin
+        patch_two_routes(self)
 
     def test_a_STALE_first_section_is_merged_and_the_second_is_untouched(self):
         """A config carrying two same-named blocks must come back carrying
@@ -310,6 +323,10 @@ class MultiRoutePlanTest(unittest.TestCase):
     helpers is invisible to it, and two such defects were live in this module.
     Everything here goes through the door production uses.
     """
+
+    def setUp(self):
+        # ds4pro as ONE alias on TWO vendors: the shape these arms pin
+        patch_two_routes(self)
 
     def _plan(self, *providers):
         config = ('host: "127.0.0.1"\n'

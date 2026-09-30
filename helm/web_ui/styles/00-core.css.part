@@ -12,7 +12,7 @@
    reports it hidden. The two disagree silently and nothing in the JS is wrong.
 
    MEASURED, three separate times in this tree, each cured only where it was
-   found: `#lrsec [hidden]` below, `#declform[hidden]` and `#declfill[hidden]`
+   found: the retired pipeline wall's `[hidden]`, `#declform[hidden]` and `#declfill[hidden]`
    in the quota sheet. The fourth was the stale-build offer, which reached the
    owner: `#stalebuild{display:flex}` pinned it under the top edge permanently,
    so it announced "helm has changed since you opened this page" on a page that
@@ -142,6 +142,10 @@ button{font:inherit}
 
 /* ---------- views ---------- */
 .view{display:none}.view.on{display:block}
+/* EVERY IN-PAGE TARGET LANDS BELOW THE STICKY NAVIGATION (task/3475): a
+   link that scrolled a heading to the viewport top put it UNDER the nav.
+   Zero specificity, so a target with its own clearance keeps it. */
+:where(.view [id],.view .brow){scroll-margin-top:calc(var(--navh,48px) + 8px)}
 .placeholder{padding:72px 20px;text-align:center;color:var(--mut)}
 .placeholder .glyph{font-size:2rem;opacity:.4}
 .empty{padding:24px;text-align:center;color:var(--mut)}
@@ -163,146 +167,6 @@ header{padding:18px 0 4px}
 #banner.show{display:block}
 #stalebanner{display:none;margin:14px 0 0;padding:9px 14px;border:1px solid color-mix(in srgb,var(--warn) 45%,transparent);border-radius:10px;background:var(--card);color:var(--warn);font-size:var(--f2)}
 #stalebanner.show{display:block}
-
-/* ---------- land pipeline (the record's own row per lane; `helm lr list`) ----------
-   COLOUR IS A CLASS, NEVER A MOOD. --ok is spent on exactly one thing: a
-   landing GIT itself observed. Everything unproven is neutral --mut, so an
-   unverified row reads as honest history rather than as an alert, and only the
-   two alarm classes (CONTRARY, STALLED) get --bad/--warn and the ⚠ glyph.
-   The lane name NO LONGER ELLIPSIZES and a row is no longer a fixed two lines
-   (task/333): the name gets its own block at full card width and WRAPS, so how
-   tall a row is depends on how long its name is. This paragraph said the
-   opposite and I corrected only its twin 30 lines down; a review caught the
-   one I left — the whole reason a comment describing layout is a liability
-   the moment layout changes. The tap-to-expand is unchanged and still carries
-   the detail. */
-#lrsec{margin:16px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;font-size:var(--f1)}
-#lrsec .slabel{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
-#lrsec .lrhead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
-#lrsec .lrcounts{color:var(--sub);font-size:var(--f1);font-variant-numeric:tabular-nums}
-#lrsec .lrhow{margin-left:auto;color:var(--mut);font-size:var(--f0)}
-#lrsec .lrfresh{margin-top:2px;color:var(--mut);font-size:var(--f0);font-variant-numeric:tabular-nums}
-#lrsec .lrfiled{margin-top:2px;color:var(--sub);font-size:var(--f0);font-variant-numeric:tabular-nums}
-#lrsec .lrunknown{margin-top:8px;padding:8px 10px;border-radius:8px;border:1px solid color-mix(in srgb,var(--bad) 55%,transparent);background:color-mix(in srgb,var(--bad) 10%,transparent);color:var(--bad);font-weight:700;font-size:var(--f2)}
-/* NOT-READ-YET is its own colour: loud enough that a blank-and-zero card can
-   never be mistaken for a quiet one, and distinct from the --bad strip so
-   "nothing has answered" never reads as "the ledger is unreadable". */
-#lrsec .lrpending{margin-top:8px;padding:8px 10px;border-radius:8px;border:1px solid color-mix(in srgb,var(--warn) 55%,transparent);background:color-mix(in srgb,var(--warn) 10%,transparent);color:var(--warn);font-weight:700;font-size:var(--f2)}
-#lrsec .lrwhy{margin-top:5px;color:var(--fg);word-break:break-word}
-#lrsec .lrnone{margin-top:8px;color:var(--mut)}
-/* WHAT IS BUILDING — the band above the in-flight rows. Deliberately QUIET in
-   the healthy case (a hairline rail, no fill): building is the process working,
-   never an alarm, and anything louder would compete with the contrary edge on
-   the cards below it, which is the one thing on this card that must never be
-   outshouted. The UNKNOWN head is the exception and borrows the card's own
-   --bad vocabulary, because "the lane rooms could not be read" and "nothing is
-   being built" must never look alike. */
-.lrbuild{margin-top:8px;padding:5px 0 5px 8px;border-left:2px solid var(--line2);border-radius:0 8px 8px 0;background:color-mix(in srgb,var(--fg) 2%,transparent)}
-.lrbhead{font-size:var(--f0);font-weight:700;letter-spacing:.04em;color:var(--sub);font-variant-numeric:tabular-nums}
-.lrbhead.unk{color:var(--bad)}
-.lrbwhy{margin-top:2px;font-size:var(--f0);color:var(--mut);word-break:break-word}
-.lrbrows{margin-top:4px;display:flex;flex-direction:column;gap:3px}
-.lrbrow{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:var(--f0)}
-.lrbrow .lrblane{font-weight:700;color:var(--fg);overflow-wrap:anywhere;word-break:break-word;min-width:0}
-.lrbrow .lrbwho{color:var(--sub)}
-.lrbrow .lrbn{flex:0 0 auto;padding:0 6px;border-radius:var(--r-pill);background:var(--line2);color:var(--fg);font-variant-numeric:tabular-nums}
-.lrbrow .lrblease{flex:0 0 auto;margin-left:auto;color:var(--mut);font-variant-numeric:tabular-nums}
-.lrbrow .lrbdirty{flex:0 0 auto;color:var(--warn)}
-.lrrows{margin-top:7px;display:flex;flex-direction:column;gap:6px}
-/* an author `display` beats the UA rule behind the `hidden` attribute, so the
-   collapsed closed-list rendered fully expanded until this line existed —
-   caught in the browser, not by any string assertion. */
-#lrsec [hidden]{display:none}
-.lrrow{padding:6px 8px;border-radius:8px;background:color-mix(in srgb,var(--fg) 4%,transparent);border-left:3px solid var(--line2);cursor:pointer}
-.lrrow.landed{border-left-color:var(--ok)}
-.lrrow.alarm{border-left-color:var(--bad);background:color-mix(in srgb,var(--bad) 8%,transparent)}
-.lrrow .lrl1,.lrrow .lrl2{display:flex;align-items:baseline;gap:8px}
-/* THE NAME IS THE HEADLINE AND IT NO LONGER COMPETES FOR WIDTH (task/333).
-   It was flex:1 1 auto beside three flex:0 0 auto siblings, so it was the only
-   element that could shrink and it shrank to 3px. On its own block it owns the
-   full card width, and it WRAPS instead of ellipsizing — a lane name is
-   [A-Za-z0-9._-]{1,64}, so the whole identifier is readable without an expand.
-   HOW MANY LINES THAT TAKES IS NOT PROMISED. This comment once promised
-   "at most two"; a measurement in Chrome showed 3-4, and that reading was
-   right. Line count depends on the name's break opportunities and the column
-   width, and there is no bound worth asserting: the CLAIM here is that the
-   name is never CLIPPED, which is the property the owner complained about and
-   the only one the tests pin. flex-wrap on .lrl1 keeps the badges from
-   re-creating the squeeze on a narrow card. */
-.lrrow .lrtitle{font-weight:700;color:var(--fg);line-height:1.3;margin-bottom:1px;
-  overflow-wrap:anywhere;word-break:break-word}
-.lrrow .lrl1{flex-wrap:wrap}
-/* .lrlane is DELETED, not kept "just in case": lrRowHTML is the only renderer
-   of this card (the board and the list share it), and it now emits .lrtitle.
-   A CSS rule nothing can match is the same stale-state defect as a dead code
-   path — the next reader would tune it and see nothing change. */
-.lrrow .lrstate{flex:0 0 auto;font-size:var(--f0);font-weight:700;letter-spacing:.04em;color:var(--mut)}
-.lrrow.landed .lrstate{color:var(--ok)}
-.lrrow.alarm .lrstate{color:var(--bad)}
-.lrrow .lrdwell{flex:0 0 auto;color:var(--mut);font-size:var(--f0);font-variant-numeric:tabular-nums}
-.lrrow .lrwarn{flex:0 0 auto;color:var(--bad)}
-.lrrow .lrl2{margin-top:2px;font-size:var(--f0);color:var(--mut);flex-wrap:wrap}
-.lrrow .lrsha{font-family:ui-monospace,monospace;color:var(--sub)}
-.lrrow .lrpol{color:var(--mut);letter-spacing:.04em}
-.lrrow .lrg{margin-left:auto;padding:0 6px;border-radius:var(--r-pill);font-size:var(--f0);background:var(--line2);color:var(--mut)}
-.lrrow .lrg.pend{color:var(--warn)}
-.lrrow .lrmark{margin-top:3px;font-size:var(--f0);word-break:break-word}
-.lrrow .lrmark.bad{color:var(--bad);font-weight:600}
-.lrrow .lrmark.warn{color:var(--warn);font-weight:600}
-.lrrow .lrmark.mut{color:var(--mut)}
-/* RELATED ROWS, NESTED (owner 2026-08-11: "if these are actually stacked
-   somehow then they should display as related, the list you print on the webUI
-   makes them look all separate"). The box is DELIBERATELY quiet — a hairline
-   rail and a caption, no fill and no border colour of its own — because it is
-   a statement about NAMES, not a state. Anything louder would compete with the
-   alarm edge on the cards inside it, which is the one thing on this card that
-   must never be outshouted. A lane holding one chain and one row is not boxed
-   at all and inherits nothing here. */
-.lrgrp{display:flex;flex-direction:column;gap:6px}
-.lrgrp.multi{padding:5px 0 5px 8px;border-left:2px solid var(--line2);border-radius:0 8px 8px 0;background:color-mix(in srgb,var(--fg) 2%,transparent)}
-.lrghead{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:var(--f0);color:var(--sub)}
-.lrghead .lrglane{font-weight:700;letter-spacing:.02em;overflow-wrap:anywhere;word-break:break-word;min-width:0}
-.lrghead .lrgn{margin-left:auto;flex:0 0 auto;padding:0 7px;border-radius:var(--r-pill);background:var(--line2);color:var(--fg);font-variant-numeric:tabular-nums}
-.lrgnote{font-size:var(--f0);color:var(--mut);word-break:break-word}
-/* the fold for earlier rounds of ONE chain. Same quiet treatment as the
-   closed-strip door: this is the process having worked, never an alarm. */
-.lrgmore{display:block;width:100%;padding:2px 0 0;border:0;background:none;color:var(--mut);font:inherit;font-size:var(--f0);text-align:left;cursor:pointer}
-.lrgmore:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.lrgearlier{display:flex;flex-direction:column;gap:6px;padding-left:8px;border-left:1px dashed var(--line2)}
-.lrx{margin-top:6px;padding-top:6px;border-top:1px solid var(--line);font-size:var(--f0);color:var(--mut)}
-.lrx div{margin-top:2px;word-break:break-word}
-.lrx b{color:var(--fg);font-weight:600}
-.lrx code{font-family:ui-monospace,monospace;color:var(--codefg);background:var(--code);border-radius:4px;padding:0 4px}
-.lrx .lrcant{margin-top:5px;color:var(--sub);font-style:italic}
-#lrsec .lrfoot{margin-top:7px;color:var(--mut);font-size:var(--f0)}
-#lrsec button.lrfoot{display:block;width:100%;padding:0;border:0;background:none;font:inherit;text-align:left;cursor:pointer}
-#lrsec button.lrfoot:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-/* the pipeline as a BOARD (the default view; owner 2026-08-03): one column per
-   state the rows ACTUALLY carry, pipeline order left→right, and the columns
-   scroll horizontally inside the card so the page itself never scrolls
-   sideways (the predecessor kanban's whole-column rule). The cards are the
-   SAME .lrrow element the list draws — alarm edge, marks, expand, sha-copy —
-   so the two views can never describe one row differently. */
-#lrsec .lrvtog{margin-left:auto;display:inline-flex;border:1px solid var(--line);border-radius:var(--r-pill);overflow:hidden;flex:0 0 auto}
-#lrsec .lrvtog~.lrhow{margin-left:0}
-#lrsec .lrvopt{padding:1px 9px;font-size:var(--f0);color:var(--mut);cursor:pointer;user-select:none}
-#lrsec .lrvopt.on{background:var(--line2);color:var(--fg);font-weight:700}
-.lrkb{margin-top:7px;display:flex;gap:8px;overflow-x:auto;align-items:flex-start;padding-bottom:4px}
-.lrkcol{flex:0 0 250px;width:250px;min-width:250px;background:color-mix(in srgb,var(--fg) 3%,transparent);border:1px solid var(--line);border-radius:10px;padding:6px}
-/* a column holding any alarmed card is itself edged loud — CONTRARY/STALLED
-   must not go quiet just because the wall turned into columns */
-.lrkcol.alarmed{border-color:color-mix(in srgb,var(--bad) 45%,transparent)}
-.lrkhead{display:flex;align-items:baseline;gap:6px;padding:1px 4px 6px;font-size:var(--f0);font-weight:700;letter-spacing:.06em;color:var(--sub)}
-.lrkhead .lrkstate{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-.lrkhead .lrkwarn{flex:0 0 auto;color:var(--bad)}
-.lrkhead .lrkn{margin-left:auto;flex:0 0 auto;padding:0 7px;border-radius:var(--r-pill);background:var(--line2);color:var(--fg);font-variant-numeric:tabular-nums}
-.lrkrows{display:flex;flex-direction:column;gap:6px}
-/* the door a discharged row left behind. A verified-superseded / confirmation
-   row is CLOSED, so it is no longer a card in this column — the chip carries
-   the tap to the ONE closed list at the foot of the card. Quiet on purpose:
-   this is the process having worked, never an alarm. */
-.lrkcol .lrkfoot{display:block;width:100%;margin-top:6px;padding:5px 0 0;border:0;border-top:1px solid var(--line);border-radius:0;background:none;color:var(--mut);font:inherit;font-size:var(--f0);text-align:left;cursor:pointer}
-.lrkcol .lrkfoot:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 /* ---------- readiness gauge (may forward work resume? `helm ready`) ---------- */
 #readysec{margin:16px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;font-size:var(--f1)}
@@ -371,6 +235,11 @@ header{padding:18px 0 4px}
 #posturesec .ppre{min-height:44px;padding:0 12px;border:1px dashed var(--line2);border-radius:var(--r);background:transparent;color:var(--sub);font-size:var(--f1);cursor:pointer}
 #posturesec .pnote{box-sizing:border-box;display:block;width:100%;margin:8px 0 0;padding:8px 10px;border:1px solid var(--line2);border-radius:var(--r);background:var(--elev);color:var(--fg);font:inherit;font-size:var(--f2);resize:vertical}
 #posturesec .pmsg{margin:6px 0 0;min-height:1.5em;font-size:var(--f1)}
+#posturesec .pmsg:empty{display:none}
+#posturesec .pfold{display:inline-block;margin:6px 16px 0 0;vertical-align:top}
+#posturesec .pfold[open]{display:block}
+#posturesec .pfold>summary{cursor:pointer;color:var(--sub);font-size:var(--f1)}
+#posturesec .pfold>summary:hover{color:var(--fg)}
 #posturesec .pmsg.pok{color:var(--ok)}
 #posturesec .pmsg.pbad{color:var(--bad)}
 

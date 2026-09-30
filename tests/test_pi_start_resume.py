@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from helm import pi
+from helm.seat import FAMILIES
 
 
 class PiLaunchLineTest(unittest.TestCase):
@@ -161,8 +162,10 @@ class PiCmdTest(unittest.TestCase):
         cmd, env = execvpe.call_args.args
         binary = cmd[0]
         self.assertEqual(binary, "/usr/bin/pi")
+        # the model is the family's catalogued one, never a typed id: the
+        # codex ruling moved it twice (gpt-6-astra -> gpt-6-sol -> gpt-6.1-sol)
         self.assertEqual(cmd, ["/usr/bin/pi", "--model",
-                               "helm-codex-2/gpt-6-astra",
+                               "helm-codex-2/%s" % FAMILIES["codex"]["model"],
                                "--print", "probe"])
         self.assertEqual(env["HELM_PI_PROXY_KEY"], "secret-key")
         self.assertEqual(env["HELM_AGENT_HARNESS"], "pi")

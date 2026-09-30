@@ -713,13 +713,17 @@ class RegistryDetailRouteTest(unittest.TestCase):
 # driving different renderers.
 BOARD_ROW_FNS = ("age", "ago", "light", "pkey", "lineageN", "lightset", "dmsg",
                  "detailBody", "detailPane", "lrDur", "lrAgo", "flagWhen",
-                 "boardSec", "boardSecState", "boardSecWord", "boardChip",
-                 "boardChips", "boardCount", "boardLanes", "boardLaneWord",
-                 "boardProgress",
-                 "boardRepoBadge", "boardRepos", "boardKanban",
-                 "boardKanbanHTML", "boardKanbanCount", "boardFoldLine",
-                 "boardWide", "boardWaits", "boardDetail",
-                 "boardRowHTML")
+                 "boardSec", "boardSecState", "boardSecWord",
+                 "boardTeam", "boardCount", "boardLanes", "boardLaneWord",
+                 "boardProgress", "boardRepoBadge", "boardRepos",
+                 "boardLand", "boardWide", "boardDetail", "projTab", "boardRowHTML",
+                 # the row's one count is its share of the Work page's read
+                 # (task/3643); with no read it says "reading…" on every row
+                 "wkProjectCount",
+                 # the row's team mark and the open row's team section
+                 # (task/3156); with no board reading both draw their empty
+                 # line, the same for every row these classes compare
+                 "teamMini", "teamParts", "teamSplit", "teamFold", "teamSection")
 
 
 class RegistryWireReadersTest(unittest.TestCase):
@@ -737,11 +741,13 @@ class RegistryWireReadersTest(unittest.TestCase):
     """
 
     EXTRACT = BOARD_ROW_FNS
-    CONSTS = ("LIGHTS", "FLAGCOL", "KANBAN_OF")
+    CONSTS = ("LIGHTS", "FLAGCOL", "PROJ_TABS")
     DECLS = ("DETAIL_HAVE", "DETAIL_ROUTE", "BOARD_DIRTY")
 
     SUPPORT = r"""
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+// the Work page's read (task/3643), not read: every row counts "reading…"
+let WORK = null;
 """
     # THE WHOLE-RECORD DOOR, DELIBERATELY. This class asks ONE question — do
     # `state` and `kind` have a reader — and the answer must not depend on
@@ -750,8 +756,8 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt
     # fields were dropped; the lazy-detail split gets its own class below.
     DRIVER = r"""
 DETAIL_ROUTE = null;
-const out = {full: boardRowHTML(FULL, null, true), trim: boardRowHTML(TRIM, null, true),
-             lossy: boardRowHTML(LOSSY, null, true)};
+const out = {full: boardRowHTML(FULL, null, true, "about"), trim: boardRowHTML(TRIM, null, true, "about"),
+             lossy: boardRowHTML(LOSSY, null, true, "about")};
 out.key_full = lightset(FULL).match(/data-key='([^']*)'/)[1];
 out.key_trim = lightset(TRIM).match(/data-key='([^']*)'/)[1];
 console.log(JSON.stringify(out));
@@ -878,18 +884,22 @@ class RegistryLazyDetailRuntimeTest(unittest.TestCase):
     """
 
     EXTRACT = BOARD_ROW_FNS
-    CONSTS = ("LIGHTS", "FLAGCOL", "KANBAN_OF")
+    CONSTS = ("LIGHTS", "FLAGCOL", "PROJ_TABS")
     DECLS = ("DETAIL_HAVE", "DETAIL_ROUTE", "BOARD_DIRTY")
 
     SUPPORT = r"""
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+// the Work page's read (task/3643), not read: every row counts "reading…"
+let WORK = null;
 """
     # ONE ROW, FIVE DRAWS. The first is the OLD door — whole records, no
     # `detail_route` — which is the pane the owner has today and therefore the
     # thing every later draw is measured against.
     DRIVER = r"""
 const out = {};
-const row = p => boardRowHTML(p, null, true);
+// AN OPEN PROJECT IS TABS (task/3445): the pane is its About tab and the
+// light setter its Team tab, so each state draws both
+const row = p => boardRowHTML(p, null, true, "about") + boardRowHTML(p, null, true, "team");
 DETAIL_ROUTE = null;
 out.before = row(FULL);
 out.before_lossy = row(LOSSY);

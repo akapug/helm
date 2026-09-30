@@ -1,6 +1,7 @@
 """One origin, one coordinate, and producers that keep every candidate."""
 
 import datetime
+import json
 import os
 import sys
 import unittest
@@ -593,3 +594,169 @@ class ClearanceAsksTheDialogNotTheScreenTest(unittest.TestCase):
         NOTHING is ever certified cleared, which is a different defect."""
         parsed = panetail.parse("the dialog is gone\n❯ a human typed this")
         self.assertEqual(panetail.modal_standing(parsed).state, panetail.ENDED)
+
+
+#: THE MEASURED SCREEN (task/3201): what `helm seat rehome --apply` read in a
+#: seat's pane after it typed /exit into a Claude Code 2.1.283 session holding
+#: background tasks — the inbox beacon Monitor every seat keeps armed is one.
+#: Private paths and names are replaced, the shape is byte-for-byte the
+#: pane's.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "fixtures", "exit-confirm-dialog-tail.txt"),
+          encoding="utf-8") as _fh:
+    EXIT_DIALOG = _fh.read()
+
+
+def exit_dialog_focused_on(n, screen=EXIT_DIALOG):
+    """The measured screen with Claude Code's pointer on option `n` instead of
+    option 1, where the dialog opens. `n` None removes the pointer."""
+    unfocused = screen.replace("   ❯ 1. ", "     1. ")
+    if n is None:
+        return unfocused
+    return unfocused.replace("     %d. " % n, "   ❯ %d. " % n)
+
+
+class ExitConfirmDialogTest(unittest.TestCase):
+    """task/3201 — Claude Code's exit-confirm dialog, recognised ONCE here.
+
+    The dialog is not a Yes/No run, so every shipped option reader calls it
+    UNQUALIFIED and the rehome read it as "no readable composer", three times,
+    and refused a pane its own /exit had already moved. The recogniser lives in
+    this module because a pane tail is normalized once and read by every
+    classifier; the verbs that type /exit consume its answer through one door.
+    """
+
+    def test_the_measured_screen_is_a_standing_dialog_focused_on_option_1(self):
+        got = panetail.exit_dialog(EXIT_DIALOG)
+        self.assertTrue(got.standing, got.why)
+        self.assertEqual(got.focus, (1, "Exit and stop tasks"))
+        self.assertEqual(got.focus, panetail.EXIT_CONFIRM)
+        self.assertEqual([n for n, _l in got.options], [1, 2, 3])
+        self.assertEqual(got.options[2], (3, "Stay"))
+        # KINDS ONLY: a task row's description is a shell command line, and a
+        # recogniser has no business carrying it into a refusal.
+        self.assertEqual(got.tasks, ["monitor", "shell", "shell", "shell"])
+
+    def test_the_items_reader_keeps_each_row_whole_for_the_exit_owner(self):
+        """task/3515: the verb that typed /exit records WHAT it stopped, so a
+        seat can re-arm it. A scheduled task's kind is two words, which the
+        one-word kind reader never matches; the items reader keeps it. A
+        screen that is not a standing dialog lists nothing."""
+        screen = EXIT_DIALOG.replace(
+            "   shell · W=/tmp/example/worktrees/lane-a…",
+            "   scheduled task · Every hour at :13 · helm example sweep")
+        got = panetail.exit_dialog_items(screen)
+        self.assertEqual(len(got), 4, got)
+        self.assertEqual(got[0], "monitor · example-seat inbox beacon")
+        self.assertIn("scheduled task · Every hour at :13 · helm example "
+                      "sweep", got)
+        self.assertEqual(panetail.exit_dialog_items(
+            screen + "\n❯ typed after the dialog"), [])
+
+    def test_the_pointer_on_stay_is_REPORTED_never_corrected(self):
+        """The recogniser says where the pointer IS. Whether a pointer that is
+        not on option 1 may be answered is the consumer's decision, and the
+        consumer refuses it."""
+        got = panetail.exit_dialog(exit_dialog_focused_on(3))
+        self.assertTrue(got.standing, got.why)
+        self.assertEqual(got.focus, (3, "Stay"))
+        self.assertNotEqual(got.focus, panetail.EXIT_CONFIRM)
+
+    def test_a_screen_with_no_pointer_has_NO_focus_not_a_default_one(self):
+        got = panetail.exit_dialog(exit_dialog_focused_on(None))
+        self.assertTrue(got.standing, got.why)
+        self.assertIsNone(got.focus)
+
+    def test_the_same_rows_QUOTED_above_a_live_composer_are_not_standing(self):
+        """A seat that reads this task prints the dialog as tool output, and
+        its composer and footer chrome render below it. The dialog owns the
+        screen only when its own footer is the bottom row.
+
+        EVERY ROW OF THE QUOTE MATCHES ON ITS OWN — header, choices, pointer
+        and footer, indented the way tool output continues — so the only thing
+        that can refuse it is what sits BELOW it."""
+        quoted = "\n".join(["● Read the task body:"] +
+                           ["     " + line for line in
+                            EXIT_DIALOG.splitlines()] +
+                           ["─" * 40, "❯", "─" * 40,
+                            "  opus-5 | ~/dev/example/repo"])
+        got = panetail.exit_dialog(quoted)
+        self.assertFalse(got.standing)
+        self.assertIn("bottom", got.why)
+        # CONTROL on the same producer: the unquoted rows DO stand.
+        self.assertTrue(panetail.exit_dialog(EXIT_DIALOG).standing)
+
+    def test_a_row_below_the_footer_means_the_dialog_is_gone(self):
+        """What the pane shows once the session exits: the dialog's frame is
+        scrollback and the shell's prompt is newer."""
+        got = panetail.exit_dialog(EXIT_DIALOG + "~/dev/example/repo $\n")
+        self.assertFalse(got.standing)
+        self.assertTrue(panetail.exit_dialog(EXIT_DIALOG).standing)
+
+    def test_a_yes_no_dialog_is_not_the_exit_dialog(self):
+        got = panetail.exit_dialog("Do you want to proceed?\n❯ 1. Yes\n"
+                                   "  2. No\nEnter to confirm · Esc to "
+                                   "cancel\n")
+        self.assertFalse(got.standing)
+        self.assertIn("header", got.why)
+        self.assertTrue(panetail.exit_dialog(EXIT_DIALOG).standing)
+
+
+#: THE LIVE READ (task/3201, measured on a throwaway pane): `orca terminal read
+#: --limit 200 --json`'s `result.terminal` while the exit-confirm dialog was
+#: up. It carries NO `draft` key, which is load-bearing: `OrcaAdapter.read`
+#: turns a string `draft` into a composer row appended BELOW the footer.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "fixtures", "exit-confirm-dialog-orca-read.json"),
+          encoding="utf-8") as _fh:
+    ORCA_READ = json.load(_fh)["terminal"]
+
+
+def _measured_orca(terminal):
+    """The SHIPPED `OrcaAdapter.read` over a transport that answers with
+    `terminal`, so the tail under test is the one helm's own read builds."""
+    from helm import harness
+
+    class _Orca(harness.OrcaAdapter):
+        def _run(self, args, timeout=60, env=None):
+            return {"terminal": dict(terminal)}
+
+    return _Orca()
+
+
+class ExitConfirmDialogLiveReadTest(unittest.TestCase):
+    """The recogniser against what orca actually returned, through helm's own
+    adapter read, not against a hand-built screen."""
+
+    def test_the_live_read_through_the_adapter_is_a_standing_dialog(self):  # noqa: VACUOUS_ASSERTION — the absent draft key and the absent composer ARE the measured facts; the same fixture's tail is asserted to stand, name its pointer and carry the title row, so the read produced a dialog
+        from helm import harness
+        self.assertNotIn("draft", ORCA_READ,
+                         "the fixture now carries a draft, so it no longer "
+                         "records the measured orca shape")
+        tail = _measured_orca(ORCA_READ).read("handle", limit=200)
+        got = panetail.exit_dialog(tail)
+        self.assertTrue(got.standing, got.why)
+        self.assertEqual(got.focus, panetail.EXIT_CONFIRM)
+        # The live screen draws a title and a rule the first fixture lacks;
+        # the one background task is the prompt's `sleep 900` shell.
+        self.assertIn("Background work is running", tail)
+        self.assertEqual(got.tasks, ["shell"])
+        # And it is the reason the turn verb read "no readable composer".
+        self.assertIsNone(harness._prompt_line(tail))
+
+    def test_a_draft_field_would_hide_the_dialog_and_the_answer_is_a_refusal(self):
+        """WHAT THE MEASUREMENT RULED OUT, PINNED. Had orca carried `draft`
+        while the dialog was up, `OrcaAdapter.read` would append a composer row
+        below the footer and the dialog would not read as standing — so the
+        exit door would press nothing and the rehome would refuse. That is the
+        refusing direction, and the day a producer starts sending the field,
+        this arm names what to re-measure."""
+        tail = _measured_orca(dict(ORCA_READ, draft="")).read("handle",
+                                                              limit=200)
+        self.assertEqual(tail.splitlines()[-1], "❯")
+        got = panetail.exit_dialog(tail)
+        self.assertFalse(got.standing)
+        self.assertIn("bottom", got.why)
+        # CONTROL: the same object without the field stands.
+        self.assertTrue(panetail.exit_dialog(
+            _measured_orca(ORCA_READ).read("handle", limit=200)).standing)

@@ -605,6 +605,7 @@ class TableTest(GcBase):
         owners = {p["stream"]: p["owner"] for p in gc.POLICIES
                   if p.get("owner")}
         self.assertEqual(owners, {
+            "chat-cursors": "seats-cursor",
             "chat-cursor-locks": "seats-cursor",
             "keepalive-log": "keepalive",
             "rotated-generations": "keepalive",
@@ -650,7 +651,8 @@ class TimerShipsTest(unittest.TestCase):
         cwd = line[0].split("=", 1)[1]
         self.assertNotIn("-wt/", cwd, "unit captured a lane worktree")
         self.assertTrue(os.path.isdir(cwd), cwd)
-        src = open(os.path.join(os.path.dirname(gc.__file__), "gc.py")).read()
+        with open(os.path.join(os.path.dirname(gc.__file__), "gc.py"), encoding="utf-8") as fh:
+            src = fh.read()
         self.assertNotIn(cwd, src, "operator path baked into the template")
 
     def test_interval_must_be_positive(self):

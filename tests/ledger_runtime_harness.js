@@ -153,4 +153,35 @@ const detail = {firstWrites, secondWrites, changedWrites, firstTexts, secondText
   firstDynamicWrites, secondDynamicWrites, firstPulse, secondPulse, firstState, secondState,
   degradedFirstWrites, degradedSecondWrites, degradedAgeBefore, degradedAgeAfter,
   panelWrites: Object.fromEntries(ids.map(id => [id, els[id].writes]))};
-console.log(JSON.stringify([{name: "unchanged_poll_keeps_rows_and_refreshes_ages", detail}]));
+// RULE 2 ON HISTORY: what every panel shows the owner, hovers included, off
+// the real renderers — a signed read, a transport in a fallback mode, and a
+// signed read that returned no entries (the mismatch sentence).
+render();
+const ownerText = {signed: ids.map(id => els[id].html).join("\n")};
+ledgerStrip({...signed, transport: {mode: "relay", label: "relay"}});
+ownerText.fallback = els.ledgerstrip.html;
+ledgerTurns([]);
+ownerText.mismatch = els.ledgerturns.html;
+// RULE 2 ON HISTORY'S TOP CARD (console walk 4, P1 2): a failure's reason,
+// cause and remediation are the agents' text and name helm verbs; the card
+// draws the owner's copy the server sends beside them, on every branch that
+// draws a failure.
+const fault = {profile: "seat-a", code: "identity_conflict",
+  reason: "identity conflict: Relaunch through `helm launch` (which sets both vars to the seat)",
+  cause: "not re-probeable — clears when seat-a next commits a signed turn, or on `helm chat transport ack --profile seat-a`",
+  remediation: "relaunch this seat through `helm launch`; if this profile was retired or renamed: helm chat transport ack --profile <name>",
+  owner_say: "OWNER-SAY seat-a posts unsigned; its lead starts it again",
+  first_failure: "first", last_failure: new Date(NOW - 12000).toISOString(), last_age_s: 12};
+ledgerStrip({...signed, transport: {...fault, mode: "degraded"}});
+ownerText.degraded = els.ledgerstrip.html;
+ledgerStrip({...signed, transport: {...fault, mode: "unknown"}});
+ownerText.unknown = els.ledgerstrip.html;
+ledgerStrip({offline: true, node: "http://ledger", transport: {...fault, mode: "degraded"}});
+ownerText.offline = els.ledgerstrip.html;
+ledgerStrip({...signed, transport: {mode: "signed",
+  scoped: ["ds4pro (dark since first): last signing attempt failed (identity_conflict: Relaunch through `helm launch`)"],
+  owner_scoped: ["OWNER-SCOPED ds4pro is not running now"]}});
+ownerText.scoped = els.ledgerstrip.html;
+
+console.log(JSON.stringify([{name: "unchanged_poll_keeps_rows_and_refreshes_ages", detail},
+                            {name: "owner_text", detail: ownerText}]));

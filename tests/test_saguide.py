@@ -706,9 +706,11 @@ class ReviewAndSiblingPhysicsTest(unittest.TestCase):
     RULES = {
         "sibling sweep": ("every other place asking the same question",
                           "callers", "named in your report"),
-        "reviewer patches": ("MECHANICAL", "own worktree",
-                             "exact reviewed tip", "unpushed",
-                             "returns that tip with its verdict"),
+        "mode selection": ("REVIEW FIX MODE",),
+        "PATCH cure": ("PATCH commits", "exact tip", "scratch clone",
+                       "unpushed"),
+        "MELD-DIFF cure": ("MELD-DIFF posts exact diff", "pair meld",
+                           "author to apply"),
         # The boundary is part of the rule: a reviewer told to patch
         # everything would patch a DESIGN finding, which belongs in a meld.
         "reviewer boundary": ("DESIGN", "read-only"),

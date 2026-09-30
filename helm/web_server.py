@@ -128,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
                 return                   # headers are out; do not corrupt them
             try:
                 self._json({"error": "the server failed before it answered; "
-                                     "see the helm web log"}, 500)
+                                     "see the web server's log"}, 500)
             except _CLIENT_GONE:
                 pass                     # they left while we were apologising
             except Exception:            # noqa: BLE001 — nothing left to try
@@ -489,11 +489,107 @@ def _prewarm(name, warm):
     return t
 
 
+def _cmd_web_shot(args):
+    """web shot --tree <dir> --view <hash> --label before|after [--widths
+    1440,420] [--out-dir <dir>] — capture before/after screenshots of a web
+    tree at a chosen view. Parses the subcommand and delegates all capture
+    to helm.webshot (which owns the server-start, port-pick, and chrome
+    contract). Stdlib only."""
+    from . import webshot
+
+    tree = None
+    view = None
+    label = None
+    widths = [1440, 420]
+    out_dir = None
+    args = list(args)
+    while args:
+        a = args.pop(0)
+        if a == "--tree" and args:
+            tree = args.pop(0)
+        elif a.startswith("--tree="):
+            tree = a.split("=", 1)[1]
+        elif a == "--view" and args:
+            view = args.pop(0)
+        elif a.startswith("--view="):
+            view = a.split("=", 1)[1]
+        elif a == "--label" and args:
+            label = args.pop(0)
+        elif a.startswith("--label="):
+            label = a.split("=", 1)[1]
+        elif a == "--widths" and args:
+            widths = [int(x) for x in args.pop(0).split(",") if x]
+        elif a.startswith("--widths="):
+            widths = [int(x) for x in a.split("=", 1)[1].split(",") if x]
+        elif a == "--out-dir" and args:
+            out_dir = args.pop(0)
+        elif a.startswith("--out-dir="):
+            out_dir = a.split("=", 1)[1]
+        elif a == "--help" or a.startswith("--help="):
+            help_text = (
+                "web shot --tree <dir> --view <hash> --label before|after "
+                "[--widths 1440,420] [--out-dir <dir>]\n"
+                "Capture before/after screenshots of a web tree at a chosen "
+                "view. The tree must contain a runnable `helm/` web server; a "
+                "fresh Chrome profile and a throwaway port (7600-7699) are "
+                "used, and before/after PNGs are written under --out-dir. "
+                "Refusal (exit 1) when the tree has no server, no chrome on "
+                "PATH, or a capture produces no real image.\n")
+            print(help_text)
+            return 0
+        else:
+            print("usage: web shot --tree <dir> --view <hash> --label "
+                  "before|after [--widths 1440,420] [--out-dir <dir>]",
+                  file=sys.stderr)
+            return 2
+
+    # Defaults and hard checks, per the capture contract.
+    if not tree:
+        print("web shot: --tree is required", file=sys.stderr)
+        return 1
+    if not view:
+        print("web shot: --view is required", file=sys.stderr)
+        return 1
+    if label is None:
+        label = "after"
+    elif label not in ("before", "after"):
+        print("web shot: --label must be 'before' or 'after'", file=sys.stderr)
+        return 1
+    if not out_dir:
+        out_dir = ".webshot"
+    if not widths or any(w <= 0 for w in widths):
+        print("web shot: --widths must be positive integers", file=sys.stderr)
+        return 1
+
+    # The capture is a real, blocking operation (server start + chrome).
+    # stdio is already the user's, so just call and return its exit code.
+    return webshot.run(tree=tree, view=view, label=label,
+                       widths=widths, out_dir=out_dir)
+
+
 def cmd_web(args):
-    """web [--port N] [--open] — serve the read-only web surface on localhost."""
+    """web [--port N] [--open] — serve the read-only web surface on localhost.
+
+    Also serves the `shot` subcommand: `web shot --tree <dir> --view <hash>
+    --label before|after [--widths 1440,420] [--out-dir <dir>]` captures
+    before/after screenshots of the tree's web view (see helm/webshot.py),
+    `web walk [--repo DIR]`, which prints the brief a fresh reader walks
+    the whole console by (see helm/console_walk.py), and `web unit
+    [--install]`, which prints or installs the helm-web unit's allocator
+    drop-in (see helm/webmem.py)."""
+    args = list(args or [])
+    # The `shot` subcommand is a separate capture path; it takes the arg tail
+    # after "shot" and delegates. Anything else is the normal server.
+    if args and args[0] in ("shot", "webshot"):
+        return _cmd_web_shot(args[1:])
+    if args and args[0] == "walk":
+        from . import console_walk
+        return console_walk.cmd_walk(args[1:])
+    if args and args[0] == "unit":
+        from . import webmem
+        return webmem.cmd_unit(args[1:])
     port = DEFAULT_PORT
     do_open = False
-    args = list(args or [])
     while args:
         a = args.pop(0)
         if a == "--open":
@@ -508,6 +604,16 @@ def cmd_web(args):
         if port is None:
             print("helm web: --port wants an integer", file=sys.stderr)
             return 2
+    # THE ALLOCATOR IS BOUNDED BEFORE ANY THREAD STARTS (task/3715): glibc's
+    # arenas follow concurrency, so the bound is set while this is still the
+    # only thread, and the environment that carries it into every re-exec is
+    # written before the follow thread could exec (helm/webmem.py).
+    from . import webmem
+    print(webmem.describe(webmem.apply()), file=sys.stderr)
+    # THE CODE THIS SERVER RUNS IS NAMED BEFORE IT BINDS: loading the resident
+    # takes the tree's digest (`stopfacts_resident.LOADED_POLICY`), so a land
+    # during the start is still a change the follow thread sees.
+    from . import stopfacts_resident
     try:
         srv = make_server(port)
     except OSError as e:
@@ -517,10 +623,13 @@ def cmd_web(args):
     _prewarm_configs()
     _prewarm_board()
     bound = srv.server_address[1]
-    # THE STOP GUARD'S FACTS ARE COMPUTED HERE AND READ BY EVERY SEAT'S STOP
-    # HOOK (helm/stopfacts_resident.py). Off the serve path like the prewarms:
-    # a daemon thread, and a failure costs stale stop facts, never a server.
-    from . import stopfacts_resident
+    # EVERY `helm web` FOLLOWS ITS CODE, on every port: a follow thread
+    # re-execs it onto the tree after a land (task/3132), so no board serves
+    # code older than its checkout. The console port also computes the stop
+    # guard's facts every seat's Stop hook reads, and that leg is the follow
+    # thread's follower (helm/stopfacts_resident.py). Off the serve path like
+    # the prewarms: daemon threads, and a failure costs stale code or stale
+    # stop facts, never a server.
     stopfacts_resident.start(port=bound)
     url = "http://%s:%d/" % (BIND, bound)
     print("helm web ⎈ %s  (Ctrl-C to stop)" % url)

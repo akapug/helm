@@ -19,7 +19,11 @@ Orca sync, cred.launch_sync: a home whose token is stale against Orca's managed
 copy of the same account is synced from it, and a home whose identity disagrees
 with Orca's execs nothing. A --home launch then ensures the home's `skills ->
 hub` link (skillsync.link_canonical: created when missing, a link elsewhere
-named and left alone — never a session that silently sees no skills). `--model` is carried onto claude's argv unless the
+named and left alone — never a session that silently sees no skills). Any
+launch onto a credhome other than the default then runs
+homes.reconcile_seat_home: the default home's user-scope MCP servers, the
+global instructions link, and the approval of the cwd's project `.mcp.json`
+servers (projectmcp). `--model` is carried onto claude's argv unless the
 passed-through args already name one; with no model at all, the launch SAYS
 which model the home's settings.json will pick instead of leaving it silent.
 
@@ -181,17 +185,18 @@ def build_env(base, seat, home_path=None, room=None, room_source=None,
 
 def home_note(home_path, asked):
     """The anti-drift line: `--home cto-example` names a DIRECTORY, and a past
-    `/login` may have put a different account inside it. Print who the home
-    ACTUALLY holds (cred.account_of reads the content) before exec — the
-    operator asked for an account, not a path. Never blocks the launch."""
+    `/login` may have put a different account inside it. Print which account
+    the home's metadata names (cred.account_of reads .claude.json), with the
+    token lineage beside it, before exec — the operator asked for an account,
+    not a path. Never blocks the launch."""
     from . import cred
     verdict, acct = cred.verdict_for(home_path)
     if verdict == "UNKNOWN":
         print("[helm launch] home %s: account unreadable (%s) — launching anyway"
               % (asked, acct["error"]), file=sys.stderr)
         return
-    print("[helm launch] home %s HOLDS %s%s"
-          % (asked, acct["email"],
+    print("[helm launch] home %s %s%s"
+          % (asked, cred.metadata_says(acct["email"], home_path),
              "  ** DRIFT: this dir's name promises another account; that account's "
              "home is %s (`helm cred list`) **" % homes.canonical_name(acct["email"])
              if verdict == "DRIFT" else ""), file=sys.stderr)
@@ -344,6 +349,16 @@ def cmd_launch(args):
         return 1
     if home_path:
         link_skills(home_path, opts["home"])
+    # THE SEAT-HOME RECONCILE (task/2698, task/2670, task/3089): a credhome
+    # the child runs on gets the default home's user-scope MCP servers, the
+    # global instructions link, and the approval of this cwd's project
+    # .mcp.json servers — without which Claude Code never runs them in a seat
+    # nobody is there to answer the prompt for. Not the default home: its
+    # approvals are the owner's own. Each line is a change or a fault; never
+    # fatal.
+    if not homes._is_default(config_home):
+        for line in homes.reconcile_seat_home(config_home, cwd):
+            print("[helm launch] %s" % line, file=sys.stderr)
     claude_args, model_note = carry_model(opts["model"], claude_args, config_home)
     if model_note:
         print(model_note, file=sys.stderr)

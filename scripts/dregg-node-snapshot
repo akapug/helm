@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# dregg node snapshot: copy the node's tmpfs working dir to disk while the node
+# is SIGSTOPped, so the copy is crash-consistent (not a half-written live redb,
+# which redb's repair cannot recover). Installed by scripts/node-migration.sh;
+# fired by the timer and on unit stop.
+#
+#   dregg-node-snapshot UNIT TMPFS_DIR DISK_DIR
+#
+#   UNIT      systemd --user unit name (e.g. dregg-cave.service)
+#   TMPFS_DIR the node's live working dir (the node.key guard lives here)
+#   DISK_DIR  the destination snapshot directory
+#
+# If TMPFS_DIR/node.key is missing, the node has nothing live to snapshot:
+# exit 0 and do nothing. If the unit is running, SIGSTOP it before the rsync
+# and SIGCONT it after (via a trap, so a failed rsync still resumes it). If the
+# unit is stopped (MainPID 0, e.g. this runs as an ExecStopPost), rsync with no
+# signals.
+#
+# THE COPY IS BOUNDED while the node is stopped: a stalled disk must not leave
+# it frozen, and nothing else would resume it (a oneshot service has no start
+# timeout by default, and a SIGKILL runs no trap). `timeout` ends the copy after
+# DREGG_SNAPSHOT_TIMEOUT seconds (default 120), the script fails, and the trap
+# resumes the node.
+set -euo pipefail
+
+UNIT="${1:-}"
+TMPFS_DIR="${2:-}"
+DISK_DIR="${3:-}"
+
+[ -n "$UNIT" ] && [ -n "$TMPFS_DIR" ] && [ -n "$DISK_DIR" ] || {
+  echo "usage: dregg-node-snapshot UNIT TMPFS_DIR DISK_DIR" >&2
+  exit 2
+}
+
+# nothing live to snapshot (the node has not been started into tmpfs)
+if [ ! -e "$TMPFS_DIR/node.key" ]; then
+  exit 0
+fi
+
+pid="$(systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null || echo 0)"
+# MainPID is a number when the unit is running; 0 (or empty / a wrapper) when
+# stopped. Guard on the shape, as chatnode.py does for peer MainPID.
+if ! [[ "$pid" =~ ^[0-9]+$ ]] || [ "$pid" -eq 0 ]; then
+  rsync -a --delete "$TMPFS_DIR/" "$DISK_DIR/"
+else
+  # freeze the node, guarantee a resume, then copy
+  trap 'kill -CONT "$pid" 2>/dev/null || true' EXIT
+  kill -STOP "$pid"
+  timeout "${DREGG_SNAPSHOT_TIMEOUT:-120}" rsync -a --delete "$TMPFS_DIR/" "$DISK_DIR/"
+  kill -CONT "$pid"
+  trap - EXIT
+fi
+
+sync

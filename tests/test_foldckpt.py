@@ -17,19 +17,21 @@ it read are what the checkpoint must re-verify.
 """
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import marshal
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import unittest
 from unittest import mock
 
-from helm import (dispatches, eventledger, foldckpt, landreq, pk, projscope,
-                  vcs)
+from helm import (dispatches, eventledger, foldckpt, gitfacts, landreq, pk,
+                  projscope, registry, vcs)
 import tests.test_lr_close as lrc
 
 _LIVE_SEATS_PATCH = None
@@ -46,8 +48,45 @@ def setUpModule():
 
 
 def tearDownModule():
+    global _LIVE_SEATS_PATCH
     if _LIVE_SEATS_PATCH is not None:
         _LIVE_SEATS_PATCH.stop()
+    # THE GLOBAL GOES BACK TO WHAT IMPORT LEFT, as tests.test_landreq's does
+    # (task/3039): a stopped patcher left here is module data the sliced
+    # gate's leak audit reads as a rebinding, and fails the run.
+    _LIVE_SEATS_PATCH = None
+
+
+def _plant(root, name, age):
+    """A stand-in checkpoint file named `name` whose mtime is `age` seconds
+    before now; the name of the file."""
+    path = os.path.join(root, name)
+    with open(path, "wb") as f:
+        f.write(b"x")
+    at = time.time_ns() - int(age * 1_000_000_000)
+    os.utime(path, ns=(at, at))
+    return name
+
+
+def _plant_valid(root, name, age, ledger):
+    """A checkpoint of nothing, at offset 0 of `ledger`, named `name`, used
+    `age` seconds ago: a file no universal key refuses (`_universal`), so a
+    save's sweep leaves it to the age and the bounds."""
+    payload = marshal.dumps({"out": {}, "verdicts": {}, "taken": {},
+                             "actors": {"validated": {}, "unresolved": {}}})
+    header = {"format": foldckpt.FORMAT, "v": foldckpt.VERSION,
+              "policy": "0" * 64, "epoch": "absent", "lens": None,
+              "ledger": {"path": os.path.abspath(ledger), "events": 0,
+                         "offset": 0,
+                         "sha256": hashlib.sha256(b"").hexdigest()},
+              "realpaths": {}, "git": {},
+              "payload": {"bytes": len(payload),
+                          "sha256": hashlib.sha256(payload).hexdigest()}}
+    with open(os.path.join(root, name), "wb") as f:
+        f.write(json.dumps(header).encode("utf-8") + b"\n" + payload)
+    at = time.time_ns() - int(age * 1_000_000_000)
+    os.utime(os.path.join(root, name), ns=(at, at))
+    return name
 
 
 class FoldCheckpointBase(lrc.CloseBase):
@@ -254,7 +293,8 @@ class EquivalenceArms(FoldCheckpointBase):
             self.assert_full(roads[:1])
             names = sorted(os.listdir(self.store_dir()))
             self.assertEqual(len(names), 2, names)
-            self.assertIn("f" * 16 + foldckpt.SUFFIX, names)
+            self.assertEqual(sum(n.startswith("f" * 16) for n in names),
+                             1, names)
             roads, _out = self.assert_equivalent()
             self.assert_restored(roads)
         # A PROCESS THAT CANNOT NAME ITS CODE touches no checkpoint at all.
@@ -701,6 +741,37 @@ class ARepositoryThatIsGoneTest(FoldCheckpointBase):
         self.assertTrue(os.listdir(self.store_dir()))
 
 
+class TheHomeRepositoryIsPartOfTheKey(FoldCheckpointBase):
+    """A fold may resolve a legacy row's repository to the RUNNING package's
+    (`dispatches.home_repo_id`) — the chain join a source-clean close's replay
+    runs does (task/3053). Two checkouts running identical code share a code
+    digest, so the key carries that answer and re-asks it on every read."""
+
+    session = ARepositoryThatIsGoneTest.session
+
+    def test_a_fold_that_read_the_home_repository_is_keyed_on_its_answer(self):
+        here = os.path.join(self.tmp, "here.git")
+        there = os.path.join(self.tmp, "there.git")
+        state = {"out": {}, "verdicts": {}, "taken": {},
+                 "actors": {"validated": {}, "unresolved": {}}}
+        session, data = self.session()
+        with mock.patch.object(dispatches, "home_repo_id",
+                               return_value=(here, None)):
+            with foldckpt.recording() as rec:
+                self.assertEqual(foldckpt.home_repo_id(), (here, None))
+            self.assertEqual(rec.homes, [here])
+            self.assertTrue(session.save(state, 1, len(data), None, rec))
+            self.assertIsNotNone(session.restore())
+        with mock.patch.object(dispatches, "home_repo_id",
+                               return_value=(there, None)):
+            self.assertIsNone(session.restore(),
+                              "a checkpoint keyed on one home repository was "
+                              "served to a helm that belongs to another")
+            # AND MEASURED AT THE SAVE: a fold whose home read no longer
+            # answers the same is not written.
+            self.assertFalse(session.save(state, 1, len(data), None, rec))
+
+
 class ThePlan(unittest.TestCase):
     """The allowlist of git questions, one call at a time."""
 
@@ -748,6 +819,36 @@ class ThePlan(unittest.TestCase):
         rec.taints.append("a compose-landed v3 close read gate receipts")
         with self.assertRaises(foldckpt.Unplannable):
             foldckpt.plan(rec)
+
+    def test_only_a_refusal_about_one_moment_of_the_fold_is_unsettled(self):  # noqa: VACUOUS_ASSERTION — each subTest's assertRaises IS the positive; the loops run fixed tuples
+        """`Unsettled` names the refusals the NEXT fold of the same bytes may
+        not meet: a git read that did not finish, or an input that moved
+        while this fold read it. Every other refusal is a property of what
+        the fold asks, so every fold that asks it again is refused again, and
+        a reader waiting for another try gains nothing (task/3082)."""
+        sha = "a" * 40
+        for calls in (
+                ((("cat-file", "-e", sha), -1, b""),),
+                ((("cat-file", "-e", sha + "^{commit}"), 0, b""),
+                 (("cat-file", "-e", sha + "^{commit}"), 128, b"")),
+                ((("rev-parse", "--is-shallow-repository"), 0, b"false\n"),
+                 (("rev-parse", "--is-shallow-repository"), 0, b"true\n"))):
+            with self.subTest(calls=calls):
+                with self.assertRaises(foldckpt.Unsettled):
+                    self.plan(*calls)
+        for args, rc, out in (
+                (("log", "--oneline"), 0, b""),
+                (("merge-base", "--is-ancestor", sha, "b" * 40), 128, b""),
+                (("rev-parse", "HEAD"), 0, sha.encode())):
+            with self.subTest(args=args, rc=rc):
+                with self.assertRaises(foldckpt.Unplannable) as caught:
+                    self.plan((args, rc, out))
+                self.assertNotIsInstance(caught.exception, foldckpt.Unsettled)
+        rec = foldckpt.Recorder()
+        rec.taints.append("a compose-landed v3 close read gate receipts")
+        with self.assertRaises(foldckpt.Unplannable) as caught:
+            foldckpt.plan(rec)
+        self.assertNotIsInstance(caught.exception, foldckpt.Unsettled)
 
 
 class ThePolicyAsksTheTreeAtMostOncePerSecond(unittest.TestCase):
@@ -1114,6 +1215,188 @@ class TrunkAdvanceArms(FoldCheckpointBase):
             self.assert_full(roads)
             self.assertEqual(out[row["id"]].get("close_reason"), "carried")
 
+    # -- the MEASURED trunk (task/3056) --------------------------------------
+    #
+    # A carried close is replayed against the trunk commit it RECORDED while
+    # that commit is still history of trunk, and against the head only once it
+    # is not. The arms below are the ruling's: a rewrite that drops the carry
+    # falls back to the head and reopens the row, a revert leaves it closed,
+    # the task/2863 reachability check still keeps a close on the fallback
+    # road, and an unreadable ancestry probe refuses by name. The content arm
+    # first, because it is the one the isolated copy of the live ledger found.
+
+    def content_carried(self):
+        """One FIX row CHAINED to a build row, so it has a work pair, closed
+        `carried` by the CONTENT witness (`carriage-replay`): trunk carries the
+        reviewed postimage under a rewritten sha, and nothing has edited it
+        since. The rows `carried()` builds are `--new-work` and have no pair,
+        so only the history witness can ever speak for them."""
+        base = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "-b", "content-lane")
+        reviewed = self.commit("R", path="feature")
+        self.git("checkout", "-q", self.main)
+        self.commit("d")                       # trunk moves: parents differ
+        self.git("cherry-pick", reviewed)
+        build = self.dispatch(ref=base, lane="lane/content-carried",
+                              kind="build")
+        row = dispatches.add(
+            "seat-b", "lane/content-carried-review", ref=reviewed,
+            repo=self.repo, kind="review", notify=False, new_work=False,
+            supersedes=build["id"])
+        _out, err = self.mark_verdict(row["id"], reviewed, "findings",
+                                      polarity="fix")
+        self.assertIsNone(err)
+        out, err = landreq.close(row["id"], "carried",
+                                 evidence="the lander closed nothing",
+                                 repo=self.repo)
+        self.assertIsNone(err)
+        self.assertIsNotNone(out)
+        event = self.close_event(row["id"])
+        self.assertEqual(event.get("close_proof_mode"),
+                         dispatches.CARRIAGE_REPLAY,
+                         "the fixture's close must be the CONTENT witness's, "
+                         "or the edit below proves nothing about it")
+        return row, event
+
+    def test_a_CONTENT_proven_close_whose_path_trunk_EDITS_stays_CLOSED(self):  # noqa: VACUOUS_ASSERTION — the unconditional positives are one call deep in `advance`: the byte-for-byte equality with a full replay on BOTH reads and the close_reason=='carried' precondition; the arm's own assertEqual pins both poles
+        """THE SHAPE THE PARITY RUN FOUND ON THE LIVE LEDGER (task/3056).
+
+        Eight of the thirty closes the content witness proved fold REFUSED
+        when replayed at the head, because trunk later edited a path they
+        touched: the merge now conflicts, the content witness goes silent,
+        the history witness answers instead with no base, and the replay arm
+        refuses the pair it recorded. So "a trunk edit leaves the answer
+        stable" was true only of history-proven closes. Replayed against the
+        trunk it was measured at, the close answers what it answered when it
+        was minted.
+
+        AND THE CHECKPOINT DISAGREED WITH THE REPLAY BEFORE THIS CURE. An
+        advance restores the checkpoint (task/2860), which kept `carried`,
+        while a full replay at the head refused it -- so `assert_equivalent`
+        inside `advance` is what goes red on the head-replay code."""
+        row, _event = self.content_carried()
+        was, answer, roads = self.advance(row, lambda: self.commit(
+            "trunk edits the carried line's file", path="feature"))
+        self.assertEqual((was, answer), ("carried", "carried"))
+        self.assert_restored(roads)
+
+    def test_a_REWRITE_that_drops_the_measured_trunk_REPLAYS_AT_HEAD_and_REOPENS(self):  # noqa: VACUOUS_ASSERTION — the assertIsNone is bracketed by the close_reason=='carried' precondition in `advance` and by the falsifier on the SAME world, which forces the ancestry answer True and reads 'carried' back
+        """RULING ARM 1: trunk rewritten so the commit the close was measured
+        against is no longer an ancestor, and the carry dropped with it. The
+        recorded trunk has lost its licence, the close is re-derived at the
+        head exactly as before this lane, and the head does not carry it."""
+        row = self.carried()
+        measured = self.close_event(row["id"])["closing_trunk_sha"]
+        seen = []
+        real = dispatches._measured_trunk_is_history
+
+        def spy(gitdir, sha, ref):
+            got = real(gitdir, sha, ref)
+            seen.append((sha, got))
+            return got
+
+        def rewrite():
+            self.git("reset", "--hard", "-q", "HEAD~1")
+            self.commit("a different history", path="divergent")
+
+        with mock.patch.object(dispatches, "_measured_trunk_is_history", spy):
+            was, answer, roads = self.advance(row, rewrite)
+        self.assert_full(roads)
+        self.assertIn((measured, False), seen,
+                      "the fold never asked whether the measured trunk is "
+                      "still history, or was told it is")
+        self.assertIsNone(answer, "trunk was rewritten past the carry and the "
+                                  "close still reads carried")
+        self.assertEqual(was, "carried")
+        # THE FALSIFIER ON THE SAME WORLD: a recorded replay WITHOUT its
+        # licence -- the ancestry answer forced True -- keeps the row closed.
+        # So the None above is the ancestry probe's doing, not a world in
+        # which no replay could affirm.
+        with mock.patch.object(dispatches, "_measured_trunk_is_history",
+                               lambda *_a: True):
+            _full, out = self.full_replay()
+        self.assertEqual(out[row["id"]].get("close_reason"), "carried")
+
+    def test_a_REVERT_keeps_the_measured_trunk_as_history_and_the_row_CLOSED(self):  # noqa: VACUOUS_ASSERTION — the one inequality is a fixture must-hit (the revert really moved trunk off the measured commit); the arm's observables are positive: close_reason=='carried' off the full replay, and the probe's (measured, True) read off the same folds
+        """RULING ARM 2: a revert is a descendant, so the measured trunk is
+        still history of it and the close is replayed where it was proven."""
+        row = self.carried()
+        measured = self.close_event(row["id"])["closing_trunk_sha"]
+        self.settle()
+        self.assertEqual(
+            dispatches.snapshot()[0][row["id"]].get("close_reason"), "carried",
+            "the world under test never had a carried close")
+        self.git("revert", "--no-edit", "HEAD")
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), measured)
+        seen = []
+        real = dispatches._measured_trunk_is_history
+
+        def spy(gitdir, sha, ref):
+            got = real(gitdir, sha, ref)
+            seen.append((sha, got))
+            return got
+
+        # ONLY THE READS AFTER THE REVERT ARE SPIED, so the ancestry answer
+        # below belongs to the reverted trunk and not to the settle before it.
+        with mock.patch.object(dispatches, "_measured_trunk_is_history", spy):
+            roads, out = self.assert_equivalent()
+        self.assertEqual(out[row["id"]].get("close_reason"), "carried")
+        self.assertIn((measured, True), seen,
+                      "the revert's full replay never asked the measured "
+                      "trunk's ancestry, or was told it is gone")
+        self.assert_restored(roads)
+
+    def test_the_TIP_reaching_a_REWRITTEN_trunk_is_KEPT_by_the_2863_check(self):  # noqa: VACUOUS_ASSERTION — the unconditional positives are one call deep in `advance`: the byte-for-byte equality with a full replay on BOTH reads and the close_reason=='carried' precondition; the arm's own assertEqual pins both poles
+        """RULING ARM 3, on the one road where task/2863 is still reached: the
+        measured trunk is gone (the rewrite), so the close falls back to the
+        head, where the lane was merged whole -- the tip is history, the
+        history witness has an empty range, and only the reachability check
+        can keep the row closed."""
+        row = self.carried()
+
+        def rewrite_then_merge():
+            self.git("reset", "--hard", "-q", "HEAD~1")
+            self.git("merge", "--no-ff", "-q", "-m",
+                     "the rewritten trunk merges the lane whole", "side")
+
+        was, answer, roads = self.advance(row, rewrite_then_merge)
+        self.assert_full(roads)
+        self.assertEqual((was, answer), ("carried", "carried"),
+                         "a close whose tip trunk now reaches was un-closed "
+                         "on the fallback road -- task/2863")
+
+    def test_a_PRUNED_measured_trunk_falls_back_to_the_head_where_2863_KEEPS_it(self):  # noqa: VACUOUS_ASSERTION — the assertIsNone is the must-differ control on the SAME world and the SAME observable (close_reason off a full replay), bracketed by the ('carried', 'carried') pair `advance` reads off that world with the absence read as an answer
+        """THE READ'S FAILING INPUT (task/3056 round 2): the arm above, then
+        the old history expired and pruned. The measured commit is then not
+        in the repository at all, so git cannot ask about its ancestry
+        (`rev-parse --verify` answers 1, `merge-base --is-ancestor` 128). A
+        complete repository does not hold it, so it is not history: the close
+        falls back to the head exactly as it does without the prune, and the
+        reachability check keeps it. Before this the gate read the absence as
+        an unreadable probe and refused the close on every fold."""
+        row = self.carried()
+        measured = self.close_event(row["id"])["closing_trunk_sha"]
+
+        def rewrite_merge_prune():
+            self.git("reset", "--hard", "-q", "HEAD~1")
+            self.git("merge", "--no-ff", "-q", "-m",
+                     "the rewritten trunk merges the lane whole", "side")
+            self.prune(measured)
+
+        was, answer, roads = self.advance(row, rewrite_merge_prune)
+        self.assert_full(roads)
+        self.assertEqual((was, answer), ("carried", "carried"),
+                         "a close whose measured trunk was pruned from a "
+                         "complete repository was not re-derived at the head")
+        # THE MUST-DIFFER CONTROL ON THE SAME WORLD: read the absence as
+        # unreadable again, and the same fold refuses the close.
+        with mock.patch.object(dispatches, "_absent_from_a_complete_odb",
+                               lambda *_a: None):
+            _full, out = self.full_replay()
+        self.assertIsNone(out[row["id"]].get("close_reason"),
+                          "the row stayed closed without the absence being "
+                          "read, so the answer above is not its doing")
+
     # -- the shapes the CLOSE-TIME guard keeps out of the fold entirely -----
 
     def test_a_SQUASH_LANDED_tip_cannot_be_CLOSED_carried_at_all(self):
@@ -1227,6 +1510,183 @@ class AncestryGateArms(FoldCheckpointBase):
     a good row every time git failed to run.
     """
 
+    def reached_after_a_rewrite(self):
+        """Trunk drops the commit a `carried()` close was measured against and
+        then merges the lane whole.
+
+        THE ONE ROAD THAT STILL REACHES THE REACHABILITY RUNG. Since task/3056
+        a close is replayed against the trunk it was measured at while that is
+        still history, and there it answers what it answered when minted -- so
+        a plain merge of the lane no longer silences it. Only a close sent back
+        to the head can meet an empty `git cherry` range, and a rewrite past the
+        measured commit is what sends it there."""
+        measured = self.git("rev-parse", "HEAD")
+        self.git("reset", "--hard", "-q", "HEAD~1")
+        self.git("merge", "--no-ff", "-q", "-m",
+                 "the rewritten trunk merges the lane whole", "side")
+        self.assertNotEqual(
+            subprocess.run(["git", "-C", self.repo, "merge-base",
+                            "--is-ancestor", measured, "HEAD"]).returncode, 0,
+            "the measured trunk is still history, so the head is not the road")
+        return measured
+
+    def test_an_UNREADABLE_measured_trunk_probe_REFUSES_by_name(self):
+        """task/3056, THE RULING'S SAME LAW FOR THE NEW PROBE. Whether the
+        measured trunk is still history picks which trunk the close is replayed
+        against, so an unreadable answer must pick neither: guessing "yes"
+        keeps a close whose trunk may be gone, guessing "no" re-derives it at a
+        head the question was never about."""
+        from helm import rowworld
+        row = self.carried()
+        event = self.close_event(row["id"])
+        measured = event["closing_trunk_sha"]
+        before_close = [e for e in self.ledger_events()
+                        if not (e.get("id") == row["id"]
+                                and e.get("event") == "close")]
+        pre, _verdicts, _taken = dispatches._fold(before_close)
+        standing = pre[row["id"]]
+        # POSITIVE CONTROL, same event, same row, working probe.
+        self.assertIsNone(dispatches._close_event_error(
+            event, standing, current=pre))
+        real = rowworld._git
+
+        def broken(gd, *argv):
+            if argv[:2] == ("merge-base", "--is-ancestor") \
+                    and argv[2] == measured:
+                return 129, ""
+            return real(gd, *argv)
+
+        with mock.patch.object(rowworld, "_git", broken):
+            why = dispatches._close_event_error(event, standing, current=pre)
+        self.assertTrue(why, "an unreadable ancestry probe picked a trunk for "
+                             "the close instead of refusing it")
+        self.assertIn(measured[:12], why)
+        self.assertIn("is no longer readable", why)
+        self.assertIn("not a finding", why)
+        self.assertNotIn("no longer affirms", why)
+        # THE BREAK LIFTED, the same call affirms again.
+        self.assertIsNone(dispatches._close_event_error(
+            event, standing, current=pre))
+
+    def test_an_ABSENT_object_is_an_answer_only_in_a_COMPLETE_repository(self):  # noqa: VACUOUS_ASSERTION — every assertIsNone is bracketed on the SAME call by assertIs(True) for the pruned commit in the complete repository, re-asserted after each break is lifted
+        """`_absent_from_a_complete_odb`, one break at a time. A commit the
+        rewrite and the prune removed is absent from a complete repository
+        (True). Each way a repository is incomplete -- a partial clone, a
+        promisor remote, a shallow boundary -- means the object may be history
+        git never fetched, and then the answer is None. An object the
+        repository holds is never absent."""
+        self.carried()
+        measured = self.reached_after_a_rewrite()
+        self.prune(measured)
+        gitdir = self.gitdir()
+        absent = dispatches._absent_from_a_complete_odb
+        self.assertIs(absent(gitdir, measured), True,
+                      "the control: a pruned commit in a complete repository")
+        self.assertIsNone(absent(gitdir, self.git("rev-parse", "HEAD")),
+                          "an object the repository holds read as absent")
+        for key, value in (("extensions.partialClone", "origin"),
+                           ("remote.origin.promisor", "true")):
+            with self.subTest(key=key):
+                self.git("config", key, value)
+                self.assertIsNone(absent(gitdir, measured),
+                                  "%s is set, and a missing object still read "
+                                  "as absent" % key)
+                self.git("config", "--unset", key)
+                self.assertIs(absent(gitdir, measured), True,
+                              "the break lifted, the same call answers again")
+        shallow = os.path.join(gitdir, "shallow")
+        with open(shallow, "w", encoding="utf-8") as f:
+            f.write(self.git("rev-parse", "HEAD~1") + "\n")
+        try:
+            self.assertEqual(self.git("rev-parse", "--is-shallow-repository"),
+                             "true", "the fixture's boundary did not take")
+            self.assertIsNone(absent(gitdir, measured),
+                              "a shallow repository read a missing object as "
+                              "absent")
+        finally:
+            os.unlink(shallow)
+        self.assertIs(absent(gitdir, measured), True)
+
+    def test_a_PRUNED_measured_trunk_in_an_INCOMPLETE_repository_REFUSES_by_name(self):  # noqa: VACUOUS_ASSERTION — the two assertIsNone calls are the complete-repository controls on the same event and row; the refusal between them is asserted by value (the measured id, 'is no longer readable', 'not a finding') on the same _close_event_error call
+        """The pruned world, where a complete repository re-derives the close
+        at the head and the reachability check keeps it. Mark a promisor
+        remote and the same close is refused: the measured commit may be
+        history this repository never fetched. The sentence says the answer
+        is no longer readable -- git DID run, so it must not say the probe
+        did not."""
+        row = self.carried()
+        event = self.close_event(row["id"])
+        measured = event["closing_trunk_sha"]
+        before_close = [e for e in self.ledger_events()
+                        if not (e.get("id") == row["id"]
+                                and e.get("event") == "close")]
+        pre, _verdicts, _taken = dispatches._fold(before_close)
+        standing = pre[row["id"]]
+        self.assertEqual(self.reached_after_a_rewrite(), measured)
+        self.prune(measured)
+        # POSITIVE CONTROL, same event, same row, complete repository.
+        self.assertIsNone(dispatches._close_event_error(
+            event, standing, current=pre))
+        self.git("config", "remote.origin.promisor", "true")
+        try:
+            why = dispatches._close_event_error(event, standing, current=pre)
+        finally:
+            self.git("config", "--unset", "remote.origin.promisor")
+        self.assertTrue(why, "a promisor repository read a missing measured "
+                             "trunk as not history and picked the head")
+        self.assertIn(measured[:12], why)
+        self.assertIn("is no longer readable", why)
+        self.assertIn("not a finding", why)
+        self.assertNotIn("did not run", why)
+        # THE BREAK LIFTED, the same call affirms again.
+        self.assertIsNone(dispatches._close_event_error(
+            event, standing, current=pre))
+
+    def test_ONE_ancestry_probe_per_distinct_measured_trunk_per_fold(self):  # noqa: VACUOUS_ASSERTION — the inequality is a fixture must-hit (two distinct measured trunks) and `unavailable` shares its producer with `rows`, whose three close reasons are asserted by value; the probe list is asserted EQUAL to a two-element set
+        """task/3056: the live ledger's 509 carried closes name 8 measured
+        trunks, so a fold asks 8 ancestry questions, not 509. Three closes on
+        two measured trunks here: two probes, one per trunk, in one cold fold."""
+        from helm import rowworld
+        first = self.verdict_row(polarity="fix", lane="lane/probe-a")
+        second = self.verdict_row(polarity="fix", lane="lane/probe-b")
+        self.git("cherry-pick", "--no-commit", self.side)
+        self.git("commit", "-qm", "carry the side work")
+        for row in (first, second):
+            out, err = landreq.close(row["id"], "carried",
+                                     evidence="the lander closed nothing",
+                                     repo=self.repo)
+            self.assertIsNone(err)
+            self.assertEqual(out["close_reason"], "carried")
+        self.commit("trunk moves on", path="elsewhere")
+        third = self.verdict_row(polarity="fix", lane="lane/probe-c")
+        out, err = landreq.close(third["id"], "carried",
+                                 evidence="the lander closed nothing",
+                                 repo=self.repo)
+        self.assertIsNone(err)
+        self.assertEqual(out["close_reason"], "carried")
+        measured = [self.close_event(row["id"])["closing_trunk_sha"]
+                    for row in (first, second, third)]
+        self.assertEqual(measured[0], measured[1])
+        self.assertNotEqual(measured[0], measured[2])
+        asked, real = [], rowworld._git
+
+        def spy(gd, *argv):
+            if argv[:2] == ("merge-base", "--is-ancestor") \
+                    and argv[2] in measured:
+                asked.append(argv[2])
+            return real(gd, *argv)
+
+        shutil.rmtree(self.store_dir(), ignore_errors=True)
+        with mock.patch.object(rowworld, "_git", spy):
+            rows, unavailable = dispatches.snapshot()
+        self.assertIsNone(unavailable)
+        self.assertEqual([rows[r["id"]].get("close_reason")
+                          for r in (first, second, third)],
+                         ["carried"] * 3)
+        self.assertEqual(sorted(asked), sorted({measured[0], measured[2]}),
+                         "one cold fold must ask each measured trunk's "
+                         "ancestry exactly once")
+
     def test_the_gate_answers_TRUE_FALSE_and_NONE_for_three_states(self):  # noqa: VACUOUS_ASSERTION — the two assertIsNone calls sit between unconditional positives on the SAME call: assertIs(True) for a tip on trunk and assertIs(False) for one that is not, plus a closing control that re-affirms True once the broken probe is lifted
         """One arm, three states, because a tri-state whose third value is
         never exercised is a two-state with a comment."""
@@ -1268,8 +1728,7 @@ class AncestryGateArms(FoldCheckpointBase):
         gate asks about has to be the one `carriage_proof` would measure.
         """
         row = self.carried()
-        self.git("merge", "--no-ff", "-q", "-m",
-                 "trunk merges the lane whole", "side")
+        self.reached_after_a_rewrite()
         before_close = [e for e in self.ledger_events()
                         if not (e.get("id") == row["id"]
                                 and e.get("event") == "close")]
@@ -1303,8 +1762,7 @@ class AncestryGateArms(FoldCheckpointBase):
         """
         from helm import rowworld
         row = self.carried()
-        self.git("merge", "--no-ff", "-q", "-m",
-                 "trunk merges the lane whole", "side")
+        self.reached_after_a_rewrite()
         rows, _ = dispatches.snapshot()
         self.assertEqual(rows[row["id"]].get("close_reason"), "carried",
                          "the tip never became trunk history, so the probe "
@@ -1332,8 +1790,12 @@ class AncestryGateArms(FoldCheckpointBase):
             event, standing, current=pre))
         real = rowworld._git
 
+        # ONLY THE TIP'S PROBE BREAKS. The measured trunk's ancestry is asked
+        # through the same verb first (task/3056) and must still answer, or the
+        # refusal below would be that probe's and not this rung's.
         def broken(gd, *argv):
-            if argv[:2] == ("merge-base", "--is-ancestor"):
+            if argv[:2] == ("merge-base", "--is-ancestor") \
+                    and argv[2] == event["carried_tip"]:
                 return 129, ""
             return real(gd, *argv)
 
@@ -1341,7 +1803,9 @@ class AncestryGateArms(FoldCheckpointBase):
             why = dispatches._close_event_error(event, standing, current=pre)
         self.assertTrue(why, "an unreadable probe AFFIRMED the close, so the "
                              "gate authorized on a question it never asked")
-        self.assertIn("probe did not run", why)
+        self.assertIn("has since become history", why,
+                      "the refusal is not the reachability rung's")
+        self.assertIn("is no longer readable", why)
         self.assertIn("not a finding", why)
         # AND IT IS NOT THE OLDER SENTENCE. The whole requirement is that an
         # unreadable probe is distinguishable from a measured absence; if
@@ -1432,7 +1896,7 @@ class TheStoreIsAddressedPerLedger(FoldCheckpointBase):
         """THE CONTROL ON THE AXIS ITSELF: per-ledger must not have become
         per-anything-else. One ledger keeps ONE file per code version, so a
         second save under the same code replaces it rather than accumulating,
-        and `KEEP` still bounds what one ledger leaves behind."""
+        and `MAX_FILES` still bounds what one ledger leaves behind."""
         a = dispatches.ledger_path()
         first = self.save(a, b'{"id":"a"}\n')
         second = self.save(a, b'{"id":"a"}\n{"id":"a2"}\n')
@@ -1912,10 +2376,112 @@ class TwoWritersContendForOneLock(FoldCheckpointBase):
         self.assertEqual(self.banked(), total)
 
 
-class CredentialConfigIsNotGitsView(FoldCheckpointBase):
-    """An Orca seat and a plain seat share one checkpoint file per code
-    version, so a fingerprint that differs between them makes each judge the
-    other's checkpoint stale and replace it with a cold fold of its own."""
+class TheScopeDoorsRecordEveryQuestion(FoldCheckpointBase):
+    """task/3056: a memo hit and a batched answer are RECORDED like a spawn.
+
+    The fold checkpoint keys on every git question the fold consumed, seen at
+    `vcs.observed`. This lane answers three kinds of question without their
+    own process — a `merge-tree` or `diff --raw` already asked in the scope,
+    and an existence or resolution question the scope's one `cat-file
+    --batch-check` resolves — so the arm below asks the carried proof the way
+    a board read does, a plain fold and then a lensed one IN ONE SCOPE, each
+    under its own recorder, and holds the recorded questions and the plan
+    built from them against the same two folds with both doors shut.
+
+    THE FIXTURE PAYS A MERGE-TREE. `landed_then_trunk_edits(False)` is the one
+    shape here where the cheap postimage witness refuses and the replay
+    affirms, so the proof reaches every door this lane touches: `cat-file -e`,
+    `rev-parse <id>^{tree}`, `diff --raw` and `merge-tree --write-tree`."""
+
+    def rows(self):
+        base, tip = self.landed_then_trunk_edits(False)
+        return {"b": {"id": "b", "kind": "build", "tip": base},
+                "r": {"id": "r", "kind": "review", "reviewed_tip": tip,
+                      "chain_root": "b"}}
+
+    def board(self, rows):
+        """(answers, recorders, merge-tree processes) for the carried proof
+        asked by TWO recorded folds in ONE scope."""
+        answers, recs, merges, real = [], [], [], subprocess.Popen
+
+        def spy(argv, *a, **kw):
+            if "merge-tree" in [str(x) for x in argv]:
+                merges.append(argv)
+            return real(argv, *a, **kw)
+
+        with mock.patch.object(vcs.subprocess, "Popen", side_effect=spy), \
+                projscope.scope():
+            for _fold in ("plain", "lensed"):
+                with foldckpt.recording() as rec:
+                    answers.append(dispatches.carriage_proof(
+                        rows["r"], rows, {}, self.gitdir(),
+                        "refs/heads/" + self.main))
+                recs.append(rec)
+        return answers, recs, merges
+
+    def test_the_recorded_question_set_is_what_the_spawns_recorded(self):
+        rows = self.rows()
+        answers, recs, merges = self.board(rows)
+        # THE SAVING: the second fold's merge-tree is the first fold's answer.
+        self.assertEqual(len(merges), 1, "the lensed fold re-ran the merge")
+        # THE THIRD DOOR IS SHUT TOO: since task/3056 the durable table keeps
+        # the merge's raw answer, so a second board would be served it there.
+        with mock.patch.object(vcs, "_batched", return_value=None), \
+                mock.patch.object(vcs, "_scope_form", return_value=False), \
+                mock.patch.object(gitfacts, "lookup", return_value=None):
+            shut, shut_recs, shut_merges = self.board(rows)
+        # THE CONTROL: with every door shut the same two folds pay two merges,
+        # so the one above is the memo and not a fixture that merged once.
+        self.assertEqual(len(shut_merges), 2)
+        self.assertEqual([a[0] for a in answers], [True, True],
+                         "the fixture's carried proof must affirm")
+        self.assertEqual(answers, shut)
+        # THE PROPERTY: every question, in order, with its exit code and its
+        # stdout, recorded identically by both folds either way — so the plan
+        # and the re-check the checkpoint builds from them cannot move.
+        self.assertEqual([r.calls for r in recs], [r.calls for r in shut_recs])
+        lensed = [c[1] for c in recs[1].calls]
+        self.assertIn("merge-tree", [argv[0] for argv in lensed],
+                      "a memo hit must reach the recorder like a spawn")
+        self.assertIn(("rev-parse", rows["b"]["tip"] + "^{tree}"), lensed)
+        self.assertEqual(foldckpt.plan(recs[1]), foldckpt.plan(shut_recs[1]))
+        self.assertTrue(foldckpt.plan(recs[1]), "the plan is empty")
+
+    def test_a_merge_the_durable_table_answers_is_recorded_like_a_spawn(self):
+        """task/3056: `gitfacts` keeps the replay's raw `merge-tree` answer
+        under the view git's merge machinery reads, so a LATER scope -- the
+        next cold fold -- is answered without a process. The fold checkpoint
+        must still see that question and its answer, or it would key a close
+        on reads that never included the merge that decided it. And the reads
+        that take the view must NOT reach the recorder: they are not questions
+        the fold consumed, and the plan cannot re-verify them."""
+        root = os.path.join(self.tmp, "gitfacts")
+        with mock.patch.object(gitfacts, "_root", lambda: root):
+            rows = self.rows()
+            first, first_recs, paid = self.board(rows)
+            again, again_recs, merges = self.board(rows)
+        # THE UNCONDITIONAL CONTROL: the first scope really paid its merge.
+        self.assertEqual(len(paid), 1)
+        self.assertEqual([a[0] for a in first], [True, True],
+                         "the fixture's carried proof must affirm")
+        self.assertEqual(merges, [],
+                         "a second scope re-ran a merge the table holds")
+        self.assertEqual(again, first)
+        self.assertEqual([r.calls for r in again_recs],
+                         [r.calls for r in first_recs],
+                         "an answer from the table was recorded differently "
+                         "from the spawn it stands for")
+        asked = {c[1][0] for r in again_recs for c in r.calls}
+        self.assertIn("merge-tree", asked)
+        self.assertNotIn("config", asked,
+                         "the view's own reads reached the fold's recorder")
+        self.assertEqual(foldckpt.plan(again_recs[0]),
+                         foldckpt.plan(first_recs[0]))
+
+
+class TheKeyIsTheFold(FoldCheckpointBase):
+    """task/3043: the checkpoint key names only what can change the fold, and
+    every miss says which key missed."""
 
     #: What Orca exports into every seat it launches (read off a live seat's
     #: environment): two credential entries, which `git config --list` reports.
@@ -1925,15 +2491,23 @@ class CredentialConfigIsNotGitsView(FoldCheckpointBase):
             "GIT_CONFIG_KEY_1": "credential.guiPrompt",
             "GIT_CONFIG_VALUE_1": "false"}
 
-    def test_an_orca_seat_restores_a_plain_seats_checkpoint(self):  # noqa: VACUOUS_ASSERTION — the fingerprints are asserted equal and the Orca read to restore, then a CONTROL config set the same way is asserted to change the fingerprint
-        self.carried()
-        self.settle()
+    def repository(self):
         cwds = sorted(self.header()["git"])
         self.assertTrue(cwds, "the fold read no git, so no fingerprint is "
                               "under test")
-        plain, _facts = foldckpt.fingerprint(cwds[0], {})
+        return cwds[0]
+
+    def reasons(self, at="restore"):
+        return [m["reason"] for m in foldckpt.misses(dispatches.ledger_path())
+                if m.get("at") == at]
+
+    def test_an_orca_seat_restores_a_plain_seats_checkpoint(self):  # noqa: VACUOUS_ASSERTION — the fingerprints are asserted equal and the Orca read to restore, then a CONTROL config set the same way is asserted to change the fingerprint
+        self.carried()
+        self.settle()
+        cwd = self.repository()
+        plain, _facts = foldckpt.fingerprint(cwd, {})
         with mock.patch.dict(os.environ, self.ORCA):
-            orca, _facts = foldckpt.fingerprint(cwds[0], {})
+            orca, _facts = foldckpt.fingerprint(cwd, {})
             roads, _out = self.assert_equivalent()
         self.assertEqual(orca, plain, "credential config changed git's view")
         self.assert_restored(roads)
@@ -1942,4 +2516,1117 @@ class CredentialConfigIsNotGitsView(FoldCheckpointBase):
         with mock.patch.dict(os.environ, {
                 "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "merge.renames",
                 "GIT_CONFIG_VALUE_0": "false"}):
-            self.assertNotEqual(foldckpt.fingerprint(cwds[0], {})[0], plain)
+            self.assertNotEqual(foldckpt.fingerprint(cwd, {})[0], plain)
+
+    def test_every_miss_is_named_in_the_log_the_swallows_and_the_hook_span(self):  # noqa: VACUOUS_ASSERTION — every reason is asserted by its text in the miss log, the breadcrumb by its type and the hook report by its exact row
+        from helm import hooklatency, record
+        self.carried()
+        self.settle()
+        cwd = self.repository()
+        self.git("config", "merge.renames", "false")
+        with hooklatency.event_scope("standalone"):
+            roads, _out = self.assert_equivalent()
+        self.assert_full(roads)
+        stale = "git's view of %s changed" % cwd
+        self.assertIn(stale, self.reasons())
+        # THE REPOSITORY'S OWN CONFIG MOVED, which every reader sees: the
+        # fingerprints name the file, so the save wrote a new one beside the
+        # old, and replaced nothing.
+        self.assertEqual(self.reasons("replace"), [])
+        self.assertEqual(len(os.listdir(self.store_dir())), 2)
+        self.assertIn({"reason": stale, "events": 1},
+                      hooklatency.report()["fold_misses"])
+        crumbs = [c for c in record.swallows(500)
+                  if c.get("exc") == "CheckpointMiss"]
+        self.assertTrue(any(stale in c.get("msg", "") for c in crumbs),
+                        crumbs)
+        # THE ORDINARY ABSENCES are named in the log and kept out of the
+        # swallow ledger, which expected states would flood.
+        shutil.rmtree(self.store_dir())
+        self.read()
+        self.assertEqual(self.reasons()[-1], foldckpt.NO_CHECKPOINT)
+        other = os.path.join(self.store_dir(), "0" * 16 + foldckpt.SUFFIX)
+        os.replace(self.store(), other)
+        self.read()
+        self.assertEqual(self.reasons()[-1], foldckpt.WRITTEN_BY_OTHER_CODE)
+        ordinary = [c for c in record.swallows(500)
+                    if c.get("exc") == "CheckpointMiss"
+                    and ("no checkpoint" in c.get("msg", "")
+                         or "other code" in c.get("msg", ""))]
+        self.assertEqual(ordinary, [])
+
+    def test_a_lensed_burst_under_the_bound_removes_nothing(self):  # noqa: VACUOUS_ASSERTION — every planted file is asserted present by exact name
+        """Eviction is per file and by last use: a burst of lensed saves
+        under MAX_FILES removes no file, the plain fold's oldest included."""
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        key = "e" * 16
+        plain = _plant(root, foldckpt.checkpoint_name("a" * 64, None, key),
+                       100)                     # the oldest file of all
+        lensed = [_plant(root, foldckpt.checkpoint_name(
+            ("%x" % n) * 64, "a lens", key), 50 - n) for n in range(9)]
+        foldckpt.Session._prune(os.path.join(root, lensed[-1]))
+        self.assertEqual(set(os.listdir(root)), {plain} | set(lensed),
+                         "a lensed burst under MAX_FILES removed a file")
+
+    def test_a_read_that_saves_nothing_writes_nothing(self):  # noqa: VACUOUS_ASSERTION — the miss is asserted HELD by its exact reason before the unchanged listing, so the silence on disk is the rule and not a miss that never happened
+        """`helm doctor` over a home with no ledger reads the fold and must
+        leave the tree as it found it: the miss is held for a save that
+        never comes, and nothing is written."""
+        root = os.path.join(self.tmp, "quiet")
+        os.makedirs(root)
+        ledger = os.path.join(root, "dispatches.jsonl")
+        session = foldckpt.begin(ledger, dispatches.epoch_path(), b"")
+        self.assertIsNotNone(session)
+        before = sorted(os.listdir(root))
+        self.assertIsNone(session.restore())
+        self.assertEqual(session.why, foldckpt.NO_CHECKPOINT)
+        self.assertEqual(sorted(os.listdir(root)), before,
+                         "a read that saved nothing wrote to the tree")
+
+    def test_doctor_names_the_misses_and_warns_on_a_replacement(self):  # noqa: VACUOUS_ASSERTION — each doctor row is asserted to its exact level and to the reason text it must carry
+        from helm import doctor
+        self.assertIn("check_fold_checkpoint", doctor.CHECKS)
+        self.assertEqual(doctor.check_fold_checkpoint(),
+                         [("OK", "fold checkpoint: no miss recorded")])
+        self.carried()
+        self.settle()
+        # A SHARED KEY GOES STALE: the ledger prefix is rewritten in place,
+        # in one timestamp digit, so the fold reads the same repositories,
+        # its save lands on the same file, replaces it and says why.
+        path = dispatches.ledger_path()
+        with open(path, "rb") as f:
+            data = f.read()
+        at = data.index(b'"ts":"') + len(b'"ts":"') + 18    # a seconds digit
+        digit = b"1" if data[at:at + 1] != b"1" else b"2"
+        with open(path, "wb") as f:
+            f.write(data[:at] + digit + data[at + 1:])
+        self.read()
+        rows = doctor.check_fold_checkpoint()
+        self.assertEqual(len(rows), 1, rows)
+        level, text = rows[0]
+        self.assertEqual(level, "WARN", text)
+        self.assertIn("the ledger prefix was rewritten", text)
+        self.assertIn("replacement", text)
+
+    def test_the_files_beside_the_store_are_classified(self):  # noqa: VACUOUS_ASSERTION — both files are asserted present on disk first, so an empty squatter list means the registry names them and not that nothing was written
+        """The save lock and the miss log live beside the store, and the
+        projection survey must name them: an undeclared file under the home
+        is a squatter `helm doctor` warns about on every run."""
+        self.carried()
+        self.settle()
+        self.git("config", "merge.renames", "false")
+        self.read()
+        ledger = dispatches.ledger_path()
+        self.assertTrue(os.path.exists(foldckpt.save_lock_path(ledger)))
+        self.assertTrue(os.path.exists(foldckpt.misses_path(ledger)))
+        _rows, squat = registry.projection_survey()
+        self.assertEqual([f for f in squat["home"] if "ledger-fold" in f],
+                         [])
+
+
+
+class SurfaceReads(FoldCheckpointBase):
+    """One read by one reader surface, told by its road and its misses.
+    Holds no arm of its own."""
+
+    ORCA = TheKeyIsTheFold.ORCA
+    LANE = "c" * 64
+
+    @contextlib.contextmanager
+    def surface(self, name, code=None):
+        with contextlib.ExitStack() as stack:
+            if name == "orca":
+                stack.enter_context(mock.patch.dict(os.environ, self.ORCA))
+            if code or name == "lane":
+                stack.enter_context(mock.patch.object(
+                    foldckpt, "policy", return_value=code or self.LANE))
+            yield
+
+    def fresh(self):
+        shutil.rmtree(self.store_dir(), ignore_errors=True)
+        path = foldckpt.misses_path(dispatches.ledger_path())
+        for p in (path, path + ".1"):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def files(self):
+        return sorted(os.listdir(self.store_dir())) \
+            if os.path.isdir(self.store_dir()) else []
+
+    def first(self, name, code=None):
+        """(the first fold's road, the restore misses) of one read."""
+        path = foldckpt.misses_path(dispatches.ledger_path())
+        if os.path.exists(path):
+            os.remove(path)
+        with self.surface(name, code):
+            got, roads = self.read()
+        want, _out = self.full_replay()
+        self.assertEqual(got, want, "a checkpointed answer differs from a "
+                                    "cold fold")
+        count = len(self.ledger_events())
+        road = "restored" if roads[0] == (count, 0) else \
+            "full" if roads[0] == (0, count) else roads[0]
+        return road, [m["reason"] for m in foldckpt.misses(
+            dispatches.ledger_path()) if m.get("at") == "restore"]
+
+    def state_of(self, rid):
+        return dispatches.snapshot()[0][rid]
+
+
+class TheSurfaceByStateMatrix(SurfaceReads):
+    """task/3043 (with task/3048): every reader SURFACE against every STATE
+    its checkpoint can be in. One arm per cell; the cell's road (restored or
+    a full replay) and the reason a miss names are both asserted.
+
+      surfaces  plain seat; Orca seat (GIT_CONFIG_COUNT credential entries);
+                a lane worktree on other code (another `policy()`).
+      states    warm; written by the other seat kind; after a pull touching a
+                module outside the fold; after a pull touching a fold module;
+                unreadable.
+
+    A PULL IS A NEW `policy()`, WHICHEVER MODULE IT TOUCHED. The key digests
+    every module of the package, because no narrower set is provably the
+    fold's: the fold module's own import closure (`wiring.graph`) is 352 of
+    355 modules and every one of the last 92 lands touched it. So both pull
+    cells answer the same way, a named miss and the old code's checkpoint
+    left for the readers still on that code."""
+
+    def test_every_surface_against_every_state(self):  # noqa: VACUOUS_ASSERTION — every cell asserts its road and its miss list to exact values, and each read is compared byte for byte with a cold fold
+        self.carried()
+        other = {"plain": "orca", "orca": "plain", "lane": "plain"}
+        for name in ("plain", "orca", "lane"):
+            with self.subTest(surface=name, state="warm"):
+                self.fresh()
+                self.first(name)
+                self.assertEqual(self.first(name), ("restored", []))
+            with self.subTest(surface=name, state="written by the other kind"):
+                self.fresh()
+                self.first(other[name])
+                written = self.files()
+                if name == "lane":
+                    self.assertEqual(self.first(name), (
+                        "full", [foldckpt.WRITTEN_BY_OTHER_CODE]))
+                    self.assertTrue(set(written) <= set(self.files()),
+                                    "the lane evicted the hub's checkpoint")
+                else:
+                    self.assertEqual(self.first(name), ("restored", []))
+            for state, code in (("a pull outside the fold", "d" * 64),
+                                ("a pull inside the fold", "e" * 64)):
+                with self.subTest(surface=name, state=state):
+                    self.fresh()
+                    self.first(name)
+                    before = self.files()
+                    self.assertEqual(self.first(name, code=code), (
+                        "full", [foldckpt.WRITTEN_BY_OTHER_CODE]))
+                    self.assertTrue(set(before) <= set(self.files()),
+                                    "the old code's checkpoint was evicted")
+            with self.subTest(surface=name, state="unreadable"):
+                self.fresh()
+                self.first(name)
+                for f in self.files():
+                    with open(os.path.join(self.store_dir(), f), "wb") as fh:
+                        fh.write(b"\x00 not a checkpoint")
+                road, missed = self.first(name)
+                self.assertEqual(road, "full")
+                self.assertEqual(len(missed), 1, missed)
+                self.assertTrue(missed[0].startswith(
+                    "the checkpoint could not be judged"), missed)
+                self.assertEqual(self.first(name), ("restored", []))
+
+    def test_incremental_equivalence(self):  # noqa: VACUOUS_ASSERTION — the tail read is asserted restored over exactly the appended events and equal to a cold fold
+        """A restored fold advanced over the tail equals a cold fold, over a
+        tail that holds every kind of event a writer appends here."""
+        self.carried()
+        rows = [self.dispatch(lane="lane/tail-%d" % n) for n in range(2)]
+        self.settle()
+        seq = {r["id"]: self.state_of(r["id"])["seq"] for r in rows}
+        a, b = rows[0]["id"], rows[1]["id"]
+        ts = dispatches.pk.now_ts()
+        for event in (
+                {"v": 3, "event": "delivered", "seq": seq[a] + 1, "id": a,
+                 "ts": ts, "delivery_ref": "tail-ref"},
+                {"v": 3, "event": "hold", "seq": seq[b] + 1, "id": b,
+                 "ts": ts, "reason": "tail hold", "owner_gated": False},
+                {"v": 3, "event": "release", "seq": seq[b] + 2, "id": b,
+                 "ts": ts, "reason": "tail hold"},
+                {"v": 3, "event": "cancel", "seq": seq[a] + 2, "id": a,
+                 "ts": ts, "reason": "tail cancel"}):
+            self.append(event)
+        roads, out = self.assert_equivalent()
+        self.assert_restored(roads[:1], tail=4)
+        self.assertEqual(out[a]["status"], "cancelled")
+        self.assertEqual(out[b]["status"], "open")
+
+
+
+class TheFingerprintsNameTheFile(SurfaceReads):
+    """task/3043: ONE DEFINITION NAMES THE FILE AND JUDGES IT.
+
+    The checkpoint's file is keyed on the fingerprints the checkpoint
+    records, taken in the env it records (the one the fold's own git ran
+    under). So seats git answers identically share one file, and seats git
+    answers differently never can: two such seats sharing a file could use
+    neither's checkpoint, the second replaying on every read while the
+    ledger stood still and then, once its fold was longer, starving the
+    first. An env name git never sees (a selector the recorded env removes)
+    and an entry the fingerprint drops (credential.*) name no file."""
+
+    X = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "helm.view",
+         "GIT_CONFIG_VALUE_0": "x"}
+    Y = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "helm.view",
+         "GIT_CONFIG_VALUE_0": "y"}
+
+    def seat(self, view, code=None):
+        """(road, restore misses) of one read by a seat in `view`."""
+        with mock.patch.dict(os.environ, view):
+            return self.first("plain", code)
+
+    def plant(self, name, age):
+        """A checkpoint of nothing for this class's ledger, named `name`,
+        used `age` seconds ago, which no universal key refuses."""
+        os.makedirs(self.store_dir(), exist_ok=True)
+        return _plant_valid(self.store_dir(), name, age,
+                            dispatches.ledger_path())
+
+    @staticmethod
+    def code(n):
+        """A code digest whose 16-hex file-name prefix is its own."""
+        return ("%x" % n) * 64
+
+    def tail(self):
+        """One raw event on a row of this ledger: a tail no writer folded."""
+        seq = self.state_of(self.rid)["seq"]
+        self.append({"v": 3, "event": "hold", "seq": seq + 1, "id": self.rid,
+                     "ts": dispatches.pk.now_ts(), "reason": "tail hold",
+                     "owner_gated": False})
+
+    def setUp(self):
+        super().setUp()
+        self.carried()
+        self.rid = self.dispatch(lane="lane/view-tail")["id"]
+        self.fresh()
+
+    def other_repository(self, name, abbrev):
+        """A second repository whose `git config --list` differs."""
+        path = os.path.join(self.tmp, name)
+        subprocess.run(["git", "init", "-q", path], check=True)
+        subprocess.run(["git", "-C", path, "config", "core.abbrev",
+                        str(abbrev)], check=True)
+        return os.path.join(path, ".git")
+
+    def config_file(self, name, text):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def report(self, cwd, env):
+        """WHAT GIT ANSWERS the fingerprint's questions with in `cwd`, asked
+        directly of git under the ambient environment overlaid with `env`
+        (None removes), config entries in a family the fingerprint drops left
+        out: the reference the file name is held to."""
+        child = dict(os.environ)
+        for k, v in env.items():
+            if v is None:
+                child.pop(k, None)
+            else:
+                child[k] = v
+        out = []
+        for args in (["rev-parse", "--is-shallow-repository",
+                      "--is-inside-work-tree", "--git-common-dir"],
+                     ["config", "--list", "-z"],
+                     ["for-each-ref", "--format=%(refname) %(objectname)",
+                      "refs/replace/"]):
+            done = subprocess.run(["git", "-C", cwd] + args, env=child,
+                                  capture_output=True)
+            body = done.stdout
+            if args[0] == "config":
+                body = b"\0".join(e for e in body.split(b"\0") if e
+                                   and not e.lower().startswith(
+                                       foldckpt._CONFIG_DROPPED))
+            out.append((done.returncode, body))
+        return out
+
+    def test_two_views_alternating_on_a_still_ledger_each_restore(self):  # noqa: VACUOUS_ASSERTION — every read asserts its road and its miss list to exact values, and each is compared byte for byte with a cold fold
+        self.assertEqual(self.seat(self.X)[0], "full")
+        self.assertEqual(self.seat(self.Y)[0], "full")
+        for _round in range(3):
+            self.assertEqual(self.seat(self.X), ("restored", []))
+            self.assertEqual(self.seat(self.Y), ("restored", []))
+
+    def test_neither_view_starves_the_other_after_an_event(self):  # noqa: VACUOUS_ASSERTION — every read asserts its road to the exact (base, events) pair, and each is compared byte for byte with a cold fold
+        self.seat(self.X)
+        self.seat(self.Y)
+        self.tail()
+        count = len(self.ledger_events())
+        self.assertEqual(self.seat(self.X), ((count - 1, 1), []))
+        self.assertEqual(self.seat(self.Y), ((count - 1, 1), []))
+        self.assertEqual(self.seat(self.X), ("restored", []))
+        self.assertEqual(self.seat(self.Y), ("restored", []))
+
+    def test_a_view_change_between_reads_lands_in_the_new_views_own_file(self):  # noqa: VACUOUS_ASSERTION — the old view's file is asserted byte-identical and both views restore after, so the second file is the new view's and not a replacement
+        self.seat(self.X)
+        (kept,) = self.files()
+        with open(os.path.join(self.store_dir(), kept), "rb") as f:
+            before = f.read()
+        road, missed = self.seat(self.Y)
+        self.assertEqual(road, "full")
+        self.assertEqual(len(self.files()), 2, self.files())
+        with open(os.path.join(self.store_dir(), kept), "rb") as f:
+            self.assertEqual(f.read(), before, "the new view replaced the "
+                                               "old view's checkpoint")
+        self.assertEqual(len(missed), 1, missed)
+        self.assertTrue(missed[0].startswith("git's view of"), missed)
+        self.assertEqual(self.seat(self.Y), ("restored", []))
+        self.assertEqual(self.seat(self.X), ("restored", []))
+
+    def test_an_orca_and_a_merge_config_seat_against_a_plain_one(self):  # noqa: VACUOUS_ASSERTION — the Orca read is asserted RESTORED on the plain file; the merge-config read to write a second file, leave the first byte-identical and replace nothing, and both to restore after
+        """Ambient env as a seat really carries it, in the GIT_CONFIG_COUNT
+        spelling: credential entries only (Orca's) read the plain seat's
+        checkpoint; a merge.renames entry is another fingerprint, so it
+        keeps a file of its own and neither seat replaces the other's."""
+        merge = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "merge.renames",
+                 "GIT_CONFIG_VALUE_0": "false"}
+        self.assertEqual(self.seat({})[0], "full")
+        (plain,) = self.files()
+        self.assertEqual(self.seat(TheKeyIsTheFold.ORCA), ("restored", []))
+        self.assertEqual(self.files(), [plain])
+        with open(os.path.join(self.store_dir(), plain), "rb") as f:
+            before = f.read()
+        road, missed = self.seat(merge)
+        self.assertEqual(road, "full")
+        self.assertTrue(missed and missed[0].startswith("git's view of"),
+                        missed)
+        self.assertEqual(len(self.files()), 2, self.files())
+        with open(os.path.join(self.store_dir(), plain), "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual([m for m in foldckpt.misses(dispatches.ledger_path())
+                          if m.get("at") == "replace"], [])
+        self.assertEqual(self.seat(merge), ("restored", []))
+        self.assertEqual(self.seat({}), ("restored", []))
+        self.assertEqual(self.seat(TheKeyIsTheFold.ORCA), ("restored", []))
+
+    def test_a_credential_only_config_parameter_is_the_same_file(self):  # noqa: VACUOUS_ASSERTION — the credential read is asserted RESTORED on the one file, and the CONTROL parameter on the same channel is asserted to write a second
+        self.assertEqual(self.seat({})[0], "full")
+        (one,) = self.files()
+        self.assertEqual(self.seat({"GIT_CONFIG_PARAMETERS":
+                                    "'credential.helper=store'"}),
+                         ("restored", []))
+        self.assertEqual(self.files(), [one])
+        self.assertEqual(self.seat({"GIT_CONFIG_PARAMETERS":
+                                    "'helm.view=z'"})[0], "full")
+        self.assertEqual(len(self.files()), 2, self.files())
+
+    def test_an_ambient_git_dir_is_the_same_file_and_the_same_answer(self):  # noqa: VACUOUS_ASSERTION — both GIT_DIR reads are asserted RESTORED on the one file and their rows equal to the unset read's, including the carried close
+        a = self.other_repository("a", 7)
+        b = self.other_repository("b", 12)
+        # The two answer git differently, so a key that saw GIT_DIR would
+        # split on them.
+        self.assertNotEqual(self.report(a, {}), self.report(b, {}))
+        want, _out = self.full_replay()
+        self.assertEqual(self.seat({})[0], "full")
+        (one,) = self.files()
+        for gitdir in (a, b):
+            with mock.patch.dict(os.environ, {"GIT_DIR": gitdir}):
+                got, roads = self.read()
+            self.assertEqual(got["rows"], want["rows"], gitdir)
+            count = len(self.ledger_events())
+            self.assertEqual(roads[0], (count, 0), gitdir)
+            self.assertEqual(self.files(), [one], gitdir)
+        self.assertIn("'close_reason': 'carried'", want["rows"])
+
+    def test_every_selector_moves_the_file_exactly_when_git_answers_differently(self):  # noqa: VACUOUS_ASSERTION — each cell compares the file set with git's own answers under the same env, both ways, and a selector the recorded env removes also keeps the fold's rows
+        """For every selector vcs names (`vcs._REPO_SELECTION_ENV` and the
+        fold's own `dispatches._GIT_SELECTION_ENV`), each of three values:
+        the file changes exactly when git's answers to the fingerprint's
+        questions, asked in the env the checkpoint records, change."""
+        want, _out = self.full_replay()
+        self.first("plain")
+        base = self.files()
+        with open(os.path.join(self.store_dir(), base[0]), "rb") as f:
+            (cwd, entry), = json.loads(f.readline())["git"].items()
+        recorded = dict(entry["env"])
+        answers = self.report(cwd, recorded)
+        values = (self.other_repository("elsewhere", 12),
+                  self.config_file("helm.cfg", "[helm]\n\tview = z\n"),
+                  self.config_file("cred.cfg",
+                                   "[credential]\n\thelper = store\n"))
+        names = sorted(set(vcs._REPO_SELECTION_ENV)
+                       | set(dispatches._GIT_SELECTION_ENV))
+        self.assertIn("GIT_DIR", names)
+        self.assertIn("GIT_CONFIG_GLOBAL", names)
+        moved = []
+        for name in names:
+            for value in values:
+                with self.subTest(selector=name, value=value):
+                    with mock.patch.dict(os.environ, {name: value}):
+                        same = self.report(cwd, recorded) == answers
+                        self.fresh()
+                        got, _roads = self.read()
+                    files = self.files()
+                    self.assertEqual(files == base, same, files)
+                    if name in recorded and recorded[name] is None:
+                        self.assertTrue(same, "the recorded env removes "
+                                              "%s and git still saw it" % name)
+                        self.assertEqual(got["rows"], want["rows"])
+                    moved.append(not same)
+        # BOTH POLES WERE REACHED, so the equality above was not one-sided.
+        self.assertIn(True, moved)
+        self.assertIn(False, moved)
+
+    def test_a_restore_takes_one_fingerprint_per_repository(self):
+        """Choosing the file costs no git the judgement did not already
+        spend: each restore fingerprints each recorded repository once."""
+        self.first("plain")
+        with open(os.path.join(self.store_dir(), self.files()[0]), "rb") as f:
+            cwds = json.loads(f.readline())["git"]
+        self.assertTrue(cwds)
+        with mock.patch.object(foldckpt, "fingerprint",
+                               wraps=foldckpt.fingerprint) as fp, \
+                mock.patch.object(foldckpt.Session, "restore", autospec=True,
+                                  side_effect=foldckpt.Session.restore) as rs:
+            _got, roads = self.read()
+        self.assertEqual(roads[0], (len(self.ledger_events()), 0))
+        self.assertTrue(rs.call_count)
+        self.assertEqual(fp.call_count, rs.call_count * len(cwds))
+
+    def test_a_zero_and_a_multi_repository_fold_each_restore(self):  # noqa: VACUOUS_ASSERTION — every fold is asserted to write its file, restore it, and the two-repository fold to miss by the repository whose config moved
+        """The key digests every repository a fold recorded, and a fold may
+        record none or several."""
+        ledger = os.path.join(os.path.dirname(dispatches.ledger_path()),
+                              "fold-arm.jsonl")
+        data = b'{"id":"a"}\n'
+        state = {"out": {}, "verdicts": {}, "taken": {},
+                 "actors": {"validated": {}, "unresolved": {}}}
+        second = os.path.join(self.tmp, "second")
+        subprocess.run(["git", "init", "-q", second], check=True)
+        subprocess.run(["git", "-C", second, "-c", "user.name=t", "-c",
+                        "user.email=t@t", "commit", "-q", "--allow-empty",
+                        "-m", "one"], check=True)
+        repos = {self.gitdir(): self.git("rev-parse", "HEAD"),
+                 os.path.realpath(os.path.join(second, ".git")):
+                     self.git("rev-parse", "HEAD", cwd=second)}
+        zero = None
+        for chosen in ({}, repos):
+            with self.subTest(repositories=len(chosen)):
+                rec = foldckpt.Recorder()
+                rec.calls.extend(
+                    (cwd, ("cat-file", "-e", sha + "^{commit}"), (), False,
+                     0, b"") for cwd, sha in chosen.items())
+                writer = foldckpt.begin(ledger, dispatches.epoch_path(), data)
+                self.assertTrue(writer.save(dict(state), 1, writer.end, None,
+                                            rec))
+                self.assertEqual(sorted(writer.git), sorted(chosen))
+                self.assertTrue(os.path.isfile(writer.store()))
+                reader = foldckpt.begin(ledger, dispatches.epoch_path(), data)
+                got = reader.restore()
+                self.assertIsNotNone(got, reader.why)
+                self.assertEqual(sorted(got[0]["git"]), sorted(chosen))
+                self.assertEqual(reader.store(), writer.store())
+                zero = zero if chosen else writer.store()
+        # The two-repository save subsumed the zero-repository one, which
+        # nobody the new file does not serve could still read.
+        self.assertEqual(os.listdir(os.path.dirname(zero)),
+                         [os.path.basename(reader.store())])
+        self.git("config", "helm.edit", "1", cwd=second)
+        reader = foldckpt.begin(ledger, dispatches.epoch_path(), data)
+        self.assertIsNone(reader.restore())
+        self.assertEqual(reader.why, "git's view of %s changed"
+                         % os.path.realpath(os.path.join(second, ".git")))
+
+    ARM_STATE = {"out": {}, "verdicts": {}, "taken": {},
+                 "actors": {"validated": {}, "unresolved": {}}}
+    ARM_LINES = [b'{"id":"a"}\n', b'{"id":"b"}\n', b'{"id":"c"}\n']
+
+    def arm_ledger(self, data):
+        ledger = os.path.join(os.path.dirname(dispatches.ledger_path()),
+                              "fold-arm.jsonl")
+        with open(ledger, "wb") as f:
+            f.write(data)
+        return ledger
+
+    def arm_save(self, ledger, data, count, code=None, rec=None):
+        """The file one save of `count` events writes, under `code`."""
+        with contextlib.ExitStack() as stack:
+            if code:
+                stack.enter_context(mock.patch.object(
+                    foldckpt, "policy", return_value=code))
+            writer = foldckpt.begin(ledger, dispatches.epoch_path(), data)
+            self.assertTrue(writer.save(dict(self.ARM_STATE), count,
+                                        writer.end, None,
+                                        rec or foldckpt.Recorder()))
+            return writer.store()
+
+    def removals(self, ledger):
+        return [m["reason"] for m in foldckpt.misses(ledger)
+                if m.get("at") == "remove"]
+
+    def test_a_universally_refused_file_is_removed_by_the_next_save(self):  # noqa: VACUOUS_ASSERTION — each dead file is asserted gone with its reason logged, and the save's own file asserted present
+        whole = b"".join(self.ARM_LINES)
+        rewritten = whole.replace(b'"b"', b'"B"')
+        for way, after, reason in (
+                ("shorter", b"".join(self.ARM_LINES[:2]),
+                 "the ledger is shorter than the checkpoint"),
+                ("prefix", rewritten, "the ledger prefix was rewritten"),
+                ("malformed", whole, "not a checkpoint of this format"),
+                ("another ledger", whole,
+                 "the checkpoint describes another ledger")):
+            with self.subTest(way=way):
+                ledger = self.arm_ledger(whole)
+                shutil.rmtree(foldckpt.store_dir(ledger), ignore_errors=True)
+                dead = self.arm_save(ledger, whole, 3, code="d" * 64)
+                if way == "malformed":
+                    with open(dead, "wb") as f:
+                        f.write(b"\x00 not a checkpoint\n")
+                if way == "another ledger":
+                    other = os.path.join(os.path.dirname(ledger),
+                                         "fold-arm-other.jsonl")
+                    with open(other, "wb") as f:
+                        f.write(whole)
+                    source = self.arm_save(other, whole, 3, code="d" * 64)
+                    os.replace(source, dead)
+                self.arm_ledger(after)
+                saved = self.arm_save(ledger, after, 1)
+                self.assertFalse(os.path.exists(dead),
+                                 "a file dead for every reader outlived "
+                                 "the next save")
+                self.assertTrue(os.path.exists(saved))
+                self.assertIn("removed: " + reason, self.removals(ledger))
+
+    def test_a_file_refused_only_on_another_readers_keys_survives(self):  # noqa: VACUOUS_ASSERTION — each reader-specific file is asserted present after the save, and a universally dead one beside them asserted gone
+        whole = b"".join(self.ARM_LINES)
+        ledger = self.arm_ledger(whole)
+        head = self.git("rev-parse", "HEAD")
+        rec = foldckpt.Recorder()
+        rec.calls.append((self.gitdir(), ("cat-file", "-e",
+                                          head + "^{commit}"), (), False, 0,
+                          b""))
+        with mock.patch.dict(os.environ, self.X):
+            view = self.arm_save(ledger, whole, 3, rec=rec)
+        code = self.arm_save(ledger, whole, 3, code="d" * 64)
+        dead = self.arm_save(ledger, whole, 3, code="e" * 64)
+        with open(dead, "wb") as f:
+            f.write(b"\x00 not a checkpoint\n")
+        saved = self.arm_save(ledger, whole, 2)
+        self.assertTrue(os.path.exists(view), "a file refused only on "
+                        "another view's fingerprints was removed")
+        self.assertTrue(os.path.exists(code), "a file refused only on "
+                        "another code was removed")
+        self.assertFalse(os.path.exists(dead))
+        self.assertTrue(os.path.exists(saved))
+
+    def test_the_just_saved_file_is_never_removed(self):  # noqa: VACUOUS_ASSERTION — the saved file is asserted present though the ledger read at the sweep refuses it, and an older dead file asserted gone so the sweep is shown to have run
+        whole = b"".join(self.ARM_LINES)
+        ledger = self.arm_ledger(whole)
+        dead = self.arm_save(ledger, whole, 3, code="d" * 64)
+        writer = foldckpt.begin(ledger, dispatches.epoch_path(), whole)
+        # THE LEDGER IS REWRITTEN SHORTER between this save's read and its
+        # write: the sweep, reading the ledger again, refuses this save's own
+        # file too, and must remove the other dead file only.
+        self.arm_ledger(b"".join(self.ARM_LINES[:2]))
+        self.assertTrue(writer.save(dict(self.ARM_STATE), 3, writer.end,
+                                    None, foldckpt.Recorder()))
+        self.assertTrue(os.path.exists(writer.store()),
+                        "the sweep removed the file its own save wrote")
+        self.assertFalse(os.path.exists(dead))
+
+    def test_a_refused_longer_candidate_yields_to_a_usable_shorter_one(self):  # noqa: VACUOUS_ASSERTION — the shorter file is asserted to RESTORE by its exact path and event count after the longer one is asserted refused by its exact reason
+        """THE LONGEST USABLE CANDIDATE CAN BE STALE ON A KEY EVERY READER
+        SHARES while a shorter one is not, and the restore must fall through
+        to it. A reader reproduces every nested key: a fold that read one
+        repository and one that read two. When the ledger is rewritten
+        shorter than the two-repository file, the fresh save lands under the
+        one-repository key and supersedes nothing longer, so the stale file
+        stays until it retires; a restore that judged only the longest then
+        replayed the whole ledger on every read for up to RETIRE_S, where
+        main's single file was replaced once and restored after."""
+        ledger = os.path.join(os.path.dirname(dispatches.ledger_path()),
+                              "fold-arm.jsonl")
+        lines = [b'{"id":"a"}\n', b'{"id":"b"}\n', b'{"id":"c"}\n']
+        state = {"out": {}, "verdicts": {}, "taken": {},
+                 "actors": {"validated": {}, "unresolved": {}}}
+        second = os.path.join(self.tmp, "second")
+        subprocess.run(["git", "init", "-q", second], check=True)
+        subprocess.run(["git", "-C", second, "-c", "user.name=t", "-c",
+                        "user.email=t@t", "commit", "-q", "--allow-empty",
+                        "-m", "one"], check=True)
+        both = {self.gitdir(): self.git("rev-parse", "HEAD"),
+                os.path.realpath(os.path.join(second, ".git")):
+                    self.git("rev-parse", "HEAD", cwd=second)}
+        one = {self.gitdir(): both[self.gitdir()]}
+
+        def read_of(chosen):
+            rec = foldckpt.Recorder()
+            rec.calls.extend(
+                (cwd, ("cat-file", "-e", sha + "^{commit}"), (), False, 0,
+                 b"") for cwd, sha in chosen.items())
+            return rec
+
+        # A fold of the whole ledger that read both repositories.
+        data = b"".join(lines)
+        with open(ledger, "wb") as f:
+            f.write(data)
+        writer = foldckpt.begin(ledger, dispatches.epoch_path(), data)
+        self.assertTrue(writer.save(dict(state), 3, writer.end, None,
+                                    read_of(both)))
+        longer = writer.store()
+        # A fold of the first two events that read only the first
+        # repository, saved under a second key while both are valid; it is
+        # not subsumed and subsumes nothing longer. Then the ledger is
+        # rewritten to those two events, with no save after it, so no sweep
+        # (`_bury`) has removed the longer file, now dead, before the read.
+        data = b"".join(lines[:2])
+        reader = foldckpt.begin(ledger, dispatches.epoch_path(), data)
+        self.assertTrue(reader.save(dict(state), 2, reader.end, None,
+                                    read_of(one)))
+        shorter = reader.store()
+        self.assertNotEqual(shorter, longer)
+        with open(ledger, "wb") as f:
+            f.write(data)
+        self.assertEqual(sorted(os.listdir(os.path.dirname(longer))),
+                         sorted(os.path.basename(p) for p in (longer, shorter)))
+        # The next read: the longer file is refused on the ledger, and the
+        # shorter one, valid for the ledger as it is, restores.
+        again = foldckpt.begin(ledger, dispatches.epoch_path(), data)
+        got = again.restore()
+        self.assertIsNotNone(got, "the longer candidate's refusal (%s) was "
+                                  "the read's answer" % again.why)
+        self.assertEqual(got[0]["ledger"]["events"], 2)
+        self.assertEqual(sorted(got[0]["git"]), sorted(one))
+        self.assertEqual(again.store(), shorter)
+
+    def test_the_name_and_the_check_move_together(self):  # noqa: VACUOUS_ASSERTION — the drifted read is asserted to miss by name AND to write a second file, and the undrifted read after it to restore the first
+        """ONE DEFINITION: the fingerprint names the file AND judges it. So a
+        change to the fingerprint moves both at once: the read misses by
+        `git's view` AND writes a new file, never restoring a file its
+        check refuses, never writing into a file named by another key."""
+        self.first("plain")
+        (first,) = self.files()
+        real = foldckpt.fingerprint
+
+        def drifted(cwd, env):
+            fp, facts = real(cwd, env)
+            # A DIFFERENT first digit, whatever the real one is.
+            return (None if fp is None else
+                    ("1" if fp[0] == "0" else "0") + fp[1:]), facts
+        with mock.patch.object(foldckpt, "fingerprint", drifted):
+            road, missed = self.first("plain")
+        self.assertEqual(road, "full")
+        self.assertTrue(missed and missed[0].startswith("git's view of"),
+                        missed)
+        self.assertEqual(len(self.files()), 2, self.files())
+        self.assertEqual([m for m in foldckpt.misses(dispatches.ledger_path())
+                          if m.get("at") == "replace"], [])
+        self.assertEqual(self.first("plain"), ("restored", []))
+        self.assertIn(first, self.files())
+
+    def test_a_key_no_reader_reproduces_retires_past_its_age(self):  # noqa: VACUOUS_ASSERTION — the surviving set is asserted by exact name, and the current key's file is asserted to restore
+        """A config edit moves every reader's key, so the file written
+        before it is read by nobody; it goes once its newest file is older
+        than RETIRE_S, and a key edited away only an hour ago stays."""
+        self.first("plain")
+        (first,) = self.files()
+        path = os.path.join(self.store_dir(), first)
+        at = time.time_ns() - (foldckpt.RETIRE_S + 3600) * 1_000_000_000
+        os.utime(path, ns=(at, at))
+        self.git("config", "helm.edit", "1")
+        self.assertEqual(self.first("plain")[0], "full")
+        (second,) = self.files()
+        self.assertNotEqual(second, first, "a key nobody reproduces outlived "
+                                           "RETIRE_S")
+        self.git("config", "helm.edit", "2")
+        self.assertEqual(self.first("plain")[0], "full")
+        left = self.files()
+        self.assertIn(second, left, "a key edited away an hour ago was "
+                                    "retired before RETIRE_S")
+        self.assertEqual(len(left), 2, left)
+        self.assertEqual(self.first("plain"), ("restored", []))
+
+    def test_five_live_views_each_restore(self):  # noqa: VACUOUS_ASSERTION — every second read is asserted RESTORED with no miss
+        """Five seats git answers five ways, on one unchanged ledger: each
+        saves once, and none of those saves retires another's file."""
+        views = [{"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "helm.view",
+                  "GIT_CONFIG_VALUE_0": str(n)} for n in range(5)]
+        for view in views:
+            self.assertEqual(self.seat(view)[0], "full")
+        self.assertEqual(len(self.files()), 5, self.files())
+        for view in views:
+            self.assertEqual(self.seat(view), ("restored", []), view)
+
+    def test_a_lens_term_nobody_saves_under_retires_past_its_age(self):  # noqa: VACUOUS_ASSERTION — the retired and the kept lens files are each asserted by exact name
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        dead = self.plant(foldckpt.checkpoint_name(
+            "a" * 64, "a dead lens", "e" * 16), foldckpt.RETIRE_S + 3600)
+        live = self.plant(foldckpt.checkpoint_name(
+            "a" * 64, "a live lens", "e" * 16), 3600)
+        self.assertEqual(self.first("plain")[0], "full")
+        left = self.files()
+        self.assertNotIn(dead, left, "a lens term nobody saves under "
+                                     "outlived RETIRE_S")
+        self.assertIn(live, left)
+
+    def test_a_young_file_survives_a_burst_of_saves_elsewhere(self):  # noqa: VACUOUS_ASSERTION — every file is asserted present by exact name
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        young = _plant(root, foldckpt.checkpoint_name(
+            "a" * 64, None, "y" * 16), foldckpt.RETIRE_S - 3600)
+        others = [_plant(root, foldckpt.checkpoint_name(
+            "a" * 64, None, ("%x" % n) * 16), 3600 * n) for n in range(1, 5)]
+        burst = [_plant(root, foldckpt.checkpoint_name(
+            self.code(n + 1), None, "e" * 16), 60 - n) for n in range(10)]
+        foldckpt.Session._prune(os.path.join(root, burst[-1]))
+        self.assertEqual(set(self.files()),
+                         {young} | set(others) | set(burst))
+
+    def test_the_hubs_plain_file_survives_a_lensed_save(self):  # noqa: VACUOUS_ASSERTION — all three files are asserted present by exact name
+        """A lane's ./bin/helm writes plain files under its own code all
+        day, so the newest plain file is often the lane's; a lensed save
+        must not take the hub's plain file, the one every seat reads."""
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        hub = _plant(root, foldckpt.checkpoint_name(
+            "a" * 64, None, "e" * 16), 60)
+        lane = _plant(root, foldckpt.checkpoint_name(
+            "b" * 64, None, "e" * 16), 30)
+        lensed = _plant(root, foldckpt.checkpoint_name(
+            "a" * 64, "a lens", "e" * 16), 0)
+        foldckpt.Session._prune(os.path.join(root, lensed))
+        self.assertEqual(set(self.files()), {hub, lane, lensed})
+
+    def test_every_restore_refreshes_recency(self):  # noqa: VACUOUS_ASSERTION — the refreshed mtime is asserted to within a few seconds of now, from a planted value a minute old
+        self.assertEqual(self.first("plain")[0], "full")
+        (name,) = self.files()
+        path = os.path.join(self.store_dir(), name)
+        at = time.time_ns() - 60 * 1_000_000_000
+        os.utime(path, ns=(at, at))
+        self.assertEqual(self.first("plain"), ("restored", []))
+        self.assertLess(time.time_ns() - os.stat(path).st_mtime_ns,
+                        5 * 1_000_000_000,
+                        "a restore a minute after the last use did not "
+                        "refresh the recency")
+
+    def test_the_byte_bound_evicts_least_recently_used_under_the_count(self):  # noqa: VACUOUS_ASSERTION — the kept and the evicted files are each asserted by exact name
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+
+        def plant(name, age, size):
+            _plant(root, name, age)
+            with open(os.path.join(root, name), "r+b") as f:
+                f.truncate(size)
+            os.utime(os.path.join(root, name), ns=(
+                time.time_ns() - int(age * 1e9),) * 2)
+            return name
+        files = [plant(foldckpt.checkpoint_name(self.code(n + 1), None,
+                                                "c" * 16), 60 * (n + 1), 300)
+                 for n in range(5)]
+        saved = plant(foldckpt.checkpoint_name("a" * 64, None, "e" * 16),
+                      0, 300)
+        with mock.patch.object(foldckpt, "MAX_BYTES", 1000, create=True):
+            foldckpt.Session._prune(os.path.join(root, saved))
+        self.assertLess(len(files) + 1, foldckpt.MAX_FILES)
+        self.assertEqual(set(self.files()), {saved} | set(files[:2]))
+
+    def test_the_file_just_saved_survives_even_alone_over_the_byte_bound(self):  # noqa: VACUOUS_ASSERTION — the saved file is asserted the only one left
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        other = _plant(root, foldckpt.checkpoint_name("1" * 64, None,
+                                                      "c" * 16), 60)
+        saved = _plant(root, foldckpt.checkpoint_name("a" * 64, None,
+                                                      "e" * 16), 0)
+        with open(os.path.join(root, saved), "r+b") as f:
+            f.truncate(500)
+        with mock.patch.object(foldckpt, "MAX_BYTES", 100, create=True):
+            foldckpt.Session._prune(os.path.join(root, saved))
+        self.assertEqual(self.files(), [saved])
+        self.assertNotIn(other, self.files())
+
+    def age(self, name, seconds):
+        """Set the recency of the store file `name` to `seconds` ago."""
+        at = time.time_ns() - int(seconds * 1_000_000_000)
+        os.utime(os.path.join(self.store_dir(), name), ns=(at, at))
+
+    def views(self, n, first=0):
+        return [{"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "helm.view",
+                 "GIT_CONFIG_VALUE_0": "v%d" % k}
+                for k in range(first, first + n)]
+
+    def test_a_view_that_only_restores_keeps_its_file(self):  # noqa: VACUOUS_ASSERTION — the restoring view is asserted RESTORED after four other views saved, its save being older than RETIRE_S
+        """(a) A view USED within RETIRE_S keeps its newest file however many
+        other views save, although its last SAVE is older than RETIRE_S: a
+        restore refreshes the file's recency."""
+        self.assertEqual(self.seat(self.X)[0], "full")
+        (mine,) = self.files()
+        self.age(mine, foldckpt.RETIRE_S + 3600)
+        self.assertEqual(self.seat(self.X), ("restored", []))
+        for view in self.views(4):
+            self.assertEqual(self.seat(view)[0], "full")
+        self.assertIn(mine, self.files())
+        self.assertEqual(self.seat(self.X), ("restored", []))
+
+    def test_a_view_unused_past_its_age_goes(self):  # noqa: VACUOUS_ASSERTION — the unused view's file is asserted gone and the saving view's to restore
+        self.assertEqual(self.seat(self.X)[0], "full")
+        (mine,) = self.files()
+        self.age(mine, foldckpt.RETIRE_S + 3600)
+        self.assertEqual(self.seat(self.Y)[0], "full")
+        self.assertNotIn(mine, self.files(), "a view unused past RETIRE_S "
+                                             "kept its file")
+        self.assertEqual(self.seat(self.Y), ("restored", []))
+
+    @contextlib.contextmanager
+    def paused_in_prune(self, target):
+        """Pause the first `os.stat` `_prune` takes of `target` until the
+        body returns: (paused, a thread-safe event set once it has paused)."""
+        real = os.stat
+        paused, resume = threading.Event(), threading.Event()
+
+        def stat(path, *args, **kw):
+            st = real(path, *args, **kw)
+            if path == target and not paused.is_set() \
+                    and sys._getframe(1).f_code.co_name == "_prune":
+                paused.set()
+                resume.wait(20)
+            return st
+        with mock.patch.object(foldckpt.os, "stat", stat):
+            try:
+                yield paused
+            finally:
+                resume.set()
+
+    def test_a_restore_racing_a_prune_is_linearised(self):  # noqa: VACUOUS_ASSERTION — the racing restore is asserted RESTORED and prompt, and the invariant is asserted on the file's measured recency and presence
+        """A restore concurrent with a prune either refreshes first and the
+        prune sees it, or loses to the prune and already holds its state. It
+        never refreshes a file the prune then removes from a stale snapshot:
+        the race measured with a barrier inside the prune's stat."""
+        self.assertEqual(self.first("plain")[0], "full")
+        (name,) = self.files()
+        path = os.path.join(self.store_dir(), name)
+        old = time.time_ns() - (foldckpt.RETIRE_S + 3600) * 1_000_000_000
+        os.utime(path, ns=(old, old))
+        ledger = dispatches.ledger_path()
+        with open(ledger, "rb") as f:
+            first = f.readline()
+        writer = foldckpt.begin(ledger, dispatches.epoch_path(), first)
+        state = {"out": {}, "verdicts": {}, "taken": {},
+                 "actors": {"validated": {}, "unresolved": {}}}
+        with self.paused_in_prune(path) as paused:
+            saver = threading.Thread(target=writer.save, args=(
+                state, 1, writer.end, None, foldckpt.Recorder()))
+            saver.start()
+            self.assertTrue(paused.wait(20), "the save never reached its "
+                                             "prune")
+            began = time.monotonic()
+            _got, roads = self.read()
+            spent = time.monotonic() - began
+            refreshed = os.stat(path).st_mtime_ns != old
+        saver.join(20)
+        self.assertEqual(roads[0], (len(self.ledger_events()), 0),
+                         "the racing read did not restore")
+        self.assertLess(spent, 10, "the racing restore waited on the prune")
+        self.assertFalse(refreshed and not os.path.exists(path),
+                         "a restore refreshed the file and the prune then "
+                         "removed it from its stale snapshot")
+
+    def test_a_refresh_that_finds_the_lock_busy_skips_it(self):  # noqa: VACUOUS_ASSERTION — the recency is asserted to its exact planted value and the call to return promptly
+        self.assertEqual(self.first("plain")[0], "full")
+        (name,) = self.files()
+        path = os.path.join(self.store_dir(), name)
+        old = time.time_ns() - 60 * 1_000_000_000
+        os.utime(path, ns=(old, old))
+        session = foldckpt.begin(dispatches.ledger_path(),
+                                 dispatches.epoch_path(), b"")
+        with foldckpt._save_lock(dispatches.ledger_path()) as held:
+            self.assertTrue(held)
+            began = time.monotonic()
+            session._recent(path)
+            self.assertLess(time.monotonic() - began,
+                            foldckpt.REFRESH_WAIT_S + 1.0)
+        self.assertEqual(os.stat(path).st_mtime_ns, old,
+                         "a refresh wrote while the save lock was held")
+        # A FILE THE PRUNE ALREADY REMOVED is no fault to the refresh.
+        session._recent(path + ".gone")
+
+    def test_the_prune_never_removes_a_file_whose_recency_moved(self):  # noqa: VACUOUS_ASSERTION — the moved file is asserted present and a control file of the same age asserted removed
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        age = foldckpt.RETIRE_S + 3600
+        moved = _plant(root, foldckpt.checkpoint_name("1" * 64, None,
+                                                      "c" * 16), age)
+        control = _plant(root, foldckpt.checkpoint_name("2" * 64, None,
+                                                        "c" * 16), age)
+        keep = _plant(root, foldckpt.checkpoint_name("3" * 64, None,
+                                                     "c" * 16), 0)
+        with self.paused_in_prune(os.path.join(root, moved)) as paused:
+            pruner = threading.Thread(target=foldckpt.Session._prune,
+                                      args=(os.path.join(root, keep),))
+            pruner.start()
+            self.assertTrue(paused.wait(20))
+            os.utime(os.path.join(root, moved))
+        pruner.join(20)
+        self.assertIn(moved, self.files(), "the prune removed a file whose "
+                                           "recency moved after its snapshot")
+        self.assertNotIn(control, self.files())
+
+    def test_a_victim_refreshed_mid_prune_is_replaced_by_another(self):  # noqa: VACUOUS_ASSERTION — the count, the survivor and the replacement victim are each asserted exactly
+        """25 files against a limit of 24, the oldest refreshed by an
+        unlocked updater (an older code version's restore) after the prune
+        snapshotted it: the prune still returns within the bound, by
+        evicting the next least recently used file instead."""
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        others = [_plant(root, foldckpt.checkpoint_name(
+            self.code(n % 15 + 1), None, "%016x" % n), 600 - 20 * n)
+            for n in range(foldckpt.MAX_FILES)]
+        keep = _plant(root, foldckpt.checkpoint_name("a" * 64, None,
+                                                     "e" * 16), 0)
+        oldest, next_oldest = others[0], others[1]
+        with self.paused_in_prune(os.path.join(root, oldest)) as paused:
+            pruner = threading.Thread(target=foldckpt.Session._prune,
+                                      args=(os.path.join(root, keep),))
+            pruner.start()
+            self.assertTrue(paused.wait(20))
+            os.utime(os.path.join(root, oldest))
+        pruner.join(20)
+        left = self.files()
+        self.assertEqual(len(left), foldckpt.MAX_FILES, left)
+        self.assertIn(oldest, left)
+        self.assertNotIn(next_oldest, left)
+
+    def test_an_undeletable_oldest_file_does_not_monopolize_the_prune(self):
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        others = [_plant(root, foldckpt.checkpoint_name(
+            self.code(n % 15 + 1), None, "%016x" % n), 600 - 20 * n)
+            for n in range(foldckpt.MAX_FILES + 1)]
+        keep = _plant(root, foldckpt.checkpoint_name("a" * 64, None,
+                                                     "e" * 16), 0)
+        blocked, replacement = others[:2]
+        real_unlink = os.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == os.path.join(root, blocked):
+                raise PermissionError("checkpoint is not removable")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(foldckpt.os, "unlink", side_effect=unlink):
+            foldckpt.Session._prune(os.path.join(root, keep))
+        left = self.files()
+        self.assertEqual(len(left), foldckpt.MAX_FILES, left)
+        self.assertIn(blocked, left)
+        self.assertIn(keep, left)
+        self.assertNotIn(replacement, left)
+
+    def test_a_refresher_that_moves_every_victim_ends_at_the_pass_cap(self):  # noqa: VACUOUS_ASSERTION — the crumb is asserted by its type and the bound it names, and the call to end promptly
+        from helm import record
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        others = [_plant(root, foldckpt.checkpoint_name(
+            self.code(n % 15 + 1), None, "%016x" % n), 600 - 20 * n)
+            for n in range(foldckpt.MAX_FILES + 1)]
+        keep = _plant(root, foldckpt.checkpoint_name("a" * 64, None,
+                                                     "e" * 16), 0)
+        victims = {os.path.join(root, n) for n in others}
+        real, ticks = os.stat, [time.time_ns() - 3600 * 1_000_000_000]
+
+        def stat(path, *args, **kw):
+            if path in victims and sys._getframe(1).f_code.co_name in (
+                    "_prune", "_unlink_unmoved"):
+                ticks[0] += 1
+                os.utime(path, ns=(ticks[0], ticks[0]))
+            return real(path, *args, **kw)
+        began = time.monotonic()
+        with mock.patch.object(foldckpt.os, "stat", stat):
+            foldckpt.Session._prune(os.path.join(root, keep))
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertEqual(len(self.files()), foldckpt.MAX_FILES + 2)
+        crumbs = [c for c in record.swallows(500)
+                  if c.get("exc") == "StoreOverBound"]
+        self.assertTrue(crumbs, "the capped prune recorded nothing")
+        self.assertIn("MAX_FILES", crumbs[-1].get("msg", ""))
+
+    def test_the_save_prunes_inside_the_save_lock(self):
+        ledger = dispatches.ledger_path()
+        held = []
+        real = foldckpt.Session._prune
+
+        def probe(keep):
+            fd = os.open(foldckpt.save_lock_path(ledger), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held.append(False)
+            except BlockingIOError:
+                held.append(True)
+            finally:
+                os.close(fd)
+            return real(keep)
+        with mock.patch.object(foldckpt.Session, "_prune",
+                               staticmethod(probe)):
+            self.assertEqual(self.first("plain")[0], "full")
+        self.assertTrue(held)
+        self.assertTrue(all(held), "a save pruned outside the save lock")
+
+    def test_past_the_ceiling_the_least_recently_used_file_goes(self):  # noqa: VACUOUS_ASSERTION — the evicted and the kept files are each asserted by exact name, and the refreshed view to restore
+        """(b) LRU EVICTION OVER FILES, BY LAST USE. A saved 240 s ago, B 180
+        s ago, A restored now, 22 files used 60 s ago, and a 25th saved: B's
+        goes, A's stays, because every restore refreshes recency."""
+        a, b = self.views(2)
+        self.assertEqual(self.seat(a)[0], "full")
+        (file_a,) = self.files()
+        self.assertEqual(self.seat(b)[0], "full")
+        (file_b,) = [n for n in self.files() if n != file_a]
+        self.age(file_a, 240)
+        self.age(file_b, 180)
+        self.assertEqual(self.seat(a), ("restored", []))
+        root = self.store_dir()
+        planted = [self.plant(foldckpt.checkpoint_name(
+            "a" * 64, None, ("%02x" % n) * 8), 60)
+            for n in range(foldckpt.MAX_FILES - 2)]
+        self.assertEqual(self.seat(self.views(1, first=9)[0])[0], "full")
+        left = self.files()
+        self.assertEqual(len(left), foldckpt.MAX_FILES, left)
+        self.assertNotIn(file_b, left, "the least recently USED file stayed")
+        self.assertIn(file_a, left, "the least recently SAVED file went")
+        self.assertTrue(set(planted) <= set(left))
+        self.assertEqual(self.seat(a), ("restored", []))
+
+    def test_the_file_ceiling_holds_and_spares_the_saved_file(self):  # noqa: VACUOUS_ASSERTION — the kept and the removed files are each asserted by exact name
+        """(c) The directory holds at most MAX_FILES files, and neither the
+        age nor the ceiling ever removes the file the save just wrote."""
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        files = [_plant(root, foldckpt.checkpoint_name(
+            self.code(n % 15 + 1), None, ("%02x" % n) * 8), 60 * n)
+            for n in range(foldckpt.MAX_FILES + 2)]
+        saved = _plant(root, foldckpt.checkpoint_name(
+            "a" * 64, None, "e" * 16), foldckpt.RETIRE_S + 3600)
+        foldckpt.Session._prune(os.path.join(root, saved))
+        self.assertEqual(set(self.files()),
+                         {saved} | set(files[:foldckpt.MAX_FILES - 1]))
+
+    def test_another_views_file_survives_a_burst_of_code_versions(self):  # noqa: VACUOUS_ASSERTION — the other view's file is asserted to restore after the burst, and every file to be kept under MAX_FILES
+        old = "a" * 64
+        self.assertEqual(self.seat(self.Y, old)[0], "full")
+        for n in range(9):
+            self.assertEqual(self.seat(self.X, self.code(n + 1))[0], "full")
+        self.assertEqual(self.seat(self.Y, old), ("restored", []))
+        self.assertEqual(len(self.files()), 10, self.files())
+
+    def test_dead_code_files_retire_past_their_age(self):  # noqa: VACUOUS_ASSERTION — the retired and the kept files are each asserted by exact name
+        """A file of a code version nobody runs any more, under the key
+        spelling or the one before it, goes once unused past RETIRE_S; a
+        young one of another code stays."""
+        root = self.store_dir()
+        os.makedirs(root, exist_ok=True)
+        old = foldckpt.RETIRE_S + 3600
+        dead = [self.plant("0" * 16 + foldckpt.SUFFIX, old),
+                self.plant("3" * 16 + ".v" + "d" * 16 + foldckpt.SUFFIX, old),
+                self.plant(foldckpt.checkpoint_name("2" * 64, None,
+                                                    "c" * 16), old)]
+        live = self.plant(foldckpt.checkpoint_name("4" * 64, None,
+                                                   "c" * 16), 3600)
+        self.assertEqual(self.first("plain")[0], "full")
+        left = self.files()
+        for name in dead:
+            self.assertNotIn(name, left, "a dead code file outlived RETIRE_S")
+        self.assertIn(live, left)

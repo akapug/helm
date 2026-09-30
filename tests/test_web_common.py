@@ -60,7 +60,17 @@ class TheDriftReport(unittest.TestCase):
         self.assertEqual(drift["on_disk"],
                          time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                        time.gmtime(wc._LOADED_STAMP + 3600)))
-        self.assertIn("restart helm web", drift["note"])
+        self.assertIn("until it restarts", drift["note"])
+
+    def test_the_banner_tells_the_owner_no_helm_verb(self):
+        """RULE 2 ON THE STALE-SERVER BANNER (console walk 3, open points).
+        Every page draws this note as it is, and it told the owner to
+        "restart helm web to load it"; he does not use a terminal."""
+        from tests._ownerverbs import owner_verbs
+        wc._source_stamp = lambda: wc._LOADED_STAMP + 3600
+        drift = wc.code_drift()
+        self.assertEqual(drift["stale_seconds"], 3600)     # control: it fired
+        self.assertEqual(owner_verbs(drift["note"]), [], drift["note"])
 
     def test_an_UNCHANGED_tree_reports_no_drift(self):  # noqa: VACUOUS_ASSERTION — the unconditional control is the FIRST line of the method: a stamp one hour forward yields a report with stale_seconds 3600, on the same code_drift() observable. The rung cannot link them because every call mints a fresh producer identity.
         """The must-be-silent half. Without it the arm above passes against a

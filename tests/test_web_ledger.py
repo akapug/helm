@@ -196,6 +196,11 @@ class LedgerBase(unittest.TestCase):
         # class's labels — a stale body crossing a fixture boundary.
         web._qstate.pop("ledger-about", None)
         self.addCleanup(web._qstate.pop, "ledger-about", None)
+        # THE ROOM INDEX IS PROCESS-WIDE TOO (task/3715): each arm reads its
+        # rooms cold, so an arm that counts what the join parses counts it
+        # from the file, not from a fold a sibling arm left behind.
+        web_ledger._ROOM_FOLDS.clear()
+        self.addCleanup(web_ledger._ROOM_FOLDS.clear)
 
     def req(self, path, payload=None, token=True):
         """(status, obj) — 4xx/5xx returned, not raised."""
@@ -441,7 +446,10 @@ class TestWebLedgerSigned(LedgerBase):
         room = os.path.join(os.environ["HELM_CHAT_DIR"], "main.jsonl")
         with open(room, encoding="utf-8") as f:
             prior = f.read()
-        self.addCleanup(lambda: open(room, "w", encoding="utf-8").write(prior))
+        def restore_room():
+            with open(room, "w", encoding="utf-8") as fh:
+                fh.write(prior)
+        self.addCleanup(restore_room)
         with open(room, "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": "2026-07-21T09:05:00", "from": "daria",
                                 "text": "named later", "origin": "web",
@@ -573,11 +581,19 @@ class TestWebLedgerSigned(LedgerBase):
 
     def test_bounded_join_keeps_each_leg_fail_open(self):
         self.assertIn(HEAD_HASH, web._turn_about({HEAD_HASH}))
+        # A COLD READ, as after a restart. The room index serves an unchanged
+        # room without opening it (task/3715), so a room that only a patched
+        # `open` refuses would never be asked; dropping the folds makes the
+        # join open it, and meet the refusal.
+        web_ledger._ROOM_FOLDS.clear()
+        faults = []
         with mock.patch.object(store, "_attested_priors",
                                side_effect=OSError("store unreadable")), \
                 mock.patch.object(chat, "list_rooms", return_value=["main"]), \
                 mock.patch("builtins.open", side_effect=OSError("room unreadable")):
-            self.assertEqual(web._turn_about({HEAD_HASH}), {})
+            self.assertEqual(web._turn_about({HEAD_HASH}, faults), {})
+        # fewer labels, and the room that cost them NAMED
+        self.assertEqual(faults, [{"room": "main", "reason": "unreadable"}])
 
 
 class TestWebLedgerSplitBrain(LedgerBase):

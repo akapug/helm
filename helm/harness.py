@@ -143,25 +143,23 @@ UNCERTAIN = "uncertain"
 #: numbered choices, so there is no composer to protect and none to read back.
 MODAL_STATE = "BLOCKED_ON_VENDOR_PROMPT"
 
-#: THE ESCAPE TYPES NOTHING IN THIS LAND, AND THIS IS THE LAND DECISION RATHER
-#: THAN A TUNABLE. A pane tail is unframed scrollback: it can carry an ENDED
-#: option run above a human's half-typed draft, and no scanner over that text
-#: can tell an offer that owns current input from one that has already been
-#: answered. An ended buy/switch/no run followed by "half a sentence the human
-#: was writing" classifies as a live dialog and the chooser returns its digit,
-#: so a build that typed it would type into the draft. The tail admits no
-#: bounded set of such shapes, which is what says the question is wrong rather
-#: than the answers.
+#: HELM ANSWERS A DIALOG THROUGH ONE DOOR, AND ONLY A DIALOG PROVEN TO AWAIT
+#: INPUT NOW (task/3209). `_CLIAdapter.answer_dialog` is that door and its
+#: docstring is the contract; `panetail.DIALOG_KINDS` is the table of what it
+#: may answer and `panetail.NOT_ANSWERED` says where every other recognised
+#: dialog is handled instead.
 #:
-#: So the actuator STOPS AT THE DOOR: the dialog is detected, named and
-#: reported, and no key is sent. What re-enables it is a TYPED EVENT from the
-#: producer — a structured statement that these options are awaiting input now
-#: — not a better reading of the same bytes. That is task/2386.
-#:
-#: The legs below this check are kept REACHABLE rather than deleted because
-#: 2386 turns this off and needs them proven: the arms that exercise them lift
-#: this flag explicitly and say so.
-ESCAPE_TYPES_NOTHING = True
+#: WHY A DOOR AND NOT A FLAG. A pane tail is unframed scrollback: an ENDED
+#: option run can sit above a human's half-typed draft, and a free-text chooser
+#: reading it hands back a digit that would land in the draft. That incident
+#: (e490c3b41ef) stopped the vendor escape at a global "type nothing" flag
+#: until a typed event could say a dialog awaits input. Both halves of that
+#: event now exist: task/2386's parser puts every run, wall and composer on
+#: one coordinate, so a dialog can be required to be the LAST thing on screen;
+#: and Claude Code's own presence record (<config>/sessions/<pid>.json) reads
+#: `waiting` for 'dialog open' exactly while such a dialog stands (measured).
+#: So there is no flag: each kind is answered when its proof is complete, and
+#: refused by name, with what would complete it, when it is not.
 
 
 class _PreReadRefusal(str):
@@ -403,6 +401,44 @@ class DoorRefusal(str):
 # and a seam it can READ ACROSS. Two CLI invocations also widen the real gap to
 # whole seconds, which costs nothing and can only help whatever the consuming
 # TUI's own ingest window turns out to be.
+#: The slash command that ends a Claude session. Typed ONLY through
+#: `_CLIAdapter.submit_exit`, the door that also answers the exit-confirm
+#: dialog a session with background tasks raises instead of exiting.
+EXIT_COMMAND = "/exit"
+
+
+def presence_witness(pid, start, waiting_for):
+    """A WITNESS for `answer_dialog` read from the vendor's own presence
+    record -> a callable answering (True | False | None, why).
+
+    Claude Code rewrites <config>/sessions/<pid>.json as its session changes
+    state; while a dialog of `waiting_for`'s family stands it reads `status`
+    waiting with that `waitingFor` (measured for the exit-confirm dialog:
+    'dialog open' while it stands, and back to its prior status the moment it
+    is dismissed). The record is read through helm's bracketed reader and bound
+    to THIS process by its birth stamp, so a recycled pid never lends a dead
+    session's state. Asked at the act, never cached.
+
+    TRUE is the record saying the session waits for exactly this. FALSE is the
+    record saying anything else — not waiting, or waiting for another dialog —
+    which is another moment's or another dialog's state. NONE is a record that
+    could not be read, and it is never a witness.
+    """
+    def ask():
+        from . import session
+        rec, _root, why = session.live_presence(pid, start)
+        if rec is None:
+            return None, why
+        n = int(pid)
+        status, wait = rec.get("status"), rec.get("waitingFor")
+        if status == "waiting" and wait == waiting_for:
+            return True, ("the vendor's presence record for pid %d says it "
+                          "waits for %r" % (n, waiting_for))
+        seen = ("waiting for %r" % wait if status == "waiting"
+                else "status %r" % status)
+        return False, ("the vendor's presence record for pid %d says %s, not "
+                       "waiting for %r" % (n, seen, waiting_for))
+    return ask
 SUBMIT_SETTLE_S = 0.4
 SUBMIT_VERIFY_READS = 3          # bounded repaint window, never unbounded
 SUBMIT_VERIFY_INTERVAL_S = 0.8
@@ -465,9 +501,23 @@ def read_paste_chip(body):
 
 _COMPOSER_PLACEHOLDERS = ("press up to edit queued messages",)
 
+# CLAUDE CODE'S EMPTY-COMPOSER HINT (task/1896). A fresh pane draws a dim
+# example prompt in an EMPTY composer, and the onboarding pre-read quoted it
+# as a possible human draft on three reseeds in one night (measured
+# 2026-09-09, kimi: `composer holds 'Try "how do I log an error?"'`), so the
+# brief was never typed. The body reaches this test with the SGR styling
+# stripped by the composer locator and the glyph and whitespace runs
+# normalized by `composer_body`. STRICT, because the other error types a
+# brief after a person's text: the WHOLE body must be one capitalized `Try`
+# and one non-empty double-quoted run with no quote inside it. Anything
+# before, after or beside it stays a draft.
+_COMPOSER_HINT = re.compile(r'Try "[^"]+"')
+
 
 def composer_is_placeholder(body):
-    return (body or "").lower() in _COMPOSER_PLACEHOLDERS
+    body = body or ""
+    return (body.lower() in _COMPOSER_PLACEHOLDERS
+            or _COMPOSER_HINT.fullmatch(body) is not None)
 
 
 HOLDS = "HOLDS"
@@ -1395,186 +1445,290 @@ class _CLIAdapter:
                          % (handle, len(observed),
                             _frozen_capture_note(tails)))
 
-    def choose_in_modal(self, handle, intent, on_typed=None, settle=None):
-        """(state, proof) for selecting the option that MEANS `intent`.
+    def choose_in_modal(self, handle, intent, on_typed=None, settle=None,
+                        awaiting=None):
+        """(state, proof) for selecting the vendor-dialog option that MEANS
+        `intent`, through the one dialog door (`answer_dialog`).
 
         THIS IS A DIFFERENT OPERATION FROM `submit`, AND THAT SEPARATION IS THE
-        SAFETY RATHER THAN AN ORGANISING PREFERENCE. `submit` types text a
-        caller chose earlier; its pre-read exists to protect a human's draft and
-        it refuses a pane with no composer. A modal has no composer, so an
-        earlier build made `submit` branch into modal handling whenever the pane
-        classified as a dialog — which meant EVERY caller's text became modal
-        input the moment a dialog was up, including the boot and re-arm prose
-        `seat` sends, and a digit chosen when the pane was ASSESSED was spent
-        later against options that may have been reordered since.
+        SAFETY. `submit` types text a caller chose earlier and refuses a pane
+        with no composer; a modal has no composer. So the choice takes an
+        INTENT, never a digit: the option is derived at the keystroke by the
+        shipped chooser (`vendor_escape_choice`) from the dialog the door just
+        read, so a dialog that reordered, closed or stopped offering `intent`
+        between assessment and delivery types nothing.
 
-        So the choice is its own door and it takes an INTENT, never a digit:
-          - the pane is re-read HERE, and the option is derived from THAT tail
-            by the shipped chooser, so what is pressed is decided at the
-            keystroke and cannot be a stale index into a changed dialog;
-          - a tail that is no longer a recognised modal REFUSES — there is no
-            fall-through to composer submission, so a dialog that closed
-            between assessment and delivery costs nothing and types nothing;
-          - a modal whose current options no longer offer `intent` REFUSES,
-            because authority proves WHICH PANE, never what an option means;
-          - NO ENTER IS EVER SPENT: a numbered dialog acts on the keystroke.
-
-        CLEARANCE IS POSITIVE. The re-read must classify to a recognised
-        NON-modal state. An empty tail is what `read` returns for a failed read,
-        and an unrecognised one is a pane nobody can interpret; calling either
-        of those "delivered" would spell a keystroke that may never have
-        registered as a proven escape.
+        What remains here is only the vendor kind's INTENT. Its SHAPE question
+        is `panetail.vendor_dialog`, its witness is the caller's `awaiting`,
+        and whether the kind may be answered at all is its row in
+        `panetail.DIALOG_KINDS` — the door refuses it by name while that row
+        says why not.
         """
         from . import panetail
         from .seat_lifecycle import vendor_escape_choice
+
+        def option(dialog):
+            digit, kind, seen = vendor_escape_choice(None,
+                                                     options=dialog.options)
+            if kind != intent or not digit:
+                return None, ("its safe option reads %s, not %s"
+                              % (kind or "nothing", intent))
+            return (int(digit), dict(dialog.options).get(int(digit))), None
+
+        return self.answer_dialog(handle, panetail.VENDOR_KIND, option,
+                                  awaiting, on_typed=on_typed, settle=settle)
+
+    def submit_exit(self, handle, on_typed=None, settle=None, reads=None,
+                    interval=None, presence=None, on_dialog=None):
+        """End the Claude session in `handle` with `/exit` -> (state, detail).
+
+        THE ONE VERB THAT TYPES `/exit` (task/3201), and the dialog door's
+        first user (task/3209). A session holding background tasks — every
+        helm seat holds its armed inbox-beacon Monitor — does not exit on
+        `/exit`: Claude Code opens its exit-confirm dialog, which replaces the
+        composer, so `submit`'s read-back finds no composer and answers UNKNOWN
+        about a keystroke that DID land.
+
+        TWO ACTS, EACH WITH ITS OWN PROOF:
+          1. `/exit` through `submit`, the turn verb, unchanged: clean-composer
+             pre-read, type, HOLDS, bare Enter, read-back.
+          2. ONLY IF THIS CALL TYPED `/exit` and the re-read shows the dialog,
+             the door answers it with `panetail.EXIT_CONFIRM`. Its WITNESS is
+             this call's own act: `submit` types only into a proven-clean
+             composer and the dialog has none, so a dialog somebody else
+             opened refuses before `/exit` is typed and is never answered.
+             `presence`, when the caller can read the session's presence
+             record (`presence_witness`), must not contradict it: a record
+             that reads anything but waiting for 'dialog open' refuses.
+             `on_dialog(tail)`, when given, is handed the screen this call's
+             own /exit opened, BEFORE it is answered: the list of what the
+             exit will stop is on that screen and nowhere after it.
+
+        `state` keeps the turn verb's meaning: DELIVERED is the session TAKING
+        the exit, NOT_DELIVERED a proven non-exit, UNKNOWN could-not-tell.
+        Whether the process actually ended is the caller's proof to take — a
+        pane cannot show a process dying.
+        """
+        from . import panetail
         if settle is None:
             settle = _env_float("HELM_SUBMIT_SETTLE_S", SUBMIT_SETTLE_S)
+        reads = SUBMIT_VERIFY_READS if reads is None else reads
+        interval = SUBMIT_VERIFY_INTERVAL_S if interval is None else interval
+        typed = []
+
+        def mark(at, text):
+            typed.append(at)
+            if on_typed is not None:
+                on_typed(at, text)
+
+        state, detail = self.submit(handle, EXIT_COMMAND, on_typed=mark,
+                                    settle=settle, reads=reads,
+                                    interval=interval)
+        if not typed:
+            return state, detail
         try:
-            tail = self.read(handle)
-        except HarnessError as e:
-            return UNKNOWN, ("pane %s could not be read before choosing, so "
-                             "nothing was typed: %s" % (handle, e))
-        # ADMISSION ASKS THE DIALOG'S OWN EVENTS, NOT A SCALAR STATE WORD.
-        # `_classify_pane_tail` reduces the whole tail to one word, and the
-        # word it answers for an ENDED option run sitting above a human's
-        # half-typed draft is the SAME word it answers for a dialog that is
-        # genuinely capturing keys. A gate that cannot separate those two
-        # cases cannot gate a keystroke — which is the defect this lane
-        # exists for, and the reason the scalar is gone from this door rather
-        # than tightened. The facts below separate them by construction: the
-        # occupied composer below the run IS the evidence the scalar threw
-        # away, and here it is a positioned event that outranks the run.
-        parsed = panetail.parse(tail)
-        standing = panetail.modal_standing(parsed)
-        if standing.state == panetail.ENDED or standing.occurrence is None:
+            tail = self.read(handle, limit=SUBMIT_READ_LIMIT,
+                             timeout=SUBMIT_READ_TIMEOUT_S)
+        except (HarnessError, OSError) as e:
+            return state, ("%s; the pane could not be re-read for an "
+                           "exit-confirm dialog (%s)" % (detail, e))
+        if not panetail.exit_dialog(tail).standing:
+            return state, detail
+        if on_dialog is not None:
+            on_dialog(tail)
+
+        def caused():
+            """This call's own /exit opened the dialog moments ago; the
+            vendor's record, when readable, must agree it awaits input."""
+            if presence is None:
+                return True, "this call's own %s opened it" % EXIT_COMMAND
+            ok, why = presence()
+            if ok is False:
+                return False, ("this call's %s opened a dialog, but %s"
+                               % (EXIT_COMMAND, why))
+            if ok is None:
+                return True, ("this call's own %s opened it (the vendor's "
+                              "record could not confirm it: %s)"
+                              % (EXIT_COMMAND, why))
+            return True, "this call's own %s opened it, and %s" % (
+                EXIT_COMMAND, why)
+
+        got, proof = self.answer_dialog(handle, panetail.EXIT_KIND,
+                                        panetail.EXIT_CONFIRM, caused,
+                                        settle=settle, reads=reads,
+                                        interval=interval)
+        return got, "the %s landed and opened the exit-confirm dialog; %s" % (
+            EXIT_COMMAND, proof)
+
+    def answer_dialog(self, handle, kind, option, awaiting, on_typed=None,
+                      settle=None, reads=None, interval=None):
+        """Answer ONE dialog with ONE named option -> (state, detail).
+
+        THE ONE KEYSTROKE HELM PUTS INTO A DIALOG (task/3209). It answers a
+        dialog only when that dialog is PROVEN to await input NOW. It asks the
+        WITNESS first, then answers SHAPE and KEY from ONE fresh pane read — the
+        final capture taken immediately before the key:
+
+          WITNESS  `awaiting()` answers True: the caller's proof that THIS
+                   dialog awaits input now — the vendor's own presence record
+                   (`presence_witness`), or the caller's own act having opened
+                   it. False is another caller's or another moment's dialog;
+                   None is could-not-tell. Both refuse. It runs first because
+                   its I/O can outlive the screen it was meant to corroborate.
+          SHAPE    `kind.recognise(tail)` finds its dialog STANDING after that
+                   witness: that kind's own rows in their places and nothing
+                   below them — no composer, no draft, no newer output. A dialog
+                   already answered, or one with a human's sentence under it,
+                   is scrollback, and it is refused here whatever else is true.
+          KEY      `option` (an (n, label) or a chooser over the dialog) is
+                   offered by the dialog as read NOW, and the pointer sits on
+                   it or on the row the dialog opens on (`kind.opens_on`, else
+                   the first). A pointer anywhere else means the dialog took
+                   input after it opened — a person answering it — and helm
+                   never overrules that. A kind MEASURED to draw a pointer
+                   refuses a screen with none.
+
+        THE KEY IS THE OPTION'S DIGIT, NEVER ENTER. Claude Code's select takes
+        a digit with no Enter (measured on the exit dialog: option 1's digit
+        ended the session in 2.0s). If the dialog closed between the capture
+        and the key, a digit is a stray character in a composer; an Enter
+        would submit whatever a human had typed there.
+
+        A kind whose row carries `unproven` is refused BY NAME before anything
+        is read, with the row's own account of what would enable it.
+
+        THEN THE PROOF THE KEY LANDED: the pane is read back over the bounded
+        window and the dialog must be seen to close (DELIVERED); a dialog
+        still standing, or reads that fail or come back empty, are UNKNOWN,
+        and no second key is ever spent. The keystroke's send carries the act
+        bound (`act_send_s`), never the transport's 60s default; a send that
+        fails ambiguously is UNCERTAIN, and one that provably never left this
+        box is NOT_DELIVERED.
+        """
+        if settle is None:
+            settle = _env_float("HELM_SUBMIT_SETTLE_S", SUBMIT_SETTLE_S)
+        reads = SUBMIT_VERIFY_READS if reads is None else reads
+        interval = SUBMIT_VERIFY_INTERVAL_S if interval is None else interval
+        name = kind.name
+        if kind.unproven:
             return NOT_DELIVERED, (
-                "pane %s is not showing a dialog that owns input at delivery "
-                "time (%s), so no choice was made and nothing was typed"
-                % (handle, standing.why))
-        run = standing.occurrence.detail
-        if run.qualification != panetail.QUALIFIED:
-            # SUPPRESSION IS NOT A REASON TO REACH PAST IT. A newer numbered
-            # run that is not a dialog means no choice is on offer; the older
-            # qualifying list below it is scrollback, and answering that is
-            # typing a digit at whatever now owns the screen.
+                "pane %s: helm answers no %s dialog yet, so nothing was read "
+                "and nothing was typed: %s" % (handle, name, kind.unproven))
+        # WITNESS FIRST, FINAL PANE CAPTURE LAST. A presence read performs
+        # filesystem and process I/O; the dialog can close or change during it.
+        # Reading SHAPE and KEY afterwards prevents that earlier screen from
+        # authorizing a digit into the composer that replaced the dialog.
+        if awaiting is None:
             return NOT_DELIVERED, (
-                "the newest numbered run on pane %s is not a dialog, so no "
-                "choice is on offer and nothing was typed — helm does not "
-                "fall through to an older list (%s)" % (handle, standing.why))
-        wall = panetail.wall_standing(parsed)
-        if (wall.state == panetail.IN_FORCE
-                and wall.occurrence.pos.line > run.end.line):
-            # POSITION IS NOT CHRONOLOGY AND IT IS NOT OWNERSHIP. Two
-            # placements the tail DOES settle, and both of them admit: a wall
-            # strictly above the first option row is the banner that RAISED
-            # this dialog — "you've reached your usage limit" over "1. Yes /
-            # 2. No" is the single most common shape the escape exists for, and
-            # refusing it would refuse the feature — and a wall on a line the
-            # run occupies is the reason spelled inside the label being
-            # offered, which cannot have arrived after the label carrying it.
-            #
-            # BELOW THE LAST NUMBERED ROW SETTLES NOTHING, and this branch
-            # claims nothing. A run ends at its last NUMBERED row because a
-            # line that is not an option is what closes it, so the row beneath
-            # a run is a wrapped continuation of the final label — "3. No, keep
-            # my current model (reason:" over "   usage balance exhausted)" —
-            # as readily as it is a newer screen. Those two render identically
-            # and no pane tail separates them. So the door states the
-            # measurement, names the chronology UNKNOWN, and takes the decision
-            # this build takes for any dialog whose ownership it cannot vouch
-            # for: nothing is typed.
-            #
-            # THE QUOTED STRING IS THE PANE'S, NOT THE RECOGNIZER'S. A `Wall`
-            # carries both: `spelling` is the pattern out of the table that
-            # matched and `line` is the pane line the match was found in. Only
-            # the second is something an operator can act on — there is no
-            # matched-slice field, and the line as read is the narrowest
-            # observation this record holds. Printing the pattern under these
-            # words would hand a human regex syntax as the screen and drop the
-            # vendor's own wording, which is the only part that tells them
-            # which limit they hit.
-            observed = (wall.occurrence.detail.line or "").strip()
-            return NOT_DELIVERED, (
-                "pane %s carries quota-wall text (%r) on line %d with the "
-                "choices on lines %d to %d, and a pane tail cannot say whether "
-                "that wall is a newer screen or the last option's own wrapped "
-                "label: which of them holds the keys is UNKNOWN, so nothing "
-                "was typed" % (handle, observed[:200],
-                               wall.occurrence.pos.line, run.start.line,
-                               run.end.line))
-        # The SAME run the standing facts were judged on decides the digit —
-        # one tail, one parse, one ordered list. Passing it is what stops the
-        # chooser re-scanning and answering about the older menu this door
-        # just refused.
-        digit, kind, seen = vendor_escape_choice(tail, options=run.options)
-        if kind != intent or not digit:
-            return NOT_DELIVERED, (
-                "the dialog on pane %s does not currently offer %s (its safe "
-                "option reads %s), so nothing was typed" % (handle, intent,
-                                                            kind or "nothing"))
-        if ESCAPE_TYPES_NOTHING:
-            # DETECTED, NAMED, NOT PRESSED. The refusal carries what was seen
-            # so the seat is VISIBLE to an operator — which is the outcome the
-            # lane exists for — while the keystroke waits on a producer event
-            # that can say these options own current input.
-            return NOT_DELIVERED, (
-                "pane %s is showing a vendor dialog whose safe option reads %r "
-                "(option %s), and helm types NOTHING into a dialog in this "
-                "build: a pane tail cannot distinguish an offer awaiting input "
-                "from one already answered above a human's draft. The seat is "
-                "parked and visible; re-enabling the keystroke is task/2386"
-                % (handle, seen, digit))
+                "pane %s: no witness was given that its %s dialog awaits this "
+                "call's answer now, so nothing was typed" % (handle, name))
         try:
-            self.send(handle, digit, enter=False)
+            ok, proof = awaiting()
+        except Exception as e:              # noqa: BLE001 — a witness that raised proves nothing
+            ok, proof = None, "the witness raised %s: %s" % (
+                e.__class__.__name__, e)
+        if ok is not True:
+            return NOT_DELIVERED, (
+                "pane %s: %s that its %s dialog awaits this call's answer now "
+                "(%s), so nothing was typed"
+                % (handle, "its witness refuses" if ok is False
+                   else "nothing proves", name, proof))
+        try:
+            tail = self.read(handle, limit=SUBMIT_READ_LIMIT,
+                             timeout=SUBMIT_READ_TIMEOUT_S)
+        except (HarnessError, OSError) as e:
+            return UNKNOWN, ("pane %s could not be read before answering its "
+                             "%s dialog, so nothing was typed: %s"
+                             % (handle, name, e))
+        if not (tail or "").strip():
+            return UNKNOWN, ("pane %s read back EMPTY, which is what a failed "
+                             "read returns, so nothing was typed" % handle)
+        # SHAPE
+        dialog = kind.recognise(tail)
+        if not dialog.standing:
+            return NOT_DELIVERED, (
+                "pane %s is not showing a %s dialog that owns the screen (%s), "
+                "so nothing was typed" % (handle, name, dialog.why))
+        # KEY
+        offered = [(int(n), label) for n, label in dialog.options]
+        if callable(option):
+            want, why = option(dialog)
+        else:
+            want = (int(option[0]), option[1])
+            why = None if want in offered else (
+                "it offers %s, and not '%d. %s'"
+                % ("; ".join("%d. %s" % o for o in offered) or "nothing",
+                   want[0], want[1]))
+            want = want if why is None else None
+        if want is None:
+            return NOT_DELIVERED, (
+                "pane %s: the %s dialog does not offer what helm would press "
+                "(%s), so nothing was typed" % (handle, name, why))
+        n, label = want
+        opens = kind.opens_on or 1
+        focus = dialog.focus
+        if focus is None and kind.opens_on is not None:
+            return NOT_DELIVERED, (
+                "pane %s: the %s dialog shows no readable pointer, and this "
+                "kind always draws one, so whether anyone has answered it is "
+                "unknown and nothing was typed" % (handle, name))
+        if focus is not None and tuple(focus) != (n, label) \
+                and focus[0] != opens:
+            return NOT_DELIVERED, (
+                "pane %s: the %s dialog's pointer sits on '%d. %s', which is "
+                "neither '%d. %s', the option helm would press, nor row %d, "
+                "where the dialog opens; it took input after it opened, so "
+                "helm pressed NOTHING and nothing was typed"
+                % (handle, name, focus[0], focus[1], n, label, opens))
+        key = str(n)
+        try:
+            self.send(handle, key, enter=False,
+                      **self._send_bound(act_send_s()))
         except HarnessError as e:
-            # PROVEN ABSENCE AND UNCERTAINTY ARE DIFFERENT FACTS. Only a CLI
-            # that could not be launched proves the request never left; a
-            # timeout or a malformed reply can follow input the pane accepted,
-            # and reporting that as "not delivered" tells a caller no key was
-            # pressed when one may have been.
+            # PROVEN ABSENCE AND UNCERTAINTY ARE DIFFERENT FACTS: only a CLI
+            # that could not be launched proves the request never left.
             if getattr(e, "request_absent", False):
-                return NOT_DELIVERED, ("pane %s never received the choice %r — "
-                                       "the request did not leave this box: %s"
-                                       % (handle, digit, e))
-            return UNCERTAIN, ("the choice %r was sent to pane %s and the send "
-                               "failed in a way that cannot say whether the "
-                               "keystroke arrived: %s" % (digit, handle, e))
+                return NOT_DELIVERED, (
+                    "pane %s never received %r ('%s') — the request did not "
+                    "leave this box: %s" % (handle, key, label, e))
+            return UNCERTAIN, (
+                "the key %r ('%s') was sent to pane %s and the send failed in "
+                "a way that cannot say whether it arrived: %s"
+                % (key, label, handle, e))
         if on_typed is not None:
-            # Provenance, not delivery — and a bookkeeping failure must never
-            # strand a keystroke that has already left.
+            # Provenance, not delivery; a bookkeeping failure must never strand
+            # a keystroke that has already left.
             try:
-                on_typed(handle, digit)
+                on_typed(handle, key)
             except Exception:
                 pass
         if settle > 0:
             time.sleep(settle)
-        try:
-            after = self.read(handle)
-        except HarnessError as e:
-            return UNKNOWN, ("choice %r was sent to pane %s and the pane could "
-                             "not be re-read (%s), so whether the dialog "
-                             "cleared is unknown" % (digit, handle, e))
-        if not (after or "").strip():
-            return UNKNOWN, ("choice %r was sent to pane %s and the pane read "
-                             "back EMPTY, which is what a failed read returns — "
-                             "not evidence the dialog cleared" % (digit, handle))
-        # CLEARANCE IS A QUESTION ABOUT THE DIALOG, NOT ABOUT WHICH STATE WON
-        # THE SCREEN. Reading a scalar classification and calling every
-        # non-MODAL answer "delivered" certifies a clearance from the wrong
-        # fact: a pane that is walled AND still showing a dialog classifies as
-        # something else entirely — measured, a wall above a Yes/No run reads
-        # BLOCKED_ON_HUMAN — and the dialog is still up. So the dialog is asked
-        # about ITSELF, and only positive evidence that it ENDED clears.
-        standing = panetail.modal_standing(panetail.parse(after))
-        if standing.state == panetail.ENDED:
-            return DELIVERED, ("choice %r (%s) sent to pane %s and the dialog "
-                               "has ended: %s" % (digit, seen, handle,
-                                                  standing.why))
-        return UNKNOWN, ("choice %r was sent to pane %s and the dialog has NOT "
-                         "been shown to have ended (%s), so whether it cleared "
-                         "is unknown — a pane can be walled, or showing a "
-                         "replacement dialog, while the original still owns "
-                         "input" % (digit, handle, standing.why))
+        last = "no read-back succeeded"
+        for i in range(1, max(1, reads) + 1):
+            if i > 1 and interval > 0:
+                time.sleep(interval)
+            try:
+                after = self.read(handle, limit=SUBMIT_READ_LIMIT,
+                                  timeout=SUBMIT_READ_TIMEOUT_S)
+            except (HarnessError, OSError) as e:
+                last = "read %d failed: %s" % (i, e)
+                continue
+            if not (after or "").strip():
+                # EMPTY IS WHAT A FAILED READ RETURNS, never a closed dialog.
+                last = "read %d came back empty" % i
+                continue
+            if kind.recognise(after).standing:
+                last = "read %d still shows the dialog" % i
+                continue
+            return DELIVERED, (
+                "pressed %r ('%s') into the %s dialog on pane %s — %s — and "
+                "the dialog has closed (read %d)" % (key, label, name, handle,
+                                                     proof, i))
+        return UNKNOWN, (
+            "pane %s: %r ('%s') was pressed once into the %s dialog, but the "
+            "dialog has not been seen to close (%s)"
+            % (handle, key, label, name, last))
 
     def composer_was_dirty(self, handle, reads=None, interval=None):
         """(True/False/None, detail) after one bounded pre-actuation poll.

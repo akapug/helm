@@ -33,14 +33,17 @@ this ships broken. The obvious design reads each lane's worktree HEAD and
 fires when it moves past the reviewed tip — and that design fires on a
 `helm-work` bot's mid-edit SNAPSHOT COMMIT, on a docs typo, and on an
 in-flight subagent's partial work, so it needs a clean-tree heuristic to
-suppress its own false positives. obligation's predicate is PURE LEDGER SHAPE:
-a FIX row that no LIVE row supersedes. It never reads a worktree, so a wip
+suppress its own false positives. obligation's predicate is LEDGER SHAPE: a
+FIX row that no LIVE row supersedes. It never reads a worktree, so a wip
 commit, a dirty tree and a rebase are all INVISIBLE to it by construction, and
-the only thing that clears an item is a real ledger event (a superseding
-dispatch, a cancel, a withdrawal). There is no noise channel to filter.
+the only things that clear an item are a real ledger event (a superseding
+dispatch, a cancel, a withdrawal) and a LAND: its one git question is whether
+the cure the REVIEWER committed and named on the FIX is on origin/main
+(task/3357), by ancestry or, for a cure that landed rebased, by patch identity.
+No local commit can make either true. There is no noise channel to filter.
 
-THE COST OF THAT CHOICE, STATED HONESTLY: because it never reads git, it
-cannot distinguish "cured and not re-dispatched" from "never cured at all".
+THE COST OF THAT CHOICE, STATED HONESTLY: because it never reads a lane's
+tip, it cannot distinguish "cured and not re-dispatched" from "never cured".
 obligation ruled that deliberately — both want the SAME next action from the
 SAME person — and the `what` string is written to cover both branches without
 guessing which one the reader is in.
@@ -354,25 +357,29 @@ WantedBy=timers.target
 """
 
 
-def _timer_units(interval=DEFAULT_INTERVAL_S):
+def _timer_units(interval=DEFAULT_INTERVAL_S, inputs=None):
     # A persistent unit must never capture a DISPOSABLE WORKTREE's path: the
     # binary is the stable install, the cwd is the lane folded back to the
-    # shared checkout (stalebot._timer_units' law, same reason).
+    # shared checkout (stalebot._timer_units' law, same reason). `inputs`
+    # replaces per-install values (timerhealth.unit_values).
     from . import work
     helm_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "helm")
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cwd = work.find_root(here) or here
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    from . import timerhealth
+    udir = timerhealth.user_unit_dir()
     return (os.path.join(udir, "helm-owed-push.service"),
-            _UNIT_SERVICE % {"helm": helm_bin, "cwd": cwd},
+            _UNIT_SERVICE % timerhealth.unit_values(
+                {"helm": helm_bin, "cwd": cwd}, inputs),
             os.path.join(udir, "helm-owed-push.timer"),
-            _UNIT_TIMER % {"interval": interval})
+            _UNIT_TIMER % timerhealth.unit_values({"interval": interval},
+                                                  inputs))
 
 
 def ensure_timer(interval=DEFAULT_INTERVAL_S):
     """Install/refresh and enable the cadence -> (ok, detail). Idempotent."""
     import shutil
-    import subprocess
+    from . import timerhealth
     if interval < 1:
         return False, "interval must be at least 1 second"
     systemctl = shutil.which("systemctl")
@@ -380,19 +387,11 @@ def ensure_timer(interval=DEFAULT_INTERVAL_S):
         return False, ("systemctl unavailable; run `helm owed-push` from "
                        "another scheduler")
     spath, service, tpath, timer = _timer_units(interval)
-    try:
-        os.makedirs(os.path.dirname(spath), exist_ok=True)
-        pk.atomic_write(spath, service)
-        pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    for cmd in ([systemctl, "--user", "daemon-reload"],
-                [systemctl, "--user", "enable", "--now",
-                 "helm-owed-push.timer"]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, "%s failed: %s" % (
-                " ".join(cmd), (r.stderr or r.stdout or "").strip()[:200])
+    error, _unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer)), ("helm-owed-push.timer",),
+        systemctl)
+    if error:
+        return False, error
     return True, "owed-push cadence enabled every %ds (%s)" % (interval, tpath)
 
 

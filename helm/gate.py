@@ -60,7 +60,7 @@ import threading
 import time
 import uuid
 
-from . import chat, eventledger, gateauthority, gatechild, gateslice, gatetestrecord, home, pk, scratch, seats, vcs
+from . import chat, eventledger, gateauthority, gatechild, gateloads, gateslice, gatetestrecord, home, pk, scratch, seats, vcs
 
 RECEIPTS = "gate-receipts.jsonl"
 # THE SIDECAR BESIDE THE RECEIPT. A declared `exit`-protocol command's whole
@@ -141,6 +141,11 @@ _TIMING_RUNNER_TOLERANCE = 0.000501
 # the exact same raw value, so its allowance is exactly zero.
 _TIMING_ROW_UNIT = 0.000001
 _NO_TIMING = object()
+# The events a receipt ledger holds BESIDE its receipts, each naming the
+# receipt it belongs to: the failure identity chunks (authority), the module
+# timings and the load record (both advisory). A reader of receipts skips
+# all three by this one name.
+_SIBLING_EVENTS = (_FAILURE_CHUNK_EVENT, _TIMING_EVENT, gateloads.EVENT)
 # THE LADDER AND THE KINDS ARE TWO DIFFERENT THINGS, and conflating them is
 # what this block exists to prevent.
 #
@@ -1218,6 +1223,111 @@ def _module_timing_event(receipt, timing):
                     "unattributed_wall": None, "top": []}
         fallback["id"] = _timing_id(fallback)
         return fallback
+    return row
+
+
+def _module_loads(repo, directory, dirty, slice_evidence):
+    """The run's LOAD RECORD (task/3039 lane 2, helm/gateloads.py), or None.
+    -> {"record", "kind", "seconds", "stats"}
+
+    SILENT when no runner armed (a tree whose suite bootstrap does not carry
+    the recorder: an adopter's, a fixture's), because there is nothing to
+    explain; LOUD when a runner armed and the record still cannot be kept,
+    because that is a run whose focused rounds will fall back to the static
+    closure. Only a clean tree is recorded: a record is keyed by the tree it
+    ran on, and a dirty run ran on bytes no tree names."""
+    try:
+        return _module_loads_unguarded(repo, directory, dirty, slice_evidence)
+    except Exception as exc:                            # noqa: BLE001
+        # ADVISORY, SO TOTAL: a record that cannot be built costs this run
+        # its record and the next focused plan its narrowing, never the
+        # receipt (measured: an unencodable path once raised here and the
+        # whole suite's result was lost).
+        sys.stderr.write("helm gate: NOTE — this run keeps no load record: "
+                         "%s: %s\n" % (type(exc).__name__,
+                                       _failure_text(str(exc))))
+        return None
+
+
+def _module_loads_unguarded(repo, directory, dirty, slice_evidence):
+    started = time.monotonic()
+    runners, children, errors = gateloads.read_artifacts(directory)
+    if not runners:
+        return None
+    expected = slice_evidence.get("workers") \
+        if isinstance(slice_evidence, dict) else 1
+    reason = None
+    if dirty is not False:
+        reason = "the tree was dirty when the run started"
+    elif errors:
+        reason = errors[0]
+    elif len(runners) != expected:
+        reason = ("%d runner records for %s runners"
+                  % (len(runners), expected))
+    record = stats = None
+    if reason is None:
+        rc, out, err = vcs.backend(repo).text(repo, "ls-files", "-z")
+        if rc != 0:
+            reason = "cannot list the tracked tree: %s" % (
+                err or "git exited %s" % rc)
+        else:
+            files = [p for p in (out or "").split("\0") if p.endswith(".py")]
+            record, stats, reason = gateloads.build_record(
+                runners, children, repo, files)
+    if reason:
+        sys.stderr.write("helm gate: NOTE — this run keeps no load record, "
+                         "so focused rounds on its tree fall back to the "
+                         "static import closure: %s\n"
+                         % _failure_text(reason, gateloads.REASON_CAP))
+        return None
+    return {"record": record, "stats": stats,
+            "kind": SLICED if isinstance(slice_evidence, dict) else SERIAL,
+            "seconds": time.monotonic() - started}
+
+
+def _plant_loads_marker(repo, directory):
+    """Name this run's loads directory in the checkout's git dir, for a helm
+    child whose environment lost the keys (`gateloads.MARKER`). -> the
+    marker's path, or None when it cannot be written: such children then go
+    unrecorded, which costs their test modules their narrowing only."""
+    rc, out, _err = vcs.backend(repo).text(repo, "rev-parse",
+                                           "--absolute-git-dir")
+    if rc != 0 or not os.path.isabs((out or "").strip()):
+        return None
+    path = os.path.join(out.strip(), gateloads.MARKER)
+    try:
+        gateloads.write_json(os.path.dirname(path), gateloads.MARKER,
+                             {"dir": directory})
+    except OSError:
+        return None
+    return path
+
+
+def _module_loads_event(receipt, loads):
+    """The advisory sibling event carrying one run's load record, or None.
+    Bound to the receipt by id and to the tree by sha, and only for a run
+    whose bracket says the tree held still: a record is a fact about ONE
+    tree."""
+    if not loads or receipt.get("dirty") is not False \
+            or receipt.get("dirty_after") is not False \
+            or receipt.get("tree_after") != receipt.get("tree") \
+            or receipt.get("head_after") != receipt.get("head"):
+        return None
+    try:
+        row = gateloads.event(receipt["id"], receipt["head"],
+                              receipt["tree"], loads["kind"], loads["record"],
+                              loads["seconds"])
+        size = _event_bytes(row)
+    except Exception as exc:                            # noqa: BLE001
+        sys.stderr.write("helm gate: NOTE — this run's load record could not "
+                         "be written: %s: %s\n" % (
+                             type(exc).__name__, _failure_text(str(exc))))
+        return None
+    if size > eventledger.MAX_EVENT_BYTES:
+        sys.stderr.write("helm gate: NOTE — this run's load record is %d "
+                         "bytes, over the ledger's %d-byte event limit, and "
+                         "was not kept\n" % (size, eventledger.MAX_EVENT_BYTES))
+        return None
     return row
 
 
@@ -2776,8 +2886,12 @@ def carriage(repo, reviewed, candidate):
     ANCESTRY FIRST, THEN THE PATCH SEQUENCE, which is the order `bind` has
     always used: a descendant carries its ancestor by construction, and a
     rebased or cherry-picked train carries it as an unambiguous contiguous run
-    of patch ids. `sequence` is the 4-tuple the caller needs to explain
-    itself, or None when ancestry answered without asking."""
+    of patch ids. When trunk's train merges make the pair's range unreadable,
+    the primitive reads each side off the remote default branch instead; no
+    trunk is passed here because this predicate holds none. Only EXACT and
+    CONTAINED carry; BACKWARD, like every other answer, does not.
+    `sequence` is the 4-tuple the caller needs to explain itself, or None
+    when ancestry answered without asking."""
     backend = vcs.backend(repo)
     relation = backend.ancestry(repo, reviewed, candidate)
     if relation == vcs.ANCESTOR:
@@ -2965,7 +3079,35 @@ def _agent_pane_pids(proc_dir=None):
     index = beacons.agent_index(proc_dir)
     if index is None:
         return None                  # unlistable process table: UNKNOWN
-    return sorted(index.get("by_pid") or ())
+    return sorted(pid for pid in index.get("by_pid") or ()
+                  if not _print_mode_agent(pid, proc_dir))
+
+
+def _print_mode_agent(pid, proc_dir=None):
+    """True when this agent runs in PRINT MODE (`-p`/`--print`): a batch job,
+    not an interactive pane.
+
+    The pane cap protects the responsiveness of seats someone is working in.
+    A print-mode agent has no one at its keyboard, so it is load like any
+    other job and gets no pane's protection. MEASURED: an overnight eval
+    ran `claude -p` inside containers on a build host, the host read as
+    "carries agent panes", and its whole-suite cap fell from 16 to 2, which
+    refused a land gate five times.
+
+    The mode is read from argv (session._is_headless, the one reader of it).
+    An argv that cannot be read counts as a PANE: the cap is the side to fail
+    toward. The CLI also enters print mode on its own when stdin is not a
+    terminal; that case is not detected here and the agent stays a pane,
+    which is the same safe direction."""
+    from . import session
+    try:
+        with open(os.path.join(_census_proc_dir(proc_dir), str(pid),
+                               "cmdline"), "rb") as fh:
+            argv = [a.decode("utf-8", "replace")
+                    for a in fh.read(1 << 16).split(b"\0") if a]
+    except OSError:
+        return False
+    return session._is_headless(argv)
 
 
 def _online_cpu_count():
@@ -3063,9 +3205,9 @@ _DISCOVERY_VALUE_FLAGS = {
 # they were written to. No module of that name ships, so nothing on this tree
 # can mint another; dropping the name would silently change what those stored
 # rows arm and discharge at the seam rung (helm/work/_gc.py), which is the only
-# reader of this set. tests/test_gateshard.py holds both halves. A receipt
-# naming anything else was produced by a command nobody can vouch runs this
-# tree's tests, so its whole-suite CLAIM has no runner behind it.
+# reader of this set. tests/test_stored_suite_runners.py holds both halves.
+# A receipt naming anything else was produced by a command nobody can vouch
+# runs this tree's tests, so its whole-suite CLAIM has no runner behind it.
 _STORED_SUITE_RUNNERS = frozenset(("unittest", "helm.gaterunner"))
 _PSI_SOME = re.compile(r"^some .*\bavg10=(\d+(?:\.\d+)?)", re.M)
 
@@ -3138,8 +3280,22 @@ def _suite_shaped(argv, runner="unittest"):
 # ---------------------------------------------------------------------------
 SLICE_RUNNER = "helm/gateslice.py"
 # Every file the runner executes, sorted: the script plus what it loads by path.
-SLICE_RUNNER_FILES = ("helm/gatechild.py", "helm/gateshard.py",
-                      "helm/gateslice.py", "helm/pathenv.py")
+# helm/gateloads.py joined with the load recorder (task/3039 lane 2): each
+# worker loads it by path and it wraps the import system, so a receipt that
+# did not bind its blob would let a doctored recorder shape the run unbound.
+SLICE_RUNNER_FILES = ("helm/gatechild.py", "helm/gateloads.py",
+                      "helm/gateshard.py", "helm/gateslice.py",
+                      "helm/pathenv.py")
+# The runner file sets a STORED sliced receipt may carry: the one this helm
+# mints, and the one every sliced receipt minted before the load recorder
+# carries. A receipt is immutable and names the files it ran; each set is
+# still re-derived blob by blob against the receipt's own tree
+# (`slice_tree_refusal`).
+SLICE_RUNNER_FILE_SETS = (
+    SLICE_RUNNER_FILES,
+    ("helm/gatechild.py", "helm/gateshard.py", "helm/gateslice.py",
+     "helm/pathenv.py"),
+)
 _SLICE_KEYS = frozenset((
     "v", "kind", "runner", "workers", "units", "planned", "modules_digest",
     "inventory_digest", "assignment_digest", "schedule", "leak_mode",
@@ -3182,8 +3338,8 @@ def _validate_slice(row):
     if type(runner) is not dict or set(runner) != {"path", "files"} \
             or runner["path"] != SLICE_RUNNER \
             or type(runner["files"]) is not list \
-            or [f.get("path") if type(f) is dict else None
-                for f in runner["files"]] != list(SLICE_RUNNER_FILES) \
+            or tuple(f.get("path") if type(f) is dict else None
+                     for f in runner["files"]) not in SLICE_RUNNER_FILE_SETS \
             or any(set(f) != {"path", "blob"}
                    or not _SHA.fullmatch(str(f["blob"]))
                    for f in runner["files"]):
@@ -3394,13 +3550,21 @@ _DIAGNOSTIC_RUNNERS = (("helm", "gateshard.py"), gateslice.SCRIPT)
 
 def _diagnostic_shard_shaped(argv):
     """Does argv run a diagnostic parallel runner at suite scale, without
-    granting authority?"""
+    granting authority?
+
+    The slice runner's FOCUSED scope (`gateslice.py --modules NAME...`) is
+    one too: a subset of the suite on many cores holds a host-cap slot just
+    as the whole discovery does, so the census sees it and a `--` command
+    shaped like it is admitted, never a capacity bypass."""
     argv = [str(a) for a in (argv or ())]
-    if len(argv) != 2 or not _SUITE_INTERP.fullmatch(
+    if len(argv) < 2 or not _SUITE_INTERP.fullmatch(
             os.path.basename(argv[0])) or not os.path.isabs(argv[1]):
         return False
-    return tuple(os.path.normpath(argv[1]).split(os.sep)[-2:]) \
-        in _DIAGNOSTIC_RUNNERS
+    runner = tuple(os.path.normpath(argv[1]).split(os.sep)[-2:])
+    if len(argv) == 2:
+        return runner in _DIAGNOSTIC_RUNNERS
+    return runner == gateslice.SCRIPT and len(argv) > 3 \
+        and argv[2] == gateslice.MODULES_FLAG
 
 
 def _suite_cgroup_position(pid, proc_dir):
@@ -3933,7 +4097,7 @@ def suite_occupancy(proc_dir=None, admissions_path=None):
 
 
 def _admit_suite(position=None, proc_dir=None, topology=_CAPACITY_UNSET,
-                  admissions_path=None, slots=1):
+                  admissions_path=None, slots=1, occupant=None):
     """Admit one canonical suite OWNER onto the BOX. -> (grant, refusal)
 
     SLOTS ARE THE OWNER'S WEIGHT. A serial suite keeps one process busy and
@@ -3942,6 +4106,14 @@ def _admit_suite(position=None, proc_dir=None, topology=_CAPACITY_UNSET,
     `grant["slots"]` says how many it holds. The granted weight rides in its
     intent row, so every other admission on this host prices it at that
     weight for as long as its launcher lives.
+
+    `occupant` IS THE INTENT OF AN OWNER THAT HOLDS NO FIFO POSITION: a sliced
+    FOCUSED run, which skips the queue by design and still starts a worker
+    per core. {id, pid, starttime, holder}: its guard's cgroup token (the name
+    the census reads its running root by), this launcher and its start. It is
+    never a queue capability -- nothing here or below hands it to a FIFO
+    consumer -- and the caller releases it (`_admission_release(id)`) when the
+    run ends; a launcher that dies first is pruned by its dead pid.
 
     Topology is the slow/static half and is captured before the flock. Panes,
     suite owners and PSI are live authority facts: all are re-read under the
@@ -3972,7 +4144,7 @@ def _admit_suite(position=None, proc_dir=None, topology=_CAPACITY_UNSET,
         return _capacity_grant(proc_dir, topology), \
             "gate admission runtime root is unavailable: %s" % root_err
     try:
-        with seats._flocked(path + ".lock") as lock:
+        with seats._flocked(path + ".lock", check=True) as lock:
             if lock.f is None:
                 return None, "gate admission lock is unavailable"
             census = suite_census(proc_dir)
@@ -4048,16 +4220,17 @@ def _admit_suite(position=None, proc_dir=None, topology=_CAPACITY_UNSET,
                     " ".join(refusals + [_FAB_HANDOFF]))
             if slots > 1:
                 capacity = dict(capacity, slots=granted)
-            if position is not None:
-                intent = {"position": position["id"],
-                          "pid": position["pid"],
-                          "starttime": position["starttime"],
-                          "holder": position["holder"],
+            owner = position if position is not None else occupant
+            if owner is not None:
+                intent = {"position": owner["id"],
+                          "pid": owner["pid"],
+                          "starttime": owner["starttime"],
+                          "holder": owner["holder"],
                           "ts": pk.now_ts()}
                 if granted > 1:
                     intent["slots"] = granted
                 live.append(intent)
-            if live != rows or position is not None:
+            if live != rows or owner is not None:
                 pk.write_json(path, {"v": 1, "admissions": live})
     except OSError as exc:
         return capacity, "gate admission state write failed: %s" % exc
@@ -4072,7 +4245,7 @@ def _admission_release(position_id, admissions_path=None):
         return "gate admission runtime root is unavailable: %s" % exc
     _audit_host_admission(None, path)
     try:
-        with seats._flocked(path + ".lock") as lock:
+        with seats._flocked(path + ".lock", check=True) as lock:
             if lock.f is None:
                 return "gate admission lock is unavailable"
             rows = _admissions_load(path)
@@ -5353,8 +5526,13 @@ def _stderr_tail(out, row, source=None):
 
 def _mint_result(repo, head, tree, dirty, ident, cmd, suite, label, rc,
                  started, out, legacy=None, focus=None, module_timing=_NO_TIMING,
-                 command=None, sidecar=None, slice=None, minter=None):
+                 command=None, sidecar=None, slice=None, minter=None,
+                 module_loads=None, focus_slice=None):
     """Bracket, parse, reconcile and append one completed child result.
+
+    `focus_slice` is a SLICED focused run's {workers, evidence}, or None for
+    a serial one: it becomes the focus block's `slice` (`_focus_slice_block`),
+    so a serial focused row keeps its byte shape and its id grammar.
 
     `focus` is the measured plan from `focus_plan`, or None. A focused row
     mints at v6 — the version whose content id binds the `suite` flag and the
@@ -5380,6 +5558,9 @@ def _mint_result(repo, head, tree, dirty, ident, cmd, suite, label, rc,
     if focus:
         ran_modules, ran_ids = _executed_modules(out)
         focus = dict(focus, executed=ran_modules, executed_ids=ran_ids)
+        if focus_slice is not None:
+            focus["slice"] = _focus_slice_block(focus_slice, parsed, rc,
+                                                focus["selected"])
     full_failures = parsed["failures"]
     # A FOCUSED RUN DOES NOT CHUNK, and that is a scope limit, not an
     # oversight. The focused kind's whole claim is its `focus` block and the
@@ -5483,6 +5664,16 @@ def _mint_result(repo, head, tree, dirty, ident, cmd, suite, label, rc,
                          "sources disagree%s" % ("; " + parsed["detail"]
                                                  if parsed["detail"] else ""))
         row["failures_unreadable"] = True
+    if focus and row["status"] == "OK":
+        leak_refusal = _focus_slice_leak_refusal(focus.get("slice"))
+        if leak_refusal:
+            # REPORT MODE DOES NOT CHANGE UNITTEST'S FOOTER. It can therefore
+            # exit 0 while naming the precise state that makes serial red and
+            # fresh workers green. Keep both measured signals honest (the
+            # child's zero exit and the census in the focus block), but the
+            # receipt's overall verdict is UNKNOWN and cannot bind.
+            row["status"] = "UNKNOWN"
+            row["detail"] = "focused slice result refused: %s" % leak_refusal
     # WHOSE failure is this? Only a whole-suite FAILED can ask: a custom
     # command's failure identities are not minted by unittest's protocol, and
     # any other status has nothing to attribute. The answer is advisory —
@@ -5535,6 +5726,7 @@ def _mint_result(repo, head, tree, dirty, ident, cmd, suite, label, rc,
     timing_event = _module_timing_event(
         row, module_timing or _unknown_timing("module timing was not captured")) \
         if suite and module_timing is not _NO_TIMING else None
+    loads_event = _module_loads_event(row, module_loads) if suite else None
     # AFTER the id, deliberately: see `_stderr_tail`. A red receipt that names
     # a failing test and destroys the only copy of WHY it failed is why this
     # exists, and it must never become something a reader can rely on.
@@ -5585,6 +5777,8 @@ def _mint_result(repo, head, tree, dirty, ident, cmd, suite, label, rc,
                     return False
             if timing_event:
                 eventledger.append_unlocked(path, timing_event)
+            if loads_event:
+                eventledger.append_unlocked(path, loads_event)
             if not eventledger.append_unlocked(path, row):
                 return False
             # THE LOCAL MINT RECORD, AFTER THE RECEIPT AND UNDER ITS LOCK
@@ -5728,6 +5922,12 @@ def _cross_tree_refusal(repo):
 # two independent measurements bracketing the run, not by the caller's word.
 
 FOCUS_POLICY = "changed+importers-v2"
+# THE RECORDED-LOADS POLICY (task/3039 lane 2, helm/gateloads.py): the
+# selection comes from what a whole-suite run RECORDED each test module
+# reaching, diffed from the record's own tree. The static closure above stays
+# the fallback for a tree with no usable record.
+FOCUS_POLICY_V3 = gateloads.POLICY
+FOCUS_POLICIES = (FOCUS_POLICY, FOCUS_POLICY_V3)
 
 # A focus block must fit inside one ledger event with the rest of its row
 # (eventledger.MAX_EVENT_BYTES = 64KB). A change big enough to blow this is a
@@ -6731,9 +6931,58 @@ def _unmapped_refusal(unmapped):
 def _names_path(text, path):
     """Does this source NAME the repo path? Either the path itself, or its
     last component as a whole quoted string literal — how `os.path.join`
-    spells a file. A name inside a longer word is not a name."""
-    base = path.rsplit("/", 1)[-1]
-    return path in text or ('"%s"' % base) in text or ("'%s'" % base) in text
+    spells a file. A name inside a longer word is not a name. ONE rule for
+    both policies: the recorded planner asks `gateloads.names_path`."""
+    return gateloads.names_path(text, path)
+
+
+#: The module whose `AUDITS` names the tree-wide audits, in every helm tree.
+_AUDIT_LIST = "helm.gateaudits"
+
+
+def _tree_audits(text):
+    """The dotted audit modules a tree's OWN audit list names, or None when
+    `text` (its `helm/gateaudits.py`, None when absent) holds no readable
+    list.
+
+    READ FROM THE TREE UNDER SELECTION, NEVER FROM THE RUNNING HELM. The
+    running helm's list belongs to whatever tree it was installed from: a
+    lane branched before an audit joined that list neither lists nor ships
+    the audit, so reading the running list refused every focused plan on
+    such a lane the moment one audit was added, and a helm upgraded between
+    a mint and its verdict re-derived a different selection than the mint
+    made. The source is parsed and never run: module-level assignments of
+    string tuples and their sums, which is how the list is spelled
+    (`AUDITS = ENUMERATORS + RUNG_ARMS`); `TreeAuditListArms` holds the
+    reader to the live list."""
+    if text is None:
+        return None
+    import ast
+    try:
+        body = ast.parse(text).body
+    except (SyntaxError, ValueError):
+        return None
+    names = {}
+
+    def value(node):
+        if isinstance(node, ast.Name):
+            return names[node.id]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return value(node.left) + value(node.right)
+        return ast.literal_eval(node)
+
+    for node in body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            try:
+                names[node.targets[0].id] = value(node.value)
+            except (KeyError, TypeError, ValueError):
+                names.pop(node.targets[0].id, None)
+    audits = names.get("AUDITS")
+    if not isinstance(audits, tuple) or not audits \
+            or not all(type(n) is str and n.isidentifier() for n in audits):
+        return None
+    return ["tests." + name for name in audits]
 
 
 def _focus_selection(files, changed):
@@ -6743,8 +6992,9 @@ def _focus_selection(files, changed):
 
     A changed PYTHON module selects its consumer closure (`_scope_selection`).
     A changed file with no import graph (a doc, a script, a data file)
-    selects every tree-wide audit (`gateaudits.AUDITS`) plus every test
-    module whose source names the path (`_names_path`). task/3039: that
+    selects every tree-wide audit the tree's own list names
+    (`_tree_audits`) plus every test module whose source names the path
+    (`_names_path`). task/3039: that
     refusal made `--focus` unusable for 79 of the week's 142 lane runs, 62 of
     them lanes whose only other files were `.md`.
 
@@ -6772,13 +7022,12 @@ def _focus_selection(files, changed):
         selected = []
         universe = sorted(m for m in files if _is_test_module(m))
     if unmapped:
-        from . import gateaudits
-        audits = ["tests." + name for name in gateaudits.AUDITS]
+        audits = _tree_audits((files.get(_AUDIT_LIST) or (None, None))[1])
         # THE FILES THAT EXIST, not the universe: a DELETED module joins the
         # universe (its importers must still resolve the edge), and a tree
         # that deleted an audit does not ship it.
         present = {mod for mod in files if _is_test_module(mod)}
-        if not set(audits) <= present:
+        if audits is None or not set(audits) <= present:
             return None, None, _unmapped_refusal(unmapped)
         named = [mod for mod in sorted(present)
                  if any(_names_path(files[mod][1], path)
@@ -6805,8 +7054,229 @@ def _single_merge_base(git, repo, trunk, tip, trunk_name):
     return bases[0], None
 
 
-def focus_plan(repo):
-    """The MEASURED scope of a focused run: -> (plan, err).
+_RECORD_PROBES = 12          # newest load records a planner will weigh
+_ANCESTOR_TREES = 4000       # how far back HEAD's history is read for trees
+
+
+def _record_receipt_refusal(event, receipt):
+    """Why `receipt` cannot vouch for the load record `event`, or None. A
+    record is used only when its run was a GREEN whole suite on exactly the
+    record's clean tree: a test that failed may have stopped before reaching
+    what it would reach passing."""
+    if not isinstance(receipt, dict):
+        return "its receipt is not in the ledger"
+    if receipt.get("suite") is not True or receipt.get("status") != "OK":
+        return "its receipt %s is not a green whole suite" % receipt.get("id")
+    if receipt.get("tree") != event.get("tree") \
+            or receipt.get("head") != event.get("head") \
+            or receipt.get("dirty") is not False \
+            or receipt.get("dirty_after") is not False:
+        return "its receipt %s names another or an unclean tree" \
+            % receipt.get("id")
+    return None
+
+
+def _load_records():
+    """Every usable load record, newest first. -> ([event], why when none)"""
+    rows, unavailable = eventledger.checked_events(receipts_path(),
+                                                   strict=True)
+    if unavailable:
+        return [], "the receipt ledger is unavailable (%s)" % unavailable
+    events = [r for r in rows if isinstance(r, dict)
+              and r.get("event") == gateloads.EVENT]
+    if not events:
+        return [], ("the receipt ledger holds no load record; a whole-suite "
+                    "gate of a helm tree writes one")
+    good, _skipped = _receipts_from(rows)
+    by_id = {r["id"]: r for r in good}
+    out = [e for e in reversed(events) if gateloads.event_error(e) is None
+           and _record_receipt_refusal(e, by_id.get(e.get("receipt"))) is None]
+    if not out:
+        return [], ("none of the ledger's %d load records belongs to a green "
+                    "whole-suite receipt of its own clean tree" % len(events))
+    return out, None
+
+
+def _chosen_record(repo, git):
+    """(event, record) the planner selects from, or (None, why).
+
+    A record whose tree is in HEAD's own history comes first (its diff to
+    HEAD is this lane's change and nothing else), newest first; otherwise the
+    newest record whose tree this repository holds at all. Any of them is
+    SOUND, because the diff is taken from the record's own tree: the choice
+    only decides how much a stale record over-selects."""
+    events, why = _load_records()
+    if not events:
+        return None, why
+    rc, out, _err = git.text(repo, "log", "--format=%T",
+                             "-n", str(_ANCESTOR_TREES), "HEAD")
+    ancestors = set((out or "").split()) if rc == 0 else set()
+    present = []
+    for event in events[:_RECORD_PROBES]:
+        rc, _out, _err = git.text(repo, "cat-file", "-e",
+                                  event["tree"] + "^{tree}")
+        if rc != 0:
+            continue
+        record, err = gateloads.read_event(event)
+        if err:
+            continue
+        if event["tree"] in ancestors:
+            return (event, record), None
+        present.append((event, record))
+    if present:
+        return present[0], None
+    return None, ("no usable load record's tree is in this repository "
+                  "(%d weighed)" % min(len(events), _RECORD_PROBES))
+
+
+def _changes_since(repo, git, t0, tip=None):
+    """Every path that differs from the record's tree `t0` to `tip` (the
+    worktree when None: staged, unstaged and untracked). -> (changed,
+    structural, err); `structural` holds the added, deleted and
+    type-changed paths, the ones a directory listing can see."""
+    args = ["diff", "--no-renames", "--name-status", "-z", t0] \
+        + ([tip] if tip else [])
+    rc, out, err = git.text(repo, *args)
+    if rc != 0:
+        return None, None, ("cannot diff the record's tree %s against %s: %s"
+                            % (t0[:12], (tip or "the worktree")[:12],
+                               err or "git exited %s" % rc))
+    tokens = [t for t in (out or "").split("\0") if t]
+    if len(tokens) % 2:
+        return None, None, "the diff from the record's tree is unreadable"
+    changed, structural = set(), set()
+    for status, path in zip(tokens[::2], tokens[1::2]):
+        changed.add(path)
+        if status[:1] in "ADT":
+            structural.add(path)
+    if tip is None:
+        rc, out, err = git.text(repo, "ls-files", "--others",
+                                "--exclude-standard", "-z")
+        if rc != 0:
+            return None, None, "cannot list untracked files: %s" % (
+                err or "git exited %s" % rc)
+        untracked = {p for p in (out or "").split("\0") if p}
+        changed |= untracked
+        structural |= untracked
+    return changed, structural, None
+
+
+def _tree_test_texts(repo, git, tip):
+    """{test module: source} for a COMMITTED tree, and its audit list's
+    source under `_AUDIT_LIST`, in two git calls (one listing, one batch
+    read), with `_tree_module_files`' symlink refusal. -> (texts, err)"""
+    rc, out, err = git.text(repo, "ls-tree", "-r", "-z", tip)
+    if rc != 0:
+        return None, "cannot read the tree of %s: %s" % (
+            tip[:12], err or "git exited %s" % rc)
+    wanted = []
+    for entry in (out or "").split("\0"):
+        if not entry.strip():
+            continue
+        meta, _tab, path = entry.partition("\t")
+        fields = meta.split()
+        if len(fields) < 3:
+            return None, "unreadable ls-tree entry %r in %s" % (
+                entry[:80], tip[:12])
+        if fields[0] == "120000" and _module_shaped(path):
+            return None, _SYMLINK_REFUSAL % path
+        mod = _module_name(path)
+        if mod and (_is_test_module(mod) or mod == _AUDIT_LIST):
+            wanted.append((mod, fields[2]))
+    rc, raw, err = git.run(repo, "cat-file", "--batch",
+                           stdin=("\n".join(sha for _m, sha in wanted)
+                                  + "\n").encode("ascii"))
+    if rc != 0:
+        return None, "cannot read the test sources of %s: %s" % (
+            tip[:12], os.fsdecode(err or b"").strip() or "git exited %s" % rc)
+    texts, at = {}, 0
+    for mod, sha in wanted:
+        end = raw.find(b"\n", at)
+        header = raw[at:end].split() if end >= 0 else []
+        if len(header) != 3 or header[0].decode("ascii", "replace") != sha \
+                or not header[2].isdigit():
+            return None, "the batch read of %s's test sources is unreadable" \
+                % tip[:12]
+        size = int(header[2])
+        texts[mod] = raw[end + 1:end + 1 + size].decode("utf-8", "replace")
+        at = end + 1 + size + 1
+    return texts, None
+
+
+def _v3_selection(record, texts, changed, structural):
+    """`gateloads.select` over one tree's test sources, `texts` also holding
+    its audit list's source (`_AUDIT_LIST`). -> (selected, universe, err);
+    refuses a tree that does not ship its own audit list and every module
+    the list names."""
+    audits = _tree_audits(texts.get(_AUDIT_LIST))
+    universe = {m for m in texts if _is_test_module(m)}
+    if audits is None:
+        return None, None, (
+            "this tree ships no readable tree-wide audit list (%s) for a "
+            "recorded selection to run" % _AUDIT_LIST)
+    missing = [m for m in audits if m not in universe]
+    if missing:
+        return None, None, (
+            "this tree does not ship the tree-wide audit %s that every "
+            "recorded selection runs" % ", ".join(missing[:4]))
+    selected = gateloads.select(record, universe, changed, structural,
+                                texts.get, audits)
+    return selected, sorted(universe), None
+
+
+def _focus_plan_v3(repo, git, trunk, mb, files, chosen):
+    """The recorded-loads plan: -> (plan, err, note). `note` set means this
+    record cannot serve and the static closure should: the tree does not
+    ship the audits a recorded selection runs, or its diff is too large to
+    record. A recorded plan is never refused where the static closure
+    would serve."""
+    event, record = chosen
+    changed, structural, err = _changes_since(repo, git, event["tree"])
+    if err:
+        return None, err, None
+    texts = {m: row[1] for m, row in files.items()
+             if _is_test_module(m) or m == _AUDIT_LIST}
+    selected, universe, err = _v3_selection(record, texts, changed,
+                                            structural)
+    if err:
+        return None, None, err
+    if set(selected) >= set(universe):
+        return None, ("the recorded selection covers every test module "
+                      "(%d/%d) — that is the whole suite by another name, "
+                      "and a focused run must not become its bypass; %s"
+                      % (len(selected), len(universe), _SUITE_ROUTE)), None
+    plan = {"policy": FOCUS_POLICY_V3, "trunk": trunk, "base": mb,
+            "record": event["id"], "t0": event["tree"],
+            "changed": sorted(changed), "selected": selected,
+            "universe": len(universe)}
+    if len(json.dumps(plan)) > _FOCUS_PLAN_BYTES:
+        return None, None, (
+            "the newest usable load record (%s, tree %s) differs from this "
+            "tree in %d files, too many to record in a focused scope"
+            % (event["id"], event["tree"][:12], len(changed)))
+    return plan, None, None
+
+
+def focus_plan(repo, policy=None):
+    """The MEASURED scope of a focused run: -> (plan, err). See
+    `focus_plan_explained`, which also says why a plan fell back."""
+    plan, err, _note = focus_plan_explained(repo, policy)
+    return plan, err
+
+
+def focus_plan_explained(repo, policy=None):
+    """The MEASURED scope of a focused run: -> (plan, err, note).
+
+    TWO POLICIES, ONE DOOR (task/3039 lane 2). With a usable LOAD RECORD in
+    the receipt ledger (`_chosen_record`) the plan is `FOCUS_POLICY_V3`: the
+    test modules whose recorded run reached a file that changed since the
+    record's tree (`gateloads.select`, `_focus_plan_v3`). Without one it is
+    the static closure described below (`FOCUS_POLICY`), and `note` says why
+    no record served; `note` is None for a v3 plan and for every refusal.
+    `policy` pins one: FOCUS_POLICY never reads the ledger, and
+    FOCUS_POLICY_V3 refuses rather than fall back.
+
+    THE STATIC CLOSURE (FOCUS_POLICY):
 
     plan = {"policy", "trunk", "base", "changed", "selected", "universe"} —
     changed is repo-relative file paths (committed, uncommitted, untracked,
@@ -6836,52 +7306,64 @@ def focus_plan(repo):
     ordinary call, so `consumes_all` stayed False and this plan came back
     confident and too small), which is why the rename map resolves a callee
     the way `_spawn_callee` always has."""
+    if policy not in (None, FOCUS_POLICY, FOCUS_POLICY_V3):
+        return None, "unknown focus policy %r" % (policy,), None
     git = vcs.backend(repo)
     trunk_name = git.trunk_ref(repo)
     trunk = git.head_sha(repo, ref=trunk_name)
     if not trunk:
         return None, "cannot resolve trunk (%s) to anchor a focused scope" \
-            % trunk_name
+            % trunk_name, None
     trunk = trunk.strip().lower()
     mb, err = _single_merge_base(git, repo, trunk, "HEAD", trunk_name)
     if err:
-        return None, err
+        return None, err, None
     changed = _changed_files(repo, git, mb)
     if changed is None:
         return None, ("cannot read the changed-file set against merge-base "
                       "%s — an unmeasurable scope must not narrow the gate"
-                      % mb[:12])
+                      % mb[:12]), None
     if not changed:
         return None, ("nothing changed against merge-base %s — there is no "
                       "scope to focus on. A lane room has nothing of its own "
                       "to test until it changes something; outside a lane "
                       "room of helm's own tree, the whole suite is `helm "
                       "gate run`, or `fab gate` on a host that refuses local "
-                      "suites" % mb[:12])
+                      "suites" % mb[:12]), None
     files, err = _worktree_module_files(repo)
     if err:
-        return None, err
+        return None, err, None
+    note = None
+    if policy != FOCUS_POLICY:
+        record, note = _chosen_record(repo, git)
+        if record is not None:
+            plan, err, note = _focus_plan_v3(repo, git, trunk, mb, files,
+                                             record)
+            if note is None:
+                return plan, err, None
+        if policy == FOCUS_POLICY_V3:
+            return None, note, None
     selected, universe, err = _focus_selection(files, changed)
     if err:
-        return None, err
+        return None, err, None
     if not selected:
         return None, ("no test module consumes %s — a focused run would "
                       "prove itself by running nothing. Write the test; "
                       "until then, %s"
-                      % (", ".join(sorted(changed)[:4]), _SUITE_ROUTE))
+                      % (", ".join(sorted(changed)[:4]), _SUITE_ROUTE)), None
     if set(selected) >= set(universe):
         return None, ("the consumer closure covers every test module "
                       "(%d/%d) — that is the whole suite by another name, "
                       "and a focused run must not become its bypass; %s"
-                      % (len(selected), len(universe), _SUITE_ROUTE))
+                      % (len(selected), len(universe), _SUITE_ROUTE)), None
     plan = {"policy": FOCUS_POLICY, "trunk": trunk, "base": mb,
             "changed": sorted(changed), "selected": selected,
             "universe": len(universe)}
     if len(json.dumps(plan)) > _FOCUS_PLAN_BYTES:
         return None, ("the focused scope is too large to record verifiably "
                       "(%d files, %d test modules); %s"
-                      % (len(changed), len(selected), _SUITE_ROUTE))
-    return plan, None
+                      % (len(changed), len(selected), _SUITE_ROUTE)), None
+    return plan, None, note
 
 
 def _focus_of(row):
@@ -6960,6 +7442,82 @@ def _executed_modules(out):
                     continuation = True
                 break
     return sorted(modules), ids
+
+
+def _focus_slice_block(ran, parsed, rc, selected):
+    """The `slice` entry of a SLICED focused receipt's focus block. -> dict
+
+    LEAK SAFETY, NOT COVERAGE AUTHORITY. The focused bind reads only this
+    block's leak census: an unreadable census, a disabled audit or any leak
+    refuses the row because fresh workers can otherwise hide a serial failure.
+    The RAN set still comes from the protocol exactly as a serial focused
+    run's does. So does the verdict, except that `_mint_result` turns an OK
+    into UNKNOWN whenever this census refuses (any of the three cases
+    above). The kind binds a cure round and never an APPROVE or a land
+    whichever runner produced it. It is bound into the id with the rest of
+    the block, so what it says about the run cannot be improved later.
+
+    `seconds` is each selected module's wall, in `selected` order -- a list,
+    not a map, because the module names are already in the row twice and the
+    row has to fit one ledger event -- and it is what the next round's
+    longest-first schedule reads (`recorded_module_seconds`). Evidence the
+    runner did not write, or that disagrees with the protocol it printed, is
+    recorded as unreadable, never repaired."""
+    block = {"runner": SLICE_RUNNER, "workers": ran.get("workers")}
+    ev = ran.get("evidence")
+    why = None
+    if not isinstance(ev, dict) or ev.get("kind") != "gateslice" \
+            or ev.get("scope") != "modules":
+        why = "the runner wrote no focused-scope evidence for this run"
+    else:
+        outcome = ev.get("outcome")
+        seconds = ev.get("seconds")
+        if not (isinstance(outcome, dict)
+                and parsed["status"] in ("OK", "FAILED")
+                and outcome.get("ran") == parsed["ran"]
+                and outcome.get("skipped") == (parsed["skipped"] or 0)
+                and outcome.get("ok") == (parsed["status"] == "OK")
+                and rc == (0 if parsed["status"] == "OK" else 1)):
+            why = "the runner's evidence disagrees with the protocol it printed"
+        elif not isinstance(seconds, dict) or not all(
+                _finite_nonnegative(seconds.get(m)) for m in selected):
+            why = "the runner's per-module seconds do not cover the selection"
+    if why:
+        block.update(seconds=None, unreadable=why)
+        return block
+    block.update({key: ev.get(key) for key in (
+        "workers", "schedule", "leak_mode", "leaks", "planned",
+        "inventory_digest")})
+    block["seconds"] = [round(float(seconds[m]), 3) for m in selected]
+    return block
+
+
+def _focus_slice_leak_refusal(block):
+    """Why a focused slice block cannot stand for its serial run, or None.
+
+    Report mode remains necessary until every selected module is clean under
+    the audit: unlike fail mode it does not alter unittest's protocol. That
+    cannot make its findings advisory. A leak is exactly the state a producer
+    can leave for a later serial consumer while fresh workers hide it, so both
+    the mint and every stored-row reader ask this one predicate."""
+    if block is None:
+        return None
+    if type(block) is not dict:
+        return "the focused slice leak census is not an object"
+    if block.get("unreadable"):
+        return "the focused slice leak census is unreadable: %s" % \
+            block["unreadable"]
+    mode, leaks = block.get("leak_mode"), block.get("leaks")
+    if mode not in ("report", "fail") or type(leaks) is not int or leaks < 0:
+        return ("the focused slice leak census has mode %r and count %r; "
+                "the audit must be report or fail with a readable count"
+                % (mode, leaks))
+    if leaks:
+        return ("the focused slice leak audit ran in %s mode and reported %d "
+                "leaking module%s; fresh workers can hide the serial state "
+                "that leak leaves behind" % (
+                    mode, leaks, "" if leaks == 1 else "s"))
+    return None
 
 
 def _declared_refusal(project, sentence):
@@ -7568,12 +8126,48 @@ def newest_slice_seconds():
     return newest["id"], newest["slice_authority"]["seconds"]
 
 
-def _slice_timings(slice_dir, outside=None):
+def recorded_module_seconds():
+    """Per-module seconds from every sliced run this ledger holds, the newest
+    measurement of each module winning. -> {module: seconds} or None
+
+    A whole sliced suite (v10) records every module in `slice_authority`; a
+    sliced focused run (v6) records the modules it selected in its focus
+    block's `slice.seconds`, in `selected` order. Merging them is what lets a
+    focused round's own timings order the next round's schedule. Advisory,
+    like every timing source: a value that is not a finite second count in
+    [0, 86400] against a module label is skipped."""
+    rows, _unavailable, _skipped = receipts()
+    out = {}
+    for row in rows:
+        if row.get("v") == SLICE_VERSION:
+            seconds = (row.get("slice_authority") or {}).get("seconds")
+            pairs = seconds.items() if isinstance(seconds, dict) else ()
+        elif row.get("v") == FOCUSED_VERSION:
+            focus = _focus_of(row)
+            block = focus.get("slice")
+            seconds = block.get("seconds") if isinstance(block, dict) else None
+            selected = focus.get("selected")
+            pairs = zip(selected, seconds) \
+                if isinstance(seconds, list) and isinstance(selected, list) \
+                and len(seconds) == len(selected) else ()
+        else:
+            continue
+        for label, value in pairs:
+            if isinstance(label, str) and _MODULE_LABEL.fullmatch(label) \
+                    and _finite_nonnegative(value) \
+                    and value <= _TIMINGS_MAX_SECONDS:
+                out[label] = value
+    return out or None
+
+
+def _slice_timings(slice_dir, outside=None, focused=False):
     """Write the per-module seconds the runner's longest-first schedule reads.
     -> path or None
 
     First source that validates wins: an explicit `--timings FILE`, then the
-    home's slice-timings.json, then the newest sliced receipt in this ledger.
+    home's slice-timings.json, then the newest sliced receipt in this ledger
+    (for a FOCUSED run: every sliced run the ledger holds, newest per module,
+    `recorded_module_seconds`, so the focused rounds' own timings count).
     An outside file that fails `read_slice_timings` is named on stderr and
     skipped, never trusted. Advisory throughout: no timings only means the
     runner claims modules in ascending order, which is slower and never wrong.
@@ -7589,7 +8183,8 @@ def _slice_timings(slice_dir, outside=None):
               "falls back to the next source" % (path, why), file=sys.stderr)
     try:
         if seconds is None:
-            _rid, seconds = newest_slice_seconds()
+            seconds = recorded_module_seconds() if focused \
+                else newest_slice_seconds()[1]
         if not seconds:
             return None
         path = os.path.join(slice_dir, "timings.json")
@@ -7600,34 +8195,63 @@ def _slice_timings(slice_dir, outside=None):
         return None
 
 
-def _slice_env(slice_dir, capacity, timings=None):
-    """The runner's contract: its granted workers, the leak audit in `fail`
-    mode, where to write its evidence, and what to schedule by."""
+def _slice_env(slice_dir, capacity, timings=None, focus_workers=None):
+    """The runner's contract: its granted workers, the leak audit's mode,
+    where to write its evidence, and what to schedule by.
+
+    `focus_workers` is a FOCUSED run's own ceiling (`focus_mode`: the
+    selection's size, or a Fab job's core grant); the workers are the fewer
+    of it and the host's grant.
+
+    THE LEAK AUDIT FAILS A WHOLE SLICED SUITE AND REPORTS ON A FOCUSED ONE.
+    `fail` is what lets a sliced suite stand for the serial one (v10's
+    authority clause), and every worker there loads the whole discovery, so a
+    finding does not depend on which modules were loaded. A focused round
+    loads only its selection, and whether a unit's leftover state is new
+    depends on what ran before it in its worker: measured, tests.test_gateshard
+    alone leaves HELM_ADOPTED_DIR and HELM_CHAT_ROOM set, which a whole
+    discovery had already set. Until that module is clean, report mode keeps
+    the finding diagnostic rather than rewriting unittest's result. It is not
+    advisory: `_focus_slice_leak_refusal` turns an unreadable or nonzero census
+    into an UNKNOWN, unbindable focused receipt, and every stored-row reader
+    asks the same predicate. Once focused runs can use fail mode, the runner
+    itself supplies the red protocol instead."""
+    workers = max(1, int((capacity or {}).get("slots") or 1)) \
+        * _CORES_PER_SUITE
+    if focus_workers is not None:
+        workers = max(1, min(workers, int(focus_workers)))
     env = {
         # The grant is in WORKERS, so the runner's own per-suite share must
         # not divide it again.
         "HELM_GATE_SUITE_CAP": "1",
-        "HELM_GATESLICE_WORKERS": str(
-            max(1, int((capacity or {}).get("slots") or 1)) * _CORES_PER_SUITE),
-        "HELM_GATESLICE_LEAKS": "fail",
+        "HELM_GATESLICE_WORKERS": str(workers),
+        "HELM_GATESLICE_LEAKS": "fail" if focus_workers is None else "report",
         "HELM_GATESLICE_EVIDENCE": os.path.join(slice_dir, "evidence.json"),
     }
-    timings = _slice_timings(slice_dir, timings)
+    timings = _slice_timings(slice_dir, timings,
+                             focused=focus_workers is not None)
     if timings:
         env["HELM_GATESLICE_TIMINGS"] = timings
     return env
 
 
-def _slice_evidence(slice_dir, runner_files):
-    """The runner's evidence plus the runner record, or None when the run
-    produced no readable verdict (the runner writes evidence only then)."""
+def _runner_evidence(slice_dir):
+    """The evidence object the slice runner wrote, or None: it writes one
+    only for a run that produced a readable verdict."""
     try:
         with open(os.path.join(slice_dir, "evidence.json"),
                   encoding="utf-8") as fh:
             evidence = json.load(fh)
     except (OSError, ValueError):
         return None
-    if not isinstance(evidence, dict) or not runner_files:
+    return evidence if isinstance(evidence, dict) else None
+
+
+def _slice_evidence(slice_dir, runner_files):
+    """The runner's evidence plus the runner record, or None when the run
+    produced no readable verdict (the runner writes evidence only then)."""
+    evidence = _runner_evidence(slice_dir)
+    if evidence is None or not runner_files:
         return None
     return dict(evidence, runner={"path": SLICE_RUNNER,
                                   "files": list(runner_files)})
@@ -7660,7 +8284,18 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
     in `focus_plan` keeps this from becoming the queue's own bypass. Custom
     diagnostic commands remain outside the queue and, as before, cannot bind
     a verdict. The receipt is written before this returns, so a claim can
-    never exist in a reviewer's terminal without existing on disk."""
+    never exist in a reviewer's terminal without existing on disk.
+
+    A FOCUSED SELECTION RUNS AS SLICES when `focus_mode` says so and the host
+    grants the slots (`_admit_suite` with this run's own intent, since it
+    holds no FIFO position): helm/gateslice.py's `--modules` scope, each
+    worker loading the selected modules the way the one serial process
+    does. Anything else runs serial, and the run SAYS which, and why, on
+    stderr: a small selection, a Fab job granted too few cores, a host too
+    small, or a host that granted no slots (a suite-scale selection then
+    refuses, as the serial run would). Either way the receipt is the focused
+    kind (v6) under the same binding rules; a sliced one carries the slice
+    evidence in its focus block."""
     repo = os.path.realpath(repo or os.getcwd())
     cross_err = _cross_tree_refusal(repo)
     if cross_err:
@@ -7675,10 +8310,17 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
         return None, ("gate run --sliced runs helm's whole suite; it does not "
                       "combine with --focus or a `--` command")
     plan = None
+    focus_workers = None
+    focus_why = None
     if focus:
-        plan, plan_err = focus_plan(repo)
+        plan, plan_err, plan_note = focus_plan_explained(repo)
         if plan_err:
             return None, plan_err
+        if plan_note:
+            sys.stderr.write("helm gate: NOTE — this focused run uses the "
+                             "static import closure (%s): %s\n"
+                             % (FOCUS_POLICY, plan_note))
+        _mode, focus_why, focus_workers = focus_mode(plan)
     suite = not argv and not focus
     command = None
     sidecar = None
@@ -7759,6 +8401,31 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
         capacity, admit_err = _admit_suite(topology=topology)
         if admit_err:
             return None, admit_err
+    focus_intent = None
+    if focus and focus_workers is not None:
+        # A SLICED FOCUSED RUN starts a worker per core, so it asks the host
+        # for the slots its workers need, like the sliced suite, and holds
+        # them under an intent of its own: it has no FIFO position to carry
+        # one, and a grant no intent records is priced at one slot by every
+        # other admission on this host.
+        guard = _guard_identity()
+        occupant = {"id": guard["id"], "pid": os.getpid(),
+                    "starttime": guard["launcher_start"], "holder": "focus"}
+        capacity, admit_err = _admit_suite(
+            topology=topology, occupant=occupant,
+            slots=-(-focus_workers // _CORES_PER_SUITE))
+        if not admit_err:
+            focus_intent = guard
+        elif len(plan["selected"]) * 2 > plan["universe"]:
+            # A suite-scale selection run serial would be refused by the same
+            # door: the cap and the memory-stall floor do not depend on the
+            # slot count.
+            return None, admit_err
+        else:
+            capacity = focus_workers = None
+            focus_why = ("the host granted no slots for slices, and a "
+                         "selection this small runs unadmitted: %s"
+                         % admit_err)
     elif focus and len(plan["selected"]) * 2 > plan["universe"]:
         # A suite-SCALE focused run occupies the same memory as the queued
         # kind, and it is the ORDINARY outcome rather than a rare one: any
@@ -7774,6 +8441,30 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
             return None, admit_err
     if focus and capacity is None:
         capacity = suite_capacity(topology=topology)
+    if focus and focus_workers is not None:
+        # The host's grant narrows the run's own ceiling: two workers a slot.
+        focus_workers = max(1, min(focus_workers, max(1, int(
+            capacity.get("slots") or 1)) * _CORES_PER_SUITE))
+        cmd = _focus_slice_argv(ident, plan["selected"])
+    if focus:
+        # SAID EITHER WAY, never silently: which runner this round used, and
+        # the one sentence that chose it.
+        sys.stderr.write(
+            "helm gate: NOTE — this focused run executes as SLICES: %d modules "
+            "on %d workers of %s\n" % (len(plan["selected"]), focus_workers,
+                                       gateslice.SCRIPT[-1])
+            if focus_workers is not None else
+            "helm gate: NOTE — this focused run executes SERIAL, in one "
+            "process: %s\n" % focus_why)
+
+    def release_focus_intent():
+        if focus_intent is not None:
+            err = _admission_release(focus_intent["id"])
+            if err:
+                sys.stderr.write("helm gate: WARNING — the sliced focused "
+                                 "run's admission intent was not released "
+                                 "(%s); it lapses when this process exits\n"
+                                 % err)
     timing_dir = timing_token = None
     timing_setup_reason = None
     # THE CHILD'S TMPDIR IS A ROOT THIS PROCESS OWNS AND REMOVES. tests/
@@ -7797,15 +8488,33 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
                 _ok, finish_err = _finish_position(repo, position, "REFUSED")
                 if finish_err:
                     reason = "%s; %s" % (reason, finish_err)
+            release_focus_intent()
             return None, reason
+    loads_dir = loads_marker = None
+    if suite and command["protocol"] == PROTOCOL_UNITTEST:
+        # THE LOAD RECORD (task/3039 lane 2): which repository files each
+        # test module reached, written by the runner (serial child or each
+        # slice worker) and every helm child a test starts. Advisory: a
+        # record that cannot be kept costs the focused planner its record,
+        # never this run.
+        try:
+            loads_dir = tempfile.mkdtemp(prefix="helm-gate-loads-")
+        except OSError:
+            loads_dir = None
     slice_dir = None
-    if sliced:
+    if sliced or focus_workers is not None:
         # The evidence the runner writes and the timings it schedules by live
         # here, outside the child's TMPDIR, and go with this run.
         try:
             slice_dir = tempfile.mkdtemp(prefix="helm-gate-slice-")
         except OSError as exc:
-            _ok, finish_err = _finish_position(repo, position, "REFUSED")
+            finish_err = _finish_position(repo, position, "REFUSED")[1] \
+                if position else None
+            release_focus_intent()
+            if scratch_root:
+                scratch.reap_owned(scratch_root)
+            if loads_dir:
+                shutil.rmtree(loads_dir, ignore_errors=True)
             reason = "slice scratch is unavailable: %s" % exc
             return None, reason if not finish_err else "%s; %s" % (
                 reason, finish_err)
@@ -7864,6 +8573,14 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
                 env.pop(key)
             if sliced:
                 env.update(_slice_env(slice_dir, capacity, timings))
+            if loads_dir:
+                loads_marker = _plant_loads_marker(repo, loads_dir)
+                # A window file inherited from an OUTER recorded run names
+                # that runner's windows, not this one's.
+                env.pop(gateloads.WINDOW_ENV, None)
+                env.update({gateloads.DIR_ENV: loads_dir,
+                            gateloads.ROOT_ENV: repo,
+                            gateloads.RUNNER_ENV: "1"})
             if timing_dir:
                 env.update({
                     "HELM_GATE_RECORD_DIR": timing_dir,
@@ -7919,9 +8636,20 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
                 if focus or custom_suite else os.environ.copy()
             if scratch_root:
                 child_env["TMPDIR"] = scratch_root
+            if slice_dir:
+                # The sliced focused run's contract is the sliced suite's,
+                # never an outer run's leftover evidence, timings or cap.
+                for key in [k for k in child_env
+                            if k.startswith("HELM_GATESLICE_")]:
+                    child_env.pop(key)
+                child_env.update(_slice_env(slice_dir, capacity,
+                                            focus_workers=focus_workers))
             try:
+                # A sliced focused run's cgroup token is the one its intent
+                # names, so the census prices the running root at its grant.
                 stdout, stderr, rc, run_err = _queued_process(
-                    repo, cmd, None, timeout, identity=_guard_identity(),
+                    repo, cmd, None, timeout,
+                    identity=focus_intent or _guard_identity(),
                     env=child_env)
                 if run_err:
                     return None, "gate command did not run: %s" % run_err
@@ -7939,6 +8667,26 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
                 timing_setup_reason or "module timing was not captured")
         slice_evidence = _slice_evidence(slice_dir, runner_files) \
             if sliced else None
+        # A sliced FOCUSED run's evidence rides its focus block, never the
+        # sliced suite's `slice_authority`: None when the run was serial,
+        # else the workers asked and what the runner wrote (or None).
+        focus_slice = {"workers": focus_workers,
+                       "evidence": _runner_evidence(slice_dir)} \
+            if focus and slice_dir else None
+        if focus_slice is not None:
+            # REPORTED BY THE RUNNER, FAILED CLOSED BY THE RECEIPT
+            # (`_focus_slice_leak_refusal`), and never silent either.
+            leaking = [line[len("gateslice leak: "):].split(":", 1)[0]
+                       for line in _ANSI.sub("", out or "").splitlines()
+                       if line.startswith("gateslice leak: ")]
+            if leaking:
+                sys.stderr.write(
+                    "helm gate: NOTE — %d selected module%s left process "
+                    "state other modules can see (the slice runner's leak "
+                    "audit, report mode): %s\n" % (
+                        len(leaking), "" if len(leaking) == 1 else "s",
+                        ", ".join(leaking[:8]) + (" and %d more" % (  # noqa: SILENT_CAP — the cut names its count ("and N more"); the receipt keeps the census
+                            len(leaking) - 8) if len(leaking) > 8 else "")))
         # THE REPOSITORY HELM'S OWN RUNNER RAN IN, as the identity every land
         # door compares (task/3066): read here, once, so the mint's own
         # bounded work opens no second git.
@@ -7947,6 +8695,8 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
             minter = gateimport._repo_identity(repo) or ""
         except Exception:                               # noqa: BLE001
             minter = ""
+        module_loads = _module_loads(repo, loads_dir, dirty, slice_evidence) \
+            if loads_dir else None
         try:
             row, minted, mint_err = _mint_result(
                 repo, head, tree, dirty, ident, cmd, suite, label, rc, started, out,
@@ -7955,7 +8705,8 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
                 if suite and not sliced
                 and command["protocol"] == PROTOCOL_UNITTEST
                 else _NO_TIMING, command=command, sidecar=sidecar,
-                slice=slice_evidence, minter=minter)
+                slice=slice_evidence, minter=minter,
+                module_loads=module_loads, focus_slice=focus_slice)
         except BaseException:
             if position:
                 _finish_position(repo, position)
@@ -7983,8 +8734,16 @@ def run(repo=None, argv=None, label=None, timeout=None, focus=False,
         # OURS: a gate that started after us owns the file now, and
         # deleting theirs would free a room whose suite is still running.
         _inflight_close(repo, inflight_nonce)
+        release_focus_intent()
         if timing_dir:
             shutil.rmtree(timing_dir, ignore_errors=True)
+        if loads_dir:
+            if loads_marker:
+                try:
+                    os.unlink(loads_marker)
+                except OSError:
+                    pass
+            shutil.rmtree(loads_dir, ignore_errors=True)
         if slice_dir:
             shutil.rmtree(slice_dir, ignore_errors=True)
         if scratch_root:
@@ -8043,13 +8802,18 @@ def receipts():
         # was a guard whose success path was exercised by every test and whose
         # failure path was exercised by none.
         return [], unavailable, 0
+    out, skipped = _receipts_from(rows)
+    return out, None, skipped
+
+
+def _receipts_from(rows):
+    """`receipts()` over rows already read. -> (receipts, skipped)"""
     chunks, skipped = _failure_chunks(rows)
     _timing_rows, _timing_poisoned, timing_skipped = _timings(rows)
     skipped += timing_skipped
     out = []
     for row in rows:
-        if isinstance(row, dict) and row.get("event") in (
-                _FAILURE_CHUNK_EVENT, _TIMING_EVENT):
+        if isinstance(row, dict) and row.get("event") in _SIBLING_EVENTS:
             continue
         # TOTAL BY CONSTRUCTION. Any row this loop cannot evaluate is a row the
         # ledger does not contain, never an exception in a caller's frame: one
@@ -8060,7 +8824,7 @@ def receipts():
             out.append(row)
         else:
             skipped += 1
-    return out, None, skipped
+    return out, skipped
 
 
 def _id_matches(row, chunks=None):
@@ -8129,8 +8893,7 @@ def unreadable_versions():
         return None
     out = {}
     for row in rows:
-        if isinstance(row, dict) and row.get("event") in (
-                _FAILURE_CHUNK_EVENT, _TIMING_EVENT):
+        if isinstance(row, dict) and row.get("event") in _SIBLING_EVENTS:
             continue
         # THE SAME PREDICATE THE FILTER USED, not a second opinion about it.
         if _id_matches(row):
@@ -8165,8 +8928,7 @@ def _stored_but_unverifiable(prefix):
         return None, None, None
     chunks, _skipped = _failure_chunks(rows)
     for row in rows:
-        if isinstance(row, dict) and row.get("event") in (
-                _FAILURE_CHUNK_EVENT, _TIMING_EVENT):
+        if isinstance(row, dict) and row.get("event") in _SIBLING_EVENTS:
             continue
         try:
             rid = str(row.get("id") or "")
@@ -8343,35 +9105,86 @@ NEED_LAND = "land"
 # `land_refusal`, the one predicate, directly or through bind(need=NEED_LAND),
 # and then `land_provenance_refusal` at its success exit (task/3066).
 # The data audit now makes a fail-mode sliced run of that tree FAILED, naming
-# tests._shared.VALUE; the refusal by kind stays until the flip is decided,
-# and that flip must also consult `sliced_land_disabled` below.
+# tests._shared.VALUE.
+#
+# THE FLIP IS EVIDENCE, NOT A SWITCH. A sliced receipt of these versions
+# authorizes a land only while the canary stands for slices
+# (`sliced_land_refusal`): no DISABLE marker, and a canary record
+# (helm/gatecanary.py `standing`) that holds, since its newest DIVERGED, a
+# clean one-pass finder run, a clean report-mode sliced whole suite, three
+# trees whose serial and fail-mode sliced receipts AGREE test for test with
+# their sliced runs on two hosts, a red tree whose real failures the
+# sliced run caught too, and compared evidence (the older receipt's own
+# stamp, never when the verdict was written) minted within 36 hours, which
+# HELM_GATE_CANARY_MAX_AGE_H may only tighten, since nothing else in the
+# record expires and a canary that stops speaking must stop admitting
+# slices. The receipt
+# itself must also
+# be one that can stand for the serial suite: well formed, its leak census
+# covering module data, its audit in fail mode with no leaking module. Every
+# other answer refuses, and a serial receipt is judged exactly as before.
 LANE_ONLY_VERSIONS = (SLICE_VERSION,)
 
 
-def land_refusal(row):
+def land_refusal(row, global_dir=None):
     """Why this receipt's KIND cannot authorize a land, or None.
 
     The kind decides, never the argv or the counts: a sliced receipt can be
     honest, green and bound to the exact tree and still miss a failure only
-    one serial process shows. Status, suite and tree stay each door's own
-    clauses; this answers only the question the kind owns. The door's LAST
-    question, provenance, is `land_provenance_refusal`.
+    one serial process shows, so it is admitted only on the canary's
+    evidence (`sliced_land_refusal`). Status, suite and tree stay each door's
+    own clauses; this answers only the question the kind owns. The door's
+    LAST question, provenance, is `land_provenance_refusal`.
     """
     if isinstance(row, dict) and row.get("v") in LANE_ONLY_VERSIONS:
-        return ("receipt %s is a sliced receipt: a land needs a serial "
-                "whole-suite receipt; a sliced receipt binds lane tips only "
-                "(task/3039). Gate the tree being landed with `helm gate "
-                "window launch --repo <room>`" % (row.get("id")
-                                                  or "<unidentified>"))
+        why = _sliced_receipt_refusal(row) or sliced_land_refusal(global_dir)
+        if why:
+            return ("receipt %s is a sliced receipt: a land needs a serial "
+                    "whole-suite receipt until the canary stands for slices "
+                    "(task/3039), and %s. Gate the tree being landed serial "
+                    "with `helm gate window launch --repo <room>`"
+                    % (row.get("id") or "<unidentified>", why))
     return None
+
+
+def _sliced_receipt_refusal(row):
+    """Why this sliced receipt cannot stand for the serial suite, whatever
+    the canary says, or None."""
+    why = slice_refusal(row)
+    if why:
+        return why
+    auth = row["slice_authority"]
+    if auth["v"] < SLICE_DATA_AUDIT_EVIDENCE:
+        return ("its leak census (evidence v%d) predates the module-data "
+                "audit, which a sliced land needs (v%d)"
+                % (auth["v"], SLICE_DATA_AUDIT_EVIDENCE))
+    return _slice_authority_refusal(row)
+
+
+def sliced_land_refusal(global_dir=None):
+    """Why no sliced receipt may authorize a land right now, or None.
+
+    The DISABLE marker first (`sliced_land_disabled`), then the canary
+    record's standing (`gatecanary.standing`). Each answer names what is
+    missing and the move that supplies it. A record that cannot be read
+    refuses: nothing here ever reads an absence of evidence as consent."""
+    why = sliced_land_disabled(global_dir)
+    if why:
+        return why
+    from . import gatecanary
+    try:
+        return gatecanary.standing(global_dir)["why"]
+    except Exception as exc:        # noqa: BLE001 -- fail closed, say why
+        return ("the canary record could not be read (%s: %s), so it stands "
+                "for nothing" % (type(exc).__name__, exc))
 
 
 # THE CANARY'S VETO (task/3039). helm/gatecanary.py runs one serial and one
 # sliced whole suite of trunk's tip each night and compares them test by
-# test; on any divergence it writes this marker. NOTHING READS IT YET, because
-# `land_refusal` above refuses every sliced receipt by kind. It exists so
-# that the flip, when it is decided, has one predicate to consult beside the
-# kind: while the marker stands, a sliced receipt authorizes no land.
+# test; on any divergence (its own, a `compare`'s or a train shadow's) it
+# writes this marker. `sliced_land_refusal` asks it before anything else:
+# while the marker stands, a sliced receipt authorizes no land, whatever the
+# canary record holds.
 SLICED_LAND_MARKER = os.path.join(".state", "gate-canary",
                                   "sliced-land-disabled.json")
 
@@ -8395,8 +9208,9 @@ def sliced_land_disabled(global_dir=None):
         return None
     except (OSError, ValueError) as exc:
         return ("the sliced-land marker %s cannot be read (%s); sliced "
-                "receipts stay refused at land until it is read or cleared "
-                "with `helm gate canary clear --reason ...`" % (path, exc))
+                "receipts stay refused at land until it is repaired, then "
+                "cleared with `helm gate canary clear --reason ...`" %
+                (path, exc))
     if not isinstance(marker, dict):
         marker = {}
     return ("the gate canary saw serial and sliced disagree on tree %s since "
@@ -8671,13 +9485,73 @@ def _bind_focused(row, tip, head, repo_id):
             "focused receipt binds only the exact tree its scope was "
             "measured against; re-run `helm gate run --focus` on the "
             "reviewed tip" % (row["id"], head[:12], tip[:12]))
+    if focus.get("policy") == FOCUS_POLICY_V3:
+        state, rid, scope = _v3_scope(row, focus, tip, repo_id)
+    else:
+        state, rid, scope = _v2_scope(row, focus, tip, repo_id)
+    if state:
+        return state, rid, scope
+    # THE HALF OF THE FOCUSED BIND NO TREE CAN ANSWER: what the RUNNER
+    # reported, weighed against the re-derived selection. `record` names the
+    # load record a recorded scope came from (None for the static closure).
+    derived_sel, universe, changed, record = scope
+    executed = focus.get("executed")
+    if not isinstance(executed, list) \
+            or not all(isinstance(m, str) for m in executed):
+        return "REFUSED", row["id"], (
+            "focused receipt %s records no readable RAN set — the selection "
+            "is only what was asked for, and a receipt that cannot say what "
+            "the runner reported proves nothing about coverage; re-run `helm "
+            "gate run --focus` on the reviewed tip" % row["id"])
+    never_ran = sorted(set(derived_sel) - set(executed))
+    if never_ran:
+        return "REFUSED", row["id"], (
+            "focused receipt %s selected %s and the runner never reported a "
+            "test from %s — the consumer closure was asked for and not "
+            "measured, so this receipt covers less than its scope claims"
+            % (row["id"],
+               "them" if len(never_ran) > 1 else "it",
+               ", ".join(never_ran[:4])
+               + (" (+%d more)" % (len(never_ran) - 4)
+                  if len(never_ran) > 4 else "")))
+    ids, ran = focus.get("executed_ids"), row.get("ran")
+    if type(ids) is not int or ids < 0:
+        return "REFUSED", row["id"], (
+            "focused receipt %s records no test-id count from its runner — "
+            "the RAN set it reports cannot be weighed against the run's own "
+            "summary" % row["id"])
+    if type(ran) is not int or ids > ran:
+        return "REFUSED", row["id"], (
+            "focused receipt %s reports %d test ids from a run whose own "
+            "summary says it ran %s — a reader that matched more ids than "
+            "the runner executed was matching something other than test "
+            "ids, and the module set it derived cannot be trusted to say "
+            "what ran" % (row["id"], ids, ran))
+    scope = "scope covers the %d-file reviewed diff" % changed \
+        if record is None else (
+            "recorded selection from load record %s covers the %d-file diff "
+            "since its tree %s" % (record[0], changed, record[1][:12]))
+    return "VERIFIED", row["id"], (
+        "%s on %s@%s — FOCUSED %d/%d, %s, "
+        "runner reported %d test%s across %d module%s"
+        % (interpreter_label(_ident_of(row)), tip[:12],
+           host_label(_host_of(row)), len(derived_sel), universe, scope,
+           ids, "" if ids == 1 else "s",
+           len(executed), "" if len(executed) == 1 else "s"))
+
+
+def _v2_scope(row, focus, tip, repo_id):
+    """The STATIC-CLOSURE arm of the focused bind. -> (state, rid, scope):
+    a refusal triple, or (None, None, (selection, universe size, changed
+    count, None)). Every field re-derived as `_bind_focused` describes."""
     if focus.get("policy") != FOCUS_POLICY:
         return "REFUSED", row["id"], (
             "focused receipt %s was planned under policy %r and this binder "
-            "re-derives %r — a scope this reader cannot reproduce cannot be "
+            "re-derives %s — a scope this reader cannot reproduce cannot be "
             "checked, and an unchecked scope never binds; re-run `helm gate "
             "run --focus` on the reviewed tip"
-            % (row["id"], focus.get("policy"), FOCUS_POLICY))
+            % (row["id"], focus.get("policy"),
+               " or ".join(repr(p) for p in FOCUS_POLICIES)))
     base = str(focus.get("base") or "").strip().lower()
     if not _SHA.fullmatch(base):
         return "REFUSED", row["id"], (
@@ -8783,45 +9657,156 @@ def _bind_focused(row, tip, head, repo_id):
             "reviewed tree holds %d — the ratio on its evidence line "
             "describes some other tree" % (row["id"], focus.get("universe"),
                                            len(derived_universe)))
-    executed = focus.get("executed")
-    if not isinstance(executed, list) \
-            or not all(isinstance(m, str) for m in executed):
-        return "REFUSED", row["id"], (
-            "focused receipt %s records no readable RAN set — the selection "
-            "is only what was asked for, and a receipt that cannot say what "
-            "the runner reported proves nothing about coverage; re-run `helm "
-            "gate run --focus` on the reviewed tip" % row["id"])
-    never_ran = sorted(set(derived_sel) - set(executed))
-    if never_ran:
-        return "REFUSED", row["id"], (
-            "focused receipt %s selected %s and the runner never reported a "
-            "test from %s — the consumer closure was asked for and not "
-            "measured, so this receipt covers less than its scope claims"
-            % (row["id"],
-               "them" if len(never_ran) > 1 else "it",
-               ", ".join(never_ran[:4])
-               + (" (+%d more)" % (len(never_ran) - 4)
-                  if len(never_ran) > 4 else "")))
-    ids, ran = focus.get("executed_ids"), row.get("ran")
-    if type(ids) is not int or ids < 0:
-        return "REFUSED", row["id"], (
-            "focused receipt %s records no test-id count from its runner — "
-            "the RAN set it reports cannot be weighed against the run's own "
-            "summary" % row["id"])
-    if type(ran) is not int or ids > ran:
-        return "REFUSED", row["id"], (
-            "focused receipt %s reports %d test ids from a run whose own "
-            "summary says it ran %s — a reader that matched more ids than "
-            "the runner executed was matching something other than test "
-            "ids, and the module set it derived cannot be trusted to say "
-            "what ran" % (row["id"], ids, ran))
-    return "VERIFIED", row["id"], (
-        "%s on %s@%s — FOCUSED %d/%d, scope covers the %d-file reviewed diff, "
-        "runner reported %d test%s across %d module%s"
-        % (interpreter_label(_ident_of(row)), tip[:12],
-           host_label(_host_of(row)), len(derived_sel),
-           len(derived_universe), len(derived), ids, "" if ids == 1 else "s",
-           len(executed), "" if len(executed) == 1 else "s"))
+    return None, None, (derived_sel, len(derived_universe), len(derived),
+                        None)
+
+
+def _v3_scope(row, focus, tip, repo_id):
+    """The RECORDED-LOADS arm of the focused bind. -> (state, rid, scope):
+    a refusal triple, or (None, None, (selection, universe size, changed
+    count, (record id, T0))).
+
+    EVERY FIELD IS RE-DERIVED, as the static arm re-derives its own: the
+    base against the standing repository's trunk; the RECORD from the
+    ledger by the id the scope names (its content id, payload digest and
+    its receipt's green clean whole suite on the same tree, exactly as the
+    planner demanded); the changed set from the record's tree T0 to the
+    reviewed tip, never from the merge-base; and the selection from that
+    record, that diff and the tip's own committed test sources, through the
+    planner's one rule (`_v3_selection`). A scope whose selection differs
+    from the re-derived one in either direction refuses.
+
+    NOT HERE IS NOT FALSE. A routed mint selects from its own box's ledger,
+    and this host may never have imported that record, or holds it about a
+    tree this repository lacks. Nothing here can re-derive such a scope and
+    nothing here proves it wrong, so it answers UNVERIFIED and names no
+    receipt: a cure-round verdict then records what a tokenless one records,
+    where a refusal would fail the verdict, and no door above the cure round
+    reads a focused receipt at all."""
+    rid = row["id"]
+
+    def refuse(why):
+        return "REFUSED", rid, why
+
+    def not_here(why):
+        return "UNVERIFIED", None, why
+
+    base = str(focus.get("base") or "").strip().lower()
+    t0 = str(focus.get("t0") or "").strip().lower()
+    record_id = focus.get("record")
+    if not _SHA.fullmatch(base) or not _SHA.fullmatch(t0) \
+            or not isinstance(record_id, str) or not record_id:
+        return refuse("focused receipt %s records no full-sha base, record "
+                      "tree or record id — its recorded scope cannot be "
+                      "re-derived, so it cannot be checked" % rid)
+    recorded = focus.get("changed")
+    recorded_sel = focus.get("selected")
+    if not isinstance(recorded, list) \
+            or not all(isinstance(p, str) for p in recorded) \
+            or not isinstance(recorded_sel, list) \
+            or not all(isinstance(m, str) for m in recorded_sel):
+        return refuse("focused receipt %s's recorded changed-set or "
+                      "selection is unreadable — an uncheckable scope "
+                      "refuses" % rid)
+    repo = str(repo_id or "")
+    if not os.path.isabs(repo) or os.path.realpath(repo) != repo \
+            or not os.path.isdir(repo):
+        return refuse("standing dispatch repository is unreadable — the "
+                      "recorded scope cannot be re-measured against the "
+                      "reviewed tip, and a scope nobody re-measures is a "
+                      "guard fed its own answer")
+    git = vcs.backend(repo)
+    trunk_name = git.trunk_ref(repo)
+    trunk = (git.head_sha(repo, ref=trunk_name) or "").strip().lower()
+    if not trunk:
+        return refuse("the standing repository cannot resolve trunk (%s), so "
+                      "the recorded base cannot be re-derived" % trunk_name)
+    derived_base, mb_err = _single_merge_base(git, repo, trunk, tip,
+                                              trunk_name)
+    if mb_err:
+        return refuse(mb_err)
+    if derived_base != base:
+        return refuse("focused receipt %s records base %s but the standing "
+                      "repository derives merge-base %s for this tip"
+                      % (rid, base[:12], derived_base[:12]))
+    rows, unavailable = eventledger.checked_events(receipts_path(),
+                                                   strict=True)
+    if unavailable:
+        return refuse("the receipt ledger is unavailable (%s), so load "
+                      "record %s cannot be read" % (unavailable, record_id))
+    hits = [r for r in rows if isinstance(r, dict)
+            and r.get("event") == gateloads.EVENT and r.get("id") == record_id]
+    if not hits:
+        return not_here("focused receipt %s names load record %s and this "
+                        "host's receipt ledger holds no such record — a "
+                        "routed mint selects from its box's ledger, and a "
+                        "scope nothing here can re-derive is not checked "
+                        "here" % (rid, record_id))
+    event = hits[0]
+    if any(gateloads.canonical(h) != gateloads.canonical(event)
+           for h in hits):
+        return refuse("load record %s appears with different content — "
+                      "neither copy is trusted" % record_id)
+    record, err = gateloads.read_event(event)
+    if err:
+        return refuse("load record %s is unreadable: %s" % (record_id, err))
+    if event["tree"] != t0:
+        return refuse("focused receipt %s names T0 %s and its load record "
+                      "%s was made on %s" % (rid, t0[:12], record_id,
+                                             event["tree"][:12]))
+    good, _skipped = _receipts_from(rows)
+    receipt = next((r for r in good if r.get("id") == event["receipt"]), None)
+    why = _record_receipt_refusal(event, receipt)
+    if why:
+        return refuse("load record %s cannot vouch for a selection: %s"
+                      % (record_id, why))
+    rc, _out, _err = git.text(repo, "cat-file", "-e", t0 + "^{tree}")
+    if rc != 0:
+        return not_here("the record's tree %s is not in the standing "
+                        "repository, so the diff from it cannot be "
+                        "re-derived here" % t0[:12])
+    derived, structural, err = _changes_since(repo, git, t0, tip)
+    if err:
+        return refuse(err)
+    uncovered = sorted(derived - set(recorded))
+    phantom = sorted(set(recorded) - derived)
+    if uncovered or phantom:
+        return refuse(
+            "focused receipt %s's recorded changed-set differs from the diff "
+            "%s..%s the standing repository derives%s%s — re-run `helm gate "
+            "run --focus` on the clean reviewed tip"
+            % (rid, t0[:12], tip[:12],
+               (" (it omits %s)" % ", ".join(uncovered[:4])) if uncovered
+               else "",
+               (" (it adds %s)" % ", ".join(phantom[:4])) if phantom else ""))
+    texts, err = _tree_test_texts(repo, git, tip)
+    if err:
+        return refuse("the reviewed tree cannot be re-read for scope "
+                      "derivation: %s" % err)
+    derived_sel, universe, err = _v3_selection(record, texts, derived,
+                                               structural)
+    if err:
+        return refuse("the recorded selection cannot be re-derived at %s: %s"
+                      % (tip[:12], err))
+    if sorted(recorded_sel) != derived_sel:
+        missing = sorted(set(derived_sel) - set(recorded_sel))
+        extra = sorted(set(recorded_sel) - set(derived_sel))
+        return refuse(
+            "focused receipt %s's recorded selection disagrees with the "
+            "selection re-derived from load record %s at %s%s%s — the "
+            "selection is the receipt's whole claim, and this reader only "
+            "takes the one it derives itself" % (
+                rid, record_id, tip[:12],
+                (" (never ran: %s)" % ", ".join(missing[:4])) if missing
+                else "",
+                (" (claims modules the record does not select: %s)"
+                 % ", ".join(extra[:4])) if extra else ""))
+    if focus.get("universe") != len(universe):
+        return refuse("focused receipt %s records a %s-module test universe "
+                      "and the reviewed tree holds %d"
+                      % (rid, focus.get("universe"), len(universe)))
+    return None, None, (derived_sel, len(universe), len(derived),
+                        (record_id, t0))
 
 
 def _declared_row_refusal(row):
@@ -9109,6 +10094,21 @@ def row_refusal(row, about="", consuming_repo=None):
             or slice_tree_refusal(row, consuming_repo or row.get("repo_id"))
         if refusal:
             return refusal
+    if row.get("v") == FOCUSED_VERSION and row.get("suite") is not False:
+        # THE VERSION AND THE FLAG AGREE, or the row is a focused scope
+        # wearing the whole-suite word: v6 is minted only for a focused run,
+        # whose flag reads false, and a re-flagged row bound an approve.
+        return ("receipt %s is the focused kind (v%d) and records suite %r — "
+                "that kind proves the tests its scope selected, never the "
+                "whole suite" % (row.get("id") or "<unidentified>",
+                                 FOCUSED_VERSION, row.get("suite")))
+    if row.get("v") == FOCUSED_VERSION:
+        focus = _focus_of(row)
+        refusal = _focus_slice_leak_refusal(
+            focus.get("slice") if isinstance(focus, dict) else None)
+        if refusal:
+            return "focused receipt %s refused: %s" % (
+                row.get("id") or "<unidentified>", refusal)
     for field in ("id", "head", "tree", "dirty", "status", "rc"):
         if field not in row:
             return ("receipt %s carries no %r field — a reader that DEFAULTS a "
@@ -9222,9 +10222,11 @@ def bind(evidence, reviewed_tip, repo_id=None, reviewed_ts=None,
                             lane tip). Only a whole-suite receipt satisfies
                             it, serial or sliced.
       NEED_LAND             NEED_SUITE, and the receipt's KIND may authorize
-                            a land: `land_refusal` refuses the sliced kind,
-                            so only a serial whole-suite receipt satisfies
-                            it; and, LAST, its PROVENANCE: an authenticated
+                            a land: `land_refusal` admits a serial
+                            whole-suite receipt, and a sliced one only while
+                            the canary stands for slices
+                            (`sliced_land_refusal`); and, LAST, its
+                            PROVENANCE: an authenticated
                             door (a local mint, a Fab completion, a routed
                             custody) placed it in the repository the caller
                             names (`repo_id`, else `consuming_repo`), never
@@ -9236,9 +10238,11 @@ def bind(evidence, reviewed_tip, repo_id=None, reviewed_ts=None,
                             after this reader RE-DERIVES the changed set from
                             the standing repository and proves the recorded
                             scope covers it — a scope nobody re-measures is a
-                            guard fed its own answer. A whole-suite receipt
-                            also satisfies it: strength covers weakness,
-                            never the reverse.
+                            guard fed its own answer. A recorded scope whose
+                            load record or record tree this host lacks is
+                            UNVERIFIED, naming no receipt (`_v3_scope`). A
+                            whole-suite receipt also satisfies it: strength
+                            covers weakness, never the reverse.
 
     Exact-tip receipts retain their historical binding. A later whole-suite
     receipt may also bind when the standing dispatch repository proves the
@@ -9497,6 +10501,9 @@ def bind(evidence, reviewed_tip, repo_id=None, reviewed_ts=None,
                     "since a patch-id miss never proves absence",
                 vcs.PATCH_SEQUENCE_EMPTY:
                     "the review's patch sequence is empty",
+                vcs.PATCH_SEQUENCE_BACKWARD:
+                    "its copy of the reviewed patches sits on an older trunk "
+                    "point than the reviewed tip does",
                 vcs.PATCH_SEQUENCE_UNKNOWN:
                     "its ordered patch sequence cannot be derived",
             }.get(state, "its ordered patch sequence is unclassified")
@@ -9542,8 +10549,9 @@ USAGE = ("usage: helm gate run [--focus [--plan]] "
          "[--supersede] ...\n"
          "       (a whole suite REFUSES in a lane room, and on a tree that "
          "already holds a\n"
-         "        whole-suite receipt; a compose room launches through "
-         "`gate window launch`)\n"
+         "        green whole-suite receipt that can land it, or a red one "
+         "without --again;\n"
+         "        a compose room launches through `gate window launch`)\n"
          "       (no mode flag: SLICES in a lane, peek, seat or harness room, "
          "whose receipt\n"
          "        never authorizes a land; SERIAL everywhere else, in a "
@@ -9556,13 +10564,17 @@ USAGE = ("usage: helm gate run [--focus [--plan]] "
          "[--id RECEIPT-ID]\n"
          "       helm gate fab contract|reconcile|detached ...\n"
          "       helm gate window launch [--repo PATH] [--label TEXT] "
-         "[--trunk REF] [--supersede]\n"
+         "[--trunk REF] [--supersede] [--serial]\n"
          "       helm gate window show [--recover]\n"
-         "       helm gate audits [--repo PATH] [--json] [-- <test module>...]\n"
+         "       helm gate audits [--repo PATH] [--json] [--serial] "
+         "[-- <test module>...]\n"
          "       helm gate provenance [--activate] [--json]\n"
          "       helm gate slice-timings\n"
          "       helm gate canary [status] | run [--repo PATH] | compare "
-         "<serial-id> <sliced-id> | clear --reason TEXT | --install-timer")
+         "<serial-id> <sliced-id> | catch <serial-id> <sliced-id> | finder "
+         "[--repo PATH] [--ref REF] | clear --reason TEXT | --install-timer "
+         "[--host HOST]\n"
+         "       helm gate shadow [status] [--json] | run | --install-timer")
 
 
 def _fmt(row):
@@ -9612,6 +10624,10 @@ def _show_focus(row):
     print("  %-10s %s  base %s" % (
         "focus", _failure_text(focus.get("policy")) or "?",
         (_failure_text(focus.get("base")) or "?")[:12]))
+    if "record" in focus or "t0" in focus:
+        print("    record    %s  T0 %s" % (
+            _failure_text(focus.get("record")) or "?",
+            _failure_text(focus.get("t0")) or "?"))
     for path in changed if isinstance(changed, list) else ():
         print("    changed   %s" % _failure_text(path))
     for mod in selected if isinstance(selected, list) else ():
@@ -9633,6 +10649,29 @@ def _show_focus(row):
         len(ran), universe if type(universe) is int else "?",
         len(selected) if isinstance(selected, list) else "?",
         ids if type(ids) is int else "?"))
+    if "slice" not in focus:
+        return
+    block = focus["slice"]
+    if not isinstance(block, dict):
+        print("    slices    UNREADABLE (stored slice evidence is not a mapping)")
+        return
+    if block.get("unreadable") is not None:
+        print("    slices    %s workers; evidence unreadable: %s" % (
+            _failure_text(str(block.get("workers"))) or "?",
+            _failure_text(block.get("unreadable")) or "?"))
+        return
+    print("    slices    %s workers, %s, leak audit %s (%s leaking)" % (
+        _failure_text(str(block.get("workers"))) or "?",
+        _failure_text(block.get("schedule")) or "?",
+        _failure_text(block.get("leak_mode")) or "?",
+        _failure_text(str(block.get("leaks"))) or "?"))
+    seconds = block.get("seconds")
+    if isinstance(seconds, list) and isinstance(selected, list) \
+            and len(seconds) == len(selected):
+        slowest = sorted(((s, m) for m, s in zip(selected, seconds)
+                          if _finite_nonnegative(s)), reverse=True)[:3]
+        print("    slowest   %s" % ", ".join(
+            "%s %.1fs" % (_failure_text(m), s) for s, m in slowest))
 
 
 def trunk_standing(row, root=None):
@@ -10011,6 +11050,9 @@ def _gate_dispatch(args):
     if sub == "canary":
         from . import gatecanary
         return gatecanary.cmd(rest)
+    if sub == "shadow":
+        from . import gateshadow
+        return gateshadow.cmd(rest)
     if sub == "provenance":
         from . import gateimport
         return gateimport.cmd_provenance(rest)
@@ -10129,18 +11171,28 @@ def tree_suite_receipt(top):
     red answer. A dirty checkout names no tree a receipt can hold, so it has no
     answer here. A row `row_refusal` refuses (dirty, moved, unnamed) is no
     answer about any tree."""
+    rows, unreadable = tree_suite_receipts(top)
+    return (rows[-1] if rows else None), unreadable
+
+
+def tree_suite_receipts(top):
+    """(rows, unreadable) — EVERY whole-suite receipt the ledger holds for
+    this checkout's exact CLEAN tree, oldest first, under
+    `tree_suite_receipt`'s rules."""
     head, tree, dirty, err = tree_state(top)
     if err or dirty is not False or not tree:
-        return None, None
+        return [], None
     rows, unavailable, _skipped = receipts()
     if unavailable:
-        return None, unavailable
-    found = None
-    for row in rows:
-        if row.get("suite") is True and row.get("tree") == tree \
-                and row_refusal(row, consuming_repo=top) is None:
-            found = row
-    return found, None
+        return [], unavailable
+    return [row for row in rows
+            if row.get("suite") is True and row.get("tree") == tree
+            and row_refusal(row, consuming_repo=top) is None], None
+
+
+def _suite_kind(row):
+    """SLICED or SERIAL: the kind of one whole-suite receipt."""
+    return SLICED if row.get("v") == SLICE_VERSION else SERIAL
 
 
 def _touched_tests(top):
@@ -10189,7 +11241,8 @@ def _focused_route(top):
             "import` refuses a focused artifact. The floor, from the audits "
             "and this lane's own test modules (add the consumers `--focus "
             "--plan` names):",
-            "      " + gateaudits.command(top, touched),
+            "      " + gateaudits.command(
+                top, touched, gateaudits.mode(top, touched)[0]),
             "  On a box that may run suites, the focused gate mints a "
             "cure-round receipt:",
             "      helm gate run --repo %s --focus" % top]
@@ -10207,9 +11260,11 @@ def whole_suite_door(repo, why=None, again=False, mode="local", canary=None):
 
     `canary` is the kind (SERIAL or SLICED) a run asks for under
     CANARY_ENV: the nightly canary (helm/gatecanary.py) needs ONE receipt of
-    each kind on trunk's tree, so a run of the OTHER kind than the tree's
-    last whole-suite receipt is admitted, labelled `canary`. A second run of
-    the same kind is refused exactly as before.
+    each kind on trunk's tree, so a run of a kind this tree holds NO receipt
+    of is admitted, labelled `canary`. A run of a kind the tree already holds
+    is refused exactly as before, whatever kind came last: judging by the
+    LAST receipt alone admitted serial, sliced, serial, ... forever, each
+    run the other kind of the one before it.
 
     A TREE THAT DOES NOT SHIP HELM IS ADMITTED UNREAD: these are helm's own
     landing rules, and an adopter project keeps its own."""
@@ -10222,41 +11277,71 @@ def whole_suite_door(repo, why=None, again=False, mode="local", canary=None):
     kind, top = gate_room(repo)
     policy = _POLICY if mode == "plan" else ""
     label, notes = [], []
-    prior, unreadable = tree_suite_receipt(top)
+    held, unreadable = tree_suite_receipts(top)
+    prior = held[-1] if held else None
     crossing = canary is not None and prior is not None \
-        and (prior.get("v") == SLICE_VERSION) != (canary == SLICED)
+        and all(_suite_kind(row) != canary for row in held)
     if unreadable:
-        notes.append("the receipt ledger could not be read (%s), so the "
-                     "one-suite-per-tree door proved nothing and let this "
-                     "through" % unreadable)
-    elif crossing:
+        # UNKNOWN IS NEITHER A PLAN NOR A SILENT NO (task/3323): a ledger
+        # this door cannot read cannot say whether the tree already holds a
+        # receipt that lands it, and the mint would append to that ledger.
+        return REFUSE, (
+            "%sUNKNOWN: the receipt ledger could not be read (%s), so this "
+            "door cannot tell whether %s already holds a receipt that can "
+            "authorize a land of its tree. Nothing ran; `helm gate list` "
+            "names what the ledger holds, and a gate runs once it reads"
+            % (policy, unreadable, top)), []
+    if crossing:
         label.append("canary")
-        notes.append("canary: a %s run of a tree whose last whole-suite "
-                     "receipt, gate:%s, is the other kind; the serial/sliced "
-                     "comparison needs one of each" % (canary, prior.get("id")))
+        notes.append("canary: a %s run of a tree that holds no %s "
+                     "receipt (its last whole-suite receipt, gate:%s, is the "
+                     "other kind); the serial/sliced comparison needs one of "
+                     "each" % (canary, canary, prior.get("id")))
     elif prior is not None and prior.get("status") == "OK":
-        head = tree_state(top)[0]
-        # A COMPOSE ROOM'S SUITE IS ITS TRAIN'S LAND GATE, so its green tree
-        # is "already gated" only by a receipt that can authorize the land
-        # (task/3066): a green only the generic import door placed binds the
-        # lane-level question and not this one, and refusing to re-gate on it
-        # would leave the train with no receipt any land door takes.
-        need = NEED_LAND if kind == "compose" else NEED_SUITE
-        state, _rid, bind_why = bind(evidence_line(prior), head or "",
-                                     repo_id=top, need=need)
-        if state == "VERIFIED":
-            return REFUSE, (
-                "%sthis exact tree already holds a GREEN whole-suite receipt, "
-                "gate:%s (%s, head %s, room %s), and it binds this tree. "
-                "Paste its evidence line instead of spending a second suite "
-                "on the same bytes:\n    %s\n  A green tree is never "
-                "re-gated; `--again` is for a RED tree."
-                % (policy, prior.get("id"), _failure_text(prior.get("ts")),
-                   str(prior.get("head") or "?")[:12], receipt_room(prior),
-                   evidence_line(prior))), []
-        notes.append("this tree's green receipt gate:%s does not bind here "
-                     "(%s), so it is gated again" % (prior.get("id"),
-                                                     bind_why))
+        # A GREEN TREE IS "ALREADY GATED" ONLY BY A RECEIPT THAT CAN LAND IT,
+        # in every room (task/3066 for a compose room, task/3323 and
+        # task/3589 everywhere). A green that binds only lane-level purposes
+        # (a sliced v10, a receipt only the generic import placed) refused
+        # here left the tree no road to the receipt a land door takes. The
+        # answer is foldcheck's own tree-vs-gate rung at land strength, so
+        # this door and the fold cannot disagree about which receipt that
+        # is; and every green is asked, newest first, because a later green
+        # that cannot land does not un-gate one that can.
+        from . import foldcheck
+        head = tree_state(top)[0] or ""
+        refused = []
+        for row in reversed([r for r in held if r.get("status") == "OK"]):
+            rung = foldcheck.land_authority(top, head, "gate:%s"
+                                            % row.get("id"))
+            if rung.verdict == foldcheck.UNKNOWN:
+                return REFUSE, (
+                    "%sUNKNOWN: this exact tree holds a GREEN whole-suite "
+                    "receipt, gate:%s (room %s), and whether it can "
+                    "authorize a land of this tree could not be measured: "
+                    "%s. Nothing ran; a second suite is spent only on a tree "
+                    "whose greens are known not to land"
+                    % (policy, row.get("id"), receipt_room(row),
+                       rung.discriminator)), []
+            if rung.verdict == foldcheck.PASS:
+                return REFUSE, (
+                    "%sthis exact tree already holds a GREEN whole-suite "
+                    "receipt, gate:%s (%s, head %s, room %s), and it can "
+                    "authorize a land of this tree (%s). Paste its evidence "
+                    "line instead of spending a second suite on the same "
+                    "bytes:\n    %s\n  A green tree is never re-gated; "
+                    "`--again` is for a RED tree."
+                    % (policy, row.get("id"), _failure_text(row.get("ts")),
+                       str(row.get("head") or "?")[:12], receipt_room(row),
+                       rung.discriminator, evidence_line(row))), []
+            refused.append("gate:%s (%s)" % (row.get("id"),
+                                             rung.discriminator))
+        notes.append("this tree's green whole-suite receipts cannot "
+                     "authorize a land of it, so none of them binds here "
+                     "and it is gated again: %s" % "; ".join(refused)
+                     if len(refused) > 1 else
+                     "this tree's green receipt %s cannot authorize a land "
+                     "of it, so it does not bind here and the tree is gated "
+                     "again" % refused[0])
     elif prior is not None:
         if not again:
             return REFUSE, (
@@ -10485,6 +11570,80 @@ def suite_mode(repo, sliced=False, serial=False, label=None, where="local",
                     "APPROVE and never a land" % kind), False
 
 
+# THE SLICED FOCUSED RUNNER. A focused selection is routinely half the suite,
+# and one serial process spent ~98% of a focused round executing it. Run as
+# slices of the one runner the sliced suite uses (helm/gateslice.py, its
+# `--modules` scope), the round's wall is bounded by its slowest module, not
+# by the sum. The receipt is the same focused kind (v6) with the same
+# binding rules: it binds a cure-round verdict and never an APPROVE or a
+# land, whichever runner produced it; only its focus block gains the slice
+# evidence (`_focus_slice_block`).
+#
+# Below this many selected modules a worker's own load is most of the round,
+# so the selection runs in one process.
+FOCUS_SLICE_MIN_MODULES = 6
+# Fab's core grant for the job it runs (fab-run-worker exports it): inside a
+# Fab job the cores are the dispatch's, never the node's.
+FAB_CORES_ENV = "FAB_JOBS"
+
+
+def focus_mode(plan, env=None, where="local"):
+    """(mode, reason, workers) for ONE focused run.
+
+    `mode` is SLICED (the selection through helm/gateslice.py's module scope)
+    or SERIAL (one `python -m unittest -v` process); `reason` is the one
+    sentence that decided it, which the run says on stderr either way; and
+    `workers` is the most workers a sliced run may start before the host's
+    grant (`_admit_suite`) narrows it, or None for SERIAL.
+
+    SERIAL when: the selection is under FOCUS_SLICE_MIN_MODULES; this run is
+    inside a Fab job whose core grant (FAB_JOBS) is under SLICE_MIN_CORES --
+    the grant `fab gate` asks by default is one slot's share, and slices in
+    it would only contend; or this host has too few online CPUs. `where` is
+    "plan" for the question asked before a dispatch: the run then executes on
+    a host this process cannot count, so only the selection decides."""
+    env = os.environ if env is None else env
+    count = len(plan["selected"])
+    if count < FOCUS_SLICE_MIN_MODULES:
+        return SERIAL, ("%d selected module%s: under %d, starting slice "
+                        "workers costs more than it saves"
+                        % (count, "" if count == 1 else "s",
+                           FOCUS_SLICE_MIN_MODULES)), None
+    ceiling = SLICE_SLOTS * _CORES_PER_SUITE
+    if where == "local" and env.get(FAB_JOB_ENV):
+        try:
+            granted = int(env.get(FAB_CORES_ENV) or 0)
+        except ValueError:
+            granted = 0
+        if granted < SLICE_MIN_CORES:
+            return SERIAL, (
+                "this run is inside a Fab job granted %s core%s (%s), and a "
+                "sliced run needs at least %d: size the dispatch for slices "
+                "to run them" % (granted or "no readable", ""
+                                 if granted == 1 else "s", FAB_CORES_ENV,
+                                 SLICE_MIN_CORES)), None
+        ceiling = min(ceiling, granted)
+    elif where == "local":
+        cores = _online_cpu_count()
+        if cores is None or cores < SLICE_MIN_CORES:
+            return SERIAL, (
+                "this host has %s online CPUs and a sliced run starts at "
+                "least %d workers, which would only contend for them"
+                % ("an unknown number of" if cores is None else cores,
+                   SLICE_MIN_CORES)), None
+    workers = min(ceiling, count)
+    return SLICED, ("%d selected modules run as slices on up to %d workers"
+                    % (count, workers)), workers
+
+
+def _focus_slice_argv(ident, modules):
+    """The sliced focused command: THIS helm's runner, the way the interpreter
+    is this helm's (`interpreter`), over exactly the selected modules."""
+    return [ident["executable"],
+            os.path.realpath(os.path.abspath(gateslice.__file__)),
+            gateslice.MODULES_FLAG] + list(modules)
+
+
 def _cmd_run(rest):
     rest = list(rest or ())
     cut = rest.index("--") if "--" in rest else len(rest)
@@ -10532,10 +11691,12 @@ def _cmd_run(rest):
         print(timings_err, file=sys.stderr)
         return 2
     label = _opt(opts, "--label")
-    if sliced and label and _TRAIN_LABEL.match(label):
+    if sliced and label and _TRAIN_LABEL.match(label) \
+            and sliced_land_refusal():
         print("helm gate run: a gate labelled %r is a train's land gate, and "
-              "a sliced receipt authorizes no land; drop --sliced (or the "
-              "label)" % label, file=sys.stderr)
+              "the land door admits no sliced receipt now (%s); drop "
+              "--sliced (or the label)" % (label, sliced_land_refusal()),
+              file=sys.stderr)
         return 2
     if label is None:
         # AFTER the usage check, which is about what a caller TYPED: inside a
@@ -10594,9 +11755,16 @@ def _cmd_run(rest):
                          "; `--serial` runs it serial" % mode_why)
         again = "--again" in opts or os.environ.get(AGAIN_ENV) == "1"
         canary = suite_kind if os.environ.get(CANARY_ENV) == "1" else None
-        verdict, door_note, parts = whole_suite_door(target, why=why,
-                                                     again=again, mode=mode,
-                                                     canary=canary)
+        from . import gatewindow
+        if mode == "plan" and gatewindow.dispatching():
+            # THE WINDOW'S OWN SIZING QUESTION (task/3463 item 14): Fab asks
+            # it from inside the landing-window door's dispatch, which has
+            # already admitted this suite; the doors below exist for the runs
+            # that bypass the window, and here they refused the window itself.
+            verdict, door_note, parts = ADMIT, None, []
+        else:
+            verdict, door_note, parts = whole_suite_door(
+                target, why=why, again=again, mode=mode, canary=canary)
         if "--supersede" in opts and verdict == ADMIT:
             print("helm gate run: --supersede takes the running window's "
                   "place, so it applies only to a compose room's local "
@@ -10627,22 +11795,27 @@ def _cmd_run(rest):
         if mode_note and mode != "plan" and verdict != WINDOW:
             print("helm gate: NOTE — " + mode_note, file=sys.stderr)
         if verdict == WINDOW:
+            # A compose room's gate is its train's LAND gate, launched by the
+            # window, which runs it as slices exactly while the land door
+            # admits a sliced receipt (`gatewindow.land_mode`). `--sliced`
+            # asks for that and is refused, naming why, when the door would
+            # refuse the receipt; `--serial` passes through as the escape.
+            room = _opt(opts, "--repo") or os.getcwd()
             if sliced:
-                # A compose room's gate is its train's LAND gate, and the
-                # window launches Fab's serial scope; dropping the flag there
-                # would run a mode the caller did not ask for, without a word.
-                print("helm gate run: %s is a compose room, whose gate is the "
-                      "train's land gate: the window launches it SERIAL, and "
-                      "a sliced receipt authorizes no land; drop --sliced"
-                      % target, file=sys.stderr)
-                return 2
+                wanted, why = gatewindow.land_mode(room)
+                if not wanted:
+                    print("helm gate run: %s is a compose room, whose gate is "
+                          "the train's land gate, and it runs as slices only "
+                          "while the land door admits a sliced receipt: %s. "
+                          "`helm gate window launch --repo %s` gates it "
+                          "serial" % (target, why, room), file=sys.stderr)
+                    return 2
             # REUSE, NEVER DUPLICATE: the landing-window door consults the
             # window, prints WAIT/SUPERSEDE when a live run already covers
             # this room, and records the launch in runs.json when it is clear.
-            from . import gatewindow
             rc, _request = gatewindow.launch(
-                _opt(opts, "--repo") or os.getcwd(), label=label,
-                supersede="--supersede" in opts)
+                room, label=label, supersede="--supersede" in opts,
+                serial=serial)
             return rc
     elif "--supersede" in opts or "--again" in opts or why and \
             "--lane-suite" in opts:
@@ -10744,7 +11917,7 @@ def _cmd_run(rest):
         # same policy, print it, run nothing, mint nothing. A reviewer who
         # suspects an omitted consumer diffs this against the receipt's
         # recorded scope instead of arguing about colour.
-        plan, plan_err = focus_plan(
+        plan, plan_err, plan_note = focus_plan_explained(
             os.path.realpath(_opt(opts, "--repo") or os.getcwd()))
         if plan_err:
             if as_json:
@@ -10753,17 +11926,38 @@ def _cmd_run(rest):
                 return 1
             print("helm gate: " + plan_err, file=sys.stderr)
             return 1
+        # THE RUNNER RIDES THE ANSWER, as the whole suite's mode does: `mode`
+        # is what this selection runs as wherever it runs, and `slice` sizes
+        # it -- the most workers it starts -- so a dispatcher outside helm
+        # asks its node for those cores instead of one slot's share.
+        mode, mode_why, workers = focus_mode(plan, where="plan")
         if as_json:
-            print(json.dumps({"plan": plan}, ensure_ascii=False, indent=1))
+            answer = {"plan": plan, "mode": mode, "mode_reason": mode_why,
+                      "slice": None if workers is None else {
+                          "runner": SLICE_RUNNER, "workers": workers,
+                          "slots": -(-workers // _CORES_PER_SUITE),
+                          "modules": len(plan["selected"])}}
+            if workers is None:
+                answer["slice_reason"] = mode_why
+            if plan_note:
+                answer["fallback"] = plan_note
+            print(json.dumps(answer, ensure_ascii=False, indent=1))
             return 0
+        if plan_note:
+            print("helm gate: NOTE — no load record serves this tree, so the "
+                  "selection is the static import closure: %s" % plan_note,
+                  file=sys.stderr)
         print("focus policy %s  base %s" % (plan["policy"],
                                             plan["base"][:12]))
+        if plan["policy"] == FOCUS_POLICY_V3:
+            print("  record    %s  T0 %s" % (plan["record"], plan["t0"]))
         for path in plan["changed"]:
             print("  changed   %s" % path)
         for mod in plan["selected"]:
             print("  selected  %s" % mod)
         print("  %d/%d test modules" % (len(plan["selected"]),
                                         plan["universe"]))
+        print("  mode      %s — %s" % (mode, mode_why))
         return 0
     row, err = run(repo=_opt(opts, "--repo"), argv=argv, timings=timings,
                    label=label, timeout=timeout, focus=focus, sliced=sliced)

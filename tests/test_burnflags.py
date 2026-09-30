@@ -37,6 +37,8 @@ A fixture is MUTATED by an arm on purpose — that is how a control is built —
 and every mutation states what it changed and asserts the unmutated capture
 gives the other answer, so a probe that saw no input cannot pass.
 """
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -73,7 +75,11 @@ def _history():
 #: real measurement to a family it was never about. `ds4flash` is declared so
 #: a weak rung can be run without wearing a strong family's name; until a seat
 #: is minted on it, it reads UNMEASURED on every burn surface, which is true.
-_UNSEATED_FAMILIES = ("ds4flash", "dots3")  # noqa: SEAT_NAME — catalog FAMILY keys, which is what this list is about
+#: `qwenlocal` and `bonsai` are here for the same reason: each family was
+#: catalogued after this capture was taken, and no seat of it existed then.
+#: So is `cursor`: its seat was hand-made and dark, and no catalog entry named
+#: it, at the capture.
+_UNSEATED_FAMILIES = ("ds4flash", "dots3", "qwenlocal", "bonsai", "cursor")  # noqa: SEAT_NAME — catalog FAMILY keys, which is what this list is about
 
 #: Catalog families that HAVE A SEAT and STILL have no record in this capture,
 #: which is a DIFFERENT fact from the tuple above and was measured rather than
@@ -1516,6 +1522,60 @@ class SnapshotTest(unittest.TestCase):
         self.assertTrue(bf.write_snapshot(inputs={}, now=1.0, path=self.path))
 
 
+class CreditsFieldTest(unittest.TestCase):
+    """task/3156: each flag carries the reset credits in hand, from the reset
+    rung's own rows — counts only. Every credit read is in hand: a reset
+    lifts a rate-limit wall and a workspace credits-depleted wall alike
+    (measured on trunk), and a Pro credit the spend order holds is still
+    held."""
+
+    def rows(self):
+        return [{"account": "ready@example.com", "reason": "ready",
+                 "available": 1, "spendable": 1},
+                {"account": "team-a@example.com", "reason": "ready",
+                 "available": 2, "spendable": 2},
+                {"account": "pro@example.com", "reason": "pro-credit-held",
+                 "available": 1, "spendable": None},
+                {"account": "idle@example.com",
+                 "reason": "weekly-not-exhausted",
+                 "available": None, "spendable": None}]
+
+    def test_the_codex_flag_carries_the_credits_and_no_identity(self):
+        now, inputs = _reference_world()
+        inputs["reset_credits"] = {"codex": self.rows()}
+        # CONTROL: the identities ARE in the input
+        self.assertIn("ready@example.com", json.dumps(inputs["reset_credits"]))
+        payload = bf.fold(inputs, now=now)
+        got = payload["families"]["codex"]["credits"]
+        self.assertEqual(got, {"usable": 4, "unread": 1,
+                               "why": "1 account not asked for a balance "
+                                      "this pass (no spendable wall)"})
+        blob = json.dumps(payload)
+        for secret in ("ready@example.com", "team-a@example.com",
+                       "idle@example.com", "example.com"):
+            self.assertNotIn(secret, blob)
+        # a family the rung never ran for carries no credits field value
+        self.assertIsNone(payload["families"][bf.NATIVE_FAMILY]["credits"])
+        self.assertIn("credits", payload["families"][bf.NATIVE_FAMILY])
+
+    def test_no_wall_makes_a_counted_credit_unusable(self):
+        """Trunk measured that a reset lifts a workspace credits-depleted
+        wall, and dropped that refusal from the rung; a summary that still
+        split such credits off would name a reason the rung no longer
+        writes."""
+        got = bf.credit_summary(self.rows()[:3])
+        self.assertEqual(got, {"usable": 4, "unread": 0, "why": None})
+        self.assertIsNone(bf.credit_summary(None))
+        self.assertEqual(bf.credit_summary([])["why"], None)
+
+    def test_the_colour_is_untouched_by_credits(self):
+        now, inputs = _reference_world()
+        plain = bf.fold(inputs, now=now)["families"]["codex"]["colour"]
+        inputs["reset_credits"] = {"codex": self.rows()}
+        self.assertEqual(bf.fold(inputs, now=now)["families"]["codex"]
+                         ["colour"], plain)
+
+
 class NativeAdapterTest(unittest.TestCase):
     """The reader between the creds probe cycle's history log and the money
     axis: which rows carry a reading and which carry none."""
@@ -1784,12 +1844,859 @@ class VerbTest(unittest.TestCase):
                                       "--until", until]), 2)
         self.assertEqual(bf.cmd_burn(["declare", "kimi", "orange"]), 2)
 
+    def test_an_improving_declaration_exits_two_and_names_the_measured_colour(self):
+        """A declaration that would lighten a measured colour is refused at
+        the door, in the web door's sentence, and nothing is written. Worse,
+        equal, and a family with no measured colour stay admitted."""
+        until = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                              time.gmtime(time.time() + 7200))
+        # The headline colour is YELLOW on purpose: the refusal must name the
+        # worst measured AXIS (reach RED), not that headline.
+        improving = {"colour": bf.YELLOW,
+                     "axes": {"money": bf.YELLOW, "reach": bf.RED,
+                              "policy": None}}
+        err = io.StringIO()
+        with mock.patch.object(bf, "family_flag", return_value=improving), \
+                contextlib.redirect_stderr(err):
+            rc = bf.cmd_burn(["declare", "kimi", "orange", "--until", until,
+                              "would lighten a red reach"])
+        self.assertEqual(rc, 2)
+        self.assertIn("measured RED", err.getvalue())
+        self.assertIn("raise its share", err.getvalue())
+        self.assertEqual(
+            bf.read_declarations().get("families", {}).get("kimi", {})
+            .get("colour", "UNWRITTEN"),
+            "UNWRITTEN")
+        with mock.patch.object(bf, "family_flag",
+                               return_value={"axes": {"money": bf.ORANGE}}):
+            self.assertEqual(bf.cmd_burn(["declare", "kimi", "orange",
+                                          "--until", until, "held even"]), 0)
+        self.assertEqual(bf.read_declarations()["families"]["kimi"]["colour"],
+                         bf.ORANGE)
+        with mock.patch.object(bf, "family_flag",
+                               return_value={"axes": {"money": bf.YELLOW}}):
+            self.assertEqual(bf.cmd_burn(["declare", "kimi", "red", "--until",
+                                          until, "hold the family"]), 0)
+        self.assertEqual(bf.read_declarations()["families"]["kimi"]["colour"],
+                         bf.RED)
+        with mock.patch.object(bf, "family_flag", return_value=None):
+            self.assertEqual(bf.cmd_burn(["declare", "gemini", "orange",
+                                          "--until", until,
+                                          "nothing measured"]), 0)
+        self.assertEqual(
+            bf.read_declarations()["families"]["gemini"]["colour"], bf.ORANGE)
+        # Equal is admitted at the web door too: the fold keeps a declaration
+        # that matches the measured colour, so the door must write it.
+        from helm import web
+        even = {"colour": bf.ORANGE, "axes": {"money": bf.ORANGE},
+                "expires_at": time.time() + 3600}
+        with mock.patch.object(bf, "family_flag", return_value=even):
+            body, status = web._api_burn_declare({
+                "family": "codex", "colour": "ORANGE", "until": "24h",
+                "reason": "held even at the web door"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(bf.read_declarations()["families"]["codex"]["colour"],
+                         bf.ORANGE)
+
     def test_the_verb_is_wired_into_the_dispatch_table_and_the_help(self):
         from helm import cli
         self.assertIn("burn", cli.VERBS)
         help_text = cli._VERB_HELP["burn"]
         for token in ("why", "declare", "--until", "--json"):
             self.assertIn(token, help_text)
+
+
+#: The local-names key the catalog names every local family's operator by.
+OPERATOR_KEY = "local-operator-seat"
+
+
+def _declare_operator(name):
+    """THE OPERATOR IS THIS HOST'S DATA: its local-names file names the seat,
+    as production reads it. None removes the declaration."""
+    from helm import home, localnames
+    os.makedirs(home.global_dir(), exist_ok=True)
+    with open(os.path.join(home.global_dir(), localnames.CONFIG), "w",
+              encoding="utf-8") as fh:
+        json.dump({OPERATOR_KEY: name} if name else {}, fh)
+    # the reader's cache is keyed on the file's stat, and a rewrite inside one
+    # mtime tick keeps it
+    localnames._cache["stat"] = None
+
+
+class LocalCertificationTest(unittest.TestCase):
+    """A LOCAL family — served from the operator's own GPU, which the catalog
+    spells `base_url_from` on the family's default pool row — reads money
+    GREEN while the seat that runs the hardware certifies it, and GREY again
+    the moment the certification lapses or is revoked. Reach is untouched: an
+    outage on the local server is still RED.
+
+    NO CERTIFICATION HERE IS HAND-WRITTEN. Every record is minted by the
+    producer (`certify_local`, `revoke_local` or the verb) into a temporary
+    helm home or file, by seat-a, the declared operator seat, from its own
+    roster-bound session. The one record the producer refuses to mint, a
+    certification naming a non-local family, is built by re-keying a minted
+    record, and that arm asserts the unmutated record still answers."""
+
+    LOCAL = "qwenlocal"
+    #: seat-a's harness session, in the shape the harness mints one
+    SID = "a1b2c3d4-0000-4000-8000-000000000001"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="burnflags-local-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, "certifications.json")
+        # THE CHAT SURFACE TOO: the roster the verb checks the certifier
+        # against lives there, and it must be this arm's, never the fleet's.
+        env = mock.patch.dict(os.environ,
+                              {"HELM_HOME": os.path.join(self.dir, "home"),
+                               "HELM_CHAT_DIR": os.path.join(self.dir, "chat")})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("MELD_CHAT_DIR", None)
+        # seat-a is the OPERATOR SEAT and is ROSTERED with its own session,
+        # through the roster's own writer; seat-b is not rostered at all
+        _declare_operator("seat-a")
+        from helm import seats
+        with self._as_seat("seat-a", session=None):
+            seats.write_roster("seat-a", session=self.SID,
+                               presence_beat=False)
+
+    @contextlib.contextmanager
+    def _as_seat(self, name, session=True):
+        """The acting seat is `name` (None: no identity at all), presenting
+        `session`: True is the seat's own bound session (seat-a's; no other
+        seat has one), None is no session. Every other session key is
+        scrubbed, so a runner's own session can never bind the verb to a seat
+        this arm did not state."""
+        if session is True:
+            session = self.SID if name == "seat-a" else None
+        with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": name or ""}):
+            for key in ("MELD_CHAT_NAME", "CLAUDE_CODE_SESSION_ID",
+                        "CLAUDE_SESSION_ID", "CODEX_SESSION_ID"):
+                os.environ.pop(key, None)
+            if session:
+                os.environ["CLAUDE_CODE_SESSION_ID"] = session
+            yield
+
+    def _certified(self, at, until, path=None):
+        ok, err = bf.certify_local(self.LOCAL, until, by="seat-a",
+                                   session=self.SID,
+                                   note="the serving checks passed", now=at,
+                                   path=path or self.path)
+        self.assertTrue(ok, err)
+        return bf.read_local_certifications(path or self.path)
+
+    def _fold(self, certifications, now, upstream=None, critical=None):
+        _ref, inputs = _reference_world()
+        inputs["local_certifications"] = certifications
+        if upstream:
+            inputs["upstream"] = dict(inputs["upstream"], **upstream)
+        if critical:
+            inputs["critical"] = critical
+        return bf.fold(inputs, now=now)
+
+    def _verb(self, *args):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = bf.cmd_burn(["certify-local"] + list(args))
+        return rc, err.getvalue()
+
+    def test_a_fresh_certification_reads_a_local_familys_money_green(self):
+        now, _inputs = _reference_world()
+        until = now + 7200
+        snap = self._fold(self._certified(now - 60, until), now=now)
+        flag = snap["families"][self.LOCAL]
+        self.assertEqual((flag["colour"], flag["axis"], flag["axes"]["money"]),
+                         (bf.GREEN, "money", bf.GREEN))
+        self.assertEqual(flag["cause_id"], "money:certified-local")
+        # its own provenance, never a vendor measurement
+        self.assertEqual(flag["provenance"], "certified-local")
+        self.assertEqual(flag["money_provenance"], "certified-local")
+        self.assertIn("operator's own GPU", flag["cause"])
+        self.assertIn("seat-a", flag["cause"])
+        self.assertIn(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until)),
+                      flag["cause"])
+        self.assertEqual(flag["measured_at"], now - 60)
+        self.assertIn("certified-local",
+                      "\n".join(bf.render_why(flag, now=now)))
+        self.assertIn("CERTIFIED", "\n".join(bf.render(snap, now=now)))
+        # CONTROL: the same world with no certification reads the family
+        # GREY for its missing reader, exactly as before this rule existed
+        bare = self._fold({"families": {}}, now=now)
+        self.assertEqual(bare["families"][self.LOCAL]["colour"], bf.GREY)
+        self.assertEqual(bare["families"][self.LOCAL]["cause_id"],
+                         "money:no-reader")
+        self.assertNotIn("CERTIFIED", "\n".join(bf.render(bare, now=now)))
+
+    def test_a_lapsed_certification_reads_grey_exactly_as_no_certification(self):  # noqa: VACUOUS_ASSERTION — the same record folded one second before its until is asserted GREEN at the end of this method
+        now, _inputs = _reference_world()
+        certs = self._certified(now - 7200, now + 60)
+        lapsed = self._fold(certs, now=now + 60)["families"][self.LOCAL]
+        self.assertEqual(lapsed["colour"], bf.GREY)
+        self.assertEqual(lapsed["cause_id"], "money:no-reader")
+        # a lapse is not an error: the flag is the one no file at all gives
+        self.assertEqual(lapsed, self._fold({"families": {}}, now=now + 60)
+                         ["families"][self.LOCAL])
+        # CONTROL: one second before its own until the same record answers
+        self.assertEqual(self._fold(certs, now=now + 59)
+                         ["families"][self.LOCAL]["colour"], bf.GREEN)
+
+    def test_a_non_local_family_is_refused_by_the_producer_and_ignored_by_the_fold(self):  # noqa: VACUOUS_ASSERTION — the local family is asserted in the set, a local record is asserted written, and the unmutated record in the same file is asserted GREEN
+        local = bf.local_families()
+        self.assertIn(self.LOCAL, local)
+        self.assertIn("qwen27", local)
+        for family in ("kimi", "codex", bf.NATIVE_FAMILY):
+            self.assertNotIn(family, local)
+        now, _inputs = _reference_world()
+        ok, err = bf.certify_local("kimi", now + 7200, by="seat-a",
+                                   session=self.SID, now=now,
+                                   path=self.path)
+        self.assertFalse(ok)
+        self.assertIn("base_url_from", err)
+        self.assertFalse(os.path.exists(self.path))
+        with self._as_seat("seat-a"):
+            for args in (("kimi", "--until", "2h"), ("codex", "--revoke"),
+                         ("nobody", "--until", "2h")):
+                rc, said = self._verb(*args)
+                self.assertEqual(rc, 2, args)
+                self.assertIn("not a local family", said)
+        self.assertFalse(os.path.exists(bf.local_certifications_path()))
+        # A FILE THAT NAMES ONE ANYWAY: the producer's own record re-keyed
+        # onto kimi, a family with no money reader, so honouring it would
+        # turn that family's money GREEN. That re-key is the one mutation.
+        certs = self._certified(now - 60, now + 7200)
+        self.assertTrue(os.path.exists(self.path))
+        certs["families"]["kimi"] = dict(certs["families"][self.LOCAL],
+                                         family="kimi")
+        flags = self._fold(certs, now=now)["families"]
+        self.assertEqual(flags["kimi"]["axes"]["money"], bf.GREY)
+        self.assertNotEqual(flags["kimi"]["money_provenance"],
+                            "certified-local")
+        # CONTROL: the unmutated record in the same file still answers
+        self.assertEqual(flags[self.LOCAL]["colour"], bf.GREEN)
+
+    def test_an_outage_stays_red_on_reach_and_overall_with_a_fresh_certification(self):
+        now, _inputs = _reference_world()
+        certs = self._certified(now - 60, now + 7200)
+        bar = _upstream()["upstream"]["codex"]["falsification_bar_s"] or 0
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                              time.gmtime(now - bar - 60))
+        for state in ("AUTH-UNAVAILABLE", "UPSTREAM-5XX"):
+            record = {"state": state, "dark": True,
+                      "falsification_bar_s": bar, "since": since}
+            snap = self._fold(certs, now=now, upstream={self.LOCAL: record},
+                              critical=[self.LOCAL])
+            flag = snap["families"][self.LOCAL]
+            # a live outage contradicts "running optimally": the
+            # certification is withdrawn and money reads as uncertified
+            self.assertEqual(flag["axes"]["money"], bf.GREY, state)
+            self.assertEqual(flag["axes"]["reach"], bf.RED, state)
+            self.assertEqual((flag["colour"], flag["axis"]),
+                             (bf.RED, "reach"), state)
+            self.assertEqual((snap["overall"]["colour"],
+                              snap["overall"]["family"]),
+                             (bf.RED, self.LOCAL), state)
+        # CONTROL: the same world with the server up reads GREEN overall
+        # through the same family, so RED above is the outage
+        snap = self._fold(certs, now=now, critical=[self.LOCAL])
+        self.assertEqual((snap["overall"]["colour"], snap["overall"]["family"]),
+                         (bf.GREEN, self.LOCAL))
+
+    def test_a_certified_seat_busy_over_a_healthy_record_stays_green(self):
+        """MUST-HIT (the ruling on busy local seats). The certified local
+        seat's canary ran past the pass deadline on the proxy's keepalive
+        bytes: busy, not failing. The pass keeps its HEALTHY record, so the
+        certification stands and the family reads GREEN. CONTROL: the same
+        busy reading with no prior record composes UNKNOWN, which withdraws
+        the certification: the GREY every busy pass read before the ruling."""
+        from helm import proxywatch
+        now, _inputs = _reference_world()
+        certs = self._certified(now - 60, now + 7200)
+        busy = proxywatch._client_timeout(120000, 37)[:3]
+        with mock.patch.object(proxywatch, "_upstream_once",
+                               return_value=busy):
+            reading = proxywatch.upstream_canary(
+                "seat-a", family=self.LOCAL,
+                sleep=mock.Mock(side_effect=AssertionError("confirmed")))
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600))
+        healthy = {"state": "HEALTHY", "dark": False, "since": since}
+        priors = {"healthy": {"upstream": {self.LOCAL: dict(
+            healthy, seats={"seat-a": dict(healthy)})}}, "none": {}}
+        got = {}
+        for name, prior in priors.items():
+            with mock.patch.object(
+                    proxywatch, "_seat_canary_observation",
+                    return_value=(reading, None, "NO-REPRESENTATIVE")):
+                record = proxywatch.upstream_health(
+                    [{"seat": "seat-a", "family": self.LOCAL,
+                      "probe": "healthy"}], now=now, prior=prior)[self.LOCAL]
+            flag = self._fold(certs, now=now, upstream={self.LOCAL: record})[
+                "families"][self.LOCAL]
+            got[name] = (record["state"], flag["colour"],
+                         flag["axes"]["money"])
+        self.assertEqual(got, {"healthy": ("HEALTHY", bf.GREEN, bf.GREEN),
+                               "none": ("UNKNOWN", bf.GREY, bf.GREY)}, got)
+
+    def test_expires_at_is_the_certifications_own_until(self):  # noqa: VACUOUS_ASSERTION — both folds are asserted unconditionally after the loop to differ in ts and in reading age
+        now, _inputs = _reference_world()
+        until = now + 7200
+        certs = self._certified(now - 60, until)
+        first = self._fold(certs, now=now)
+        later = self._fold(certs, now=now + 600)
+        for snap in (first, later):
+            flag = snap["families"][self.LOCAL]
+            self.assertEqual(flag["expires_at"], until)
+            self.assertEqual(flag["expires_kind"], "local-certification")
+        # CONTROL: the clock moved between the two folds
+        self.assertNotEqual(first["ts"], later["ts"])
+        self.assertEqual(later["families"][self.LOCAL]["reading_age_s"],
+                         first["families"][self.LOCAL]["reading_age_s"] + 600)
+
+    def test_a_duration_until_resolves_to_the_producers_instant_plus_it(self):
+        at = 1789000000.0
+        for text, secs in (("2h", 7200), ("90m", 5400), ("1d", 86400),
+                           ("3600", 3600)):
+            ok, err = bf.certify_local(self.LOCAL, text, by="seat-a",
+                                       session=self.SID, now=at,
+                                       path=self.path)
+            self.assertTrue(ok, (text, err))
+            rec = bf.read_local_certifications(self.path)["families"][self.LOCAL]
+            self.assertEqual((rec["certified_at"], rec["until"]),
+                             (at, at + secs), text)
+        # an ISO instant is stored as that instant
+        iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at + 1800))
+        self.assertTrue(bf.certify_local(self.LOCAL, iso, by="seat-a",
+                                         session=self.SID, now=at,
+                                         path=self.path)[0])
+        stored = bf.read_local_certifications(self.path)
+        self.assertEqual(stored["families"][self.LOCAL]["until"], at + 1800)
+        # every other spelling, and an instant already past, is refused and
+        # leaves the stored record alone
+        past = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at - 1))
+        for text in ("0h", "2x", "-1h", "1.5h", "", None, past):
+            ok, err = bf.certify_local(self.LOCAL, text, by="seat-a",
+                                       session=self.SID, now=at,
+                                       path=self.path)
+            self.assertFalse(ok, text)
+            self.assertTrue(err, text)
+            self.assertEqual(bf.read_local_certifications(self.path), stored)
+        # through the verb: the acting seat is recorded, the note is joined
+        with self._as_seat("seat-a"):
+            rc, said = self._verb(self.LOCAL, "--until", "2h", "checks",
+                                  "passed")
+        self.assertEqual(rc, 0, said)
+        rec = bf.read_local_certifications()["families"][self.LOCAL]
+        self.assertEqual(rec["until"] - rec["certified_at"], 7200)
+        self.assertEqual((rec["by"], rec["note"], rec["family"]),
+                         ("seat-a", "checks passed", self.LOCAL))
+        with self._as_seat("seat-a"):
+            self.assertEqual(self._verb(self.LOCAL, "--until", "2x")[0], 2)
+            self.assertEqual(self._verb(self.LOCAL)[0], 2)
+            self.assertEqual(self._verb(self.LOCAL, "--until", "2h",
+                                        "--revoke")[0], 2)
+
+    def test_a_revoke_ends_the_certification_and_the_family_reads_grey(self):  # noqa: VACUOUS_ASSERTION — the same family is asserted GREEN before the revoke and again after the re-certification
+        with self._as_seat("seat-a"):
+            rc, said = self._verb(self.LOCAL, "--until", "2h")
+            self.assertEqual(rc, 0, said)
+            certs = bf.read_local_certifications()
+            now = certs["families"][self.LOCAL]["certified_at"] + 1
+            # CONTROL: before the revoke the family reads GREEN
+            self.assertEqual(self._fold(certs, now=now)
+                             ["families"][self.LOCAL]["colour"], bf.GREEN)
+            rc, said = self._verb(self.LOCAL, "--revoke", "serving", "window")
+            self.assertEqual(rc, 0, said)
+        rec = bf.read_local_certifications()["families"][self.LOCAL]
+        self.assertEqual((rec["revoked_by"], rec["revoke_note"]),
+                         ("seat-a", "serving window"))
+        self.assertIsInstance(rec["revoked_at"], float)
+        self.assertLessEqual(rec["until"], rec["revoked_at"])
+        flag = self._fold(bf.read_local_certifications(), now=now)
+        self.assertEqual(flag["families"][self.LOCAL]["colour"], bf.GREY)
+        self.assertEqual(flag["families"][self.LOCAL]["cause_id"],
+                         "money:no-reader")
+        # and a fresh certification after it restores GREEN
+        with self._as_seat("seat-a"):
+            self.assertEqual(self._verb(self.LOCAL, "--until", "2h")[0], 0)
+        certs = bf.read_local_certifications()
+        later = certs["families"][self.LOCAL]["certified_at"] + 1
+        self.assertEqual(self._fold(certs, now=later)
+                         ["families"][self.LOCAL]["colour"], bf.GREEN)
+
+    def test_a_certification_with_no_acting_seat_is_refused(self):  # noqa: VACUOUS_ASSERTION — the same call as a seat is asserted to exit 0 and to write the file
+        with self._as_seat(None):
+            rc, said = self._verb(self.LOCAL, "--until", "2h")
+        self.assertEqual(rc, 2)
+        self.assertTrue(said)
+        self.assertFalse(os.path.exists(bf.local_certifications_path()))
+        # CONTROL: the same call as a seat writes the record
+        with self._as_seat("seat-a"):
+            self.assertEqual(self._verb(self.LOCAL, "--until", "2h")[0], 0)
+        self.assertTrue(os.path.exists(bf.local_certifications_path()))
+
+    def test_only_the_exact_family_key_of_a_local_default_row_is_local(self):  # noqa: VACUOUS_ASSERTION — the exact key is asserted to certify and the table with the default row named is asserted local
+        """An alias, a project instance label, a provider name and a family
+        whose default row is missing are never local, for the producer or for
+        `local_families`."""
+        now = 1789000000.0
+        for name in ("Qwenlocal", "qwen", "qwenlocal/inst-a", "qwenlocal ",
+                     "local-vllm", ""):
+            ok, err = bf.certify_local(name, now + 7200, by="seat-a",
+                                       session=self.SID, now=now,
+                                       path=self.path)
+            self.assertFalse(ok, name)
+            self.assertIn("not a local family", err, name)
+        self.assertFalse(os.path.exists(self.path))
+        row = {"base_url_from": "k", "rung": "free"}
+        missing = {"fam": {"pool_default": "gone",
+                           "pool_providers": {"here": row}}}
+        self.assertEqual(bf.local_families(missing), ())
+        self.assertEqual(bf.local_families({"fam": {"pool_providers":
+                                                    {"here": row}}}), ())
+        # CONTROL: the same table with the default naming that row is local,
+        # and the exact key certifies
+        self.assertEqual(bf.local_families(
+            {"fam": dict(missing["fam"], pool_default="here")}), ("fam",))
+        self.assertTrue(bf.certify_local(self.LOCAL, now + 7200, by="seat-a",
+                                         session=self.SID,
+                                         now=now, path=self.path)[0])
+
+    def test_a_hand_written_file_greens_no_paid_family_and_a_bad_one_reads_grey(self):  # noqa: VACUOUS_ASSERTION — the producer's own local row in the same file is asserted GREEN
+        from helm import pk
+        now, _inputs = _reference_world()
+        # THE ONE ROW NOT TYPED BY HAND is the local family's: the producer's
+        # own record, minted into a scratch file and copied in. A hand-typed
+        # local row carries no session key and reads GREY unverifiable
+        # (CertifierSessionTest), so it could not be this arm's control.
+        minted = self._certified(now - 60, now + 7200,
+                                 path=self.path + ".minted")
+        fresh = dict(minted["families"][self.LOCAL])
+        paid = ("kimi", "ds4pro", "grok", "codex", bf.NATIVE_FAMILY)
+        rows = {f: dict(fresh, family=f) for f in paid + ("qwenlocal/inst-a",)}
+        rows[self.LOCAL] = dict(fresh)
+        pk.atomic_write(self.path, json.dumps({"families": rows}))
+        snap = self._fold(bf.read_local_certifications(self.path), now=now)
+        flags = snap["families"]
+        for family in paid:
+            self.assertNotEqual(flags[family]["money_provenance"],
+                                bf.CERTIFIED_LOCAL, family)
+        self.assertNotIn("qwenlocal/inst-a", flags)
+        self.assertEqual(snap["readers"]["certified_local"], [self.LOCAL])
+        # CONTROL: the local row of the same file answers
+        self.assertEqual(flags[self.LOCAL]["money_provenance"],
+                         bf.CERTIFIED_LOCAL)
+        bare = self._fold({"families": {}}, now=now)["families"][self.LOCAL]
+        # A FILE THAT DOES NOT PARSE, OR PARSES TO THE WRONG SHAPE, is not an
+        # absent file: it reads GREY with a cause that names it
+        for text in ("{corrupt", "[]", '{"families": []}'):
+            pk.atomic_write(self.path, text)
+            flag = self._fold(bf.read_local_certifications(self.path),
+                              now=now)["families"][self.LOCAL]
+            self.assertEqual(flag["colour"], bf.GREY, text)
+            self.assertEqual(flag["cause_id"],
+                             "money:certification-unreadable", text)
+            self.assertIn(self.path, flag["cause"], text)
+            self.assertNotEqual(flag["cause"], bare["cause"], text)
+        # a well-formed file whose ROW is malformed holds no certification
+        for text in ('{"families": {"qwenlocal": "yes"}}',
+                     '{"families": {"qwenlocal": {"until": "2099-01-01T00:00:00Z", "by": "seat-a"}}}',
+                     '{"families": {"qwenlocal": {"until": NaN, "by": "seat-a"}}}',
+                     '{"families": {"qwenlocal": {"until": 1e999, "by": "seat-a"}}}',
+                     '{"families": {"qwenlocal": {"until": %r, "by": 7}}}'
+                     % (now + 7200)):
+            pk.atomic_write(self.path, text)
+            flag = self._fold(bf.read_local_certifications(self.path),
+                              now=now)["families"][self.LOCAL]
+            self.assertEqual(flag, bare, text)
+
+    def test_an_until_past_the_one_day_ceiling_is_refused(self):  # noqa: VACUOUS_ASSERTION — the same verb at exactly the ceiling is asserted to exit 0 and write the file
+        self.assertEqual(bf.CERTIFICATION_CEILING_S, 86400)
+        two_days = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                 time.gmtime(time.time() + 2 * 86400))
+        with self._as_seat("seat-a"):
+            for text in ("25h", "86401", "1789000000", two_days):
+                rc, said = self._verb(self.LOCAL, "--until", text)
+                self.assertEqual(rc, 2, text)
+                self.assertIn("ceiling", said, text)
+            # A BARE NUMBER IS A DURATION IN SECONDS, so an epoch typed as an
+            # instant is refused by the ceiling and told how to write one
+            said = self._verb(self.LOCAL, "--until", "1789000000")[1]
+            self.assertIn("seconds", said)
+            self.assertIn("ISO-8601", said)
+        self.assertFalse(os.path.exists(bf.local_certifications_path()))
+        # CONTROL: exactly the ceiling is a certification
+        with self._as_seat("seat-a"):
+            rc, said = self._verb(self.LOCAL, "--until", "1d")
+        self.assertEqual(rc, 0, said)
+        rec = bf.read_local_certifications()["families"][self.LOCAL]
+        self.assertEqual(rec["until"] - rec["certified_at"], 86400)
+
+    def test_an_unrostered_or_sessionless_acting_seat_is_refused(self):  # noqa: VACUOUS_ASSERTION — the operator's bound session through the same verb is asserted to exit 0 and be recorded as the certifier
+        # an unrostered seat, and the rostered operator with NO session (the
+        # timer shape round 2 admitted): neither has a session behind it
+        from helm import home
+        for name in ("seat-b", "seat-a"):
+            with self._as_seat(name, session=None):
+                self.assertIsNone(home.session_id())
+                for args in (("--until", "2h"), ("--revoke",)):
+                    rc, said = self._verb(self.LOCAL, *args)
+                    self.assertEqual(rc, 2, (name, args, said))
+                    self.assertIn("roster", said, (name, args))
+        self.assertFalse(os.path.exists(bf.local_certifications_path()))
+        # CONTROL: the operator seat in its own bound session certifies and
+        # is recorded as the certifier
+        with self._as_seat("seat-a"):
+            self.assertEqual(home.session_id(), self.SID)
+            rc, said = self._verb(self.LOCAL, "--until", "2h")
+        self.assertEqual(rc, 0, said)
+        self.assertEqual(
+            bf.read_local_certifications()["families"][self.LOCAL]["by"],
+            "seat-a")
+
+    def test_a_family_with_a_paid_row_beside_its_local_default_is_not_local(self):  # noqa: VACUOUS_ASSERTION — the same entry with only its local default row is asserted local
+        from helm import seat
+        real = seat.FAMILIES["ds4pro"]
+        self.assertNotIn("ds4pro", bf.local_families())
+        # THE ONE MUTATION: the real ds4pro entry with its default row served
+        # from the operator's box beside a paid alternate row. The catalog no
+        # longer ships a two-row family (ds4pro is the DeepSeek direct key
+        # alone since ds4-direct-off-peak-only), so the paid row is planted.
+        default = real["pool_default"]
+        rows = {default: dict(real["pool_providers"][default],
+                              base_url_from="ds4pro"),
+                "paid-alternate": {"base_url": "https://paid.example.invalid/v1"}}
+        self.assertEqual(len(rows), 2)
+        mixed = {"ds4pro": dict(real, pool_providers=rows)}
+        self.assertEqual(bf.local_families(mixed), ())
+        # CONTROL: the same entry with only that local row is local
+        only = {"ds4pro": dict(real, pool_providers={default: rows[default]})}
+        self.assertEqual(bf.local_families(only), ("ds4pro",))
+        for family in bf.local_families():
+            entry = seat.FAMILIES[family]
+            self.assertTrue(all(r.get("base_url_from") for r in
+                                entry["pool_providers"].values()), family)
+        ok, err = bf.certify_local("ds4pro", 1789007200.0, by="seat-a",
+                                   session=self.SID,
+                                   now=1789000000.0, path=self.path)
+        self.assertFalse(ok)
+        self.assertIn("not a local family", err)
+
+    def test_the_new_verb_is_named_in_the_usage_the_help_and_the_docs(self):
+        from helm import cli_help
+        for text in (bf._USAGE, cli_help._VERB_HELP["burn"]):
+            for token in ("certify-local", "--revoke", "--until"):
+                self.assertIn(token, text)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "docs", "VERBS.md"),
+                  encoding="utf-8") as fh:
+            self.assertIn("helm burn certify-local", fh.read())
+        self.assertIn("local models should always be green burnflag",
+                      bf.__doc__)
+
+
+class CertifierSessionTest(unittest.TestCase):
+    """ONLY THE OPERATOR SEAT, FROM ITS OWN ROSTER-BOUND SESSION, CERTIFIES.
+
+    A declared name is a value any process can export. With no session behind
+    it, HELM_CHAT_NAME certified as any rostered seat, and the fold took a
+    record's `by` at its word, so a forged row turned a local family GREEN.
+    The certifier is now the family's DECLARED operator seat, admitted
+    through its own session, and every record carries that session's key.
+    The fold honours a record only while the key still binds to the operator
+    on the roster, and reads every other record GREY with a cause of its own.
+
+    EVERY ARM RUNS THE PRODUCTION PATH: the verb writes the record, the
+    posting pass (`proxywatch._burn_flags_pass`) folds it and writes the
+    snapshot, and the colour is read back through `burnflags.cached_flags`.
+    A record the verb refuses to write is made by ONE mutation of a record it
+    did write, and the unmutated record is asserted GREEN in the same arm."""
+
+    LOCAL = "qwenlocal"  # noqa: SEAT_NAME — a catalog FAMILY key, never a seat
+    OPERATOR, OTHER = "seat-a", "seat-b"
+    #: Harness session ids in the shape the harness mints them, so their
+    #: sid8 keys differ.
+    SID = {"seat-a": "a1b2c3d4-0000-4000-8000-000000000001",
+           "seat-b": "e5f6a7b8-0000-4000-8000-000000000002"}
+    UNVERIFIABLE = "money:certification-unverifiable"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="burnflags-certifier-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        # THE CHAT SURFACE TOO: the roster the session binds through lives
+        # there, and it must be this arm's, never the fleet's
+        env = mock.patch.dict(os.environ,
+                              {"HELM_HOME": os.path.join(self.dir, "home"),
+                               "HELM_CHAT_DIR": os.path.join(self.dir, "chat"),
+                               "HELM_CACHE_DIR": os.path.join(self.dir,
+                                                              "cache")})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("MELD_CHAT_DIR", None)
+        _declare_operator(self.OPERATOR)
+        # BOTH SEATS JOIN WITH THEIR OWN SESSIONS, through the roster's writer
+        from helm import seats
+        for name in (self.OPERATOR, self.OTHER):
+            with self._acting(name, None):
+                seats.write_roster(name, session=self.SID[name],
+                                   presence_beat=False)
+
+    @contextlib.contextmanager
+    def _acting(self, name, session):
+        """The process declares `name` (None: nothing) and presents harness
+        session `session` (None: none). Every session variable is set here,
+        so a runner's own session can never bind the verb to a seat."""
+        with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": name or ""}):
+            for key in ("MELD_CHAT_NAME", "CLAUDE_CODE_SESSION_ID",
+                        "CLAUDE_SESSION_ID", "CODEX_SESSION_ID"):
+                os.environ.pop(key, None)
+            if session:
+                os.environ["CLAUDE_CODE_SESSION_ID"] = session
+            yield
+
+    def _verb(self, *args):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = bf.cmd_burn(["certify-local"] + list(args))
+        return rc, err.getvalue()
+
+    def _certify(self, *note):
+        """The operator certifies from its own bound session."""
+        with self._acting(self.OPERATOR, self.SID[self.OPERATOR]):
+            rc, said = self._verb(self.LOCAL, "--until", "2h", *note)
+        self.assertEqual(rc, 0, said)
+
+    def _flag(self):
+        """The local family's flag as production reads it: the posting pass
+        folds and writes the snapshot, `cached_flags` reads it back."""
+        from helm import proxywatch
+        now = time.time()
+        report = {"ts": now, "seats": [], "upstream": {}, "proxy_runtime": {}}
+        with mock.patch.object(bf, "usage_history", return_value=[]):
+            self.assertIsNotNone(proxywatch._burn_flags_pass(report))
+        flags, _age = bf.cached_flags(now=now)
+        return flags[self.LOCAL]
+
+    def _unverifiable(self, flag, label):
+        self.assertEqual(flag["colour"], bf.GREY, label)
+        self.assertEqual(flag["axes"]["money"], bf.GREY, label)
+        self.assertEqual(flag["cause_id"], self.UNVERIFIABLE, label)
+        self.assertNotEqual(flag["money_provenance"], bf.CERTIFIED_LOCAL,
+                            label)
+        # the cause names the seat whose session would make it verifiable
+        self.assertIn(self.OPERATOR, flag["cause"], label)
+
+    def test_a_sessionless_operator_name_is_refused_and_writes_nothing(self):  # noqa: VACUOUS_ASSERTION — the same name with its bound session is asserted to certify and read GREEN at the end of this method
+        path = bf.local_certifications_path()
+        for args in ((self.LOCAL, "--until", "2h"), (self.LOCAL, "--revoke")):
+            with self._acting(self.OPERATOR, None):
+                rc, said = self._verb(*args)
+            self.assertEqual(rc, 2, (args, said))
+            # the refusal says how to certify: from the operator's own session
+            self.assertIn("its own session", said, args)
+            self.assertFalse(os.path.exists(path), args)
+        # CONTROL: the same name WITH its bound session certifies
+        self._certify()
+        self.assertEqual(self._flag()["colour"], bf.GREEN)
+
+    def test_a_roster_bound_session_of_a_non_operator_seat_is_refused(self):  # noqa: VACUOUS_ASSERTION — the operator's own session is asserted to certify and read GREEN at the end of this method
+        path = bf.local_certifications_path()
+        # declared and corroborated, and the session alone: both are seat-b
+        for declared in (self.OTHER, None):
+            for args in ((self.LOCAL, "--until", "2h"),
+                         (self.LOCAL, "--revoke")):
+                with self._acting(declared, self.SID[self.OTHER]):
+                    rc, said = self._verb(*args)
+                self.assertEqual(rc, 2, (declared, args, said))
+                self.assertIn("operator seat", said, (declared, args))
+                self.assertIn(self.OPERATOR, said, (declared, args))
+                self.assertFalse(os.path.exists(path), (declared, args))
+        # CONTROL: the operator's own bound session certifies
+        self._certify()
+        self.assertEqual(self._flag()["colour"], bf.GREEN)
+
+    def test_the_operators_bound_session_certifies_and_stamps_its_key(self):
+        from helm.seats_cursor import _sid8
+        key = _sid8(self.SID[self.OPERATOR])
+        # declared and corroborated, and the session alone: both certify
+        for declared in (self.OPERATOR, None):
+            with self._acting(declared, self.SID[self.OPERATOR]):
+                rc, said = self._verb(self.LOCAL, "--until", "2h", "checks",
+                                      "passed")
+            self.assertEqual(rc, 0, (declared, said))
+            rec = bf.read_local_certifications()["families"][self.LOCAL]
+            self.assertEqual((rec["by"], rec.get("session_key")),
+                             (self.OPERATOR, key), declared)
+            # THE KEY, NEVER THE SESSION ID: a whole id is a bearer value
+            with open(bf.local_certifications_path(), encoding="utf-8") as fh:
+                self.assertNotIn(self.SID[self.OPERATOR], fh.read())
+            flag = self._flag()
+            self.assertEqual((flag["colour"], flag["cause_id"],
+                              flag["money_provenance"]),
+                             (bf.GREEN, "money:certified-local",
+                              bf.CERTIFIED_LOCAL), declared)
+            self.assertIn(self.OPERATOR, flag["cause"])
+        # the revoke comes from the same session and stamps it too
+        with self._acting(None, self.SID[self.OPERATOR]):
+            rc, said = self._verb(self.LOCAL, "--revoke", "serving", "window")
+        self.assertEqual(rc, 0, said)
+        rec = bf.read_local_certifications()["families"][self.LOCAL]
+        self.assertEqual((rec["revoked_by"], rec.get("revoked_session_key")),
+                         (self.OPERATOR, key))
+        flag = self._flag()
+        self.assertEqual((flag["colour"], flag["cause_id"]),
+                         (bf.GREY, "money:no-reader"))
+
+    def test_a_record_that_does_not_bind_to_the_operator_never_reads_green(self):  # noqa: VACUOUS_ASSERTION — the record as the verb wrote it is asserted GREEN before and after the mutations
+        from helm import pk
+        from helm.seats_cursor import _sid8
+        self._certify()
+        path = bf.local_certifications_path()
+        with open(path, encoding="utf-8") as fh:
+            minted = json.load(fh)
+        rec = minted["families"][self.LOCAL]
+        # CONTROL: the record as the verb wrote it answers GREEN
+        self.assertEqual(self._flag()["colour"], bf.GREEN)
+        now = time.time()
+        forged = {
+            # a bare `by`: the record with its session key taken off
+            "a bare by": {k: v for k, v in rec.items() if k != "session_key"},
+            # a key that binds to another seat, and one no roster knows
+            "a key bound to another seat": dict(
+                rec, session_key=_sid8(self.SID[self.OTHER])),
+            "a key no roster knows": dict(rec, session_key="ffffffff"),
+            # a certifier that is not the operator, with and without its own
+            # bound session behind it
+            "a non-operator certifier": dict(rec, by=self.OTHER),
+            "a non-operator with its own key": dict(
+                rec, by=self.OTHER, session_key=_sid8(self.SID[self.OTHER])),
+            # the row a forger types from nothing
+            "a hand-written row": {"family": self.LOCAL, "by": self.OPERATOR,
+                                   "certified_at": now - 60,
+                                   "until": now + 7200},
+        }
+        for label, row in forged.items():
+            pk.atomic_write(path, json.dumps({"families": {self.LOCAL: row}}))
+            self._unverifiable(self._flag(), label)
+        # CONTROL: the unmutated record, restored, answers GREEN again
+        pk.atomic_write(path, json.dumps(minted))
+        self.assertEqual(self._flag()["colour"], bf.GREEN)
+
+    def test_a_replayed_record_is_the_stated_residual(self):
+        """THE KEY IS NOT A SECRET, AND THE DOCS SAY SO. A revoked row keeps
+        the operator's session key, so a process that can write the file can
+        put a later `until` on it and drop the revocation. The fold reads
+        that GREEN, because the key still binds to the operator: this is the
+        residual the docs state (the same-user trust boundary of the roster
+        and the snapshot), MEASURED here so a cure that closes it has to
+        flip this arm on purpose, and so no doc can claim a hand-written row
+        always reads GREY."""
+        from helm import pk
+        from helm.seats_cursor import _sid8
+        self._certify()
+        with self._acting(None, self.SID[self.OPERATOR]):
+            rc, said = self._verb(self.LOCAL, "--revoke")
+        self.assertEqual(rc, 0, said)
+        path = bf.local_certifications_path()
+        with open(path, encoding="utf-8") as fh:
+            revoked = json.load(fh)["families"][self.LOCAL]
+        self.assertEqual(self._flag()["colour"], bf.GREY)
+        # the key a replay needs is on the revoked row itself
+        self.assertEqual(revoked["session_key"],
+                         _sid8(self.SID[self.OPERATOR]))
+        now = time.time()
+        replay = {k: v for k, v in revoked.items()
+                  if not k.startswith("revoke")}
+        replay.update(certified_at=now - 60, until=now + 7200)
+        pk.atomic_write(path, json.dumps({"families": {self.LOCAL: replay}}))
+        self.assertEqual(self._flag()["colour"], bf.GREEN)
+
+    def test_a_session_that_rebinds_elsewhere_reads_grey(self):  # noqa: VACUOUS_ASSERTION — the same record is asserted GREEN before the rebind, after the operator moved to a new session of its own
+        from helm import seats, seats_roster
+        self._certify()
+        self.assertEqual(self._flag()["colour"], bf.GREEN)
+        # THE OPERATOR MOVES ON: a new session of its own, the old one kept on
+        # its row. A process presenting the old session is still the operator,
+        # so the record still binds.
+        fresh = "c9d0e1f2-0000-4000-8000-000000000003"
+        with self._acting(self.OPERATOR, None):
+            seats.write_roster(self.OPERATOR, session=fresh,
+                               presence_beat=False)
+        self.assertEqual(seats.seat_for_session(self.SID[self.OPERATOR]),
+                         self.OPERATOR)
+        self.assertEqual(self._flag()["colour"], bf.GREEN)
+        # THE ROSTER'S OWN REPAIR HANDS THE CERTIFYING SESSION TO seat-b
+        ok, why = seats_roster.disown_session(
+            self.OPERATOR, self.SID[self.OPERATOR], to=self.OTHER)
+        self.assertTrue(ok, why)
+        self.assertEqual(seats.seat_for_session(self.SID[self.OPERATOR]),
+                         self.OTHER)
+        self._unverifiable(self._flag(), "rebound")
+
+    def test_a_family_with_no_declared_operator_is_certified_by_nobody(self):  # noqa: VACUOUS_ASSERTION — the declared operator is asserted to certify and read GREEN in the middle of this method
+        path = bf.local_certifications_path()
+        _declare_operator(None)
+        for args in ((self.LOCAL, "--until", "2h"), (self.LOCAL, "--revoke")):
+            with self._acting(self.OPERATOR, self.SID[self.OPERATOR]):
+                rc, said = self._verb(*args)
+            self.assertEqual(rc, 2, (args, said))
+            self.assertIn("no operator seat", said, args)
+            self.assertFalse(os.path.exists(path), args)
+        # CONTROL: declared, the same session certifies
+        _declare_operator(self.OPERATOR)
+        self._certify()
+        self.assertEqual(self._flag()["colour"], bf.GREEN)
+        # and the record reads GREY the moment the declaration is gone
+        _declare_operator(None)
+        flag = self._flag()
+        self.assertEqual((flag["colour"], flag["cause_id"]),
+                         (bf.GREY, self.UNVERIFIABLE))
+        self.assertIn("no operator seat", flag["cause"])
+
+    def test_the_catalog_names_each_local_operator_by_a_local_names_key(self):  # noqa: VACUOUS_ASSERTION — every local family is asserted to name the key, and the operator is asserted to resolve to seat-a before the declaration is removed
+        from helm import localnames, seat
+        self.assertIn(OPERATOR_KEY, localnames.KEYS)
+        local = bf.local_families()
+        self.assertEqual(set(local), {"qwen27", "qwenlocal", "bonsai"})  # noqa: SEAT_NAME — the catalog FAMILY keys of the local families, never seats
+        for family in local:
+            self.assertEqual(seat.FAMILIES[family].get("operator_seat_from"),
+                             OPERATOR_KEY, family)
+        # a family that is not local has no operator to declare
+        for family in sorted(set(seat.FAMILIES) - set(local)):
+            self.assertNotIn("operator_seat_from", seat.FAMILIES[family],
+                             family)
+        self.assertEqual(bf.local_operator(self.LOCAL), self.OPERATOR)
+        # absent from this host's local names is no operator at all
+        _declare_operator(None)
+        self.assertIsNone(bf.local_operator(self.LOCAL))
+
+    def test_the_help_and_the_docs_say_session_bound_and_operator_only(self):  # noqa: VACUOUS_ASSERTION — each of the four texts is asserted to carry both phrases, and the docs section to name the new cause
+        from helm import cli_help
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "docs", "VERBS.md"),
+                  encoding="utf-8") as fh:
+            docs = fh.read()
+        start = docs.index("#### `helm burn certify-local")
+        section = docs[start:docs.index("\n#### ", start + 1)]
+        for label, text in (("VERBS.md", section),
+                            ("cli_help", cli_help._VERB_HELP["burn"]),
+                            ("the verb", bf._cmd_certify_local.__doc__),
+                            ("the module", bf.__doc__)):
+            self.assertIn("operator seat", text, label)
+            self.assertIn("roster-bound session", text, label)
+            self.assertNotIn("timer", text, label)
+            # a hand-written row carrying the operator's key reads GREEN
+            # (test_a_replayed_record_is_the_stated_residual), so no surface
+            # may promise that every hand-written row reads GREY
+            self.assertNotIn("a hand-written row", text, label)
+        for label, text in (("VERBS.md", section),
+                            ("cli_help", cli_help._VERB_HELP["burn"]),
+                            ("the module", bf.__doc__)):
+            flat = " ".join(text.split()).casefold()
+            self.assertIn("replay", flat, label)
+            self.assertIn("not a secret", flat, label)
+        self.assertIn(self.UNVERIFIABLE, section)
 
 
 class NoNetworkTest(unittest.TestCase):

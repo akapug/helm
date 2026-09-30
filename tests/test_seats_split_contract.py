@@ -231,15 +231,73 @@ class FacadeCompletenessTest(unittest.TestCase):
 
         over = {f: n for f, n in sizes.items()
                 if f != "seats.py" and n > FINISH}
-        self.assertEqual(over, {}, "an EXTRACTED module is over the %d-line "
-                                   "budget, which defeats the split: %s"
-                                   % (FINISH, over))
-        self.assertLessEqual(
-            sizes["seats.py"], CEILING,
-            "seats.py GREW past the ratchet (%d). The split is supposed to "
-            "drain this file; if an extraction legitimately moves code back "
-            "in, say why in the commit and lower CEILING deliberately."
-            % CEILING)
+        # THE WAY OUT LEADS, in the commit rung's own words
+        # (splitbudget.way_out), so a seat reading this red learns how to
+        # split before it reads the rule it broke.
+        self.assertEqual(over, {}, _budget_red(
+            over, FINISH, "an EXTRACTED module is over the %d-line budget, "
+            "which defeats the split" % FINISH))
+        self.assertLessEqual(sizes["seats.py"], CEILING, _budget_red(
+            {"seats.py": sizes["seats.py"]}, CEILING, "seats.py is over its "
+            "%d-line ratchet; the split drains this file and the ratchet is "
+            "never raised to fit a commit" % CEILING))
+
+
+class BudgetBackstopLeadsWithTheWayOutTest(unittest.TestCase):
+    """THE BACKSTOP'S RED NAMES THE FIX FIRST (task/3524), in the commit
+    rung's own words: `splitbudget.way_out` is one text with two readers, the
+    way the budget numbers are. Each arm runs the real backstop with one
+    module read as over budget and reads the failure it raises."""
+
+    def _red(self, name, lines):
+        real = _read
+
+        def sized(path):
+            if os.path.basename(path) == name:
+                return "x = 1\n" * lines
+            return real(path)
+        case = FacadeCompletenessTest("test_the_facade_only_ever_shrinks")
+        with mock.patch.object(sys.modules[__name__], "_read", sized):
+            with self.assertRaises(AssertionError) as cm:
+                case.test_the_facade_only_ever_shrinks()
+        return str(cm.exception)
+
+    def test_an_extracted_module_over_budget_is_told_to_split_it(self):
+        from helm import splitbudget
+        name = sorted(f for f in os.listdir(HELM)
+                      if f.startswith("seats_") and f.endswith(".py"))[0]
+        said = self._red(name, splitbudget.FINISH + 58)
+        self.assertIn("sibling module", said,
+                      "the backstop's red does not name the way out: %r" % said)
+        self.assertIn("helm/%s_<topic>.py" % name[:-3], said)
+        self.assertLess(said.index("sibling module"), said.index("budget"),
+                        "the rule comes before the way out: %r" % said)
+        self.assertIn(str(splitbudget.FINISH + 58), said)
+        self.assertTrue(splitbudget.EXAMPLES)
+        for new, _old, commit in splitbudget.EXAMPLES:
+            self.assertIn(new, said)
+            self.assertIn(commit, said)
+            self.assertTrue(os.path.isfile(os.path.join(ROOT, new)))
+
+    def test_the_facade_over_its_ceiling_is_told_to_split_it(self):
+        from helm import splitbudget
+        said = self._red("seats.py", splitbudget.CEILING + 1)
+        self.assertIn("sibling module", said,
+                      "the facade's red does not name the way out: %r" % said)
+        self.assertIn("helm/seats_<topic>.py", said)
+        self.assertIn("_IMPL_MODULES", said,
+                      "a module split out of the facade must join its patch "
+                      "fan-out, and the red does not say so: %r" % said)
+        self.assertLess(said.index("sibling module"), said.index("budget"))
+
+
+def _budget_red(over, limit, rule):
+    """The backstop's failure text: the way out for the first module over
+    budget, then the rule and every module's size."""
+    from helm import splitbudget
+    lines = (splitbudget.way_out("helm/" + sorted(over)[0], limit)
+             if over else [])
+    return "\n".join(lines + ["%s: %s" % (rule, over)])
 
 
 # THE SCOPE MODEL IS DELETED, NOT VERSIONED. Its history is the argument:

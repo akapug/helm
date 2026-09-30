@@ -152,7 +152,7 @@ class SpiralKeyChainTest(unittest.TestCase):
                 os.environ[k] = v
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def observe(self, path=None):
+    def observe(self, path=None, clean=False):
         """One round: a dispatch the seat sent, then a FIX verdict on it.
 
         `deadline_s` is not decoration — `_valid_identity` throws a row
@@ -174,8 +174,15 @@ class SpiralKeyChainTest(unittest.TestCase):
             row["supersedes"] = self.rows[-1]
         self.assertTrue(eventledger.append(D.ledger_path(), row))
         self.rows.append(rid)
+        if clean:
+            # A SOURCE-CLEAN HOLD: an answered round that accuses no path.
+            self.assertTrue(eventledger.append(D.ledger_path(), {
+                "v": 3, "event": "hold", "seq": 1, "id": rid,
+                "ts": row["ts"], "reason": "read clean", "owner_gated": False,
+                "source_clean_tip": tip, "hold_actor": PEER}))
         if path is not None:
             argv = ["verdict", rid, tip, "--fix", "--measured",
+                    "--finding-count", "1", "--prior-relation", "new",
                     "--worse-than-main", path,
                     "--no-patch-because", "a design finding for a meld",
                     "Reviewer observation naming %s." % path]
@@ -208,20 +215,26 @@ class SpiralKeyChainTest(unittest.TestCase):
         self.assertIn("review spiral", block)
         self.assertNotIn(SF.UNDER_ARMED, block)
 
-    def test_three_disjoint_path_sets_fire_under_armed_and_do_not_block(self):
-        """Every round found a defect the previous arms could not see. There
-        is nothing open to converge, so the meld prescription is withdrawn —
-        and the seat is not walled for the behaviour a review exists to
-        produce."""
+    def test_three_disjoint_path_sets_prescribe_a_BAR_meld_and_block(self):
+        """T3. Every round found a defect the previous arms could not see.
+        There is no open finding to converge, and what the chain lacks is the
+        BAR: the closed harms and falsifier classes the next read may use. So
+        the rung blocks, and its invite is the bar meld, not the converge
+        meld a re-litigated finding gets."""
         for path in ("helm/a.py", "helm/b.py", "helm/c.py"):
             self.observe(path)
         info, block, warn = self.read("underarmed")
         self.assertEqual(info["rounds"], 3)
         self.assertEqual(info["prescription"], SF.UNDER_ARMED)
-        self.assertIsNone(block)
-        self.assertIn(SF.UNDER_ARMED, warn)
-        self.assertIn("3 disjoint finding path sets", warn)
-        self.assertIn("ask the author for the generating cause", warn)
+        self.assertIsNotNone(block, "an under-armed chain was only advised")
+        self.assertIn("review spiral", block)
+        self.assertIn("UNDER-ARMED, so the meld agrees the BAR", block)
+        self.assertIn("3 disjoint finding path sets", block)
+        self.assertIn('helm chat meld invite %s "one-lane: agree the bar' % PEER,
+                      block)
+        self.assertNotIn("converge every open review finding", block)
+        self.assertIn("ask the author for the generating cause", block)
+        self.assertNotIn("Not blocking", warn or "")
 
     def test_two_rounds_fire_nothing(self):
         """Two disjoint rounds are the ordinary shape of a review, not a
@@ -238,11 +251,14 @@ class SpiralKeyChainTest(unittest.TestCase):
         self.assertEqual(self.read("three")[0]["prescription"], SF.UNDER_ARMED)
 
     def test_a_keyless_round_is_unknown_and_the_render_says_so(self):
-        """An undecided round yields no finding identity. It counts toward
-        neither bucket, so two keyed rounds cannot reach UNDER-ARMED — and
-        the block that stands instead says which rounds it could not read."""
+        """An answered round that accuses no path yields no finding identity.
+        It counts toward neither bucket, so two keyed rounds cannot reach
+        UNDER-ARMED — and the block that stands instead says which rounds it
+        could not read. The keyless round is a clean read: the reading is
+        taken over ANSWERED rounds only, so a round in flight is not in it,
+        and a round nobody answered is not a round at all (task/2682)."""
         self.observe("helm/a.py")
-        self.observe(None)
+        self.observe(clean=True)
         self.observe("helm/b.py")
         info, block, warn = self.read("keyless")
         self.assertEqual(info["prescription"], "MELD")

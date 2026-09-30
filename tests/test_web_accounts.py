@@ -171,6 +171,54 @@ class AccountsEndpointTest(AccountsBase):
         self.assertEqual(out["code"], "conflict")
         self.assertEqual(self.raw(), before)
 
+    def test_a_write_landing_between_the_save_and_its_read_back_is_not_folded_in(self):  # noqa: VACUOUS_ASSERTION — the assertIsNone is on the third writer's save error inside the seam; its unconditional positive control is the stored plan of acct-b being "Third Writer Plan" at the end of this arm, which only a save that landed can satisfy
+        """THE SAVE ANSWERS THE REVISION IT WROTE, not the one a later read saw.
+
+        The door re-reads the inventory after the write to answer the row with
+        its derived fields, and that read runs after the lock is released. A
+        third writer's save can land in between. Answered from that read, the
+        page's fill path adopts a revision that covers a write it never drew,
+        and its next cell passes the compare-and-set over that write. The seam
+        is the re-read itself: the third writer saves on its first call."""
+        from unittest import mock
+        with measuring([]):
+            web._api_accounts_post({"action": "save", "account": row()})
+            web._api_accounts_post({"action": "save", "account": row(id="acct-b")})
+            before = accounts.read()["revision"]
+            real = accounts.client_rows
+            seen = {}
+
+            def a_third_writer_lands_first(*a, **k):
+                if "wrote" not in seen:
+                    seen["wrote"] = accounts.read()["revision"]
+                    _r, err, _c = accounts.save(
+                        {"id": "acct-b", "plan": "Third Writer Plan"})
+                    self.assertIsNone(err, err)
+                    seen["third"] = accounts.read()["revision"]
+                return real(*a, **k)
+
+            with mock.patch.object(accounts, "client_rows", a_third_writer_lands_first):
+                out, status = web._api_accounts_post(
+                    {"action": "save", "revision": before,
+                     "account": {"id": "acct-a", "price_month": "$20"}})
+            self.assertEqual(status, 200, out)
+            # THE STATE UNDER TEST WAS REACHED: this save moved the inventory,
+            # and the third write landed after it and before the read-back.
+            self.assertNotEqual(seen["wrote"], before)
+            self.assertNotEqual(seen["third"], seen["wrote"])
+            self.assertEqual(accounts.read()["revision"], seen["third"])
+            self.assertEqual(out["revision"], seen["wrote"],
+                             "the answer carried a revision that covers the "
+                             "third writer's save")
+            # …so the page's next cell, posting that revision, is told the
+            # list moved instead of writing over a change it never drew.
+            refused, status = web._api_accounts_post(
+                {"action": "save", "revision": out["revision"],
+                 "account": {"id": "acct-b", "plan": "Page Plan"}})
+            self.assertEqual((status, refused.get("code")), (409, "conflict"), refused)
+            plans = {a["id"]: a["plan"] for a in accounts.read()["accounts"]}
+            self.assertEqual(plans["acct-b"], "Third Writer Plan")
+
     def test_a_remove_answers_the_new_revision_and_a_stale_one_conflicts(self):
         web._api_accounts_post({"action": "save", "account": row()})
         web._api_accounts_post({"action": "save", "account": row(id="acct-b")})
@@ -583,7 +631,14 @@ let POST_REPLY = {ok: true};
 let FETCH_REPLY = null;
 let CONFIRMED = true;
 const confirm = () => CONFIRMED;
-const declPost = body => { POSTED.push(body); return Promise.resolve(POST_REPLY); };
+/* POST_GATE holds a save's answer until an arm releases it, so an arm can act
+   while a cell's save is in flight — deterministically, never by timing. */
+let POST_GATE = null;
+const declPost = body => {
+  POSTED.push(body);
+  const r = POST_REPLY;
+  return POST_GATE ? POST_GATE.then(() => r) : Promise.resolve(r);
+};
 const j = _url => Promise.resolve(FETCH_REPLY);
 
 /* a minimal DOM: one stub element per selector the card touches */
@@ -926,7 +981,11 @@ declFillToggle();
    as though the cards were on screen together. */
 out.fill_on = {fill: !el("#declfill").hidden, read: !el("#declrows").hidden,
                label: el("#dFill").textContent};
-declFillToggle();
+/* AWAITED, because leaving fill mode re-reads the inventory. Left in flight,
+   that re-read landed during the NEXT arm's save and replaced the DECL it had
+   drawn, so the arm's "the server's row replaces the local one" was answered
+   by a push onto the re-read's empty list. */
+await declFillToggle();
 out.fill_off = {fill: !el("#declfill").hidden, read: !el("#declrows").hidden,
                 label: el("#dFill").textContent};
 
@@ -1034,6 +1093,121 @@ out.fill_off = {fill: !el("#declfill").hidden, read: !el("#declrows").hidden,
   out.fill_conflict_toast = TOASTS[TOASTS.length - 1];
   out.fill_conflict_reloaded = RENDER_ACCTS_CALLS;
 
+  /* --- LEAVING FILL MODE REDRAWS THE READING CARD --- */
+  /* A fill cell's save patches DECL and redraws nothing that is hidden, and
+     the reading card is hidden while he fills. Its confirm and remove post
+     DECL.revision, so the card he comes back to has to be drawn from that
+     DECL, not from the one before every cell he filled. */
+  EL["#declfill"] = null; delete EL["#declfill"];
+  render({accounts: [A({id: "acct-a", price_month: "$7"})], revision: "rev-read"});
+  DECL_FILL = false;
+  declFillToggle();
+  POST_REPLY = {ok: true, revision: "rev-read-2",
+                account: A({id: "acct-a", price_month: "$31", price_value: 31,
+                            headline: "vendor-x · Small Plan · x1 · $31/mo · reading the live timeline"})};
+  await declFillSave({dataset: {fkeyrow: "id:acct-a", fkey: "price_month", frow: "0"},
+                      value: "$31", type: "text"});
+  out.fill_exit_before = el("#declrows").innerHTML;
+  FETCH_REPLY = Object.assign({}, FILL_DEFAULTS, {revision: "rev-read-2",
+    accounts: [A({id: "acct-a", price_month: "$31", price_value: 31,
+                  headline: "vendor-x · Small Plan · x1 · $31/mo · reading the live timeline"})]});
+  await declFillToggle();
+  out.fill_exit_read = el("#declrows").innerHTML;
+  out.fill_exit_revision = DECL.revision;
+
+  /* --- A DESCRIBE AFTER A FILL SAVE OPENS THE RECORD AS SAVED --- */
+  /* The "+ describe" chip on the measured table opens the form through the
+     join, which is drawn once per load; a fill cell's save patches
+     DECL.accounts and DECL.revision but not the join. The form posts the
+     revision it opened with, so it has to show the fields that revision
+     holds, or the old price rides a fresh revision over the one he filled. */
+  const JOINED = A({id: "acct-a", measured_as: "quota-row-1",
+                    measured_as_masked: "quota-row-1", price_month: "$7"});
+  render({accounts: [JOINED], revision: "rev-join",
+          join: {matched: {"quota-row-1": JOINED}, declared_only: [], measured_only: []}});
+  DECL_FILL = false;
+  declFillToggle();
+  const joinedKey = (fillRows().find(r => r.id === "acct-a") || {}).key;
+  POST_REPLY = {ok: true, revision: "rev-join-2",
+                account: A({id: "acct-a", measured_as: "quota-row-1",
+                            measured_as_masked: "quota-row-1", price_month: "$31"})};
+  await declFillSave({dataset: {fkeyrow: joinedKey, fkey: "price_month", frow: "0"},
+                      value: "$31", type: "text"});
+  /* still IN fill mode: the describe chip on the measured table stays live
+     while he fills, and leaving fill mode re-reads the join */
+  out.describe_after_fill_saved = DECL.revision;
+  out.describe_after_fill_join_price = DECL.join.matched["quota-row-1"].price_month;
+  declOpenFor("quota-row-1");
+  out.describe_after_fill_rev = DECL_REV;
+  out.describe_after_fill_price = el("#dPrice").value;
+  out.describe_after_fill_edit = DECL_EDIT;
+  declFormClose();
+
+  /* --- LEAVING FILL MODE RE-READS THE JOIN, not only the rows --- */
+  /* A record a fill cell CREATED is not in the join until the server joins
+     it. Redrawn from the old join, the undescribed strip still offers
+     "describe" for that account, and that describe opens an ADD: a second
+     record for one subscription. */
+  EL["#declfill"] = null; delete EL["#declfill"];
+  const STRIP = {name_masked: "quota-row-9", key: M().measured_key,
+                 suggest_id: "quota-row-9", provider: "vendor-x"};
+  render({accounts: [], revision: "rev-strip",
+          join: {matched: {}, declared_only: [], measured_only: [STRIP]}});
+  out.strip_before = el("#declrows").innerHTML;
+  CREDS = [M()];
+  DECL_FILL = false;
+  declFillToggle();
+  POST_REPLY = {ok: true, revision: "rev-strip-2",
+                account: A({id: "vendor-x-quota-row-9", price_month: "$9",
+                            subscription: "s-nine"})};
+  await declFillSave({dataset: {fkeyrow: "s-nine", fkey: "price_month", frow: "0"},
+                      value: "$9", type: "text"});
+  out.strip_created = (DECL.accounts || []).map(a => a.id);
+  const JOINED9 = A({id: "vendor-x-quota-row-9", price_month: "$9",
+                     measured_as: "quota-row-9", measured_as_masked: "quota-row-9",
+                     subscription: "s-nine"});
+  FETCH_REPLY = Object.assign({}, FILL_DEFAULTS, {accounts: [JOINED9],
+    revision: "rev-strip-2",
+    join: {matched: {"quota-row-9": JOINED9}, declared_only: [], measured_only: []}});
+  await declFillToggle();
+  out.strip_after = el("#declrows").innerHTML;
+  out.strip_after_join = Object.keys((DECL.join || {}).matched || {});
+
+  /* --- …AND THE RE-READ WAITS FOR THE SAVE HIS OWN CLICK MADE --- */
+  /* He leaves fill mode by clicking "done filling", and the click blurs the
+     box he was typing in, which is what saves it: that cell's save is posted
+     a moment before the re-read. Sent together, the re-read can be served
+     before the write, and the card comes back without the record the cell is
+     creating. FETCH_REPLY is what a read served at that moment answers. */
+  EL["#declfill"] = null; delete EL["#declfill"];
+  render({accounts: [], revision: "rev-race",
+          join: {matched: {}, declared_only: [], measured_only: [STRIP]}});
+  DECL_FILL = false;
+  declFillToggle();
+  let raceDone;
+  POST_GATE = new Promise(done => { raceDone = done; });
+  POST_REPLY = {ok: true, revision: "rev-race-2",
+                account: A({id: "vendor-x-quota-row-9", price_month: "$9",
+                            subscription: "s-nine"})};
+  const blurSave = declFillSave({dataset: {fkeyrow: "s-nine", fkey: "price_month", frow: "0"},
+                                 value: "$9", type: "text"});
+  /* the server while that write is in flight… */
+  FETCH_REPLY = Object.assign({}, FILL_DEFAULTS, {revision: "rev-race",
+    join: {matched: {}, declared_only: [], measured_only: [STRIP]}});
+  const leaving = declFillToggle();
+  /* …and once it is done */
+  FETCH_REPLY = Object.assign({}, FILL_DEFAULTS, {accounts: [JOINED9],
+    revision: "rev-race-2",
+    join: {matched: {"quota-row-9": JOINED9}, declared_only: [], measured_only: []}});
+  raceDone();
+  POST_GATE = null;
+  await blurSave;
+  await leaving;
+  out.race_posted = POSTED[POSTED.length - 1].account.price_month;
+  out.race_revision = DECL.revision;
+  out.race_read = el("#declrows").innerHTML;
+  CREDS = [];
+
   /* --- ENTER AND TAB GO DOWN THE COLUMN --- */
   const BOXES = [];
   const FOCUSED = [];
@@ -1096,8 +1270,8 @@ class DeclaredCardRenderTest(unittest.TestCase):
         driver = DRIVER.replace("__UNDESCRIBED__", json.dumps(undescribed)) \
                        .replace("__BADROWS__", json.dumps(bad_rows))
         with open(cls.path, "w", encoding="utf-8") as f:
-            f.write(SUPPORT + "\nlet DECL, DECL_EDIT = null, DECL_MKEY = null;\n"
-                    + "let DECL_FILL = false;\n"
+            f.write(SUPPORT + "\nlet DECL, DECL_EDIT = null, DECL_MKEY = null, DECL_REV = \"\", DECL_GEN = 0;\n"
+                    + "let DECL_FILL = false;\nconst FILL_POSTS = new Set();\n"
                     + _extract_const(src, "DECL_FIELDS") + "\n"
                     + _extract_const(src, "FILL_COLS") + "\n"
                     + _extract_const(src, "FILL_BILLING") + "\n"
@@ -1257,9 +1431,12 @@ class DeclaredCardRenderTest(unittest.TestCase):
         self.assertIn("clean", html)
 
     def test_the_totals_line_says_accounts_units_and_monthly_spend(self):
+        """ONE NOUN FOR ONE THING (task/3635): the subscriptions are "paid
+        accounts", the word the nav, Home and the table use for the same
+        count; the records he wrote down are "rows", never "accounts"."""
         html = self.html("declared_only")
-        self.assertIn("<b>1</b> account declared", html)
-        self.assertIn("<b>1</b> subscription in total", html)
+        self.assertIn("<b>1</b> account declared (1 paid, 0 free)", html)
+        self.assertIn("1 row written down", html)
         self.assertIn("<b>$7</b>/month", html)
 
     def test_an_unpriced_row_makes_the_total_say_it_is_a_floor(self):
@@ -1683,6 +1860,67 @@ class DeclaredCardRenderTest(unittest.TestCase):
                       "hunting for the one that did not save")
         self.assertTrue(self.html("fill_conflict_reloaded"))
 
+    def test_leaving_fill_mode_redraws_the_reading_card_from_what_was_saved(self):
+        """The card he returns to carries confirm and remove, which post the
+        card's revision; drawn before his fill saves, it showed rows that
+        revision no longer describes."""
+        # THE STATE UNDER TEST WAS REACHED: the save landed and the hidden
+        # card was still the one drawn before it
+        self.assertEqual(self.html("fill_exit_revision"), "rev-read-2")
+        self.assertIn("$7/mo", self.html("fill_exit_before"))
+        read = self.html("fill_exit_read")
+        self.assertIn("$31/mo", read)
+        self.assertNotIn("$7/mo", read)
+
+    def test_a_describe_after_a_fill_save_opens_the_record_as_saved(self):
+        """The describe chip opens the form through the join, which a fill
+        save does not patch. The form posts the revision it opened with, so
+        the fields it shows must be the ones that revision holds: drawn from
+        the join's copy, the old price rode the new revision over the one he
+        had just filled."""
+        # THE STATE UNDER TEST WAS REACHED: the save landed and the join still
+        # holds the record as it was before it
+        self.assertEqual(self.html("describe_after_fill_saved"), "rev-join-2")
+        self.assertEqual(self.html("describe_after_fill_join_price"), "$7")
+        self.assertEqual(self.html("describe_after_fill_edit"), "acct-a")
+        self.assertEqual(self.html("describe_after_fill_rev"), "rev-join-2")
+        self.assertEqual(self.html("describe_after_fill_price"), "$31",
+                         "the form opened on the join's copy from before the "
+                         "fill save, under the revision after it")
+
+    def test_leaving_fill_mode_re_reads_the_join_a_created_record_joins(self):
+        """The undescribed strip and the describe chips are drawn from the
+        join, which only the server computes. A record a fill cell created is
+        not in the join the page holds, so a redraw from it still offers to
+        describe that account, and the describe mints a second record."""
+        key = 'data-dkey="m-deadbeefdeadbeef"'
+        # THE STATE UNDER TEST WAS REACHED: the strip offered the account, and
+        # the fill cell really created its record
+        self.assertIn(key, self.html("strip_before"))
+        self.assertEqual(self.html("strip_created"), ["vendor-x-quota-row-9"])
+        self.assertNotIn(key, self.html("strip_after"),
+                         "the strip still offers to describe an account whose "
+                         "record the fill cell just created")
+        self.assertEqual(self.html("strip_after_join"), ["quota-row-9"])
+
+    def test_leaving_fill_mode_re_reads_after_the_save_its_own_click_made(self):
+        """The click on "done filling" blurs the box he was typing in, and the
+        blur is the save — so the one exit gesture there is always posts a
+        cell a moment before the re-read. A re-read served before that write
+        draws the card without the record the cell created, the strip offers
+        the account again, and no later answer redraws it."""
+        key = 'data-dkey="m-deadbeefdeadbeef"'
+        # THE STATE UNDER TEST WAS REACHED: the cell's save was posted and
+        # answered, and the card was redrawn at all
+        self.assertEqual(self.html("race_posted"), "$9")
+        self.assertEqual(self.html("race_revision"), "rev-race-2")
+        read = self.html("race_read")
+        self.assertIn("vendor-x-quota-row-9", read,
+                      "the card was re-read before the save its own click made")
+        self.assertNotIn(key, read,
+                         "the strip still offers to describe the account the "
+                         "last cell created a record for")
+
     def test_enter_and_tab_move_down_the_column_and_shift_tab_moves_back_up(self):
         self.assertEqual(self.html("fill_focus_order"),
                          ["vendor/1", "vendor/2", "vendor/1"])
@@ -1713,13 +1951,21 @@ const fetch = (url, opts) => {
     PAGE_FETCHES++;
     return Promise.resolve({ok: true, status: 200, text: () => Promise.resolve("")});
   }
-  SENT.push({url, body: JSON.parse(opts.body)});
-  const r = REPLY;
-  return Promise.resolve({
+  const sent = JSON.parse(opts.body);
+  SENT.push({url, body: sent});
+  /* A REPLY MAY BE THE DOOR'S OWN RULE rather than a scripted answer: given
+     the body, it answers as the server would, so an arm can say "a stale
+     revision is refused" and let what the page POSTED decide the outcome. */
+  const r = typeof REPLY === "function" ? REPLY(sent) : REPLY;
+  const res = {
     ok: r.status >= 200 && r.status < 300, status: r.status,
     json: () => r.body === undefined ? Promise.reject(new Error("not json"))
-                                     : Promise.resolve(r.body)});
+                                     : Promise.resolve(r.body)};
+  /* POST_GATE holds the answer until an arm releases it, so the arm can act
+     while a save is in flight — deterministically, never by timing. */
+  return POST_GATE ? POST_GATE.then(() => res) : Promise.resolve(res);
 };
+let POST_GATE = null;
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const TOASTS = [];
 const toast = t => TOASTS.push(t);
@@ -1732,7 +1978,9 @@ const renderDeclared = () => { RELOADS++; };
 const renderDeclFill = () => {};
 const renderAccts = () => {};
 let FETCH_REPLY = null;
-const j = _url => Promise.resolve(FETCH_REPLY);
+/* J_GATE holds a reload in flight the same way POST_GATE holds a save. */
+let J_GATE = null;
+const j = _url => J_GATE ? J_GATE.then(() => FETCH_REPLY) : Promise.resolve(FETCH_REPLY);
 let CONFIRMED = true;
 const confirm = () => CONFIRMED;
 const EL = {};
@@ -1866,10 +2114,101 @@ const out = {};
   await declConfirm("acct-a");
   out.confirm_refused_toast = TOASTS[TOASTS.length - 1];
 
+  /* --- A LATE ANSWER NEVER ACTS ON A NEWER FORM --- */
+  /* He presses save on one form and, before its answer or the reload after
+     it is back, opens another. What comes back is about the FIRST form: it
+     may not re-point the revision of the one now open, whose fields were
+     drawn before that reload, and it may not close it. */
+  const tick = () => new Promise(done => setTimeout(done, 0));
+  /* (a) the 409 is back, and the reload after it is still in flight */
+  openWith("rev-first");
+  let reloadDone;
+  J_GATE = new Promise(done => { reloadDone = done; });
+  FETCH_REPLY = Object.assign({}, REV2, {revision: "rev-late"});
+  REPLY = {status: 409, body: {error: "someone else changed the accounts list while this one was open.", code: "conflict"}};
+  const firstSave = declSave();
+  await tick();
+  declFormOpen({id: "acct-second", vendor: "vendor-y", plan: "Second Plan"});
+  out.late_reload_opened_rev = DECL_REV;
+  reloadDone();
+  J_GATE = null;
+  await firstSave;
+  out.late_reload_landed = DECL.revision;
+  out.late_reload_rev = DECL_REV;
+  out.late_reload_open = !el("#declform").hidden;
+  out.late_reload_plan = el("#dPlan").value;
+  /* (b) the save's success is still in flight */
+  openWith("rev-ok-first");
+  let postDone;
+  POST_GATE = new Promise(done => { postDone = done; });
+  REPLY = {status: 200, body: {ok: true, revision: "rev-ok-2"}};
+  FETCH_REPLY = REV2;
+  TOASTS.length = 0;
+  const okSave = declSave();
+  await tick();
+  declFormOpen({id: "acct-third", vendor: "vendor-z", plan: "Third Plan"});
+  const thirdRev = DECL_REV;
+  postDone();
+  POST_GATE = null;
+  await okSave;
+  out.late_ok_sent = SENT.length;
+  out.late_ok_toast = TOASTS[TOASTS.length - 1];
+  out.late_ok_open = !el("#declform").hidden;
+  out.late_ok_rev_kept = DECL_REV === thirdRev;
+  out.late_ok_plan = el("#dPlan").value;
+  /* (c) the 409 ITSELF is still in flight. Arm (a) opens its second form
+     after the refusal was painted, so the refusal of a form he has left was
+     never drawn anywhere but in the form he was still in. */
+  openWith("rev-c-first");
+  let conflictDone;
+  POST_GATE = new Promise(done => { conflictDone = done; });
+  REPLY = {status: 409, body: {error: "someone else changed the accounts list while this one was open.", code: "conflict"}};
+  FETCH_REPLY = Object.assign({}, REV2, {revision: "rev-c-late"});
+  TOASTS.length = 0;
+  const conflictSave = declSave();
+  await tick();
+  declFormOpen({id: "acct-fourth", vendor: "vendor-w", plan: "Fourth Plan"});
+  const fourthMsg = el("#dMsg").innerHTML;
+  const fourthRev = DECL_REV;
+  conflictDone();
+  POST_GATE = null;
+  await conflictSave;
+  out.late_conflict_toast = TOASTS[TOASTS.length - 1];
+  out.late_conflict_msg_kept = el("#dMsg").innerHTML === fourthMsg;
+  out.late_conflict_rev_kept = DECL_REV === fourthRev;
+  out.late_conflict_landed = DECL.revision;
+  /* (d) a `stale` — the write LANDED — still in flight: his save, said as
+     one, and it closes nothing. Arm (b) is a 200, which takes the other
+     branch. */
+  openWith("rev-d-first");
+  let staleDone;
+  POST_GATE = new Promise(done => { staleDone = done; });
+  REPLY = {status: 409, body: {error: "your change was saved, but the accounts list changed underneath it.", code: "stale"}};
+  FETCH_REPLY = REV2;
+  TOASTS.length = 0;
+  const staleSave = declSave();
+  await tick();
+  declFormOpen({id: "acct-fifth", vendor: "vendor-v", plan: "Fifth Plan"});
+  staleDone();
+  POST_GATE = null;
+  await staleSave;
+  out.late_stale_toast = TOASTS[TOASTS.length - 1];
+  out.late_stale_open = !el("#declform").hidden;
+  out.late_stale_plan = el("#dPlan").value;
+
   out.page_fetches = PAGE_FETCHES;
   console.log(JSON.stringify(out));
 })();
 """
+
+
+def _transport_state(src):
+    """The card's own state for a lifted-transport run: the form's globals and
+    the SHIPPED field list. The field list was a hand mirror here, eleven
+    fields long while the form carried fourteen — the rot `_extract_const`
+    names — so the payload these arms posted was not the page's."""
+    return ("\nlet DECL, DECL_EDIT = null, DECL_MKEY = null, DECL_REV = \"\", DECL_GEN = 0;\n"
+            + _extract_const(src, "DECL_FIELDS") + "\n")
 
 
 class RealTransportRuntimeTest(unittest.TestCase):
@@ -1895,13 +2234,7 @@ class RealTransportRuntimeTest(unittest.TestCase):
         cls.tmp = tempfile.mkdtemp(prefix="helm-web-accounts-transport-")
         cls.path = os.path.join(cls.tmp, "run.js")
         with open(cls.path, "w", encoding="utf-8") as f:
-            f.write(TRANSPORT_SUPPORT + "\nlet DECL, DECL_EDIT = null;\n"
-                    + "const DECL_FIELDS = [[\"#dId\", \"id\"], [\"#dVendor\", \"vendor\"], "
-                      "[\"#dPlan\", \"plan\"], [\"#dCount\", \"count\"], "
-                      "[\"#dPrice\", \"price_month\"], [\"#dGood\", \"good_for\"], "
-                      "[\"#dNot\", \"not_for\"], [\"#dReach\", \"reach\"], "
-                      "[\"#dMeasured\", \"measured_as\"], [\"#dRenews\", \"renews_on\"], "
-                      "[\"#dNotes\", \"notes\"]];\n"
+            f.write(TRANSPORT_SUPPORT + _transport_state(src)
                     + fns + "\n" + TRANSPORT_DRIVER)
         chk = subprocess.run([cls.node, "--check", cls.path],
                              capture_output=True, text=True)
@@ -2024,10 +2357,202 @@ class RealTransportRuntimeTest(unittest.TestCase):
         self.assertTrue(self.got("confirm_conflict_reloaded"))
         self.assertTrue(self.got("confirm_refused_toast").startswith("\u2717"))
 
+    def test_a_late_reload_never_re_points_a_newer_forms_revision(self):
+        """The reload after a 409 re-points the form to the revision he was
+        shown, which is right for the form that got the 409 and wrong for one
+        opened while that reload was in flight: its fields were drawn before
+        the reload, and the new revision would let them pass the
+        compare-and-set over what the reload brought in."""
+        # THE STATE UNDER TEST WAS REACHED: the reload landed after the second
+        # form opened on the card as it was before it
+        self.assertEqual(self.got("late_reload_landed"), "rev-late")
+        self.assertEqual(self.got("late_reload_opened_rev"), "rev-first")
+        self.assertTrue(self.got("late_reload_open"))
+        self.assertEqual(self.got("late_reload_plan"), "Second Plan")
+        self.assertEqual(self.got("late_reload_rev"), "rev-first",
+                         "the first form's reload re-pointed the second form")
+
+    def test_a_late_success_never_closes_a_newer_form(self):
+        """The first save's success is still his, and still said; the form
+        opened after he pressed it is not the one that saved."""
+        self.assertEqual(self.got("late_ok_sent"), 1)
+        self.assertTrue(self.got("late_ok_toast").startswith("\u2713 saved"),
+                        self.got("late_ok_toast"))
+        self.assertTrue(self.got("late_ok_open"),
+                        "the first form's success closed the second form")
+        self.assertTrue(self.got("late_ok_rev_kept"))
+        self.assertEqual(self.got("late_ok_plan"), "Third Plan")
+
+    def test_a_late_refusal_is_a_toast_and_never_paints_a_newer_form(self):
+        """A 409 that lands after he opened another form is about the first
+        one: painted into the form now open, it would tell him the form he is
+        filling was refused. It is said in a toast, the card still reloads,
+        and the newer form keeps its own line and its own revision."""
+        self.assertTrue(self.got("late_conflict_toast").startswith(
+            "✗ someone else changed"), self.got("late_conflict_toast"))
+        self.assertEqual(self.got("late_conflict_landed"), "rev-c-late")
+        self.assertTrue(self.got("late_conflict_msg_kept"),
+                        "the first form's refusal was painted into the second form")
+        self.assertTrue(self.got("late_conflict_rev_kept"))
+
+    def test_a_late_landed_save_never_closes_a_newer_form(self):
+        """`stale` is a write that landed, so it closes its form like a
+        success; landing after he opened another form, it must close nothing."""
+        self.assertTrue(self.got("late_stale_toast").startswith("✓ saved — "),
+                        self.got("late_stale_toast"))
+        self.assertTrue(self.got("late_stale_open"),
+                        "the first form's landed save closed the second form")
+        self.assertEqual(self.got("late_stale_plan"), "Fifth Plan")
+
     def test_no_arm_here_touched_the_bearer_refresh_path(self):  # noqa: VACUOUS_ASSERTION — ZERO page fetches is the product law for this file: none of these arms is a 403, so a refresh would mean an arm ran something other than what it says. The positive control on the same stub is test_a_success_is_the_parsed_body_and_closes_the_form, whose 200 proves the fetch stub answered at all
         """A page fetch would mean a 403 arm ran by accident and every result
         above is about something other than what its name says."""
         self.assertEqual(self.got("page_fetches"), 0)
+
+
+OPENED_DRIVER = r"""
+/* THE REAL DOOR'S TWO VIEWS OF ONE INVENTORY, and its own refusal, spliced in
+   by the test from web._api_accounts and web._api_accounts_post. */
+const OPENED = __OPENED__, REREAD = __REREAD__, REFUSAL = __REFUSAL__;
+/* THE DOOR'S COMPARE-AND-SET, answered as the door answers it: the revision
+   the inventory has NOW is taken, any other gets the 409 it refused with.
+   What the page SENT is then posted through the real door by the python half,
+   so this rule is checked against the shipped one rather than trusted. */
+REPLY = body => body.revision === REREAD.revision
+  ? {status: 200, body: {ok: true, revision: REREAD.revision + "-after"}}
+  : {status: 409, body: REFUSAL};
+const out = {};
+(async () => {
+  DECL = Object.assign({}, OPENED);
+  declFormOpen(DECL.accounts.find(a => a.id === "acct-a"));
+  el("#dPlan").value = "Owner Plan";
+  /* ANOTHER WRITER SAVED, AND THIS TAB RE-READ while the form stayed open:
+     the fold closed and reopened, or he ticked confirm on another row. Both
+     are loadDeclared, which replaces DECL and never touches the form. */
+  FETCH_REPLY = REREAD;
+  await loadDeclared();
+  out.live_revision = DECL.revision;
+  SENT.length = 0; RELOADS = 0;
+  const first = await declSave();
+  out.first_posted = SENT.length ? SENT[0].body : null;
+  out.first_code = first && first.code;
+  out.first_form_open = !el("#declform").hidden;
+  out.first_plan_kept = el("#dPlan").value;
+  out.first_msg = el("#dMsg").innerHTML;
+  out.first_reloaded = RELOADS > 0;
+  /* HE HAS NOW BEEN SHOWN THE CONFLICT and the card behind the form draws the
+     row as it stands, so a second press is his informed choice. */
+  SENT.length = 0;
+  const second = await declSave();
+  out.second_posted = SENT.length ? SENT[0].body : null;
+  out.second_ok = !!(second && second.ok);
+  out.second_form_closed = el("#declform").hidden;
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+class TheFormSavesTheRevisionItOpenedTest(AccountsBase):
+    """A STALE FORM MAY NOT WRITE OVER A SAVE IT NEVER SAW.
+
+    The form holds the fields it was opened with; the card's `DECL` is
+    replaced by every re-read — the fold reopening, a confirm or a remove on
+    any row. A save that posted `DECL.revision` carried the revision of the
+    LATEST read, not of the fields in the form, so another writer's save
+    passed the compare-and-set and the stale fields merged over it with no 409.
+    Found by review (ds4pro and three codex models); every Opus read missed it.
+
+    Both ends are the shipped ones: the page's transport, loader and save are
+    lifted out of the assembled UI, the two inventories and the refusal come
+    from the real door, and what the page posted is posted through that door."""
+
+    def setUp(self):
+        super().setUp()
+        if not shutil.which("node"):
+            raise unittest.SkipTest("node not available")
+        self.world = measuring([])
+        self.world.__enter__()
+        self.addCleanup(self.world.__exit__, None, None, None)
+
+    def run_page(self, opened, reread, refusal):
+        src = web_ui_loader.read_text()
+        fns = "\n\n".join(_extract_fn(src, n) for n in TRANSPORT_EXTRACT)
+        driver = (OPENED_DRIVER.replace("__OPENED__", json.dumps(opened))
+                  .replace("__REREAD__", json.dumps(reread))
+                  .replace("__REFUSAL__", json.dumps(refusal)))
+        path = os.path.join(self.dir, "run.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(TRANSPORT_SUPPORT + _transport_state(src) + fns + "\n" + driver)
+        proc = subprocess.run([shutil.which("node"), path],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout or "{}")
+
+    def test_a_re_read_between_open_and_save_does_not_move_the_forms_revision(self):
+        out, status = web._api_accounts_post({"action": "save", "account": row()})
+        self.assertEqual(status, 200, out)
+        opened = web._api_accounts()
+        # ANOTHER WRITER: a one-field save from a second tab, against the
+        # revision it read, which the door takes.
+        out, status = web._api_accounts_post(
+            {"action": "save", "revision": opened["revision"],
+             "account": {"id": "acct-a", "plan": "Other Writer Plan"}})
+        self.assertEqual(status, 200, out)
+        reread = web._api_accounts()
+        # THE PRECONDITION: the inventory really moved, so "posted the opened
+        # revision" and "posted the live one" are two different values.
+        self.assertNotEqual(reread["revision"], opened["revision"])
+        # the door's own refusal of the opened revision, which writes nothing
+        refusal, status = web._api_accounts_post(
+            {"action": "save", "revision": opened["revision"],
+             "account": {"id": "acct-a", "confirmed": True}})
+        self.assertEqual((status, refusal.get("code")), (409, "conflict"), refusal)
+
+        got = self.run_page(opened, reread, refusal)
+        # the re-read DID move the card's revision under the open form…
+        self.assertEqual(got["live_revision"], reread["revision"])
+        # …and the save carried the revision the form was OPENED with anyway
+        self.assertEqual(got["first_posted"]["revision"], opened["revision"],
+                         "the form posted the card's live revision, so the "
+                         "other writer's save passed the compare-and-set")
+
+        # THE REAL DOOR, given exactly what the page posted: refused, and the
+        # other writer's plan is still what is stored.
+        answer, status = web._api_accounts_post(got["first_posted"])
+        self.assertEqual((status, answer.get("code")), (409, "conflict"), answer)
+        self.assertEqual(accounts.read()["accounts"][0]["plan"], "Other Writer Plan")
+
+        # THE DRAFT IS KEPT: the form stays open with what he typed, the
+        # sentence says so, and the card behind it was re-read.
+        self.assertEqual(got["first_code"], "conflict")
+        self.assertTrue(got["first_form_open"])
+        self.assertEqual(got["first_plan_kept"], "Owner Plan")
+        self.assertIn("someone else changed", got["first_msg"])
+        self.assertIn("Your edits are kept here", got["first_msg"])
+        self.assertTrue(got["first_reloaded"])
+
+    def test_the_second_press_after_the_conflict_is_the_one_that_writes(self):
+        """THE OWNER'S LOOP. Shown the conflict, with the row as it stands drawn
+        behind the form, a second press carries the revision he was shown and
+        lands — never the refused one again forever, and never silently."""
+        web._api_accounts_post({"action": "save", "account": row()})
+        opened = web._api_accounts()
+        web._api_accounts_post(
+            {"action": "save", "revision": opened["revision"],
+             "account": {"id": "acct-a", "plan": "Other Writer Plan"}})
+        reread = web._api_accounts()
+        refusal, _status = web._api_accounts_post(
+            {"action": "save", "revision": opened["revision"],
+             "account": {"id": "acct-a", "confirmed": True}})
+
+        got = self.run_page(opened, reread, refusal)
+        self.assertEqual(got["first_posted"]["revision"], opened["revision"])
+        self.assertEqual(got["second_posted"]["revision"], reread["revision"])
+        answer, status = web._api_accounts_post(got["second_posted"])
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(accounts.read()["accounts"][0]["plan"], "Owner Plan")
+        self.assertTrue(got["second_ok"])
+        self.assertTrue(got["second_form_closed"])
 
 
 class CreateTransitionEndToEndTest(AccountsBase):
@@ -2704,11 +3229,11 @@ class OwnerSurfaceLawTest(unittest.TestCase):
             self.assertLess(i_new, self.src.index(below), below)
         self.assertLess(i_table, i_new)
         self.assertIn('id="acctdeclared" open', self.src)
-        # the burn-flag fold is no longer one of them: it moved onto the burn
-        # board (task/2975), ahead of this tab, and the quota tab kept its
-        # account tables
-        self.assertLess(self.src.index('id="flagcard"'),
-                        self.src.index('id="view-quota"'))
+        # THE FAMILIES CARD HEADS THIS TAB (task/3445 L4): supply measured
+        # once for the whole fleet, above the accounts that bill it
+        self.assertLess(self.src.index('id="view-quota"'),
+                        self.src.index('id="flagcard"'))
+        self.assertLess(self.src.index('id="flagcard"'), i_table)
 
     def test_the_order_question_is_answered_by_the_tiers_not_by_a_column_sort(self):
         """THE ONE AFFORDANCE THIS PASS REMOVED, pinned here with its reason so
@@ -2750,7 +3275,7 @@ class OwnerSurfaceLawTest(unittest.TestCase):
             + self.src.split("function quotaResetCell")[1][:1200] \
             + self.src.split("function quotaIdCell")[1][:1600]
         for fact in ("windows_left", "windows_per_week", "windows_verdict",
-                     "name_lies", "duplicate_homes", "stfix", "resets_at_ms"):
+                     "name_lies", "duplicate_homes", "CRED_SAID", "resets_at_ms"):
             self.assertIn(fact, table, fact)
         self.assertIn("function quotaHeadHTML", self.src)
 

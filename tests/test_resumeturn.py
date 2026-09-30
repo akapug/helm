@@ -15,15 +15,19 @@ pane, no real process, no chat node.
 """
 import contextlib
 import fcntl
+import gc
 import io
 import json
 import os
 import re
 import shlex
 import shutil
+import sys
 import tempfile
+import threading
 import time
 import unittest
+import warnings
 from unittest import mock
 
 from helm import (composers, handoff, harness, hooks, inject, orcaadopt, pk,
@@ -615,6 +619,29 @@ class DetachedInjectionTest(ResumeTurnBase):
             rc = resumeturn.cmd_resume_turn(["--show", token])
         self.assertEqual(rc, 0)
         printed.assert_called_once_with(" ".join(text.split()))
+
+    def test_show_answers_an_expired_directive_marked_stale(self):
+        text = "continue the assigned lane " * 20
+        with mock.patch.object(resumeturn, "injection_ttl_s", return_value=100), \
+                mock.patch.object(resumeturn.time, "time", return_value=1000):
+            wire = resumeturn._wire_text("codex", SID, text)
+        token = wire.split("--show ", 1)[1].rstrip("`")
+        with mock.patch.object(resumeturn.time, "time", return_value=4700), \
+                mock.patch("builtins.print") as printed:
+            rc = resumeturn.cmd_resume_turn(["--show", token])
+        out = "\n".join(str(c.args[0]) for c in printed.call_args_list)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("STALE", out)
+        self.assertIn("60m", out)
+        self.assertIn(" ".join(text.split()), out)
+        # The Enter gate is unchanged: an expired pointer is still not deliverable.
+        with mock.patch.object(resumeturn.time, "time", return_value=4700):
+            self.assertIsNone(resumeturn.show_directive(token))
+            self.assertEqual(resumeturn.indirection_payload_available(wire), (False, token))
+
+    def test_show_still_refuses_an_unknown_directive(self):
+        with mock.patch("builtins.print"):
+            self.assertEqual(resumeturn.cmd_resume_turn(["--show", "0123456789abcdef"]), 1)
 
     def test_child_submits_the_short_wire_and_keeps_the_full_directive(self):  # noqa: VACUOUS_ASSERTION — resumed mode and ad.sent are positive controls on the same delivery
         text = "continue the assigned lane " * 20
@@ -5521,38 +5548,76 @@ class AlertWakeDmTest(ResumeTurnBase):
         hook-budget coupling but not lane coupling — a stalled DM leg must
         not starve the room row, and the child returns at its bound.
 
-        The ratios are the arm: the DM stalls for up to twice the join bound
-        and the child must be back by 1.75 of it, so a child that waited for
-        the DM cannot pass and one that returned at its bound cannot fail.
+        THE STALL OUTLIVES THE CHILD BY CONSTRUCTION, NOT BY A RACE. The DM
+        leg blocks until the arm releases it, and the arm releases it only
+        after wake_alert has returned. The arm observes whether that stall
+        was still running at the return: a child that honours its bound
+        returns with the stall in progress, and a child that waits for the
+        DM leg cannot return until the stall ends, which only HANG_S ends.
+        No elapsed time is compared to anything, so a slow host moves when
+        each step happens and never which way the arm answers.
+
+        THE BOUND FALLS DUE ONCE THE ROOM LEG IS DONE. The join budget is the
+        one reading wake_alert takes after starting both legs; here that
+        reading waits for the room leg to finish and then answers zero. So
+        the room row is in before the bound expires however slowly the host
+        schedules the room leg, and the DM leg is still owed its whole stall
+        when the bound expires.
 
         THE STALLED LEG ENDS INSIDE THIS ARM. wake_alert abandons it at the
         join bound, still running, and its refusal line prints when the
         stall ends. Left alone, that line lands in whichever later test is
         capturing stderr at the time, so the arm releases the stall and
-        joins the leg before it returns."""
+        joins the leg before it returns, with its seams still patched."""
         import threading
-        calls, legs = [], []
-        join = 0.5
-        release = threading.Event()
+        from tests._lockwait import HANG_S
+        calls, rooms, legs, consulted = [], [], [], []
+        posted, stalled = threading.Event(), threading.Event()
+        release, stall_over = threading.Event(), threading.Event()
+
+        def post(text, **kw):
+            calls.append((text, kw))
+            if not kw.get("dm"):
+                rooms.append(threading.current_thread())
+                posted.set()
 
         def slow_dm(to, text, **kw):
             legs.append(threading.current_thread())
-            release.wait(2 * join)
+            stalled.set()
+            release.wait(HANG_S)
+            stall_over.set()
             return None, "too slow to matter"
 
-        started = time.time()
-        with mock.patch.dict(os.environ,
-                             {"HELM_RESUME_TURN_WAKE_JOIN_S": str(join)}), \
+        def bound_due():
+            consulted.append(threading.current_thread())
+            self.assertTrue(posted.wait(HANG_S),
+                            "fixture: the room leg never posted")
+            rooms[0].join(HANG_S)
+            return 0.0
+
+        with mock.patch.object(resumeturn, "_wake_join_s",
+                               side_effect=bound_due), \
                 mock.patch.object(seats, "dm", side_effect=slow_dm), \
-                self.recorded(calls):
+                mock.patch("helm.chat.post", side_effect=post):
             ok = resumeturn.wake_alert(self.wake_payload())
-        elapsed = time.time() - started
-        release.set()
-        for leg in legs:
-            leg.join(5)
-        self.assertEqual(len(legs), 1, "fixture: the DM leg never ran")
-        self.assertLess(elapsed, 1.75 * join,
-                        "the child must return at its join bound")
+            returned_mid_stall = not stall_over.is_set()
+            reached = stalled.wait(HANG_S)
+            release.set()
+            for leg in legs:
+                leg.join(HANG_S)
+        self.assertTrue(reached, "fixture: the DM leg never ran")
+        # MUST-HIT: the join bound is the seam this arm makes fall due. A
+        # child that stopped reading it joins on a bound of its own, and the
+        # verdict below becomes a race between that bound and HANG_S.
+        self.assertEqual(len(consulted), 1,
+                         "fixture: wake_alert never read its join bound "
+                         "through _wake_join_s, so the bound never fell due")
+        self.assertEqual(len(legs), 1, legs)
+        self.assertFalse(legs[0].is_alive(),
+                         "the stalled leg outlived the arm")
+        self.assertTrue(returned_mid_stall,
+                        "the child waited for the stalled DM leg instead of "
+                        "returning at its join bound")
         self.assertTrue(ok, "the room row must land despite the stall")
         self.assertEqual(len(self.rooms(calls)), 1)
 
@@ -5908,7 +5973,8 @@ class SpokeSinceTest(unittest.TestCase):
         check reddens here even if every fixture above still passes.
         """
         import ast as _ast
-        src = open(handoff.__file__, encoding="utf-8").read()
+        with open(handoff.__file__, encoding="utf-8") as fh:
+            src = fh.read()
         fns = {n.name: n for n in _ast.walk(_ast.parse(src))
                if isinstance(n, _ast.FunctionDef)}
         for name in ("_spoken_at", "spoke_since"):
@@ -6065,8 +6131,12 @@ _CONTENTS_CLAIM = re.compile(
 # THE MODULES THAT PRODUCE REFUSALS ABOUT A PANE. The corpus arm below reads
 # their string literals, so this list IS the scan's population and a module
 # added here widens it.
+# `helm/panetail.py` joined with the dialog door (task/3209): the door's SHAPE
+# refusals are the dialog recognisers' own sentences, so a contents claim in
+# one of them is a claim the door makes.
 _REFUSAL_MODULES = ("helm/composers.py", "helm/resumeturn.py",
-                    "helm/orcaadopt.py", "helm/harness.py")
+                    "helm/orcaadopt.py", "helm/harness.py",
+                    "helm/panetail.py")
 
 # EVERY PRODUCTION LITERAL THE DETECTOR MAY FIRE ON, each one a sentence written
 # AFTER a real read. Derived by running the scan, then read one by one: this is
@@ -6083,18 +6153,14 @@ _READ_PATH_LITERALS = (
     "the full current composer could not be identified exactly",
     "current composer does not exactly equal Helm's recorded text",
     "the composer no longer holds the text",
-    # `choose_in_modal` reads the pane into `tail` as its first act and every
-    # sentence below that read describes what the read returned. This one says
-    # a dialog is not showing; the detector is right that it claims contents,
-    # and the claim is one the door measured.
-    "is not showing a dialog that owns input at delivery time",
-    # The SAME door's wall sentence, and it is a contents claim on purpose: the
-    # quoted wall LINE and both line spans it prints are fields of the parse of
-    # the tail that first read returned, so the sentence reports measurements
-    # rather than asserting a screen. It quotes the pane's own words and never
-    # the recognizer that matched them. It says nothing about which of them
-    # arrived first, because position does not carry that.
-    "carries quota-wall text",
+    # The dialog door (`answer_dialog`) reads the pane after its witness, as
+    # the last read before its key, and hands that tail to the kind's
+    # recogniser (`panetail.vendor_dialog`, 2386's `modal_standing`), whose
+    # sentences describe what that read returned: no dialog owns input, or a
+    # composer holding text sits below the choices. The detector is right
+    # that they claim contents, and the claim is one the door measured.
+    "not showing a dialog that owns input",
+    "a composer holding text is rendered below the run",
 )
 
 
@@ -8403,8 +8469,8 @@ class ADeafInEffectPaneIsNudgedNotReArmedTest(ResumeTurnBase):
         self.assertIn("--seat", argv)
         self.assertEqual(argv[argv.index("--seat") + 1], "codex")
         self.assertEqual(argv[argv.index("--session") + 1], self.SID)
-        text = io.open(argv[argv.index("--text-file") + 1],
-                       encoding="utf-8").read()
+        with io.open(argv[argv.index("--text-file") + 1], encoding="utf-8") as fh:
+            text = fh.read()
         self.assertIn("4020s", text)
         self.assertIn("helm chat read", text)
         # THE SENTENCE SAYS WHAT THIS IS NOT, because a seat reading a
@@ -9263,6 +9329,31 @@ class TheRearmKeystrokeReachesEveryDeclaredHostTest(ResumeTurnBase):
             self.assertEqual("herdr", orcaadopt._detected_host())
         with mock.patch.object(harness, "detect", return_value=None):
             self.assertIn("none detected", orcaadopt._detected_host())
+
+
+class SpawnChildReaperTest(unittest.TestCase):
+    """spawn_child starts a DETACHED deliverer that must outlive the hook, so
+    it is never waited on in line. Dropping its Popen object while the child
+    still ran made CPython warn "subprocess N is still running" and left the
+    child unreaped until the parent exited. A background reaper holds the
+    object and waits on it."""
+
+    def test_the_detached_child_is_held_and_reaped_not_dropped(self):  # noqa: VACUOUS_ASSERTION — the empty warning list is paired with a positive control, a live reaper thread asserted present then joined; at trunk both the warning and the missing reaper fail it
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always", ResourceWarning)
+            resumeturn.spawn_child(
+                [sys.executable, "-c", "import time; time.sleep(1)"])
+            gc.collect()
+        self.assertEqual([str(w.message) for w in seen
+                          if issubclass(w.category, ResourceWarning)], [])
+        reapers = [t for t in threading.enumerate()
+                   if t.name == "resume-turn-reaper"]
+        self.assertTrue(reapers, "no reaper holds the detached child")
+        for t in reapers:
+            t.join(timeout=10)
+        self.assertFalse([t for t in reapers if t.is_alive()],
+                         "the reaper did not see the child exit")
+
 
 if __name__ == "__main__":
     unittest.main()

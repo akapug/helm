@@ -23,24 +23,13 @@ own module body, after every name it needs exists. A module object is in
 `sys.modules` from the first line of its execution, so either import order
 resolves.
 """
-import calendar
-import contextlib
-import functools
-import hashlib
 import json
 import os
-import re
-import subprocess
 import sys
-import tempfile
-import threading
 import time
-import unicodedata
 
 from . import landreq
-from . import dispatches, foldcheck, foldcompose, home, pk, projscope, query, vcs
-from .seats_common import recipient_matches
-from .store import load as store_load
+from . import dispatches, foldcheck, foldcompose, home, pk, projscope, vcs
 from .work import _lanes
 
 
@@ -120,6 +109,10 @@ def card(lr):
             # never merge two pieces of work that are not one.
             "chain_root": lr.get("chain_root"),
             "supersedes": lr.get("supersedes"),
+            # THE TASK THE ONE JOIN GAVE THE LOOP (task/3643), copied, never
+            # re-read off the lane label; `task_why` rides only when UNKNOWN
+            **({"task": lr["task"]} if "task" in lr else {}),
+            **({"task_why": lr["task_why"]} if lr.get("task_why") else {}),
             "base_sha": lr.get("base_sha") or "",
             "author": lr["author"], "reviewer": lr["reviewer"],
             "kind": lr.get("kind"), "polarity": lr.get("polarity"),
@@ -133,6 +126,14 @@ def card(lr):
             "closed_ts_unreadable": lr.get("closed_ts_unreadable", False),
             "closed_ts_impossible": lr.get("closed_ts_impossible", False),
             "ledger_refused": lr.get("ledger_refused") or [],
+            # THE ADVISORY READS, RENDERED (task/3081's remaining surface):
+            # the kanban card is where a lane owner reads the row, and it
+            # dropped them — the same invisibility the CLI side cured. The
+            # lines are `dispatches.advisory_read_lines`' own, so the card
+            # and `lr show` can never word one read two ways; a row with no
+            # read carries no key.
+            **({"advisory_lines": dispatches.advisory_read_lines(lr)}
+               if lr.get("advisory_reads") else {}),
             "stalled": lr["stalled"],
             # TERMINAL RIDES THE WIRE, because the header that reads it is the
             # exact place these two surfaces have already disagreed once. This
@@ -185,6 +186,15 @@ def card(lr):
             # (`honored` below, same reason). Every Python surface calls
             # `landreq.on_main_unverdicted` on the card's own fields.
             "on_main_unverdicted": landreq.on_main_unverdicted(lr),
+            # A SOURCE-CLEAN HOLD RIDES THE WIRE (task/3053, the author's
+            # ruling on the seam): the predicate the scheduler and the kanban
+            # call on this card reads `source_clean_tip`, the holder rung's
+            # one answer rides beside it, and `source_clean_on_main` is the
+            # one sentence the wall, the scheduler row, the waits and the
+            # kanban card print for such a row on trunk — never re-derived.
+            "source_clean_tip": lr.get("source_clean_tip"),
+            "source_clean_rehold": lr.get("source_clean_rehold"),
+            "source_clean_on_main": landreq.source_clean_on_main(lr),
             # PROJECT-SCOPE MARKS RIDE THE WIRE (task/974): the escape view
             # renders foreign rows and a row without its label is a row the
             # reader mistakes for their own — the exact confusion the scope
@@ -378,6 +388,59 @@ def _fold_proven(root, tip, report, gate_ref):
     return 0
 
 
+def _print_source_clean_landings(repo, head, gate_ref, apply=False):
+    """After the fold's rungs, every HELD SOURCE-CLEAN row this head lands,
+    judged by `close --reason source-clean-landed` (task/3053) -> rc.
+
+    A DRY LISTING BY DEFAULT and it never changes foldcheck's exit code: it
+    names each row QUALIFIES, REFUSED with every failed condition, or
+    NOT-IN-HEAD. `--apply` closes exactly the rows that qualify, and only a
+    row that QUALIFIED and then FAILED at the write returns 1, because that is
+    an apply that did not do what it listed; a row that never qualified is a
+    listing, not an error. Silent when the repository holds no such row and
+    nothing was asked of it, like the lease listing beside it; an unreadable
+    ledger or head says so in one line."""
+    try:
+        entries, err = landreq.source_clean_landings(repo, head, gate_ref,
+                                                     apply=apply)
+    except Exception as exc:            # noqa: BLE001 — named, never silent
+        print("\nsource-clean holds: UNKNOWN — the sweep could not run (%s: %s)"
+              % (type(exc).__name__, exc))
+        return 1 if apply else 0
+    if err:
+        print("\nsource-clean holds: UNKNOWN — %s" % err)
+        return 1 if apply else 0
+    if not entries:
+        if apply:
+            print("\nsource-clean holds: none held in this repository — "
+                  "nothing to close")
+        return 0
+    landed = [e for e in entries if e["verdict"] != "NOT-IN-HEAD"]
+    elsewhere = [e for e in entries if e["verdict"] == "NOT-IN-HEAD"]
+    print("\nSOURCE-CLEAN HOLDS THIS HEAD LANDS (%s, %s) — each judged by "
+          "`close --reason source-clean-landed`:"
+          % (gate_ref or "no gate named", "APPLY" if apply else "dry run"))
+    for e in landed:
+        print("  %-9s %s  tip %s  held by %s — %s" % (
+            e["verdict"], e["id"][:12], e["tip"][:12],
+            e.get("holder") or "(unrecorded)", e.get("why") or ""))
+    if not landed:
+        print("  (none — no held source-clean tip is in this head's history)")
+    if elsewhere:
+        print("  NOT-IN-HEAD %d row(s), which this land does not carry: %s"
+              % (len(elsewhere), ", ".join(e["id"][:12] for e in elsewhere)))
+    count = {}
+    for e in landed:
+        count[e["verdict"]] = count.get(e["verdict"], 0) + 1
+    print("%d landed row(s): %s%s" % (
+        len(landed), ", ".join("%d %s" % (count[v], v) for v in
+                               ("CLOSED", "QUALIFIES", "FAILED", "REFUSED")
+                               if count.get(v)) or "none",
+        " — dry run, nothing appended: re-run with --apply to close them"
+        if count.get("QUALIFIES") and not apply else ""))
+    return 1 if count.get("FAILED") else 0
+
+
 def _print_landed_leases(root):
     """After a fold, the leases the trunk now carries — the land releases
     none of them, so this names each one and the exact line that does.
@@ -430,6 +493,17 @@ def _retracted_mark(lr):
         else "; no successor carries the review"))
 
 
+def _claim_lines(lr):
+    """The hand-back claim lines for a review row (task/3540), or []. The
+    dispatch row is read by id; an unreadable ledger prints what it did."""
+    if lr.get("kind") != "review":
+        return []
+    current, unavailable = dispatches.snapshot()
+    row = None if unavailable else current.get(lr.get("id"))
+    from . import handback_claims
+    return handback_claims.lines(row)
+
+
 def _line(lr, avail=None):
     marks = []
     # PROJECT PROVENANCE FIRST (task/974): these rows reach a listing only
@@ -458,10 +532,23 @@ def _line(lr, avail=None):
     # mark the row renders as a slow reviewer with a growing dwell and nothing
     # contradicting it. Suppressing the STALLED word alone would remove the
     # accusation and leave the reader to supply it themselves.
-    if lr.get("source_clean_tip"):
+    clean = str(lr.get("source_clean_tip") or "")
+    rehold = lr.get("source_clean_rehold") if clean else None
+    if rehold:
+        # UNLESS ITS HOLDER RUNG REFUSES (task/3053: NO HOLDER in the read's
+        # finding f; a stranger's or a lane author's stamp in the author's
+        # ruling 3, round 4): the land closes such a row on no hold but its
+        # non-author recipient's, so this row waits on its REVIEWER's re-hold
+        # — the one move that clears it, named in full — and never on a close
+        # that would refuse it. The projection asked the rung once
+        # (`source_clean_rehold`); this reads its answer.
+        marks.append("SOURCE-CLEAN at %s, but no land can close it and it is "
+                     "its REVIEWER's to re-hold: %s"
+                     % (clean[:12], rehold.get("why") or rehold.get("door")))
+    elif clean:
         marks.append("SOURCE-CLEAN at %s — the review is COMPLETE; this waits "
                      "on the INTEGRATOR's whole-suite gate, not on its reviewer"
-                     % str(lr["source_clean_tip"])[:12])
+                     % clean[:12])
     # THE WORK IS ALREADY IN HISTORY AND THE ROW IS STILL BILLING SOMEBODY.
     # A row can pin a tip that trunk already contains, with zero commits ahead,
     # while every other field on it renders as ordinary owed work. Nothing else
@@ -484,7 +571,17 @@ def _line(lr, avail=None):
     # debris. `landreq.on_main_unverdicted` is the one predicate every board
     # surface folds on (task/2381), so this line and the owner's count line
     # name the same rows.
-    if landreq.on_main_unverdicted(lr):
+    #
+    # A SOURCE-CLEAN ROW'S REVIEW DID HAPPEN (task/3053): its reader held it
+    # clean, the land shipped it, and what is missing is its CLOSE — the
+    # integrator's when the holder rung passes, the recipient's re-hold when
+    # it refuses. The predicate exempts it, and this line prints the one
+    # sentence every board surface prints for it
+    # (`landreq.source_clean_on_main`), never a copy of its own.
+    owed_on_main = landreq.source_clean_on_main(lr)
+    if owed_on_main:
+        marks.append("ALREADY ON TRUNK — %s" % owed_on_main)
+    elif landreq.on_main_unverdicted(lr):
         marks.append("ALREADY ON TRUNK — this work is in history and the row "
                      "has NO VERDICT recorded; it is a LEDGER gap (a review "
                      "that never happened), not a slow reviewer and not a "
@@ -627,17 +724,18 @@ def _line(lr, avail=None):
     # honored-first: the stalled ALARM yields to the honored banner (one
     # predicate, every surface) — the successor already landed, so there is
     # nothing to unstall. `stalled` itself is untouched.
-    if lr["stalled"] and not landreq.honored_display(lr):
+    if landreq.stall_alarm(lr):
         # SUCCESSION OUTRANKS THE STALL ALARM, for the same reason honored does
         # one line up: a stall nobody can unstall is noise, not a debt
         # reminder. honored_display only ever answers for CONTRARY rows, so six
         # in-flight rows whose work was cured on a successor and APPROVED by a
         # second reviewer alarmed for up to five and a half days with nothing
-        # able to notice. `stalled` itself is untouched — display only.
+        # able to notice. `stall_alarm` is the one predicate for all of it —
+        # the one land board asks it too (task/3585) — and a row the chain
+        # carried never reaches this branch. `stalled` itself is untouched —
+        # display only.
         state = lr.get("succession_state")
-        if state == landreq.SUCCESSION_MOVED:
-            pass                       # the chain carried it; nothing to unstall
-        elif state == landreq.SUCCESSION_UNKNOWN:
+        if state == landreq.SUCCESSION_UNKNOWN:
             root = str(lr.get("chain_root") or "")
             why = lr.get("succession_unknown_reason") or (
                 "no chain root; this row predates or escaped chain sealing"
@@ -660,8 +758,8 @@ def _line(lr, avail=None):
         if landreq.honored_display(lr):
             # "c" is its OWN kind, not a variant of honored wording: the row
             # is the resolved door's confirmation round, whose reviewed tip
-            # is the landed cure BY DESIGN — the exact words lrMarks prints,
-            # or the card and the terminal describe one row differently.
+            # is the landed cure BY DESIGN — its own words, never the
+            # honored-through-succession wording.
             mark = ("CONFIRMATION: %s by design — the resolution verified "
                     "on trunk; the discharge instrument, never a debt"
                     % fact) if discharge == "c" else \
@@ -795,9 +893,10 @@ def _render_show(lr):
         state = "%s — RETIRED (%s)" % (lr["state"], landreq._retired_label(lr))
     out = ["LAND REQUEST %s   %s%s" % (
         lr["id"], state,
-        # honored-first, same predicate as every other surface: the stalled
-        # ALARM yields to the honored banner printed on the contrary line
-        "  STALLED" if lr["stalled"] and not landreq.honored_display(lr) else "")]
+        # honored-first and succession-aware, the one predicate every surface
+        # asks (`stall_alarm`): the stalled ALARM yields to the honored banner
+        # printed on the contrary line and to a proved successor
+        "  STALLED" if landreq.stall_alarm(lr) else "")]
     # DIRECTLY UNDER THE HEADLINE, because the headline is this binary's
     # reading and this line says where that reading stopped.
     unread = dispatches.unknown_kinds_note(lr)
@@ -858,6 +957,24 @@ def _render_show(lr):
             out.append("  exit      no cure committed, because: %s"
                        % lr["no_patch_because"])
         out.append("  gate      %s" % (lr.get("gate") or "UNVERIFIED"))
+    # EVERY MODEL RUN'S ADVISORY READ, right under the seat verdict it is not
+    # (task/3081). `verdict (none)` above was the whole answer a lane owner
+    # got for a recorded read, and he concluded the write had failed. None
+    # of these lines exists on a row that carries no read.
+    out.extend("  " + line for line in dispatches.advisory_read_lines(lr))
+    # THE HAND-BACK'S CLAIMS (task/3540), read off the dispatch row itself:
+    # the projection carries neither the brief nor the checkout it binds in.
+    # They are THIS row's: when `lr show` of a cancelled id opened the row
+    # that continues it (task/3081), `lr` is that row, the land request, and
+    # its claims bind to its own tip and tree; the cancelled row's brief is
+    # not re-read. They print before the superseded rows' reads, so no claim
+    # line sits under a FROM header naming another row.
+    out.extend("  " + line for line in _claim_lines(lr))
+    # AND EVERY READ ON A CANCELLED ROW THIS ONE CONTINUES, under the row it
+    # was recorded on (task/3081): a cancelled or rebound row is no land
+    # request, so this is the one page its reads can be read on.
+    out.extend("  " + line for line in dispatches.superseded_read_lines(
+        lr.get("superseded_reads")))
     if landreq.live_ready(lr):
         # WHO READ THIS THAT DID NOT WRITE IT — the whole promise the review
         # procedure makes, said on the detail page the integrator opens before
@@ -994,6 +1111,23 @@ def _render_show(lr):
                 lr.get("discharging_id") or "-",
                 (lr.get("discharging_tip") or "-")[:12],
                 lr.get("discharge_tier") or "-"))
+            out.append("  evidence  %s" % (lr.get("close_evidence") or "-"))
+        elif reason == "source-clean-landed":
+            # BOTH HALVES OF THE AUTHORITY, and the absence of the third
+            # (task/3053): the hold, the gate, and no APPROVE anywhere.
+            out.append("  hold      source-clean at %s by %s (the recipient) "
+                       "at %s" % ((lr.get("reviewed_tip") or "-")[:12],
+                                  lr.get("source_clean_hold_actor") or "-",
+                                  lr.get("source_clean_hold_ts") or "-"))
+            out.append("  gate      gate:%s whole-suite OK on %s (tree %s), "
+                       "whose history contains the tip" % (
+                           lr.get("source_clean_gate") or "-",
+                           (lr.get("source_clean_gate_head") or "-")[:12],
+                           (lr.get("source_clean_gate_tree") or "-")[:12]))
+            out.append("  trunk     %s@%s  proof %s — no APPROVE was minted" % (
+                lr.get("closing_trunk_ref") or "-",
+                (lr.get("closing_trunk_sha") or "-")[:12],
+                lr.get("close_proof_mode") or "-"))
             out.append("  evidence  %s" % (lr.get("close_evidence") or "-"))
         elif reason == "withdrawn":
             out.append("  withdrawn absent at %s@%s  %s" % (
@@ -1170,8 +1304,25 @@ def _render_show(lr):
                 else "past threshold, not billed (HONORED through "
                 "succession)") \
             if lr["stalled"] and landreq.honored_display(lr) \
+            else "past threshold, not alarmed (CARRIED by a proved " \
+            "successor)" if lr["stalled"] and not landreq.stall_alarm(lr) \
             else "STALLED" if lr["stalled"] else "ok"
         tail = "  (threshold %s — %s)" % (landreq._fmt_dwell(threshold), word)
+    if lr.get("source_clean_tip") and threshold is not None:
+        # THE THRESHOLD IS THE HOLD'S, NOT THE STAGE'S (task/2695): printing
+        # it beside the stage dwell would compare two different clocks.
+        # ON WHOM, as `owed_by` says (task/3053): a hold whose holder rung
+        # refuses — NO HOLDER, a stranger's hand, a lane author's — is its
+        # reviewer's to re-make, not the integrator's to close, and the line
+        # names the re-hold the projection already derived.
+        rehold = lr.get("source_clean_rehold")
+        out.append("  held      %s source-clean, on the %s%s" % (
+            landreq._fmt_dwell(lr["hold_age_s"])
+            if lr.get("hold_age_s") is not None
+            else "UNKNOWN (the hold's stamp is unreadable)",
+            "reviewer — %s" % (rehold.get("why") or rehold.get("door"))
+            if rehold else "integrator", tail))
+        tail = ""
     out.append("  dwell     %s in %s%s" % (
         landreq._fmt_dwell(lr["dwell_s"]) if lr.get("dwell_known")
         else "UNKNOWN (this row's age was never measured: the record carries "
@@ -1218,11 +1369,11 @@ def _print_loop_list(rows_, filed_, read_at, note="", withheld=None,
     retired = sum(1 for lr in rows_ if lr["terminal"])
     # ONE PREDICATE FOR "IN FLIGHT" ACROSS BOTH FRONT-ENDS, which is the
     # whole point of this lane and which its first cut did not finish:
-    # the browser partitions honored rows OUT of its in-flight
-    # count (00-core.js lrHonored, `live.length + " in flight"`) while
-    # this header counted them IN, so one word still named two numbers —
+    # the browser partitioned honored rows OUT of its in-flight
+    # count (its `lrHonored`, retired with the land board in task/3643)
+    # while this header counted them IN, so one word still named two numbers —
     # the exact defect one surface down. The direction is not a taste
-    # call: the owner ruled it (2026-08-04, quoted at 00-core.js:1089)
+    # call: the owner ruled it (quoted in landreq.inflight_rows)
     # "superseded, if verified, should just be like another type of
     # closed", so honored is CLOSED and the CLI follows the ruling.
     # The docstring above already promised "minus honored" and was, until
@@ -1339,6 +1490,9 @@ def _cmd_lr(args):
         return 2
     verb, rest = args[0], args[1:]
     from .cli import guard_tail, suggest
+    if verb == "postland":
+        from . import postland
+        return postland.cmd(rest)
     if verb == "refs":
         rc = guard_tail("helm lr refs", rest, flags=("--json",),
                         valued=("--repo",), usage=landreq.USAGE)
@@ -1421,6 +1575,12 @@ def _cmd_lr(args):
         return 0
     if verb == "legacy-completion-hints":
         return landreq._cmd_legacy_completion_hints(rest)
+    if verb == "backfill-hold-actor":
+        from . import holdbackfill
+        return holdbackfill.cmd(rest)
+    if verb == "backfill-review-pins":
+        from . import pinbackfill
+        return pinbackfill.cmd(rest)
     if verb == "list":
         rc = guard_tail("helm lr list", rest,
                         flags=("--all", "--json", "--cold", "--all-projects"),
@@ -1670,7 +1830,8 @@ def _cmd_lr(args):
         # "no" and for "I could not tell", which are both reasons not to
         # announce a land.
         fc_usage = ("usage: helm lr foldcheck <tip> [--gate gate:TOKEN] "
-                    "[--repo PATH] [--remote R] [--branch B] [--no-fetch]")
+                    "[--repo PATH] [--remote R] [--branch B] [--no-fetch] "
+                    "[--apply]")
         # CLOSED-SET TAIL, and the reason it is not the hand-rolled scan it
         # was: reading options by `opts.index(name) + 1` raised IndexError on
         # a trailing `--gate` and silently IGNORED `--bogus`. A rung that
@@ -1679,7 +1840,7 @@ def _cmd_lr(args):
         # not do, and then read the answer as though it had.
         tip = rest[0] if rest and not rest[0].startswith("-") else None
         rc = guard_tail("helm lr foldcheck", rest[1:] if tip else rest,
-                        flags=("--no-fetch",),
+                        flags=("--no-fetch", "--apply"),
                         valued=("--gate", "--repo", "--remote", "--branch"),
                         usage=fc_usage)
         if rc is not None:
@@ -1699,15 +1860,42 @@ def _cmd_lr(args):
             branch=_opt("--branch", "main"),
             fetch="--no-fetch" not in opts)
         report = foldcheck.report(rungs)
+        # THE SOURCE-CLEAN STAGE RUNS WHATEVER THE RUNGS SAID (task/3053).
+        # The rungs answer "may this head be pushed"; the stage answers "which
+        # held source-clean rows does this head land, and may each close" —
+        # and every close re-proves its own three conditions through the one
+        # door, so a head that cannot fold yet still lists its rows honestly
+        # (their trunk condition is what refuses them) and a row whose tip
+        # already reached trunk under an earlier head still closes.
         if not foldcheck.ok(rungs):
             for line in report:
                 print(line)
-            return 1
-        root = _lanes.find_root(repo)
-        try:
-            return _fold_proven(root, tip, report, _opt("--gate"))
-        finally:
-            _print_landed_leases(root)
+            fold_rc = 1
+        else:
+            if "--apply" in opts:
+                # THE LAND'S FIRST LEDGER READ, once the rungs say this head
+                # may land and before the fold: timed by the landed
+                # checkout's own helm in a new process and recorded once per
+                # head (`helm/postland.py`, task/3538). A head the rungs
+                # refuse has not landed, so it is not timed: its first row
+                # would be final and would stand for the real land. The read
+                # never stops the fold: one it cannot time is a row that
+                # says why.
+                try:
+                    from . import postland
+                    postland.take(repo, tip, "foldcheck")
+                except Exception as exc:                 # noqa: BLE001
+                    print("helm lr postland: nothing recorded for %s: the "
+                          "recorder could not run: %s: %s"
+                          % (tip, type(exc).__name__, exc), file=sys.stderr)
+            root = _lanes.find_root(repo)
+            try:
+                fold_rc = _fold_proven(root, tip, report, _opt("--gate"))
+            finally:
+                _print_landed_leases(root)
+        stage_rc = _print_source_clean_landings(
+            repo, tip, _opt("--gate"), apply="--apply" in opts)
+        return fold_rc or stage_rc
     if verb == "stalls":
         rc = guard_tail("helm lr stalls", rest, flags=("--json",), usage=landreq.USAGE)
         if rc is not None:
@@ -1782,9 +1970,23 @@ def _cmd_lr(args):
                 # beside it: a row whose work is on trunk is owed by nobody,
                 # and printing a debtor next to the correction leaves the
                 # routing debt standing.
-                tail = landreq._landed_marker(store_row, lr["state"])
-                print(landreq._line(lr, avail=stall_avail) + "  (>= %s in %s, %s)%s" % (
-                    landreq._fmt_dwell(lr["stall_threshold_s"]), lr["state"],
+                #
+                # EXCEPT A SOURCE-CLEAN HOLD ON TRUNK (task/3053, the author's
+                # ruling on the seam): the land did not settle it, and its
+                # close is owed — `_line` above already prints the one
+                # sentence naming the move and its holder — so the owed-by
+                # clause stands, and "owed by NOBODY" would unbill the row
+                # the clock exists to bill.
+                tail = "" if landreq.source_clean_on_main(lr) \
+                    else landreq._landed_marker(store_row, lr["state"])
+                # A SOURCE-CLEAN ROW'S CLOCK IS ITS HOLD (task/2695), so the
+                # line names that clock rather than a stage the review has
+                # already left; the threshold is the gate turnaround.
+                where = ("since the source-clean hold (%s)"
+                         % landreq._fmt_dwell(lr.get("hold_age_s") or 0)
+                         if lr.get("source_clean_tip") else "in %s" % lr["state"])
+                print(landreq._line(lr, avail=stall_avail) + "  (>= %s %s, %s)%s" % (
+                    landreq._fmt_dwell(lr["stall_threshold_s"]), where,
                     tail or ("owed by %s" % landreq._owed_by_whom(lr)), marker))
         if unmeasurable_rows:
             print("helm lr — %d loop%s NOT stall-checked:" % (
@@ -1811,12 +2013,43 @@ def _cmd_lr(args):
         if rc is not None:
             return rc
         lr, err = landreq.get(rid)
+        # A CANCELLED ID OPENS THE ROW THAT CONTINUES IT (task/3081): `lr`
+        # drops a cancelled row, and a rebind cancels the id every earlier
+        # message named. One first line says which row this is instead; a
+        # fork is named, never chosen, and a dead end refuses as before.
+        note = None
+        if err:
+            gone, live = dispatches.live_successors(
+                dispatches.snapshot()[0] or {}, rid)
+            if len(live) == 1:
+                why = dispatches._one_line(gone.get("cancel_reason"), 256)
+                shown = landreq.get(live[0]["id"])[0]
+                if shown is None:
+                    # THE ROW THAT CONTINUES IT IS NO LAND REQUEST EITHER (a
+                    # ref-less row is none): the refusal stays about the id
+                    # that was typed and names that row, never "no such land
+                    # request" about an id nobody typed.
+                    err += ("; it is CANCELLED (%s) and %s continues it, "
+                            "which does not open as a land request either"
+                            % (why, live[0]["id"][:12]))
+                else:
+                    note = ("helm lr: %s is CANCELLED (%s) — showing %s, the "
+                            "row that continues it" % (
+                                gone["id"][:12], why, live[0]["id"][:12]))
+                    lr, err = shown, None
+            elif live:
+                err += "; it is CANCELLED and %d rows continue it: %s" % (
+                    len(live), ", ".join(r["id"][:12] for r in live))
         if err:
             print("helm lr: " + err, file=sys.stderr)
             return 1
         if "--json" in rest[1:]:
+            if note:
+                print(note, file=sys.stderr)
             print(json.dumps(lr, ensure_ascii=False, indent=1))
             return 0
+        if note:
+            print(note)
         print(landreq._render_show(lr))
         return 0
     if verb == "land":
@@ -1842,10 +2075,11 @@ def _cmd_lr(args):
     print("helm lr: unknown subverb '%s'%s (%s)" % (
         verb, suggest(verb, ("list", "show", "stalls", "foldcheck",
                              "legacy-completion-hints", "land", "compose",
+                             "backfill-hold-actor", "backfill-review-pins",
                              "close",
                              "annotate-delivered-report", "discharge",
                              "withdraw", "abandon", "close-landed",
-                             "expired", "retire")),
+                             "expired", "retire", "postland")),
         landreq.USAGE),
         file=sys.stderr)
     return 2
@@ -2397,7 +2631,7 @@ def _cmd_close(rest):
                     valued=("--reason", "--evidence", "--artifact-ref",
                             "--report-ref", "--tip", "--repo", "--trunk",
                             "--needs-restart", "--attest", "--compose-manifest",
-                            "--compose-gate"), usage=landreq.USAGE)
+                            "--compose-gate", "--gate"), usage=landreq.USAGE)
     if rc is not None:
         return rc
 
@@ -2438,6 +2672,19 @@ def _cmd_close(rest):
         print("helm lr close: --repo/--trunk belong to --reason %s (%s)"
               % ("/".join(landreq.REPO_TRUNK_REASONS), landreq.USAGE), file=sys.stderr)
         return 2
+    # `--gate` IS SOURCE-CLEAN-LANDED'S OWN FLAG, and required there: its
+    # third condition is a verified whole-suite receipt whose commit contains
+    # the held tip, and the receipt is named, never guessed (task/3053).
+    if val("--gate") is not None and reason != "source-clean-landed":
+        print("helm lr close: --gate belongs to --reason source-clean-landed "
+              "— the whole-suite receipt a landed source-clean hold closes on "
+              "(%s)" % landreq.USAGE, file=sys.stderr)
+        return 2
+    if reason == "source-clean-landed" and val("--gate") is None:
+        print("helm lr close: --reason source-clean-landed requires --gate "
+              "gate:TOKEN — a verified whole-suite receipt on a commit "
+              "containing the held tip (%s)" % landreq.USAGE, file=sys.stderr)
+        return 2
     if val("--attest") is not None and reason != "chain-proof":
         print("helm lr close: --attest belongs to --reason chain-proof — it "
               "admits an UNMEASURABLE approval tier on the record, and no "
@@ -2476,7 +2723,8 @@ def _cmd_close(rest):
                      artifact_ref=val("--artifact-ref"),
                      report_ref=val("--report-ref"),
                      attest=val("--attest"),
-                     attester=landreq._acting_seat(), **compose_options)
+                     attester=landreq._acting_seat(), gate=val("--gate"),
+                     **compose_options)
     if err:
         # D10c: a dry-run refusal prints the refusing rung's EXACT message
         # with the mirrored exit — and appends nothing, same as the live path.
@@ -2706,6 +2954,35 @@ def _cmd_withdraw(rest):
           lr["id"][:12])
     return 0
 
+#: WHY `lr compose` TAKES NO SOURCE-CLEAN CAR (task/3053; the author's
+#: ruling 1, round 4) — the sentence every such candidate is excluded with.
+COMPOSE_REFUSES_SOURCE_CLEAN = (
+    "a source-clean car rides only `helm train`, which merges its held tip; "
+    "lr compose cherry-picks and its copy could never close "
+    "source-clean-landed")
+
+
+def _stopped_pick_residue(be, room, err):
+    """The paths a stopped, conflict-free pick left changed, or None.
+
+    None means the "empty pick" reading has real evidence, or the state is
+    not a pick in progress at all: git said "The previous cherry-pick is now
+    empty", no CHERRY_PICK_HEAD remains, or the index and tree equal HEAD. A
+    list means the pick is NOT empty — CHERRY_PICK_HEAD present, the diff
+    against HEAD names paths — so the stop was a conflict something resolved
+    (task/2687). An unreadable diff is not evidence of emptiness: it names
+    no path, and the caller keeps its UNKNOWN wording."""
+    if "cherry-pick is now empty" in (err or ""):
+        return None
+    rc, _o, _e = be.text(room, *landreq._REF_ARGV, "CHERRY_PICK_HEAD")
+    if rc != 0:
+        return None
+    rc, out, _e = be.text(room, "diff", "--name-only", "HEAD")
+    if rc != 0 or not out:
+        return None
+    return out.split()
+
+
 def _cmd_compose(rest):
     """helm lr compose <id> [<id>...] — stand N APPROVED lanes on ONE composed
     tip, measuring per member that the approved CONTENT is what composed
@@ -2816,6 +3093,25 @@ def _cmd_compose(rest):
                 excluded.append({"id": lr["id"], "lane": lr.get("lane") or "?",
                                  "reason": berr, "state": lr.get("state")})
                 continue
+        # A SOURCE-CLEAN CAR RIDES ONLY `helm train` (task/3053; the author's
+        # ruling 1, round 4). A held source-clean row owes no approve, and the
+        # one door that closes it after the land, `source-clean-landed`,
+        # proves the held tip reached trunk by ANCESTRY only — so a copy never
+        # closes it. This verb cherry-picks, so its land would carry a copy
+        # and the row would sit open forever; `helm train` merges the held
+        # tip. Every source-clean candidate is refused by name, and the
+        # predicate `helm train` asks (`landreq.source_clean_car`) is asked
+        # here too, so a hold the train would ALSO refuse says why.
+        clean_tip, clean_why = (None, None) if bounded is not None \
+            else landreq.source_clean_car(lr)
+        if clean_tip or clean_why:
+            excluded.append({
+                "id": lr["id"], "lane": lr.get("lane") or "?",
+                "reason": COMPOSE_REFUSES_SOURCE_CLEAN + (
+                    "; `helm train` refuses it too: %s" % clean_why
+                    if clean_why else ""),
+                "state": lr.get("state"), "basis": "source-clean"})
+            continue
         if bounded is None and not landreq.live_ready(lr):
             # A CLOSED ROW IS NO MEMBER, whatever its stored state says. The
             # projection keeps READY on a row closed as landed and marks it
@@ -2935,6 +3231,10 @@ def _cmd_compose(rest):
               "--repo overrides)" % (bound,), file=sys.stderr)
         return 1
     be = vcs.backend(root)
+    # The train's own rerere switch, imported here rather than at module
+    # top: landwindow imports the ledger eagerly, and the ledger imports
+    # this module at the end of its body.
+    from . import landwindow
     scoped_batch = any(p["bounded"] is not None for p in picks)
     # --repo is a Git working path, not a registry identity. Worktrees and
     # subdirectories belong to the same canonical project as their main root.
@@ -3220,21 +3520,39 @@ def _cmd_compose(rest):
 
     for p in list(picks):
         lane = p["lr"].get("lane") or "?"
-        rc, _o, err = be.text(room, "cherry-pick", p["mb"] + ".." + p["tip"],
-                              timeout=120)
+        # RERERE OFF, exactly as the train's merge runs (task/2687): with it
+        # on, a recorded resolution applies itself to this car's conflict — a
+        # resolution nobody reviewed on this tree — and the pick stops with
+        # the path staged and no unmerged entry, which read as "empty".
+        rc, _o, err = be.text(room, *landwindow.NO_RERERE, "cherry-pick",
+                              p["mb"] + ".." + p["tip"], timeout=120)
         if rc != 0:
             rc2, out, _e = be.text(room, "diff", "--name-only",
                                    "--diff-filter=U")
             doubt = " (patch-identity screen %s — an older rebased " \
                     "land is not ruled out)" % screen if screen else ""
+            staged = None
+            if not (rc2 == 0 and out):
+                staged = _stopped_pick_residue(be, room, err)
             if rc2 == 0 and out:
                 why = ("conflict in %s at %s — evict or reorder it%s"
                        % (", ".join(out.split()), head[:12], doubt))
+            elif staged:
+                # A pick in progress, nothing unmerged, and a NON-empty diff
+                # against HEAD: the conflict was resolved by something other
+                # than a reviewer (a staged resolution), so it is a
+                # conflict, named, and evicted like one — never "empty"
+                # (task/2687).
+                why = ("conflict in %s at %s, auto-resolved (the pick stopped "
+                       "with CHERRY_PICK_HEAD present, no unmerged path and "
+                       "a non-empty diff against HEAD) — evict or reorder "
+                       "it%s" % (", ".join(staged), head[:12], doubt))
             else:
-                # No unmerged paths: the pick stopped for a NON-conflict
-                # reason (an empty pick — content already present — or an
-                # interrupted one). Naming it a conflict would assert a
-                # cause the state refutes; UNKNOWN stays UNKNOWN (a FIX).
+                # No unmerged paths and no staged residue: the pick stopped
+                # for a NON-conflict reason (an empty pick — content already
+                # present — or an interrupted one). Naming it a conflict
+                # would assert a cause the state refutes; UNKNOWN stays
+                # UNKNOWN (a FIX).
                 why = ("pick stopped at %s WITHOUT conflicts — an empty pick "
                        "(content already present?) or an interrupted one; "
                        "state UNKNOWN%s: %s"

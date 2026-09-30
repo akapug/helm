@@ -9,7 +9,9 @@
 </style>
 
 <nav id="nav">
-  <span class="brand"><span class="mark">⎈</span>helm</span>
+  <!-- THE BRAND IS HOME (task/3445): "/" opens the one-screen dashboard, and
+       the brand goes back to it from any page. -->
+  <a class="brand on" id="brand" href="#home" title="Home — the whole app on one screen"><span class="mark">⎈</span>helm</a>
   <!-- FOUR PAGES, the owner's words: "are board and work and the 'work
        landing' section at the top of history (which is really the kanban
        board) really all separate things? what if it was just work and
@@ -18,11 +20,16 @@
        moves to the 4th item in the top level menu?". So WORK is one page (the
        board, the work tab, the scheduler and the land pipeline), CHAT is
        unchanged, FLEET keeps its sections, and HISTORY is the signing ledger.
-       Only Fleet has a section row. Every retired hash (#board, #helm,
-       #scheduler, #ledger) still lands on the page that took it over, through
-       canonView; AREA_OF in the nav script is the one map. -->
+       WORK AND FLEET HAVE SECTION ROWS (task/3445, the IA review's Option 1;
+       the owner: "why would the work page have all projects listed twice or
+       more listing different things?"): Work is projects, then work — ONE
+       page for the backlog and the pipeline (task/3643) — with pipeline and
+       backlog as its two pre-filtered entries, each project listed once. Every retired
+       hash (#board, #helm, #scheduler, #ledger) still lands on the page that
+       took it over, through canonView; AREA_OF in the nav script is the one
+       map. -->
   <div class="navareas">
-    <button class="navarea on" data-a="work">Work</button>
+    <button class="navarea" data-a="work">Work</button>
     <button class="navarea" data-a="chat">Chat</button>
     <button class="navarea" data-a="fleet">Fleet</button>
     <button class="navarea" data-a="history">History</button>
@@ -30,14 +37,22 @@
   <span class="spacer"></span>
   <div class="stats" id="navstats"></div>
   <button class="icon" id="themetog" title="toggle light / dark">◐</button>
-  <button class="icon" id="trayBtn" title="team tray — collect seats">⊞</button>
-  <!-- the section row of the OPEN area. Only Fleet has one; the row is hidden
-       (.solo) while a single-page area is open. The Fleet group stays in the
+  <button class="icon" id="trayBtn" title="launch tray — sessions to resume together">⊞</button>
+  <!-- the section row of the OPEN area. Work and Fleet have one; the row is
+       hidden (.solo) while a single-page area is open. A group stays in the
        document while closed, so its badges keep rendering and every data-v
-       stays queryable. -->
+       stays queryable. The console opens on Home, which has no section row,
+       so the row is drawn hidden before any script runs. -->
   <div class="navtabs solo">
+    <div class="navsec" data-a="work">
+      <button class="navtab" data-v="work">projects</button>
+      <button class="navtab" data-v="flow">work</button>
+      <button class="navtab" data-v="pipeline">pipeline</button>
+      <button class="navtab" data-v="backlog">backlog</button>
+    </div>
     <div class="navsec" data-a="fleet">
       <button class="navtab" data-v="quota">credit</button>
+      <button class="navtab" data-v="models">models</button>
       <button class="navtab" data-v="roster">seats</button>
       <button class="navtab" data-v="sessions">sessions</button>
       <button class="navtab" data-v="configs">configs</button>
@@ -59,4 +74,11 @@
 </div>
 
 <div class="wrap">
+<div id="banner">helm isn’t answering — its web server is down or restarting; retrying quietly…</div>
+
+<!-- SEPARATE from #banner on purpose: that one is a connectivity ERROR and
+     this one is an advisory about the server's own age. One element would
+     let either clobber the other, and the case that matters most is both
+     being true at once. -->
+<div id="stalebanner"></div>
 

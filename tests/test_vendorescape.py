@@ -8,6 +8,7 @@ pane — and the double is asserted on, so "nothing was delivered" is a measured
 fact rather than the silence of a path that never ran.
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -61,6 +62,21 @@ SPEND_PANE = "\n".join(("You've reached your Fable limit", "",
 #: What the pane reads AFTER the choice lands: the dialog is gone.
 CLEARED = "\n".join(("─" * 40, "❯", "─" * 40, "  opus-5 | ~/dev/x",
                      "  ⏵⏵ bypass permissions on"))
+
+
+def _door_lifted(witness=True):
+    """LIFTS the dialog door's vendor row and PLANTS the witness the vendor's
+    presence record would give. The shipped row refuses the usage-limit menu
+    by name until a live capture proves its shape; an arm that drives what the
+    door does past that refusal lifts it here, and says so in its name."""
+    stack = contextlib.ExitStack()
+    stack.enter_context(mock.patch.object(
+        panetail, "VENDOR_KIND", panetail.VENDOR_KIND._replace(unproven=None)))
+    stack.enter_context(mock.patch.object(
+        vendorescape, "_awaiting", lambda pids: (lambda: (
+            witness, "the planted witness: the vendor's record says the "
+                     "dialog awaits input"))))
+    return stack
 
 
 class Ad(harness._CLIAdapter):
@@ -141,7 +157,8 @@ class Spy:
         def __init__(self, placed):
             self.placed = placed
 
-        def choose_in_modal(self, handle, intent, on_typed=None, settle=None):
+        def choose_in_modal(self, handle, intent, on_typed=None, settle=None,
+                            awaiting=None):
             if on_typed is not None:
                 on_typed(handle, self.placed)
             return harness.DELIVERED, "spy placed %r" % (self.placed,)
@@ -546,7 +563,7 @@ class TheRealProducerReachesTheRealAuthorizerTest(EscapeBase):
                                          session="sid-a", pids=pids,
                                          adapter=ad)
 
-    def test_a_stamped_identity_REACHES_THE_DOOR_and_the_door_refuses(self):
+    def test_a_stamped_identity_REACHES_THE_DOOR_and_the_door_refuses(self):  # noqa: VACUOUS_ASSERTION — no key IS the contract; the same call's row must name the door's vendor-limit refusal and its enabling recipe, which only a delivery that reached the door can carry, and the lifted twin below presses on the same identity
         """THE ADOPTED POSITIVE, and what it proves changed with the land cut.
 
         It never proved a keystroke was correct — it proved the AUTHORIZER let
@@ -565,9 +582,10 @@ class TheRealProducerReachesTheRealAuthorizerTest(EscapeBase):
         outcome, line = self._drive([orcaadopt.ProcIdent(4242, "1000")], ad)
         self.assertEqual(ad.sent, [], "the land decision typed into a dialog")
         self.assertEqual(outcome, vendorescape.HELD)
-        self.assertIn("showing a vendor dialog", line,
-                      "the delivery did not reach the dialog: %s" % line)
-        self.assertIn("2386", line)
+        self.assertIn("helm answers no vendor-limit dialog yet", line,
+                      "the delivery did not reach the dialog door: %s" % line)
+        self.assertIn("live pane", line,
+                      "the row does not say what enables the kind: %s" % line)
         self.assertIsNone(vendorescape._peek("seat-a"),
                           "a refusal before typing spent budget")
 
@@ -578,7 +596,7 @@ class TheRealProducerReachesTheRealAuthorizerTest(EscapeBase):
         pane. Without this, "nothing was typed" would be satisfied by a broken
         authorizer just as well as by the door."""
         ad = Ad(PANE, CLEARED)
-        with mock.patch.object(harness, "ESCAPE_TYPES_NOTHING", False):
+        with _door_lifted():
             outcome, line = self._drive([orcaadopt.ProcIdent(4242, "1000")], ad)
         self.assertTrue(ad.sent, "nothing reached the pane: %s" % line)
         self.assertEqual(ad.sent[-1][1], "2")
@@ -727,19 +745,20 @@ class TheRecognizedModalIsNamedAndNotPressedTest(unittest.TestCase):
                 mock.patch("helm.sessions.live_sids", return_value={}):
             return vendorescape.sweep([seat_name], apply=True)
 
-    #: LIFTS THE LAND DECISION, AND EVERY ARM THAT USES IT SAYS WHY. The
-    #: shipped build types nothing into a dialog (harness.ESCAPE_TYPES_NOTHING)
-    #: because a tail cannot prove an offer awaits input. The legs BELOW that
-    #: refusal — positive clearance, the uncertain-send split — are kept
-    #: reachable for task/2386, so they are exercised with the decision lifted.
-    #: The arm directly below proves the SHIPPED DEFAULT independently, so this
-    #: affordance cannot hide a build that types when it should not.
+    #: LIFTS THE DOOR'S VENDOR ROW, AND EVERY ARM THAT USES IT SAYS WHY. The
+    #: shipped dialog door refuses the usage-limit menu by name until a live
+    #: capture proves its shape (`panetail.VENDOR_KIND.unproven`). The legs
+    #: BELOW that refusal — the shape question, positive clearance, the
+    #: uncertain-send split — are exercised with the row lifted and the
+    #: vendor's presence record planted as the witness. The arm directly below
+    #: proves the SHIPPED DEFAULT independently, so this affordance cannot hide
+    #: a build that types when it should not.
     def _armed(self):
-        return mock.patch.object(harness, "ESCAPE_TYPES_NOTHING", False)
+        return _door_lifted()
 
     # ---- what this build actually does -------------------------------------
 
-    def test_the_SHIPPED_sweep_names_a_modal_and_types_NOTHING(self):
+    def test_the_SHIPPED_sweep_names_a_modal_and_types_NOTHING(self):  # noqa: VACUOUS_ASSERTION — no key IS the shipped contract; the same sweep's row must be HELD and carry the door's enabling recipe, and the armed arms below press on the same fixture
         """THE LAND DECISION, driven end to end with nothing patched.
 
         Liveness reads a real dialog, classifies it, computes a real escape
@@ -754,7 +773,8 @@ class TheRecognizedModalIsNamedAndNotPressedTest(unittest.TestCase):
         self.assertEqual(ad.sent, [], "the shipped build typed into a dialog")
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("HELD", lines[0])
-        self.assertIn("2386", lines[0], "the row does not say what unblocks it")
+        self.assertIn("live pane", lines[0],
+                      "the row does not say what unblocks it")
         self.assertIsNone(vendorescape._peek(self.SEAT),
                           "a refusal before typing spent budget")
 
@@ -791,7 +811,7 @@ class TheRecognizedModalIsNamedAndNotPressedTest(unittest.TestCase):
         line = self._sweep(self.SEAT, ad)[0]
         self.assertIn("sent=''", line, "a digit was reported as sent: %s" % line)
 
-    # ---- the legs task/2386 re-enables, exercised with the decision lifted --
+    # ---- the legs the door runs once the vendor row is proven, lifted here --
 
     def test_with_the_decision_lifted_a_registered_seat_is_freed(self):
         """THE REGISTERED LEG still composes: spawn register, lifecycle lock,

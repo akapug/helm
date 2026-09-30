@@ -14,9 +14,9 @@ from ._common import (
     STATUS_PROVISIONAL, PRIOR_PREFIX,
     _coerce_conf, derive_class,
 )
-from .load import (typed_id, 
+from .load import (typed_id, split_gate,
     candidates, load_all, counts, scope_census, _find, find_typed, _default_dir,
-    entry_scope, scope_label,
+    entry_scope, entry_project, scope_label,
     _parse_prior, _parse_lexicon, _parse_heuristic, _parse_reference,
 )
 from .resolve import resolve_prompt, pinned, route_cell as store_route_cell
@@ -24,6 +24,7 @@ from .write import (
     xrev_clear, confirm, reject, revise, write_prior, _lexicon_path, write_lexicon,
     write_heuristic, write_reference, apply_evidence, mark_superseded, retire,
     demote, pinned_stats, retag, regate, regloss, rescope, _kw_list, _KEYWORD_TYPES,
+    _resolve_write, _STMT_ALIAS,
     guard_entry_keywords, record_mint_events, doctor, _AUTHORED_PROBES_MAX,
 )
 from .index import _near_dup, near_dup_warning, _fmt
@@ -143,10 +144,14 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
                                               It keeps SERVING while staged, so
                                               canon never goes dark while it is
                                               being corrected
-  confirm <id> [--type T] [--edit <stmt...>] [--force-new]
+  confirm <id> [--type T] [--edit <stmt...>] [--force-new] [--rescope]
                                               owner ratify -> live (candidate OR
                                               provisional), or INSTALL a staged
-                                              `revise` on a live entry
+                                              `revise` on a live entry. A
+                                              statement change that would flip
+                                              the entry's DERIVED project keeps
+                                              the old one (recorded) and says
+                                              so; --rescope takes the new one
   reject <id> [--type T] [why...]             reject a candidate/provisional —
                                               retired in place (file kept)
       --type on any: disambiguate when reviewable entries share an id across
@@ -277,7 +282,8 @@ _GRAMMAR = {
     # a statement IS the decision.
     "revise": {"flags": {"--type": "one"}, "pos": 1, "tail": "guarded"},
     "confirm": {"flags": {"--type": "one", "--force-new": "switch",
-                          "--edit": "rest"}, "pos": 1, "tail": False},
+                          "--edit": "rest", "--rescope": "switch"},
+                "pos": 1, "tail": False},
     "reject": {"flags": {"--type": "one"}, "pos": 1, "tail": "literal"},
     "resolve": {"flags": {}, "pos": 0, "tail": "literal"},
     "pinned": {"flags": {"--stats": "switch"}, "pos": 0, "tail": False},
@@ -515,6 +521,42 @@ def _add_args(tail):
     return out
 
 
+def _door_id(eid, ctype):
+    """A bare id with --type names that type, exactly as its typed spelling
+    does; a typed id keeps its own type."""
+    if ctype and not split_gate(eid)[0]:
+        return "%s:%s" % (ctype, eid)
+    return eid
+
+
+def _read_door(verb, eid, ctype, project):
+    """The READ branch of keywords, gates and gloss, through the write door
+    (#951, write._resolve_write). -> (entry, rc).
+
+    These three read branches kept a type-filtered lookup after the write
+    side got its door, so an id `get` shows answered "not found", rc 1:
+    `gates episodic:<id>` (the typed ids the injector prints), `keywords
+    lexicon:<id>` (keywords never took the typed spelling) and a typed id
+    whose --type names another type. Now an id outside the verb's types is
+    refused BY TYPE (rc 2), a typed id and a --type that disagree are refused
+    as such (rc 2), and "not found" (rc 1) means the id resolves nowhere."""
+    want = split_gate(eid)[0]
+    if ctype and want and want != ctype:
+        print("helm store %s: '%s' names type %s, and --type names %s; "
+              "drop one" % (verb, eid, want, ctype), file=sys.stderr)
+        return None, 2
+    types = (ctype,) if ctype else _KEYWORD_TYPES
+    e, err = _resolve_write(_door_id(eid, ctype), verb, types,
+                            project=project)
+    if err:
+        print("helm store %s: %s" % (verb, err), file=sys.stderr)
+        return None, 2
+    if not e:
+        print("helm store %s: '%s' not found" % (verb, eid), file=sys.stderr)
+        return None, 1
+    return e, 0
+
+
 def cmd_store(args):
     """store <list|get|add|resolve|pinned|keywords|gates|gloss|rescope|xrev-clear|confirm|reject|evidence|supersede|retire|demote|events|counts> — the ONE typed personal-knowledge store."""
     args = list(args)
@@ -568,10 +610,6 @@ def cmd_store(args):
         return 2
     cmd, rest = args[0], args[1:]
 
-    # ONE DOOR, BEFORE ANY VERB RUNS. Placed here rather than in each branch
-    # because the branches are exactly what disagreed: `add` refused unknown
-    # options, `revise` swallowed them into the entry's own text. A per-branch
-    # guard is a promise every future verb has to remember to keep.
     # ONE DOOR, BEFORE ANY VERB RUNS, AND IT OWNS THE PARSE. Placed here
     # rather than in each branch because the branches are exactly what
     # disagreed: `add` refused unknown options while `revise` swallowed them
@@ -751,6 +789,22 @@ def cmd_store(args):
         print("helm store: REVISION STAGED on '" + eid + "' — the live entry "
               "is UNCHANGED and still firing. Land it with:\n"
               "  helm store confirm " + eid)
+        # THE FLIP IS NAMED AT THE STEP WHERE IT IS MADE (task/3520): the
+        # staged statement is what confirm would land, so compare its
+        # derivation against the entry's current one and tell the operator
+        # what the confirm will do about it before the stage dries. The pin
+        # itself is confirm's act, through the rescope door.
+        probe = dict(e)
+        probe["statement"] = stmt
+        alias = _STMT_ALIAS.get(e.get("type") or "")
+        if alias:
+            probe[alias] = stmt
+        if entry_project(probe) != entry_project(e):
+            print("helm store: the staged statement would derive %s, but the "
+                  "entry is %s — confirm keeps %s; pass --rescope to confirm "
+                  "with the new project"
+                  % (entry_project(probe), entry_project(e),
+                     entry_project(e)))
         return 0
 
     if cmd == "confirm":
@@ -762,13 +816,14 @@ def cmd_store(args):
         eid = " ".join(ns.pos).strip()
         if not eid:
             print("usage: helm store confirm <id> [--type T] "
-                  "[--edit <new definition...>] [--force-new]", file=sys.stderr)
+                  "[--edit <new definition...>] [--force-new] [--rescope]",
+                  file=sys.stderr)
             return 2
         guard_notes = []
         who = _acting_actor()
         e, err = confirm(eid, pk.now_ts(), new_statement=new_stmt, project=project,
                          ctype=ctype, force=force_new, guard_notes=guard_notes,
-                         by=who or "")
+                         by=who or "", allow_rescope=ns.has("--rescope"))
         if err:
             print("helm store confirm: " + err, file=sys.stderr)
             return 1
@@ -1274,12 +1329,9 @@ def cmd_store(args):
         opt = dict(ns.flags)
         ctype = opt.get("--type")
         if not any(k in opt for k in ("--add", "--remove", "--set")):
-            e = _find(eid, project=project,
-                      types=(ctype,) if ctype else _KEYWORD_TYPES)
+            e, rc = _read_door("keywords", eid, ctype, project)
             if not e:
-                print("helm store keywords: '%s' not found" % eid,
-                      file=sys.stderr)
-                return 1
+                return rc
             kws = _kw_list(e.get("keywords"))
             print("%s [%s] — %d keyword%s"
                   % (e["id"], e["type"], len(kws), "" if len(kws) == 1 else "s"))
@@ -1296,8 +1348,9 @@ def cmd_store(args):
         # the other side. `before` is what lets each listed cell say which of
         # the two things happened to it. _find is the same door the read branch
         # above uses; None simply means retag is about to report not-found.
-        prior = _find(eid, project=project,
-                      types=(ctype,) if ctype else _KEYWORD_TYPES)
+        prior = _resolve_write(_door_id(eid, ctype), "keywords",
+                               (ctype,) if ctype else _KEYWORD_TYPES,
+                               project=project)[0]
         before = {k.lower() for k in _kw_list((prior or {}).get("keywords"))}
         e, err = retag(eid, pk.now_ts(), add=opt.get("--add"),
                        remove=opt.get("--remove"), replace=opt.get("--set"),
@@ -1370,11 +1423,9 @@ def cmd_store(args):
         opt = dict(ns.flags)
         ctype = opt.get("--type")
         if not any(k in opt for k in ("--add", "--remove", "--set")):
-            e = find_typed(eid, project=project,
-                           types=(ctype,) if ctype else _KEYWORD_TYPES)
+            e, rc = _read_door("gates", eid, ctype, project)
             if not e:
-                print("helm store gates: '%s' not found" % eid, file=sys.stderr)
-                return 1
+                return rc
             gs = _kw_list(e.get("gates"))
             print("%s [%s] — %d gate%s"
                   % (e["id"], e["type"], len(gs), "" if len(gs) == 1 else "s"))
@@ -1456,11 +1507,9 @@ def cmd_store(args):
                 return _trc
             text = text or ""
         if text is None and not clear:
-            e = find_typed(eid, project=project,
-                           types=(ctype,) if ctype else _KEYWORD_TYPES)
+            e, rc = _read_door("gloss", eid, ctype, project)
             if not e:
-                print("helm store gloss: '%s' not found" % eid, file=sys.stderr)
-                return 1
+                return rc
             gl = str(e.get("gloss") or "").strip()
             print("%s [%s] — %s" % (e["id"], e["type"],
                                     ("gloss: " + gl) if gl else "no gloss"))
@@ -1711,7 +1760,7 @@ def cmd_store(args):
             # THE DRIFT LEG the mint-time refusal cannot cover: the stop-list
             # is measured from the store's own statements and MOVES, so a stem
             # that was discriminating at its mint can become chatter later.
-            # Nothing is pinned (see corpus_common) — this is where an author
+            # Nothing is pinned (see corpus_profile) — this is where an author
             # sees the verdict move, and it is a report because dropping a key
             # is retrieval judgment. Head-capped: this class is populous by
             # design (217 live rows on 2026-08-11) and must not bury the rest.

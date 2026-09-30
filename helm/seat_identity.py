@@ -65,7 +65,17 @@ def _canonical_sources(roster=None):
     from . import orcaadopt, seats
     if roster is None:
         roster = seats.roster()
-    spawned = orcaadopt.helm_spawned()
+    # The spawn register walk is the one read here that raises (an instances
+    # directory that cannot be listed, or one removed mid-walk), and this sits
+    # on the DM/dispatch path. A failed read comes back as `spawned` None with
+    # the reason as the only path, so `_evidence` refuses with it instead of a
+    # traceback, and never calls the alias misconfigured when it could not look.
+    try:
+        spawned = orcaadopt.helm_spawned()
+    except OSError as exc:
+        return roster, None, set(), [
+            "the spawn register could not be read (%s: %s); reachability was "
+            "NOT measured" % (type(exc).__name__, exc)]
     canonicals = {name for name in list(roster) + list(spawned) if _valid(name)}
     paths = [seats.safe_cwd()]
     paths.extend(row.get("cwd") for row in roster.values()
@@ -122,10 +132,9 @@ def _evidence(token, raw=None, roster=None):
     DIAGNOSIS is not, and reading a declaration instead of running the function
     is the whole reason this lane needed a paired census."""
     from . import orcaadopt
-    if roster is None:
-        roster, spawned, canonicals, paths = _canonical_sources()
-    else:
-        roster, spawned, canonicals, paths = _canonical_sources(roster=roster)
+    roster, spawned, canonicals, paths = _canonical_sources(roster=roster)
+    if spawned is None:     # the register could not be read: paths[0] says why
+        return set(), [], paths[0]
     raw = os.environ.get(_ENV) if raw is None else raw
     declarations, err = _declarations(raw)
     if err:

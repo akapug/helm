@@ -16,7 +16,7 @@ from . import dispatches, rowworld, vcs
 MARKER = "helm-compose-land/1"
 WRITER_ENV = "HELM_COMPOSE_LAND_V1"
 PROOF_VERSION = 3  # landed versions 1 (review) and 2 (build) are occupied
-SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+SHA = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _BRIEF = re.compile(
     r"helm-compose-land/1 base=([0-9a-f]{40}|[0-9a-f]{64}) "
     r"tip=([0-9a-f]{40}|[0-9a-f]{64}) bounded=1 effects=([a-z,-]+)\Z")
@@ -42,6 +42,7 @@ PROTECTED_OWNERS = (
     "helm/docref_guard.py",     # installed pre-commit citation scanner
     "helm/conflict_marker.py",  # installed pre-commit conflict scanner
     "helm/world_prose_guard.py",  # installed public-prose scanner
+    "helm/private_names.py",    # installed private-name scanner and its list
     "helm/seatname_guard.py",   # installed pre-commit identity scanner
     "helm/trailer_rung.py",     # installed commit-msg attribution scanner
     "helm/lane_discipline.py",  # installed pre-commit lane interlock
@@ -60,12 +61,18 @@ PROTECTED_OWNERS = (
     # THE SATELLITES A SIZE CEILING FORCED OUT, AND WHY THEY ARE LISTED
     # SEPARATELY. This guard names exact FILES, so a ledger that sheds a
     # module sheds its protection with it: the close/terminal writers and the
-    # verb surfaces these four entries protect were inside the two files above
+    # verb surfaces these entries protect were inside the two files above
     # them until a never-track ceiling moved them, and nothing about the
     # contract they own changed. The arm below derives this requirement from
     # each owner's own _OWNER_NAMES table, so the next split cannot reopen it.
     "helm/dispatches_close.py",  # administrative close/terminal proof writers
     "helm/dispatches_cli.py",   # the verb surface over that close/replay
+    "helm/dispatches_spiral.py",  # the review-spiral rung over the ledger
+    "helm/dispatches_tier.py",  # approval tier recorded on a verdict
+    "helm/dispatches_carriage.py",  # the carried-close carriage proof
+    "helm/dispatches_announce.py",  # verdict attestation and announcement
+    "helm/dispatches_rebind.py",  # rebind: cancel-and-reissue administration
+    "helm/dispatches_retract.py",  # verdict retraction and its reissue
     "helm/landreq_close.py",    # terminal/witness close writers and chain proof
     "helm/landreq_cli.py",      # the lr verb surface over those writers
     "helm/landreq.py",          # LAND_SCHEMA; compose/terminal/witness writers
@@ -112,7 +119,8 @@ def parse(row, rows):
         return None, "UNKNOWN: immutable work snapshot unavailable"
     # THE WHOLE BRIEF, BY REFERENCE WHEN THE ROW HAS ONE. This reader needs the
     # COMPLETE text by construction — it hashes the brief and binds the digest
-    # to `message_hash` below — so under the row cap alone it answered UNKNOWN
+    # to the original message hash or a generated-review brief reference below — so under
+    # the row cap alone it answered UNKNOWN
     # for every brief over that cap, which is now the ordinary size. Reading
     # the referenced file restores the contract for exactly those rows and
     # changes nothing for the rest: a row with no reference, an unresolvable
@@ -136,7 +144,27 @@ def parse(row, rows):
         digest = hashlib.blake2b(body.encode("utf-8"), digest_size=16).hexdigest()
     except UnicodeError:
         return None, "UNKNOWN: original brief is not UTF-8"
-    if digest != row.get("message_hash"):
+    suffix = [row.get("round_whisper")]
+    mode = row.get("review_mode")
+    if mode:
+        line = dispatches.REVIEW_MODE_LINES.get(mode)
+        if not line:
+            return None, "UNKNOWN: review mode has no known brief suffix"
+        suffix.append(line)
+    suffix = [text for text in suffix if text]
+    if suffix:
+        ending = "".join("\n\n" + text for text in suffix)
+        if not body.endswith(ending) or digest != row.get("brief_ref"):
+            return None, "UNKNOWN: generated review suffix does not bind"
+        authored = body[:-len(ending)]
+        try:
+            authored_hash = hashlib.blake2b(
+                authored.encode("utf-8"), digest_size=16).hexdigest()
+        except UnicodeError:
+            return None, "UNKNOWN: authored brief is not UTF-8"
+        if authored_hash != row.get("message_hash"):
+            return None, "UNKNOWN: authored review brief hash does not bind"
+    elif digest != row.get("message_hash"):
         return None, "UNKNOWN: original brief hash does not bind"
     if row.get("kind") != "review" or row.get("status") != "verdict" \
             or row.get("polarity") != "concur" or row.get("basis") != "measured":

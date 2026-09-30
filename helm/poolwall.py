@@ -45,6 +45,19 @@ instant a seat was last announced for; a wall whose instant is within
 ``ANNOUNCE_TOLERANCE_S`` of the recorded one is the same wall and is not
 announced again. A wall that starts after the recorded one expired has a new
 instant, and earns one new line.
+
+WHEN THE VENDOR IS THE WALL, THE EPISODE IS ITS IDENTITY. The expiry instant
+is the wall only while the proxy's cooldown IS the wall. When the upstream
+refused first — an empty balance, or a spent usage window (measured: Moonshot's
+403 ``access_terminated_error`` "You've reached your 5-hour usage limit") —
+the proxy cools the credential for a few minutes of its own, retries, is
+refused again, and starts a new cooldown with a new instant. Keyed by that
+instant, one vendor window posted a line on every renewal (five in ninety
+minutes, each "reset at <a few minutes away>"). So a wall whose cooldown has a
+vendor cause is identified by its CAUSE EPISODE: the upstream refusals since the
+last completed request, keyed by the first of them. A renewal inside the
+episode is the same wall; a completed request ends it, and the next refusal
+starts a new one with one new line.
 """
 import datetime
 import fcntl
@@ -72,6 +85,18 @@ REFUSAL_RE = re.compile(
 _DURATION_RE = re.compile(
     r"^\s*(?:(?P<h>\d+)h)?\s*(?:(?P<m>\d+)m)?\s*(?:(?P<s>\d+)s)?\s*$")
 _LOG_TS = "%Y-%m-%d %H:%M:%S"
+#: The statuses a vendor answers a spent quota with: DeepSeek's 402, Moonshot's
+#: 403 ``access_terminated_error``, and the 429 of codex and Google.
+_QUOTA_CODES = (402, 403, 429)
+#: The balance alternatives of ``proxywatch._QUOTA_WORDS``: a refusal that
+#: names one has no timed reset, whichever vendor wrote it.
+_BALANCE_WORDS = re.compile(r"insufficient (?:balance|credit)|out of credits")
+#: The window a vendor names in its own refusal ("5-hour", "weekly (7-day)",
+#: "Monthly", "this billing cycle"). Only a stated window is ever quoted.
+_WINDOW_RE = re.compile(
+    r"\b(\d+-(?:hour|day|week|month)|daily|weekly|monthly|billing cycle)\b")
+#: The proxy's name for an OpenAI-shaped upstream: the vendor follows it.
+_COMPAT = "openai-compatible-"
 
 
 def parse_reset(text):
@@ -135,8 +160,57 @@ def log_statements(path, tail_bytes=None):
         if refusal is not None:
             refusal["observed_at"] = at
             refusal["expires_at"] = at + refusal["reset_s"]
-        out.append({"observed_at": at, "code": code, "refusal": refusal})
+        out.append({"observed_at": at, "code": code, "refusal": refusal,
+                    "cause": _vendor_cause(code, body, _origin, at)})
     return out, None
+
+
+def _vendor_cause(code, body, origin, at):
+    """An UPSTREAM refusal that says the vendor's quota is spent, as
+    {code, observed_at, vendor, kind, window}, else None.
+
+    kind "balance": the grammar has no timed reset (proxywatch's
+    REFUSAL_SIGNATURES mode "none", DeepSeek's 402 Insufficient Balance, or
+    the balance words) and a top-up is the repair.
+    kind "window": the vendor names a usage limit or a quota — Moonshot's 403
+    ``access_terminated_error`` ("5-hour usage limit", "weekly (7-day) usage
+    limit", "usage limit for this billing cycle"), codex's 429
+    ``usage_limit_reached``, Google's 429 "Resource has been exhausted (e.g.
+    check quota)" — and the wall ends when the VENDOR's window resets.
+    ``window`` is the window the vendor stated, or None; no reset instant is
+    ever derived here, because none of these states one.
+
+    Either way the pool cools the credential for its own backoff, and that
+    expiry is the proxy's clock, not the vendor's: the next request after it
+    refuses the same way. A per-minute rate limit or a credential failure is
+    not a cause (proxywatch._vendor_quota decides both). ``vendor`` is the
+    signature's name, or None for the generic wording — seat_wall names that
+    one from the pool's provider."""
+    if origin == "local" or not body:
+        return None
+    from . import proxywatch
+    low = str(body).lower()
+    match = proxywatch._signature_match(low)
+    words = proxywatch._vendor_words(low)
+    if match and match[1] == "none":
+        kind = "balance"
+    elif code not in _QUOTA_CODES or not proxywatch._vendor_quota(low):
+        return None
+    elif not match and _BALANCE_WORDS.search(words):
+        kind = "balance"
+    else:
+        kind = "window"
+    window = _WINDOW_RE.search(words) if kind == "window" else None
+    return {"code": code, "observed_at": at, "kind": kind,
+            "vendor": match[0] if match else None,
+            "window": window.group(1) if window else None}
+
+
+def _upstream(wall, family):
+    """The vendor a generic refusal came from: the pool's provider without the
+    proxy's ``openai-compatible-`` prefix, else the seat's family."""
+    name = wall.get("provider") or family or "upstream"
+    return name[len(_COMPAT):] if name.startswith(_COMPAT) else name
 
 
 def log_path(family, seat):
@@ -178,6 +252,36 @@ def seat_wall(seat, family=None, now=None):
             return None, "the last pool refusal expired at %s" % iso(
                 wall["expires_at"])
         wall["seat"], wall["family"] = seat, fam
+        # THE COOLDOWN'S CAUSE AND ITS EPISODE. Walk back over the upstream
+        # refusals behind it; a completed request ends the walk, because a
+        # request that completed means a later cause, not this one. The
+        # nearest cause is what the vendor says now; the earliest refusal of
+        # that same kind is when it began saying it; the earliest cause of
+        # any kind is where the episode began, and is its identity.
+        cause = first = start = None
+        start_seen = False
+        for row in reversed(rows[:-1]):
+            if 200 <= row["code"] < 300:
+                start_seen = True
+                break
+            found = row["cause"]
+            if not found:
+                continue
+            cause = cause or found
+            if (found["vendor"], found["kind"]) == (cause["vendor"],
+                                                    cause["kind"]):
+                first = found
+            start = found
+        if cause:
+            wall["cause"] = dict(
+                cause, observed_at=first["observed_at"],
+                vendor=cause["vendor"] or _upstream(wall, fam),
+                episode={"vendor": start["vendor"] or _upstream(wall, fam),
+                         "kind": start["kind"],
+                         "first_at": start["observed_at"],
+                         # False when the log tail begins inside the episode:
+                         # its earliest visible refusal is then not the first
+                         "start_seen": start_seen})
         return wall, None
     except Exception as exc:              # noqa: BLE001 — a wall never raises
         return None, "pool wall unreadable: %s" % exc.__class__.__name__
@@ -234,24 +338,51 @@ def _pool_phrase(wall):
         wall["model"], provider, wall["count"])
 
 
+def _until(wall):
+    """"reset at <instant>" for a wall the proxy's cooldown IS; for a
+    cooldown a vendor caused, what actually ends it: a top-up for an EMPTY
+    BALANCE, the vendor's own window for a SPENT QUOTA. The proxy's instant is
+    then named as the proxy's, never as the wall's end."""
+    cause = wall.get("cause")
+    if not cause:
+        return "reset at %s" % iso(wall["expires_at"])
+    if cause["kind"] == "balance":
+        return ("NO timed reset: the upstream (%s) refused on an empty "
+                "balance, HTTP %d at %s, and a top-up by the account owner is "
+                "the repair; the proxy's own cooldown ends at %s and the next "
+                "request after it refuses the same way" % (
+                    cause["vendor"], cause["code"], iso(cause["observed_at"]),
+                    iso(wall["expires_at"])))
+    window = ("its %s usage window" % cause["window"]) if cause.get("window") \
+        else "a usage quota whose window it did not state"
+    return ("the vendor's window is the wall: the upstream (%s) refused on %s "
+            "at %s (HTTP %d); the proxy retries after each of its own "
+            "cooldowns (the current one ends at %s) and each retry refuses "
+            "the same way until the vendor's window resets" % (
+                cause["vendor"], window, iso(cause["observed_at"]),
+                cause["code"], iso(wall["expires_at"])))
+
+
 def hold_reason(wall):
     """The one sentence every held wake path gives."""
-    return ("%s is walled by its proxy pool: %s, reset at %s — the keystroke "
-            "is withheld until then; rows addressed to it stay owed" % (
-                wall["seat"], _pool_phrase(wall), iso(wall["expires_at"])))
+    return ("%s is walled by its proxy pool: %s, %s — the keystroke "
+            "is withheld until the cooldown ends; rows addressed to it stay "
+            "owed" % (wall["seat"], _pool_phrase(wall), _until(wall)))
 
 
 def blocked_on(wall):
     """The liveness row's short WHAT-it-waits-on for a pool wall."""
-    return "proxy pool: %s; reset at %s" % (
-        _pool_phrase(wall), iso(wall["expires_at"]))
+    return "proxy pool: %s; %s" % (_pool_phrase(wall), _until(wall))
 
 
 def room_line(wall):
-    return ("poolwall: seat %s is WALLED by its proxy pool — %s; reset at %s. "
-            "Every wake into its pane is held until then and rows addressed "
-            "to it stay owed; one line per wall." % (
-                wall["seat"], _pool_phrase(wall), iso(wall["expires_at"])))
+    once = ("one line per vendor refusal episode, however often the proxy "
+            "renews its cooldown" if wall.get("cause") else
+            "one line per wall")
+    return ("poolwall: seat %s is WALLED by its proxy pool — %s; %s. "
+            "Every wake into its pane is held until the cooldown ends and "
+            "rows addressed to it stay owed; %s." % (
+                wall["seat"], _pool_phrase(wall), _until(wall), once))
 
 
 def _ledger_path():
@@ -264,14 +395,41 @@ def _read_ledger():
 
 
 def announced(seat, wall, ledger=None):
-    """Has THIS wall (by expiry instant) already earned its line?"""
+    """Has THIS wall already earned its line?
+
+    A wall with a vendor cause is identified by its cause episode, a wall
+    without one by the proxy's expiry instant (see the module head)."""
     ledger = _read_ledger() if ledger is None else ledger
     row = ledger.get(seat)
     if not isinstance(row, dict):
         return False
+    if wall.get("cause"):
+        return _same_episode(row.get("episode"), wall["cause"]["episode"])
     at = row.get("expires_at")
     return isinstance(at, (int, float)) and \
         abs(at - wall["expires_at"]) <= ANNOUNCE_TOLERANCE_S
+
+
+def _same_episode(recorded, episode):
+    """Is ``episode`` the cause episode the ledger recorded -> bool.
+
+    A row written before episodes were recorded carries none, and is never
+    the same: the loud direction is one more line, not a silenced episode.
+    When the log tail shows the episode's start (a completed request before
+    its first refusal), the first refusal must match. When the tail begins
+    inside the episode, its earliest visible refusal is later than the real
+    first one and nothing visible ended the recorded episode, so a recorded
+    start at or before it is the same episode."""
+    if not isinstance(recorded, dict):
+        return False
+    at = recorded.get("first_at")
+    if not isinstance(at, (int, float)):
+        return False
+    if not episode["start_seen"]:
+        return at <= episode["first_at"] + ANNOUNCE_TOLERANCE_S
+    return (recorded.get("vendor"), recorded.get("kind")) == (
+        episode["vendor"], episode["kind"]) and \
+        abs(at - episode["first_at"]) <= ANNOUNCE_TOLERANCE_S
 
 
 def _claim(seat, wall, now):
@@ -289,6 +447,10 @@ def _claim(seat, wall, now):
             ledger[seat] = {"expires_at": wall["expires_at"],
                             "announced_at": now, "model": wall["model"],
                             "count": wall["count"]}
+            if wall.get("cause"):
+                episode = wall["cause"]["episode"]
+                ledger[seat]["episode"] = {
+                    k: episode[k] for k in ("vendor", "kind", "first_at")}
             pk.write_json(path, ledger)
             return True
         finally:

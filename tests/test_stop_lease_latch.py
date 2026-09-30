@@ -15,8 +15,11 @@ The contract these tests pin, arm by arm:
     latch turns this test red;
   * ANY change to the set — a new lease, a release, a re-claim (new lease
     id under the old resource), or a remainder crossing LEASE_TTL_ALARM_S —
-    re-prints the full block: the latch compresses repetition, never
-    severity escalation;
+    is spoken, never compressed: the latch compresses repetition, never
+    severity escalation. Since task/3123 the memory is PER LEASE, so a
+    changed set prints the lines that changed and one tally of the rest; it
+    BLOCKS only when a printed line is a held lease, and a release is a
+    count in a warn;
   * an UNWRITABLE latch degrades the sermon to a WARN, never an
     unconditional re-block (the refusal-honesty law: a gate that cannot
     remember must never become a wall);
@@ -37,6 +40,8 @@ The contract these tests pin, arm by arm:
     the enumeration loop that cannot emit without printing.
 """
 import contextlib
+import glob
+import hashlib
 import io
 import os
 import re
@@ -49,8 +54,10 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import pk, seats, seats_stop_budget, seats_stop_timing  # noqa: E402
+from helm import chat, pk, seats, seats_stop_budget, seats_stop_seam  # noqa: E402
+from helm import seats_stop_timing  # noqa: E402
 from helm import seats_stop_guard as stop_guard_impl  # noqa: E402
+from helm.seats_stop_claims import DETAIL_VERB  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -65,6 +72,7 @@ SESSION = "aaaa1111-2222-3333-4444-555566667777"
 
 FULL = "act per line, then stop:"                     # the sermon's key
 COMPRESSED = "unchanged. Reprint:"                    # the one-liner's key
+TALLY = "unchanged lease(s) not reprinted"            # a partial print's key
 
 # THE WHOLE BLOCK A BLOCKED STOP PRINTS, IN CHARACTERS. The owner reads this in
 # his terminal every time a seat is held, and it reached ~900 characters of
@@ -130,7 +138,18 @@ class LeaseLatchBase(unittest.TestCase):
         pk.write_json(seats.claims_path(), c)
 
     def guard(self):
-        return seats.stop_guard(session=SESSION, room="main", seat=ME)
+        """One stop AS A SEAT GETS IT: the ladder's answer, then published the
+        way the CLI publishes it — the blocks, else the warns. Since task/3123
+        the lease memory commits only what that publication put on
+        the stream, so a fixture that never delivers would test a seat that
+        never reads."""
+        blocks, warns = seats.stop_guard(session=SESSION, room="main", seat=ME)
+        out = io.StringIO()
+        if blocks:
+            seats_stop_seam.emit_blocks(blocks, stream=out)
+        else:
+            seats_stop_seam.emit_warns(warns, stream=out)
+        return blocks, warns
 
     def sermons(self, lines):
         return [x for x in lines if FULL in x]
@@ -365,26 +384,46 @@ class SameSetLatchTest(LeaseLatchBase):
         self.assertNotIn("--lease", line[0])      # detail lives in the sermon
         self.assertIn("helm chat stop-guard --detail", line[0])
 
-    def test_a_new_lease_reprints_the_full_block(self):
+    def test_a_new_lease_prints_only_its_own_line_as_a_block(self):  # noqa: VACUOUS_ASSERTION — the new lane's line and the tally are asserted present on the same sermon before the unchanged lane's absence is read
+        """task/3123 (c). This arm pinned the WHOLE set reprinting when one
+        lease joined it, and the whole set is what the live seat measured
+        re-reading ~25 times in one evening. The new lease is the one thing
+        the seat has not been shown, so it is the one line, and it BLOCKS
+        because a held line that is new owes its act."""
         self.claim("db-migration")
         self.guard()
         self.claim("cache-rebuild")
         blocks, _warns = self.guard()
         hit = self.sermons(blocks)
         self.assertEqual(len(hit), 1, blocks)
-        self.assertIn("db-migration", hit[0])
-        self.assertIn("cache-rebuild", hit[0])
+        self.assertIn("helm chat release cache-rebuild", hit[0])
+        self.assertIn("1 " + TALLY, hit[0])
+        # The unchanged lease is NAMED in the tally as still owed, and has no
+        # line of its own.
+        self.assertEqual([x for x in hit[0].splitlines()
+                          if x.startswith("  db-migration ")], [],
+                         "an unchanged lease was reprinted beside the new one")
 
-    def test_a_release_reprints_the_full_block_for_the_remainder(self):
+    def test_a_release_is_counted_in_a_warn_and_reprints_nothing(self):  # noqa: VACUOUS_ASSERTION — the one warn line naming the count is the unconditional positive control on the same stop's output; the absences are the contract
+        """task/3123. This arm pinned a release re-printing the remainder as a
+        BLOCK. Nothing new is owed when a lease goes away, and the remainder
+        is exactly what the seat was shown last time, so the stop says the
+        set shrank — as a count, because a released lease is named by
+        neither shape — and holds nothing."""
         self.claim("db-migration")
         self.claim("cache-rebuild")
         self.guard()
         self.drop("cache-rebuild")
-        blocks, _warns = self.guard()
-        hit = self.sermons(blocks)
-        self.assertEqual(len(hit), 1, blocks)
-        self.assertIn("db-migration", hit[0])
-        self.assertNotIn("cache-rebuild", hit[0])
+        blocks, warns = self.guard()
+        self.assertEqual(self.sermons(blocks + warns), [],
+                         "a release reprinted lines that did not change")
+        line = [w for w in warns if "1 no longer held" in w]
+        self.assertEqual(len(line), 1, warns)
+        self.assertIn("1 lease(s) held", line[0])
+        self.assertIn(DETAIL_VERB, line[0])
+        self.assertEqual(self.compressed(warns), [],
+                         "a shrunken set was reported as simply unchanged")
+        self.assertNotIn("cache-rebuild", "\n".join(blocks + warns))
 
     def test_an_all_exempt_stop_rearms_the_full_sermon(self):  # noqa: VACUOUS_ASSERTION — the giver warn and the final len(sermons)==1 are the unconditional positive controls; the mid-test sermon absence is the exempt state itself
         """sermon (latched) -> the row turns exempt for one stop (the giver
@@ -459,6 +498,370 @@ class TTLEscalationTest(LeaseLatchBase):
         line = self.compressed(warns)
         self.assertEqual(len(line), 1, warns)
         self.assertIn("1 EXPIRING", line[0])
+
+
+class PerLeaseBase(LeaseLatchBase):
+    """Three leases and the giver flip, shared by the per-lease arms below.
+    The exempt shape planted is the GIVER branch, the way the all-exempt arm
+    above plants it, because it needs no live process and no lane room: the
+    flip is a registry edit and the only variable is the latch."""
+
+    THREE = ("cache-rebuild", "db-migration", "port:9931")
+    PEER = "peer-seat"
+    PEER_SESSION = "99998888-7777-6666-5555-444433332222"
+
+    def give(self, resource):
+        c = pk.read_json(seats.claims_path(), {}) or {}
+        c[resource]["holder"] = self.PEER
+        pk.write_json(seats.claims_path(), c)
+        r = pk.read_json(seats.roster_path(), {}) or {}
+        r.setdefault(self.PEER, {})["session"] = self.PEER_SESSION
+        pk.write_json(seats.roster_path(), r)
+
+    def take_back(self, resource):
+        c = pk.read_json(seats.claims_path(), {}) or {}
+        c[resource]["holder"] = ME
+        pk.write_json(seats.claims_path(), c)
+
+    def named(self, sermon):
+        """The lines of one sermon that account for a lease, by name."""
+        return [x for x in sermon.splitlines()
+                if any(x.startswith("  %s " % r) for r in self.THREE)]
+
+    def tally(self, sermon):
+        hit = [x for x in sermon.splitlines() if TALLY in x]
+        self.assertEqual(len(hit), 1, sermon)
+        return hit[0]
+
+    def first_stop(self):
+        """Every lease printed once, as a block — the control each arm's
+        second stop is read against."""
+        blocks, _w = self.guard()
+        hit = self.sermons(blocks)
+        self.assertEqual(len(hit), 1, blocks)
+        self.assertEqual(len(self.named(hit[0])), 3, hit[0])
+        return hit[0]
+
+
+class OnlyTheChangedLinesReprintTest(PerLeaseBase):
+    """task/3123 — ONE LANE MOVING REPRINTED EVERY LANE.
+
+    MEASURED on helm-claude-2, 17:19Z-18:55Z: the leases block printed in full
+    on ~25 of ~32 stops, 8-13 lines each, and consecutive prints differed in
+    one or two lines — a lane flipping between held and an exempt state as a
+    subagent or a fab run started or ended. The latch was ONE fingerprint over
+    every lease, so any lane's change reprinted all of them."""
+
+    def test_a_lane_turning_exempt_prints_only_its_line_as_a_warn(self):  # noqa: VACUOUS_ASSERTION — the warn-channel sermon, its one named line and the tally are unconditional positive controls on the same stop; the empty block list is the contract
+        """(a) held -> exempt: nothing new is owed, so the one changed line
+        rides a WARN and the stop is not held."""
+        for r in self.THREE:
+            self.claim(r)
+        self.first_stop()
+        self.give("cache-rebuild")
+        blocks, warns = self.guard()
+        self.assertEqual(self.sermons(blocks), [],
+                         "a lane that stopped owing anything held the stop")
+        hit = self.sermons(warns)
+        self.assertEqual(len(hit), 1, warns)
+        lines = self.named(hit[0])
+        self.assertEqual(len(lines), 1, "unchanged lanes were reprinted:\n"
+                         + hit[0])
+        self.assertIn("cache-rebuild", lines[0])
+        self.assertIn("NO ACTION OWED (PEER HOLD)", lines[0])
+        tally = self.tally(hit[0])
+        self.assertIn("2 " + TALLY, tally)
+        self.assertIn("earlier", tally)
+        self.assertIn(DETAIL_VERB, tally)
+        # AN UNCHANGED HELD LEASE STILL OWES ITS ACT, so the tally may not
+        # say otherwise about the two lanes it did not reprint.
+        self.assertNotIn("NO ACTION", tally)
+        self.assertNotIn("need nothing", tally)
+        self.assertEqual(self.compressed(warns), [])
+
+    def test_a_lane_turning_held_again_prints_only_its_line_as_a_block(self):
+        """(b) exempt -> held: severity escalates through the latch, and the
+        line that escalated is the only one printed."""
+        for r in self.THREE:
+            self.claim(r)
+        self.give("cache-rebuild")
+        self.assertIn("PEER HOLD", self.first_stop())
+        self.take_back("cache-rebuild")
+        blocks, _w = self.guard()
+        hit = self.sermons(blocks)
+        self.assertEqual(len(hit), 1, blocks)
+        lines = self.named(hit[0])
+        self.assertEqual(len(lines), 1, hit[0])
+        self.assertIn("helm chat release cache-rebuild", lines[0])
+        self.assertIn("2 " + TALLY, self.tally(hit[0]))
+
+    def test_a_new_lease_among_three_prints_only_its_line_as_a_block(self):
+        """(c) the held set grows by one."""
+        self.claim("db-migration")
+        self.claim("port:9931")
+        self.guard()
+        self.claim("cache-rebuild")
+        blocks, _w = self.guard()
+        hit = self.sermons(blocks)
+        self.assertEqual(len(hit), 1, blocks)
+        lines = self.named(hit[0])
+        self.assertEqual(len(lines), 1, hit[0])
+        self.assertIn("cache-rebuild", lines[0])
+        self.assertIn("2 " + TALLY, self.tally(hit[0]))
+
+    def test_a_release_on_a_stop_that_prints_a_line_is_still_counted(self):  # noqa: VACUOUS_ASSERTION — the new lane's line and the tally are asserted present on the same sermon before the released lane's absence is read
+        """A release on the SAME stop as a new lease. The compressed line
+        counts a release ("; N no longer held") and the docs say a release is
+        counted; the partial print counted it nowhere, so the set shrinking
+        was invisible exactly when the full list was no longer reprinted
+        beside it (reviewer probe, task/3123)."""
+        self.claim("db-migration")
+        self.claim("port:9931")
+        self.guard()
+        self.drop("db-migration")
+        self.claim("cache-rebuild")
+        blocks, warns = self.guard()
+        hit = self.sermons(blocks)
+        self.assertEqual(len(hit), 1, blocks)
+        lines = self.named(hit[0])
+        self.assertEqual(len(lines), 1, hit[0])          # control: new line
+        self.assertIn("helm chat release cache-rebuild", lines[0])
+        self.assertIn("1 " + TALLY, self.tally(hit[0]))
+        self.assertIn("1 no longer held", hit[0],
+                      "a release beside a new lease was counted nowhere")
+        self.assertNotIn("db-migration", "\n".join(blocks + warns),
+                         "a released lease was named")
+
+    def test_a_lane_crossing_into_expiring_prints_its_line(self):
+        """(d) and the tally keeps the EXPIRING count of the lanes it did not
+        reprint, so a lane already expiring is not hidden by a sibling's
+        crossing."""
+        self.claim("db-migration", ttl=60)          # EXPIRING from birth
+        self.claim("port:9931")
+        self.claim("cache-rebuild")
+        self.first_stop()
+        self.decay("cache-rebuild", seats.LEASE_TTL_ALARM_S - 30)
+        blocks, _w = self.guard()
+        hit = self.sermons(blocks)
+        self.assertEqual(len(hit), 1, blocks)
+        lines = self.named(hit[0])
+        self.assertEqual(len(lines), 1, hit[0])
+        self.assertIn("cache-rebuild", lines[0])
+        self.assertIn("EXPIRING", lines[0])
+        self.assertIn("2 %s (1 EXPIRING)" % TALLY, self.tally(hit[0]))
+
+    def test_an_old_bare_hex_latch_reads_as_nothing_remembered(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a literal two-tuple, and each pass asserts the full print (len==1, three named lines) and the compressed line (len==1) on the same stops whose absences it reads
+        """(e) the latch file the pre-3123 code wrote is ONE hex fingerprint.
+        Read by the new code it must mean "nothing remembered": one full
+        print, then the new memory compresses the next stop, and never a
+        crash — including a fingerprint of digits only, which JSON would
+        happily read as a number."""
+        for r in self.THREE:
+            self.claim(r)
+        self.first_stop()
+        latch = glob.glob(os.path.join(os.environ["HELM_CHAT_DIR"],
+                                       "*.%s.*" % seats.LEASE_LATCH))
+        self.assertEqual(len(latch), 1, latch)      # must-hit: the file
+        # THE PRE-3123 WRITER'S BYTES FOR THIS SET, spelled from its source:
+        # blake2b-64 over "|"-joined (resource, lease id, TTL band), sorted by
+        # resource — so the old reader would call this set unchanged.
+        c = pk.read_json(seats.claims_path(), {}) or {}
+        old = hashlib.blake2b("|".join(
+            "%s\x1f%s\x1fheld" % (r, c[r]["lease"]) for r in sorted(self.THREE)
+        ).encode("utf-8"), digest_size=8).hexdigest()
+        for planted in (old, "1234567890123456"):
+            with open(latch[0], "w") as f:
+                f.write(planted)
+            blocks, _w = self.guard()
+            hit = self.sermons(blocks)
+            self.assertEqual(len(hit), 1, "old latch %r: %r" % (planted, blocks))
+            self.assertEqual(len(self.named(hit[0])), 3, hit[0])
+            self.assertNotIn(TALLY, hit[0])
+            blocks, warns = self.guard()
+            self.assertEqual(self.sermons(blocks), [], blocks)
+            self.assertEqual(len(self.compressed(warns)), 1, warns)
+
+    def test_detail_prints_every_line_where_the_stop_prints_one(self):
+        """(f) `--detail` bypasses the per-lease memory exactly as it bypassed
+        the fingerprint: every line, no tally."""
+        for r in self.THREE:
+            self.claim(r)
+        self.first_stop()
+        self.give("cache-rebuild")
+        _b, warns = self.guard()
+        hit = self.sermons(warns)
+        self.assertEqual(len(hit), 1, warns)        # control: a partial print
+        self.assertEqual(len(self.named(hit[0])), 1, hit[0])
+        blocks, _w = seats.stop_guard(session=SESSION, room="main", seat=ME,
+                                      detail=True)
+        hit = self.sermons(blocks)
+        self.assertEqual(len(hit), 1, blocks)
+        self.assertEqual(len(self.named(hit[0])), 3, hit[0])
+        self.assertNotIn(TALLY, hit[0])
+
+    def test_a_partial_print_names_the_unchanged_held_leases(self):  # noqa: VACUOUS_ASSERTION — the new lane's printed line and the tally's count and names are unconditional positive controls on the same sermon whose exempt-name absence is read
+        """AN AUTO-COMPACT KEEPS THE SESSION, SO IT KEEPS THE MEMORY: a
+        held lane printed before the compaction is not printed again until its
+        own state moves, and the churn that makes partial prints common is
+        exempt flips. So the tally NAMES every unchanged HELD lease — what the
+        seat still owes — and only counts the unchanged exempt ones."""
+        for r in self.THREE:
+            self.claim(r)
+        self.give("cache-rebuild")
+        self.first_stop()
+        self.claim("queue:x")
+        blocks, _w = self.guard()
+        hit = self.sermons(blocks)
+        self.assertEqual(len(hit), 1, blocks)
+        self.assertTrue([x for x in hit[0].splitlines()
+                         if x.startswith("  queue:x ")], hit[0])
+        tally = self.tally(hit[0])
+        self.assertIn("3 " + TALLY, tally)
+        self.assertIn("still owed: db-migration, port:9931", tally)
+        self.assertNotIn("cache-rebuild", tally,
+                         "an unchanged EXEMPT lane was named as owed")
+
+    def test_the_unchanged_one_liner_names_no_lease_and_points_at_detail(self):  # noqa: VACUOUS_ASSERTION — the one compressed line and its detail verb are the unconditional positive controls; the absent names are the contract
+        """THE STOP ON WHICH NOTHING MOVED STAYS ONE SHORT LINE. It is the
+        commonest stop, so names on it repeat identical text on every stop: 10
+        held leases made it about 520 bytes against main's 85. A reader who
+        lost the earlier print after a compaction runs the detail verb, which
+        works from the seat's own shell and writes nothing."""
+        for r in self.THREE:
+            self.claim(r)
+        self.give("cache-rebuild")
+        self.first_stop()
+        _b, warns = self.guard()
+        line = self.compressed(warns)
+        self.assertEqual(len(line), 1, warns)
+        self.assertIn(DETAIL_VERB, line[0])
+        for name in ("db-migration", "port:9931", "cache-rebuild"):
+            self.assertNotIn(name, line[0])
+
+    def test_a_warn_another_rung_refused_over_is_not_remembered(self):
+        """THE REFUSAL EXIT DISCARDS THE WARN CHANNEL, and the memory was
+        written while the WARN was being built. A lane that turned exempt on a
+        stop another rung refused was then "unchanged" at the next stop, so the
+        seat never saw the line at all. The memory commits what was PRINTED,
+        by the rule `commit_disclosures` already keeps for the seam rung."""
+        seats.join(session=SESSION, seat=ME, cwd=self.tmp)
+        for r in self.THREE:
+            self.claim(r)
+        self.first_stop()
+        self.give("cache-rebuild")
+        chat.post("@%s this row holds the stop" % ME, who="bob")
+        blocks, warns = self.guard()
+        # CONTROLS: the flip rode the WARN, and another rung refused the stop,
+        # so the refusal exit put only blocks on the stream.
+        self.assertEqual(len(self.sermons(warns)), 1, warns)
+        self.assertTrue([b for b in blocks if FULL not in b], blocks)
+        blocks, warns = self.guard()
+        hit = self.sermons(blocks + warns)
+        self.assertEqual(len(hit), 1, "a line the seat never saw was "
+                         "remembered as seen: %r" % (warns,))
+        lines = self.named(hit[0])
+        self.assertEqual(len(lines), 1, hit[0])
+        self.assertIn("NO ACTION OWED (PEER HOLD)", lines[0])
+
+    def _lapse_after_a_refused_stop(self, leases):
+        """held (printed) -> exempt on a stop ANOTHER rung refused -> held
+        again with the same lease id and band. Returns the third stop's
+        blocks."""
+        seats.join(session=SESSION, seat=ME, cwd=self.tmp)
+        for r in leases:
+            self.claim(r)
+        blocks, _w = self.guard()
+        self.assertEqual(len(self.sermons(blocks)), 1, blocks)   # printed
+        self.give("cache-rebuild")                  # a delegate goes live
+        chat.post("@%s this row holds the stop" % ME, who="bob")
+        blocks, _w = self.guard()
+        # CONTROL: another rung refused, so no lease print reached the stream.
+        self.assertTrue([b for b in blocks if FULL not in b], blocks)
+        self.assertEqual(self.sermons(blocks), [], blocks)
+        self.take_back("cache-rebuild")             # ...and dies
+        blocks, _w = self.guard()
+        return blocks
+
+    def test_an_exemption_that_lapses_after_a_refused_stop_blocks_again(self):
+        """THE LAPSE IS NEWS WHETHER OR NOT ITS EXEMPT LINE WAS PRINTED. The
+        seat delegated the lane itself, so it knows a delegate took it, with or
+        without the guard's LIVE DELEGATE line; the delegate dying is the event
+        the all-exempt rearm exists for (main blocks here). Recording only a
+        delivered print left the memory at the lane's first held coordinate, so
+        the return compressed into a WARN and the stop was allowed."""
+        hit = self.sermons(self._lapse_after_a_refused_stop(("cache-rebuild",)))
+        self.assertEqual(len(hit), 1, "an exemption that lapsed after a "
+                         "refused stop was compressed and the stop allowed")
+        self.assertIn("helm chat release cache-rebuild", hit[0])
+
+    def test_a_lapse_beside_a_steady_held_lane_blocks_again(self):
+        """The same with another held lane beside it, where the exempt stop
+        is a partial WARN rather than an all-exempt one."""
+        hit = self.sermons(self._lapse_after_a_refused_stop(
+            ("cache-rebuild", "db-migration")))
+        self.assertEqual(len(hit), 1, "a lapsed exemption beside a steady "
+                         "held lane was compressed and the stop allowed")
+        lines = self.named(hit[0])
+        self.assertEqual(len(lines), 1, hit[0])
+        self.assertIn("helm chat release cache-rebuild", lines[0])
+
+
+class TheDetailVerbReadsTheSessionItRunsInTest(PerLeaseBase):
+    """THE VERB THE TALLY POINTS AT PRINTED NOTHING FROM A SEAT'S SHELL.
+
+    A seat runs `helm chat stop-guard --detail` with no hook payload. The
+    ladder then had no session, the claims rung returned at once for the
+    session it did not have, and the verb exited 0 with no lease line — while
+    every partial print names it as the way back to the lines it left out.
+    The session comes from the environment, the only rung that runs is the
+    lease rung, and the read writes nothing."""
+
+    def detail_cli(self, session=SESSION):
+        from helm import seats_cli
+        env = {"CLAUDE_CODE_SESSION_ID": session} if session else {}
+        err, out = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env), \
+                contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(out):
+            rc = seats_cli.cmd("stop-guard", ["--detail"], room="main")
+        return rc, out.getvalue() + err.getvalue()
+
+    def files(self):
+        return sorted(os.path.join(d, f)
+                      for d, _s, fs in os.walk(self.tmp) for f in fs)
+
+    def test_a_bare_detail_prints_every_lease_and_writes_nothing(self):  # noqa: VACUOUS_ASSERTION — the three lease lines and rc 2 prove the read ran, and `before` is asserted to hold the claims registry, so the equality compares two real listings of the same tree
+        for r in self.THREE:
+            self.claim(r)
+        self.give("cache-rebuild")
+        before = self.files()
+        self.assertIn(os.path.realpath(seats.claims_path()),
+                      [os.path.realpath(f) for f in before])
+        rc, text = self.detail_cli()
+        self.assertIn("helm chat release db-migration", text)
+        self.assertIn("helm chat release port:9931", text)
+        self.assertIn("NO ACTION OWED (PEER HOLD)", text)
+        self.assertEqual(rc, 2, "two held leases owe their acts: " + text)
+        self.assertEqual(self.files(), before, "a read wrote state")
+
+    def test_a_bare_detail_with_no_session_says_so(self):
+        self.claim("db-migration")
+        rc, text = self.detail_cli(session=None)
+        self.assertEqual(rc, 1, text)
+        self.assertIn("no session", text)
+
+    def test_detail_reads_and_writes_no_lease_memory(self):  # noqa: VACUOUS_ASSERTION — the detail sermon (len==1) and the next stop's three named lines are unconditional positive controls on the same set whose latch absence is read
+        """The hook-payload path as well: `--detail` is a read, so it leaves
+        the memory where it found it, and the next real stop is still the
+        first stop on this set."""
+        for r in self.THREE:
+            self.claim(r)
+        blocks, _w = seats.stop_guard(session=SESSION, room="main", seat=ME,
+                                      detail=True)
+        self.assertEqual(len(self.sermons(blocks)), 1, blocks)
+        self.assertEqual(glob.glob(os.path.join(
+            os.environ["HELM_CHAT_DIR"], "*.%s.*" % seats.LEASE_LATCH)), [])
+        self.first_stop()
 
 
 class UnwritableLatchTest(LeaseLatchBase):
@@ -578,20 +981,22 @@ class EveryHeldLeaseAppearsInOneOfTheTwoShapesTest(LeaseLatchBase):
         self.assertNotIn("not yours to release", hit[0])   # prose, not red
         self.assertIn("not yours to release", "\n".join(_warns))
 
-    def test_a_released_exempt_lease_is_named_by_neither_shape(self):  # noqa: VACUOUS_ASSERTION — len(sermons)==1 plus the held lane's own line are the unconditional positive controls on this stop's blocks; the released row's absence is the finding
+    def test_a_released_exempt_lease_is_named_by_neither_shape(self):  # noqa: VACUOUS_ASSERTION — the one warn line counting the release is the unconditional positive control on this stop's output; the released row's absence is the finding
         """THE MUST-STAY-QUIET. The cure prints every lease the session HOLDS,
         which is not the same as printing every lease it ever held: a released
         row must vanish from both shapes. It also pins the exemption as a
-        fingerprint coordinate — the set CHANGED, so this is a fresh sermon and
-        not the compressed one-liner."""
+        latch coordinate — the set CHANGED, so the stop says so rather than
+        reporting it unchanged. Since task/3123 that is a count in a WARN and
+        not a reprint of the held lane, whose line did not change."""
         self.claim("db-migration")
         self.claim(self.RENEWING)
         self.guard()
         self.drop(self.RENEWING)
         blocks, warns = self.guard()
-        hit = self.sermons(blocks)
-        self.assertEqual(len(hit), 1, blocks)             # positive control
-        self.assertIn("db-migration", hit[0])
+        line = [w for w in warns if "1 no longer held" in w]
+        self.assertEqual(len(line), 1, warns)              # positive control
+        self.assertIn("1 lease(s) held", line[0])
+        self.assertEqual(self.sermons(blocks), [], blocks)
         self.assertEqual(self.compressed(warns), [],
                          "a released exemption compressed — the change was "
                          "invisible to the latch")

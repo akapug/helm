@@ -691,14 +691,13 @@ class SeatIdentityTest(McpdBase):
         """A LOCK THAT FAILS OPEN IS AVAILABILITY SEMANTICS, AND MINT ISSUES A
         CAPABILITY (on the first cure written for the finding).
 
-        `seats_common._flocked` yields holding nothing when flock raises, and
-        the body runs anyway. That is right for a shared-state mutation, where
-        finishing matters more than serialising. Handing out a bearer token
-        under those semantics promises something we cannot keep, so mint
-        refuses instead of inheriting them."""
+        `seats_common._flocked(..., check=True)` yields holding nothing when
+        flock raises (task/2520; the default form raises instead). Handing out
+        a bearer token without the lock promises something we cannot keep, so
+        mint reads `.f` and refuses."""
         from helm import seats_common
 
-        class _NoLock:                      # exactly _flocked's fail-open state
+        class _NoLock:                      # a check=True take that failed
             def __init__(self, *a, **k):
                 self.f = None
 

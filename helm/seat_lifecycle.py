@@ -180,6 +180,28 @@ def _spawn_record(d):
     return rec if isinstance(rec, dict) else None
 
 
+def _spawn_record_read(d):
+    """(record, why) — the register read STRICTLY, for a caller that must not
+    act on what it could not read. (None, None) is ABSENT: no spawn.json,
+    which is "no record". (None, why) is UNREADABLE: a file that fails to
+    read or parse, or parses to anything but an object. `_spawn_record`
+    answers None for both, and its callers rely on that; a caller about to
+    discard what the record may hold (a persisted --model choice) reads it
+    here instead, so an unread record is UNKNOWN and never "no choice"."""
+    from . import pk
+    absent = object()
+    try:
+        rec = pk.read_json(_spawn_path(d), absent, strict=True)
+    except Exception as exc:  # noqa: BLE001 — any failed read is UNREADABLE
+        return None, "spawn.json unreadable (%s)" % type(exc).__name__
+    if rec is absent:
+        return None, None
+    if not isinstance(rec, dict):
+        return None, "spawn.json unreadable (a %s, not an object)" \
+            % type(rec).__name__
+    return rec, None
+
+
 def _persisted_model(d, seat):
     """The seat's EXPLICIT --model choice recovered from spawn.json; None =
     no choice, follow the family default. This is the ONE door every
@@ -188,9 +210,18 @@ def _persisted_model(d, seat):
     spark seat (model_context 76000) back to sol's 320k — the overstated
     window a wedged seat cannot compact its way out of. Only an explicit
     choice is sticky; a default-following seat (model None) keeps tracking
-    the family so a catalog default change still propagates on refresh."""
+    the family so a catalog default change still propagates on refresh.
+
+    A DEFAULT IS NOT A CHOICE. `model_source` says which one a persisted
+    model is: "explicit" (the operator's --model) is returned; "default" (the
+    family model at that moment, kept as history) is None, so the catalog
+    decides. A record with no marker predates it and cannot say, so its model
+    is KEPT, and `seat doctor`/`seat remint` report it as "persisted, source
+    unknown" until the operator settles it (helm/seat_remint.py)."""
     rec = _spawn_record(d)
-    return rec.get("model") if rec and rec.get("seat") == seat else None
+    if not rec or rec.get("seat") != seat:
+        return None
+    return None if rec.get("model_source") == "default" else rec.get("model")
 
 
 def _pane_live(row):
@@ -248,16 +279,20 @@ def _where_adopted(seat_name, rest, unknown_msg):
     will reach for verbs that do not apply to it. When helm has never heard of
     the name at all, the original "unknown seat" message stands — a typo must
     still look like a typo."""
-    from . import orcaadopt
-    info = orcaadopt.resolve(seat_name)
+    from . import orcaadopt, seat_idle
+    info = seat_idle.with_reading(orcaadopt.resolve(seat_name), seat_name)
     if info is None:
         print("helm seat: " + _unknown_seat_reason(seat_name, unknown_msg),
               file=sys.stderr)
         return 2
+    from . import seat_rest
+    resting = seat_rest.display(seat_name) or None
     if "--json" in rest:
-        print(json.dumps(info, indent=2, sort_keys=True))
+        print(json.dumps(dict(info, rest=resting), indent=2, sort_keys=True))
         return 0
     print("%s: %s — %s" % (seat_name, info["provenance"], info["state"]))
+    if resting:
+        print("  rest    : " + resting)
     print("  evidence: " + info["evidence"])
     if info.get("handle"):
         print("  pane    : %s (orca pane key %s)"
@@ -281,6 +316,7 @@ def _where_adopted(seat_name, rest, unknown_msg):
         print("  census  : INCOMPLETE — " + info["unidentified"])
     print("  sessions: " + (", ".join(s[:8] + "…" for s in info["sessions"])
                             or "(none in helm's chat roster)"))
+    print("  idle    : " + seat_idle.phrase(info["idle"]))
     print("  note    : no helm spawn register / launch.sh — `helm seat resume "
           "%s` relaunches it from its transcript" % seat_name)
     return 0
@@ -320,10 +356,12 @@ WantedBy=timers.target
 """
 
 
-def rebind_timer_units(interval=REBIND_INTERVAL_S):
+def rebind_timer_units(interval=REBIND_INTERVAL_S, inputs=None):
+    # `inputs` replaces per-install values (timerhealth.unit_values).
     # A persistent unit must never capture a disposable worktree's PATH entry.
     helm_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "helm")
-    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    from . import timerhealth
+    udir = timerhealth.user_unit_dir()
     # WorkingDirectory is DERIVED, never a literal: the unit needs a project
     # cwd (a unit without one runs in $HOME, derives no project, and posts to
     # #main — the reason the line exists), but an operator path baked into a
@@ -334,9 +372,11 @@ def rebind_timer_units(interval=REBIND_INTERVAL_S):
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cwd = work.find_root(here) or here
     return (os.path.join(udir, "helm-seat-rebind.service"),
-            _REBIND_SERVICE % {"helm": helm_bin, "cwd": cwd},
+            _REBIND_SERVICE % timerhealth.unit_values(
+                {"helm": helm_bin, "cwd": cwd}, inputs),
             os.path.join(udir, "helm-seat-rebind.timer"),
-            _REBIND_TIMER % {"interval": interval})
+            _REBIND_TIMER % timerhealth.unit_values({"interval": interval},
+                                                    inputs))
 
 
 def ensure_rebind_timer(interval=REBIND_INTERVAL_S):
@@ -367,22 +407,16 @@ def ensure_rebind_timer(interval=REBIND_INTERVAL_S):
     that only ever removes a lie."""
     if interval < 1:
         return False, "interval must be at least 1 second"
-    from . import pk
+    from . import timerhealth
     systemctl = shutil.which("systemctl")
     if not systemctl:
         return False, "systemctl unavailable; run `helm seat resume --all --apply` from another scheduler"
     spath, service, tpath, timer = rebind_timer_units(interval)
-    try:
-        pk.atomic_write(spath, service)
-        pk.atomic_write(tpath, timer)
-    except OSError as e:
-        return False, "unit write failed: %s" % e
-    for cmd in ([systemctl, "--user", "daemon-reload"],
-                [systemctl, "--user", "enable", "--now", "helm-seat-rebind.timer"]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, "%s failed: %s" % (
-                " ".join(cmd), (r.stderr or r.stdout or "").strip()[:200])
+    error, _unchanged = timerhealth.install_user_timer(
+        ((spath, service), (tpath, timer)), ("helm-seat-rebind.timer",),
+        systemctl, subprocess)
+    if error:
+        return False, error
     return True, "timer enabled every %ds (%s)" % (interval, tpath)
 
 
@@ -797,14 +831,22 @@ def _where(seat_name, rest):
             elif ad is not None and "is not live" in detail:
                 alive = False
     upstream = _upstream_row(family) if not archived else ()
-    liveness = None if archived else seat_liveness(seat_name, upstream)
+    from . import seat_idle
+    liveness = None if archived else seat_idle.with_reading(
+        seat_liveness(seat_name, upstream), seat_name)
     resolved = None if archived else measured_seat_route(seat_name)
+    # THE OWNER'S REST (task/3280) rides both forms: a RESTING seat is up,
+    # deliberately not listening, and woken by nothing but the end of it.
+    from . import seat_rest
+    resting = seat_rest.display(seat_name) or None
     if "--json" in rest:
         print(json.dumps(dict(rec, active=not archived, archived=archived,
                               alive=alive, liveness=liveness,
-                              resolved=resolved),
+                              resolved=resolved, rest=resting),
                          indent=2, sort_keys=True))
         return 0
+    if resting:
+        print("%s: %s" % (seat_name, resting))
     if archived:
         terminal = rec["terminal"]
         ref = ("pid %s" % rec.get("pid")) \
@@ -824,6 +866,8 @@ def _where(seat_name, rest):
     rich = liveness["state"]
     if liveness.get("blocked_on"):
         rich += " (%s)" % liveness["blocked_on"]
+    # THE PANE SAYS WHAT THE SEAT IS DOING NOW; ITS HOOKS SAY SINCE WHEN.
+    rich += "; hooks %s" % seat_idle.phrase(liveness.get("idle"))
     role = _seat_role(rec.get("role")) or "UNKNOWN"
     group = seat_quota_group_phrase(family)
     print("%s: %s %s — %s; role %s; liveness %s%s; %s; %s%sworktree %s, "
@@ -1014,13 +1058,19 @@ def _unknown_remediation(evidence="the upstream record cannot derive whether a r
             "evidence": evidence, "action": None}
 
 
-def remediation_text(remediation):
-    """One operator sentence for every remediation consumer."""
+def remediation_text(remediation, owner=False):
+    """One operator sentence for every remediation consumer.
+
+    `owner=True` is the same sentence for the owner's console, which never
+    names a command because he does not use a terminal (console walk 3): the
+    proxy-restart action's measured fact, and the restart in plain words."""
     rem = remediation if isinstance(remediation, dict) else \
         _unknown_remediation()
     if rem.get("restart") == RESTART_HELPFUL and \
             rem.get("target") == "proxy" and rem.get("action"):
-        return rem["action"]
+        return ("%s; the cure is to restart this exact proxy, and the next "
+                "proxy-watch pass then measures it again"
+                % rem.get("evidence")) if owner else rem["action"]
     return "remediation UNKNOWN: cannot derive whether a restart would help (%s)" \
         % (rem.get("evidence") or "no readable remediation evidence")
 
@@ -1123,8 +1173,14 @@ _PANE_RULE_COMPOSER = re.compile(r"^\s*[─━]{2}([^─━].*)$")
 # The update toast is deliberately NOT a global line regex: only the measured
 # `Update installed` + `Restart to update` pair (or its combined row) is chrome,
 # so either exact phrase in transcript output cannot bless a historical prompt.
+# AND THE PERMISSION-MODE ROW OF A SESSION NOT IN BYPASS MODE (task/3209,
+# measured on a throwaway pane, Claude Code 2.1.283): `⏸ manual mode on · 1
+# shell · ← for agents` sits where a seat draws `⏵⏵ bypass permissions on`.
+# Without it an idle composer above that row read as NO composer and the turn
+# verb refused to type /exit into the pane. Pinned to the glyph, one word and
+# `mode on`, so prose that merely uses the glyph stays semantic content.
 _PANE_CHROME = re.compile(
-    r"^\s*(?:⏵⏵(?:\s|$)|[─━]{3,}\s*$"
+    r"^\s*(?:⏵⏵(?:\s|$)|⏸\s+\w+ mode on\b|[─━]{3,}\s*$"
     r"|[●◯◉]\s+\S+(?:\s+\(\+\d+\))?\s*$"           # `● main`, `◯ claude (+1)`
     r"|[●◯◉]\s+\S+(?:\s+\(\+\d+\))?\s{2,}\S.*$"    # marker+name+gap+desc
     r"|[\w.\-]+(?:\[[^\]\s]*\])?\s+\|\s+[~/]\S*\s*(?:\S+\s*)?$)")  # model | cwd
@@ -1167,11 +1223,18 @@ def _current_prompt_line(tail):
     bare ``──text`` transcript row never earns composer authority by itself.
     """
     lines = [_PANE_ANSI.sub("", line) for line in (tail or "").splitlines()]
-    visible = [line for line in lines if line.strip()]
+    return _current_prompt_at([line for line in lines if line.strip()])[1]
+
+
+def _current_prompt_at(visible):
+    """(index, line) of the current composer among `visible` rows, else
+    (None, None). The one composer rule `_current_prompt_line` answers with;
+    a reader that needs the rows ABOVE the composer takes its index here."""
     for i in range(len(visible) - 1, -1, -1):
         line = visible[i]
         if _PANE_PROMPT.match(line):
-            return line if _pane_chrome_tail(visible[i + 1:]) else None
+            return (i, line) if _pane_chrome_tail(visible[i + 1:]) \
+                else (None, None)
         rule = _PANE_RULE_COMPOSER.match(line)
         # Unlike a classic prompt, the measured rule-attached draft has no
         # lower rule or footer: it is the BOTTOM visible row. Allowing chrome
@@ -1182,8 +1245,97 @@ def _current_prompt_line(tail):
                 or not _PANE_RULE.match(visible[i - 1]) \
                 or not _PANE_RULE.match(visible[i - 2]):
             continue
-        return "❯\xa0" + rule.group(1).strip()
+        return i, "❯\xa0" + rule.group(1).strip()
+    return None, None
+
+
+#: A TRANSCRIPT ENTRY begins at column zero: a bullet (`● `, `⏺ ` on older
+#: builds) for output, a tool call or an error, or the composer glyph with its
+#: text for a submitted prompt. Wrapped continuation rows, `⎿` result rows, the
+#: turn-landed row, the task list and footer chrome begin no entry.
+_TURN_ENTRY = re.compile(r"^(?:[●⏺][ \t]|[❯>][ \t]*\S)")
+#: An API failure is drawn as its own entry (`● API Error: 401 …`) or as a
+#: result row under the entry it ended (`  ⎿  API Error: …`).
+_TURN_ERROR = re.compile(
+    r"^(?:[●⏺][ \t]+|[ \t]*⎿[ \t]+)?"
+    r"(?:API[ \t]+Error\b(?P<api>.*)|Connection lost mid-response\b)", re.I)
+#: THE FAILURES A PROXY THAT ANSWERS AGAIN CURES: credential (401, 403),
+#: timeout (408), rate (429) and server (5xx). Any other status is the
+#: REQUEST's fault and the same prompt fails the same way; a context-overflow
+#: 400 is autocompact's (`autocompact._overflow_400`).
+_TURN_UPSTREAM_STATUS = re.compile(r"40[138]|429|5\d\d")
+_TURN_STATUS = re.compile(r"\b[1-5]\d\d\b")
+_TURN_TRANSPORT = re.compile(
+    r"\b(connection (?:error|lost|refused|reset|closed)|timed out|timeout"
+    r"|socket hang up|fetch failed|overloaded|ECONN[A-Z]+)\b", re.I)
+
+
+def _turn_died_on(tail):
+    """The upstream error the pane's last turn ENDED on, as a short label
+    ("API Error: 401", "API Error: connection error", "Connection lost
+    mid-response"), else None.
+
+    POSITION DECIDES, as it does for a wall line and a composer: the NEWEST
+    transcript entry above the current composer must be the error. An entry
+    below it is proof the turn loop ran after it, so the error is history.
+    Rows that begin no entry are skipped, because they carry no turn.
+
+    THE LABEL IS A CLASSIFICATION, NEVER THE PANE'S BYTES. A viewport is raw
+    external content and an error body can quote a credential's fragment, so
+    only the status or the transport phrase leaves this function.
+
+    A REQUEST-SHAPED ERROR IS NOT A DEAD TURN. A 400, 404 or 413 fails the
+    same prompt again whatever the proxy reads, and an aborted request is a
+    person's interrupt; both answer None."""
+    lines = [_PANE_ANSI.sub("", line) for line in (tail or "").splitlines()]
+    visible = [line for line in lines if line.strip()]
+    at, _line = _current_prompt_at(visible)
+    if at is None:
+        return None
+    for line in reversed(visible[:at]):
+        m = _TURN_ERROR.match(line)
+        if m:
+            return _upstream_error_label(m.group("api"))
+        if _TURN_ENTRY.match(line):
+            return None
     return None
+
+
+def _upstream_error_label(api):
+    """The label for one matched error row, or None for a request-shaped one.
+    `api` is the text after "API Error"; None is the connection-lost row. The
+    status is read before any JSON body, whose own numbers are not a status."""
+    if api is None:
+        return "Connection lost mid-response"
+    head = api.split("{", 1)[0]
+    status = _TURN_STATUS.search(head)
+    if status:
+        return "API Error: %s" % status.group(0) \
+            if _TURN_UPSTREAM_STATUS.fullmatch(status.group(0)) else None
+    phrase = _TURN_TRANSPORT.search(head)
+    return "API Error: %s" % phrase.group(1).lower() if phrase else None
+
+
+def dead_turn_reading(row, beacon_none, seat=None):
+    """The one sentence every surface prints for a turn that died on an
+    upstream error over a proxy that has read HEALTHY since, or "".
+
+    A LIVE PROCESS HOLDING THE SEAT IS NOT A SEAT THAT CAN TAKE A TURN. The
+    liveness row is IDLE, which is true, and carries `turn_died` from the pane
+    tail and the seat's own proxywatch record. What that row cannot see is
+    the beacon, so `beacon_none` is the CALLER's measurement and only True
+    reads: a strict probe found nothing listening. A live beacon hears an
+    @mention, so the ordinary wake applies, and an unmeasured one proves
+    nothing. The wake verb is `beacons.repair_argv`, spelled once."""
+    died = row.get("turn_died") if isinstance(row, dict) else None
+    if beacon_none is not True or not isinstance(died, dict) \
+            or row.get("state") != "IDLE":
+        return ""
+    from .beacons import repair_argv
+    return ("turn died on upstream error (%s), proxy healthy since %s, wake "
+            "with one prompt: `%s`" % (
+                died.get("error") or "?", died.get("since") or "?",
+                repair_argv(seat or row.get("seat") or "<seat>")))
 
 
 #: THE ONE ROW THAT PROVES A COUNTER IS SPENT: the turn-landed summary the
@@ -1852,7 +2004,12 @@ PERMISSION_PROMPT = "permission"
 _PLAN_EXECUTION_RE = re.compile(
     r"Claude has written up a plan and is ready to execute\.\s*"
     r"Would you like to proceed\?", re.I)
-_OPTION_RE = re.compile(r"^\s*(\d+)\.\s+(\S.*?)\s*$")
+# THE FOCUSED OPTION CARRIES A POINTER. Claude Code draws its select's current
+# row as `❯ 1. Yes` (figures.pointer, U+276F, in the installed 2.1.282), so a
+# rule that demanded leading whitespace broke the run exactly at the option a
+# dialog opens on, and a real dialog parsed as NO options. Every fixture had
+# been typed without the pointer.
+_OPTION_RE = re.compile(r"^\s*(?:\u276f\s*)?(\d+)\.\s+(\S.*?)\s*$")
 _AFFIRMATIVE_RE = re.compile(r"^yes\b", re.I)
 _NEGATIVE_RE = re.compile(r"^no\b", re.I)
 
@@ -2041,6 +2198,10 @@ def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
                                     cannot read is a pane we know nothing about
       - pane-tail IDLE + fresh dark upstream -> WALLED: local inactivity does
                                     not claim end-to-end availability
+      - pane-tail IDLE ending on an upstream error + the seat's HEALTHY
+                                    record -> IDLE carrying `turn_died`: the
+                                    turn ended and nothing starts another
+                                    (see dead_turn_reading)
       - missing/corrupt/stale upstream -> keep the pane-tail verdict; cache
                                     blindness never fabricates a provider wall
       - stale handle             -> UNKNOWN (evidence stale-handle): the register
@@ -2126,6 +2287,7 @@ def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
     # work because its provider family is dark. Compose only at this leaf:
     # RUNNING remains running, pane-derived blockers keep their precise remedy,
     # and an unreadable/missing/stale cache cannot overwrite observed pane truth.
+    died = None
     if state == "IDLE":
         # THE POOL WALL IS READ FROM THE PRODUCER'S LOG, NOT ONLY THE PANE.
         # The pane copy of the refusal can wrap, scroll out, or sit under a
@@ -2152,17 +2314,49 @@ def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
             snapshot, family, seat_name) if upstream else (None, _err)
         aggregate_dark = not aggregate_err and aggregate.get("dark") is True
         seat_dark = not measured_err and measured.get("dark") is True
-        if aggregate_dark and seat_dark and measured.get("state") != "UNKNOWN":
+        # ONE PROXY'S CREDENTIAL FAILING IS THAT SEAT'S WALL even while its
+        # siblings answer; every other dark state still needs the family dark.
+        auth_dark = not measured_err and measured.get("state") == "AUTH-401"
+        if (aggregate_dark or auth_dark) and seat_dark and measured.get("state") != "UNKNOWN":
+            # THE DETAIL NEVER REPLACES THE SINCE: a production record always
+            # carries a detail, and the row must still say when the wall began.
             wall = "upstream %s since %s" % (
                 measured["state"], measured.get("since") or "?")
+            if measured.get("detail"):
+                wall += " — %s" % measured["detail"]
             return {"seat": seat_name, "state": "WALLED", "blocked_on": wall,
                     "evidence": "pane-tail+proxywatch",
                     "upstream_family": family,
                     "upstream_remediation_state": snapshot,
-                    "detail": "the pane is idle, but its measured upstream "
-                              "condition is refusing fresh work"}
+                    "detail": "the pane is idle, but its proxy is refusing work (%s)" % (
+                        measured.get("detail") or "upstream dark")}
+        # A TURN THAT ENDED ON AN UPSTREAM ERROR, OVER THIS SEAT'S OWN PROXY
+        # READING HEALTHY AGAIN. The pane is IDLE and stays IDLE; the row
+        # carries the dead turn beside the state, because nothing starts the
+        # next turn by itself. Only a readable HEALTHY record carrying its
+        # nonempty episode timestamp says "healthy since": UNKNOWN, a stale
+        # cache, a legacy/partial record and every wall above say nothing.
+        healthy = not measured_err and isinstance(measured, dict) \
+            and measured.get("state") == "HEALTHY" \
+            and measured.get("dark") is not True \
+            and isinstance(measured.get("since"), str) \
+            and bool(measured["since"].strip())
+        error = _turn_died_on(tail) if healthy else None
+        if error:
+            died = {"error": error, "upstream": "HEALTHY",
+                    "since": measured.get("since")}
+    if state == "BLOCKED_ON_QUOTA":
+        # A VENDOR CAUSE OUTRANKS THE PANE'S COOLDOWN CLAUSE. The pane line
+        # "(reset in 4m13s)" is the proxy's own short cooldown; when the log
+        # shows the upstream refused first (a spent window, an empty balance),
+        # that instant is not the wall's end, and the row says what is.
+        wall, _why = poolwall.seat_wall(seat_name, family=family)
+        if wall is not None and wall.get("cause"):
+            blocked_on = poolwall.blocked_on(wall)
     row = {"seat": seat_name, "state": state, "blocked_on": blocked_on,
            "evidence": "pane-tail", "detail": None}
+    if died:
+        row["turn_died"] = died
     # THE AUTHORITY FIELDS TRAVEL WITH THE ROW. An actuator needs the pane it
     # must type into and the session that pane belongs to; without them a
     # delivery is refused before the key leaves, and a caller that guessed
